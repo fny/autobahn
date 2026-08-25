@@ -631,6 +631,45 @@ fn watch_mode_heals_after_a_destination_recovers() {
 }
 
 #[test]
+fn policy_flows_through_the_agent_protocol() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    fs::write(alpha.join("file.txt"), "content").expect("file should be writable");
+    std::os::unix::fs::symlink("file.txt", alpha.join("link")).expect("symlink");
+
+    // The group's policy — ignored symlinks and 0644 files — must govern the
+    // *agent-side* endpoint, proving Initialize carries it across the wire.
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        symlink_mode = "ignore"
+        file_mode = "0644"
+        directory_mode = "0755"
+        agent_command = "{agent} agent"
+        betas = ["remote-host:{beta}"]
+        "#,
+        alpha = alpha.display(),
+        agent = agent_binary(),
+        beta = beta.display(),
+    ));
+    let outcomes = world.run_once(plans);
+    assert_all_synchronized(&outcomes);
+
+    assert_eq!(read(&beta, "file.txt"), "content");
+    use std::os::unix::fs::MetadataExt;
+    let mode = fs::symlink_metadata(beta.join("file.txt"))
+        .expect("file should exist")
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o644);
+    // The symlink was invisible on both sides.
+    assert!(!beta.join("link").exists());
+}
+
+#[test]
 fn remote_home_relative_roots_resolve_against_the_agent_home() {
     let world = World::new();
     let alpha = world.directory("alpha");

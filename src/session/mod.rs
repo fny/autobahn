@@ -710,7 +710,6 @@ mod tests {
     #[test]
     fn a_state_directory_admits_only_one_session_at_a_time() {
         use crate::endpoint::local::LocalEndpoint;
-        use crate::scan::IgnoreSet;
 
         let keep = tempfile::tempdir().unwrap();
         let state = keep.path().join("state");
@@ -721,7 +720,7 @@ mod tests {
                 LocalEndpoint::new(
                     root,
                     keep.path().join(format!("staging-{name}")),
-                    IgnoreSet::new(&[]).unwrap(),
+                    crate::endpoint::local::EndpointOptions::default(),
                 )
                 .unwrap(),
             )

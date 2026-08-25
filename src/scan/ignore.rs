@@ -95,6 +95,13 @@ pub struct IgnoreSet {
     patterns: Vec<Pattern>,
 }
 
+impl Default for IgnoreSet {
+    /// The empty ignore set, which ignores nothing.
+    fn default() -> IgnoreSet {
+        IgnoreSet::new(&[]).expect("the empty ignore set always compiles")
+    }
+}
+
 impl IgnoreSet {
     /// Compiles an ignore set from patterns.
     pub fn new(patterns: &[String]) -> Result<IgnoreSet> {

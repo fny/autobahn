@@ -40,7 +40,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::paths::{expand_tilde, resolve_for_identity};
-use crate::scan::IgnoreSet;
+use crate::scan::{IgnoreSet, SymlinkMode};
 use crate::session::session_identifier;
 use crate::tree::SyncMode;
 
@@ -74,6 +74,12 @@ pub struct Defaults {
     pub ignores: Vec<String>,
     /// The default interval, in seconds, between synchronization cycles.
     pub interval: Option<u64>,
+    /// The default symbolic link treatment (`ignore`, `portable`, or `raw`).
+    pub symlink_mode: Option<String>,
+    /// The default permission bits (octal) for created files.
+    pub file_mode: Option<String>,
+    /// The default permission bits (octal) for created directories.
+    pub directory_mode: Option<String>,
 }
 
 /// One synchronization group: a local alpha directory fanned out to one or
@@ -93,6 +99,15 @@ pub struct Group {
     pub ignores: Vec<String>,
     /// The interval, in seconds, between cycles (falls back to the defaults).
     pub interval: Option<u64>,
+    /// The symbolic link treatment (`ignore`, `portable`, or `raw`; falls
+    /// back to the defaults).
+    pub symlink_mode: Option<String>,
+    /// The permission bits (octal) for created files (falls back to the
+    /// defaults).
+    pub file_mode: Option<String>,
+    /// The permission bits (octal) for created directories (falls back to
+    /// the defaults).
+    pub directory_mode: Option<String>,
     /// Advanced: connect this group's remote betas through this command
     /// (whitespace split into argv) instead of SSH. Used for testing and
     /// custom transports; the beta's host is then informational only.
@@ -120,6 +135,14 @@ pub struct SessionPlan {
     pub ignores: Vec<String>,
     /// The interval between synchronization cycles.
     pub interval: Duration,
+    /// The symbolic link treatment.
+    pub symlink_mode: SymlinkMode,
+    /// The permission bits for created files (`None` for the endpoint
+    /// default).
+    pub file_mode: Option<u32>,
+    /// The permission bits for created directories (`None` for the endpoint
+    /// default).
+    pub directory_mode: Option<u32>,
     /// The stable identifier isolating this session's state, derived from
     /// the *resolved* endpoint identities (see
     /// [`resolve_for_identity`](crate::paths::resolve_for_identity)) so that
@@ -272,6 +295,44 @@ impl Config {
                     .unwrap_or(DEFAULT_INTERVAL_SECONDS)
                     .max(1),
             );
+            let symlink_mode = match group
+                .symlink_mode
+                .as_deref()
+                .or(self.defaults.symlink_mode.as_deref())
+            {
+                None => SymlinkMode::default(),
+                Some(mode) => match parse_symlink_mode(mode) {
+                    Ok(mode) => mode,
+                    Err(message) => {
+                        errors.push(format!("group '{name}': {message}"));
+                        SymlinkMode::default()
+                    }
+                },
+            };
+            let mut permission = |value: Option<&str>, directory: bool| match value {
+                None => None,
+                Some(mode) => match parse_permission_mode(mode, directory) {
+                    Ok(bits) => Some(bits),
+                    Err(message) => {
+                        errors.push(format!("group '{name}': {message}"));
+                        None
+                    }
+                },
+            };
+            let file_mode = permission(
+                group
+                    .file_mode
+                    .as_deref()
+                    .or(self.defaults.file_mode.as_deref()),
+                false,
+            );
+            let directory_mode = permission(
+                group
+                    .directory_mode
+                    .as_deref()
+                    .or(self.defaults.directory_mode.as_deref()),
+                true,
+            );
 
             for beta in &group.betas {
                 if beta.is_empty() {
@@ -321,6 +382,9 @@ impl Config {
                     mode,
                     ignores: ignores.clone(),
                     interval,
+                    symlink_mode,
+                    file_mode,
+                    directory_mode,
                     identifier,
                 };
                 if let Some(previous) =
@@ -342,6 +406,40 @@ impl Config {
         }
         Ok(plans)
     }
+}
+
+/// Parses a symbolic link mode name.
+pub fn parse_symlink_mode(mode: &str) -> Result<SymlinkMode, String> {
+    match mode {
+        "ignore" => Ok(SymlinkMode::Ignore),
+        "portable" => Ok(SymlinkMode::Portable),
+        "raw" | "posix-raw" => Ok(SymlinkMode::Raw),
+        other => Err(format!(
+            "unknown symlink mode '{other}' (expected one of: ignore, portable, raw)"
+        )),
+    }
+}
+
+/// Parses octal permission bits for created files or directories. The owner
+/// must retain enough access for synchronization itself to function: read
+/// and write for files, read, write, and traverse for directories.
+pub fn parse_permission_mode(mode: &str, directory: bool) -> Result<u32, String> {
+    let digits = mode.strip_prefix("0o").unwrap_or(mode);
+    let bits = u32::from_str_radix(digits, 8)
+        .map_err(|_| format!("invalid octal permission mode '{mode}'"))?;
+    if bits > 0o777 {
+        return Err(format!(
+            "permission mode '{mode}' carries bits outside the permission range"
+        ));
+    }
+    let required = if directory { 0o700 } else { 0o600 };
+    if bits & required != required {
+        return Err(format!(
+            "permission mode '{mode}' denies the owner access that \
+             synchronization itself requires (at least {required:03o})"
+        ));
+    }
+    Ok(bits)
 }
 
 /// Parses a synchronization mode name.
@@ -775,6 +873,68 @@ mod tests {
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(error.contains("invalid ignore pattern"), "{error}");
         assert!(error.contains("unknown mode"), "{error}");
+    }
+
+    #[test]
+    fn symlink_and_permission_modes_resolve_through_defaults() {
+        let config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-safe"
+            symlink_mode = "portable"
+            file_mode = "0644"
+            directory_mode = "0755"
+
+            [groups.inherits]
+            alpha = "/a"
+            betas = ["host"]
+
+            [groups.overrides]
+            alpha = "/b"
+            symlink_mode = "ignore"
+            file_mode = "600"
+            betas = ["host"]
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(plans[0].symlink_mode, SymlinkMode::Portable);
+        assert_eq!(plans[0].file_mode, Some(0o644));
+        assert_eq!(plans[0].directory_mode, Some(0o755));
+        assert_eq!(plans[1].symlink_mode, SymlinkMode::Ignore);
+        assert_eq!(plans[1].file_mode, Some(0o600));
+        assert_eq!(plans[1].directory_mode, Some(0o755));
+
+        // Invalid values are aggregated with the other errors.
+        let config = parse(
+            r#"
+            [groups.x]
+            alpha = "/a"
+            mode = "two-way-safe"
+            symlink_mode = "follow"
+            file_mode = "0444"
+            directory_mode = "banana"
+            betas = ["host"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(error.contains("unknown symlink mode 'follow'"), "{error}");
+        assert!(error.contains("denies the owner access"), "{error}");
+        assert!(
+            error.contains("invalid octal permission mode 'banana'"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn permission_mode_parsing() {
+        assert_eq!(parse_permission_mode("0644", false).unwrap(), 0o644);
+        assert_eq!(parse_permission_mode("600", false).unwrap(), 0o600);
+        assert_eq!(parse_permission_mode("0o755", true).unwrap(), 0o755);
+        // Bits beyond the permission range are rejected.
+        assert!(parse_permission_mode("7777", false).is_err());
+        // The owner must keep working access.
+        assert!(parse_permission_mode("0444", false).is_err());
+        assert!(parse_permission_mode("0600", true).is_err());
     }
 
     #[test]

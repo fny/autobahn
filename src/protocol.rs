@@ -32,6 +32,8 @@ pub struct Handshake {
 }
 
 /// The initialization request sent by the controller after the handshake.
+/// Policy travels with it so both endpoints of a session always operate
+/// under identical rules.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Initialize {
     /// The synchronization root path on the agent's filesystem.
@@ -40,6 +42,14 @@ pub struct Initialize {
     pub session: String,
     /// Ignore patterns for scanning.
     pub ignores: Vec<String>,
+    /// The treatment of symbolic links.
+    pub symlink_mode: crate::scan::SymlinkMode,
+    /// The permission bits for created non-executable files (`None` for the
+    /// agent's default).
+    pub file_mode: Option<u32>,
+    /// The permission bits for created directories (`None` for the agent's
+    /// default).
+    pub directory_mode: Option<u32>,
 }
 
 /// A request from the controller to the agent.

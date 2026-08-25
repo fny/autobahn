@@ -23,7 +23,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
-use crate::endpoint::local::LocalEndpoint;
+use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::protocol::{self, Handshake, Initialize, Request, Response};
 use crate::scan::IgnoreSet;
@@ -270,12 +270,17 @@ fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
         .join(".autobahn")
         .join("staging")
         .join(&initialize.session);
-    let ignores = IgnoreSet::new(&initialize.ignores).context("unable to compile ignores")?;
+    let options = EndpointOptions {
+        ignores: IgnoreSet::new(&initialize.ignores).context("unable to compile ignores")?,
+        symlink_mode: initialize.symlink_mode,
+        file_mode: initialize.file_mode,
+        directory_mode: initialize.directory_mode,
+    };
     // Expand a home-relative root against this agent's home directory, so
     // that a configuration like `alpha = "~/project"` fanned out to several
     // hosts lands in each host's own home rather than a literal `~`.
     let root = crate::paths::expand_tilde(&initialize.root)?;
-    LocalEndpoint::new(root, staging_root, ignores)
+    LocalEndpoint::new(root, staging_root, options)
         .with_context(|| format!("unable to create an endpoint for {}", initialize.root))
 }
 

@@ -12,10 +12,11 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
-use autobahn::endpoint::local::LocalEndpoint;
+use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
 use autobahn::endpoint::remote::RemoteEndpoint;
 use autobahn::endpoint::Endpoint;
-use autobahn::scan::IgnoreSet;
+use autobahn::protocol::Initialize;
+use autobahn::scan::{IgnoreSet, SymlinkMode};
 use autobahn::session::{CycleReport, SafetyHalt, Session};
 use autobahn::transport::Connection;
 use autobahn::tree::SyncMode;
@@ -74,7 +75,10 @@ impl Harness {
             LocalEndpoint::new(
                 self.alpha.clone(),
                 self.state.join("staging-alpha"),
-                IgnoreSet::new(&self.ignores)?,
+                EndpointOptions {
+                    ignores: IgnoreSet::new(&self.ignores)?,
+                    ..EndpointOptions::default()
+                },
             )
             .expect("alpha endpoint"),
         );
@@ -83,7 +87,10 @@ impl Harness {
                 LocalEndpoint::new(
                     self.beta.clone(),
                     self.state.join("staging-beta"),
-                    IgnoreSet::new(&self.ignores)?,
+                    EndpointOptions {
+                        ignores: IgnoreSet::new(&self.ignores)?,
+                        ..EndpointOptions::default()
+                    },
                 )
                 .expect("beta endpoint"),
             ),
@@ -94,13 +101,18 @@ impl Harness {
                 Box::new(
                     RemoteEndpoint::connect(
                         connection,
-                        self.beta.to_string_lossy().into_owned(),
-                        format!(
-                            "e2e-{}-{}",
-                            self.state.to_string_lossy().len(),
-                            blake3::hash(self.state.to_string_lossy().as_bytes()).to_hex()
-                        ),
-                        self.ignores.clone(),
+                        Initialize {
+                            root: self.beta.to_string_lossy().into_owned(),
+                            session: format!(
+                                "e2e-{}-{}",
+                                self.state.to_string_lossy().len(),
+                                blake3::hash(self.state.to_string_lossy().as_bytes()).to_hex()
+                            ),
+                            ignores: self.ignores.clone(),
+                            symlink_mode: SymlinkMode::Raw,
+                            file_mode: None,
+                            directory_mode: None,
+                        },
                     )
                     .expect("connect agent"),
                 )

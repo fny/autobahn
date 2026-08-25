@@ -7,11 +7,12 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use autobahn::config::Config;
-use autobahn::endpoint::local::LocalEndpoint;
+use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
 use autobahn::endpoint::remote::RemoteEndpoint;
 use autobahn::endpoint::Endpoint;
 use autobahn::paths;
-use autobahn::scan::IgnoreSet;
+use autobahn::protocol::Initialize;
+use autobahn::scan::{IgnoreSet, SymlinkMode};
 use autobahn::session::{session_identifier, CycleReport, Session};
 use autobahn::supervisor::{read_status, SessionStatus, Supervisor};
 use autobahn::transport::{serve_agent, Connection};
@@ -49,6 +50,27 @@ impl From<ModeArgument> for SyncMode {
     }
 }
 
+/// The symbolic link mode, as expressed on the command line.
+#[derive(Clone, Copy, ValueEnum)]
+enum SymlinkModeArgument {
+    /// Symbolic links are invisible to synchronization.
+    Ignore,
+    /// Only portable symbolic links (relative, within the root) synchronize.
+    Portable,
+    /// Symbolic links synchronize verbatim.
+    Raw,
+}
+
+impl From<SymlinkModeArgument> for SymlinkMode {
+    fn from(argument: SymlinkModeArgument) -> SymlinkMode {
+        match argument {
+            SymlinkModeArgument::Ignore => SymlinkMode::Ignore,
+            SymlinkModeArgument::Portable => SymlinkMode::Portable,
+            SymlinkModeArgument::Raw => SymlinkMode::Raw,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Command {
     /// Synchronize two roots: a local alpha and a local or remote beta.
@@ -67,6 +89,15 @@ enum Command {
         /// Ignore patterns (gitignore-style; repeatable).
         #[arg(long = "ignore")]
         ignores: Vec<String>,
+        /// Symbolic link handling: ignore, portable, or raw.
+        #[arg(long, value_enum, default_value = "raw")]
+        symlink_mode: SymlinkModeArgument,
+        /// Permission bits (octal) for created files (default 0600).
+        #[arg(long)]
+        file_mode: Option<String>,
+        /// Permission bits (octal) for created directories (default 0700).
+        #[arg(long)]
+        directory_mode: Option<String>,
         /// Keep running, synchronizing whenever content changes.
         #[arg(long)]
         watch: bool,
@@ -145,13 +176,18 @@ fn main() {
             beta,
             mode,
             ignores,
+            symlink_mode,
+            file_mode,
+            directory_mode,
             watch,
             interval,
             state_dir,
             beta_agent,
-        } => run_sync(
-            alpha, beta, mode, ignores, watch, interval, state_dir, beta_agent,
-        ),
+        } => parse_policy(symlink_mode, file_mode, directory_mode).and_then(|policy| {
+            run_sync(
+                alpha, beta, mode, ignores, policy, watch, interval, state_dir, beta_agent,
+            )
+        }),
     };
     if let Err(error) = result {
         eprintln!("autobahn: {error:#}");
@@ -172,12 +208,44 @@ fn parse_remote(beta: &str) -> Option<(&str, &str)> {
     Some((&beta[..colon], &beta[colon + 1..]))
 }
 
+/// The endpoint policy assembled from command-line arguments.
+#[derive(Clone, Copy)]
+struct Policy {
+    /// The symbolic link treatment.
+    symlink_mode: SymlinkMode,
+    /// The permission bits for created files, if overridden.
+    file_mode: Option<u32>,
+    /// The permission bits for created directories, if overridden.
+    directory_mode: Option<u32>,
+}
+
+/// Parses the policy arguments of the sync command.
+fn parse_policy(
+    symlink_mode: SymlinkModeArgument,
+    file_mode: Option<String>,
+    directory_mode: Option<String>,
+) -> Result<Policy> {
+    let parse = |mode: Option<String>, directory: bool| -> Result<Option<u32>> {
+        mode.map(|mode| {
+            autobahn::config::parse_permission_mode(&mode, directory)
+                .map_err(|message| anyhow::anyhow!(message))
+        })
+        .transpose()
+    };
+    Ok(Policy {
+        symlink_mode: symlink_mode.into(),
+        file_mode: parse(file_mode, false)?,
+        directory_mode: parse(directory_mode, true)?,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_sync(
     alpha: String,
     beta: String,
     mode: ModeArgument,
     ignores: Vec<String>,
+    policy: Policy,
     watch: bool,
     interval: u64,
     state_dir: Option<PathBuf>,
@@ -209,11 +277,26 @@ fn run_sync(
     };
 
     // Construct the alpha endpoint.
-    let ignore_set = IgnoreSet::new(&ignores)?;
+    let options = || -> Result<EndpointOptions> {
+        Ok(EndpointOptions {
+            ignores: IgnoreSet::new(&ignores)?,
+            symlink_mode: policy.symlink_mode,
+            file_mode: policy.file_mode,
+            directory_mode: policy.directory_mode,
+        })
+    };
+    let initialize = |root: String| Initialize {
+        root,
+        session: identifier.clone(),
+        ignores: ignores.clone(),
+        symlink_mode: policy.symlink_mode,
+        file_mode: policy.file_mode,
+        directory_mode: policy.directory_mode,
+    };
     let alpha_endpoint: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
         alpha_canonical,
         state_directory.join("staging-alpha"),
-        ignore_set,
+        options()?,
     )?);
 
     // Construct the beta endpoint: an agent connection (SSH or explicit
@@ -226,18 +309,14 @@ fn run_sync(
         let connection = Connection::spawn(&argv)?;
         Box::new(RemoteEndpoint::connect(
             connection,
-            beta.clone(),
-            identifier.clone(),
-            ignores.clone(),
+            initialize(beta.clone()),
         )?)
     } else if let Some((host, path)) = parse_remote(&beta) {
         let argv = Connection::ssh_argv(host, None);
         let connection = Connection::spawn(&argv)?;
         Box::new(RemoteEndpoint::connect(
             connection,
-            path.to_owned(),
-            identifier.clone(),
-            ignores.clone(),
+            initialize(path.to_owned()),
         )?)
     } else {
         let beta_root = PathBuf::from(&beta)
@@ -246,7 +325,7 @@ fn run_sync(
         Box::new(LocalEndpoint::new(
             beta_root,
             state_directory.join("staging-beta"),
-            IgnoreSet::new(&ignores)?,
+            options()?,
         )?)
     };
 

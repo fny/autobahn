@@ -23,7 +23,7 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{mode_name, BetaTarget, SessionPlan};
-use crate::endpoint::local::LocalEndpoint;
+use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::remote::RemoteEndpoint;
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
@@ -395,6 +395,14 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
     // on the network, and has remote side effects.
     let lock = SessionLock::acquire(state_directory.clone())?;
 
+    let options = || -> Result<EndpointOptions> {
+        Ok(EndpointOptions {
+            ignores: IgnoreSet::new(&plan.ignores)?,
+            symlink_mode: plan.symlink_mode,
+            file_mode: plan.file_mode,
+            directory_mode: plan.directory_mode,
+        })
+    };
     let alpha_root = plan
         .alpha
         .canonicalize()
@@ -402,14 +410,14 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
     let alpha: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
         alpha_root,
         state_directory.join("staging-alpha"),
-        IgnoreSet::new(&plan.ignores)?,
+        options()?,
     )?);
 
     let beta: Box<dyn Endpoint + Send> = match &plan.beta {
         BetaTarget::Local(path) => Box::new(LocalEndpoint::new(
             path.clone(),
             state_directory.join("staging-beta"),
-            IgnoreSet::new(&plan.ignores)?,
+            options()?,
         )?),
         BetaTarget::Remote {
             destination,
@@ -423,9 +431,14 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
             let connection = Connection::spawn(&argv)?;
             Box::new(RemoteEndpoint::connect(
                 connection,
-                path.clone(),
-                identifier.clone(),
-                plan.ignores.clone(),
+                crate::protocol::Initialize {
+                    root: path.clone(),
+                    session: identifier.clone(),
+                    ignores: plan.ignores.clone(),
+                    symlink_mode: plan.symlink_mode,
+                    file_mode: plan.file_mode,
+                    directory_mode: plan.directory_mode,
+                },
             )?)
         }
     };

@@ -34,6 +34,49 @@ const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 /// The suffix appended to the lossy rendering of a non-UTF-8 entry name.
 const NON_UTF8_SUFFIX: &str = " (non-UTF-8)";
 
+/// The treatment of symbolic links during scanning and transitioning.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SymlinkMode {
+    /// Symbolic links are invisible: never scanned, never propagated.
+    Ignore,
+    /// Symbolic links are synchronized only when their targets are portable:
+    /// relative, colon-free, and confined to the synchronization root. A
+    /// link that fails validation is recorded as problematic content.
+    Portable,
+    /// Symbolic links are synchronized verbatim, targets untouched and
+    /// unvalidated (POSIX raw).
+    #[default]
+    Raw,
+}
+
+/// Validates a symbolic link target under [`SymlinkMode::Portable`]: it must
+/// be relative, free of colons (which denote drive letters or stream names
+/// on the platforms portability targets), and must resolve within the
+/// synchronization root from the link's location (`path`, root-relative).
+pub fn validate_portable_target(path: &str, target: &str) -> Result<(), String> {
+    if target.starts_with('/') {
+        return Err("target is absolute".into());
+    }
+    if target.contains(':') {
+        return Err("target contains a colon".into());
+    }
+    // The link's containing directory sits this many levels below the root.
+    let mut depth = path.split('/').count().saturating_sub(1);
+    for component in target.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if depth == 0 {
+                    return Err("target escapes the synchronization root".into());
+                }
+                depth -= 1;
+            }
+            _ => depth += 1,
+        }
+    }
+    Ok(())
+}
+
 /// Scans the filesystem hierarchy at `root`, producing a snapshot.
 ///
 /// A `baseline` (typically the previous scan's snapshot) accelerates the
@@ -52,6 +95,7 @@ pub fn scan(
     baseline: Option<&Snapshot>,
     ignores: &IgnoreSet,
     behavior: &FilesystemBehavior,
+    symlink_mode: SymlinkMode,
 ) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
@@ -74,7 +118,7 @@ pub fn scan(
         bail!("synchronization root {} is not a directory", root.display());
     }
 
-    let mut scanner = Scanner::new(ignores, behavior);
+    let mut scanner = Scanner::new(ignores, behavior, symlink_mode);
     let content = scanner.scan_directory(root, "", baseline.and_then(|s| s.root.as_ref()));
     Ok(Snapshot {
         root: Some(Node {
@@ -96,6 +140,8 @@ struct Scanner<'a> {
     ignores: &'a IgnoreSet,
     /// The behavior of the filesystem being scanned.
     behavior: &'a FilesystemBehavior,
+    /// The treatment of symbolic links.
+    symlink_mode: SymlinkMode,
     /// The digest streaming buffer, allocated once per scan.
     buffer: Vec<u8>,
     /// The number of synchronizable directories scanned.
@@ -110,10 +156,15 @@ struct Scanner<'a> {
 
 impl<'a> Scanner<'a> {
     /// Creates a scanner applying the specified ignore set.
-    fn new(ignores: &'a IgnoreSet, behavior: &'a FilesystemBehavior) -> Scanner<'a> {
+    fn new(
+        ignores: &'a IgnoreSet,
+        behavior: &'a FilesystemBehavior,
+        symlink_mode: SymlinkMode,
+    ) -> Scanner<'a> {
         Scanner {
             ignores,
             behavior,
+            symlink_mode,
             buffer: vec![0u8; DIGEST_BUFFER_SIZE],
             directories: 0,
             files: 0,
@@ -206,7 +257,7 @@ impl<'a> Scanner<'a> {
             } else if file_type.is_file() {
                 self.scan_file(&entry_path, &metadata, baseline_child)
             } else if file_type.is_symlink() {
-                self.scan_symlink(&entry_path)
+                self.scan_symlink(&entry_path, &child_path)
             } else {
                 // Sockets, FIFOs, and device nodes have no portable
                 // representation and aren't synchronized.
@@ -310,19 +361,30 @@ impl<'a> Scanner<'a> {
         Ok((*hasher.finalize().as_bytes(), read))
     }
 
-    /// Scans the symbolic link at `disk_path`.
-    fn scan_symlink(&mut self, disk_path: &Path) -> Content {
+    /// Scans the symbolic link at `disk_path` (root-relative path `path`).
+    fn scan_symlink(&mut self, disk_path: &Path, path: &str) -> Content {
+        // Ignored symbolic links are invisible, exactly like unsupported
+        // filesystem types.
+        if self.symlink_mode == SymlinkMode::Ignore {
+            return Content::Untracked;
+        }
         let target = match fs::read_link(disk_path) {
             Ok(target) => target,
             Err(error) => return problematic(format!("unable to read symbolic link: {error}")),
         };
-        // Targets are opaque strings: they're recorded exactly as stored, with
-        // no normalization, resolution, or portability rewriting.
+        // Targets are opaque strings: they're recorded exactly as stored,
+        // with no normalization, resolution, or rewriting. Portable mode
+        // additionally *validates* (but never modifies) them.
         let Some(target) = target.to_str() else {
             return problematic("non-UTF-8 symbolic link target");
         };
         if target.is_empty() {
             return problematic("empty symbolic link target");
+        }
+        if self.symlink_mode == SymlinkMode::Portable {
+            if let Err(message) = validate_portable_target(path, target) {
+                return problematic(format!("symbolic link target is not portable: {message}"));
+            }
         }
         self.symlinks += 1;
         Content::Symlink {
@@ -481,8 +543,72 @@ mod tests {
             baseline,
             &ignores(&["excluded/"]),
             &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .expect("scan should succeed")
+    }
+
+    #[test]
+    fn symlink_modes_govern_scanning() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "file.txt", "content");
+        symlink("file.txt", root.join("relative")).expect("symlink should be creatable");
+        symlink("/etc/passwd", root.join("absolute")).expect("symlink should be creatable");
+        symlink("../escape", root.join("escaping")).expect("symlink should be creatable");
+
+        let scan_with = |mode: SymlinkMode| {
+            scan(
+                root,
+                None,
+                &ignores(&[]),
+                &FilesystemBehavior::default(),
+                mode,
+            )
+            .expect("scan should succeed")
+        };
+
+        // Raw records everything verbatim.
+        let snapshot = scan_with(SymlinkMode::Raw);
+        assert_eq!(snapshot.symlinks, 3);
+
+        // Ignore makes symbolic links invisible (untracked).
+        let snapshot = scan_with(SymlinkMode::Ignore);
+        assert_eq!(snapshot.symlinks, 0);
+        let root_node = snapshot.root.as_ref().expect("root should exist");
+        assert!(matches!(
+            root_node.child("relative").expect("recorded").content,
+            Content::Untracked
+        ));
+
+        // Portable records only validated targets; the rest are problems.
+        let snapshot = scan_with(SymlinkMode::Portable);
+        assert_eq!(snapshot.symlinks, 1);
+        let root_node = snapshot.root.as_ref().expect("root should exist");
+        assert!(matches!(
+            root_node.child("relative").expect("recorded").content,
+            Content::Symlink { .. }
+        ));
+        for name in ["absolute", "escaping"] {
+            assert!(
+                matches!(
+                    root_node.child(name).expect("recorded").content,
+                    Content::Problematic { .. }
+                ),
+                "{name} should be problematic"
+            );
+        }
+    }
+
+    #[test]
+    fn portable_target_validation() {
+        assert!(validate_portable_target("link", "sibling.txt").is_ok());
+        assert!(validate_portable_target("dir/link", "../top.txt").is_ok());
+        assert!(validate_portable_target("dir/link", "sub/./inner").is_ok());
+        assert!(validate_portable_target("link", "/absolute").is_err());
+        assert!(validate_portable_target("link", "../escapes").is_err());
+        assert!(validate_portable_target("dir/link", "../../escapes").is_err());
+        assert!(validate_portable_target("link", "c:drive").is_err());
     }
 
     #[test]
@@ -495,8 +621,14 @@ mod tests {
             decomposes_unicode: true,
             ..FilesystemBehavior::default()
         };
-        let snapshot =
-            scan(directory.path(), None, &ignores(&[]), &behavior).expect("scan should succeed");
+        let snapshot = scan(
+            directory.path(),
+            None,
+            &ignores(&[]),
+            &behavior,
+            SymlinkMode::default(),
+        )
+        .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
         assert!(root.child("caf\u{00E9}.txt").is_some(), "{root:?}");
         assert!(root.child("cafe\u{0301}.txt").is_none());
@@ -507,6 +639,7 @@ mod tests {
             None,
             &ignores(&[]),
             &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -521,6 +654,7 @@ mod tests {
             None,
             &ignores(&[]),
             &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .expect("a missing root is not an error");
         assert!(snapshot.root.is_none());
@@ -539,7 +673,8 @@ mod tests {
             &directory.path().join("file.txt"),
             None,
             &ignores(&[]),
-            &FilesystemBehavior::default()
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .is_err());
     }
@@ -723,6 +858,7 @@ mod tests {
             None,
             &ignores(&[]),
             &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -754,6 +890,7 @@ mod tests {
             None,
             &ignores(&[]),
             &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -781,8 +918,14 @@ mod tests {
         write(root_path, "vendor/keep.txt", "keep");
         write(root_path, "src/main.rs", "fn main() {}");
         let set = ignores(&["vendor", "!vendor/keep.txt"]);
-        let snapshot = scan(root_path, None, &set, &FilesystemBehavior::default())
-            .expect("scan should succeed");
+        let snapshot = scan(
+            root_path,
+            None,
+            &set,
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+        )
+        .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
 
         let vendor = child(root, "vendor");
@@ -805,6 +948,7 @@ mod tests {
             None,
             &ignores(&[]),
             &FilesystemBehavior::default(),
+            SymlinkMode::default(),
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");

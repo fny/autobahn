@@ -29,13 +29,8 @@ pub struct RemoteEndpoint {
 impl RemoteEndpoint {
     /// Establishes a remote endpoint over the provided connection:
     /// exchanges handshakes (enforcing version equality) and initializes
-    /// the agent with the root, session identifier, and ignore patterns.
-    pub fn connect(
-        connection: Connection,
-        root: String,
-        session: String,
-        ignores: Vec<String>,
-    ) -> Result<RemoteEndpoint> {
+    /// the agent with the session's root and policy.
+    pub fn connect(connection: Connection, initialize: Initialize) -> Result<RemoteEndpoint> {
         let mut connection = connection;
 
         // Exchange handshakes. Ours goes out first (the agent does the same),
@@ -50,11 +45,7 @@ impl RemoteEndpoint {
 
         // Initialize the agent's endpoint.
         connection
-            .send(&Initialize {
-                root,
-                session,
-                ignores,
-            })
+            .send(&initialize)
             .context("unable to send initialization")?;
         let response: Response = connection
             .receive()
@@ -196,6 +187,18 @@ mod tests {
     use crate::protocol;
     use crate::transport::tests::connected_pair;
 
+    /// Builds a test initialization for the specified root.
+    fn initialize(root: &str) -> Initialize {
+        Initialize {
+            root: root.into(),
+            session: "session-1".into(),
+            ignores: vec!["*.tmp".into()],
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+        }
+    }
+
     /// Runs a scripted agent over one end of a connected pair: the handshake
     /// and initialization, then one canned response per request, in order.
     /// This exercises the protocol without a `LocalEndpoint` (or a process).
@@ -234,13 +237,8 @@ mod tests {
             ],
         );
 
-        let mut endpoint = RemoteEndpoint::connect(
-            client,
-            "/home/user/project".into(),
-            "session-1".into(),
-            vec!["*.tmp".into()],
-        )
-        .expect("unable to connect");
+        let mut endpoint = RemoteEndpoint::connect(client, initialize("/home/user/project"))
+            .expect("unable to connect");
 
         // A successful exchange.
         let snapshot = endpoint.scan().expect("unable to scan");
@@ -287,7 +285,7 @@ mod tests {
             Ok(())
         });
 
-        let error = RemoteEndpoint::connect(client, "/root".into(), "session-1".into(), Vec::new())
+        let error = RemoteEndpoint::connect(client, initialize("/root"))
             .err()
             .expect("expected a version rejection");
         let message = format!("{error:#}");
@@ -313,10 +311,9 @@ mod tests {
             Ok(())
         });
 
-        let error =
-            RemoteEndpoint::connect(client, "/missing".into(), "session-1".into(), Vec::new())
-                .err()
-                .expect("expected an initialization failure");
+        let error = RemoteEndpoint::connect(client, initialize("/missing"))
+            .err()
+            .expect("expected an initialization failure");
         assert!(
             format!("{error:#}").contains("remote error: no such directory"),
             "unexpected error: {error:#}"

@@ -35,7 +35,9 @@ use anyhow::{bail, Context, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
 use crate::rsync::{self, Signature};
-use crate::scan::{self, recompose, FilesystemBehavior, IgnoreSet};
+use crate::scan::{
+    self, recompose, validate_portable_target, FilesystemBehavior, IgnoreSet, SymlinkMode,
+};
 use crate::tree::{path_join, Change, Content, Digest, FileMetadata, Node, Problem, Snapshot};
 
 /// The name prefix shared by every temporary file this module creates. It
@@ -43,20 +45,34 @@ use crate::tree::{path_join, Change, Content, Digest, FileMetadata, Node, Proble
 /// the synchronization hierarchy no matter which directory they live in.
 const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 
-/// The permission bits applied to created directories.
-const DIRECTORY_MODE: u32 = 0o755;
+/// The default permission bits applied to created directories. The default
+/// is deliberately conservative (owner-only, matching Mutagen): synchronized
+/// trees frequently hold credentials, and a too-tight mode is an
+/// inconvenience while a too-loose one is an exposure.
+const DEFAULT_DIRECTORY_MODE: u32 = 0o700;
 
-/// The permission bits applied to created executable files.
-const EXECUTABLE_FILE_MODE: u32 = 0o755;
-
-/// The permission bits applied to created non-executable files.
-const FILE_MODE: u32 = 0o644;
+/// The default permission bits applied to created non-executable files.
+const DEFAULT_FILE_MODE: u32 = 0o600;
 
 /// The size of the buffer used to stream local staging copies.
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
 /// The counter that uniquifies temporary file names within a process.
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// The policy options governing a local endpoint's behavior.
+#[derive(Debug, Default)]
+pub struct EndpointOptions {
+    /// The ignore set applied to scans.
+    pub ignores: IgnoreSet,
+    /// The treatment of symbolic links.
+    pub symlink_mode: SymlinkMode,
+    /// The permission bits for created non-executable files (`None` for the
+    /// default).
+    pub file_mode: Option<u32>,
+    /// The permission bits for created directories (`None` for the default).
+    pub directory_mode: Option<u32>,
+}
 
 /// A local filesystem endpoint.
 pub struct LocalEndpoint {
@@ -66,6 +82,12 @@ pub struct LocalEndpoint {
     staging_root: PathBuf,
     /// The ignore set applied to scans.
     ignores: IgnoreSet,
+    /// The treatment of symbolic links.
+    symlink_mode: SymlinkMode,
+    /// The permission bits for created non-executable files.
+    file_mode: u32,
+    /// The permission bits for created directories.
+    directory_mode: u32,
     /// The probed behavior of the root's filesystem, determined at the
     /// first scan that finds the root present and cached for the endpoint's
     /// lifetime.
@@ -90,7 +112,11 @@ impl LocalEndpoint {
     /// The synchronization root itself is neither created nor required to
     /// exist: a missing root is a legitimate synchronization state (and one
     /// that a transition may resolve by creating it).
-    pub fn new(root: PathBuf, staging_root: PathBuf, ignores: IgnoreSet) -> Result<LocalEndpoint> {
+    pub fn new(
+        root: PathBuf,
+        staging_root: PathBuf,
+        options: EndpointOptions,
+    ) -> Result<LocalEndpoint> {
         fs::create_dir_all(&staging_root).with_context(|| {
             format!(
                 "unable to create staging directory {}",
@@ -100,7 +126,10 @@ impl LocalEndpoint {
         Ok(LocalEndpoint {
             root,
             staging_root,
-            ignores,
+            ignores: options.ignores,
+            symlink_mode: options.symlink_mode,
+            file_mode: options.file_mode.unwrap_or(DEFAULT_FILE_MODE) & 0o777,
+            directory_mode: options.directory_mode.unwrap_or(DEFAULT_DIRECTORY_MODE) & 0o777,
             behavior: None,
             last_snapshot: None,
             supply: None,
@@ -324,6 +353,7 @@ impl Endpoint for LocalEndpoint {
             self.last_snapshot.as_ref(),
             &self.ignores,
             &behavior,
+            self.symlink_mode,
         )
         .with_context(|| format!("unable to scan {}", self.root.display()))?;
         self.last_snapshot = Some(snapshot.clone());
@@ -450,6 +480,9 @@ impl Endpoint for LocalEndpoint {
             staging_root: &self.staging_root,
             scanned: self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()),
             behavior: self.behavior.unwrap_or_default(),
+            symlink_mode: self.symlink_mode,
+            file_mode: self.file_mode,
+            directory_mode: self.directory_mode,
             problems: Vec::new(),
             missing_staged_files: false,
         };
@@ -608,6 +641,12 @@ struct Transitioner<'a> {
     /// The behavior of the root's filesystem, governing how on-disk names
     /// are matched against the hierarchy's (NFC, case-exact) names.
     behavior: FilesystemBehavior,
+    /// The treatment of symbolic links.
+    symlink_mode: SymlinkMode,
+    /// The permission bits for created non-executable files.
+    file_mode: u32,
+    /// The permission bits for created directories.
+    directory_mode: u32,
     /// The problems accumulated so far.
     problems: Vec<Problem>,
     /// Whether or not any staged content was found missing.
@@ -769,7 +808,7 @@ impl Transitioner<'_> {
                     return None;
                 }
                 if let Err(error) =
-                    fs::set_permissions(&target, Permissions::from_mode(DIRECTORY_MODE))
+                    fs::set_permissions(&target, Permissions::from_mode(self.directory_mode))
                 {
                     // The directory exists and is usable; only its mode is
                     // off, so this is reported without abandoning its
@@ -796,6 +835,29 @@ impl Transitioner<'_> {
                 })
             }
             Content::Symlink { target: link } => {
+                // Symlink policy is enforced on creation as well as at scan
+                // time: content arriving from a peer must satisfy the same
+                // rules this endpoint's own scans would apply.
+                match self.symlink_mode {
+                    SymlinkMode::Ignore => {
+                        self.problem(
+                            path,
+                            "refusing to create a symbolic link: symbolic links are ignored \
+                             by configuration",
+                        );
+                        return None;
+                    }
+                    SymlinkMode::Portable => {
+                        if let Err(message) = validate_portable_target(path, link) {
+                            self.problem(
+                                path,
+                                format!("refusing to create a symbolic link: {message}"),
+                            );
+                            return None;
+                        }
+                    }
+                    SymlinkMode::Raw => {}
+                }
                 if let Err(error) = symlink(link, &target) {
                     self.problem(path, format!("unable to create symbolic link: {error}"));
                     return None;
@@ -879,11 +941,7 @@ impl Transitioner<'_> {
             self.problem(path, format!("unable to stage content into place: {error}"));
             return None;
         }
-        let mode = if executable {
-            EXECUTABLE_FILE_MODE
-        } else {
-            FILE_MODE
-        };
+        let mode = creation_mode(self.file_mode, executable);
         if let Err(error) = fs::set_permissions(&temporary, Permissions::from_mode(mode)) {
             let _ = fs::remove_file(&temporary);
             self.problem(path, format!("unable to set file permissions: {error}"));
@@ -1127,11 +1185,7 @@ impl Transitioner<'_> {
             if old_digest == new_digest {
                 // Only executability differs, so the content is left entirely
                 // alone: this is a permission change, not a rewrite.
-                let mode = if *executable {
-                    EXECUTABLE_FILE_MODE
-                } else {
-                    FILE_MODE
-                };
+                let mode = creation_mode(self.file_mode, *executable);
                 if let Err(error) = fs::set_permissions(&target, Permissions::from_mode(mode)) {
                     self.problem(path, format!("unable to set file permissions: {error}"));
                     return Some(old.clone());
@@ -1192,6 +1246,17 @@ impl Transitioner<'_> {
 /// path the ancestor simply doesn't describe, rather than to a failed cycle.
 fn sanitize(result: Option<Node>) -> Option<Node> {
     result.as_ref().and_then(Node::synchronizable_subtree)
+}
+
+/// Computes the permission bits for a created file: the configured file
+/// mode, with executability granted (where readability already is) for
+/// executable files.
+fn creation_mode(file_mode: u32, executable: bool) -> u32 {
+    if executable {
+        file_mode | ((file_mode & 0o444) >> 2)
+    } else {
+        file_mode
+    }
 }
 
 /// Returns the staging path for content with the specified digest.
@@ -1389,7 +1454,7 @@ mod tests {
         LocalEndpoint::new(
             root.to_path_buf(),
             staging.to_path_buf(),
-            IgnoreSet::new(&[]).expect("the empty ignore set should compile"),
+            EndpointOptions::default(),
         )
         .expect("endpoint should be creatable")
     }
@@ -2038,6 +2103,115 @@ mod tests {
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert_eq!(read(&fixture.beta_root, "entry"), "now a file");
+    }
+
+    #[test]
+    fn creation_modes_default_conservatively_and_are_configurable() {
+        // Defaults: 0600 files, 0700 directories, 0700 executables.
+        let mut fixture = Fixture::new();
+        write(&fixture.alpha_root, "dir/plain.txt", "content");
+        write(&fixture.alpha_root, "dir/tool.sh", "#!/bin/sh\n");
+        fs::set_permissions(
+            fixture.alpha_root.join("dir/tool.sh"),
+            Permissions::from_mode(0o755),
+        )
+        .expect("permissions should be settable");
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        let outcome = fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        let mode = |path: &str| {
+            fs::symlink_metadata(fixture.beta_root.join(path))
+                .expect("entry should exist")
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("dir"), 0o700);
+        assert_eq!(mode("dir/plain.txt"), 0o600);
+        assert_eq!(mode("dir/tool.sh"), 0o700);
+
+        // Configured modes: 0644/0755, with executability derived (0755).
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("beta");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        let mut beta = LocalEndpoint::new(
+            root.clone(),
+            keep.path().join("staging"),
+            EndpointOptions {
+                file_mode: Some(0o644),
+                directory_mode: Some(0o755),
+                ..EndpointOptions::default()
+            },
+        )
+        .expect("endpoint should be creatable");
+        beta.scan().expect("scan should succeed");
+        let digest = *blake3::hash(b"content").as_bytes();
+        fs::write(beta.staged_path(&digest), b"content").expect("staged content");
+        let outcome = beta
+            .transition(vec![Change {
+                path: "d".into(),
+                old: None,
+                new: Some(Node::directory(
+                    "d",
+                    vec![Node {
+                        name: "run.sh".into(),
+                        content: Content::File {
+                            digest,
+                            executable: true,
+                            metadata: FileMetadata::default(),
+                        },
+                    }],
+                )),
+            }])
+            .expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        let mode = |path: &str| {
+            fs::symlink_metadata(root.join(path))
+                .expect("entry should exist")
+                .mode()
+                & 0o777
+        };
+        assert_eq!(mode("d"), 0o755);
+        assert_eq!(mode("d/run.sh"), 0o755);
+    }
+
+    #[test]
+    fn symlink_policy_is_enforced_at_creation() {
+        let mut fixture = Fixture::new();
+        fixture.beta.symlink_mode = SymlinkMode::Portable;
+        fixture.beta.scan().expect("scan should succeed");
+        let link = |name: &str, target: &str| Change {
+            path: name.into(),
+            old: None,
+            new: Some(Node {
+                name: name.into(),
+                content: Content::Symlink {
+                    target: target.into(),
+                },
+            }),
+        };
+        let outcome = fixture
+            .beta
+            .transition(vec![link("good", "file.txt"), link("bad", "/etc/passwd")])
+            .expect("transition should succeed");
+        assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
+        assert!(outcome.problems[0].message.contains("absolute"));
+        assert!(fixture.beta_root.join("good").is_symlink());
+        assert!(!fixture.beta_root.join("bad").is_symlink());
+
+        // Ignore mode refuses symlink creation outright.
+        fixture.beta.symlink_mode = SymlinkMode::Ignore;
+        let outcome = fixture
+            .beta
+            .transition(vec![link("also-good", "file.txt")])
+            .expect("transition should succeed");
+        assert_eq!(outcome.problems.len(), 1);
+        assert!(outcome.problems[0]
+            .message
+            .contains("ignored by configuration"));
     }
 
     #[test]

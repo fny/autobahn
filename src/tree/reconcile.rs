@@ -33,7 +33,11 @@ struct Reconciler {
 /// Extracts the non-deletion changes (creations and modifications) from a
 /// change list.
 fn non_deletion_changes(changes: &[Change]) -> Vec<Change> {
-    changes.iter().filter(|c| c.new.is_some()).cloned().collect()
+    changes
+        .iter()
+        .filter(|c| c.new.is_some())
+        .cloned()
+        .collect()
 }
 
 /// Indicates whether or not optional content is nil-or-untracked.
@@ -59,7 +63,13 @@ fn shallow_equal(a: Option<&Node>, b: Option<&Node>) -> bool {
 }
 
 impl Reconciler {
-    fn reconcile(&mut self, path: &str, ancestor: Option<&Node>, alpha: Option<&Node>, beta: Option<&Node>) {
+    fn reconcile(
+        &mut self,
+        path: &str,
+        ancestor: Option<&Node>,
+        alpha: Option<&Node>,
+        beta: Option<&Node>,
+    ) {
         // If either side is purely problematic at this path, then there's
         // nothing safe to do here: the problem is already surfaced as a scan
         // problem.
@@ -107,7 +117,8 @@ impl Reconciler {
             let alpha_children = alpha.map(Node::children).unwrap_or(&[]);
             let beta_children = beta.map(Node::children).unwrap_or(&[]);
             let (mut i, mut j, mut k) = (0, 0, 0);
-            while i < ancestor_children.len() || j < alpha_children.len() || k < beta_children.len() {
+            while i < ancestor_children.len() || j < alpha_children.len() || k < beta_children.len()
+            {
                 // Determine the smallest name among the remaining children.
                 let mut name: Option<&str> = None;
                 for candidate in [
@@ -159,8 +170,12 @@ impl Reconciler {
             SyncMode::TwoWaySafe | SyncMode::TwoWayResolved => {
                 self.handle_disagreement_bidirectional(path, ancestor, alpha, beta)
             }
-            SyncMode::OneWaySafe => self.handle_disagreement_one_way_safe(path, ancestor, alpha, beta),
-            SyncMode::OneWayReplica => self.handle_disagreement_one_way_replica(path, ancestor, alpha, beta),
+            SyncMode::OneWaySafe => {
+                self.handle_disagreement_one_way_safe(path, ancestor, alpha, beta)
+            }
+            SyncMode::OneWayReplica => {
+                self.handle_disagreement_one_way_replica(path, ancestor, alpha, beta)
+            }
         }
     }
 
@@ -450,7 +465,12 @@ mod tests {
     #[test]
     fn identical_states_produce_no_operations() {
         let state = dir("", vec![file("a", 1, false)]);
-        let result = reconcile(Some(&state), Some(&state), Some(&state), SyncMode::TwoWaySafe);
+        let result = reconcile(
+            Some(&state),
+            Some(&state),
+            Some(&state),
+            SyncMode::TwoWaySafe,
+        );
         assert!(result.ancestor_changes.is_empty());
         assert!(result.alpha_transitions.is_empty());
         assert!(result.beta_transitions.is_empty());

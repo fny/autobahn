@@ -106,7 +106,8 @@ impl Harness {
                 )
             }
         };
-        let mut session = Session::new(alpha_endpoint, beta_endpoint, self.mode, self.state.clone())?;
+        let mut session =
+            Session::new(alpha_endpoint, beta_endpoint, self.mode, self.state.clone())?;
         session.run_cycle()
     }
 
@@ -206,7 +207,10 @@ fn initial_sync_and_alpha_propagation_all_modes_over_agent() {
 
         // A further cycle must be a no-op.
         let report = harness.cycle_ok();
-        assert!(!report.changed(), "steady state should be a no-op ({mode:?})");
+        assert!(
+            !report.changed(),
+            "steady state should be a no-op ({mode:?})"
+        );
     }
 }
 
@@ -241,8 +245,14 @@ fn beta_addition_semantics_by_mode() {
                 harness.assert_trees_equal("beta addition");
             }
             SyncMode::OneWaySafe => {
-                assert!(!alpha_added.exists(), "one-way-safe must not reverse-propagate");
-                assert!(beta_added.exists(), "one-way-safe must preserve beta additions");
+                assert!(
+                    !alpha_added.exists(),
+                    "one-way-safe must not reverse-propagate"
+                );
+                assert!(
+                    beta_added.exists(),
+                    "one-way-safe must preserve beta additions"
+                );
             }
             SyncMode::OneWayReplica => {
                 assert!(!beta_added.exists(), "replica must remove beta additions");
@@ -320,7 +330,10 @@ fn beta_deletion_semantics_by_mode() {
 
 #[test]
 fn divergent_edits_conflict_in_safe_mode_and_resolve_in_resolved_mode() {
-    for (mode, alpha_wins) in [(SyncMode::TwoWaySafe, false), (SyncMode::TwoWayResolved, true)] {
+    for (mode, alpha_wins) in [
+        (SyncMode::TwoWaySafe, false),
+        (SyncMode::TwoWayResolved, true),
+    ] {
         let mut harness = Harness::new(mode, Transport::Agent);
         build_tree(&harness.alpha);
         harness.cycle_ok();
@@ -348,11 +361,14 @@ fn divergent_edits_conflict_in_safe_mode_and_resolve_in_resolved_mode() {
 #[test]
 fn ignored_content_stays_local_to_each_side() {
     for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayReplica] {
-        let mut harness =
-            Harness::new(mode, Transport::Agent).with_ignores(&["scratch", "*.log"]);
+        let mut harness = Harness::new(mode, Transport::Agent).with_ignores(&["scratch", "*.log"]);
         build_tree(&harness.alpha);
         fs::create_dir_all(harness.alpha.join("scratch")).unwrap();
-        fs::write(harness.alpha.join("scratch/alpha-only.txt"), "alpha scratch").unwrap();
+        fs::write(
+            harness.alpha.join("scratch/alpha-only.txt"),
+            "alpha scratch",
+        )
+        .unwrap();
         fs::write(harness.alpha.join("dir0/debug.log"), "alpha log").unwrap();
         fs::create_dir_all(harness.beta.join("scratch")).unwrap();
         fs::write(harness.beta.join("scratch/beta-only.txt"), "beta scratch").unwrap();

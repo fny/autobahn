@@ -4,7 +4,12 @@ use super::{path_join, Change, Node};
 
 /// Recursively diffs two optional hierarchies, appending changes that would
 /// transform `base` into `target`.
-fn diff_recursive(path: &str, base: Option<&Node>, target: Option<&Node>, changes: &mut Vec<Change>) {
+fn diff_recursive(
+    path: &str,
+    base: Option<&Node>,
+    target: Option<&Node>,
+    changes: &mut Vec<Change>,
+) {
     // If the content at this path isn't (shallowly) equal, then record a
     // complete replacement.
     let equal = match (base, target) {
@@ -81,7 +86,14 @@ mod tests {
     #[test]
     fn diff_detects_changes() {
         let base = Node::directory("", vec![file("a", 1, false), file("b", 2, false)]);
-        let target = Node::directory("", vec![file("a", 1, false), file("b", 3, false), file("c", 4, false)]);
+        let target = Node::directory(
+            "",
+            vec![
+                file("a", 1, false),
+                file("b", 3, false),
+                file("c", 4, false),
+            ],
+        );
         let changes = diff(Some(&base), Some(&target));
         let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
         assert_eq!(paths, vec!["b", "c"]);

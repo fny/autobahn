@@ -17,6 +17,23 @@
 
 pub mod install;
 
+/// Sends one frame over an arbitrary writer (used by the control socket,
+/// which shares the agent protocol's framing).
+pub(crate) fn send_control_frame<W: Write, T: Serialize>(
+    writer: &mut W,
+    message: &T,
+) -> anyhow::Result<()> {
+    send_frame(writer, message)
+}
+
+/// Receives one frame from an arbitrary reader (the control-socket
+/// counterpart of [`send_control_frame`]).
+pub(crate) fn receive_control_frame<R: Read, T: serde::de::DeserializeOwned>(
+    reader: &mut R,
+) -> anyhow::Result<T> {
+    receive_frame(reader)
+}
+
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -275,6 +292,9 @@ pub fn serve_agent<R: Read, W: Write>(input: R, output: W) -> Result<()> {
             Request::Transition(transitions) => {
                 endpoint.transition(transitions).map(Response::Transition)
             }
+            Request::AwaitChanges(milliseconds) => endpoint
+                .await_change(std::time::Duration::from_millis(milliseconds))
+                .map(Response::AwaitChanges),
         };
         let response = result.unwrap_or_else(|error| Response::Error(format!("{error:#}")));
         send_frame(&mut output, &response).context("unable to send response")?;

@@ -97,6 +97,17 @@ fn wait_until(deadline: Duration, mut condition: impl FnMut() -> bool) -> bool {
     condition()
 }
 
+/// Stops a watch-mode supervisor when dropped, so that a panicking
+/// assertion inside a `thread::scope` unwinds past the (otherwise eternal)
+/// watcher thread instead of deadlocking the test against it.
+struct StopGuard<'a>(&'a AtomicBool);
+
+impl Drop for StopGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Asserts that every outcome succeeded.
 fn assert_all_synchronized(outcomes: &[SessionOutcome]) {
     for outcome in outcomes {
@@ -420,6 +431,7 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
         let supervisor = Supervisor::new(watch_plans, world.state_root(), false);
         let stop = &stop;
         let watcher = scope.spawn(move || supervisor.run_watch(stop));
+        let _guard = StopGuard(stop);
         assert!(
             wait_until(Duration::from_secs(15), || beta.join("file.txt").exists()),
             "the watcher should be running and synchronized"
@@ -530,6 +542,7 @@ fn watch_mode_synchronizes_continuously_until_stopped() {
         let supervisor = Supervisor::new(plans, world.state_root(), false);
         let stop = &stop;
         let watcher = scope.spawn(move || supervisor.run_watch(stop));
+        let _guard = StopGuard(stop);
 
         // The initial content propagates...
         assert!(
@@ -594,6 +607,7 @@ fn watch_mode_heals_after_a_destination_recovers() {
         let supervisor = Supervisor::new(plans, world.state_root(), false);
         let stop = &stop;
         let watcher = scope.spawn(move || supervisor.run_watch(stop));
+        let _guard = StopGuard(stop);
 
         // The failure is observed and recorded.
         assert!(
@@ -623,6 +637,153 @@ fn watch_mode_heals_after_a_destination_recovers() {
                     .is_some_and(|status| status.state == "synchronized")
             }),
             "the recovery should be recorded"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("the watcher should stop cleanly");
+    });
+}
+
+#[test]
+fn control_socket_pauses_resumes_and_resets_sessions() {
+    use autobahn::supervisor::control::{self, ControlRequest, ControlResponse, Selector};
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "first.txt", "first");
+
+    let mut plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        interval = 3600
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+    // The interval is effectively disabled: everything below must happen
+    // through change notifications and control requests.
+    plans[0].interval = Duration::from_secs(3600);
+    let plan = plans[0].clone();
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans, world.state_root(), false);
+        let stop_ref = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
+        let _guard = StopGuard(stop_ref);
+
+        // Startup synchronizes, and file changes propagate purely through
+        // watching (no heartbeat is coming for an hour).
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            "initial content should synchronize"
+        );
+        write(&alpha, "second.txt", "second");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+            "a watched change should propagate without a heartbeat"
+        );
+
+        // Pause: the state records, and further changes stop propagating.
+        let selector = || Selector {
+            group: Some("work".into()),
+            host: None,
+        };
+        let response = control::send(&world.state_root(), &ControlRequest::Pause(selector()))
+            .expect("pause should send");
+        assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                world
+                    .status(&plan)
+                    .is_some_and(|status| status.state == "paused")
+            }),
+            "the pause should be recorded"
+        );
+        // Delete a synchronized file on alpha while paused; nothing moves.
+        fs::remove_file(alpha.join("second.txt")).expect("file should be removable");
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(
+            beta.join("second.txt").exists(),
+            "paused sessions must not sync"
+        );
+
+        // Reset while paused, then resume: with the ancestor discarded, the
+        // deletion is forgotten and beta's copy flows back to alpha.
+        let response = control::send(&world.state_root(), &ControlRequest::Reset(selector()))
+            .expect("reset should send");
+        assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
+        let response = control::send(&world.state_root(), &ControlRequest::Resume(selector()))
+            .expect("resume should send");
+        assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
+        assert!(
+            wait_until(Duration::from_secs(15), || alpha
+                .join("second.txt")
+                .exists()),
+            "after a reset, the deletion is forgotten and content merges back"
+        );
+
+        // A selector matching nothing is an error, not a silent no-op.
+        let response = control::send(
+            &world.state_root(),
+            &ControlRequest::Flush(Selector {
+                group: Some("absent".into()),
+                host: None,
+            }),
+        )
+        .expect("the request should send");
+        assert!(matches!(response, ControlResponse::Error(_)));
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("the watcher should stop cleanly");
+    });
+}
+
+#[test]
+fn watch_mode_observes_remote_changes_through_the_agent() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let remote = world.directory("remote-mirror");
+    write(&alpha, "seed.txt", "seed");
+
+    let mut plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        agent_command = "{agent} agent"
+        betas = ["fake-host:{remote}"]
+        "#,
+        alpha = alpha.display(),
+        agent = agent_binary(),
+        remote = remote.display(),
+    ));
+    // No heartbeat within the test window: propagation must ride the
+    // agent-side watcher through the AwaitChanges protocol.
+    plans[0].interval = Duration::from_secs(3600);
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans, world.state_root(), false);
+        let stop_ref = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
+        let _guard = StopGuard(stop_ref);
+
+        assert!(
+            wait_until(Duration::from_secs(15), || remote.join("seed.txt").exists()),
+            "initial content should synchronize"
+        );
+        // A change on the *remote* side propagates back without a heartbeat.
+        write(&remote, "from-remote.txt", "remote change");
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                alpha.join("from-remote.txt").exists()
+            }),
+            "remote changes should be observed through the agent"
         );
 
         stop.store(true, Ordering::Relaxed);

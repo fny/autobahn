@@ -14,9 +14,12 @@
 //! can be inspected from any process, whether or not a supervisor is
 //! currently running.
 
+pub mod control;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -55,8 +58,8 @@ pub struct SessionStatus {
     pub beta: String,
     /// The synchronization mode name.
     pub mode: String,
-    /// The session state: `synchronized`, `conflicts`, `problems`, or
-    /// `error`.
+    /// The session state: `synchronized`, `conflicts`, `problems`,
+    /// `paused`, or `error`.
     pub state: String,
     /// The number of cycles completed since the supervisor started this
     /// session.
@@ -175,8 +178,37 @@ impl Supervisor {
     /// network can hold one; for the CLI, process termination remains the
     /// hard stop.
     pub fn run_watch(&self, stop: &AtomicBool) {
+        // Every session gets a control-flag block; the registry shares them
+        // with the control socket's server thread.
+        let controls: Vec<Arc<control::WorkerControl>> = self
+            .plans
+            .iter()
+            .map(|_| Arc::<control::WorkerControl>::default())
+            .collect();
+        let registry = control::Registry {
+            entries: self
+                .plans
+                .iter()
+                .zip(&controls)
+                .map(|(plan, flags)| (plan.group.clone(), plan.host.clone(), flags.clone()))
+                .collect(),
+        };
+        let listener = match control::bind(&self.state_root) {
+            Ok(listener) => Some(listener),
+            Err(error) => {
+                // Control is a convenience, not a prerequisite for syncing.
+                eprintln!("control socket unavailable: {error:#}");
+                None
+            }
+        };
+
         std::thread::scope(|scope| {
+            if let Some(listener) = listener {
+                let registry = &registry;
+                scope.spawn(move || control::serve(listener, registry, stop));
+            }
             for (index, plan) in self.plans.iter().enumerate() {
+                let flags = controls[index].clone();
                 scope.spawn(move || {
                     // Stagger the first attempts so a large fan-out doesn't
                     // open every connection in the same instant (bounded, so
@@ -192,25 +224,30 @@ impl Supervisor {
                     let identifier = plan.identifier();
                     let mut failures = 0u32;
                     while !stop.load(Ordering::Relaxed) {
+                        if flags.paused.load(Ordering::Relaxed) {
+                            worker.hold_paused(&flags, stop);
+                            continue;
+                        }
+                        if flags.reset.swap(false, Ordering::Relaxed) {
+                            worker.reset();
+                        }
                         let result = worker.attempt();
-                        let delay = match &result {
-                            Ok(_) => {
-                                failures = 0;
-                                plan.interval
-                            }
-                            Err(_) => {
-                                failures = failures.saturating_add(1);
-                                backoff_delay(
-                                    plan.interval,
-                                    failures,
-                                    jitter_percent(&identifier, failures),
-                                )
-                            }
-                        };
+                        let failed = result.is_err();
                         if let Err(error) = worker.conclude(&result) {
                             eprintln!("[{}] unable to record status: {error:#}", plan.display());
                         }
-                        sleep_interruptible(delay, stop);
+                        if failed {
+                            failures = failures.saturating_add(1);
+                            let delay = backoff_delay(
+                                plan.interval,
+                                failures,
+                                jitter_percent(&identifier, failures),
+                            );
+                            sleep_flagged(delay, stop, &flags);
+                        } else {
+                            failures = 0;
+                            worker.await_activity(plan.interval, stop, &flags);
+                        }
                     }
                 });
             }
@@ -276,6 +313,117 @@ impl<'a> Worker<'a> {
             self.session = None;
         }
         recorded
+    }
+
+    /// Waits for the next reason to cycle: a change signaled by either
+    /// endpoint, a control wake (flush/pause/resume/reset), the interval
+    /// heartbeat, or a stop request — whichever comes first. A change gets a
+    /// short settle delay so a burst of writes lands in one cycle.
+    fn await_activity(
+        &mut self,
+        interval: Duration,
+        stop: &AtomicBool,
+        flags: &control::WorkerControl,
+    ) {
+        const SETTLE: Duration = Duration::from_millis(100);
+        let deadline = std::time::Instant::now() + interval;
+        while !stop.load(Ordering::Relaxed) {
+            if flags.wake.swap(false, Ordering::Relaxed)
+                || flags.paused.load(Ordering::Relaxed)
+                || flags.reset.load(Ordering::Relaxed)
+            {
+                return;
+            }
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            let slice = remaining.min(Duration::from_millis(500));
+            match self.session.as_mut() {
+                Some(session) => match session.await_change(slice) {
+                    Ok(true) => {
+                        std::thread::sleep(SETTLE.min(interval));
+                        return;
+                    }
+                    Ok(false) => {}
+                    // The connection is failing; let the next attempt
+                    // surface (and heal) it.
+                    Err(_) => return,
+                },
+                None => std::thread::sleep(slice.min(STOP_POLL_INTERVAL)),
+            }
+        }
+    }
+
+    /// Holds the worker while its session is paused: the paused state is
+    /// recorded once, and the hold ends on resume (or any other control
+    /// wake) or stop.
+    fn hold_paused(&mut self, flags: &control::WorkerControl, stop: &AtomicBool) {
+        // Dropping the session releases its state lock and shuts down any
+        // agent — a paused session holds no resources and doesn't block
+        // other processes.
+        self.session = None;
+        self.record_state("paused");
+        if self.verbose {
+            println!("[{}] paused", self.plan.display());
+        }
+        while !stop.load(Ordering::Relaxed) && flags.paused.load(Ordering::Relaxed) {
+            std::thread::sleep(STOP_POLL_INTERVAL);
+        }
+    }
+
+    /// Performs a session reset: the ancestor is deleted (under the session
+    /// lock, briefly reacquired via a fresh connection on the next attempt),
+    /// so the next cycle reconciles with no baseline and merges both sides
+    /// additively.
+    fn reset(&mut self) {
+        // Release our own lock first so the deletion isn't racing ourselves.
+        self.session = None;
+        let ancestor = self
+            .state_root
+            .join("sessions")
+            .join(self.plan.identifier())
+            .join("ancestor");
+        if let Err(error) = std::fs::remove_file(&ancestor) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!(
+                    "[{}] unable to reset the ancestor: {error}",
+                    self.plan.display()
+                );
+                return;
+            }
+        }
+        if self.verbose {
+            println!(
+                "[{}] reset: the next cycle merges both sides additively",
+                self.plan.display()
+            );
+        }
+    }
+
+    /// Records a bare state (such as `paused`) to the status file.
+    fn record_state(&self, state: &str) {
+        let status = SessionStatus {
+            group: self.plan.group.clone(),
+            host: self.plan.host.clone(),
+            alpha: self.plan.alpha_spec.clone(),
+            beta: self.plan.beta_spec(),
+            mode: mode_name(self.plan.mode).to_owned(),
+            state: state.to_owned(),
+            cycles: self.cycles,
+            last_alpha_transitions: 0,
+            last_beta_transitions: 0,
+            conflicts: Vec::new(),
+            problems: Vec::new(),
+            error: None,
+            updated_at: epoch_seconds(),
+        };
+        if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
+            eprintln!(
+                "[{}] unable to record status: {error:#}",
+                self.plan.display()
+            );
+        }
     }
 
     /// Records an attempt's result to the session's status file (and, when
@@ -492,6 +640,22 @@ fn jitter_percent(identifier: &str, round: u32) -> u64 {
         })
         .rotate_left(17)
         % 25
+}
+
+/// Sleeps for the specified duration, waking early on stop or on any
+/// control wake (so a flush or pause lands promptly even during backoff).
+fn sleep_flagged(duration: Duration, stop: &AtomicBool, flags: &control::WorkerControl) {
+    let deadline = std::time::Instant::now() + duration;
+    while !stop.load(Ordering::Relaxed) {
+        if flags.wake.swap(false, Ordering::Relaxed) {
+            return;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return;
+        }
+        std::thread::sleep(remaining.min(STOP_POLL_INTERVAL));
+    }
 }
 
 /// Sleeps for the specified duration, waking early if `stop` becomes true.

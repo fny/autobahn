@@ -102,6 +102,37 @@ pub struct LocalEndpoint {
     ///
     /// [`stage_begin`]: Endpoint::stage_begin
     receive: Option<ReceiveState>,
+    /// The filesystem watcher, created lazily at the first
+    /// [`await_change`](Endpoint::await_change) that finds the root present.
+    watcher: Option<ChangeWatcher>,
+}
+
+/// A recursive filesystem watcher over the synchronization root, delivering
+/// events through a channel.
+struct ChangeWatcher {
+    /// The watcher itself, retained for its lifetime side effect.
+    _watcher: notify::RecommendedWatcher,
+    /// The event stream.
+    receiver: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+}
+
+impl ChangeWatcher {
+    /// Establishes a recursive watch over `root`.
+    fn new(root: &Path) -> Result<ChangeWatcher> {
+        use notify::Watcher;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let mut watcher = notify::recommended_watcher(move |event| {
+            let _ = sender.send(event);
+        })
+        .context("unable to create a filesystem watcher")?;
+        watcher
+            .watch(root, notify::RecursiveMode::Recursive)
+            .with_context(|| format!("unable to watch {}", root.display()))?;
+        Ok(ChangeWatcher {
+            _watcher: watcher,
+            receiver,
+        })
+    }
 }
 
 impl LocalEndpoint {
@@ -134,6 +165,7 @@ impl LocalEndpoint {
             last_snapshot: None,
             supply: None,
             receive: None,
+            watcher: None,
         })
     }
 
@@ -344,6 +376,17 @@ impl Endpoint for LocalEndpoint {
         }
         let behavior = self.behavior.unwrap_or_default();
 
+        // The watcher must exist *before* the scan, not lazily at the first
+        // await: a change landing between the scan and a later
+        // watcher creation would be invisible to
+        // [`await_change`](Endpoint::await_change), and a caller relying on
+        // change signals (rather than a tight heartbeat) would never learn
+        // of it. Established here, events queue from the moment the
+        // snapshot's view of the world is taken.
+        if self.watcher.is_none() {
+            self.watcher = ChangeWatcher::new(&self.root).ok();
+        }
+
         // The retained snapshot is the scanner's baseline, which is what
         // turns a rescan into a walk of what changed rather than a re-read of
         // everything. Cloning it is cheap: directory children are shared
@@ -467,6 +510,38 @@ impl Endpoint for LocalEndpoint {
         let result = self.push_frames(&mut state, frames);
         self.receive = Some(state);
         result
+    }
+
+    fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        // The watcher is established lazily (the root may not exist yet) and
+        // re-established after failures. A root that can't be watched
+        // degrades to waiting out the timeout — the caller's heartbeat still
+        // cycles, so watching failures cost latency, never correctness.
+        if self.watcher.is_none() {
+            match ChangeWatcher::new(&self.root) {
+                Ok(watcher) => self.watcher = Some(watcher),
+                Err(_) => {
+                    std::thread::sleep(timeout);
+                    return Ok(false);
+                }
+            }
+        }
+        let watcher = self.watcher.as_ref().expect("the watcher was just created");
+        match watcher.receiver.recv_timeout(timeout) {
+            Ok(_) => {
+                // Coalesce whatever else is already queued; one wake covers
+                // any number of events.
+                while watcher.receiver.try_recv().is_ok() {}
+                Ok(true)
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                // The watcher backend died; drop it (to be re-established)
+                // and report a change so the caller rescans.
+                self.watcher = None;
+                Ok(true)
+            }
+        }
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
@@ -2286,6 +2361,33 @@ mod tests {
         // Exactly one of the pair landed, and the result says which.
         let result = outcome.results[0].as_ref().expect("directory result");
         assert_eq!(result.children().len(), 1);
+    }
+
+    #[test]
+    fn await_change_observes_writes() {
+        use std::time::{Duration, Instant};
+
+        let mut fixture = Fixture::new();
+        // A quiet root waits out the timeout.
+        assert!(!fixture
+            .alpha
+            .await_change(Duration::from_millis(50))
+            .expect("await should succeed"));
+
+        // A write arriving mid-wait is observed well before the timeout.
+        let root = fixture.alpha_root.clone();
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                std::thread::sleep(Duration::from_millis(50));
+                fs::write(root.join("new.txt"), b"content").expect("write should succeed");
+            });
+            let start = Instant::now();
+            assert!(fixture
+                .alpha
+                .await_change(Duration::from_secs(10))
+                .expect("await should succeed"));
+            assert!(start.elapsed() < Duration::from_secs(5));
+        });
     }
 
     #[test]

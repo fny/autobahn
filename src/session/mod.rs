@@ -152,6 +152,33 @@ impl Session {
         })
     }
 
+    /// Blocks until either endpoint signals that content may have changed,
+    /// or the timeout elapses; returns whether a change was signaled.
+    ///
+    /// The wait is sliced between the endpoints rather than run in parallel:
+    /// each endpoint is asked to watch for half a slice at a time, so a
+    /// change on either side is noticed within one slice without any
+    /// cross-thread cancellation machinery. Remote endpoints answer each
+    /// slice with one lightweight round trip — far cheaper than the scan
+    /// that pure interval polling would run instead.
+    pub fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        const SLICE: std::time::Duration = std::time::Duration::from_millis(250);
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+            let half = remaining.min(SLICE) / 2;
+            if self.alpha.await_change(half)? {
+                return Ok(true);
+            }
+            if self.beta.await_change(half)? {
+                return Ok(true);
+            }
+        }
+    }
+
     /// Runs one synchronization cycle: scan both endpoints, reconcile,
     /// stage and apply transitions, and update the persisted ancestor.
     pub fn run_cycle(&mut self) -> Result<CycleReport> {

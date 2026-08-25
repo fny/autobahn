@@ -108,4 +108,16 @@ pub trait Endpoint {
     /// are reported as problems and reflected in the returned results, not
     /// as errors.
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome>;
+
+    /// Blocks until content beneath the root may have changed or the timeout
+    /// elapses, returning whether a change was signaled. `false` after the
+    /// timeout means only that nothing was *observed* — callers must still
+    /// cycle on a heartbeat, since watching is inherently best-effort.
+    ///
+    /// The default implementation cannot watch: it waits out the timeout and
+    /// reports nothing observed, degrading callers to pure interval polling.
+    fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        std::thread::sleep(timeout);
+        Ok(false)
+    }
 }

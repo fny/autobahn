@@ -184,6 +184,15 @@ impl Endpoint for RemoteEndpoint {
             response => Err(unexpected_response(&response, "transition")),
         }
     }
+
+    fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        // The agent blocks for up to the requested timeout before answering,
+        // so callers should keep individual awaits short and loop.
+        match self.exchange(Request::AwaitChanges(timeout.as_millis() as u64))? {
+            Response::AwaitChanges(changed) => Ok(changed),
+            response => Err(unexpected_response(&response, "await changes")),
+        }
+    }
 }
 
 /// Wraps a failure reported by the agent, marking it as having happened on
@@ -211,6 +220,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::SupplyPull(_) => "supply pull",
         Response::StagePushed => "stage pushed",
         Response::Transition(_) => "transition",
+        Response::AwaitChanges(_) => "await changes",
         Response::Error(_) => "error",
     }
 }

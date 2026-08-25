@@ -67,6 +67,9 @@ pub enum Request {
     StagePush(Vec<TransferFrame>),
     /// Apply transitions.
     Transition(Vec<Change>),
+    /// Block until content may have changed or the specified number of
+    /// milliseconds elapses.
+    AwaitChanges(u64),
     /// Terminate the agent.
     Shutdown,
 }
@@ -90,6 +93,8 @@ pub enum Response {
     StagePushed,
     /// The outcome of Transition.
     Transition(TransitionOutcome),
+    /// Whether AwaitChanges observed a change.
+    AwaitChanges(bool),
     /// A request-level failure.
     Error(String),
 }

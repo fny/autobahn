@@ -14,6 +14,7 @@ use autobahn::paths;
 use autobahn::protocol::Initialize;
 use autobahn::scan::{IgnoreSet, SymlinkMode};
 use autobahn::session::{session_identifier, CycleReport, Session};
+use autobahn::supervisor::control::{ControlRequest, ControlResponse, Selector};
 use autobahn::supervisor::{read_status, SessionStatus, Supervisor};
 use autobahn::transport::{serve_agent, Connection};
 use autobahn::tree::SyncMode;
@@ -151,6 +152,50 @@ enum Command {
         /// group.
         host: Option<String>,
     },
+    /// Wake configured sessions in a running supervisor for an immediate
+    /// synchronization cycle.
+    Flush {
+        /// Filter to a group.
+        group: Option<String>,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Suspend cycling for configured sessions in a running supervisor.
+    Pause {
+        /// Filter to a group.
+        group: Option<String>,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Resume cycling for paused sessions in a running supervisor.
+    Resume {
+        /// Filter to a group.
+        group: Option<String>,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Reset sessions in a running supervisor: their synchronization
+    /// baselines are discarded, so the next cycle merges both sides
+    /// additively (resurrecting deletions). The group is required — a
+    /// reset is deliberate, never a default.
+    Reset {
+        /// The group to reset.
+        group: String,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Run as a synchronization agent on standard input/output (invoked on
     /// remote hosts by the sync command; not intended for interactive use).
     Agent,
@@ -171,6 +216,45 @@ fn main() {
             group,
             host,
         } => run_status(config, state_root, group, host),
+        Command::Flush {
+            group,
+            host,
+            state_root,
+        } => run_control(
+            ControlRequest::Flush(Selector { group, host }),
+            state_root,
+            "flushed",
+        ),
+        Command::Pause {
+            group,
+            host,
+            state_root,
+        } => run_control(
+            ControlRequest::Pause(Selector { group, host }),
+            state_root,
+            "paused",
+        ),
+        Command::Resume {
+            group,
+            host,
+            state_root,
+        } => run_control(
+            ControlRequest::Resume(Selector { group, host }),
+            state_root,
+            "resumed",
+        ),
+        Command::Reset {
+            group,
+            host,
+            state_root,
+        } => run_control(
+            ControlRequest::Reset(Selector {
+                group: Some(group),
+                host,
+            }),
+            state_root,
+            "reset",
+        ),
         Command::Sync {
             alpha,
             beta,
@@ -340,9 +424,27 @@ fn run_sync(
         if !watch {
             break;
         }
-        std::thread::sleep(Duration::from_secs(interval.max(1)));
+        // Wait for a change on either side (with the interval as the
+        // heartbeat), then let a short settle window coalesce write bursts.
+        // An await failure is deliberately ignored here: the next cycle
+        // surfaces the underlying problem with full context.
+        if let Ok(true) = session.await_change(Duration::from_secs(interval.max(1))) {
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     Ok(())
+}
+
+/// Sends a control request to the running supervisor and reports the result.
+fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str) -> Result<()> {
+    let state_root = resolve_state_root(state_root)?;
+    match autobahn::supervisor::control::send(&state_root, &request)? {
+        ControlResponse::Applied { sessions } => {
+            println!("{verb} {sessions} session(s)");
+            Ok(())
+        }
+        ControlResponse::Error(message) => bail!(message),
+    }
 }
 
 /// Loads the groups configuration from an explicit or default path.

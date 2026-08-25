@@ -38,27 +38,49 @@ fn expand_tilde_in(path: &str, home: &str) -> Result<PathBuf> {
 /// `~/.config/autobahn/config.toml` per the XDG base directory
 /// specification (which also requires `XDG_CONFIG_HOME` to be absolute —
 /// a relative value is ignored rather than resolved against the working
-/// directory).
+/// directory). An absolute `XDG_CONFIG_HOME` needs no `HOME` at all, and
+/// the `HOME` fallback must itself be absolute — a relative home would
+/// make the configuration path depend on the working directory.
 pub fn default_config_path() -> Result<PathBuf> {
     let xdg = std::env::var("XDG_CONFIG_HOME").ok();
-    let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(config_path_in(xdg.as_deref(), &home))
+    let home = std::env::var("HOME").ok();
+    config_path_from(xdg.as_deref(), home.as_deref())
 }
 
 /// Computes the configuration path from explicit environment values.
-fn config_path_in(xdg_config_home: Option<&str>, home: &str) -> PathBuf {
-    let base = match xdg_config_home {
-        Some(directory) if directory.starts_with('/') => PathBuf::from(directory),
-        _ => PathBuf::from(home).join(".config"),
-    };
-    base.join("autobahn").join("config.toml")
+fn config_path_from(xdg_config_home: Option<&str>, home: Option<&str>) -> Result<PathBuf> {
+    if let Some(directory) = xdg_config_home {
+        if directory.starts_with('/') {
+            return Ok(PathBuf::from(directory)
+                .join("autobahn")
+                .join("config.toml"));
+        }
+    }
+    let home = home.context("HOME is not set")?;
+    if !home.starts_with('/') {
+        anyhow::bail!("HOME ({home:?}) is not an absolute path");
+    }
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("autobahn")
+        .join("config.toml"))
 }
 
 /// Returns the default state root, under which session state
 /// (`sessions/<id>/`) and supervisor status (`status/`) are kept.
 pub fn default_state_root() -> Result<PathBuf> {
+    Ok(absolute_home()?.join(".autobahn"))
+}
+
+/// Returns the current user's home directory, requiring it to be absolute:
+/// every default path is derived from it, and a relative `HOME` would make
+/// them all silently working-directory-dependent.
+fn absolute_home() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".autobahn"))
+    if !home.starts_with('/') {
+        anyhow::bail!("HOME ({home:?}) is not an absolute path");
+    }
+    Ok(PathBuf::from(home))
 }
 
 #[cfg(test)]
@@ -97,15 +119,19 @@ mod tests {
 
     #[test]
     fn relative_xdg_config_home_is_ignored_per_the_specification() {
+        // An absolute XDG_CONFIG_HOME wins and needs no HOME at all.
         assert_eq!(
-            config_path_in(Some("/etc/xdg"), "/home/user"),
+            config_path_from(Some("/etc/xdg"), None).unwrap(),
             PathBuf::from("/etc/xdg/autobahn/config.toml")
         );
         for invalid in [Some("relative/config"), Some(""), None] {
             assert_eq!(
-                config_path_in(invalid, "/home/user"),
+                config_path_from(invalid, Some("/home/user")).unwrap(),
                 PathBuf::from("/home/user/.config/autobahn/config.toml")
             );
         }
+        // Without a usable XDG_CONFIG_HOME, HOME must exist and be absolute.
+        assert!(config_path_from(None, None).is_err());
+        assert!(config_path_from(None, Some("relative-home")).is_err());
     }
 }

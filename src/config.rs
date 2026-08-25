@@ -176,10 +176,15 @@ impl Config {
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
         let mut errors = Vec::new();
         let mut plans = Vec::new();
-        // Two plans with the same identifier would share ancestor, staging,
-        // and status state while running concurrently, so duplicates are a
-        // configuration error rather than a runtime surprise.
-        let mut identifiers: HashMap<String, String> = HashMap::new();
+        // Two plans over the same roots would synchronize the same trees
+        // concurrently (and, when textually identical, share session state),
+        // so duplicates are a configuration error rather than a runtime
+        // surprise. Detection compares *canonicalized* local paths, so
+        // aliases — a trailing `/.`, a symlink, `~/data` versus its expanded
+        // form — are caught, not just textual repeats. (Nested or otherwise
+        // overlapping roots are a different hazard that no pairwise identity
+        // can detect.)
+        let mut identities: HashMap<(PathBuf, String), String> = HashMap::new();
 
         for (name, group) in &self.groups {
             let mode = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
@@ -294,10 +299,21 @@ impl Config {
                     ignores: ignores.clone(),
                     interval,
                 };
-                if let Some(previous) = identifiers.insert(plan.identifier(), plan.display()) {
+                let identity = (
+                    duplicate_detection_key(&plan.alpha),
+                    match &plan.beta {
+                        BetaTarget::Local(path) => {
+                            duplicate_detection_key(path).to_string_lossy().into_owned()
+                        }
+                        BetaTarget::Remote {
+                            destination, path, ..
+                        } => format!("{destination}:{path}"),
+                    },
+                );
+                if let Some(previous) = identities.insert(identity, plan.display()) {
                     errors.push(format!(
                         "sessions '{previous}' and '{}' describe the same alpha and beta; \
-                         they would share session state and race each other",
+                         they would synchronize the same trees concurrently",
                         plan.display()
                     ));
                     continue;
@@ -311,6 +327,15 @@ impl Config {
         }
         Ok(plans)
     }
+}
+
+/// Resolves a local path to its identity for duplicate detection:
+/// canonicalized when it exists (collapsing symlinks and dot components),
+/// lexically normalized otherwise. Detection is best-effort by nature — a
+/// root that doesn't exist yet can't have its symlinks resolved — but a
+/// missing root also can't be destructively synchronized yet.
+fn duplicate_detection_key(path: &std::path::Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
 }
 
 /// Parses a synchronization mode name.
@@ -635,6 +660,45 @@ mod tests {
             "#,
         );
         assert!(config.plans().is_err());
+    }
+
+    #[test]
+    fn aliased_paths_are_detected_as_duplicates() {
+        // Textual differences that denote the same directory — a dot
+        // component, and a symlink — must not evade duplicate detection.
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let data = keep.path().join("data");
+        std::fs::create_dir_all(&data).expect("directory should be creatable");
+        let alias = keep.path().join("alias");
+        std::os::unix::fs::symlink(&data, &alias).expect("symlink should be creatable");
+
+        let config = parse(&format!(
+            r#"
+            [groups.direct]
+            alpha = "{data}"
+            mode = "two-way-safe"
+            betas = ["host:/mirror"]
+
+            [groups.dotted]
+            alpha = "{data}/."
+            mode = "one-way-replica"
+            betas = ["host:/mirror"]
+
+            [groups.linked]
+            alpha = "{alias}"
+            mode = "one-way-replica"
+            betas = ["host:/mirror"]
+            "#,
+            data = data.display(),
+            alias = alias.display(),
+        ));
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(
+            error.contains("describe the same alpha and beta"),
+            "{error}"
+        );
+        assert!(error.contains("dotted@host"), "{error}");
+        assert!(error.contains("linked@host"), "{error}");
     }
 
     #[test]

@@ -427,12 +427,22 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
 
         // A second "process" attempting the same session is refused while
         // the first holds the lock.
-        let outcomes = world.run_once(plans);
+        let outcomes = world.run_once(plans.clone());
         let error = outcomes[0]
             .result
             .as_ref()
             .expect_err("the session lock must refuse a concurrent run");
         assert!(error.contains("another autobahn process"), "{error}");
+
+        // The refusal must not have clobbered the owner's status file: the
+        // session's shared state belongs to the lock holder.
+        let status = world
+            .status(&plans[0])
+            .expect("the owner's status should exist");
+        assert_ne!(
+            status.state, "error",
+            "a lock loser must never overwrite the owner's status: {status:?}"
+        );
 
         stop.store(true, Ordering::Relaxed);
         watcher.join().expect("the watcher should stop cleanly");

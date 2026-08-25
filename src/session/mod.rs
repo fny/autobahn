@@ -81,7 +81,22 @@ pub struct Session {
     ancestor: Option<Node>,
     /// The exclusive lock on the session state directory, held for the
     /// session's lifetime (released when the file closes on drop).
-    _lock: File,
+    _lock: SessionLock,
+}
+
+/// The error raised when a session's state directory is locked by another
+/// live session. Callers that race for sessions legitimately (a supervisor
+/// coexisting with another supervisor or a manual `sync`) can detect this
+/// case by downcasting, and must treat the session's shared state — its
+/// status file included — as owned by the lock holder.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "another autobahn process is already synchronizing this session \
+     (state directory {state_directory})"
+)]
+pub struct SessionLockHeld {
+    /// The state directory that was found locked.
+    pub state_directory: String,
 }
 
 /// Computes a stable session identifier from the two endpoint
@@ -101,23 +116,30 @@ pub fn session_identifier(alpha_spec: &str, beta_spec: &str) -> String {
 }
 
 impl Session {
-    /// Creates a session between the provided endpoints, loading any
-    /// persisted ancestor from the session state directory (which is created
-    /// if needed).
+    /// Creates a session between the provided endpoints, acquiring the state
+    /// directory's exclusive lock and loading any persisted ancestor (the
+    /// directory is created if needed).
     pub fn new(
         alpha: Box<dyn Endpoint + Send>,
         beta: Box<dyn Endpoint + Send>,
         mode: SyncMode,
         state_directory: PathBuf,
     ) -> Result<Session> {
-        fs::create_dir_all(&state_directory).with_context(|| {
-            format!(
-                "unable to create session state directory {}",
-                state_directory.display()
-            )
-        })?;
-        let lock = acquire_state_lock(&state_directory)?;
-        let ancestor_path = state_directory.join("ancestor");
+        Session::with_lock(alpha, beta, mode, SessionLock::acquire(state_directory)?)
+    }
+
+    /// Creates a session between the provided endpoints under an
+    /// already-held state lock. This exists so that callers with expensive
+    /// endpoint construction (spawning SSH, handshaking with an agent) can
+    /// acquire the lock *first* and discover a conflicting session before
+    /// incurring any of that work or its remote side effects.
+    pub fn with_lock(
+        alpha: Box<dyn Endpoint + Send>,
+        beta: Box<dyn Endpoint + Send>,
+        mode: SyncMode,
+        lock: SessionLock,
+    ) -> Result<Session> {
+        let ancestor_path = lock.state_directory().join("ancestor");
         let ancestor = load_ancestor(&ancestor_path)?;
         Ok(Session {
             alpha,
@@ -367,10 +389,11 @@ fn one_side_emptied_root(
 }
 
 /// How long lock acquisition keeps retrying before concluding the session
-/// genuinely belongs to someone else. See [`acquire_state_lock`].
+/// genuinely belongs to someone else. See [`SessionLock::acquire`].
 const LOCK_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Acquires the exclusive advisory lock on a session state directory.
+/// An exclusive advisory lock on a session state directory, held for the
+/// owning session's lifetime and released when dropped.
 ///
 /// Two sessions over the same state would race each other's ancestor,
 /// staging, and status writes — with different modes, destructively. The
@@ -378,42 +401,67 @@ const LOCK_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_
 /// from the same process (a duplicated configuration) or another one (two
 /// supervisors, or a supervisor plus a manual `sync`). Advisory `flock` is
 /// exactly right here: every path into the state directory goes through
-/// [`Session::new`], and the lock dies with its process, so a crash can
-/// never leave a stale lock behind.
-///
-/// Acquisition retries briefly before reporting a conflict: releasing a
-/// `flock` is delayed if a concurrently forked child (an agent or SSH
-/// subprocess spawned by another session's worker) inherited the lock file
-/// descriptor in the instant between fork and exec — the descriptors are
-/// close-on-exec, so the delay is microseconds, but a back-to-back
-/// release-and-reacquire can land inside it. A lock still held after the
-/// timeout is a real concurrent session, not that window.
-fn acquire_state_lock(state_directory: &Path) -> Result<File> {
-    let path = state_directory.join("lock");
-    let file = File::options()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(&path)
-        .with_context(|| format!("unable to open session lock {}", path.display()))?;
-    let deadline = std::time::Instant::now() + LOCK_ACQUISITION_TIMEOUT;
-    loop {
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(file);
-        }
-        let error = std::io::Error::last_os_error();
-        if error.kind() != std::io::ErrorKind::WouldBlock {
-            return Err(error)
-                .with_context(|| format!("unable to lock session state {}", path.display()));
-        }
-        if std::time::Instant::now() >= deadline {
-            bail!(
-                "another autobahn process is already synchronizing this session \
-                 (state directory {})",
+/// this lock, and the lock dies with its process, so a crash can never
+/// leave a stale lock behind.
+pub struct SessionLock {
+    /// The locked state directory.
+    state_directory: PathBuf,
+    /// The open, locked file (the lock releases when it closes).
+    _file: File,
+}
+
+impl SessionLock {
+    /// Acquires the lock on a state directory, creating the directory if
+    /// needed. A directory locked by a live session yields a
+    /// [`SessionLockHeld`] error (downcastable through the chain).
+    ///
+    /// Acquisition retries briefly before reporting a conflict: releasing a
+    /// `flock` is delayed if a concurrently forked child (an agent or SSH
+    /// subprocess spawned by another session's worker) inherited the lock
+    /// file descriptor in the instant between fork and exec — the
+    /// descriptors are close-on-exec, so the delay is microseconds, but a
+    /// back-to-back release-and-reacquire can land inside it. A lock still
+    /// held after the timeout is a real concurrent session, not that window.
+    pub fn acquire(state_directory: PathBuf) -> Result<SessionLock> {
+        fs::create_dir_all(&state_directory).with_context(|| {
+            format!(
+                "unable to create session state directory {}",
                 state_directory.display()
-            );
+            )
+        })?;
+        let path = state_directory.join("lock");
+        let file = File::options()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .with_context(|| format!("unable to open session lock {}", path.display()))?;
+        let deadline = std::time::Instant::now() + LOCK_ACQUISITION_TIMEOUT;
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(SessionLock {
+                    state_directory,
+                    _file: file,
+                });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(error)
+                    .with_context(|| format!("unable to lock session state {}", path.display()));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(SessionLockHeld {
+                    state_directory: state_directory.display().to_string(),
+                }
+                .into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+
+    /// Returns the locked state directory.
+    pub fn state_directory(&self) -> &Path {
+        &self.state_directory
     }
 }
 

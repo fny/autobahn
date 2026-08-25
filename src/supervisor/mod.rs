@@ -27,7 +27,7 @@ use crate::endpoint::local::LocalEndpoint;
 use crate::endpoint::remote::RemoteEndpoint;
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
-use crate::session::{CycleReport, Session};
+use crate::session::{CycleReport, Session, SessionLock, SessionLockHeld};
 use crate::transport::Connection;
 
 /// The maximum delay between attempts for a failing session.
@@ -138,15 +138,17 @@ impl Supervisor {
                         let mut worker = Worker::new(plan, &self.state_root, self.verbose);
                         let result = worker.attempt();
                         let recorded = worker.record(&result);
-                        let result = result
-                            .map(|(digest, _)| digest)
-                            .map_err(|error| format!("{error:#}"))
-                            .and_then(|digest| match recorded {
-                                Ok(()) => Ok(digest),
-                                Err(error) => Err(format!(
-                                    "synchronized, but unable to record status: {error:#}"
-                                )),
-                            });
+                        let result = match (result, recorded) {
+                            (Ok((digest, _)), Ok(())) => Ok(digest),
+                            (Ok(_), Err(record_error)) => Err(format!(
+                                "synchronized, but unable to record status: {record_error:#}"
+                            )),
+                            (Err(error), Ok(())) => Err(format!("{error:#}")),
+                            (Err(error), Err(record_error)) => Err(format!(
+                                "{error:#}; additionally, unable to record status: \
+                                 {record_error:#}"
+                            )),
+                        };
                         SessionOutcome {
                             display: plan.display(),
                             result,
@@ -174,10 +176,20 @@ impl Supervisor {
     /// hard stop.
     pub fn run_watch(&self, stop: &AtomicBool) {
         std::thread::scope(|scope| {
-            for plan in &self.plans {
+            for (index, plan) in self.plans.iter().enumerate() {
                 scope.spawn(move || {
+                    // Stagger the first attempts so a large fan-out doesn't
+                    // open every connection in the same instant (bounded, so
+                    // small deployments and fast test intervals barely
+                    // notice it).
+                    let stagger = Duration::from_millis(100)
+                        .saturating_mul(index as u32)
+                        .min(Duration::from_secs(3))
+                        .min(plan.interval);
+                    sleep_interruptible(stagger, stop);
+
                     let mut worker = Worker::new(plan, &self.state_root, self.verbose);
-                    let jitter = jitter_percent(&plan.identifier());
+                    let identifier = plan.identifier();
                     let mut failures = 0u32;
                     while !stop.load(Ordering::Relaxed) {
                         let result = worker.attempt();
@@ -188,7 +200,11 @@ impl Supervisor {
                             }
                             Err(_) => {
                                 failures = failures.saturating_add(1);
-                                backoff_delay(plan.interval, failures, jitter)
+                                backoff_delay(
+                                    plan.interval,
+                                    failures,
+                                    jitter_percent(&identifier, failures),
+                                )
                             }
                         };
                         if let Err(error) = worker.record(&result) {
@@ -254,8 +270,22 @@ impl<'a> Worker<'a> {
     /// Records an attempt's result to the session's status file (and, when
     /// verbose, to standard output), reporting a failure to persist the
     /// status so that callers can surface it.
+    ///
+    /// A lock conflict is the one failure that is *not* recorded: the
+    /// session's shared state — its status file included — belongs to the
+    /// lock holder, and writing "another process is synchronizing" over the
+    /// holder's live status would replace the truth with a complaint about
+    /// having lost the race to tell it.
     fn record(&self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
         let display = self.plan.display();
+        if let Err(error) = result {
+            if error.downcast_ref::<SessionLockHeld>().is_some() {
+                if self.verbose {
+                    eprintln!("[{display}] skipped: {error:#}");
+                }
+                return Ok(());
+            }
+        }
         let mut status = SessionStatus {
             group: self.plan.group.clone(),
             host: self.plan.host.clone(),
@@ -348,6 +378,12 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
 
+    // The lock comes first: a conflicting session must be discovered before
+    // any endpoint work happens, not after spawning SSH and handshaking
+    // with a remote agent — endpoint construction is expensive, can block
+    // on the network, and has remote side effects.
+    let lock = SessionLock::acquire(state_directory.clone())?;
+
     let alpha_root = plan
         .alpha
         .canonicalize()
@@ -383,7 +419,7 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
         }
     };
 
-    Session::new(alpha, beta, plan.mode, state_directory)
+    Session::with_lock(alpha, beta, plan.mode, lock)
 }
 
 /// Flattens a cycle report's problems into labeled lines.
@@ -415,12 +451,21 @@ fn backoff_delay(interval: Duration, consecutive_failures: u32, jitter_percent: 
     base + jitter
 }
 
-/// Derives a stable per-session jitter percentage (0–24) from the session
-/// identifier, spreading retry schedules without any runtime randomness.
-fn jitter_percent(identifier: &str) -> u64 {
-    identifier.bytes().fold(0u64, |accumulator, byte| {
-        accumulator.wrapping_mul(31).wrapping_add(byte as u64)
-    }) % 25
+/// Derives a jitter percentage (0–24) from the session identifier and the
+/// retry round, spreading retry schedules without any runtime randomness.
+/// Mixing the round in decorrelates sessions from one retry to the next, so
+/// sessions that happen to share a delay bucket in one round don't stay
+/// phase-aligned forever.
+fn jitter_percent(identifier: &str, round: u32) -> u64 {
+    identifier
+        .bytes()
+        .fold(round as u64, |accumulator, byte| {
+            accumulator
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add(byte as u64)
+        })
+        .rotate_left(17)
+        % 25
 }
 
 /// Sleeps for the specified duration, waking early if `stop` becomes true.
@@ -448,15 +493,33 @@ fn status_directory(state_root: &Path) -> PathBuf {
     state_root.join("status")
 }
 
-/// Writes a session's status file atomically.
+/// The counter that uniquifies status temporary names within a process.
+static STATUS_TEMPORARY_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Writes a session's status file atomically. The temporary name is unique
+/// per writer (process and counter), so even two processes racing over the
+/// same session — which the session lock makes rare but a crashed lock
+/// holder's final write can still overlap — publish whole files in
+/// last-writer-wins order rather than tearing each other's temporaries.
 fn write_status(state_root: &Path, identifier: &str, status: &SessionStatus) -> Result<()> {
     let directory = status_directory(state_root);
     fs::create_dir_all(&directory).context("unable to create the status directory")?;
     let path = directory.join(format!("{identifier}.json"));
-    let temporary = directory.join(format!("{identifier}.json.tmp"));
+    let temporary = directory.join(format!(
+        "{identifier}.json.{}-{}.tmp",
+        std::process::id(),
+        STATUS_TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
     let data = serde_json::to_vec_pretty(status).context("unable to encode status")?;
-    fs::write(&temporary, data).context("unable to write status")?;
-    fs::rename(&temporary, &path).context("unable to publish status")?;
+    if let Err(error) = fs::write(&temporary, data) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("unable to write status");
+    }
+    if let Err(error) = fs::rename(&temporary, &path) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("unable to publish status");
+    }
     Ok(())
 }
 
@@ -497,10 +560,20 @@ mod tests {
         let saturated = backoff_delay(Duration::from_secs(5), 1000, 20);
         assert_eq!(saturated, MAXIMUM_BACKOFF + MAXIMUM_BACKOFF / 5);
         for identifier in ["a", "b", "0123456789abcdef", ""] {
-            assert!(jitter_percent(identifier) < 25);
+            for round in [1, 2, 3, 100] {
+                assert!(jitter_percent(identifier, round) < 25);
+            }
         }
-        // The percentage is a stable function of the identifier.
-        assert_eq!(jitter_percent("session-x"), jitter_percent("session-x"));
+        // The percentage is a stable function of the identifier and round,
+        // and varies with the round (so retry buckets don't stay aligned).
+        assert_eq!(
+            jitter_percent("session-x", 3),
+            jitter_percent("session-x", 3)
+        );
+        let varied: std::collections::HashSet<u64> = (1..=25)
+            .map(|round| jitter_percent("session-x", round))
+            .collect();
+        assert!(varied.len() > 1, "jitter should vary across rounds");
     }
 
     /// An endpoint whose scans always present the same content and whose

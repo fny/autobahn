@@ -28,11 +28,29 @@ autobahn sync ./project user@host:/srv/project \
     --watch --mode one-way-replica --ignore target --ignore '*.log'
 ```
 
-Remote roots use scp-style `[user@]host:path` syntax and require `autobahn`
-(the same version) to be installed on the remote host: the CLI runs
-`ssh host autobahn agent` and speaks a framed, version-checked protocol over
-stdio. There is no daemon; state (the synchronization ancestor and staged
-content) lives under `~/.autobahn/sessions/<session-id>`.
+Remote roots use scp-style `[user@]host:path` syntax. The CLI runs the
+agent over `ssh` (key-based auth; streams are LZ4- and SSH-compressed) and
+speaks a framed, version-checked protocol over stdio. Agents install
+themselves: connections invoke a versioned agent path
+(`~/.autobahn/bin/autobahn-<version>`), and when it's missing the
+controller probes the remote platform, streams a matching binary into
+place (from `AUTOBAHN_AGENTS_DIR`, an `agents/` directory beside the
+executable — build one with `scripts/build-agents.sh` — or, on a
+same-platform fleet, the running executable itself), and retries. There is
+no daemon; state (the synchronization ancestor, staged content, and a scan
+cache that accelerates cold starts) lives under
+`~/.autobahn/sessions/<session-id>`.
+
+Both sides watch their roots natively (inotify/FSEvents), so `--watch` and
+the supervisor react to changes — local and remote — within a fraction of a
+second; the configured interval is only a fallback heartbeat. Filesystem
+behavior is probed per root: executability bits are propagated around
+volumes that can't store them, names recompose to NFC on decomposing (HFS+)
+volumes, and case-insensitive volumes refuse case-colliding siblings
+instead of corrupting them. Created files default to conservative 0600/0700
+permissions (configurable per group or via `--file-mode`/`--directory-mode`),
+and symbolic links can be synchronized raw (default), validated as portable,
+or ignored (`--symlink-mode`, or `symlink_mode` per group).
 
 ### Supervising many sessions
 
@@ -66,6 +84,13 @@ autobahn up             # supervise every configured session continuously
 autobahn up --once      # one pass over every session, then exit
 autobahn status         # recorded state of every session, grouped by group
 autobahn status project # ... filtered to one group (optionally + host)
+
+# Control a running supervisor (group and host filters optional):
+autobahn flush          # wake sessions for an immediate cycle
+autobahn pause project  # suspend a group (drops connections and locks)
+autobahn resume project
+autobahn reset project  # discard the baseline: next cycle merges both
+                        # sides additively (resurrects deletions)
 ```
 
 A beta is remote (`[user@]host[:path]`) unless it visibly denotes a local
@@ -106,8 +131,11 @@ never race the same session.
 
 ## Scope
 
-Unix only. SSH (or any stdio subprocess) transport only — no Docker, no
-daemon, no forwarding. Polling-based watching.
+Unix only (Linux; macOS-oriented behaviors — Unicode normalization, case
+handling, executability propagation — are implemented and awaiting a macOS
+build target). SSH (or any stdio subprocess) transport only — no Docker,
+no daemon, no forwarding. Native filesystem watching with an interval
+heartbeat as fallback.
 
 ## Development
 

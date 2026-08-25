@@ -117,9 +117,29 @@ impl Registry {
     }
 }
 
-/// Returns the control socket path under a state root.
+/// Returns the control socket path for a state root.
+///
+/// Unix socket paths are limited to roughly 108 bytes (`sockaddr_un`), so a
+/// deeply nested state root can't hold its own socket. In that case the
+/// socket falls back to a short per-user directory, named by the *resolved*
+/// state root's digest — both the supervisor and the CLI derive the same
+/// path from the same state root, wherever it lives.
 pub fn socket_path(state_root: &Path) -> PathBuf {
-    state_root.join("control.sock")
+    const MAXIMUM_SOCKET_PATH: usize = 100;
+    let direct = state_root.join("control.sock");
+    if direct.as_os_str().len() <= MAXIMUM_SOCKET_PATH {
+        return direct;
+    }
+    let identity = crate::paths::resolve_for_identity(state_root);
+    let digest = blake3::hash(identity.as_os_str().as_encoded_bytes());
+    let mut name = String::with_capacity(16);
+    for byte in &digest.as_bytes()[..8] {
+        use std::fmt::Write;
+        let _ = write!(name, "{byte:02x}");
+    }
+    std::env::temp_dir()
+        .join(format!("autobahn-{}", unsafe { libc::getuid() }))
+        .join(format!("{name}.sock"))
 }
 
 /// Binds the control socket, replacing any stale socket file left by a
@@ -129,6 +149,15 @@ pub(crate) fn bind(state_root: &Path) -> Result<UnixListener> {
     std::fs::create_dir_all(state_root)
         .with_context(|| format!("unable to create the state root {}", state_root.display()))?;
     let path = socket_path(state_root);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+        // The fallback directory lives in the shared temporary directory;
+        // keep it private to the user (best-effort — it may already exist
+        // with these permissions).
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    }
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("unable to bind control socket {}", path.display()))?;
@@ -202,6 +231,21 @@ mod tests {
                 ("other".into(), "host1".into(), Arc::default()),
             ],
         }
+    }
+
+    #[test]
+    fn socket_paths_respect_the_unix_socket_length_limit() {
+        // A short state root holds its own socket.
+        let short = socket_path(Path::new("/tmp/autobahn-state"));
+        assert_eq!(short, PathBuf::from("/tmp/autobahn-state/control.sock"));
+
+        // A deep one falls back to a short per-user path — deterministically,
+        // so the CLI and the supervisor agree on it.
+        let deep = PathBuf::from(format!("/tmp/{}/state", "long-component/".repeat(12)));
+        let fallback = socket_path(&deep);
+        assert!(fallback.as_os_str().len() <= 108, "{fallback:?}");
+        assert_eq!(fallback, socket_path(&deep));
+        assert_ne!(fallback, socket_path(Path::new("/other/equally/deep/root")));
     }
 
     #[test]

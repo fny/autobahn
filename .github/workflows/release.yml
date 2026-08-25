@@ -1,0 +1,87 @@
+# Builds every supported platform on a version tag and publishes a release
+# whose assets follow the agent bundle's naming (autobahn-<os>-<arch>), so a
+# downloaded set doubles as an agents directory for cross-platform
+# controllers. Linux binaries are static musl (no libc version constraints);
+# macOS binaries link only the always-present libSystem.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            platform: linux-x86_64
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            platform: linux-aarch64
+            linker: aarch64-linux-gnu-gcc
+            packages: gcc-aarch64-linux-gnu
+          - os: macos-14
+            target: aarch64-apple-darwin
+            platform: darwin-aarch64
+          - os: macos-14
+            target: x86_64-apple-darwin
+            platform: darwin-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Install cross toolchain
+        if: matrix.packages
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      - name: Configure cross linker
+        if: matrix.linker
+        run: |
+          mkdir -p ~/.cargo
+          cat >> ~/.cargo/config.toml <<EOF
+          [target.${{ matrix.target }}]
+          linker = "${{ matrix.linker }}"
+          EOF
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+      - name: Stage artifact
+        run: cp target/${{ matrix.target }}/release/autobahn autobahn-${{ matrix.platform }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-${{ matrix.platform }}
+          path: autobahn-${{ matrix.platform }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Assemble the agents bundle and checksums
+        run: |
+          mkdir agents
+          cp autobahn-* agents/
+          tar czf autobahn-agents.tar.gz agents
+          sha256sum autobahn-* > SHA256SUMS
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "autobahn $GITHUB_REF_NAME" \
+            --generate-notes \
+            autobahn-linux-x86_64 \
+            autobahn-linux-aarch64 \
+            autobahn-darwin-aarch64 \
+            autobahn-darwin-x86_64 \
+            autobahn-agents.tar.gz \
+            SHA256SUMS

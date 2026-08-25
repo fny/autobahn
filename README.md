@@ -143,6 +143,17 @@ build target). SSH (or any stdio subprocess) transport only — no Docker,
 no daemon, no forwarding. Native filesystem watching with an interval
 heartbeat as fallback.
 
+## Installing from a release
+
+Each release ships one binary per platform (`autobahn-<os>-<arch>`), an
+`autobahn-agents.tar.gz` bundling all of them under `agents/`, and
+`SHA256SUMS`. Put your platform's binary on your `PATH` as `autobahn`; a
+controller whose fleet spans platforms also unpacks the agents bundle into
+an `agents` directory beside the binary (or points `AUTOBAHN_AGENTS_DIR` at
+it), from which remote hosts are bootstrapped automatically on first
+connect. Linux binaries are statically linked (musl) and run on any
+distribution.
+
 ## Development
 
 ```sh

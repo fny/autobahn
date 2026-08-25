@@ -79,6 +79,12 @@ moment the host answers again, without affecting its siblings. Each session
 records its state to `~/.autobahn/status/` after every attempt, which is
 what `status` reads (from any process, running supervisor or not).
 
+Local roots must be absolute or `~`-relative (a working-directory-relative
+root would mean different trees under a service than in a shell), and each
+session's state directory is exclusively locked while a session runs, so
+two processes — two supervisors, or a supervisor and a manual `sync` — can
+never race the same session.
+
 ### Synchronization modes
 
 | Mode | Behavior |

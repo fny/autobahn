@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{mode_name, BetaTarget, SessionPlan};
@@ -124,7 +124,10 @@ impl Supervisor {
 
     /// Runs one attempt of every session in parallel and returns their
     /// outcomes (in plan order). Individual failures are captured in the
-    /// outcomes rather than aborting the run.
+    /// outcomes rather than aborting the run, and a failure to *record* a
+    /// successful attempt's status is itself a failure — automation reading
+    /// the exit code must be able to trust that the status files reflect
+    /// what happened.
     pub fn run_once(&self) -> Vec<SessionOutcome> {
         std::thread::scope(|scope| {
             let handles: Vec<_> = self
@@ -134,12 +137,19 @@ impl Supervisor {
                     scope.spawn(move || {
                         let mut worker = Worker::new(plan, &self.state_root, self.verbose);
                         let result = worker.attempt();
-                        worker.record(&result);
+                        let recorded = worker.record(&result);
+                        let result = result
+                            .map(|(digest, _)| digest)
+                            .map_err(|error| format!("{error:#}"))
+                            .and_then(|digest| match recorded {
+                                Ok(()) => Ok(digest),
+                                Err(error) => Err(format!(
+                                    "synchronized, but unable to record status: {error:#}"
+                                )),
+                            });
                         SessionOutcome {
                             display: plan.display(),
-                            result: result
-                                .map(|(digest, _)| digest)
-                                .map_err(|error| format!("{error:#}")),
+                            result,
                         }
                     })
                 })
@@ -152,14 +162,22 @@ impl Supervisor {
     }
 
     /// Runs every session continuously until `stop` becomes true: each
-    /// session cycles on its own interval, backs off exponentially while its
-    /// destination is failing, and reconnects (healing the session) on the
-    /// first attempt after a failure.
+    /// session cycles on its own interval, backs off (exponentially, with
+    /// per-session jitter so a recovering host isn't hit by every session at
+    /// once) while its destination is failing, and reconnects (healing the
+    /// session) on the first attempt after a failure.
+    ///
+    /// The stop flag is honored between attempts and during sleeps; it
+    /// cannot interrupt a cycle already in flight, so returning waits for
+    /// in-flight cycles to finish. SSH keepalives bound how long a dead
+    /// network can hold one; for the CLI, process termination remains the
+    /// hard stop.
     pub fn run_watch(&self, stop: &AtomicBool) {
         std::thread::scope(|scope| {
             for plan in &self.plans {
                 scope.spawn(move || {
                     let mut worker = Worker::new(plan, &self.state_root, self.verbose);
+                    let jitter = jitter_percent(&plan.identifier());
                     let mut failures = 0u32;
                     while !stop.load(Ordering::Relaxed) {
                         let result = worker.attempt();
@@ -170,10 +188,12 @@ impl Supervisor {
                             }
                             Err(_) => {
                                 failures = failures.saturating_add(1);
-                                backoff_delay(plan.interval, failures)
+                                backoff_delay(plan.interval, failures, jitter)
                             }
                         };
-                        worker.record(&result);
+                        if let Err(error) = worker.record(&result) {
+                            eprintln!("[{}] unable to record status: {error:#}", plan.display());
+                        }
                         sleep_interruptible(delay, stop);
                     }
                 });
@@ -218,19 +238,7 @@ impl<'a> Worker<'a> {
             if self.session.is_none() {
                 self.session = Some(connect(self.plan, self.state_root)?);
             }
-            let session = self.session.as_mut().expect("the session was just created");
-            let mut digest = CycleDigest::default();
-            loop {
-                let report = session.run_cycle()?;
-                digest.cycles += 1;
-                digest.alpha_transitions += report.alpha_transitions;
-                digest.beta_transitions += report.beta_transitions;
-                digest.conflicts = report.conflicts.len();
-                digest.problems = problem_lines(&report).len();
-                if !report.missing_staged_files || digest.cycles > MAXIMUM_FOLLOW_UP_CYCLES as u64 {
-                    return Ok((digest, report));
-                }
-            }
+            run_cycles(self.session.as_mut().expect("the session was just created"))
         })();
         if result.is_err() {
             self.session = None;
@@ -244,8 +252,9 @@ impl<'a> Worker<'a> {
     }
 
     /// Records an attempt's result to the session's status file (and, when
-    /// verbose, to standard output).
-    fn record(&self, result: &Result<(CycleDigest, CycleReport)>) {
+    /// verbose, to standard output), reporting a failure to persist the
+    /// status so that callers can surface it.
+    fn record(&self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
         let display = self.plan.display();
         let mut status = SessionStatus {
             group: self.plan.group.clone(),
@@ -302,8 +311,32 @@ impl<'a> Worker<'a> {
                 }
             }
         }
-        if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
-            eprintln!("[{display}] unable to record status: {error:#}");
+        write_status(self.state_root, &self.plan.identifier(), &status)
+    }
+}
+
+/// Runs one cycle plus bounded follow-ups while staged content is reported
+/// missing. Exhausting the cap with content *still* missing is a failure,
+/// not a quiet success: the destination is churning faster than content can
+/// be transferred, and automation must not read that as "synchronized".
+fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
+    let mut digest = CycleDigest::default();
+    loop {
+        let report = session.run_cycle()?;
+        digest.cycles += 1;
+        digest.alpha_transitions += report.alpha_transitions;
+        digest.beta_transitions += report.beta_transitions;
+        digest.conflicts = report.conflicts.len();
+        digest.problems = problem_lines(&report).len();
+        if !report.missing_staged_files {
+            return Ok((digest, report));
+        }
+        if digest.cycles > MAXIMUM_FOLLOW_UP_CYCLES as u64 {
+            bail!(
+                "staged content was still missing after {} cycles; source content is \
+                 changing faster than it can be transferred",
+                digest.cycles
+            );
         }
     }
 }
@@ -370,10 +403,24 @@ fn problem_lines(report: &CycleReport) -> Vec<String> {
 }
 
 /// Computes the delay before a failing session's next attempt: its interval
-/// doubled per consecutive failure, capped at [`MAXIMUM_BACKOFF`].
-fn backoff_delay(interval: Duration, consecutive_failures: u32) -> Duration {
+/// doubled per consecutive failure, capped at [`MAXIMUM_BACKOFF`], plus a
+/// per-session jitter fraction. The jitter is applied *after* the cap so
+/// that sessions saturated at the cap stay spread out — without it, every
+/// session that failed together (a rebooting host, a dropped network)
+/// would retry together forever.
+fn backoff_delay(interval: Duration, consecutive_failures: u32, jitter_percent: u64) -> Duration {
     let factor = 1u32 << consecutive_failures.saturating_sub(1).min(16);
-    interval.saturating_mul(factor).min(MAXIMUM_BACKOFF)
+    let base = interval.saturating_mul(factor).min(MAXIMUM_BACKOFF);
+    let jitter = Duration::from_millis(base.as_millis() as u64 * jitter_percent / 100);
+    base + jitter
+}
+
+/// Derives a stable per-session jitter percentage (0–24) from the session
+/// identifier, spreading retry schedules without any runtime randomness.
+fn jitter_percent(identifier: &str) -> u64 {
+    identifier.bytes().fold(0u64, |accumulator, byte| {
+        accumulator.wrapping_mul(31).wrapping_add(byte as u64)
+    }) % 25
 }
 
 /// Sleeps for the specified duration, waking early if `stop` becomes true.
@@ -435,12 +482,107 @@ mod tests {
     #[test]
     fn backoff_doubles_per_failure_and_saturates() {
         let interval = Duration::from_secs(5);
-        assert_eq!(backoff_delay(interval, 1), Duration::from_secs(5));
-        assert_eq!(backoff_delay(interval, 2), Duration::from_secs(10));
-        assert_eq!(backoff_delay(interval, 3), Duration::from_secs(20));
-        assert_eq!(backoff_delay(interval, 7), MAXIMUM_BACKOFF);
+        assert_eq!(backoff_delay(interval, 1, 0), Duration::from_secs(5));
+        assert_eq!(backoff_delay(interval, 2, 0), Duration::from_secs(10));
+        assert_eq!(backoff_delay(interval, 3, 0), Duration::from_secs(20));
+        assert_eq!(backoff_delay(interval, 7, 0), MAXIMUM_BACKOFF);
         // Large failure counts don't overflow the shift.
-        assert_eq!(backoff_delay(interval, 1000), MAXIMUM_BACKOFF);
+        assert_eq!(backoff_delay(interval, 1000, 0), MAXIMUM_BACKOFF);
+    }
+
+    #[test]
+    fn backoff_jitter_spreads_saturated_sessions() {
+        // Jitter is bounded (under 25% above the cap) and survives
+        // saturation, so sessions that failed together stay spread out.
+        let saturated = backoff_delay(Duration::from_secs(5), 1000, 20);
+        assert_eq!(saturated, MAXIMUM_BACKOFF + MAXIMUM_BACKOFF / 5);
+        for identifier in ["a", "b", "0123456789abcdef", ""] {
+            assert!(jitter_percent(identifier) < 25);
+        }
+        // The percentage is a stable function of the identifier.
+        assert_eq!(jitter_percent("session-x"), jitter_percent("session-x"));
+    }
+
+    /// An endpoint whose scans always present the same content and whose
+    /// transitions always report staged content missing — the shape of a
+    /// destination churning faster than transfers can complete.
+    struct ChurningEndpoint {
+        /// The root this endpoint reports on every scan.
+        root: crate::tree::Node,
+    }
+
+    impl crate::endpoint::Endpoint for ChurningEndpoint {
+        fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+            Ok(crate::tree::Snapshot {
+                root: Some(self.root.clone()),
+                ..crate::tree::Snapshot::default()
+            })
+        }
+
+        fn stage_begin(
+            &mut self,
+            _files: Vec<crate::endpoint::FileRequest>,
+        ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+            // Everything is claimed to be staged already, so the cycle
+            // proceeds straight to a transition that reports it missing.
+            Ok(Vec::new())
+        }
+
+        fn supply_open(&mut self, _needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+            unreachable!("no staging needs are ever reported")
+        }
+
+        fn supply_pull(
+            &mut self,
+            _max_frames: usize,
+        ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+            unreachable!("no staging needs are ever reported")
+        }
+
+        fn stage_push(&mut self, _frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+            unreachable!("no staging needs are ever reported")
+        }
+
+        fn transition(
+            &mut self,
+            transitions: Vec<crate::tree::Change>,
+        ) -> Result<crate::endpoint::TransitionOutcome> {
+            Ok(crate::endpoint::TransitionOutcome {
+                results: vec![None; transitions.len()],
+                problems: Vec::new(),
+                missing_staged_files: true,
+            })
+        }
+    }
+
+    #[test]
+    fn exhausting_the_follow_up_cap_is_an_error_not_a_success() {
+        use crate::tree::{Content, FileMetadata, Node, SyncMode};
+
+        let alpha_root = Node::directory(
+            "",
+            vec![Node {
+                name: "churning.txt".into(),
+                content: Content::File {
+                    digest: [7u8; 32],
+                    executable: false,
+                    metadata: FileMetadata::default(),
+                },
+            }],
+        );
+        let beta_root = Node::directory("", Vec::new());
+
+        let state = tempfile::tempdir().expect("temporary directory should be creatable");
+        let mut session = Session::new(
+            Box::new(ChurningEndpoint { root: alpha_root }),
+            Box::new(ChurningEndpoint { root: beta_root }),
+            SyncMode::TwoWaySafe,
+            state.path().join("session"),
+        )
+        .expect("the session should construct");
+
+        let error = run_cycles(&mut session).expect_err("the cap must surface as an error");
+        assert!(format!("{error:#}").contains("still missing"), "{error:#}");
     }
 
     #[test]

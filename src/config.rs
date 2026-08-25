@@ -32,7 +32,7 @@
 //! an explicit path inherits the group's alpha path *as written* (so a
 //! home-relative alpha resolves against each remote host's own home).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -40,6 +40,7 @@ use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
 use crate::paths::expand_tilde;
+use crate::scan::IgnoreSet;
 use crate::session::session_identifier;
 use crate::tree::SyncMode;
 
@@ -175,6 +176,10 @@ impl Config {
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
         let mut errors = Vec::new();
         let mut plans = Vec::new();
+        // Two plans with the same identifier would share ancestor, staging,
+        // and status state while running concurrently, so duplicates are a
+        // configuration error rather than a runtime surprise.
+        let mut identifiers: HashMap<String, String> = HashMap::new();
 
         for (name, group) in &self.groups {
             let mode = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
@@ -199,6 +204,16 @@ impl Config {
                 errors.push(format!("group '{name}' has no betas"));
             }
             let alpha = match expand_tilde(&group.alpha) {
+                // A relative alpha would resolve against whatever working
+                // directory the supervisor happened to start in — a
+                // different tree under a service than in a shell.
+                Ok(alpha) if !group.alpha.is_empty() && !alpha.is_absolute() => {
+                    errors.push(format!(
+                        "group '{name}' alpha '{}' must be an absolute (or ~-relative) path",
+                        group.alpha
+                    ));
+                    None
+                }
                 Ok(alpha) => Some(alpha),
                 Err(error) => {
                     errors.push(format!("group '{name}': {error:#}"));
@@ -220,6 +235,12 @@ impl Config {
 
             let mut ignores = self.defaults.ignores.clone();
             ignores.extend(group.ignores.iter().cloned());
+            // Compile the combined patterns now, so a bad pattern is a
+            // configuration error alongside the others rather than a runtime
+            // failure discovered only by the affected session's worker.
+            if let Err(error) = IgnoreSet::new(&ignores) {
+                errors.push(format!("group '{name}': invalid ignore pattern: {error:#}"));
+            }
             let interval = Duration::from_secs(
                 group
                     .interval
@@ -240,6 +261,17 @@ impl Config {
                         continue;
                     }
                 };
+                if let BetaTarget::Local(path) = &target {
+                    // The same working-directory hazard as a relative alpha,
+                    // and the trap that catches unexpanded `~user` forms.
+                    if !path.is_absolute() {
+                        errors.push(format!(
+                            "group '{name}' beta '{beta}' must be an absolute (or ~-relative) \
+                             local path"
+                        ));
+                        continue;
+                    }
+                }
                 let host = match &target {
                     BetaTarget::Local(path) => path.to_string_lossy().into_owned(),
                     BetaTarget::Remote { destination, .. } => host_of(destination).to_owned(),
@@ -252,7 +284,7 @@ impl Config {
                 let (Some(mode), Some(alpha)) = (mode, alpha.clone()) else {
                     continue;
                 };
-                plans.push(SessionPlan {
+                let plan = SessionPlan {
                     group: name.clone(),
                     host,
                     alpha,
@@ -261,7 +293,16 @@ impl Config {
                     mode,
                     ignores: ignores.clone(),
                     interval,
-                });
+                };
+                if let Some(previous) = identifiers.insert(plan.identifier(), plan.display()) {
+                    errors.push(format!(
+                        "sessions '{previous}' and '{}' describe the same alpha and beta; \
+                         they would share session state and race each other",
+                        plan.display()
+                    ));
+                    continue;
+                }
+                plans.push(plan);
             }
         }
 
@@ -557,6 +598,89 @@ mod tests {
         );
         // Local betas never involve an agent.
         assert_eq!(plans[1].beta, BetaTarget::Local(PathBuf::from("/local")));
+    }
+
+    #[test]
+    fn duplicate_sessions_are_rejected() {
+        let config = parse(
+            r#"
+            [groups.one]
+            alpha = "/data"
+            mode = "two-way-safe"
+            betas = ["host:/mirror"]
+
+            [groups.two]
+            alpha = "/data"
+            mode = "one-way-replica"
+            betas = ["host:/mirror"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(
+            error.contains("describe the same alpha and beta"),
+            "{error}"
+        );
+        assert!(
+            error.contains("one@host") && error.contains("two@host"),
+            "{error}"
+        );
+
+        // The same beta listed twice within one group is caught as well.
+        let config = parse(
+            r#"
+            [groups.one]
+            alpha = "/data"
+            mode = "two-way-safe"
+            betas = ["host", "host"]
+            "#,
+        );
+        assert!(config.plans().is_err());
+    }
+
+    #[test]
+    fn relative_local_roots_are_rejected() {
+        let config = parse(
+            r#"
+            [groups.x]
+            alpha = "relative/alpha"
+            mode = "two-way-safe"
+            betas = ["./relative-beta", "~user/beta", "/absolute/beta"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(
+            error.contains("alpha 'relative/alpha' must be an absolute"),
+            "{error}"
+        );
+        assert!(
+            error.contains("'./relative-beta' must be an absolute"),
+            "{error}"
+        );
+        // The unexpanded ~user form is relative, so it's caught by the same
+        // check instead of silently becoming a working-directory child.
+        assert!(
+            error.contains("'~user/beta' must be an absolute"),
+            "{error}"
+        );
+        assert!(!error.contains("/absolute/beta"), "{error}");
+    }
+
+    #[test]
+    fn invalid_ignore_patterns_are_reported_with_the_other_errors() {
+        let config = parse(
+            r#"
+            [defaults]
+            ignores = ["[unclosed"]
+
+            [groups.x]
+            alpha = "/data"
+            mode = "sideways"
+            betas = ["host"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(error.contains("invalid ignore pattern"), "{error}");
+        assert!(error.contains("unknown mode"), "{error}");
     }
 
     #[test]

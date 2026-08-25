@@ -7,8 +7,9 @@
 //! other". The controller is the hub: endpoints never communicate directly,
 //! so either side may be local or remote.
 
-use std::fs;
-use std::path::PathBuf;
+use std::fs::{self, File};
+use std::os::unix::io::AsRawFd;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
@@ -78,6 +79,9 @@ pub struct Session {
     ancestor_path: PathBuf,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
+    /// The exclusive lock on the session state directory, held for the
+    /// session's lifetime (released when the file closes on drop).
+    _lock: File,
 }
 
 /// Computes a stable session identifier from the two endpoint
@@ -112,6 +116,7 @@ impl Session {
                 state_directory.display()
             )
         })?;
+        let lock = acquire_state_lock(&state_directory)?;
         let ancestor_path = state_directory.join("ancestor");
         let ancestor = load_ancestor(&ancestor_path)?;
         Ok(Session {
@@ -120,6 +125,7 @@ impl Session {
             mode,
             ancestor_path,
             ancestor,
+            _lock: lock,
         })
     }
 
@@ -360,6 +366,57 @@ fn one_side_emptied_root(
     alpha_empty != beta_empty
 }
 
+/// How long lock acquisition keeps retrying before concluding the session
+/// genuinely belongs to someone else. See [`acquire_state_lock`].
+const LOCK_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Acquires the exclusive advisory lock on a session state directory.
+///
+/// Two sessions over the same state would race each other's ancestor,
+/// staging, and status writes — with different modes, destructively. The
+/// lock makes that structurally impossible whether the second session comes
+/// from the same process (a duplicated configuration) or another one (two
+/// supervisors, or a supervisor plus a manual `sync`). Advisory `flock` is
+/// exactly right here: every path into the state directory goes through
+/// [`Session::new`], and the lock dies with its process, so a crash can
+/// never leave a stale lock behind.
+///
+/// Acquisition retries briefly before reporting a conflict: releasing a
+/// `flock` is delayed if a concurrently forked child (an agent or SSH
+/// subprocess spawned by another session's worker) inherited the lock file
+/// descriptor in the instant between fork and exec — the descriptors are
+/// close-on-exec, so the delay is microseconds, but a back-to-back
+/// release-and-reacquire can land inside it. A lock still held after the
+/// timeout is a real concurrent session, not that window.
+fn acquire_state_lock(state_directory: &Path) -> Result<File> {
+    let path = state_directory.join("lock");
+    let file = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("unable to open session lock {}", path.display()))?;
+    let deadline = std::time::Instant::now() + LOCK_ACQUISITION_TIMEOUT;
+    loop {
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(file);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error)
+                .with_context(|| format!("unable to lock session state {}", path.display()));
+        }
+        if std::time::Instant::now() >= deadline {
+            bail!(
+                "another autobahn process is already synchronizing this session \
+                 (state directory {})",
+                state_directory.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Loads a persisted ancestor, treating a missing file as an absent
 /// ancestor and failing on corruption (an unreadable ancestor must not be
 /// silently discarded, since that would resurrect deletions).
@@ -471,5 +528,52 @@ mod tests {
         let path = directory.path().join("ancestor");
         fs::write(&path, b"garbage").unwrap();
         assert!(load_ancestor(&path).is_err());
+    }
+
+    #[test]
+    fn a_state_directory_admits_only_one_session_at_a_time() {
+        use crate::endpoint::local::LocalEndpoint;
+        use crate::scan::IgnoreSet;
+
+        let keep = tempfile::tempdir().unwrap();
+        let state = keep.path().join("state");
+        let endpoint = |name: &str| -> Box<dyn crate::endpoint::Endpoint + Send> {
+            let root = keep.path().join(name);
+            fs::create_dir_all(&root).unwrap();
+            Box::new(
+                LocalEndpoint::new(
+                    root,
+                    keep.path().join(format!("staging-{name}")),
+                    IgnoreSet::new(&[]).unwrap(),
+                )
+                .unwrap(),
+            )
+        };
+
+        let held = Session::new(
+            endpoint("a1"),
+            endpoint("b1"),
+            SyncMode::TwoWaySafe,
+            state.clone(),
+        )
+        .expect("the first session should acquire the lock");
+
+        let error = Session::new(
+            endpoint("a2"),
+            endpoint("b2"),
+            SyncMode::TwoWaySafe,
+            state.clone(),
+        )
+        .err()
+        .expect("a concurrent session over the same state must be refused");
+        assert!(
+            format!("{error:#}").contains("another autobahn process"),
+            "{error:#}"
+        );
+
+        // Dropping the first session releases the lock.
+        drop(held);
+        Session::new(endpoint("a3"), endpoint("b3"), SyncMode::TwoWaySafe, state)
+            .expect("the lock should be free again");
     }
 }

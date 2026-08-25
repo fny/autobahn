@@ -359,6 +359,87 @@ fn an_unreachable_destination_does_not_block_other_sessions() {
 }
 
 #[test]
+fn a_status_recording_failure_fails_the_run() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "content");
+
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+
+    // Make status recording impossible: a regular file squats on the status
+    // directory's path.
+    fs::create_dir_all(world.state_root()).expect("state root should be creatable");
+    fs::write(world.state_root().join("status"), b"not a directory")
+        .expect("blocker should be writable");
+
+    let outcomes = world.run_once(plans);
+    let error = outcomes[0]
+        .result
+        .as_ref()
+        .expect_err("an unrecordable attempt must not report success");
+    assert!(error.contains("unable to record status"), "{error}");
+    // The synchronization itself did happen — only its recording failed.
+    assert_eq!(read(&beta, "file.txt"), "content");
+}
+
+#[test]
+fn concurrent_sessions_over_the_same_state_are_refused() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "content");
+
+    // Duplicate plans can't come from one configuration (plans() rejects
+    // them), so simulate two supervisor processes: two Supervisors over the
+    // same state root, one of whose workers already holds the session lock.
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+    let mut watch_plans = plans.clone();
+    watch_plans[0].interval = Duration::from_millis(30);
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(watch_plans, world.state_root(), false);
+        let stop = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop));
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("file.txt").exists()),
+            "the watcher should be running and synchronized"
+        );
+
+        // A second "process" attempting the same session is refused while
+        // the first holds the lock.
+        let outcomes = world.run_once(plans);
+        let error = outcomes[0]
+            .result
+            .as_ref()
+            .expect_err("the session lock must refuse a concurrent run");
+        assert!(error.contains("another autobahn process"), "{error}");
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("the watcher should stop cleanly");
+    });
+}
+
+#[test]
 fn a_missing_alpha_is_a_session_error_not_a_crash() {
     let world = World::new();
     let beta = world.directory("beta");

@@ -82,6 +82,7 @@ dependencies = [
  "blake3",
  "clap",
  "globset",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

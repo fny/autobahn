@@ -103,7 +103,10 @@ impl Connection {
     /// `BatchMode=yes` disables interactive prompting: password and
     /// passphrase prompts would otherwise compete with the protocol for the
     /// child's stdio, so key-based (or agent-based) authentication is
-    /// required.
+    /// required. The keepalive options bound how long a dead network can
+    /// hang a session mid-cycle: without them, a vanished peer could block a
+    /// protocol read indefinitely (the synchronous workers have no other way
+    /// to interrupt an in-flight cycle).
     ///
     /// [`RemoteEndpoint::connect`]: crate::endpoint::remote::RemoteEndpoint::connect
     pub fn ssh_argv(host: &str, remote_command: Option<&str>) -> Vec<String> {
@@ -111,6 +114,10 @@ impl Connection {
             "ssh".to_owned(),
             "-o".to_owned(),
             "BatchMode=yes".to_owned(),
+            "-o".to_owned(),
+            "ServerAliveInterval=15".to_owned(),
+            "-o".to_owned(),
+            "ServerAliveCountMax=4".to_owned(),
             host.to_owned(),
             remote_command.unwrap_or(DEFAULT_REMOTE_COMMAND).to_owned(),
         ]
@@ -135,15 +142,16 @@ impl Connection {
     /// output ensures it can't block writing to a pipe nobody is draining.
     /// The wait that follows is therefore expected to return promptly and is
     /// performed without a timeout.
-    pub fn close(self) -> Result<()> {
-        let Connection {
-            reader,
-            writer,
-            child,
-        } = self;
-        drop(writer);
-        drop(reader);
-        let Some(mut child) = child else {
+    pub fn close(mut self) -> Result<()> {
+        drop(std::mem::replace(
+            &mut self.writer,
+            Box::new(std::io::sink()),
+        ));
+        drop(std::mem::replace(
+            &mut self.reader,
+            Box::new(std::io::empty()),
+        ));
+        let Some(mut child) = self.child.take() else {
             return Ok(());
         };
         let status = match child.wait() {
@@ -159,6 +167,29 @@ impl Connection {
             bail!("the agent process exited with {status}");
         }
         Ok(())
+    }
+
+    /// Returns the process identifier of the owned child, if any.
+    #[cfg(test)]
+    pub(crate) fn child_id(&self) -> Option<u32> {
+        self.child.as_ref().map(std::process::Child::id)
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        // Last-resort cleanup for connections dropped without a graceful
+        // [`close`](Connection::close) — most notably when a handshake or
+        // initialization fails before a `RemoteEndpoint` (whose own drop
+        // closes the connection) ever exists. Without this, every failed
+        // connection attempt would leave a zombie (or a live orphan holding
+        // dead pipes), and a watch-mode retry loop would accumulate them
+        // indefinitely. The graceful path has already taken the child, so
+        // this kills only processes nothing else is responsible for.
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -598,19 +629,36 @@ pub(crate) mod tests {
 
     #[test]
     fn ssh_argv_defaults_to_the_agent_command() {
+        let argv = Connection::ssh_argv("host", None);
+        assert_eq!(argv[0], "ssh");
+        assert!(argv.contains(&"BatchMode=yes".to_owned()));
+        assert!(argv.contains(&"ServerAliveInterval=15".to_owned()));
+        assert_eq!(&argv[argv.len() - 2..], ["host", "autobahn agent"]);
+
+        let argv = Connection::ssh_argv("user@host", Some("/opt/bin/autobahn agent"));
         assert_eq!(
-            Connection::ssh_argv("host", None),
-            vec!["ssh", "-o", "BatchMode=yes", "host", "autobahn agent"]
+            &argv[argv.len() - 2..],
+            ["user@host", "/opt/bin/autobahn agent"]
         );
+    }
+
+    #[test]
+    fn dropping_an_unclosed_connection_reaps_the_child() {
+        // `cat` blocks on its standard input, standing in for an agent (or
+        // ssh) process whose handshake never completed. Dropping the
+        // connection without close() must terminate and reap it — this is
+        // the path taken whenever a connection attempt fails.
+        let connection = Connection::spawn(&["cat".to_owned()]).expect("cat should spawn");
+        let pid = connection.child_id().expect("the child id should be known") as i32;
         assert_eq!(
-            Connection::ssh_argv("user@host", Some("/opt/bin/autobahn agent")),
-            vec![
-                "ssh",
-                "-o",
-                "BatchMode=yes",
-                "user@host",
-                "/opt/bin/autobahn agent"
-            ]
+            unsafe { libc::kill(pid, 0) },
+            0,
+            "the child should be alive"
         );
+        drop(connection);
+        // The drop killed and reaped synchronously: the pid no longer
+        // refers to a process (or zombie) of ours.
+        let alive = unsafe { libc::kill(pid, 0) };
+        assert_eq!(alive, -1, "the child should be gone after the drop");
     }
 }

@@ -402,24 +402,47 @@ fn stage(
     source
         .supply_open(needs)
         .context("unable to open supply stream")?;
-    loop {
-        let frames = source
-            .supply_pull(SUPPLY_BATCH_SIZE)
-            .context("unable to pull file content")?;
-        if frames.is_empty() {
-            break;
+    // The pull and push halves run on separate threads with a small bounded
+    // buffer between them, so the source's reads overlap the destination's
+    // writes even when both endpoints share this process. (A remote
+    // destination additionally keeps its own window of pushed batches in
+    // flight, and stage_finish drains those acknowledgements.)
+    let (batches, staged) = std::sync::mpsc::sync_channel(1);
+    std::thread::scope(|scope| {
+        let pusher = scope.spawn(move || -> Result<()> {
+            while let Ok(frames) = staged.recv() {
+                destination
+                    .stage_push_nowait(frames)
+                    .context("unable to push file content")?;
+            }
+            destination
+                .stage_finish()
+                .context("unable to complete staging")
+        });
+        let mut pull_error = None;
+        loop {
+            match source.supply_pull(SUPPLY_BATCH_SIZE) {
+                Ok(frames) => {
+                    // Emptiness signals exhaustion; a send failure means the
+                    // pusher stopped early, and its error is reported below.
+                    if frames.is_empty() || batches.send(frames).is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    pull_error = Some(error.context("unable to pull file content"));
+                    break;
+                }
+            }
         }
-        // Pushes are pipelined: a remote destination keeps a window of
-        // batches in flight rather than paying a round trip per batch, and
-        // stage_finish drains the outstanding acknowledgements.
-        destination
-            .stage_push_nowait(frames)
-            .context("unable to push file content")?;
-    }
-    destination
-        .stage_finish()
-        .context("unable to complete staging")?;
-    Ok(())
+        // Closing the channel lets the pusher drain and finish.
+        drop(batches);
+        let pushed = pusher.join().expect("the staging pusher never panics");
+        match pull_error {
+            Some(error) => Err(error),
+            None => pushed,
+        }
+    })
 }
 
 /// Detects the emptied-root condition: the ancestor was a directory with

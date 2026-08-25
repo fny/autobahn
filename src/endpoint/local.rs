@@ -268,6 +268,23 @@ impl LocalEndpoint {
         index
     }
 
+    /// Reports whether the last scan recorded a regular file at a
+    /// root-relative path — the gate for base-signature computation, saving
+    /// a filesystem probe for every path known to hold nothing usable.
+    fn snapshot_records_file(&self, path: &str) -> bool {
+        let mut node = match self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
+            Some(root) => root,
+            None => return false,
+        };
+        for component in path.split('/') {
+            match node.child(component) {
+                Some(child) => node = child,
+                None => return false,
+            }
+        }
+        matches!(node.content, Content::File { .. })
+    }
+
     /// Attempts to satisfy a content request from a file that already exists
     /// in the root, streaming it into staging while digesting it. Returns
     /// whether the content was staged: a digest mismatch (the file changed
@@ -305,24 +322,117 @@ impl LocalEndpoint {
     /// the size of that file's *delta*, not the file), never more: the next
     /// file is only deltified once the previous one has been fully drained.
     fn buffer_delta(&self, need: &StagingNeed, pending: &mut VecDeque<TransferFrame>) {
-        let path = self.root.join(&need.request.path);
-        let error = match File::open(&path) {
-            Err(error) => Some(format!("unable to open {}: {error}", need.request.path)),
-            Ok(file) => match rsync::deltify(file, &need.signature, &mut |op| {
-                pending.push_back(TransferFrame::Op(op));
-                Ok(())
-            }) {
-                Ok(()) => None,
-                Err(error) => Some(format!(
-                    "unable to compute a delta for {}: {error:#}",
-                    need.request.path
-                )),
-            },
+        // The requested path supplies first; if it can't (vanished, become
+        // unreadable, or changed), any other scanned path recording the
+        // same digest holds identical content and is tried in its place —
+        // so one bad path never starves the paths that share its content.
+        // (The receiver verifies the digest regardless, so a stale
+        // candidate merely fails staging as it would have anyway.)
+        let error = match self.try_supply(&need.request.path, &need.signature, pending) {
+            Ok(()) => None,
+            Err(primary_error) => {
+                let recovered = self
+                    .digest_paths(&need.request.digest, &need.request.path)
+                    .into_iter()
+                    .any(|candidate| {
+                        self.try_supply(&candidate, &need.signature, pending)
+                            .is_ok()
+                    });
+                (!recovered).then_some(primary_error)
+            }
         };
         // A failed supply still terminates the file's stream, so that the
         // receiver discards its partial content and moves on rather than
         // desynchronizing from the need list.
         pending.push_back(TransferFrame::EndOfFile { error });
+    }
+
+    /// Attempts to supply one file's delta from a specific root-relative
+    /// path, buffering its operations. A failure removes whatever the
+    /// attempt buffered, leaving `pending` exactly as it was.
+    fn try_supply(
+        &self,
+        path: &str,
+        signature: &Signature,
+        pending: &mut VecDeque<TransferFrame>,
+    ) -> Result<(), String> {
+        let mark = pending.len();
+        let result = self.supply_from(path, signature, pending);
+        if result.is_err() {
+            pending.truncate(mark);
+        }
+        result
+    }
+
+    /// The single-path supply attempt behind [`try_supply`](Self::try_supply).
+    fn supply_from(
+        &self,
+        path: &str,
+        signature: &Signature,
+        pending: &mut VecDeque<TransferFrame>,
+    ) -> Result<(), String> {
+        let disk_path = self.root.join(path);
+        match File::open(&disk_path) {
+            Err(error) => Err(format!("unable to open {path}: {error}")),
+            // With no base to delta against the file streams through whole,
+            // read directly into owned operation-sized chunks — no shared
+            // scratch buffer to zero, no copy out of it, and no size probe.
+            // Files within the operation size limit (the vast majority)
+            // arrive as a single chunk.
+            Ok(mut file) if signature.is_empty() => loop {
+                let mut chunk = Vec::with_capacity(rsync::MAXIMUM_DATA_OPERATION_SIZE);
+                match Read::by_ref(&mut file)
+                    .take(rsync::MAXIMUM_DATA_OPERATION_SIZE as u64)
+                    .read_to_end(&mut chunk)
+                {
+                    Err(error) => break Err(format!("unable to read {path}: {error}")),
+                    Ok(0) => break Ok(()),
+                    Ok(read) => {
+                        // Small files would otherwise pin a full-sized
+                        // allocation through the batch pipeline.
+                        if read < rsync::MAXIMUM_DATA_OPERATION_SIZE / 2 {
+                            chunk.shrink_to_fit();
+                        }
+                        pending.push_back(TransferFrame::Op(rsync::Op::Data(chunk)));
+                    }
+                }
+            },
+            Ok(file) => rsync::deltify(file, signature, &mut |op| {
+                pending.push_back(TransferFrame::Op(op));
+                Ok(())
+            })
+            .map_err(|error| format!("unable to compute a delta for {path}: {error:#}")),
+        }
+    }
+
+    /// Collects every root-relative path (other than the excluded one) whose
+    /// scanned content records the given digest. Only consulted when a
+    /// supply attempt fails, so the walk stays off the hot path.
+    fn digest_paths(&self, digest: &Digest, exclude: &str) -> Vec<String> {
+        fn collect(
+            node: &Node,
+            path: &str,
+            digest: &Digest,
+            exclude: &str,
+            paths: &mut Vec<String>,
+        ) {
+            match &node.content {
+                Content::File {
+                    digest: recorded, ..
+                } if recorded == digest && path != exclude => paths.push(path.to_owned()),
+                Content::Directory(children) => {
+                    for child in children.iter() {
+                        collect(child, &path_join(path, &child.name), digest, exclude, paths);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut paths = Vec::new();
+        if let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
+            collect(root, "", digest, exclude, &mut paths);
+        }
+        paths
     }
 
     /// Applies a batch of transfer frames to the receive state.
@@ -386,13 +496,21 @@ impl LocalEndpoint {
         let temporary = self.staging_root.join(temporary_name("recv"));
         let output = File::create(&temporary)
             .with_context(|| format!("unable to create {}", temporary.display()))?;
-        let target = self.root.join(&need.request.path);
-        let base = match fs::symlink_metadata(&target) {
-            Ok(metadata) if metadata.file_type().is_file() => match File::open(&target) {
-                Ok(file) => PatchBase::File(file),
-                Err(_) => PatchBase::empty(),
-            },
-            _ => PatchBase::empty(),
+        // An empty signature means the delta can only carry literal data —
+        // no block operation can reference a base — so the target needn't
+        // be probed or opened at all (the common case on a cold
+        // destination).
+        let base = if need.signature.is_empty() {
+            PatchBase::empty()
+        } else {
+            let target = self.root.join(&need.request.path);
+            match fs::symlink_metadata(&target) {
+                Ok(metadata) if metadata.file_type().is_file() => match File::open(&target) {
+                    Ok(file) => PatchBase::File(file),
+                    Err(_) => PatchBase::empty(),
+                },
+                _ => PatchBase::empty(),
+            }
         };
         Ok(ReceiveFile {
             temporary,
@@ -474,16 +592,13 @@ impl Endpoint for LocalEndpoint {
 
         // Persist the cache when the hierarchy actually changed (an
         // unchanged scan shares its root storage with the baseline, so the
-        // comparison is a pointer check, not a tree walk), and always after
-        // a cold-start load — the freshly written file then reflects this
-        // process's scan rather than whatever a previous process (or
-        // corruption) left behind.
-        if cached.is_some()
-            || !roots_share_storage(
-                baseline.and_then(|snapshot| snapshot.root.as_ref()),
-                snapshot.root.as_ref(),
-            )
-        {
+        // comparison is a pointer check, not a tree walk). A cold-start scan
+        // that adopted the loaded cache's storage unchanged needs no rewrite
+        // either: the file on disk already describes exactly this hierarchy.
+        if !roots_share_storage(
+            baseline.and_then(|snapshot| snapshot.root.as_ref()),
+            snapshot.root.as_ref(),
+        ) {
             self.store_scan_cache(&snapshot);
         }
 
@@ -505,14 +620,33 @@ impl Endpoint for LocalEndpoint {
             state.discard();
         }
 
+        // One directory read inventories what previous cycles left staged,
+        // replacing a per-request stat (on a cold destination, 40k stats
+        // against an empty directory).
+        let mut staged: std::collections::HashSet<String> = fs::read_dir(&self.staging_root)
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| entry.ok())
+                    .filter_map(|entry| entry.file_name().into_string().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+
         // The local-content index is only built if a request actually misses
         // staging, and only once per staging operation.
         let mut index: Option<HashMap<Digest, String>> = None;
         let mut needs = Vec::new();
         for request in files {
-            // Already staged, either by an earlier request in this batch or
-            // by an interrupted previous cycle.
-            if fs::symlink_metadata(self.staged_path(&request.digest)).is_ok() {
+            // Already staged by an interrupted previous cycle, satisfied
+            // locally earlier in this batch, or already scheduled for
+            // transfer by an earlier request (staging is content-addressed,
+            // so one transfer serves every path sharing the digest). If the
+            // one scheduled transfer then fails, the digest's paths go
+            // unpublished this cycle — but the transition reports the
+            // missing content, and the immediate follow-up cycle re-plans
+            // from fresh scans, which drops any vanished or changed source
+            // path from consideration.
+            if !staged.insert(digest_hex(&request.digest)) {
                 continue;
             }
 
@@ -533,8 +667,15 @@ impl Endpoint for LocalEndpoint {
 
             // The content has to be transferred, so describe whatever base
             // content exists at the target path for the source to delta
-            // against.
-            let signature = base_signature(&self.root.join(&request.path));
+            // against. The last scan already knows whether the path holds a
+            // regular file; anything else yields an empty signature without
+            // touching the filesystem (the common case on a cold
+            // destination).
+            let signature = if self.snapshot_records_file(&request.path) {
+                base_signature(&self.root.join(&request.path))
+            } else {
+                Signature::default()
+            };
             needs.push(StagingNeed { request, signature });
         }
 
@@ -639,9 +780,8 @@ impl Endpoint for LocalEndpoint {
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
         // Validation is performed against the last scan, which the
         // controller's cycle guarantees is the very scan these transitions
-        // were reconciled from. The snapshot is deliberately *not* updated
-        // here: the next scan is what re-establishes the record, and a
-        // half-updated record would be worse than a stale one.
+        // were reconciled from. (The snapshot is refreshed only *after* all
+        // changes are applied, from the achieved results — see below.)
         // Count how many publishes each staged digest could at most serve
         // in this batch, so that a digest's final publish can move the
         // staged file into place instead of copying it — halving the write
@@ -670,12 +810,77 @@ impl Endpoint for LocalEndpoint {
             // must never abort the rest of the transition.
             results.push(transitioner.apply(change));
         }
-        Ok(TransitionOutcome {
+        let outcome = TransitionOutcome {
             results,
             problems: transitioner.problems,
             missing_staged_files: transitioner.missing_staged_files,
-        })
+        };
+
+        // Fold the achieved results into the retained snapshot and its
+        // persisted cache. The results carry the metadata of the entries as
+        // created, so the next scan (in this process or the next) re-digests
+        // only what changed *after* the transition instead of treating every
+        // published file as unknown — on a large cold sync, that's the
+        // difference between a metadata sweep and rehashing the whole tree.
+        // Refusals and partial applications are safe to fold too: they
+        // describe what is actually on disk.
+        if let Some(snapshot) = self.last_snapshot.as_mut() {
+            let achieved: Vec<Change> = transitions
+                .iter()
+                .zip(outcome.results.iter())
+                .map(|(transition, result)| Change {
+                    path: transition.path.clone(),
+                    old: None,
+                    new: result.clone(),
+                })
+                .collect();
+            match crate::tree::apply(snapshot.root.as_ref(), &achieved) {
+                Ok(root) => {
+                    snapshot.root = root;
+                    recount(snapshot);
+                    let snapshot = snapshot.clone();
+                    self.store_scan_cache(&snapshot);
+                }
+                // A graft failure (which real transition results shouldn't
+                // produce) just drops the baseline, degrading the next scan
+                // to a full walk.
+                Err(_) => self.last_snapshot = None,
+            }
+        }
+        Ok(outcome)
     }
+}
+
+/// Recomputes a snapshot's statistics from its hierarchy, mirroring the
+/// scanner's counting: every synchronizable directory (the root included),
+/// file, and symbolic link.
+fn recount(snapshot: &mut Snapshot) {
+    fn count(node: &Node, tallies: &mut (u64, u64, u64, u64)) {
+        match &node.content {
+            Content::Directory(children) => {
+                tallies.0 += 1;
+                for child in children.iter() {
+                    count(child, tallies);
+                }
+            }
+            Content::File { metadata, .. } => {
+                tallies.1 += 1;
+                tallies.3 += metadata.size;
+            }
+            Content::Symlink { .. } => tallies.2 += 1,
+            _ => {}
+        }
+    }
+    let mut tallies = (0, 0, 0, 0);
+    if let Some(root) = &snapshot.root {
+        count(root, &mut tallies);
+    }
+    (
+        snapshot.directories,
+        snapshot.files,
+        snapshot.symlinks,
+        snapshot.total_file_size,
+    ) = tallies;
 }
 
 /// The state of an open supply stream: the needs being supplied, the index of
@@ -1125,12 +1330,13 @@ impl Transitioner<'_> {
         created
     }
 
-    /// Publishes staged content at a target path: bring the staged file to a
-    /// temporary beside the target, set its permissions, then rename it into
-    /// place. Copying keeps the staged content available for other paths that
-    /// share it, so a digest's final use moves instead (falling back to a
-    /// copy across filesystems), and the rename makes the target's transition
-    /// from old content to new atomic.
+    /// Publishes staged content at a target path. A digest's last use sets
+    /// the staged file's permissions in place and renames it directly onto
+    /// the target — two syscalls, no data movement. Earlier uses (and
+    /// cross-filesystem staging roots, where the rename fails) copy to a
+    /// temporary beside the target and rename that into place, keeping the
+    /// staged content available for the paths that still share it. Either
+    /// way the target's transition from old content to new is atomic.
     fn publish_file(
         &mut self,
         path: &str,
@@ -1140,19 +1346,7 @@ impl Transitioner<'_> {
         executable: bool,
     ) -> Option<FileMetadata> {
         let staged = staged_path(self.staging_root, digest);
-        if fs::symlink_metadata(&staged).is_err() {
-            // The content was staged (or should have been) and has since
-            // vanished, or the source couldn't supply it. Either way the
-            // controller runs another cycle immediately.
-            self.missing_staged_files = true;
-            self.problem(
-                path,
-                "staged content is unavailable; it will be retransferred on the next cycle",
-            );
-            return None;
-        }
-
-        let temporary = parent.join(temporary_name("apply"));
+        let mode = creation_mode(self.file_mode, executable);
         let last_use = match self.staged_uses.get_mut(digest) {
             Some(count) => {
                 *count = count.saturating_sub(1);
@@ -1160,26 +1354,49 @@ impl Transitioner<'_> {
             }
             None => false,
         };
-        let moved = last_use && fs::rename(&staged, &temporary).is_ok();
+
+        // A missing staged file surfaces as NotFound from whichever
+        // operation touches it first: the content was never supplied or has
+        // since vanished, and the controller runs another cycle immediately.
+        let missing = |error: &io::Error| error.kind() == ErrorKind::NotFound;
+
+        let moved = last_use
+            && fs::set_permissions(&staged, Permissions::from_mode(mode)).is_ok()
+            && fs::rename(&staged, target).is_ok();
         if !moved {
+            let temporary = parent.join(temporary_name("apply"));
             if let Err(error) = fs::copy(&staged, &temporary) {
                 let _ = fs::remove_file(&temporary);
-                self.problem(path, format!("unable to stage content into place: {error}"));
+                // NotFound can also mean the target's parent vanished
+                // concurrently, so the staged side is confirmed missing
+                // (specifically absent, not merely unprobeable) before
+                // scheduling a retransfer.
+                let staged_absent = matches!(
+                    fs::symlink_metadata(&staged),
+                    Err(ref probe) if probe.kind() == ErrorKind::NotFound
+                );
+                if missing(&error) && staged_absent {
+                    self.missing_staged_files = true;
+                    self.problem(
+                        path,
+                        "staged content is unavailable; it will be retransferred on the next \
+                         cycle",
+                    );
+                } else {
+                    self.problem(path, format!("unable to stage content into place: {error}"));
+                }
                 return None;
             }
-        }
-        // On failure past this point a moved file is returned to staging
-        // (best-effort), so the content needn't be retransferred.
-        let mode = creation_mode(self.file_mode, executable);
-        if let Err(error) = fs::set_permissions(&temporary, Permissions::from_mode(mode)) {
-            self.unpublish(moved, &temporary, &staged);
-            self.problem(path, format!("unable to set file permissions: {error}"));
-            return None;
-        }
-        if let Err(error) = fs::rename(&temporary, target) {
-            self.unpublish(moved, &temporary, &staged);
-            self.problem(path, format!("unable to publish content: {error}"));
-            return None;
+            if let Err(error) = fs::set_permissions(&temporary, Permissions::from_mode(mode)) {
+                let _ = fs::remove_file(&temporary);
+                self.problem(path, format!("unable to set file permissions: {error}"));
+                return None;
+            }
+            if let Err(error) = fs::rename(&temporary, target) {
+                let _ = fs::remove_file(&temporary);
+                self.problem(path, format!("unable to publish content: {error}"));
+                return None;
+            }
         }
 
         // The metadata recorded on the result node comes from the file as it
@@ -1191,14 +1408,6 @@ impl Transitioner<'_> {
                 self.problem(path, format!("unable to probe the created file: {error}"));
                 Some(FileMetadata::default())
             }
-        }
-    }
-
-    /// Disposes of a publish temporary after a failure: a moved staged file
-    /// goes back to staging (best-effort), a copy is simply removed.
-    fn unpublish(&self, moved: bool, temporary: &Path, staged: &Path) {
-        if !moved || fs::rename(temporary, staged).is_err() {
-            let _ = fs::remove_file(temporary);
         }
     }
 
@@ -1533,13 +1742,18 @@ fn count_staged_uses(node: &Node, uses: &mut HashMap<Digest, usize>) {
     }
 }
 
-fn staged_path(staging_root: &Path, digest: &Digest) -> PathBuf {
+/// Renders a digest as the lowercase hex name its staged content lives under.
+fn digest_hex(digest: &Digest) -> String {
     use std::fmt::Write;
     let mut name = String::with_capacity(digest.len() * 2);
     for byte in digest {
         let _ = write!(name, "{byte:02x}");
     }
-    staging_root.join(name)
+    name
+}
+
+fn staged_path(staging_root: &Path, digest: &Digest) -> PathBuf {
+    staging_root.join(digest_hex(digest))
 }
 
 /// Generates a unique temporary file name carrying the scan-invisible prefix.
@@ -1817,6 +2031,53 @@ mod tests {
             leftovers.is_empty(),
             "staged content remained: {leftovers:?}"
         );
+    }
+
+    #[test]
+    fn supply_recovers_from_an_alternate_path_sharing_the_digest() {
+        let mut fixture = Fixture::new();
+        write(&fixture.alpha_root, "a.txt", "shared content");
+        write(&fixture.alpha_root, "b.txt", "shared content");
+        let transitions = fixture.beta_transitions();
+        // The first path vanishes after the scan; its content must still
+        // be supplied from the surviving duplicate.
+        fs::remove_file(fixture.alpha_root.join("a.txt")).expect("file should be removable");
+        fixture.stage(&transitions);
+        let outcome = fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert!(!outcome.missing_staged_files);
+        assert_eq!(read(&fixture.beta_root, "a.txt"), "shared content");
+        assert_eq!(read(&fixture.beta_root, "b.txt"), "shared content");
+    }
+
+    #[test]
+    fn transition_folds_achieved_results_into_the_snapshot() {
+        let mut fixture = Fixture::new();
+        write(&fixture.alpha_root, "a.txt", "alpha content");
+        write(&fixture.alpha_root, "dir/b.txt", "nested content");
+
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should succeed");
+
+        // The retained snapshot describes the achieved state — counters
+        // included — and agrees with what a fresh scan observes, which is
+        // what lets that scan skip re-digesting the published content.
+        let retained = fixture
+            .beta
+            .last_snapshot
+            .clone()
+            .expect("a snapshot should be retained");
+        assert_eq!(retained.files, 2);
+        assert_eq!(retained.directories, 2);
+        let rescanned = fixture.beta.scan().expect("scan should succeed");
+        assert!(retained.content_equal(&rescanned));
     }
 
     #[test]

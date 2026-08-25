@@ -78,7 +78,9 @@ pub struct TransitionOutcome {
 /// on the destination (which filters out already-staged content and returns
 /// signatures for the rest), `supply_open` on the source, then pumps batches
 /// from `supply_pull` into `stage_push` until the source reports exhaustion.
-pub trait Endpoint {
+/// Endpoints are `Send` so the controller can drive the two sides of that
+/// pump from separate threads.
+pub trait Endpoint: Send {
     /// Performs a filesystem scan, returning the current snapshot. Endpoints
     /// accelerate rescans internally (via node-resident metadata from prior
     /// snapshots); callers just get a fresh, consistent snapshot.

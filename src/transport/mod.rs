@@ -240,7 +240,11 @@ fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
         .join("staging")
         .join(&initialize.session);
     let ignores = IgnoreSet::new(&initialize.ignores).context("unable to compile ignores")?;
-    LocalEndpoint::new(PathBuf::from(&initialize.root), staging_root, ignores)
+    // Expand a home-relative root against this agent's home directory, so
+    // that a configuration like `alpha = "~/project"` fanned out to several
+    // hosts lands in each host's own home rather than a literal `~`.
+    let root = crate::paths::expand_tilde(&initialize.root)?;
+    LocalEndpoint::new(root, staging_root, ignores)
         .with_context(|| format!("unable to create an endpoint for {}", initialize.root))
 }
 

@@ -34,6 +34,51 @@ Remote roots use scp-style `[user@]host:path` syntax and require `autobahn`
 stdio. There is no daemon; state (the synchronization ancestor and staged
 content) lives under `~/.autobahn/sessions/<session-id>`.
 
+### Supervising many sessions
+
+For more than a one-off sync, a declarative configuration fans **groups** —
+one local alpha directory each — out to any number of destinations, and a
+supervisor runs every resulting session in parallel:
+
+```toml
+# ~/.config/autobahn/config.toml
+# Top-level keys (like `disabled`) must precede the first section header.
+disabled = ["flaky.example.com"]
+
+[defaults]
+mode = "two-way-safe"
+ignores = [".git"]
+interval = 5            # seconds between cycles
+
+[groups.project]
+alpha = "~/project"
+ignores = ["target"]
+betas = ["build.example.com", "user@lab.example.com:/srv/project"]
+
+[groups.dotfiles]
+alpha = "~/.config/shell"
+mode = "one-way-replica"
+betas = ["build.example.com", "/mnt/backup/shell"]
+```
+
+```sh
+autobahn up             # supervise every configured session continuously
+autobahn up --once      # one pass over every session, then exit
+autobahn status         # recorded state of every session, grouped by group
+autobahn status project # ... filtered to one group (optionally + host)
+```
+
+A beta is remote (`[user@]host[:path]`) unless it visibly denotes a local
+path (a leading `.`, `/`, or `~`, or a `/` before any `:`). A remote beta
+without a path inherits the group's alpha path as written, so a
+home-relative alpha resolves against each remote host's own home. The
+configuration is the source of truth: there is no session registry to drift
+from it, and no reachability probe to go stale — a session whose destination
+is down simply fails its cycle, backs off exponentially, and heals the
+moment the host answers again, without affecting its siblings. Each session
+records its state to `~/.autobahn/status/` after every attempt, which is
+what `status` reads (from any process, running supervisor or not).
+
 ### Synchronization modes
 
 | Mode | Behavior |

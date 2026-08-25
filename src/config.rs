@@ -1,0 +1,574 @@
+//! The groups configuration: a declarative description of synchronization
+//! sessions, organized as groups that fan one local directory (the alpha)
+//! out to any number of destinations (the betas).
+//!
+//! The configuration is the source of truth: the supervisor derives its
+//! session list from it on every start, so what is running is always what
+//! the file says (there is no imperative session registry to drift from it).
+//! A minimal configuration looks like:
+//!
+//! ```toml
+//! # Top-level keys (like `disabled`) must precede the first section header.
+//! disabled = ["flaky.example.com"]
+//!
+//! [defaults]
+//! mode = "two-way-safe"
+//! ignores = [".git"]
+//! interval = 5
+//!
+//! [groups.project]
+//! alpha = "~/project"
+//! betas = ["build.example.com", "user@lab.example.com:/srv/project"]
+//!
+//! [groups.dotfiles]
+//! alpha = "~/.config/shell"
+//! mode = "one-way-replica"
+//! betas = ["build.example.com", "/mnt/backup/shell"]
+//! ```
+//!
+//! A beta is **remote** unless it visibly denotes a local path: an entry
+//! containing a `/` before any `:`, or beginning with `.`, `/`, or `~`, is a
+//! local path; anything else is `[user@]host[:path]`. A remote beta without
+//! an explicit path inherits the group's alpha path *as written* (so a
+//! home-relative alpha resolves against each remote host's own home).
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::{bail, Context, Result};
+use serde::Deserialize;
+
+use crate::paths::expand_tilde;
+use crate::session::session_identifier;
+use crate::tree::SyncMode;
+
+/// The synchronization interval used when neither a group nor the defaults
+/// specify one.
+pub const DEFAULT_INTERVAL_SECONDS: u64 = 5;
+
+/// The parsed configuration file.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// Settings inherited by every group.
+    #[serde(default)]
+    pub defaults: Defaults,
+    /// Hosts excluded from every group's betas.
+    #[serde(default)]
+    pub disabled: Vec<String>,
+    /// The synchronization groups, keyed by name.
+    #[serde(default)]
+    pub groups: BTreeMap<String, Group>,
+}
+
+/// Settings inherited by every group (each overridable per group).
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Defaults {
+    /// The default synchronization mode.
+    pub mode: Option<String>,
+    /// Ignore patterns prepended to every group's own.
+    #[serde(default)]
+    pub ignores: Vec<String>,
+    /// The default interval, in seconds, between synchronization cycles.
+    pub interval: Option<u64>,
+}
+
+/// One synchronization group: a local alpha directory fanned out to one or
+/// more beta destinations.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Group {
+    /// The alpha synchronization root (a local path; `~` is expanded).
+    pub alpha: String,
+    /// The beta destinations (remote `[user@]host[:path]` or local paths).
+    #[serde(default)]
+    pub betas: Vec<String>,
+    /// The synchronization mode (falls back to the defaults).
+    pub mode: Option<String>,
+    /// Ignore patterns, appended to the defaults' patterns.
+    #[serde(default)]
+    pub ignores: Vec<String>,
+    /// The interval, in seconds, between cycles (falls back to the defaults).
+    pub interval: Option<u64>,
+    /// Advanced: connect this group's remote betas through this command
+    /// (whitespace split into argv) instead of SSH. Used for testing and
+    /// custom transports; the beta's host is then informational only.
+    pub agent_command: Option<String>,
+}
+
+/// One planned session: a fully resolved (group, beta) pair, ready for the
+/// supervisor to run.
+#[derive(Clone, Debug)]
+pub struct SessionPlan {
+    /// The name of the group the session belongs to.
+    pub group: String,
+    /// The destination label: the remote host, or the local beta path.
+    pub host: String,
+    /// The alpha root, tilde-expanded.
+    pub alpha: PathBuf,
+    /// The alpha root as written in the configuration (used for session
+    /// identity and for remote path inheritance).
+    pub alpha_spec: String,
+    /// The beta destination.
+    pub beta: BetaTarget,
+    /// The synchronization mode.
+    pub mode: SyncMode,
+    /// The combined ignore patterns (defaults first, then the group's).
+    pub ignores: Vec<String>,
+    /// The interval between synchronization cycles.
+    pub interval: Duration,
+}
+
+/// A resolved beta destination.
+#[derive(Clone, Debug, PartialEq)]
+pub enum BetaTarget {
+    /// A local directory (tilde-expanded).
+    Local(PathBuf),
+    /// A remote root reached through an agent.
+    Remote {
+        /// The SSH destination (`host` or `user@host`).
+        destination: String,
+        /// The root path on the remote side (possibly home-relative; the
+        /// agent expands it against its own home).
+        path: String,
+        /// An agent command overriding SSH (whitespace-split argv).
+        agent_command: Option<Vec<String>>,
+    },
+}
+
+impl SessionPlan {
+    /// Returns the display name of the session (`group@host`).
+    pub fn display(&self) -> String {
+        format!("{}@{}", self.group, self.host)
+    }
+
+    /// Returns the beta specification string used for session identity.
+    pub fn beta_spec(&self) -> String {
+        match &self.beta {
+            BetaTarget::Local(path) => path.to_string_lossy().into_owned(),
+            BetaTarget::Remote {
+                destination, path, ..
+            } => format!("{destination}:{path}"),
+        }
+    }
+
+    /// Returns the stable identifier isolating this session's state.
+    pub fn identifier(&self) -> String {
+        session_identifier(&self.alpha_spec, &self.beta_spec())
+    }
+}
+
+impl Config {
+    /// Loads and parses a configuration file.
+    pub fn load(path: &std::path::Path) -> Result<Config> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("unable to read configuration {}", path.display()))?;
+        toml::from_str(&text)
+            .with_context(|| format!("unable to parse configuration {}", path.display()))
+    }
+
+    /// Derives the session plans this configuration describes, excluding
+    /// disabled hosts. Every problem in the configuration is reported, not
+    /// just the first.
+    pub fn plans(&self) -> Result<Vec<SessionPlan>> {
+        let mut errors = Vec::new();
+        let mut plans = Vec::new();
+
+        for (name, group) in &self.groups {
+            let mode = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
+                Some(mode) => match parse_mode(mode) {
+                    Ok(mode) => Some(mode),
+                    Err(message) => {
+                        errors.push(format!("group '{name}': {message}"));
+                        None
+                    }
+                },
+                None => {
+                    errors.push(format!(
+                        "group '{name}' has no mode and the defaults specify none"
+                    ));
+                    None
+                }
+            };
+            if group.alpha.is_empty() {
+                errors.push(format!("group '{name}' has an empty alpha"));
+            }
+            if group.betas.is_empty() {
+                errors.push(format!("group '{name}' has no betas"));
+            }
+            let alpha = match expand_tilde(&group.alpha) {
+                Ok(alpha) => Some(alpha),
+                Err(error) => {
+                    errors.push(format!("group '{name}': {error:#}"));
+                    None
+                }
+            };
+            let agent_command = match &group.agent_command {
+                None => None,
+                Some(command) => {
+                    let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+                    if argv.is_empty() {
+                        errors.push(format!("group '{name}' has an empty agent_command"));
+                        None
+                    } else {
+                        Some(argv)
+                    }
+                }
+            };
+
+            let mut ignores = self.defaults.ignores.clone();
+            ignores.extend(group.ignores.iter().cloned());
+            let interval = Duration::from_secs(
+                group
+                    .interval
+                    .or(self.defaults.interval)
+                    .unwrap_or(DEFAULT_INTERVAL_SECONDS)
+                    .max(1),
+            );
+
+            for beta in &group.betas {
+                if beta.is_empty() {
+                    errors.push(format!("group '{name}' has an empty beta"));
+                    continue;
+                }
+                let target = match parse_beta(beta, &group.alpha, agent_command.clone()) {
+                    Ok(target) => target,
+                    Err(message) => {
+                        errors.push(format!("group '{name}' beta '{beta}': {message}"));
+                        continue;
+                    }
+                };
+                let host = match &target {
+                    BetaTarget::Local(path) => path.to_string_lossy().into_owned(),
+                    BetaTarget::Remote { destination, .. } => host_of(destination).to_owned(),
+                };
+                if let BetaTarget::Remote { .. } = &target {
+                    if self.disabled.iter().any(|disabled| disabled == &host) {
+                        continue;
+                    }
+                }
+                let (Some(mode), Some(alpha)) = (mode, alpha.clone()) else {
+                    continue;
+                };
+                plans.push(SessionPlan {
+                    group: name.clone(),
+                    host,
+                    alpha,
+                    alpha_spec: group.alpha.clone(),
+                    beta: target,
+                    mode,
+                    ignores: ignores.clone(),
+                    interval,
+                });
+            }
+        }
+
+        if !errors.is_empty() {
+            bail!("invalid configuration:\n  {}", errors.join("\n  "));
+        }
+        Ok(plans)
+    }
+}
+
+/// Parses a synchronization mode name.
+pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
+    match mode {
+        "two-way-safe" => Ok(SyncMode::TwoWaySafe),
+        "two-way-resolved" => Ok(SyncMode::TwoWayResolved),
+        "one-way-safe" => Ok(SyncMode::OneWaySafe),
+        "one-way-replica" => Ok(SyncMode::OneWayReplica),
+        other => Err(format!(
+            "unknown mode '{other}' (expected one of: one-way-replica, one-way-safe, \
+             two-way-resolved, two-way-safe)"
+        )),
+    }
+}
+
+/// Returns the canonical name of a synchronization mode.
+pub fn mode_name(mode: SyncMode) -> &'static str {
+    match mode {
+        SyncMode::TwoWaySafe => "two-way-safe",
+        SyncMode::TwoWayResolved => "two-way-resolved",
+        SyncMode::OneWaySafe => "one-way-safe",
+        SyncMode::OneWayReplica => "one-way-replica",
+    }
+}
+
+/// Indicates whether or not a beta entry denotes a local path (rather than a
+/// remote host): it does when it visibly looks like one — a `/` before any
+/// `:`, or a leading `.`, `/`, or `~`.
+fn is_local(beta: &str) -> bool {
+    if beta.starts_with('.') || beta.starts_with('/') || beta.starts_with('~') {
+        return true;
+    }
+    match (beta.find('/'), beta.find(':')) {
+        (Some(_), None) => true,
+        (Some(slash), Some(colon)) => slash < colon,
+        _ => false,
+    }
+}
+
+/// Parses one beta entry against its group's alpha (whose path a remote
+/// entry inherits when it specifies none).
+fn parse_beta(
+    beta: &str,
+    alpha: &str,
+    agent_command: Option<Vec<String>>,
+) -> Result<BetaTarget, String> {
+    if is_local(beta) {
+        let path = expand_tilde(beta).map_err(|error| format!("{error:#}"))?;
+        return Ok(BetaTarget::Local(path));
+    }
+    let (destination, path) = match beta.find(':') {
+        Some(colon) => {
+            let path = &beta[colon + 1..];
+            if path.is_empty() {
+                return Err("empty path after ':'".into());
+            }
+            (&beta[..colon], path.to_owned())
+        }
+        None => (beta, alpha.to_owned()),
+    };
+    if destination.is_empty() || host_of(destination).is_empty() {
+        return Err("empty host".into());
+    }
+    Ok(BetaTarget::Remote {
+        destination: destination.to_owned(),
+        path,
+        agent_command,
+    })
+}
+
+/// Extracts the host from an SSH destination (`host` or `user@host`).
+fn host_of(destination: &str) -> &str {
+    match destination.rfind('@') {
+        Some(at) => &destination[at + 1..],
+        None => destination,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Config {
+        toml::from_str(text).expect("configuration should parse")
+    }
+
+    #[test]
+    fn a_full_configuration_produces_the_expected_plans() {
+        let config = parse(
+            r#"
+            disabled = ["down.example.com"]
+
+            [defaults]
+            mode = "two-way-safe"
+            ignores = [".git"]
+            interval = 30
+
+            [groups.project]
+            alpha = "~/project"
+            ignores = ["*.tmp"]
+            betas = [
+                "build.example.com",
+                "user@lab.example.com:/srv/project",
+                "down.example.com",
+            ]
+
+            [groups.backup]
+            alpha = "/data"
+            mode = "one-way-replica"
+            interval = 300
+            betas = ["/mnt/backup/data"]
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(plans.len(), 3);
+
+        // Groups iterate in name order (backup before project).
+        assert_eq!(plans[0].display(), "backup@/mnt/backup/data");
+        assert_eq!(plans[0].mode, SyncMode::OneWayReplica);
+        assert_eq!(plans[0].interval, Duration::from_secs(300));
+        assert_eq!(
+            plans[0].beta,
+            BetaTarget::Local(PathBuf::from("/mnt/backup/data"))
+        );
+        // The defaults' ignores apply even where the group adds none.
+        assert_eq!(plans[0].ignores, vec![".git".to_owned()]);
+
+        assert_eq!(plans[1].display(), "project@build.example.com");
+        assert_eq!(plans[1].mode, SyncMode::TwoWaySafe);
+        assert_eq!(plans[1].interval, Duration::from_secs(30));
+        assert_eq!(
+            plans[1].ignores,
+            vec![".git".to_owned(), "*.tmp".to_owned()]
+        );
+        // A remote beta without a path inherits the alpha as written, so it
+        // resolves against the remote home.
+        assert_eq!(
+            plans[1].beta,
+            BetaTarget::Remote {
+                destination: "build.example.com".into(),
+                path: "~/project".into(),
+                agent_command: None,
+            }
+        );
+
+        assert_eq!(plans[2].display(), "project@lab.example.com");
+        assert_eq!(
+            plans[2].beta,
+            BetaTarget::Remote {
+                destination: "user@lab.example.com".into(),
+                path: "/srv/project".into(),
+                agent_command: None,
+            }
+        );
+
+        // The disabled host appears in no plan.
+        assert!(plans.iter().all(|plan| plan.host != "down.example.com"));
+    }
+
+    #[test]
+    fn beta_entries_are_classified_as_local_or_remote() {
+        let local = |beta: &str| {
+            matches!(
+                parse_beta(beta, "~/x", None).expect("should parse"),
+                BetaTarget::Local(_)
+            )
+        };
+        assert!(local("/absolute/path"));
+        assert!(local("./relative"));
+        assert!(local("~/home/relative"));
+        assert!(local("some/relative/path"));
+        assert!(!local("host"));
+        assert!(!local("host.example.com"));
+        assert!(!local("user@host"));
+        assert!(!local("host:/path"));
+        assert!(!local("user@host:path/with/slashes"));
+    }
+
+    #[test]
+    fn malformed_beta_entries_are_rejected() {
+        assert!(parse_beta("host:", "~/x", None).is_err());
+        assert!(parse_beta(":path", "~/x", None).is_err());
+        assert!(parse_beta("user@:path", "~/x", None).is_err());
+    }
+
+    #[test]
+    fn session_identity_is_stable_and_distinct() {
+        let config = parse(
+            r#"
+            [groups.a]
+            alpha = "~/x"
+            mode = "two-way-safe"
+            betas = ["host1", "host2"]
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(plans[0].identifier(), plans[0].identifier());
+        assert_ne!(plans[0].identifier(), plans[1].identifier());
+    }
+
+    #[test]
+    fn every_configuration_problem_is_reported_at_once() {
+        let config = parse(
+            r#"
+            [groups.first]
+            alpha = "~/x"
+            mode = "sideways"
+            betas = []
+
+            [groups.second]
+            alpha = ""
+            betas = ["host"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(error.contains("unknown mode 'sideways'"), "{error}");
+        assert!(error.contains("expected one of"), "{error}");
+        assert!(error.contains("'first' has no betas"), "{error}");
+        assert!(error.contains("'second' has an empty alpha"), "{error}");
+        assert!(
+            error.contains("'second' has no mode and the defaults specify none"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected_with_suggestions() {
+        // A misspelled group key ('beta' for 'betas') fails to parse, and
+        // serde's diagnostic names the valid fields.
+        let error = toml::from_str::<Config>(
+            r#"
+            [groups.x]
+            alpha = "~/x"
+            mode = "two-way-safe"
+            beta = ["host"]
+            "#,
+        )
+        .expect_err("parsing should fail")
+        .to_string();
+        assert!(error.contains("beta"), "{error}");
+        assert!(error.contains("betas"), "{error}");
+
+        // Unknown top-level keys fail as well.
+        assert!(toml::from_str::<Config>("disable = [\"host\"]").is_err());
+    }
+
+    #[test]
+    fn defaults_are_optional() {
+        let config = parse(
+            r#"
+            [groups.x]
+            alpha = "/a"
+            mode = "two-way-safe"
+            betas = ["host"]
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(
+            plans[0].interval,
+            Duration::from_secs(DEFAULT_INTERVAL_SECONDS)
+        );
+        assert!(plans[0].ignores.is_empty());
+    }
+
+    #[test]
+    fn agent_command_applies_to_remote_betas() {
+        let config = parse(
+            r#"
+            [groups.x]
+            alpha = "/a"
+            mode = "two-way-safe"
+            agent_command = "custom-agent --flag"
+            betas = ["host", "/local"]
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(
+            plans[0].beta,
+            BetaTarget::Remote {
+                destination: "host".into(),
+                path: "/a".into(),
+                agent_command: Some(vec!["custom-agent".into(), "--flag".into()]),
+            }
+        );
+        // Local betas never involve an agent.
+        assert_eq!(plans[1].beta, BetaTarget::Local(PathBuf::from("/local")));
+    }
+
+    #[test]
+    fn mode_names_round_trip() {
+        for mode in [
+            SyncMode::TwoWaySafe,
+            SyncMode::TwoWayResolved,
+            SyncMode::OneWaySafe,
+            SyncMode::OneWayReplica,
+        ] {
+            assert_eq!(parse_mode(mode_name(mode)).unwrap(), mode);
+        }
+        assert!(parse_mode("bidirectional").is_err());
+    }
+}

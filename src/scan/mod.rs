@@ -2,13 +2,35 @@
 
 pub mod ignore;
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::fs::{self, Metadata};
+use std::io::{ErrorKind, Read};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Context, Result};
 
-use crate::tree::Snapshot;
+use crate::tree::{path_join, Content, Digest, FileMetadata, Node, Snapshot};
 
 pub use ignore::IgnoreSet;
+
+/// The size of the fixed buffer used to stream file contents through the
+/// digester.
+const DIGEST_BUFFER_SIZE: usize = 64 * 1024;
+
+/// The file type mask within a raw mode value (`S_IFMT`).
+const MODE_TYPE_MASK: u32 = 0o170000;
+
+/// The executability bits within a raw mode value.
+const MODE_EXECUTABLE_MASK: u32 = 0o111;
+
+/// The name prefix used by transition staging temporaries, which are
+/// invisible to scans.
+const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
+
+/// The suffix appended to the lossy rendering of a non-UTF-8 entry name.
+const NON_UTF8_SUFFIX: &str = " (non-UTF-8)";
 
 /// Scans the filesystem hierarchy at `root`, producing a snapshot.
 ///
@@ -24,5 +46,698 @@ pub use ignore::IgnoreSet;
 /// content; unreadable entries appear as problematic content. A missing root
 /// yields a snapshot with no content.
 pub fn scan(root: &Path, baseline: Option<&Snapshot>, ignores: &IgnoreSet) -> Result<Snapshot> {
-    todo!("implemented by the scan module")
+    // Probe the root without following symbolic links. A missing root isn't
+    // an error — it's a legitimate (and common) synchronization state.
+    let metadata = match fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return Ok(Snapshot {
+                root: None,
+                preserves_executability: true,
+                ..Snapshot::default()
+            });
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("unable to probe synchronization root {}", root.display())
+            });
+        }
+    };
+    if !metadata.is_dir() {
+        bail!("synchronization root {} is not a directory", root.display());
+    }
+
+    let mut scanner = Scanner::new(ignores);
+    let content = scanner.scan_directory(root, "", baseline.and_then(|s| s.root.as_ref()));
+    Ok(Snapshot {
+        root: Some(Node {
+            name: String::new(),
+            content,
+        }),
+        // Scanning is Unix-only, where executability is always preserved.
+        preserves_executability: true,
+        directories: scanner.directories,
+        files: scanner.files,
+        symlinks: scanner.symlinks,
+        total_file_size: scanner.total_file_size,
+    })
+}
+
+/// The mutable state of a single scan operation: the ignore set being
+/// applied, a reusable digest buffer, and the running statistics.
+struct Scanner<'a> {
+    /// The ignore set consulted for every entry.
+    ignores: &'a IgnoreSet,
+    /// The digest streaming buffer, allocated once per scan.
+    buffer: Vec<u8>,
+    /// The number of synchronizable directories scanned.
+    directories: u64,
+    /// The number of synchronizable files scanned.
+    files: u64,
+    /// The number of synchronizable symbolic links scanned.
+    symlinks: u64,
+    /// The total size of synchronizable file content.
+    total_file_size: u64,
+}
+
+impl<'a> Scanner<'a> {
+    /// Creates a scanner applying the specified ignore set.
+    fn new(ignores: &'a IgnoreSet) -> Scanner<'a> {
+        Scanner {
+            ignores,
+            buffer: vec![0u8; DIGEST_BUFFER_SIZE],
+            directories: 0,
+            files: 0,
+            symlinks: 0,
+            total_file_size: 0,
+        }
+    }
+
+    /// Scans the directory at `disk_path`, whose root-relative path is
+    /// `path`, using `baseline` (the node observed at the same position by a
+    /// previous scan, if any) for digest reuse and structural sharing.
+    fn scan_directory(&mut self, disk_path: &Path, path: &str, baseline: Option<&Node>) -> Content {
+        // The full listing is materialized up front so that it can be
+        // sorted: the hierarchy model requires name-sorted children, and
+        // sorted children are what make baseline lookups and reconciliation
+        // linear merges.
+        let entries = match read_directory(disk_path) {
+            Ok(entries) => entries,
+            Err(error) => return problematic(format!("unable to read directory: {error:#}")),
+        };
+        self.directories += 1;
+
+        let mut children = Vec::with_capacity(entries.len());
+        for (raw_name, entry_path) in entries {
+            let lossy_name = raw_name.to_string_lossy();
+
+            // Staging temporaries belong to in-flight transitions, not to
+            // the synchronized hierarchy.
+            if lossy_name.starts_with(TEMPORARY_PREFIX) {
+                continue;
+            }
+
+            // Names that aren't valid UTF-8 can't be represented in (or
+            // transmitted with) the hierarchy model, so they're recorded
+            // under a lossy, explicitly marked name.
+            let non_utf8 = raw_name.to_str().is_none();
+            let name = if non_utf8 {
+                format!("{lossy_name}{NON_UTF8_SUFFIX}")
+            } else {
+                lossy_name.into_owned()
+            };
+            let child_path = path_join(path, &name);
+
+            // The entry's type is needed both to dispatch the scan and to
+            // resolve directory-only ignore patterns, so it's fetched (again
+            // without following symbolic links) before anything else.
+            let metadata = match fs::symlink_metadata(&entry_path) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    // Without a type there's nothing to classify, not even
+                    // for the purposes of the ignore set.
+                    children.push(Node {
+                        name,
+                        content: problematic(format!("unable to probe entry: {error}")),
+                    });
+                    continue;
+                }
+            };
+            let file_type = metadata.file_type();
+
+            // Ignores are consulted before any descent, which is what keeps
+            // ignored subtrees from costing anything at all.
+            if self.ignores.ignored(&child_path, file_type.is_dir()) {
+                children.push(Node {
+                    name,
+                    content: Content::Untracked,
+                });
+                continue;
+            }
+            if non_utf8 {
+                children.push(Node {
+                    name,
+                    content: problematic("non-UTF-8 filename"),
+                });
+                continue;
+            }
+
+            // The baseline is tracked in parallel with the walk, so the
+            // counterpart of an entry is one binary search into the current
+            // directory's baseline children rather than a walk from the
+            // hierarchy root.
+            let baseline_child = baseline.and_then(|node| node.child(&name));
+            let content = if file_type.is_dir() {
+                self.scan_directory(&entry_path, &child_path, baseline_child)
+            } else if file_type.is_file() {
+                self.scan_file(&entry_path, &metadata, baseline_child)
+            } else if file_type.is_symlink() {
+                self.scan_symlink(&entry_path)
+            } else {
+                // Sockets, FIFOs, and device nodes have no portable
+                // representation and aren't synchronized.
+                Content::Untracked
+            };
+            children.push(Node { name, content });
+        }
+
+        // Entries were processed in on-disk name order, which is also the
+        // recorded name order except where lossy renaming intervened, so a
+        // (stable) re-sort settles those cases. Two distinct on-disk names
+        // can also collapse onto one recorded name, in which case the last
+        // entry wins.
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut unique: Vec<Node> = Vec::with_capacity(children.len());
+        for child in children {
+            if unique.last().is_some_and(|last| last.name == child.name) {
+                unique.pop();
+            }
+            unique.push(child);
+        }
+
+        // If nothing in this directory changed, adopt the baseline's child
+        // storage instead of publishing a fresh allocation. Adoption is
+        // bottom-up: a subdirectory that adopted its own baseline storage
+        // compares pointer-equal here, so an unchanged subtree collapses to
+        // a single Arc clone at its top.
+        if let Some(Content::Directory(baseline_children)) = baseline.map(|node| &node.content) {
+            if adoptable(&unique, baseline_children) {
+                return Content::Directory(baseline_children.clone());
+            }
+        }
+        Content::Directory(Arc::new(unique))
+    }
+
+    /// Scans the file at `disk_path`, whose (already fetched) metadata is
+    /// `metadata`, reusing the baseline digest where the metadata proves the
+    /// content can't have changed.
+    fn scan_file(
+        &mut self,
+        disk_path: &Path,
+        metadata: &Metadata,
+        baseline: Option<&Node>,
+    ) -> Content {
+        let mut recorded = file_metadata(metadata);
+
+        // The digest is only recomputed when the metadata that would have
+        // accompanied it has changed. This is the difference between a scan
+        // that reads the whole hierarchy and one that reads only what moved.
+        let digest = match reusable_digest(baseline, &recorded) {
+            Some(digest) => digest,
+            None => {
+                let (digest, read) = match self.digest_file(disk_path) {
+                    Ok(result) => result,
+                    Err(error) => return problematic(format!("unable to read file: {error:#}")),
+                };
+                if read != recorded.size {
+                    // The file changed size between the stat and the read,
+                    // so the digest describes content the recorded metadata
+                    // doesn't. Re-stat and record what's there now: the
+                    // digest is still a faithful record of some version of
+                    // the file, and any further change moves the mtime and
+                    // forces a re-read on the next scan.
+                    match fs::symlink_metadata(disk_path) {
+                        Ok(fresh) => recorded = file_metadata(&fresh),
+                        Err(error) => {
+                            return problematic(format!("unable to re-probe file: {error}"));
+                        }
+                    }
+                }
+                digest
+            }
+        };
+
+        self.files += 1;
+        self.total_file_size += recorded.size;
+        Content::File {
+            digest,
+            executable: recorded.mode & MODE_EXECUTABLE_MASK != 0,
+            metadata: recorded,
+        }
+    }
+
+    /// Streams the file at `disk_path` through BLAKE3, returning its digest
+    /// and the number of bytes read.
+    fn digest_file(&mut self, disk_path: &Path) -> Result<(Digest, u64)> {
+        let mut file = fs::File::open(disk_path)
+            .with_context(|| format!("unable to open {}", disk_path.display()))?;
+        let mut hasher = blake3::Hasher::new();
+        let mut read = 0u64;
+        loop {
+            let count = file
+                .read(&mut self.buffer)
+                .with_context(|| format!("unable to read {}", disk_path.display()))?;
+            if count == 0 {
+                break;
+            }
+            hasher.update(&self.buffer[..count]);
+            read += count as u64;
+        }
+        Ok((*hasher.finalize().as_bytes(), read))
+    }
+
+    /// Scans the symbolic link at `disk_path`.
+    fn scan_symlink(&mut self, disk_path: &Path) -> Content {
+        let target = match fs::read_link(disk_path) {
+            Ok(target) => target,
+            Err(error) => return problematic(format!("unable to read symbolic link: {error}")),
+        };
+        // Targets are opaque strings: they're recorded exactly as stored, with
+        // no normalization, resolution, or portability rewriting.
+        let Some(target) = target.to_str() else {
+            return problematic("non-UTF-8 symbolic link target");
+        };
+        if target.is_empty() {
+            return problematic("empty symbolic link target");
+        }
+        self.symlinks += 1;
+        Content::Symlink {
+            target: target.to_owned(),
+        }
+    }
+}
+
+/// Lists a directory, returning its entries' names and paths sorted by name
+/// in byte order.
+fn read_directory(path: &Path) -> Result<Vec<(OsString, PathBuf)>> {
+    let listing =
+        fs::read_dir(path).with_context(|| format!("unable to list {}", path.display()))?;
+    let mut entries = Vec::new();
+    for entry in listing {
+        let entry = entry.with_context(|| format!("unable to list {}", path.display()))?;
+        entries.push((entry.file_name(), entry.path()));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries)
+}
+
+/// Extracts the scan-time metadata recorded on file nodes.
+fn file_metadata(metadata: &Metadata) -> FileMetadata {
+    FileMetadata {
+        mtime_seconds: metadata.mtime(),
+        mtime_nanos: metadata.mtime_nsec() as u32,
+        size: metadata.size(),
+        inode: metadata.ino(),
+        mode: metadata.mode(),
+    }
+}
+
+/// Returns the baseline node's digest if its metadata proves that the file's
+/// content matches what was observed at scan time.
+fn reusable_digest(baseline: Option<&Node>, fresh: &FileMetadata) -> Option<Digest> {
+    let Some(Content::File {
+        digest, metadata, ..
+    }) = baseline.map(|node| &node.content)
+    else {
+        return None;
+    };
+    // Modification time, size, and inode together detect every content
+    // change that doesn't deliberately forge them, and the type bits guard
+    // against a path having become a different kind of file entirely.
+    let unchanged = metadata.mtime_seconds == fresh.mtime_seconds
+        && metadata.mtime_nanos == fresh.mtime_nanos
+        && metadata.size == fresh.size
+        && metadata.inode == fresh.inode
+        && metadata.mode & MODE_TYPE_MASK == fresh.mode & MODE_TYPE_MASK;
+    unchanged.then_some(*digest)
+}
+
+/// Indicates whether or not freshly scanned children are equivalent to their
+/// baseline counterparts, and thus whether the baseline's child storage can
+/// be adopted in place of the fresh allocation.
+///
+/// Equivalence is deliberately stricter than content equality: directories
+/// must be pointer-equal (having themselves adopted their baseline storage)
+/// and files must carry identical scan metadata, so that adoption never
+/// discards a fresher observation.
+fn adoptable(fresh: &[Node], baseline: &[Node]) -> bool {
+    fresh.len() == baseline.len()
+        && fresh.iter().zip(baseline.iter()).all(|(new, old)| {
+            new.name == old.name
+                && match (&new.content, &old.content) {
+                    (Content::Directory(a), Content::Directory(b)) => Arc::ptr_eq(a, b),
+                    (Content::Directory(_), _) | (_, Content::Directory(_)) => false,
+                    (Content::File { metadata: a, .. }, Content::File { metadata: b, .. }) => {
+                        a == b && new.content_equal(old, false)
+                    }
+                    _ => new.content_equal(old, false),
+                }
+        })
+}
+
+/// Creates problematic content with the specified message.
+fn problematic(message: impl Into<String>) -> Content {
+    Content::Problematic {
+        message: message.into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use tempfile::{tempdir, TempDir};
+
+    use crate::tree::DIGEST_SIZE;
+
+    fn ignores(patterns: &[&str]) -> IgnoreSet {
+        let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_owned()).collect();
+        IgnoreSet::new(&patterns).expect("patterns should compile")
+    }
+
+    fn write(root: &Path, path: &str, contents: &str) {
+        let full = root.join(path);
+        if let Some(parent) = full.parent() {
+            fs::create_dir_all(parent).expect("parent should be creatable");
+        }
+        fs::write(&full, contents).expect("file should be writable");
+    }
+
+    fn digest_of(contents: &str) -> Digest {
+        *blake3::hash(contents.as_bytes()).as_bytes()
+    }
+
+    fn child<'a>(node: &'a Node, path: &str) -> &'a Node {
+        let mut current = node;
+        for component in path.split('/') {
+            current = current
+                .child(component)
+                .unwrap_or_else(|| panic!("{path} should exist"));
+        }
+        current
+    }
+
+    fn file_content(node: &Node, path: &str) -> (Digest, bool) {
+        match &child(node, path).content {
+            Content::File {
+                digest, executable, ..
+            } => (*digest, *executable),
+            other => panic!("{path} should be a file, found {other:?}"),
+        }
+    }
+
+    fn children_arc(node: &Node) -> Arc<Vec<Node>> {
+        match &node.content {
+            Content::Directory(children) => children.clone(),
+            other => panic!("expected a directory, found {other:?}"),
+        }
+    }
+
+    /// Builds a hierarchy exercising every content kind the scanner
+    /// produces, returning the (retained) temporary directory.
+    fn fixture() -> TempDir {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "alpha.txt", "alpha");
+        write(root, "beta.txt", "beta contents");
+        write(root, "nested/inner.txt", "inner");
+        write(root, "nested/deeper/leaf.txt", "leaf");
+        write(root, "tool.sh", "#!/bin/sh\n");
+        fs::set_permissions(root.join("tool.sh"), fs::Permissions::from_mode(0o755))
+            .expect("permissions should be settable");
+        symlink("alpha.txt", root.join("link")).expect("symlink should be creatable");
+        write(root, "excluded/secret.txt", "secret");
+        write(root, ".autobahn-tmp-staging", "staging");
+        directory
+    }
+
+    fn scan_fixture(root: &Path, baseline: Option<&Snapshot>) -> Snapshot {
+        scan(root, baseline, &ignores(&["excluded/"])).expect("scan should succeed")
+    }
+
+    #[test]
+    fn missing_root_yields_empty_snapshot() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let snapshot = scan(&directory.path().join("absent"), None, &ignores(&[]))
+            .expect("a missing root is not an error");
+        assert!(snapshot.root.is_none());
+        assert!(snapshot.preserves_executability);
+        assert_eq!(snapshot.directories, 0);
+        assert_eq!(snapshot.files, 0);
+        assert_eq!(snapshot.symlinks, 0);
+        assert_eq!(snapshot.total_file_size, 0);
+    }
+
+    #[test]
+    fn non_directory_root_is_rejected() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        write(directory.path(), "file.txt", "contents");
+        assert!(scan(&directory.path().join("file.txt"), None, &ignores(&[])).is_err());
+    }
+
+    #[test]
+    fn scans_a_mixed_hierarchy() {
+        let directory = fixture();
+        let snapshot = scan_fixture(directory.path(), None);
+        let root = snapshot.root.as_ref().expect("root should exist");
+        assert_eq!(root.name, "");
+        assert!(root.validate(false).is_ok());
+
+        // Children are name-sorted, and the staging temporary is invisible.
+        let names: Vec<&str> = root.children().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "alpha.txt",
+                "beta.txt",
+                "excluded",
+                "link",
+                "nested",
+                "tool.sh"
+            ]
+        );
+
+        // Files carry correct digests and executability.
+        assert_eq!(file_content(root, "alpha.txt"), (digest_of("alpha"), false));
+        assert_eq!(
+            file_content(root, "nested/deeper/leaf.txt"),
+            (digest_of("leaf"), false)
+        );
+        assert_eq!(
+            file_content(root, "tool.sh"),
+            (digest_of("#!/bin/sh\n"), true)
+        );
+
+        // Symbolic link targets are stored verbatim.
+        match &child(root, "link").content {
+            Content::Symlink { target } => assert_eq!(target, "alpha.txt"),
+            other => panic!("expected a symlink, found {other:?}"),
+        }
+
+        // Ignored directories are untracked and never descended.
+        let excluded = child(root, "excluded");
+        assert!(matches!(excluded.content, Content::Untracked));
+        assert!(excluded.children().is_empty());
+
+        // File metadata is recorded for digest reuse.
+        match &child(root, "alpha.txt").content {
+            Content::File { metadata, .. } => {
+                assert_eq!(metadata.size, 5);
+                assert_ne!(metadata.inode, 0);
+                assert_eq!(metadata.mode & MODE_TYPE_MASK, 0o100000);
+            }
+            other => panic!("expected a file, found {other:?}"),
+        }
+    }
+
+    #[test]
+    fn statistics_count_synchronizable_content() {
+        let directory = fixture();
+        let snapshot = scan_fixture(directory.path(), None);
+        // The root, "nested", and "nested/deeper" — the ignored directory is
+        // untracked and therefore uncounted.
+        assert_eq!(snapshot.directories, 3);
+        assert_eq!(snapshot.files, 5);
+        assert_eq!(snapshot.symlinks, 1);
+        assert_eq!(
+            snapshot.total_file_size,
+            ("alpha".len()
+                + "beta contents".len()
+                + "inner".len()
+                + "leaf".len()
+                + "#!/bin/sh\n".len()) as u64
+        );
+        assert!(snapshot.preserves_executability);
+    }
+
+    #[test]
+    fn unchanged_rescan_adopts_the_entire_hierarchy() {
+        let directory = fixture();
+        let baseline = scan_fixture(directory.path(), None);
+        let rescan = scan_fixture(directory.path(), Some(&baseline));
+
+        let baseline_root = baseline.root.as_ref().expect("root should exist");
+        let rescan_root = rescan.root.as_ref().expect("root should exist");
+        assert!(Arc::ptr_eq(
+            &children_arc(baseline_root),
+            &children_arc(rescan_root)
+        ));
+        assert!(baseline.content_equal(&rescan));
+
+        // Statistics must match a from-scratch scan even though nothing was
+        // reallocated.
+        let fresh = scan_fixture(directory.path(), None);
+        assert_eq!(rescan.directories, fresh.directories);
+        assert_eq!(rescan.files, fresh.files);
+        assert_eq!(rescan.symlinks, fresh.symlinks);
+        assert_eq!(rescan.total_file_size, fresh.total_file_size);
+    }
+
+    #[test]
+    fn rescan_rehashes_changes_and_adopts_untouched_siblings() {
+        let directory = fixture();
+        let root_path = directory.path();
+        let baseline = scan_fixture(root_path, None);
+        let baseline_root = baseline.root.as_ref().expect("root should exist");
+        let baseline_nested = children_arc(child(baseline_root, "nested"));
+
+        // Rewrite one root-level file with content of a different length, so
+        // that the change is visible regardless of mtime granularity.
+        write(root_path, "alpha.txt", "alpha, revised");
+        let rescan = scan_fixture(root_path, Some(&baseline));
+        let rescan_root = rescan.root.as_ref().expect("root should exist");
+
+        // The rewritten file is re-digested...
+        assert_eq!(
+            file_content(rescan_root, "alpha.txt").0,
+            digest_of("alpha, revised")
+        );
+        // ...the changed directory's storage is fresh...
+        assert!(!Arc::ptr_eq(
+            &children_arc(baseline_root),
+            &children_arc(rescan_root)
+        ));
+        // ...but the untouched sibling subtree is adopted wholesale.
+        assert!(Arc::ptr_eq(
+            &baseline_nested,
+            &children_arc(child(rescan_root, "nested"))
+        ));
+        assert_eq!(
+            rescan.total_file_size,
+            baseline.total_file_size + ("alpha, revised".len() - "alpha".len()) as u64
+        );
+    }
+
+    #[test]
+    fn matching_metadata_reuses_the_baseline_digest() {
+        let directory = fixture();
+        let root_path = directory.path();
+        let mut baseline = scan_fixture(root_path, None);
+
+        // Poison a baseline digest without touching the file. A scan that
+        // re-read the file would compute the true digest; only a scan that
+        // reused the recorded one can reproduce the poison.
+        let poison = [0xAB; DIGEST_SIZE];
+        let root = baseline.root.as_mut().expect("root should exist");
+        if let Content::Directory(children) = &mut root.content {
+            for child in Arc::make_mut(children) {
+                if child.name == "alpha.txt" {
+                    if let Content::File { digest, .. } = &mut child.content {
+                        *digest = poison;
+                    }
+                }
+            }
+        }
+
+        let rescan = scan_fixture(root_path, Some(&baseline));
+        let rescan_root = rescan.root.as_ref().expect("root should exist");
+        assert_eq!(file_content(rescan_root, "alpha.txt").0, poison);
+        // A file whose size changed is re-read despite the baseline entry.
+        write(root_path, "beta.txt", "beta contents, extended");
+        let third = scan_fixture(root_path, Some(&rescan));
+        let third_root = third.root.as_ref().expect("root should exist");
+        assert_eq!(
+            file_content(third_root, "beta.txt").0,
+            digest_of("beta contents, extended")
+        );
+    }
+
+    #[test]
+    fn unicode_names_are_scanned_and_sorted() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(root_path, "Ünicode.txt", "u");
+        write(root_path, "日本語/файл.txt", "b");
+        write(root_path, "a.txt", "a");
+        let snapshot = scan(root_path, None, &ignores(&[])).expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+
+        // Sorting is by UTF-8 byte order, so ASCII precedes the rest.
+        let names: Vec<&str> = root.children().iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["a.txt", "Ünicode.txt", "日本語"]);
+        assert_eq!(file_content(root, "Ünicode.txt").0, digest_of("u"));
+        assert_eq!(file_content(root, "日本語/файл.txt").0, digest_of("b"));
+        assert!(root.validate(true).is_ok());
+    }
+
+    #[test]
+    fn non_utf8_names_are_marked_and_deduplicated() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        // Two distinct invalid byte sequences that render to the same lossy
+        // name, plus an ordinary file for company.
+        for raw in [b"\xff\xfe".as_slice(), b"\xfe\xff".as_slice()] {
+            let name = std::ffi::OsStr::from_bytes(raw);
+            fs::write(root_path.join(name), "bytes").expect("file should be writable");
+        }
+        write(root_path, "plain.txt", "plain");
+
+        let snapshot = scan(root_path, None, &ignores(&[])).expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+        // The colliding entries collapse into a single marked node, and the
+        // hierarchy remains sorted and unique.
+        assert_eq!(root.children().len(), 2);
+        assert!(root.validate(false).is_ok());
+        let marked = root
+            .children()
+            .iter()
+            .find(|child| child.name.ends_with(NON_UTF8_SUFFIX))
+            .expect("the non-UTF-8 entry should be recorded");
+        match &marked.content {
+            Content::Problematic { message } => assert_eq!(message, "non-UTF-8 filename"),
+            other => panic!("expected problematic content, found {other:?}"),
+        }
+        // Problematic content isn't synchronizable, so it isn't counted.
+        assert_eq!(snapshot.files, 1);
+    }
+
+    #[test]
+    fn ignored_directories_are_never_descended_despite_negations() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(root_path, "vendor/keep.txt", "keep");
+        write(root_path, "src/main.rs", "fn main() {}");
+        let set = ignores(&["vendor", "!vendor/keep.txt"]);
+        let snapshot = scan(root_path, None, &set).expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+
+        let vendor = child(root, "vendor");
+        assert!(matches!(vendor.content, Content::Untracked));
+        assert!(vendor.child("keep.txt").is_none());
+        assert_eq!(snapshot.files, 1);
+        assert_eq!(snapshot.directories, 2);
+    }
+
+    #[test]
+    fn unreadable_directories_become_problematic() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(root_path, "locked/inner.txt", "inner");
+        let locked = root_path.join("locked");
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
+            .expect("permissions should be settable");
+        let snapshot = scan(root_path, None, &ignores(&[])).expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+        let problems = root.problems();
+        // Running as root defeats the permission bits, in which case the
+        // directory scans normally; otherwise it must be problematic.
+        if !problems.is_empty() {
+            assert_eq!(problems[0].path, "locked");
+            assert_eq!(snapshot.directories, 1);
+        }
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))
+            .expect("permissions should be restorable");
+    }
 }

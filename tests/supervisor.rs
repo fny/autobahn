@@ -165,6 +165,13 @@ fn a_configuration_file_drives_multiple_groups_and_hosts() {
     assert_eq!(read(&local_beta, "src/main.rs"), "fn main() {}");
     assert_eq!(read(&local_beta, "README.md"), "readme");
     assert_eq!(read(&second_beta, "src/main.rs"), "fn main() {}");
+    // A root created by the transition takes the configured directory mode
+    // (the conservative default), not the umask's.
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        fs::symlink_metadata(&second_beta).expect("root").mode() & 0o777,
+        0o700
+    );
     assert_eq!(read(&agent_beta, "todo.txt"), "everything");
 
     // Every session recorded a synchronized status.
@@ -454,6 +461,52 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
         assert_ne!(
             status.state, "error",
             "a lock loser must never overwrite the owner's status: {status:?}"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        watcher.join().expect("the watcher should stop cleanly");
+    });
+}
+
+#[test]
+fn a_second_supervisor_over_the_same_state_root_is_refused() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "content");
+
+    let mut plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+    plans[0].interval = Duration::from_millis(30);
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans.clone(), world.state_root(), false);
+        let stop_ref = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
+        let _guard = StopGuard(stop_ref);
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("file.txt").exists()),
+            "the first supervisor should be running"
+        );
+
+        // A second supervisor for the same state root returns immediately
+        // instead of capturing the control socket from the first.
+        let second = Supervisor::new(plans.clone(), world.state_root(), false);
+        let never = AtomicBool::new(false);
+        let start = Instant::now();
+        second.run_watch(&never);
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the second supervisor should be refused promptly"
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -808,7 +861,7 @@ fn agents_install_automatically_over_ssh() {
         &script,
         format!(
             "#!/bin/sh\n\
-             while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; *) break;; esac; done\n\
+             while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; *) break;; esac; done\n\
              shift\n\
              HOME={home} exec /bin/sh -c \"$*\"\n",
             home = remote_home.display()

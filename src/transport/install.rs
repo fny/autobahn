@@ -112,12 +112,17 @@ fn locate_agent_binary(platform: &str) -> Option<PathBuf> {
 /// observes a partial binary).
 fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
     let version = protocol::version();
+    // The temporary is uniquified by the remote shell's PID ($$): two
+    // controllers bootstrapping the same host concurrently must not stream
+    // into one file, or the later `cat` truncates what the earlier one is
+    // about to rename into the executable path. With unique temporaries,
+    // the final rename is atomic and last-writer-wins with a whole binary.
     let script = format!(
         "mkdir -p ~/.autobahn/bin && \
-         cat > ~/.autobahn/bin/.autobahn-tmp-install-{version} && \
-         chmod 755 ~/.autobahn/bin/.autobahn-tmp-install-{version} && \
-         mv ~/.autobahn/bin/.autobahn-tmp-install-{version} \
-            ~/.autobahn/bin/autobahn-{version}"
+         tmp=~/.autobahn/bin/.autobahn-tmp-install-{version}-$$ && \
+         cat > \"$tmp\" && \
+         chmod 755 \"$tmp\" && \
+         mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}"
     );
     let mut child = ssh_command(destination, &script)
         .stdin(Stdio::piped())
@@ -139,10 +144,13 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Builds an SSH command running `script` on the destination.
+/// Builds an SSH command running `script` on the destination. The option
+/// terminator keeps a hostile destination (one beginning with `-`) from
+/// being parsed as an SSH option such as `ProxyCommand`.
 fn ssh_command(destination: &str, script: &str) -> Command {
     let mut command = Command::new(super::ssh_binary());
     command.args(super::ssh_options());
+    command.arg("--");
     command.arg(destination);
     command.arg(script);
     command.stdout(Stdio::piped());

@@ -504,6 +504,12 @@ fn parse_beta(
     if destination.is_empty() || host_of(destination).is_empty() {
         return Err("empty host".into());
     }
+    // A destination beginning with `-` could reach ssh looking like an
+    // option; the transport also passes an option terminator, but no such
+    // destination is legitimate in the first place.
+    if destination.starts_with('-') {
+        return Err("host begins with '-'".into());
+    }
     Ok(BetaTarget::Remote {
         destination: destination.to_owned(),
         path,
@@ -624,6 +630,9 @@ mod tests {
         assert!(parse_beta("host:", "~/x", None).is_err());
         assert!(parse_beta(":path", "~/x", None).is_err());
         assert!(parse_beta("user@:path", "~/x", None).is_err());
+        // A destination that could read as an SSH option is never a host.
+        assert!(parse_beta("-oProxyCommand=evil:path", "~/x", None).is_err());
+        assert!(parse_beta("-host", "~/x", None).is_err());
     }
 
     #[test]

@@ -137,8 +137,17 @@ pub fn socket_path(state_root: &Path) -> PathBuf {
         use std::fmt::Write;
         let _ = write!(name, "{byte:02x}");
     }
-    std::env::temp_dir()
-        .join(format!("autobahn-{}", unsafe { libc::getuid() }))
+    let directory = format!("autobahn-{}", unsafe { libc::getuid() });
+    let fallback = std::env::temp_dir()
+        .join(&directory)
+        .join(format!("{name}.sock"));
+    if fallback.as_os_str().len() <= MAXIMUM_SOCKET_PATH {
+        return fallback;
+    }
+    // An over-length TMPDIR would defeat the fallback too; /tmp is short by
+    // construction.
+    PathBuf::from("/tmp")
+        .join(directory)
         .join(format!("{name}.sock"))
 }
 
@@ -161,6 +170,12 @@ pub(crate) fn bind(state_root: &Path) -> Result<UnixListener> {
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("unable to bind control socket {}", path.display()))?;
+    // Restrict the socket itself as a second layer under the peer
+    // credential check performed per connection.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
     listener
         .set_nonblocking(true)
         .context("unable to configure the control socket")?;
@@ -187,11 +202,55 @@ pub(crate) fn serve(listener: UnixListener, registry: &Registry, stop: &AtomicBo
     }
 }
 
-/// Handles one control connection: a single request/response exchange.
+/// Verifies that the connecting peer is the same user as this process:
+/// control requests are state-destructive (`reset` in particular), so
+/// authorization must not rest on directory permissions alone.
+fn peer_is_same_user(stream: &UnixStream) -> Result<bool> {
+    use std::os::unix::io::AsRawFd;
+    let fd = stream.as_raw_fd();
+    #[cfg(target_os = "linux")]
+    {
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        let result = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                &mut credentials as *mut _ as *mut libc::c_void,
+                &mut length,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("unable to read peer credentials");
+        }
+        Ok(credentials.uid == unsafe { libc::getuid() })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let (mut uid, mut gid): (libc::uid_t, libc::gid_t) = (0, 0);
+        let result = unsafe { libc::getpeereid(fd, &mut uid, &mut gid) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error()).context("unable to read peer credentials");
+        }
+        Ok(uid == unsafe { libc::getuid() })
+    }
+}
+
+/// Handles one control connection: a single request/response exchange, with
+/// timeouts so a stalled client can never wedge the control service.
 fn handle(stream: UnixStream, registry: &Registry) -> Result<()> {
     stream
         .set_nonblocking(false)
         .context("unable to configure the control connection")?;
+    let timeout = Some(std::time::Duration::from_secs(2));
+    stream
+        .set_read_timeout(timeout)
+        .and_then(|()| stream.set_write_timeout(timeout))
+        .context("unable to configure control timeouts")?;
+    if !peer_is_same_user(&stream)? {
+        anyhow::bail!("rejecting a control request from another user");
+    }
     let mut reader = stream
         .try_clone()
         .context("unable to clone the control connection")?;

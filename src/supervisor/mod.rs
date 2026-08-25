@@ -178,6 +178,18 @@ impl Supervisor {
     /// network can hold one; for the CLI, process termination remains the
     /// hard stop.
     pub fn run_watch(&self, stop: &AtomicBool) {
+        // One supervisor per state root: a second one's workers would all
+        // lose their session locks anyway, but it would still capture the
+        // control socket — commands would land in a supervisor that owns
+        // nothing. Refuse up front instead.
+        let _supervisor_lock = match SessionLock::acquire(self.state_root.join("supervisor")) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("unable to supervise: {error:#}");
+                return;
+            }
+        };
+
         // Every session gets a control-flag block; the registry shares them
         // with the control socket's server thread.
         let controls: Vec<Arc<control::WorkerControl>> = self
@@ -372,19 +384,28 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Performs a session reset: the ancestor is deleted (under the session
-    /// lock, briefly reacquired via a fresh connection on the next attempt),
-    /// so the next cycle reconciles with no baseline and merges both sides
-    /// additively.
+    /// Performs a session reset: the ancestor is deleted under the session
+    /// state lock, so the next cycle reconciles with no baseline and merges
+    /// both sides additively.
     fn reset(&mut self) {
-        // Release our own lock first so the deletion isn't racing ourselves.
+        // Release our own session (and its lock) first, then reacquire the
+        // lock bare for the deletion: the ancestor must never be removed
+        // while any session — ours or another process's — could be using
+        // it. If another process holds the lock, the reset is refused
+        // rather than raced.
         self.session = None;
-        let ancestor = self
+        let state_directory = self
             .state_root
             .join("sessions")
-            .join(self.plan.identifier())
-            .join("ancestor");
-        if let Err(error) = std::fs::remove_file(&ancestor) {
+            .join(self.plan.identifier());
+        let _lock = match SessionLock::acquire(state_directory.clone()) {
+            Ok(lock) => lock,
+            Err(error) => {
+                eprintln!("[{}] unable to reset: {error:#}", self.plan.display());
+                return;
+            }
+        };
+        if let Err(error) = std::fs::remove_file(state_directory.join("ancestor")) {
             if error.kind() != std::io::ErrorKind::NotFound {
                 eprintln!(
                     "[{}] unable to reset the ancestor: {error}",

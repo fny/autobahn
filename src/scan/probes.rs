@@ -34,6 +34,10 @@ pub struct FilesystemBehavior {
     pub preserves_executability: bool,
     /// Whether or not stored names come back Unicode-decomposed (NFD).
     pub decomposes_unicode: bool,
+    /// Whether or not name lookups treat Unicode normalization forms as
+    /// equivalent (APFS does while storing names verbatim; a decomposing
+    /// volume is insensitive by construction).
+    pub normalization_insensitive: bool,
     /// Whether or not name lookups are case-insensitive.
     pub case_insensitive: bool,
 }
@@ -44,6 +48,7 @@ impl Default for FilesystemBehavior {
         FilesystemBehavior {
             preserves_executability: true,
             decomposes_unicode: false,
+            normalization_insensitive: false,
             case_insensitive: false,
         }
     }
@@ -67,9 +72,13 @@ pub fn recompose(name: &str) -> String {
 /// an existing directory; individual probe failures fall back to the
 /// defaults for the property in question.
 pub fn probe(root: &Path) -> FilesystemBehavior {
+    let unicode = probe_unicode(root);
     FilesystemBehavior {
         preserves_executability: probe_executability(root).unwrap_or(true),
-        decomposes_unicode: probe_unicode_decomposition(root).unwrap_or(false),
+        decomposes_unicode: unicode.map(|(decomposes, _)| decomposes).unwrap_or(false),
+        normalization_insensitive: unicode
+            .map(|(decomposes, insensitive)| decomposes || insensitive)
+            .unwrap_or(false),
         case_insensitive: probe_case_insensitivity(root).unwrap_or(false),
     }
 }
@@ -89,54 +98,64 @@ fn cleanup(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
-/// Probes whether executability bits survive: create a file, mark it
-/// executable, and see whether the bit reads back.
+/// Probes whether executability bits survive: a file must hold the execute
+/// bit when set *and* release it when cleared. Checking only one direction
+/// would misclassify volumes that synthesize a fixed mode for every file
+/// (a FAT mount with `mode=0777` reports everything executable and would
+/// pass a set-only probe while preserving nothing).
 fn probe_executability(root: &Path) -> Option<bool> {
     let path = root.join(probe_name("x"));
     fs::write(&path, b"").ok()?;
     let result = (|| {
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).ok()?;
+        let cleared = fs::symlink_metadata(&path).ok()?.permissions().mode() & 0o111 == 0;
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).ok()?;
-        let metadata = fs::symlink_metadata(&path).ok()?;
-        Some(metadata.permissions().mode() & 0o111 != 0)
+        let set = fs::symlink_metadata(&path).ok()?.permissions().mode() & 0o111 != 0;
+        Some(cleared && set)
     })();
     cleanup(&path);
     result
 }
 
-/// Probes whether the volume decomposes Unicode names: create a file whose
-/// name carries a composed character and check which form the directory
-/// listing reports.
-fn probe_unicode_decomposition(root: &Path) -> Option<bool> {
+/// Probes the volume's Unicode name behavior: whether stored names come
+/// back decomposed (NFD), and whether lookups treat normalization forms as
+/// equivalent even when names are stored verbatim (APFS). Returns
+/// `(decomposes, lookup_insensitive)`.
+fn probe_unicode(root: &Path) -> Option<(bool, bool)> {
     // U+00E9 (é) composed; its decomposed form is "e" + U+0301.
     let name = probe_name("\u{00E9}");
     let path = root.join(&name);
+    let marker = name
+        .strip_suffix('\u{00E9}')
+        .expect("the probe name ends with the composed character")
+        .to_owned();
     fs::write(&path, b"").ok()?;
     let result = (|| {
-        // The stored name is recovered from a directory listing (a lookup by
-        // the composed name would succeed either way on normalizing
-        // volumes, revealing nothing).
-        let marker = name
-            .strip_suffix('\u{00E9}')
-            .expect("the probe name ends with the composed character");
+        // The stored form is recovered from a directory listing (a lookup by
+        // the composed name would succeed either way on normalizing volumes,
+        // revealing nothing)...
+        let mut decomposes = None;
         for entry in fs::read_dir(root).ok()? {
             let stored = entry.ok()?.file_name();
             let stored = stored.to_string_lossy();
-            if let Some(suffix) = stored.strip_prefix(marker) {
-                return Some(suffix != "\u{00E9}");
+            if let Some(suffix) = stored.strip_prefix(marker.as_str()) {
+                decomposes = Some(suffix != "\u{00E9}");
+                break;
             }
         }
-        None
+        // ...while lookup equivalence is probed directly: does the NFD
+        // spelling reach the NFC-created file?
+        let insensitive = fs::symlink_metadata(root.join(format!("{marker}e\u{0301}"))).is_ok();
+        Some((decomposes?, insensitive))
     })();
     // The stored name may differ from the created one; remove by listing
-    // when the direct removal misses.
+    // when the direct removal misses — matching only *this probe's* unique
+    // marker, never other temporaries (which may be another session's live
+    // staging files).
     if fs::remove_file(&path).is_err() {
         if let Ok(entries) = fs::read_dir(root) {
             for entry in entries.flatten() {
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .starts_with(TEMPORARY_PREFIX)
-                {
+                if entry.file_name().to_string_lossy().starts_with(&marker) {
                     let _ = fs::remove_file(entry.path());
                 }
             }

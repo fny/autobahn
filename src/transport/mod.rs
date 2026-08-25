@@ -157,6 +157,10 @@ impl Connection {
     pub fn ssh_argv(host: &str, remote_command: Option<&str>) -> Vec<String> {
         let mut argv = vec![ssh_binary()];
         argv.extend(ssh_options().into_iter().map(str::to_owned));
+        // The option terminator keeps a hostile host specification (one
+        // beginning with `-`) from being parsed as an SSH option such as
+        // `ProxyCommand`, which would mean local command execution.
+        argv.push("--".to_owned());
         argv.push(host.to_owned());
         argv.push(remote_command.unwrap_or(DEFAULT_REMOTE_COMMAND).to_owned());
         argv
@@ -361,6 +365,13 @@ pub(crate) fn verify_handshake(handshake: &Handshake) -> Result<()> {
 /// Encodes a message and writes it as one length-prefixed frame, flushing so
 /// that the peer sees it immediately.
 /// The frame-payload flag marking an uncompressed body.
+///
+/// The flag byte was introduced with compression; a build predating it
+/// reads the flag as part of the handshake payload (and vice versa), so
+/// version mismatches against such builds surface as decode errors rather
+/// than the named-versions diagnostic. Builds from the flag onward share
+/// the outer format, and their handshakes decode — and diagnose — across
+/// versions.
 const FRAME_UNCOMPRESSED: u8 = 0;
 
 /// The frame-payload flag marking an LZ4-compressed body (followed by the
@@ -450,7 +461,18 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     }
 
     match payload.split_first() {
-        Some((&FRAME_UNCOMPRESSED, body)) => Ok(Some(body.to_vec())),
+        Some((&FRAME_UNCOMPRESSED, body)) => {
+            // The outer length admits the compressed header's overhead; an
+            // uncompressed body must still respect the frame cap itself.
+            if body.len() > protocol::MAXIMUM_FRAME_SIZE as usize {
+                bail!(
+                    "incoming frame of {} bytes exceeds the maximum frame size of {} bytes",
+                    body.len(),
+                    protocol::MAXIMUM_FRAME_SIZE
+                );
+            }
+            Ok(Some(body.to_vec()))
+        }
         Some((&FRAME_COMPRESSED, rest)) => {
             if rest.len() < 4 {
                 bail!("compressed frame is missing its length header");
@@ -642,6 +664,32 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn uncompressed_bodies_cannot_ride_the_compression_headroom() {
+        // The outer length admits the compressed header's five bytes; an
+        // uncompressed body must not be able to use that headroom to exceed
+        // the frame cap itself.
+        let (reader, mut writer) = pipe();
+        let (_sink_reader, sink_writer) = pipe();
+        let mut connection = Connection::from_streams(Box::new(reader), Box::new(sink_writer));
+
+        let body_length = protocol::MAXIMUM_FRAME_SIZE as usize + 1;
+        let mut frame = Vec::with_capacity(body_length + 1);
+        frame.push(FRAME_UNCOMPRESSED);
+        frame.resize(body_length + 1, 0);
+        writer
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .expect("unable to write");
+        writer.write_all(&frame).expect("unable to write");
+        let error = connection
+            .receive::<Request>()
+            .expect_err("expected a rejection");
+        assert!(
+            format!("{error:#}").contains("maximum frame size"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn oversized_frames_are_rejected_on_send() {
         let (mut first, mut second) = connected_pair();
 
@@ -786,10 +834,12 @@ pub(crate) mod tests {
     #[test]
     fn ssh_argv_defaults_to_the_agent_command() {
         let argv = Connection::ssh_argv("host", None);
-        assert_eq!(argv[0], "ssh");
+        assert!(argv[0].ends_with("ssh"), "{argv:?}");
         assert!(argv.contains(&"BatchMode=yes".to_owned()));
         assert!(argv.contains(&"ServerAliveInterval=15".to_owned()));
-        assert_eq!(&argv[argv.len() - 2..], ["host", "autobahn agent"]);
+        // The option terminator precedes the host, so a hostile host can't
+        // read as an SSH option.
+        assert_eq!(&argv[argv.len() - 3..], ["--", "host", "autobahn agent"]);
 
         let argv = Connection::ssh_argv("user@host", Some("/opt/bin/autobahn agent"));
         assert_eq!(

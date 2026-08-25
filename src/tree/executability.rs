@@ -5,33 +5,83 @@
 //! every file reads as executable, or none does. Fed directly into
 //! reconciliation, that noise would masquerade as content changes: phantom
 //! modifications that churn permissions on the other side forever. The fix
-//! (Mutagen's `PropagateExecutability`) is to graft the executability bits
-//! from a trusted reference — the ancestor — onto the affected side's
-//! snapshot before reconciliation, so only real content differences remain.
+//! (Mutagen's shape) is strip-then-graft: a non-preserving side contributes
+//! no executability information of its own, so its snapshot's bits are
+//! replaced wholesale — grafted from a trusted reference (the ancestor)
+//! where the reference holds a file at the same path, and stripped to
+//! non-executable everywhere else. Only real content differences remain for
+//! reconciliation to see.
 //!
-//! Grafting is structural and copy-on-write: subtrees without any grafted
-//! bit share their storage with the input snapshot, so the pass costs
-//! allocation only in proportion to the bits it actually changes.
+//! The pass is structural and copy-on-write: subtrees without any adjusted
+//! bit share their storage with the input snapshot, so it costs allocation
+//! only in proportion to the bits it actually changes.
 
 use std::sync::Arc;
 
 use super::{Content, Node};
 
 /// Propagates executability bits from `reference` onto `target`, returning
-/// the adjusted hierarchy. Bits are grafted wherever both hierarchies hold a
-/// file at the same path; everything else is left untouched.
+/// the adjusted hierarchy: files with a file counterpart in the reference
+/// take the reference's bit, and files without one are stripped to
+/// non-executable (this is what keeps a volume that reports every file
+/// executable from marking freshly created content executable everywhere
+/// else).
 pub fn propagate_executability(reference: Option<&Node>, target: Option<&Node>) -> Option<Node> {
-    match (reference, target) {
-        (Some(reference), Some(target)) => {
-            Some(propagate_node(reference, target).unwrap_or_else(|| target.clone()))
+    let target = target?;
+    let adjusted = match reference {
+        Some(reference) => propagate_node(reference, target),
+        None => strip_node(target),
+    };
+    Some(adjusted.unwrap_or_else(|| target.clone()))
+}
+
+/// Rebuilds a directory node with the specified child replacements
+/// (returning `None`, meaning "use the input as-is", when there are none).
+fn rebuild(target: &Node, children: &Arc<Vec<Node>>, changes: Vec<(usize, Node)>) -> Option<Node> {
+    if changes.is_empty() {
+        return None;
+    }
+    let mut rebuilt = children.as_ref().clone();
+    for (index, node) in changes {
+        rebuilt[index] = node;
+    }
+    Some(Node {
+        name: target.name.clone(),
+        content: Content::Directory(Arc::new(rebuilt)),
+    })
+}
+
+/// Strips executability throughout a hierarchy, returning the adjusted node
+/// if anything changed.
+fn strip_node(target: &Node) -> Option<Node> {
+    match &target.content {
+        Content::File {
+            digest,
+            executable: true,
+            metadata,
+        } => Some(Node {
+            name: target.name.clone(),
+            content: Content::File {
+                digest: *digest,
+                executable: false,
+                metadata: *metadata,
+            },
+        }),
+        Content::Directory(children) => {
+            let changes: Vec<(usize, Node)> = children
+                .iter()
+                .enumerate()
+                .filter_map(|(index, child)| strip_node(child).map(|node| (index, node)))
+                .collect();
+            rebuild(target, children, changes)
         }
-        (_, target) => target.cloned(),
+        _ => None,
     }
 }
 
-/// Grafts executability from `reference` onto `target`, returning the
-/// adjusted node if anything changed and `None` when `target` can be used
-/// as-is.
+/// Grafts executability from `reference` onto `target` (stripping wherever
+/// the reference holds no file counterpart), returning the adjusted node if
+/// anything changed and `None` when `target` can be used as-is.
 fn propagate_node(reference: &Node, target: &Node) -> Option<Node> {
     match (&reference.content, &target.content) {
         (
@@ -59,7 +109,8 @@ fn propagate_node(reference: &Node, target: &Node) -> Option<Node> {
         }
         (Content::Directory(reference_children), Content::Directory(target_children)) => {
             // Both child lists are name-sorted, so the reference counterpart
-            // of each target child is found by a linear merge.
+            // of each target child is found by a linear merge; children the
+            // reference doesn't vouch for are stripped.
             let mut changes: Vec<(usize, Node)> = Vec::new();
             let mut reference_index = 0usize;
             for (target_index, target_child) in target_children.iter().enumerate() {
@@ -68,29 +119,21 @@ fn propagate_node(reference: &Node, target: &Node) -> Option<Node> {
                 {
                     reference_index += 1;
                 }
-                let Some(reference_child) = reference_children.get(reference_index) else {
-                    break;
+                let counterpart = reference_children
+                    .get(reference_index)
+                    .filter(|child| child.name == target_child.name);
+                let adjusted = match counterpart {
+                    Some(reference_child) => propagate_node(reference_child, target_child),
+                    None => strip_node(target_child),
                 };
-                if reference_child.name != target_child.name {
-                    continue;
-                }
-                if let Some(changed) = propagate_node(reference_child, target_child) {
-                    changes.push((target_index, changed));
+                if let Some(adjusted) = adjusted {
+                    changes.push((target_index, adjusted));
                 }
             }
-            if changes.is_empty() {
-                return None;
-            }
-            let mut children = target_children.as_ref().clone();
-            for (index, node) in changes {
-                children[index] = node;
-            }
-            Some(Node {
-                name: target.name.clone(),
-                content: Content::Directory(Arc::new(children)),
-            })
+            rebuild(target, target_children, changes)
         }
-        _ => None,
+        // A type mismatch means the reference vouches for nothing here.
+        _ => strip_node(target),
     }
 }
 
@@ -122,7 +165,7 @@ mod tests {
     }
 
     #[test]
-    fn bits_are_grafted_where_both_sides_hold_files() {
+    fn bits_are_grafted_where_vouched_and_stripped_where_not() {
         let reference = Node::directory(
             "",
             vec![
@@ -130,21 +173,36 @@ mod tests {
                 file("plain", false),
             ],
         );
-        // The target reports noise: everything executable.
+        // The target reports noise: everything executable, including a file
+        // the reference has never seen.
         let target = Node::directory(
             "",
             vec![
-                Node::directory("sub", vec![file("tool", false), file("new", true)]),
+                Node::directory("sub", vec![file("new", true), file("tool", false)]),
                 file("plain", true),
             ],
         );
         let adjusted = propagate_executability(Some(&reference), Some(&target))
             .expect("the target should survive");
-        // Grafted where both sides hold files...
+        // Grafted where the reference holds a file...
         assert!(executable_of(&adjusted, "sub/tool"));
         assert!(!executable_of(&adjusted, "plain"));
-        // ...and untouched where the reference has no counterpart.
-        assert!(executable_of(&adjusted, "sub/new"));
+        // ...and stripped where it doesn't: a non-preserving volume can't
+        // vouch for a new file's executability.
+        assert!(!executable_of(&adjusted, "sub/new"));
+    }
+
+    #[test]
+    fn a_missing_reference_strips_everything() {
+        let target = Node::directory(
+            "",
+            vec![file("a", true), Node::directory("d", vec![file("b", true)])],
+        );
+        let adjusted =
+            propagate_executability(None, Some(&target)).expect("the target should survive");
+        assert!(!executable_of(&adjusted, "a"));
+        assert!(!executable_of(&adjusted, "d/b"));
+        assert!(propagate_executability(Some(&target), None).is_none());
     }
 
     #[test]
@@ -177,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn a_fully_unchanged_target_is_returned_as_is() {
+    fn a_fully_vouched_unchanged_target_is_returned_as_is() {
         let tree = Node::directory("", vec![file("a", true), file("b", false)]);
         let adjusted = propagate_executability(Some(&tree), Some(&tree.clone()))
             .expect("the target should survive");
@@ -185,16 +243,13 @@ mod tests {
     }
 
     #[test]
-    fn type_mismatches_and_missing_references_are_left_alone() {
+    fn type_mismatches_strip_rather_than_trust() {
+        // The reference holds a directory where the target holds an
+        // executable file: nothing vouches for that bit.
         let reference = Node::directory("", vec![Node::directory("entry", vec![])]);
         let target = Node::directory("", vec![file("entry", true)]);
         let adjusted = propagate_executability(Some(&reference), Some(&target))
             .expect("the target should survive");
-        assert!(executable_of(&adjusted, "entry"));
-
-        // No reference at all: the target passes through.
-        let passed = propagate_executability(None, Some(&target)).expect("target");
-        assert!(passed.content_equal(&target, true));
-        assert!(propagate_executability(Some(&reference), None).is_none());
+        assert!(!executable_of(&adjusted, "entry"));
     }
 }

@@ -108,7 +108,7 @@ pub struct LocalEndpoint {
 }
 
 /// A recursive filesystem watcher over the synchronization root, delivering
-/// events through a channel.
+/// events through a bounded channel.
 struct ChangeWatcher {
     /// The watcher itself, retained for its lifetime side effect.
     _watcher: notify::RecommendedWatcher,
@@ -120,9 +120,14 @@ impl ChangeWatcher {
     /// Establishes a recursive watch over `root`.
     fn new(root: &Path) -> Result<ChangeWatcher> {
         use notify::Watcher;
-        let (sender, receiver) = std::sync::mpsc::channel();
+        // The channel is bounded and overflow is *dropped*: consumers only
+        // ever ask "did anything change?", so once at least one event is
+        // queued, further events carry no additional information — and an
+        // unbounded queue would let a write burst during a long cycle grow
+        // memory without limit.
+        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
         let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.send(event);
+            let _ = sender.try_send(event);
         })
         .context("unable to create a filesystem watcher")?;
         watcher
@@ -181,12 +186,17 @@ impl LocalEndpoint {
         self.staging_root.with_extension("scancache")
     }
 
-    /// Loads the persisted scan cache, if a valid one exists. The cache is
-    /// purely a cold-start accelerant: it seeds the first scan's baseline so
-    /// unchanged files (by full metadata match) skip re-digesting, exactly
-    /// as a same-process previous snapshot would. It is *never* used for
-    /// transition validation — that record always comes from a real scan of
-    /// this process — and an unreadable or invalid cache is simply ignored.
+    /// Loads the persisted scan cache, if a valid one exists. The cache
+    /// seeds a cold start's first scan baseline, so unchanged files (by
+    /// full metadata match) skip re-digesting exactly as they would against
+    /// a same-process previous snapshot — which also means cached digests
+    /// can flow, metadata-gated, into that scan's snapshot and everything
+    /// downstream of it, transition validation included. The cache is
+    /// therefore *trusted state*, exactly like the ancestor it lives
+    /// beside: both share the state directory's protection, and an
+    /// unreadable or structurally invalid cache is ignored (it only ever
+    /// saves work). This is the same contract as Mutagen's persisted scan
+    /// cache.
     fn load_scan_cache(&self) -> Option<Snapshot> {
         let data = fs::read(self.scan_cache_path()).ok()?;
         let snapshot: Snapshot = bincode::deserialize(&data).ok()?;
@@ -444,11 +454,16 @@ impl Endpoint for LocalEndpoint {
 
         // Persist the cache when the hierarchy actually changed (an
         // unchanged scan shares its root storage with the baseline, so the
-        // comparison is a pointer check, not a tree walk).
-        if !roots_share_storage(
-            baseline.and_then(|snapshot| snapshot.root.as_ref()),
-            snapshot.root.as_ref(),
-        ) {
+        // comparison is a pointer check, not a tree walk), and always after
+        // a cold-start load — the freshly written file then reflects this
+        // process's scan rather than whatever a previous process (or
+        // corruption) left behind.
+        if cached.is_some()
+            || !roots_share_storage(
+                baseline.and_then(|snapshot| snapshot.root.as_ref()),
+                snapshot.root.as_ref(),
+            )
+        {
             self.store_scan_cache(&snapshot);
         }
 
@@ -908,6 +923,17 @@ impl Transitioner<'_> {
                 );
                 return None;
             }
+            // The configured directory mode applies to the root itself just
+            // like any other created directory (parents above the root stay
+            // untouched: they aren't synchronization content).
+            if let Err(error) =
+                fs::set_permissions(root, Permissions::from_mode(self.directory_mode))
+            {
+                self.problem(
+                    path,
+                    format!("unable to set the synchronization root's permissions: {error}"),
+                );
+            }
             let created = self.create_children(path, root, children);
             return Some(Node::directory(new.name.clone(), created));
         }
@@ -1007,9 +1033,26 @@ impl Transitioner<'_> {
     /// that its siblings still land.
     fn create_children(&mut self, path: &str, directory: &Path, children: &[Node]) -> Vec<Node> {
         let mut created = Vec::with_capacity(children.len());
-        // On a case-insensitive volume, sibling names that differ only by
-        // case denote a single on-disk entry; creating the second would
-        // corrupt the first, so it's refused up front.
+        // On a volume with name equivalence rules — case-insensitive
+        // lookups, or Unicode-normalization-insensitive ones (decomposing
+        // volumes are the latter by construction) — sibling names that fold
+        // together denote a single on-disk entry; creating the second would
+        // silently replace the first, so it's refused up front.
+        let behavior = self.behavior;
+        let folds_names = behavior.case_insensitive
+            || behavior.normalization_insensitive
+            || behavior.decomposes_unicode;
+        let fold = move |name: &str| {
+            let mut key = if behavior.normalization_insensitive || behavior.decomposes_unicode {
+                recompose(name)
+            } else {
+                name.to_owned()
+            };
+            if behavior.case_insensitive {
+                key = key.to_lowercase();
+            }
+            key
+        };
         let mut folded: HashMap<String, ()> = HashMap::new();
         for child in children {
             let child_path = path_join(path, &child.name);
@@ -1020,13 +1063,11 @@ impl Transitioner<'_> {
                 );
                 continue;
             }
-            if self.behavior.case_insensitive
-                && folded.insert(child.name.to_lowercase(), ()).is_some()
-            {
+            if folds_names && folded.insert(fold(&child.name), ()).is_some() {
                 self.problem(
                     &child_path,
-                    "refusing to create this entry: its name collides with a sibling's on \
-                     this case-insensitive filesystem",
+                    "refusing to create this entry: its name collides with a sibling's \
+                     under this filesystem's name equivalence rules",
                 );
                 continue;
             }
@@ -2365,6 +2406,53 @@ mod tests {
     }
 
     #[test]
+    fn normalization_equivalent_siblings_are_refused_on_folding_volumes() {
+        // NFC and NFD spellings denote one entry on a decomposing (or
+        // normalization-insensitive) volume; creating both would silently
+        // replace the first with the second.
+        let mut fixture = Fixture::new();
+        fixture.beta.behavior = Some(FilesystemBehavior {
+            decomposes_unicode: true,
+            normalization_insensitive: true,
+            ..FilesystemBehavior::default()
+        });
+        fixture.beta.scan().expect("scan should succeed");
+
+        let digest = *blake3::hash(b"content").as_bytes();
+        fs::create_dir_all(&fixture.beta.staging_root).expect("staging root");
+        fs::write(fixture.beta.staged_path(&digest), b"content").expect("staged content");
+        let child = |name: &str| Node {
+            name: name.into(),
+            content: Content::File {
+                digest,
+                executable: false,
+                metadata: FileMetadata::default(),
+            },
+        };
+        let outcome = fixture
+            .beta
+            .transition(vec![Change {
+                path: "d".into(),
+                old: None,
+                new: Some(Node::directory(
+                    "d",
+                    vec![child("caf\u{00E9}.txt"), child("cafe\u{0301}.txt")],
+                )),
+            }])
+            .expect("transition should succeed");
+        assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
+        assert!(
+            outcome.problems[0].message.contains("equivalence"),
+            "{}",
+            outcome.problems[0].message
+        );
+        // Exactly one spelling landed, and the result reports only it — the
+        // ancestor will never carry a phantom sibling.
+        let result = outcome.results[0].as_ref().expect("directory result");
+        assert_eq!(result.children().len(), 1);
+    }
+
+    #[test]
     fn decomposed_on_disk_names_match_nfc_expectations() {
         let mut fixture = Fixture::new();
         // NFD on disk simulates a decomposing volume on our byte-preserving
@@ -2429,7 +2517,7 @@ mod tests {
             .expect("transition should succeed");
         assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
         assert!(
-            outcome.problems[0].message.contains("case-insensitive"),
+            outcome.problems[0].message.contains("equivalence"),
             "{}",
             outcome.problems[0].message
         );

@@ -22,9 +22,18 @@ use crate::tree::{Change, Snapshot};
 /// Dropping the endpoint closes its channel; when that channel was the
 /// connection's last, the connection shuts the agent down and reaps its
 /// process.
+/// The number of staging push batches kept in flight before waiting for an
+/// acknowledgement. With batches sized toward
+/// [`SUPPLY_TARGET_BYTES`](crate::endpoint::local::SUPPLY_TARGET_BYTES),
+/// this bounds unacknowledged data in transit while hiding the round-trip
+/// latency that a strict push-ack-push cadence would pay per batch.
+const PUSH_WINDOW: usize = 4;
+
 pub struct RemoteEndpoint {
     /// The endpoint's channel.
     channel: AgentChannel,
+    /// The number of staging pushes sent but not yet acknowledged.
+    pending_pushes: usize,
 }
 
 impl RemoteEndpoint {
@@ -34,12 +43,15 @@ impl RemoteEndpoint {
     pub fn connect(connection: Connection, initialize: Initialize) -> Result<RemoteEndpoint> {
         let connection = AgentConnection::connect(connection)?;
         let channel = connection.open(initialize)?;
-        Ok(RemoteEndpoint { channel })
+        Ok(RemoteEndpoint::from_channel(channel))
     }
 
     /// Wraps an already-open channel (the pooled path).
     pub(crate) fn from_channel(channel: AgentChannel) -> RemoteEndpoint {
-        RemoteEndpoint { channel }
+        RemoteEndpoint {
+            channel,
+            pending_pushes: 0,
+        }
     }
 
     /// Terminates the endpoint, reporting failures that the silent drop
@@ -47,6 +59,39 @@ impl RemoteEndpoint {
     /// ignored, or a non-successful agent exit.
     pub fn close(self) -> Result<()> {
         self.channel.close()
+    }
+
+    /// Consumes one owed staging push acknowledgement. The pending count
+    /// decreases even on failure: either a response was consumed or the
+    /// channel itself failed (in which case nothing further will arrive).
+    fn drain_push_ack(&mut self) -> Result<()> {
+        let response = self.channel.receive_response();
+        self.pending_pushes -= 1;
+        match response? {
+            Response::StagePushed => Ok(()),
+            Response::Error(message) => Err(remote_error(message)),
+            response => Err(unexpected_response(&response, "stage push")),
+        }
+    }
+
+    /// Drains staging push acknowledgements until at most `target` remain.
+    /// On any failure, every remaining acknowledgement is drained as well —
+    /// so the channel never carries stale staging responses into later
+    /// requests — and the first error is returned.
+    fn drain_pushes_to(&mut self, target: usize) -> Result<()> {
+        let mut first_error = None;
+        while self.pending_pushes > 0 {
+            if first_error.is_none() && self.pending_pushes <= target {
+                break;
+            }
+            if let Err(error) = self.drain_push_ack() {
+                first_error.get_or_insert(error);
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Performs one exchange, translating a remote failure into a local
@@ -156,6 +201,26 @@ impl Endpoint for RemoteEndpoint {
             Response::StagePushed => Ok(()),
             response => Err(unexpected_response(&response, "stage push")),
         }
+    }
+
+    fn stage_push_nowait(&mut self, frames: Vec<TransferFrame>) -> Result<()> {
+        // Keep at most a window of unacknowledged pushes in flight; each
+        // ack drained here corresponds (in order) to an earlier push. A
+        // failure drains the whole window before surfacing, leaving the
+        // channel free of staging responses.
+        self.drain_pushes_to(PUSH_WINDOW - 1)?;
+        if let Err(error) = self.channel.send_only(Request::StagePush(frames)) {
+            // A locally-failed send (e.g. an oversized batch) can leave the
+            // connection healthy, so the in-flight window must still settle.
+            let _ = self.drain_pushes_to(0);
+            return Err(error);
+        }
+        self.pending_pushes += 1;
+        Ok(())
+    }
+
+    fn stage_finish(&mut self) -> Result<()> {
+        self.drain_pushes_to(0)
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
@@ -311,6 +376,62 @@ mod tests {
         assert_eq!(received.root, "/home/user/project");
         assert_eq!(received.session, "session-1");
         assert_eq!(received.ignores, vec!["*.tmp".to_owned()]);
+    }
+
+    #[test]
+    fn staging_pushes_pipeline_with_a_bounded_window() {
+        let (client, agent) = connected_pair();
+        // Six pushes, all acknowledged positively.
+        let agent = scripted_agent(agent, vec![Response::StagePushed; 6]);
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        for _ in 0..6 {
+            endpoint
+                .stage_push_nowait(Vec::new())
+                .expect("push should send");
+        }
+        endpoint.stage_finish().expect("all pushes should complete");
+        drop(endpoint);
+        agent.join().expect("agent thread panicked").expect("agent");
+    }
+
+    #[test]
+    fn a_failed_push_surfaces_no_later_than_stage_finish() {
+        let (client, agent) = connected_pair();
+        let agent = scripted_agent(
+            agent,
+            vec![
+                Response::StagePushed,
+                Response::Error("disk full".into()),
+                Response::StagePushed,
+            ],
+        );
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        // The window lets these sends succeed before their acks arrive; the
+        // failure must surface by the time staging completes.
+        let mut failed = None;
+        for _ in 0..3 {
+            if let Err(error) = endpoint.stage_push_nowait(Vec::new()) {
+                failed = Some(error);
+                break;
+            }
+        }
+        let error = match failed {
+            Some(error) => error,
+            None => endpoint
+                .stage_finish()
+                .expect_err("the failed push must surface"),
+        };
+        assert!(
+            format!("{error:#}").contains("disk full"),
+            "unexpected error: {error:#}"
+        );
+        // The failure must leave no acknowledgements queued on the channel:
+        // a later request would otherwise consume a stale staging response.
+        assert_eq!(endpoint.pending_pushes, 0);
+        drop(endpoint);
+        let _ = agent.join();
     }
 
     #[test]

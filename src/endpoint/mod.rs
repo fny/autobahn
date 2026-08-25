@@ -103,6 +103,26 @@ pub trait Endpoint {
     /// staging, applying them incrementally.
     fn stage_push(&mut self, frames: Vec<TransferFrame>) -> Result<()>;
 
+    /// Pushes a batch of transfer frames without requiring completion
+    /// acknowledgement, letting implementations keep several batches in
+    /// flight over high-latency transports. Errors may be deferred to
+    /// [`stage_finish`](Endpoint::stage_finish); callers must invoke it
+    /// after the final batch. A failure from either method settles all
+    /// in-flight batches first, so the endpoint remains usable for
+    /// subsequent operations. The default is simply the synchronous push.
+    fn stage_push_nowait(&mut self, frames: Vec<TransferFrame>) -> Result<()> {
+        self.stage_push(frames)
+    }
+
+    /// Completes a sequence of [`stage_push_nowait`] batches, surfacing any
+    /// deferred failure. The default (synchronous pushes) has nothing to
+    /// wait for.
+    ///
+    /// [`stage_push_nowait`]: Endpoint::stage_push_nowait
+    fn stage_finish(&mut self) -> Result<()> {
+        Ok(())
+    }
+
     /// Applies transitions to this endpoint's filesystem, sourcing file
     /// content from staged data. Refusals (due to concurrent modification)
     /// are reported as problems and reflected in the returned results, not

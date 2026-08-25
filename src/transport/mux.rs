@@ -80,14 +80,15 @@ struct Shared {
 struct Slot {
     /// The response queue.
     sender: mpsc::Sender<Response>,
-    /// Whether or not a request is outstanding (a response arriving without
-    /// one is a protocol violation). The flag bounds, rather than
-    /// eliminates, duplicate damage: a duplicate landing in the window
-    /// after the *next* request marks itself outstanding is delivered as
-    /// that request's answer — which surfaces as a typed protocol error at
-    /// the caller — and the genuine answer that follows then fails the
-    /// connection. Nothing desynchronizes silently.
-    outstanding: bool,
+    /// The number of outstanding requests (a response arriving with none
+    /// is a protocol violation). Ordinary exchanges keep this at most one;
+    /// windowed staging pushes keep several acknowledgements in flight.
+    /// The counter bounds, rather than eliminates, duplicate damage: a
+    /// duplicate landing while a request is outstanding is delivered as an
+    /// answer — which surfaces as a typed protocol error at the caller —
+    /// and the genuine answer that follows then fails the connection.
+    /// Nothing desynchronizes silently.
+    outstanding: u32,
 }
 
 /// The routing table and lifecycle flags.
@@ -156,8 +157,8 @@ impl AgentConnection {
                             .lock()
                             .expect("the state lock is never poisoned");
                         match state.channels.get_mut(&channel) {
-                            Some(slot) if slot.outstanding => {
-                                slot.outstanding = false;
+                            Some(slot) if slot.outstanding > 0 => {
+                                slot.outstanding -= 1;
                                 // A failed send means the channel handle is
                                 // being dropped; its close is on the way.
                                 let _ = slot.sender.send(response);
@@ -216,7 +217,7 @@ impl AgentConnection {
                 channel,
                 Slot {
                     sender,
-                    outstanding: true,
+                    outstanding: 1,
                 },
             );
             state.open += 1;
@@ -288,6 +289,16 @@ impl AgentChannel {
     /// response may be [`Response::Error`] (a request-level failure on the
     /// far side); a transport failure is an error here.
     pub fn exchange(&mut self, request: Request) -> Result<Response> {
+        self.send_only(request)?;
+        self.receive_response()
+    }
+
+    /// Sends a request without awaiting its response, which remains owed on
+    /// the channel and must be drained with
+    /// [`receive_response`](AgentChannel::receive_response) (in order).
+    /// This is what lets bulk staging keep a window of pushes in flight
+    /// instead of paying one round trip per batch.
+    pub fn send_only(&mut self, request: Request) -> Result<()> {
         {
             let mut state = self
                 .shared
@@ -301,22 +312,27 @@ impl AgentChannel {
                 .channels
                 .get_mut(&self.channel)
                 .ok_or_else(|| anyhow!("the channel has been closed"))?;
-            slot.outstanding = true;
+            slot.outstanding += 1;
         }
         if let Err(error) = self.shared.send(&MuxRequest::Request {
             channel: self.channel,
             request,
         }) {
-            // The request never went out; nothing is outstanding (leaving
-            // the flag set would let a stray later response masquerade as
+            // The request never went out; it isn't outstanding (leaving the
+            // count raised would let a stray later response masquerade as
             // an answer).
             if let Ok(mut state) = self.shared.state.lock() {
                 if let Some(slot) = state.channels.get_mut(&self.channel) {
-                    slot.outstanding = false;
+                    slot.outstanding = slot.outstanding.saturating_sub(1);
                 }
             }
             return Err(error).context("unable to send request to the agent");
         }
+        Ok(())
+    }
+
+    /// Receives the next owed response on this channel.
+    pub fn receive_response(&mut self) -> Result<Response> {
         self.receiver.recv().map_err(|_| {
             anyhow!(
                 "the agent connection failed: {}",

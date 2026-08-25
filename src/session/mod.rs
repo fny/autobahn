@@ -22,7 +22,7 @@ use crate::tree::{
 /// The number of transfer frames pumped between endpoints per round trip
 /// during staging. Larger batches amortize protocol round trips; each frame
 /// is bounded by the rsync maximum data operation size.
-const SUPPLY_BATCH_SIZE: usize = 256;
+const SUPPLY_BATCH_SIZE: usize = 16_384;
 
 /// A synchronization halt requiring explicit user intervention, raised when
 /// a cycle would perform a change so sweeping that it more likely reflects
@@ -409,10 +409,16 @@ fn stage(
         if frames.is_empty() {
             break;
         }
+        // Pushes are pipelined: a remote destination keeps a window of
+        // batches in flight rather than paying a round trip per batch, and
+        // stage_finish drains the outstanding acknowledgements.
         destination
-            .stage_push(frames)
+            .stage_push_nowait(frames)
             .context("unable to push file content")?;
     }
+    destination
+        .stage_finish()
+        .context("unable to complete staging")?;
     Ok(())
 }
 

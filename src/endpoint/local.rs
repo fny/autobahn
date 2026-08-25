@@ -57,6 +57,26 @@ const DEFAULT_FILE_MODE: u32 = 0o600;
 /// The size of the buffer used to stream local staging copies.
 const COPY_BUFFER_SIZE: usize = 64 * 1024;
 
+/// The payload size a supply batch aims for. Small files produce tiny
+/// frames, and a purely frame-counted batch would carry under a megabyte —
+/// hundreds of round trips for a large tree. Sizing batches by bytes keeps
+/// each round trip carrying real payload while staying far inside the
+/// protocol's frame cap.
+pub const SUPPLY_TARGET_BYTES: usize = 8 * 1024 * 1024;
+
+/// Estimates the wire weight of a transfer frame.
+fn frame_weight(frame: &TransferFrame) -> usize {
+    match frame {
+        TransferFrame::Op(crate::rsync::Op::Data(data)) => data.len() + 16,
+        // Supply error messages embed paths and OS error text of unbounded
+        // length, so they must count toward the byte budget too.
+        TransferFrame::EndOfFile {
+            error: Some(message),
+        } => message.len() + 24,
+        _ => 24,
+    }
+}
+
 /// The counter that uniquifies temporary file names within a process.
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -544,7 +564,8 @@ impl Endpoint for LocalEndpoint {
         let limit = max_frames.max(1);
 
         let mut frames = Vec::new();
-        while frames.len() < limit {
+        let mut bytes = 0usize;
+        while frames.len() < limit && bytes < SUPPLY_TARGET_BYTES {
             if state.pending.is_empty() {
                 if state.current >= state.needs.len() {
                     break;
@@ -555,9 +576,12 @@ impl Endpoint for LocalEndpoint {
                 self.buffer_delta(need, &mut state.pending);
                 state.current += 1;
             }
-            while frames.len() < limit {
+            while frames.len() < limit && bytes < SUPPLY_TARGET_BYTES {
                 match state.pending.pop_front() {
-                    Some(frame) => frames.push(frame),
+                    Some(frame) => {
+                        bytes += frame_weight(&frame);
+                        frames.push(frame);
+                    }
                     None => break,
                 }
             }
@@ -2204,6 +2228,45 @@ mod tests {
             outcome.problems[0].message
         );
         assert!(fixture.beta_root.join("link").exists());
+    }
+
+    #[test]
+    fn supply_batches_are_sized_by_bytes_not_just_frames() {
+        let mut fixture = Fixture::new();
+        // A 20MB file yields far more payload than one batch should carry.
+        fs::write(
+            fixture.alpha_root.join("big.bin"),
+            pseudo_random(20 * 1024 * 1024, 0xBEEF),
+        )
+        .expect("file should be writable");
+        let transitions = fixture.beta_transitions();
+        let requests = transition_dependencies(&transitions);
+        let needs = fixture
+            .beta
+            .stage_begin(requests)
+            .expect("staging should begin");
+        fixture
+            .alpha
+            .supply_open(needs)
+            .expect("supply should open");
+
+        let frames = fixture
+            .alpha
+            .supply_pull(usize::MAX)
+            .expect("supply should pull");
+        let bytes: usize = frames
+            .iter()
+            .map(|frame| match frame {
+                TransferFrame::Op(crate::rsync::Op::Data(data)) => data.len(),
+                _ => 0,
+            })
+            .sum();
+        // The batch stops near the byte target rather than swallowing the
+        // whole file (one frame of overshoot is permitted).
+        assert!(
+            (SUPPLY_TARGET_BYTES..SUPPLY_TARGET_BYTES + 128 * 1024).contains(&bytes),
+            "batch carried {bytes} bytes"
+        );
     }
 
     #[test]

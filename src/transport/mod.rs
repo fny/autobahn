@@ -62,9 +62,11 @@ pub(crate) fn ssh_binary() -> String {
 
 /// The options applied to every SSH invocation. `BatchMode` disables
 /// interactive prompting (prompts would compete with the protocol for
-/// stdio), the keepalives bound how long a dead network can hang a
-/// synchronous cycle, and `Compression` recovers most of a dedicated
-/// compression layer's benefit on the raw stream for free.
+/// stdio), and the keepalives bound how long a dead network can hang a
+/// synchronous cycle. SSH-level compression is deliberately *disabled*:
+/// the protocol stream is already LZ4-compressed, and recompressing it
+/// with zlib costs seconds of CPU on both ends of a large transfer for
+/// almost no wire savings.
 pub(crate) fn ssh_options() -> Vec<&'static str> {
     vec![
         "-o",
@@ -74,7 +76,7 @@ pub(crate) fn ssh_options() -> Vec<&'static str> {
         "-o",
         "ServerAliveCountMax=4",
         "-o",
-        "Compression=yes",
+        "Compression=no",
     ]
 }
 

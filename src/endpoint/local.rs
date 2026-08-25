@@ -642,6 +642,16 @@ impl Endpoint for LocalEndpoint {
         // were reconciled from. The snapshot is deliberately *not* updated
         // here: the next scan is what re-establishes the record, and a
         // half-updated record would be worse than a stale one.
+        // Count how many publishes each staged digest could at most serve
+        // in this batch, so that a digest's final publish can move the
+        // staged file into place instead of copying it — halving the write
+        // volume of large (especially cold) transfers.
+        let mut staged_uses = HashMap::new();
+        for change in &transitions {
+            if let Some(node) = &change.new {
+                count_staged_uses(node, &mut staged_uses);
+            }
+        }
         let mut transitioner = Transitioner {
             root: &self.root,
             staging_root: &self.staging_root,
@@ -650,6 +660,7 @@ impl Endpoint for LocalEndpoint {
             symlink_mode: self.symlink_mode,
             file_mode: self.file_mode,
             directory_mode: self.directory_mode,
+            staged_uses,
             problems: Vec::new(),
             missing_staged_files: false,
         };
@@ -814,6 +825,12 @@ struct Transitioner<'a> {
     file_mode: u32,
     /// The permission bits for created directories.
     directory_mode: u32,
+    /// Per digest, how many publishes this batch could still require. A
+    /// count reaching zero marks a staged file's last possible use, letting
+    /// it be moved into place rather than copied. Counts are upper bounds
+    /// (a refusal skips publishes without decrementing), which only ever
+    /// turns a move into a copy, never the reverse.
+    staged_uses: HashMap<Digest, usize>,
     /// The problems accumulated so far.
     problems: Vec<Problem>,
     /// Whether or not any staged content was found missing.
@@ -1108,11 +1125,12 @@ impl Transitioner<'_> {
         created
     }
 
-    /// Publishes staged content at a target path: copy the staged file to a
+    /// Publishes staged content at a target path: bring the staged file to a
     /// temporary beside the target, set its permissions, then rename it into
-    /// place. Copying (rather than moving) keeps the staged content available
-    /// for other paths that share it, and the rename makes the target's
-    /// transition from old content to new atomic.
+    /// place. Copying keeps the staged content available for other paths that
+    /// share it, so a digest's final use moves instead (falling back to a
+    /// copy across filesystems), and the rename makes the target's transition
+    /// from old content to new atomic.
     fn publish_file(
         &mut self,
         path: &str,
@@ -1135,19 +1153,31 @@ impl Transitioner<'_> {
         }
 
         let temporary = parent.join(temporary_name("apply"));
-        if let Err(error) = fs::copy(&staged, &temporary) {
-            let _ = fs::remove_file(&temporary);
-            self.problem(path, format!("unable to stage content into place: {error}"));
-            return None;
+        let last_use = match self.staged_uses.get_mut(digest) {
+            Some(count) => {
+                *count = count.saturating_sub(1);
+                *count == 0
+            }
+            None => false,
+        };
+        let moved = last_use && fs::rename(&staged, &temporary).is_ok();
+        if !moved {
+            if let Err(error) = fs::copy(&staged, &temporary) {
+                let _ = fs::remove_file(&temporary);
+                self.problem(path, format!("unable to stage content into place: {error}"));
+                return None;
+            }
         }
+        // On failure past this point a moved file is returned to staging
+        // (best-effort), so the content needn't be retransferred.
         let mode = creation_mode(self.file_mode, executable);
         if let Err(error) = fs::set_permissions(&temporary, Permissions::from_mode(mode)) {
-            let _ = fs::remove_file(&temporary);
+            self.unpublish(moved, &temporary, &staged);
             self.problem(path, format!("unable to set file permissions: {error}"));
             return None;
         }
         if let Err(error) = fs::rename(&temporary, target) {
-            let _ = fs::remove_file(&temporary);
+            self.unpublish(moved, &temporary, &staged);
             self.problem(path, format!("unable to publish content: {error}"));
             return None;
         }
@@ -1161,6 +1191,14 @@ impl Transitioner<'_> {
                 self.problem(path, format!("unable to probe the created file: {error}"));
                 Some(FileMetadata::default())
             }
+        }
+    }
+
+    /// Disposes of a publish temporary after a failure: a moved staged file
+    /// goes back to staging (best-effort), a copy is simply removed.
+    fn unpublish(&self, moved: bool, temporary: &Path, staged: &Path) {
+        if !moved || fs::rename(temporary, staged).is_err() {
+            let _ = fs::remove_file(temporary);
         }
     }
 
@@ -1481,6 +1519,20 @@ fn creation_mode(file_mode: u32, executable: bool) -> u32 {
 }
 
 /// Returns the staging path for content with the specified digest.
+/// Accumulates, per digest, how many file publishes the given hierarchy
+/// could at most require.
+fn count_staged_uses(node: &Node, uses: &mut HashMap<Digest, usize>) {
+    match &node.content {
+        Content::File { digest, .. } => *uses.entry(*digest).or_insert(0) += 1,
+        Content::Directory(children) => {
+            for child in children.iter() {
+                count_staged_uses(child, uses);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn staged_path(staging_root: &Path, digest: &Digest) -> PathBuf {
     use std::fmt::Write;
     let mut name = String::with_capacity(digest.len() * 2);
@@ -1731,6 +1783,40 @@ mod tests {
         }
         data.truncate(length);
         data
+    }
+
+    #[test]
+    fn published_content_moves_out_of_staging_on_its_last_use() {
+        let mut fixture = Fixture::new();
+        write(&fixture.alpha_root, "one.txt", "shared content");
+        write(&fixture.alpha_root, "two.txt", "shared content");
+        write(&fixture.alpha_root, "three.txt", "unique content");
+
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        let outcome = fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+
+        // Every target holds its content...
+        assert_eq!(read(&fixture.beta_root, "one.txt"), "shared content");
+        assert_eq!(read(&fixture.beta_root, "two.txt"), "shared content");
+        assert_eq!(read(&fixture.beta_root, "three.txt"), "unique content");
+        // ...and each digest's last publish consumed its staged file, so
+        // the staging root retains no content (only, possibly, empty
+        // bookkeeping entries such as the scan cache).
+        let leftovers: Vec<_> = fs::read_dir(fixture._keep.path().join("staging-beta"))
+            .expect("staging root should be readable")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.metadata().map(|m| m.len() > 0).unwrap_or(false))
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "staged content remained: {leftovers:?}"
+        );
     }
 
     #[test]

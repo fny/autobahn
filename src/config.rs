@@ -39,7 +39,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
-use crate::paths::expand_tilde;
+use crate::paths::{expand_tilde, resolve_for_identity};
 use crate::scan::IgnoreSet;
 use crate::session::session_identifier;
 use crate::tree::SyncMode;
@@ -120,6 +120,13 @@ pub struct SessionPlan {
     pub ignores: Vec<String>,
     /// The interval between synchronization cycles.
     pub interval: Duration,
+    /// The stable identifier isolating this session's state, derived from
+    /// the *resolved* endpoint identities (see
+    /// [`resolve_for_identity`](crate::paths::resolve_for_identity)) so that
+    /// textual aliases of the same roots — across configurations, or between
+    /// a supervisor and a manual `sync` — share one identity and therefore
+    /// one state lock.
+    identifier: String,
 }
 
 /// A resolved beta destination.
@@ -157,7 +164,19 @@ impl SessionPlan {
 
     /// Returns the stable identifier isolating this session's state.
     pub fn identifier(&self) -> String {
-        session_identifier(&self.alpha_spec, &self.beta_spec())
+        self.identifier.clone()
+    }
+}
+
+/// Computes a session identity string for a beta target: the resolved
+/// physical path for a local target, the textual `destination:path` for a
+/// remote one (whose paths can only be resolved on the remote side).
+fn beta_identity(beta: &BetaTarget) -> String {
+    match beta {
+        BetaTarget::Local(path) => resolve_for_identity(path).to_string_lossy().into_owned(),
+        BetaTarget::Remote {
+            destination, path, ..
+        } => format!("{destination}:{path}"),
     }
 }
 
@@ -289,6 +308,10 @@ impl Config {
                 let (Some(mode), Some(alpha)) = (mode, alpha.clone()) else {
                     continue;
                 };
+                let alpha_identity = resolve_for_identity(&alpha);
+                let beta_identity = beta_identity(&target);
+                let identifier =
+                    session_identifier(&alpha_identity.to_string_lossy(), &beta_identity);
                 let plan = SessionPlan {
                     group: name.clone(),
                     host,
@@ -298,19 +321,11 @@ impl Config {
                     mode,
                     ignores: ignores.clone(),
                     interval,
+                    identifier,
                 };
-                let identity = (
-                    duplicate_detection_key(&plan.alpha),
-                    match &plan.beta {
-                        BetaTarget::Local(path) => {
-                            duplicate_detection_key(path).to_string_lossy().into_owned()
-                        }
-                        BetaTarget::Remote {
-                            destination, path, ..
-                        } => format!("{destination}:{path}"),
-                    },
-                );
-                if let Some(previous) = identities.insert(identity, plan.display()) {
+                if let Some(previous) =
+                    identities.insert((alpha_identity, beta_identity), plan.display())
+                {
                     errors.push(format!(
                         "sessions '{previous}' and '{}' describe the same alpha and beta; \
                          they would synchronize the same trees concurrently",
@@ -327,15 +342,6 @@ impl Config {
         }
         Ok(plans)
     }
-}
-
-/// Resolves a local path to its identity for duplicate detection:
-/// canonicalized when it exists (collapsing symlinks and dot components),
-/// lexically normalized otherwise. Detection is best-effort by nature — a
-/// root that doesn't exist yet can't have its symlinks resolved — but a
-/// missing root also can't be destructively synchronized yet.
-fn duplicate_detection_key(path: &std::path::Path) -> PathBuf {
-    std::fs::canonicalize(path).unwrap_or_else(|_| path.components().collect())
 }
 
 /// Parses a synchronization mode name.
@@ -699,6 +705,30 @@ mod tests {
         );
         assert!(error.contains("dotted@host"), "{error}");
         assert!(error.contains("linked@host"), "{error}");
+
+        // Betas that don't exist yet still alias when their *ancestors* do:
+        // a missing mirror under a symlinked parent would be created at the
+        // same physical location as its direct spelling.
+        let config = parse(&format!(
+            r#"
+            [groups.one]
+            alpha = "{data}"
+            mode = "two-way-safe"
+            betas = ["{data}/mirror/new"]
+
+            [groups.two]
+            alpha = "{alias}"
+            mode = "one-way-replica"
+            betas = ["{alias}/mirror/new"]
+            "#,
+            data = data.display(),
+            alias = alias.display(),
+        ));
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(
+            error.contains("describe the same alpha and beta"),
+            "{error}"
+        );
     }
 
     #[test]

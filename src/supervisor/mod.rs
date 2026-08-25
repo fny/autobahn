@@ -137,7 +137,7 @@ impl Supervisor {
                     scope.spawn(move || {
                         let mut worker = Worker::new(plan, &self.state_root, self.verbose);
                         let result = worker.attempt();
-                        let recorded = worker.record(&result);
+                        let recorded = worker.conclude(&result);
                         let result = match (result, recorded) {
                             (Ok((digest, _)), Ok(())) => Ok(digest),
                             (Ok(_), Err(record_error)) => Err(format!(
@@ -207,7 +207,7 @@ impl Supervisor {
                                 )
                             }
                         };
-                        if let Err(error) = worker.record(&result) {
+                        if let Err(error) = worker.conclude(&result) {
                             eprintln!("[{}] unable to record status: {error:#}", plan.display());
                         }
                         sleep_interruptible(delay, stop);
@@ -246,9 +246,13 @@ impl<'a> Worker<'a> {
     }
 
     /// Runs one attempt: connect if not connected, then run a cycle (plus
-    /// bounded follow-ups while staged content is reported missing). On
-    /// failure the session is dropped, so the next attempt reconnects from
-    /// scratch (which also shuts down and reaps any agent process).
+    /// bounded follow-ups while staged content is reported missing).
+    ///
+    /// A failed attempt's session is *not* dropped here but in
+    /// [`conclude`](Worker::conclude), after the status has been recorded:
+    /// dropping it releases the state lock, and releasing before recording
+    /// would let a waiting successor acquire the session and publish a newer
+    /// status that this worker's stale error write then overwrites.
     fn attempt(&mut self) -> Result<(CycleDigest, CycleReport)> {
         let result = (|| {
             if self.session.is_none() {
@@ -256,15 +260,22 @@ impl<'a> Worker<'a> {
             }
             run_cycles(self.session.as_mut().expect("the session was just created"))
         })();
-        if result.is_err() {
-            self.session = None;
-        } else {
-            self.cycles += result
-                .as_ref()
-                .map(|(digest, _)| digest.cycles)
-                .unwrap_or(0);
+        if let Ok((digest, _)) = &result {
+            self.cycles += digest.cycles;
         }
         result
+    }
+
+    /// Concludes an attempt: records its status (while any held lock is
+    /// still ours), then, on failure, drops the session so the next attempt
+    /// reconnects from scratch (which also shuts down and reaps any agent
+    /// process).
+    fn conclude(&mut self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
+        let recorded = self.record(result);
+        if result.is_err() {
+            self.session = None;
+        }
+        recorded
     }
 
     /// Records an attempt's result to the session's status file (and, when

@@ -72,6 +72,43 @@ pub fn default_state_root() -> Result<PathBuf> {
     Ok(absolute_home()?.join(".autobahn"))
 }
 
+/// Resolves a path to its physical identity: fully canonicalized when it
+/// exists, and otherwise the canonicalized deepest *existing* ancestor with
+/// the missing suffix reappended (lexically normalized).
+///
+/// This is the path form that session identity and duplicate detection are
+/// built on. Textual comparison isn't enough — `/data/.`, a symlink alias,
+/// and `~/data` versus its expansion all denote one directory — and plain
+/// canonicalization isn't either, because a root that doesn't exist *yet*
+/// (one a transition will create) still has an identity: the place it will
+/// be created, which lives under its existing ancestors' resolved form.
+/// Without ancestor resolution, `/real/new` and `/alias/new` (where `alias`
+/// is a symlink to `real`) would get distinct identities while denoting the
+/// same future directory.
+pub fn resolve_for_identity(path: &std::path::Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    let normalized: PathBuf = path.components().collect();
+    let mut prefix = normalized.as_path();
+    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
+    while let Some(parent) = prefix.parent() {
+        let Some(name) = prefix.file_name() else {
+            break;
+        };
+        suffix.push(name.to_owned());
+        if let Ok(resolved) = std::fs::canonicalize(parent) {
+            let mut result = resolved;
+            for name in suffix.iter().rev() {
+                result.push(name);
+            }
+            return result;
+        }
+        prefix = parent;
+    }
+    normalized
+}
+
 /// Returns the current user's home directory, requiring it to be absolute:
 /// every default path is derived from it, and a relative `HOME` would make
 /// them all silently working-directory-dependent.
@@ -133,5 +170,32 @@ mod tests {
         // Without a usable XDG_CONFIG_HOME, HOME must exist and be absolute.
         assert!(config_path_from(None, None).is_err());
         assert!(config_path_from(None, Some("relative-home")).is_err());
+    }
+
+    #[test]
+    fn identity_resolution_sees_through_ancestors_of_missing_paths() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let real = keep.path().join("real");
+        std::fs::create_dir_all(&real).expect("directory should be creatable");
+        let alias = keep.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).expect("symlink should be creatable");
+
+        // An existing path fully canonicalizes.
+        assert_eq!(
+            resolve_for_identity(&alias),
+            std::fs::canonicalize(&real).unwrap()
+        );
+        // A missing leaf under a symlinked ancestor resolves to the same
+        // identity as the direct spelling — this is exactly the case where
+        // whole-path canonicalization fails and textual comparison lies.
+        assert_eq!(
+            resolve_for_identity(&alias.join("new/deeper")),
+            resolve_for_identity(&real.join("new/deeper")),
+        );
+        // Dot components are normalized even when nothing exists.
+        assert_eq!(
+            resolve_for_identity(std::path::Path::new("/nonexistent/./x")),
+            PathBuf::from("/nonexistent/x")
+        );
     }
 }

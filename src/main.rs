@@ -189,17 +189,23 @@ fn run_sync(
         .canonicalize()
         .with_context(|| format!("unable to resolve alpha root {alpha}"))?;
 
-    // Compute the session identity and state directory.
-    let identifier = session_identifier(&alpha_canonical.to_string_lossy(), &beta);
+    // Compute the session identity and state directory. Local paths are
+    // resolved to their physical identity, so a session created here shares
+    // its identity (and therefore its state lock) with any supervisor
+    // session over the same roots, even when the two spell them differently.
+    let beta_identity = if beta_agent.is_some() || parse_remote(&beta).is_some() {
+        beta.clone()
+    } else {
+        paths::resolve_for_identity(&PathBuf::from(&beta))
+            .to_string_lossy()
+            .into_owned()
+    };
+    let identifier = session_identifier(&alpha_canonical.to_string_lossy(), &beta_identity);
     let state_directory = match state_dir {
         Some(directory) => directory,
-        None => {
-            let home = std::env::var("HOME").context("HOME is not set")?;
-            PathBuf::from(home)
-                .join(".autobahn")
-                .join("sessions")
-                .join(&identifier)
-        }
+        None => paths::default_state_root()?
+            .join("sessions")
+            .join(&identifier),
     };
 
     // Construct the alpha endpoint.

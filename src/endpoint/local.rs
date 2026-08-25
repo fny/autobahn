@@ -175,6 +175,42 @@ impl LocalEndpoint {
         staged_path(&self.staging_root, digest)
     }
 
+    /// Returns the path of the persisted scan cache (a sibling of the
+    /// staging directory, so it shares the staging state's lifecycle).
+    fn scan_cache_path(&self) -> PathBuf {
+        self.staging_root.with_extension("scancache")
+    }
+
+    /// Loads the persisted scan cache, if a valid one exists. The cache is
+    /// purely a cold-start accelerant: it seeds the first scan's baseline so
+    /// unchanged files (by full metadata match) skip re-digesting, exactly
+    /// as a same-process previous snapshot would. It is *never* used for
+    /// transition validation — that record always comes from a real scan of
+    /// this process — and an unreadable or invalid cache is simply ignored.
+    fn load_scan_cache(&self) -> Option<Snapshot> {
+        let data = fs::read(self.scan_cache_path()).ok()?;
+        let snapshot: Snapshot = bincode::deserialize(&data).ok()?;
+        if let Some(root) = &snapshot.root {
+            root.validate(false).ok()?;
+        }
+        Some(snapshot)
+    }
+
+    /// Persists the scan cache, best-effort and atomically. Failures are
+    /// invisible by design: the cache only ever saves work.
+    fn store_scan_cache(&self, snapshot: &Snapshot) {
+        let Ok(data) = bincode::serialize(snapshot) else {
+            return;
+        };
+        let path = self.scan_cache_path();
+        let temporary = self
+            .staging_root
+            .with_extension(format!("scancache.{}.tmp", std::process::id()));
+        if fs::write(&temporary, data).is_ok() && fs::rename(&temporary, &path).is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+
     /// Builds an index from content digest to root-relative path over the
     /// last scan's file nodes, enabling requests to be satisfied by content
     /// that already exists somewhere in the root.
@@ -389,16 +425,33 @@ impl Endpoint for LocalEndpoint {
 
         // The retained snapshot is the scanner's baseline, which is what
         // turns a rescan into a walk of what changed rather than a re-read of
-        // everything. Cloning it is cheap: directory children are shared
-        // through `Arc`.
+        // everything. A cold start (no retained snapshot yet) seeds the
+        // baseline from the persisted scan cache instead, so even the first
+        // scan of a process re-digests only what changed since the last one.
+        let cached = match self.last_snapshot {
+            Some(_) => None,
+            None => self.load_scan_cache(),
+        };
+        let baseline = self.last_snapshot.as_ref().or(cached.as_ref());
         let snapshot = scan::scan(
             &self.root,
-            self.last_snapshot.as_ref(),
+            baseline,
             &self.ignores,
             &behavior,
             self.symlink_mode,
         )
         .with_context(|| format!("unable to scan {}", self.root.display()))?;
+
+        // Persist the cache when the hierarchy actually changed (an
+        // unchanged scan shares its root storage with the baseline, so the
+        // comparison is a pointer check, not a tree walk).
+        if !roots_share_storage(
+            baseline.and_then(|snapshot| snapshot.root.as_ref()),
+            snapshot.root.as_ref(),
+        ) {
+            self.store_scan_cache(&snapshot);
+        }
+
         self.last_snapshot = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -1321,6 +1374,28 @@ impl Transitioner<'_> {
 /// path the ancestor simply doesn't describe, rather than to a failed cycle.
 fn sanitize(result: Option<Node>) -> Option<Node> {
     result.as_ref().and_then(Node::synchronizable_subtree)
+}
+
+/// Indicates whether two snapshot roots share their child storage (the
+/// scanner's adoption guarantee for a fully unchanged hierarchy): both are
+/// directories whose children are the same allocation. A deserialized cache
+/// baseline never shares storage, so the first scan after a cold start
+/// always refreshes the cache — exactly once per process.
+fn roots_share_storage(baseline: Option<&Node>, fresh: Option<&Node>) -> bool {
+    match (baseline, fresh) {
+        (
+            Some(Node {
+                content: Content::Directory(a),
+                ..
+            }),
+            Some(Node {
+                content: Content::Directory(b),
+                ..
+            }),
+        ) => std::sync::Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
+    }
 }
 
 /// Computes the permission bits for a created file: the configured file
@@ -2361,6 +2436,88 @@ mod tests {
         // Exactly one of the pair landed, and the result says which.
         let result = outcome.results[0].as_ref().expect("directory result");
         assert_eq!(result.children().len(), 1);
+    }
+
+    #[test]
+    fn scan_cache_seeds_cold_starts_and_yields_to_metadata_changes() {
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        let staging = keep.path().join("staging");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        write(&root, "file.txt", "content");
+
+        // A first endpoint scans and persists the cache.
+        let mut first =
+            LocalEndpoint::new(root.clone(), staging.clone(), EndpointOptions::default())
+                .expect("endpoint should be creatable");
+        let snapshot = first.scan().expect("scan should succeed");
+        let cache_path = first.scan_cache_path();
+        assert!(cache_path.exists(), "the cache should persist");
+        drop(first);
+
+        // Poison the cached digest for the (unchanged) file. A fresh
+        // endpoint's first scan must consume the cache as its baseline —
+        // proven by the poisoned digest surviving the full-metadata match,
+        // exactly as an in-process baseline hint would.
+        let mut cached: Snapshot =
+            bincode::deserialize(&fs::read(&cache_path).expect("cache should read"))
+                .expect("cache should decode");
+        let root_node = cached.root.as_mut().expect("root should exist");
+        {
+            let children = std::sync::Arc::make_mut(match &mut root_node.content {
+                Content::Directory(children) => children,
+                _ => panic!("expected a directory"),
+            });
+            match &mut children[0].content {
+                Content::File { digest, .. } => *digest = [0xAB; 32],
+                _ => panic!("expected a file"),
+            }
+        }
+        fs::write(&cache_path, bincode::serialize(&cached).expect("encode"))
+            .expect("cache should be writable");
+
+        let mut second =
+            LocalEndpoint::new(root.clone(), staging.clone(), EndpointOptions::default())
+                .expect("endpoint should be creatable");
+        let reloaded = second.scan().expect("scan should succeed");
+        let digest_of = |snapshot: &Snapshot| match &snapshot
+            .root
+            .as_ref()
+            .and_then(|root| root.child("file.txt"))
+            .expect("file should exist")
+            .content
+        {
+            Content::File { digest, .. } => *digest,
+            _ => panic!("expected a file"),
+        };
+        assert_eq!(digest_of(&reloaded), [0xAB; 32]);
+        drop(second);
+
+        // Change the file (moving its mtime/size): the poisoned hint no
+        // longer matches the metadata, so the content is re-read and the
+        // digest is honest again.
+        write(&root, "file.txt", "changed content");
+        let mut third =
+            LocalEndpoint::new(root.clone(), staging.clone(), EndpointOptions::default())
+                .expect("endpoint should be creatable");
+        let rescanned = third.scan().expect("scan should succeed");
+        assert_eq!(
+            digest_of(&rescanned),
+            *blake3::hash(b"changed content").as_bytes()
+        );
+        drop(third);
+
+        // A corrupt cache is ignored, and the scan still succeeds.
+        fs::write(&cache_path, b"garbage").expect("cache should be writable");
+        let mut fourth = LocalEndpoint::new(root.clone(), staging, EndpointOptions::default())
+            .expect("endpoint should be creatable");
+        let recovered = fourth.scan().expect("scan should succeed");
+        assert_eq!(
+            digest_of(&recovered),
+            *blake3::hash(b"changed content").as_bytes()
+        );
+        assert!(recovered.root.is_some());
+        let _ = snapshot;
     }
 
     #[test]

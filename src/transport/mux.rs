@@ -81,7 +81,12 @@ struct Slot {
     /// The response queue.
     sender: mpsc::Sender<Response>,
     /// Whether or not a request is outstanding (a response arriving without
-    /// one is a protocol violation).
+    /// one is a protocol violation). The flag bounds, rather than
+    /// eliminates, duplicate damage: a duplicate landing in the window
+    /// after the *next* request marks itself outstanding is delivered as
+    /// that request's answer — which surfaces as a typed protocol error at
+    /// the caller — and the genuine answer that follows then fails the
+    /// connection. Nothing desynchronizes silently.
     outstanding: bool,
 }
 
@@ -188,6 +193,12 @@ impl AgentConnection {
     /// failure.
     pub fn open(&self, initialize: Initialize) -> Result<AgentChannel> {
         let channel = self.shared.next_channel.fetch_add(1, Ordering::Relaxed);
+        // Identifiers are never reused within a connection; exhausting them
+        // (four billion opens) fails the open rather than wrapping into a
+        // collision.
+        if channel == u32::MAX {
+            bail!("the connection's channel identifiers are exhausted");
+        }
         let (sender, receiver) = mpsc::channel();
         {
             let mut state = self
@@ -292,12 +303,20 @@ impl AgentChannel {
                 .ok_or_else(|| anyhow!("the channel has been closed"))?;
             slot.outstanding = true;
         }
-        self.shared
-            .send(&MuxRequest::Request {
-                channel: self.channel,
-                request,
-            })
-            .context("unable to send request to the agent")?;
+        if let Err(error) = self.shared.send(&MuxRequest::Request {
+            channel: self.channel,
+            request,
+        }) {
+            // The request never went out; nothing is outstanding (leaving
+            // the flag set would let a stray later response masquerade as
+            // an answer).
+            if let Ok(mut state) = self.shared.state.lock() {
+                if let Some(slot) = state.channels.get_mut(&self.channel) {
+                    slot.outstanding = false;
+                }
+            }
+            return Err(error).context("unable to send request to the agent");
+        }
         self.receiver.recv().map_err(|_| {
             anyhow!(
                 "the agent connection failed: {}",

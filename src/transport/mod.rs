@@ -382,7 +382,15 @@ fn serve_channel<W: Write>(
             endpoint
         }
         Err(error) => {
-            let _ = serve_send(output, channel, Response::Error(format!("{error:#}")));
+            // The same fallback as below: even a failed *error* send must
+            // not leave the controller's open waiting forever while the
+            // transport is healthy.
+            let response = Response::Error(format!("{error:#}"));
+            if let Err(send_error) = serve_send(output, channel, response) {
+                let fallback =
+                    Response::Error(format!("unable to send the response: {send_error:#}"));
+                let _ = serve_send(output, channel, fallback);
+            }
             return;
         }
     };

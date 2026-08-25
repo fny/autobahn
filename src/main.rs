@@ -312,10 +312,8 @@ fn run_sync(
             initialize(beta.clone()),
         )?)
     } else if let Some((host, path)) = parse_remote(&beta) {
-        let argv = Connection::ssh_argv(host, None);
-        let connection = Connection::spawn(&argv)?;
-        Box::new(RemoteEndpoint::connect(
-            connection,
+        Box::new(autobahn::endpoint::remote::connect_ssh(
+            host,
             initialize(path.to_owned()),
         )?)
     } else {

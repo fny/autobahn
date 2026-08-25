@@ -424,22 +424,24 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
             path,
             agent_command,
         } => {
-            let argv = match agent_command {
-                Some(argv) => argv.clone(),
-                None => Connection::ssh_argv(destination, None),
+            let initialize = crate::protocol::Initialize {
+                root: path.clone(),
+                session: identifier.clone(),
+                ignores: plan.ignores.clone(),
+                symlink_mode: plan.symlink_mode,
+                file_mode: plan.file_mode,
+                directory_mode: plan.directory_mode,
             };
-            let connection = Connection::spawn(&argv)?;
-            Box::new(RemoteEndpoint::connect(
-                connection,
-                crate::protocol::Initialize {
-                    root: path.clone(),
-                    session: identifier.clone(),
-                    ignores: plan.ignores.clone(),
-                    symlink_mode: plan.symlink_mode,
-                    file_mode: plan.file_mode,
-                    directory_mode: plan.directory_mode,
-                },
-            )?)
+            match agent_command {
+                Some(argv) => {
+                    let connection = Connection::spawn(argv)?;
+                    Box::new(RemoteEndpoint::connect(connection, initialize)?)
+                }
+                None => Box::new(crate::endpoint::remote::connect_ssh(
+                    destination,
+                    initialize,
+                )?),
+            }
         }
     };
 

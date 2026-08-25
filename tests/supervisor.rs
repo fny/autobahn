@@ -631,6 +631,73 @@ fn watch_mode_heals_after_a_destination_recovers() {
 }
 
 #[test]
+fn agents_install_automatically_over_ssh() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let remote_home = world.directory("remote-home");
+    let remote_mirror = world.directory("remote-mirror");
+    write(&alpha, "file.txt", "content");
+
+    // A fake `ssh` that runs the remote command locally under the fake
+    // remote home — auth-free SSH semantics, faithful enough for the
+    // install flow (which streams the agent binary through stdin).
+    let script_dir = world.directory("fake-bin");
+    let script = script_dir.join("ssh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; *) break;; esac; done\n\
+             shift\n\
+             HOME={home} exec /bin/sh -c \"$*\"\n",
+            home = remote_home.display()
+        ),
+    )
+    .expect("script should be writable");
+    let mut permissions = fs::metadata(&script).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&script, permissions).expect("script should be executable");
+
+    // The agent bundle holds this platform's binary under bundle naming.
+    let agents = world.directory("agents");
+    fs::copy(agent_binary(), agents.join("autobahn-linux-x86_64")).expect("bundle copy");
+
+    // These variables are consulted only by the SSH connection path, which
+    // only this test exercises (every other test connects via
+    // agent_command); tests in this binary can therefore run in parallel.
+    std::env::set_var("AUTOBAHN_SSH", &script);
+    std::env::set_var("AUTOBAHN_AGENTS_DIR", &agents);
+
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        betas = ["fake-host:{remote_mirror}"]
+        "#,
+        alpha = alpha.display(),
+        remote_mirror = remote_mirror.display(),
+    ));
+    let outcomes = world.run_once(plans.clone());
+    assert_all_synchronized(&outcomes);
+
+    // The content synchronized, and the versioned agent was installed into
+    // the (fake) remote home along the way.
+    assert_eq!(read(&remote_mirror, "file.txt"), "content");
+    let installed: Vec<String> = fs::read_dir(remote_home.join(".autobahn/bin"))
+        .expect("the agent directory should exist")
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        installed.iter().any(|name| name.starts_with("autobahn-")),
+        "{installed:?}"
+    );
+
+    // A second pass reuses the installed agent.
+    assert_all_synchronized(&world.run_once(plans));
+}
+
+#[test]
 fn policy_flows_through_the_agent_protocol() {
     let world = World::new();
     let alpha = world.directory("alpha");

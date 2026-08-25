@@ -93,6 +93,41 @@ impl RemoteEndpoint {
     }
 }
 
+/// Connects to an agent on a remote SSH host, installing this version's
+/// agent and retrying once when the first attempt fails.
+///
+/// The remote command always names the *versioned* agent path
+/// (`~/.autobahn/bin/autobahn-<version>`), so hosts are upgraded
+/// automatically: a controller that was just upgraded finds its versioned
+/// agent missing, installs it, and proceeds — no fleet-wide lockstep
+/// required, and older controllers keep using their own older agents
+/// untouched.
+pub fn connect_ssh(destination: &str, initialize: Initialize) -> Result<RemoteEndpoint> {
+    let remote_command = transport::install::versioned_remote_command();
+    let argv = Connection::ssh_argv(destination, Some(&remote_command));
+    let attempt = || -> Result<RemoteEndpoint> {
+        let connection = Connection::spawn(&argv)?;
+        RemoteEndpoint::connect(connection, initialize.clone())
+    };
+    let initial = match attempt() {
+        Ok(endpoint) => return Ok(endpoint),
+        Err(error) => error,
+    };
+    // The versioned agent is missing or unusable; install it and retry
+    // once. (If the failure was something else — authentication, an
+    // unreachable host — installation fails the same way and both failures
+    // surface together.)
+    transport::install::ensure_agent(destination).with_context(|| {
+        format!("unable to connect to {destination} ({initial:#}), and agent installation failed")
+    })?;
+    attempt().with_context(|| {
+        format!(
+            "unable to connect to {destination} even after installing the agent \
+             (initial failure: {initial:#})"
+        )
+    })
+}
+
 impl Drop for RemoteEndpoint {
     fn drop(&mut self) {
         // Shut the agent down and reap it, best-effort: sessions construct

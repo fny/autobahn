@@ -15,6 +15,8 @@
 //!
 //! [`LocalEndpoint`]: crate::endpoint::local::LocalEndpoint
 
+pub mod install;
+
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -31,6 +33,32 @@ use crate::scan::IgnoreSet;
 /// The remote command used by [`Connection::ssh_argv`] when no override is
 /// provided.
 pub const DEFAULT_REMOTE_COMMAND: &str = "autobahn agent";
+
+/// Returns the SSH executable to use: the `AUTOBAHN_SSH` environment
+/// variable when set (a testing and customization hook, in the spirit of
+/// Mutagen's `MUTAGEN_SSH_PATH`), and plain `ssh` from the search path
+/// otherwise.
+pub(crate) fn ssh_binary() -> String {
+    std::env::var("AUTOBAHN_SSH").unwrap_or_else(|_| "ssh".to_owned())
+}
+
+/// The options applied to every SSH invocation. `BatchMode` disables
+/// interactive prompting (prompts would compete with the protocol for
+/// stdio), the keepalives bound how long a dead network can hang a
+/// synchronous cycle, and `Compression` recovers most of a dedicated
+/// compression layer's benefit on the raw stream for free.
+pub(crate) fn ssh_options() -> Vec<&'static str> {
+    vec![
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=4",
+        "-o",
+        "Compression=yes",
+    ]
+}
 
 /// A bidirectional byte-stream connection to an agent (typically a child
 /// process's stdio: `ssh host autobahn agent` for remote roots, or a direct
@@ -110,17 +138,11 @@ impl Connection {
     ///
     /// [`RemoteEndpoint::connect`]: crate::endpoint::remote::RemoteEndpoint::connect
     pub fn ssh_argv(host: &str, remote_command: Option<&str>) -> Vec<String> {
-        vec![
-            "ssh".to_owned(),
-            "-o".to_owned(),
-            "BatchMode=yes".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveInterval=15".to_owned(),
-            "-o".to_owned(),
-            "ServerAliveCountMax=4".to_owned(),
-            host.to_owned(),
-            remote_command.unwrap_or(DEFAULT_REMOTE_COMMAND).to_owned(),
-        ]
+        let mut argv = vec![ssh_binary()];
+        argv.extend(ssh_options().into_iter().map(str::to_owned));
+        argv.push(host.to_owned());
+        argv.push(remote_command.unwrap_or(DEFAULT_REMOTE_COMMAND).to_owned());
+        argv
     }
 
     /// Sends one length-prefixed, bincode-encoded frame.
@@ -318,15 +340,49 @@ pub(crate) fn verify_handshake(handshake: &Handshake) -> Result<()> {
 
 /// Encodes a message and writes it as one length-prefixed frame, flushing so
 /// that the peer sees it immediately.
+/// The frame-payload flag marking an uncompressed body.
+const FRAME_UNCOMPRESSED: u8 = 0;
+
+/// The frame-payload flag marking an LZ4-compressed body (followed by the
+/// decompressed length).
+const FRAME_COMPRESSED: u8 = 1;
+
+/// The encoded size below which compression isn't attempted: tiny frames
+/// (bare requests, acknowledgements) can't compress meaningfully and would
+/// only pay the header.
+const COMPRESSION_THRESHOLD: usize = 256;
+
+/// The bytes the compressed-frame header adds to a payload.
+const COMPRESSED_HEADER_SIZE: usize = 5;
+
 fn send_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
-    let payload = bincode::serialize(message).context("unable to encode frame")?;
-    if payload.len() > protocol::MAXIMUM_FRAME_SIZE as usize {
+    let encoded = bincode::serialize(message).context("unable to encode frame")?;
+    if encoded.len() > protocol::MAXIMUM_FRAME_SIZE as usize {
         bail!(
             "outgoing frame of {} bytes exceeds the maximum frame size of {} bytes",
-            payload.len(),
+            encoded.len(),
             protocol::MAXIMUM_FRAME_SIZE
         );
     }
+
+    // Compress when it actually helps: the payload carries a flag byte
+    // declaring which form it took, so the reader never guesses (and a
+    // frame that doesn't shrink — already-compressed file content, mostly —
+    // travels verbatim).
+    let mut payload = Vec::with_capacity(encoded.len() + COMPRESSED_HEADER_SIZE);
+    if encoded.len() >= COMPRESSION_THRESHOLD {
+        let compressed = lz4_flex::block::compress(&encoded);
+        if compressed.len() + COMPRESSED_HEADER_SIZE < encoded.len() {
+            payload.push(FRAME_COMPRESSED);
+            payload.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            payload.extend_from_slice(&compressed);
+        }
+    }
+    if payload.is_empty() {
+        payload.push(FRAME_UNCOMPRESSED);
+        payload.extend_from_slice(&encoded);
+    }
+
     let length = payload.len() as u32;
     writer
         .write_all(&length.to_le_bytes())
@@ -346,7 +402,9 @@ fn receive_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T> {
 
 /// Reads one frame's payload, returning `None` for a clean end-of-stream at a
 /// frame boundary (which callers awaiting an answer treat as an error, but
-/// which is the agent's normal exit condition).
+/// which is the agent's normal exit condition). The decompressed size is
+/// validated against the frame cap *before* any allocation, so a hostile
+/// header can't induce one.
 fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
     let mut prefix = [0u8; 4];
     match reader.read_exact(&mut prefix) {
@@ -355,7 +413,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
         Err(error) => return Err(error).context("unable to read frame length"),
     }
     let length = u32::from_le_bytes(prefix);
-    if length > protocol::MAXIMUM_FRAME_SIZE {
+    if length as usize > protocol::MAXIMUM_FRAME_SIZE as usize + COMPRESSED_HEADER_SIZE {
         bail!(
             "incoming frame of {} bytes exceeds the maximum frame size of {} bytes",
             length,
@@ -370,7 +428,31 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
         }
         Err(error) => return Err(error).context("unable to read frame payload"),
     }
-    Ok(Some(payload))
+
+    match payload.split_first() {
+        Some((&FRAME_UNCOMPRESSED, body)) => Ok(Some(body.to_vec())),
+        Some((&FRAME_COMPRESSED, rest)) => {
+            if rest.len() < 4 {
+                bail!("compressed frame is missing its length header");
+            }
+            let (header, body) = rest.split_at(4);
+            let raw_length =
+                u32::from_le_bytes(header.try_into().expect("the header is four bytes"));
+            if raw_length > protocol::MAXIMUM_FRAME_SIZE {
+                bail!(
+                    "compressed frame declares {} bytes, exceeding the maximum frame size of \
+                     {} bytes",
+                    raw_length,
+                    protocol::MAXIMUM_FRAME_SIZE
+                );
+            }
+            let decompressed = lz4_flex::block::decompress(body, raw_length as usize)
+                .context("unable to decompress frame")?;
+            Ok(Some(decompressed))
+        }
+        Some((flag, _)) => bail!("invalid frame flag {flag}"),
+        None => bail!("empty frame"),
+    }
 }
 
 #[cfg(test)]
@@ -495,6 +577,51 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn frames_compress_transparently() {
+        let (mut first, mut second) = connected_pair();
+
+        // A large, compressible payload round-trips (and, at 300KB of
+        // repetition, would fail fast if the compressed path were broken).
+        let large = "highly repetitive content ".repeat(12_000);
+        first.send(&large).expect("unable to send");
+        let received: String = second.receive().expect("unable to receive");
+        assert_eq!(received, large);
+
+        // A payload below the compression threshold (stored verbatim)
+        // round-trips as well.
+        first.send(&Request::Shutdown).expect("unable to send");
+        assert!(matches!(
+            second.receive::<Request>().expect("unable to receive"),
+            Request::Shutdown
+        ));
+    }
+
+    #[test]
+    fn hostile_decompressed_sizes_are_rejected_before_allocation() {
+        let (reader, mut writer) = pipe();
+        let (_sink_reader, sink_writer) = pipe();
+        let mut connection = Connection::from_streams(Box::new(reader), Box::new(sink_writer));
+
+        // A tiny frame declaring an enormous decompressed size: the reader
+        // must reject the declaration, not trust it with an allocation.
+        let mut frame = Vec::new();
+        frame.push(FRAME_COMPRESSED);
+        frame.extend_from_slice(&(protocol::MAXIMUM_FRAME_SIZE + 1).to_le_bytes());
+        frame.extend_from_slice(b"junk");
+        writer
+            .write_all(&(frame.len() as u32).to_le_bytes())
+            .expect("unable to write");
+        writer.write_all(&frame).expect("unable to write");
+        let error = connection
+            .receive::<Request>()
+            .expect_err("expected a rejection");
+        assert!(
+            format!("{error:#}").contains("maximum frame size"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
     fn oversized_frames_are_rejected_on_send() {
         let (mut first, mut second) = connected_pair();
 
@@ -523,9 +650,13 @@ pub(crate) mod tests {
         let mut connection = Connection::from_streams(Box::new(reader), Box::new(sink_writer));
 
         // Only the length prefix is written: an honest implementation must
-        // reject it without waiting for (or allocating) the body.
+        // reject it without waiting for (or allocating) the body. The limit
+        // admits the compression header on top of the frame cap, so the
+        // first rejectable length sits just beyond both.
         writer
-            .write_all(&(protocol::MAXIMUM_FRAME_SIZE + 1).to_le_bytes())
+            .write_all(
+                &(protocol::MAXIMUM_FRAME_SIZE + COMPRESSED_HEADER_SIZE as u32 + 1).to_le_bytes(),
+            )
             .expect("unable to write");
         let error = connection
             .receive::<Request>()

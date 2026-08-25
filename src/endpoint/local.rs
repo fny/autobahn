@@ -1043,13 +1043,19 @@ impl Transitioner<'_> {
             || behavior.normalization_insensitive
             || behavior.decomposes_unicode;
         let fold = move |name: &str| {
-            let mut key = if behavior.normalization_insensitive || behavior.decomposes_unicode {
-                recompose(name)
+            // Case-insensitive lookups use Unicode case *folding* (`Σ`, `σ`,
+            // and `ς` all collide), not mere lowercasing; folding can emit
+            // decomposed sequences, so recomposition follows it.
+            let mut key = if behavior.case_insensitive {
+                caseless::default_case_fold_str(name)
             } else {
                 name.to_owned()
             };
-            if behavior.case_insensitive {
-                key = key.to_lowercase();
+            if behavior.case_insensitive
+                || behavior.normalization_insensitive
+                || behavior.decomposes_unicode
+            {
+                key = recompose(&key);
             }
             key
         };

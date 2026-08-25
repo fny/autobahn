@@ -464,7 +464,10 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
         );
 
         stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("the watcher should stop cleanly");
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
 }
 
@@ -503,14 +506,22 @@ fn a_second_supervisor_over_the_same_state_root_is_refused() {
         let second = Supervisor::new(plans.clone(), world.state_root(), false);
         let never = AtomicBool::new(false);
         let start = Instant::now();
-        second.run_watch(&never);
+        let refusal = second.run_watch(&never);
         assert!(
             start.elapsed() < Duration::from_secs(10),
             "the second supervisor should be refused promptly"
         );
+        let error = format!(
+            "{:#}",
+            refusal.expect_err("the second supervisor must be refused")
+        );
+        assert!(error.contains("another autobahn process"), "{error}");
 
         stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("the watcher should stop cleanly");
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
 }
 
@@ -613,7 +624,10 @@ fn watch_mode_synchronizes_continuously_until_stopped() {
         );
 
         stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("the watcher should stop cleanly");
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
 
     // The status reflects a session that cycled repeatedly.
@@ -693,7 +707,10 @@ fn watch_mode_heals_after_a_destination_recovers() {
         );
 
         stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("the watcher should stop cleanly");
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
 }
 
@@ -792,7 +809,10 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
         assert!(matches!(response, ControlResponse::Error(_)));
 
         stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("the watcher should stop cleanly");
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
 }
 
@@ -840,7 +860,10 @@ fn watch_mode_observes_remote_changes_through_the_agent() {
         );
 
         stop.store(true, Ordering::Relaxed);
-        watcher.join().expect("the watcher should stop cleanly");
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
 }
 

@@ -177,18 +177,14 @@ impl Supervisor {
     /// in-flight cycles to finish. SSH keepalives bound how long a dead
     /// network can hold one; for the CLI, process termination remains the
     /// hard stop.
-    pub fn run_watch(&self, stop: &AtomicBool) {
+    pub fn run_watch(&self, stop: &AtomicBool) -> Result<()> {
         // One supervisor per state root: a second one's workers would all
         // lose their session locks anyway, but it would still capture the
         // control socket — commands would land in a supervisor that owns
-        // nothing. Refuse up front instead.
-        let _supervisor_lock = match SessionLock::acquire(self.state_root.join("supervisor")) {
-            Ok(lock) => lock,
-            Err(error) => {
-                eprintln!("unable to supervise: {error:#}");
-                return;
-            }
-        };
+        // nothing. Refuse up front instead (and let the caller exit
+        // non-zero — a refused supervisor is a failure, not a quiet no-op).
+        let _supervisor_lock = SessionLock::acquire(self.state_root.join("supervisor"))
+            .context("unable to supervise")?;
 
         // Every session gets a control-flag block; the registry shares them
         // with the control socket's server thread.
@@ -264,6 +260,7 @@ impl Supervisor {
                 });
             }
         });
+        Ok(())
     }
 }
 

@@ -17,6 +17,7 @@
 //! needs no bundle at all).
 
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -112,17 +113,26 @@ fn locate_agent_binary(platform: &str) -> Option<PathBuf> {
 /// observes a partial binary).
 fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
     let version = protocol::version();
+    // The binary is read into memory once, so the bytes streamed are
+    // exactly the bytes measured — a bundle replaced or truncated mid-read
+    // can't smuggle a partial binary past the check.
+    let content = fs::read(binary)
+        .with_context(|| format!("unable to read agent binary {}", binary.display()))?;
     // The temporary is uniquified by the remote shell's PID ($$): two
     // controllers bootstrapping the same host concurrently must not stream
     // into one file, or the later `cat` truncates what the earlier one is
-    // about to rename into the executable path. With unique temporaries,
-    // the final rename is atomic and last-writer-wins with a whole binary.
+    // about to rename into the executable path. The remote length check
+    // catches a stream cut short (a dropped connection, a killed ssh)
+    // before anything is published; the rename is atomic and
+    // last-writer-wins with a verified whole binary.
     let script = format!(
         "mkdir -p ~/.autobahn/bin && \
          tmp=~/.autobahn/bin/.autobahn-tmp-install-{version}-$$ && \
          cat > \"$tmp\" && \
+         [ \"$(wc -c < \"$tmp\")\" -eq {length} ] || {{ rm -f \"$tmp\"; exit 70; }} && \
          chmod 755 \"$tmp\" && \
-         mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}"
+         mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}",
+        length = content.len()
     );
     let mut child = ssh_command(destination, &script)
         .stdin(Stdio::piped())
@@ -132,12 +142,10 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
         .stdin
         .take()
         .ok_or_else(|| anyhow!("ssh standard input unavailable"))?;
-    let mut file = fs::File::open(binary)
-        .with_context(|| format!("unable to open agent binary {}", binary.display()))?;
-    let copy = std::io::copy(&mut file, &mut stdin);
+    let write = stdin.write_all(&content);
     drop(stdin);
     let status = child.wait().context("unable to wait for ssh")?;
-    copy.context("unable to stream the agent binary")?;
+    write.context("unable to stream the agent binary")?;
     if !status.success() {
         bail!("the installation command exited with {status}");
     }

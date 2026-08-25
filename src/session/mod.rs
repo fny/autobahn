@@ -205,18 +205,27 @@ impl Session {
         }
 
         // On a side whose filesystem can't preserve executability bits, the
-        // scanned bits are noise; graft the ancestor's bits on so that
-        // reconciliation sees only real content changes rather than phantom
-        // permission churn.
+        // scanned bits are noise; replace them from trusted references — the
+        // other side (when it preserves bits) for byte-identical files, and
+        // the ancestor otherwise — so reconciliation sees only real content
+        // changes rather than phantom permission churn.
         let alpha_root = if alpha_snapshot.preserves_executability {
             alpha_snapshot.root.clone()
         } else {
-            propagate_executability(self.ancestor.as_ref(), alpha_snapshot.root.as_ref())
+            let peer = beta_snapshot
+                .preserves_executability
+                .then_some(beta_snapshot.root.as_ref())
+                .flatten();
+            propagate_executability(self.ancestor.as_ref(), peer, alpha_snapshot.root.as_ref())
         };
         let beta_root = if beta_snapshot.preserves_executability {
             beta_snapshot.root.clone()
         } else {
-            propagate_executability(self.ancestor.as_ref(), beta_snapshot.root.as_ref())
+            let peer = alpha_snapshot
+                .preserves_executability
+                .then_some(alpha_snapshot.root.as_ref())
+                .flatten();
+            propagate_executability(self.ancestor.as_ref(), peer, beta_snapshot.root.as_ref())
         };
 
         // Safety: if the ancestor root was a directory with non-trivial
@@ -728,10 +737,14 @@ mod tests {
         assert!(!report.changed(), "{report:?}");
         assert!(report.conflicts.is_empty());
 
-        // Cycle 3: alpha's *real* change still propagates to beta.
+        // Cycle 3: alpha makes a *real* executability change. Beta's copy
+        // holds the same bytes, so the preserving peer vouches for the new
+        // bit directly — the sides agree immediately, with no transition
+        // and no conflict (the case a purely ancestor-based graft would
+        // have reported as a false conflict).
         let report = session.run_cycle().expect("cycle 3");
-        assert_eq!(report.beta_transitions, 1, "{report:?}");
-        assert_eq!(report.alpha_transitions, 0);
+        assert!(!report.changed(), "{report:?}");
+        assert!(report.conflicts.is_empty(), "{report:?}");
     }
 
     #[test]

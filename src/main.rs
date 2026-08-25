@@ -511,8 +511,7 @@ fn run_up(config: Option<PathBuf>, once: bool, state_root: Option<PathBuf>) -> R
     // Watch mode runs until the process is terminated: agent processes exit
     // when their connection streams close, so no explicit cleanup is needed.
     let stop = std::sync::atomic::AtomicBool::new(false);
-    supervisor.run_watch(&stop);
-    Ok(())
+    supervisor.run_watch(&stop)
 }
 
 /// Shows the recorded status of the configured sessions.

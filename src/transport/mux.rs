@@ -8,15 +8,20 @@
 //! session becomes a channel on it.
 //!
 //! The shape is deliberately simple. Each channel is strict
-//! request/response (at most one outstanding request), so the router needs
-//! no reordering: a single reader thread tags responses back to their
-//! channels' queues, and senders interleave whole frames through a shared
-//! writer. The agent serves each channel on its own thread, so one
+//! request/response (at most one outstanding request, which the router
+//! enforces: an unsolicited or duplicate response is a protocol violation
+//! that fails the connection rather than desynchronizing a channel), so
+//! routing needs no reordering: a single reader thread tags responses back
+//! to their channels' queues, and senders interleave whole frames through a
+//! shared writer. The agent serves each channel on its own thread, so one
 //! channel's blocking change-wait never stalls another's scan.
 //!
-//! Lifecycle: the connection shuts down (and the agent process is reaped)
-//! when its last channel closes. A connection whose transport fails marks
-//! itself dead and unblocks every waiting channel with the failure; pooled
+//! Lifecycle: the connection is kept alive by its handles
+//! ([`AgentConnection`] clones — a pool typically holds one) and its open
+//! channels, and shuts down (closing the writer so the agent sees
+//! end-of-stream, then reaping the process with a bounded wait) when the
+//! last of both is gone. A transport failure marks the connection dead,
+//! unblocks every waiting channel with the failure, and reaps; pooled
 //! callers observe the death and build a fresh connection.
 
 use std::collections::HashMap;
@@ -31,17 +36,21 @@ use crate::protocol::{Handshake, Initialize, MuxRequest, MuxResponse, Request, R
 
 use super::Connection;
 
-/// A multiplexed agent connection: a cloneable handle through which
-/// channels are opened.
-#[derive(Clone)]
+/// How long a graceful shutdown waits for the agent to exit before killing
+/// it. The writer is closed first, so a healthy agent exits on end-of-stream
+/// almost immediately; the timeout only bounds a wedged one.
+const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// A multiplexed agent connection handle. Handles (and open channels) keep
+/// the connection alive; channels are opened through any handle.
 pub struct AgentConnection {
     /// The shared connection state.
     shared: Arc<Shared>,
 }
 
 /// One session channel on an agent connection, speaking the ordinary
-/// request/response protocol. Dropping the channel closes it (and shuts the
-/// connection down if it was the last).
+/// request/response protocol. Dropping the channel closes it; the
+/// connection shuts down once no channels and no handles remain.
 pub struct AgentChannel {
     /// The shared connection state.
     shared: Arc<Shared>,
@@ -49,11 +58,15 @@ pub struct AgentChannel {
     channel: u32,
     /// The stream of responses routed to this channel.
     receiver: mpsc::Receiver<Response>,
+    /// Whether or not [`close`](AgentChannel::close) already released the
+    /// channel (so the drop must not release it again).
+    closed: bool,
 }
 
-/// The state shared between channel handles and the reader thread.
+/// The state shared between handles, channels, and the router thread.
 struct Shared {
-    /// The frame writer (senders interleave whole frames).
+    /// The frame writer (senders interleave whole frames). Replaced with a
+    /// sink at shutdown, which is what closes the agent's standard input.
     writer: Mutex<Box<dyn Write + Send>>,
     /// The agent process, if this connection owns one.
     child: Mutex<Option<Child>>,
@@ -63,12 +76,23 @@ struct Shared {
     next_channel: AtomicU32,
 }
 
+/// One channel's routing slot.
+struct Slot {
+    /// The response queue.
+    sender: mpsc::Sender<Response>,
+    /// Whether or not a request is outstanding (a response arriving without
+    /// one is a protocol violation).
+    outstanding: bool,
+}
+
 /// The routing table and lifecycle flags.
 struct Router {
-    /// Response queues by channel.
-    channels: HashMap<u32, mpsc::Sender<Response>>,
-    /// The number of live [`AgentChannel`] handles.
+    /// The routing slots by channel.
+    channels: HashMap<u32, Slot>,
+    /// The number of live [`AgentChannel`] values.
     open: usize,
+    /// The number of live [`AgentConnection`] handles.
+    handles: usize,
     /// The transport failure that killed the connection, if any.
     dead: Option<String>,
     /// Whether or not shutdown has begun (guards double reaping).
@@ -77,17 +101,29 @@ struct Router {
 
 impl AgentConnection {
     /// Establishes a multiplexed connection: exchanges handshakes
-    /// (enforcing version equality) and starts the response router.
+    /// (enforcing version equality) and starts the response router. A
+    /// handshake failure reaps the spawned process before reporting.
     pub fn connect(connection: Connection) -> Result<AgentConnection> {
         let (mut reader, mut writer, child) = connection.into_parts();
 
         // Exchange handshakes. Ours goes out first (the agent does the
-        // same), so neither side blocks waiting for the other to speak.
-        super::send_frame(&mut writer, &super::local_handshake())
-            .context("unable to send handshake")?;
-        let peer: Handshake =
-            super::receive_frame(&mut reader).context("unable to receive the agent's handshake")?;
-        super::verify_handshake(&peer)?;
+        // same), so neither side blocks waiting for the other to speak. On
+        // failure the child must be reaped here — `into_parts` transferred
+        // that responsibility to us.
+        let handshake = (|| -> Result<()> {
+            super::send_frame(&mut writer, &super::local_handshake())
+                .context("unable to send handshake")?;
+            let peer: Handshake = super::receive_frame(&mut reader)
+                .context("unable to receive the agent's handshake")?;
+            super::verify_handshake(&peer)
+        })();
+        if let Err(error) = handshake {
+            if let Some(mut child) = child {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            return Err(error);
+        }
 
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
@@ -95,6 +131,7 @@ impl AgentConnection {
             state: Mutex::new(Router {
                 channels: HashMap::new(),
                 open: 0,
+                handles: 1,
                 dead: None,
                 shutdown: false,
             }),
@@ -109,15 +146,31 @@ impl AgentConnection {
             let failure = loop {
                 match super::receive_frame::<_, MuxResponse>(&mut reader) {
                     Ok(MuxResponse { channel, response }) => {
-                        let state = router
+                        let mut state = router
                             .state
                             .lock()
                             .expect("the state lock is never poisoned");
-                        if let Some(sender) = state.channels.get(&channel) {
-                            // A failed send means the channel handle is
-                            // being dropped; its close is already on the
-                            // way.
-                            let _ = sender.send(response);
+                        match state.channels.get_mut(&channel) {
+                            Some(slot) if slot.outstanding => {
+                                slot.outstanding = false;
+                                // A failed send means the channel handle is
+                                // being dropped; its close is on the way.
+                                let _ = slot.sender.send(response);
+                            }
+                            Some(_) => {
+                                // A response nobody asked for would be
+                                // consumed as the answer to the *next*
+                                // request, silently desynchronizing the
+                                // channel; failing the connection is the
+                                // safe interpretation.
+                                break format!(
+                                    "protocol error: unsolicited response on channel {channel}"
+                                );
+                            }
+                            // A response for an unknown channel is the
+                            // benign race of an answer crossing a close on
+                            // the wire.
+                            None => {}
                         }
                     }
                     Err(error) => break format!("{error:#}"),
@@ -130,6 +183,9 @@ impl AgentConnection {
     }
 
     /// Opens a session channel, initializing its endpoint on the agent.
+    /// A failure with [`usable`](AgentConnection::usable) still true is
+    /// channel-local (the agent refused this endpoint), not a connection
+    /// failure.
     pub fn open(&self, initialize: Initialize) -> Result<AgentChannel> {
         let channel = self.shared.next_channel.fetch_add(1, Ordering::Relaxed);
         let (sender, receiver) = mpsc::channel();
@@ -145,7 +201,13 @@ impl AgentConnection {
             if state.shutdown {
                 bail!("the agent connection has shut down");
             }
-            state.channels.insert(channel, sender);
+            state.channels.insert(
+                channel,
+                Slot {
+                    sender,
+                    outstanding: true,
+                },
+            );
             state.open += 1;
         }
         let opened = (|| -> Result<()> {
@@ -170,9 +232,11 @@ impl AgentConnection {
                 shared: self.shared.clone(),
                 channel,
                 receiver,
+                closed: false,
             }),
             Err(error) => {
-                self.shared.release(channel);
+                let _ = self.shared.send(&MuxRequest::Close { channel });
+                let _ = self.shared.release_channel(channel);
                 Err(error)
             }
         }
@@ -189,11 +253,45 @@ impl AgentConnection {
     }
 }
 
+impl Clone for AgentConnection {
+    fn clone(&self) -> AgentConnection {
+        self.shared
+            .state
+            .lock()
+            .expect("the state lock is never poisoned")
+            .handles += 1;
+        AgentConnection {
+            shared: self.shared.clone(),
+        }
+    }
+}
+
+impl Drop for AgentConnection {
+    fn drop(&mut self) {
+        let _ = self.shared.release_handle();
+    }
+}
+
 impl AgentChannel {
     /// Performs one request/response exchange on this channel. The returned
     /// response may be [`Response::Error`] (a request-level failure on the
     /// far side); a transport failure is an error here.
     pub fn exchange(&mut self, request: Request) -> Result<Response> {
+        {
+            let mut state = self
+                .shared
+                .state
+                .lock()
+                .expect("the state lock is never poisoned");
+            if let Some(reason) = &state.dead {
+                bail!("the agent connection has failed: {reason}");
+            }
+            let slot = state
+                .channels
+                .get_mut(&self.channel)
+                .ok_or_else(|| anyhow!("the channel has been closed"))?;
+            slot.outstanding = true;
+        }
         self.shared
             .send(&MuxRequest::Request {
                 channel: self.channel,
@@ -207,17 +305,31 @@ impl AgentChannel {
             )
         })
     }
+
+    /// Closes the channel, reporting any shutdown failure (dropping does
+    /// the same silently).
+    pub fn close(mut self) -> Result<()> {
+        self.closed = true;
+        let closed = self.shared.send(&MuxRequest::Close {
+            channel: self.channel,
+        });
+        let released = self.shared.release_channel(self.channel);
+        closed.and(released)
+    }
 }
 
 impl Drop for AgentChannel {
     fn drop(&mut self) {
+        if self.closed {
+            return;
+        }
         // Close the channel (best-effort: a dead connection has nothing to
         // tell) and let the shared state decide whether the whole
         // connection should shut down.
         let _ = self.shared.send(&MuxRequest::Close {
             channel: self.channel,
         });
-        self.shared.release(self.channel);
+        let _ = self.shared.release_channel(self.channel);
     }
 }
 
@@ -246,99 +358,147 @@ impl Shared {
     fn fail(&self, reason: String) {
         let already_down = {
             let mut state = self.state.lock().expect("the state lock is never poisoned");
-            let already_down = state.shutdown || state.dead.is_some();
+            let already_down = state.dead.is_some();
             state.dead.get_or_insert(reason);
             // Dropping the senders is what unblocks the receivers.
             state.channels.clear();
             already_down
         };
         if !already_down {
-            self.reap(false);
+            // Kill unconditionally: even when a graceful shutdown is in
+            // flight, a router failure means the stream died under it, and
+            // its bounded wait must not depend on the agent's cooperation.
+            let _ = self.reap(false);
         }
     }
 
-    /// Releases one channel handle, shutting the connection down when it
-    /// was the last.
-    fn release(&self, channel: u32) {
+    /// Releases one channel, shutting the connection down when nothing
+    /// keeps it alive any longer.
+    fn release_channel(&self, channel: u32) -> Result<()> {
         let shut_down = {
             let mut state = self.state.lock().expect("the state lock is never poisoned");
             state.channels.remove(&channel);
             state.open = state.open.saturating_sub(1);
-            if state.open == 0 && !state.shutdown && state.dead.is_none() {
-                state.shutdown = true;
-                true
-            } else {
-                false
-            }
+            Self::begin_shutdown(&mut state)
         };
         if shut_down {
-            let _ = self.send(&MuxRequest::Shutdown);
-            self.reap(true);
+            self.shutdown()
+        } else {
+            Ok(())
         }
     }
 
-    /// Reaps the agent process: a graceful reap waits for the exit that the
-    /// shutdown frame causes; an ungraceful one kills first.
-    fn reap(&self, graceful: bool) {
+    /// Releases one connection handle, shutting the connection down when
+    /// nothing keeps it alive any longer.
+    fn release_handle(&self) -> Result<()> {
+        let shut_down = {
+            let mut state = self.state.lock().expect("the state lock is never poisoned");
+            state.handles = state.handles.saturating_sub(1);
+            Self::begin_shutdown(&mut state)
+        };
+        if shut_down {
+            self.shutdown()
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Decides (under the state lock) whether this release triggers
+    /// shutdown.
+    fn begin_shutdown(state: &mut Router) -> bool {
+        if state.open == 0 && state.handles == 0 && !state.shutdown && state.dead.is_none() {
+            state.shutdown = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Performs the graceful shutdown: ask the agent to exit, close its
+    /// standard input (the guarantee that it exits even if it ignores the
+    /// request), and reap with a bounded wait.
+    fn shutdown(&self) -> Result<()> {
+        let requested = self.send(&MuxRequest::Shutdown);
+        {
+            // Dropping the real writer closes the agent's stdin; the agent
+            // exits on end-of-stream regardless of the shutdown frame's
+            // fate.
+            let mut writer = self
+                .writer
+                .lock()
+                .expect("the writer lock is never poisoned");
+            *writer = Box::new(std::io::sink());
+        }
+        let reaped = self.reap(true);
+        requested.and(reaped)
+    }
+
+    /// Reaps the agent process. A graceful reap waits (bounded) for the
+    /// exit that the closed stream causes, killing on timeout; an
+    /// ungraceful one kills first.
+    fn reap(&self, graceful: bool) -> Result<()> {
         let Some(mut child) = self
             .child
             .lock()
             .expect("the child lock is never poisoned")
             .take()
         else {
-            return;
+            return Ok(());
         };
-        if !graceful {
-            let _ = child.kill();
+        if graceful {
+            let deadline = std::time::Instant::now() + REAP_TIMEOUT;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => {
+                        if status.success() {
+                            return Ok(());
+                        }
+                        bail!("the agent process exited with {status}");
+                    }
+                    Ok(None) => {
+                        if std::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                    Err(_) => break,
+                }
+            }
         }
-        if child.wait().is_err() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let _ = child.kill();
+        let _ = child.wait();
+        if graceful {
+            bail!("the agent process had to be killed after ignoring shutdown");
         }
-    }
-}
-
-impl Drop for Shared {
-    fn drop(&mut self) {
-        // Last-resort cleanup: normally the last channel release or a
-        // transport failure has already reaped, but a connection dropped
-        // with zero channels ever opened must not leak its process.
-        if let Some(mut child) = self
-            .child
-            .lock()
-            .expect("the child lock is never poisoned")
-            .take()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
+        Ok(())
     }
 }
 
 /// A pool of agent connections keyed by their spawn command, sharing one
 /// connection per key and serializing (re)establishment per key — which is
 /// also what makes first-contact agent installation happen once per host
-/// rather than once per session.
+/// rather than once per session. The pool's stored handles keep idle
+/// connections alive for reuse; dropping the pool releases them.
 #[derive(Default)]
 pub struct AgentPool {
     /// The per-key slots.
-    slots: Mutex<HashMap<Vec<String>, Arc<Mutex<Slot>>>>,
+    slots: Mutex<HashMap<Vec<String>, Arc<Mutex<PoolSlot>>>>,
 }
 
 /// One pool slot: the live connection for a key, if any.
 #[derive(Default)]
-struct Slot {
-    /// The connection, which may have died or shut down since it was
-    /// stored.
+struct PoolSlot {
+    /// The connection, which may have died since it was stored.
     connection: Option<AgentConnection>,
 }
 
 impl AgentPool {
     /// Opens a channel on the pooled connection for `key`, building a fresh
-    /// connection with `establish` when none exists or the existing one is
-    /// no longer usable. Establishment (including any agent installation it
-    /// performs) runs under the key's lock, so concurrent sessions for one
-    /// host wait for a single bootstrap instead of racing their own.
+    /// connection with `establish` when none exists or the existing one has
+    /// failed. A channel-local refusal (the agent rejecting this endpoint
+    /// on an otherwise healthy connection) is returned as-is — it would
+    /// refuse identically on a fresh connection, and rebuilding would
+    /// strand the sessions using the current one.
     pub fn channel(
         &self,
         key: &[String],
@@ -352,10 +512,12 @@ impl AgentPool {
         let mut slot = slot.lock().expect("the slot lock is never poisoned");
         if let Some(connection) = &slot.connection {
             if connection.usable() {
-                // An open failure on a connection that *looked* usable means
-                // it died underneath us; fall through and rebuild.
-                if let Ok(channel) = connection.open(initialize.clone()) {
-                    return Ok(channel);
+                match connection.open(initialize.clone()) {
+                    Ok(channel) => return Ok(channel),
+                    // Still usable: the refusal is channel-local.
+                    Err(error) if connection.usable() => return Err(error),
+                    // The connection died underneath the open; rebuild.
+                    Err(_) => {}
                 }
             }
         }
@@ -384,6 +546,27 @@ mod tests {
         }
     }
 
+    /// Starts a real agent over in-memory pipes, returning the client end
+    /// and a receiver that yields the agent's exit result.
+    fn spawned_agent() -> (Connection, mpsc::Receiver<Result<()>>) {
+        let (client, agent) = connected_pair();
+        let (agent_reader, agent_writer, _) = agent.into_parts();
+        let (finished_sender, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = crate::transport::serve_agent(agent_reader, agent_writer);
+            let _ = finished_sender.send(result);
+        });
+        (client, finished)
+    }
+
+    /// Waits for an agent's exit and asserts it was clean.
+    fn assert_clean_exit(finished: &mpsc::Receiver<Result<()>>) {
+        finished
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the agent must exit")
+            .expect("the agent must exit cleanly");
+    }
+
     #[test]
     fn channels_multiplex_without_blocking_each_other() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
@@ -393,12 +576,7 @@ mod tests {
         std::fs::create_dir_all(&root_b).expect("root should be creatable");
         std::fs::write(root_a.join("file.txt"), b"content").expect("file should be writable");
 
-        // The agent serves both channels over one in-memory connection.
-        let (client, agent) = connected_pair();
-        let (agent_reader, agent_writer, _) = agent.into_parts();
-        let server =
-            std::thread::spawn(move || crate::transport::serve_agent(agent_reader, agent_writer));
-
+        let (client, finished) = spawned_agent();
         let connection = AgentConnection::connect(client).expect("unable to connect");
         let mut channel_a = connection.open(initialize(&root_a)).expect("open a");
         let mut channel_b = connection.open(initialize(&root_b)).expect("open b");
@@ -437,11 +615,9 @@ mod tests {
         drop(channel_a);
         drop(connection);
 
-        // With every channel closed, the agent shut down cleanly.
-        server
-            .join()
-            .expect("the agent thread panicked")
-            .expect("the agent should exit cleanly");
+        // With every channel and handle released, the agent shut down
+        // cleanly.
+        assert_clean_exit(&finished);
     }
 
     #[test]
@@ -454,13 +630,7 @@ mod tests {
         let root = keep.path().join("root");
         std::fs::create_dir_all(&root).expect("root should be creatable");
 
-        let (client, agent) = connected_pair();
-        let (agent_reader, agent_writer, _) = agent.into_parts();
-        let (finished_sender, finished) = mpsc::channel();
-        std::thread::spawn(move || {
-            let result = crate::transport::serve_agent(agent_reader, agent_writer);
-            let _ = finished_sender.send(result);
-        });
+        let (client, finished) = spawned_agent();
 
         // The protocol is spoken by hand so that the transport can be
         // severed with the channel still open (the real client would send a
@@ -479,22 +649,108 @@ mod tests {
         let _: MuxResponse = client.receive().expect("opened");
         drop(client);
 
-        let result = finished
-            .recv_timeout(std::time::Duration::from_secs(10))
-            .expect("the agent must exit after an abrupt disconnect");
-        result.expect("a clean end-of-stream is a clean agent exit");
+        assert_clean_exit(&finished);
     }
 
     #[test]
-    fn the_pool_shares_one_connection_per_key() {
+    fn a_handleless_connection_shuts_down_without_ever_opening_a_channel() {
+        let (client, finished) = spawned_agent();
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        // No channel is ever opened; dropping the last handle must still
+        // shut the agent down (and end the router) rather than leaking
+        // both.
+        drop(connection);
+        assert_clean_exit(&finished);
+    }
+
+    #[test]
+    fn a_failed_handshake_reaps_the_spawned_process() {
+        // `true` exits immediately without speaking the protocol, so the
+        // handshake fails; the spawned process must be reaped rather than
+        // left as a zombie.
+        let connection = Connection::spawn(&["true".to_owned()]).expect("the process should spawn");
+        let pid = connection.child_id().expect("the child id should be known") as i32;
+        let error = AgentConnection::connect(connection)
+            .err()
+            .expect("the handshake must fail");
+        assert!(
+            format!("{error:#}").contains("handshake"),
+            "unexpected error: {error:#}"
+        );
+        // Reaped: the pid no longer refers to a process (or zombie) of ours.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[test]
+    fn unsolicited_responses_fail_the_connection() {
+        let (scripted, agent_side) = connected_pair();
+        let script = std::thread::spawn(move || -> Result<()> {
+            let mut connection = scripted;
+            let _: Handshake = connection.receive()?;
+            connection.send(&crate::transport::local_handshake())?;
+            let MuxRequest::Open { channel, .. } = connection.receive()? else {
+                anyhow::bail!("expected an open");
+            };
+            connection.send(&MuxResponse {
+                channel,
+                response: Response::Initialized,
+            })?;
+            // One request arrives; answer it twice. The duplicate must fail
+            // the connection rather than poisoning the channel's next
+            // exchange.
+            let _: MuxRequest = connection.receive()?;
+            connection.send(&MuxResponse {
+                channel,
+                response: Response::StagePushed,
+            })?;
+            connection.send(&MuxResponse {
+                channel,
+                response: Response::StagePushed,
+            })?;
+            // Hold the connection open until the client observes the
+            // failure.
+            let _: Result<MuxRequest> = connection.receive();
+            Ok(())
+        });
+
+        let connection = AgentConnection::connect(agent_side).expect("unable to connect");
+        let mut channel = connection
+            .open(initialize(std::path::Path::new("/unused")))
+            .expect("open");
+        let response = channel
+            .exchange(Request::StagePush(Vec::new()))
+            .expect("the first exchange succeeds");
+        assert!(matches!(response, Response::StagePushed));
+
+        // The duplicate arrives asynchronously; the next exchange must
+        // surface the protocol failure.
+        let mut failed = false;
+        for _ in 0..100 {
+            match channel.exchange(Request::StagePush(Vec::new())) {
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(error) => {
+                    assert!(
+                        format!("{error:#}").contains("unsolicited"),
+                        "unexpected error: {error:#}"
+                    );
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "the duplicate response was never detected");
+        drop(channel);
+        drop(connection);
+        let _ = script.join();
+    }
+
+    #[test]
+    fn the_pool_shares_one_connection_and_keeps_channel_refusals_local() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let root = keep.path().join("root");
         std::fs::create_dir_all(&root).expect("root should be creatable");
 
-        let (client, agent) = connected_pair();
-        let (agent_reader, agent_writer, _) = agent.into_parts();
-        let _server =
-            std::thread::spawn(move || crate::transport::serve_agent(agent_reader, agent_writer));
+        let (client, finished) = spawned_agent();
 
         let pool = AgentPool::default();
         let key = vec!["test-host".to_owned()];
@@ -511,8 +767,25 @@ mod tests {
         let channel_two = pool
             .channel(&key, initialize(&root), &mut establish)
             .expect("second channel");
+
+        // An endpoint the agent refuses (an invalid ignore pattern) is a
+        // channel-local error: the connection stays shared and no rebuild
+        // is attempted.
+        let mut refused = initialize(&root);
+        refused.ignores = vec!["[unclosed".to_owned()];
+        let error = pool
+            .channel(&key, refused, &mut establish)
+            .err()
+            .expect("the endpoint must be refused");
+        assert!(
+            format!("{error:#}").contains("remote error"),
+            "unexpected error: {error:#}"
+        );
         assert_eq!(connections_built, 1);
+
         drop(channel_one);
         drop(channel_two);
+        drop(pool);
+        assert_clean_exit(&finished);
     }
 }

@@ -42,11 +42,11 @@ impl RemoteEndpoint {
         RemoteEndpoint { channel }
     }
 
-    /// Terminates the endpoint. This is the drop behavior with a name, for
-    /// callers that want the closure to be visible in the code.
+    /// Terminates the endpoint, reporting failures that the silent drop
+    /// path would swallow: an unsendable close, a shutdown the agent
+    /// ignored, or a non-successful agent exit.
     pub fn close(self) -> Result<()> {
-        drop(self);
-        Ok(())
+        self.channel.close()
     }
 
     /// Performs one exchange, translating a remote failure into a local

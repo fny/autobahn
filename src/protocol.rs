@@ -70,8 +70,6 @@ pub enum Request {
     /// Block until content may have changed or the specified number of
     /// milliseconds elapses.
     AwaitChanges(u64),
-    /// Terminate the agent.
-    Shutdown,
 }
 
 /// A response from the agent to the controller. Every response variant

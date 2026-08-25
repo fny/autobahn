@@ -258,7 +258,7 @@ impl Drop for Connection {
 /// unreadable file, a refused transition) are part of normal operation and
 /// must not tear down the session. Only handshake, initialization, and
 /// transport failures terminate the agent, and a clean end-of-stream (the
-/// controller going away without a [`Request::Shutdown`]) is a successful
+/// controller going away without a shutdown frame) is a successful
 /// exit.
 pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> {
     let mut input = input;
@@ -307,25 +307,15 @@ pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> 
                             )?;
                             continue;
                         }
-                        // Endpoint creation failures answer on the channel (the
-                        // controller would otherwise see only silence) without
-                        // affecting the connection's other channels.
-                        let endpoint = match create_endpoint(&initialize) {
-                            Ok(endpoint) => endpoint,
-                            Err(error) => {
-                                serve_send(
-                                    &output,
-                                    channel,
-                                    Response::Error(format!("{error:#}")),
-                                )?;
-                                continue;
-                            }
-                        };
+                        // Endpoint creation happens on the channel's own
+                        // thread (it touches the filesystem, and the
+                        // dispatcher must never block on one channel's
+                        // behalf); the thread answers the open itself, with
+                        // Initialized or with the creation failure.
                         let (sender, receiver) = std::sync::mpsc::channel::<Request>();
                         channels.insert(channel, sender);
                         let output = &output;
-                        scope.spawn(move || serve_channel(channel, endpoint, receiver, output));
-                        serve_send(output, channel, Response::Initialized)?;
+                        scope.spawn(move || serve_channel(channel, initialize, receiver, output));
                     }
                     protocol::MuxRequest::Request { channel, request } => {
                         match channels.get(&channel) {
@@ -372,20 +362,32 @@ pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> 
     })
 }
 
-/// Serves one channel: requests in order, each answered on the shared
-/// writer. The thread ends when the dispatcher drops the channel's sender.
+/// Serves one channel: the endpoint is created here (answering the open),
+/// then requests are served in order, each answered on the shared writer.
+/// The thread ends when the dispatcher drops the channel's sender.
 fn serve_channel<W: Write>(
     channel: u32,
-    mut endpoint: LocalEndpoint,
+    initialize: Initialize,
     requests: std::sync::mpsc::Receiver<Request>,
     output: &std::sync::Mutex<W>,
 ) {
+    // Endpoint creation failures answer on the channel (the controller
+    // would otherwise see only silence) without affecting the connection's
+    // other channels.
+    let mut endpoint = match create_endpoint(&initialize) {
+        Ok(endpoint) => {
+            if serve_send(output, channel, Response::Initialized).is_err() {
+                return;
+            }
+            endpoint
+        }
+        Err(error) => {
+            let _ = serve_send(output, channel, Response::Error(format!("{error:#}")));
+            return;
+        }
+    };
     while let Ok(request) = requests.recv() {
         let result = match request {
-            // A channel-level shutdown request ends this channel only (kept
-            // for symmetry; the controller normally closes channels via the
-            // multiplexer).
-            Request::Shutdown => return,
             Request::Scan => endpoint.scan().map(Response::Scan),
             Request::StageBegin(files) => endpoint.stage_begin(files).map(Response::StageBegin),
             Request::SupplyOpen(needs) => {
@@ -405,10 +407,16 @@ fn serve_channel<W: Write>(
                 .map(Response::AwaitChanges),
         };
         let response = result.unwrap_or_else(|error| Response::Error(format!("{error:#}")));
-        // A write failure means the connection is gone; the dispatcher is
-        // failing too, so this thread just ends.
-        if serve_send(output, channel, response).is_err() {
-            return;
+        // A response can be unsendable for its own reasons (most notably an
+        // encoding larger than the frame cap) while the transport is
+        // healthy; a small error frame keeps the controller from waiting
+        // forever. If even that fails, the connection is gone and the
+        // dispatcher is failing with it.
+        if let Err(error) = serve_send(output, channel, response) {
+            let fallback = Response::Error(format!("unable to send the response: {error:#}"));
+            if serve_send(output, channel, fallback).is_err() {
+                return;
+            }
         }
     }
 }
@@ -726,14 +734,14 @@ pub(crate) mod tests {
         second
             .send(&Request::SupplyPull(64))
             .expect("unable to send");
-        second.send(&Request::Shutdown).expect("unable to send");
+        second.send(&Request::Scan).expect("unable to send");
         assert!(matches!(
             first.receive::<Request>().expect("unable to receive"),
             Request::SupplyPull(64)
         ));
         assert!(matches!(
             first.receive::<Request>().expect("unable to receive"),
-            Request::Shutdown
+            Request::Scan
         ));
     }
 
@@ -750,10 +758,10 @@ pub(crate) mod tests {
 
         // A payload below the compression threshold (stored verbatim)
         // round-trips as well.
-        first.send(&Request::Shutdown).expect("unable to send");
+        first.send(&Request::Scan).expect("unable to send");
         assert!(matches!(
             second.receive::<Request>().expect("unable to receive"),
-            Request::Shutdown
+            Request::Scan
         ));
     }
 
@@ -823,10 +831,10 @@ pub(crate) mod tests {
         );
 
         // Nothing was written, so the connection remains usable.
-        first.send(&Request::Shutdown).expect("unable to send");
+        first.send(&Request::Scan).expect("unable to send");
         assert!(matches!(
             second.receive::<Request>().expect("unable to receive"),
-            Request::Shutdown
+            Request::Scan
         ));
     }
 

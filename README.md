@@ -41,6 +41,12 @@ no daemon; state (the synchronization ancestor, staged content, and a scan
 cache that accelerates cold starts) lives under
 `~/.autobahn/sessions/<session-id>`.
 
+Sessions that target the same host share one agent connection (one SSH
+process, one authentication, one entry against any per-IP connection rate
+limit): the supervisor multiplexes each session as a channel over a pooled
+connection per host, and first-contact agent installation happens once per
+host rather than once per session.
+
 Both sides watch their roots natively (inotify/FSEvents), so `--watch` and
 the supervisor react to changes — local and remote — within a fraction of a
 second; the configured interval is only a fallback heartbeat. Filesystem

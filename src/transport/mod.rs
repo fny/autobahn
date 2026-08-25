@@ -16,6 +16,7 @@
 //! [`LocalEndpoint`]: crate::endpoint::local::LocalEndpoint
 
 pub mod install;
+pub mod mux;
 
 /// Sends one frame over an arbitrary writer (used by the control socket,
 /// which shares the agent protocol's framing).
@@ -217,6 +218,18 @@ impl Connection {
     pub(crate) fn child_id(&self) -> Option<u32> {
         self.child.as_ref().map(std::process::Child::id)
     }
+
+    /// Decomposes the connection into its streams and child, transferring
+    /// cleanup responsibility to the caller (the drop-time reaping is
+    /// disarmed).
+    pub(crate) fn into_parts(
+        mut self,
+    ) -> (Box<dyn Read + Send>, Box<dyn Write + Send>, Option<Child>) {
+        let reader = std::mem::replace(&mut self.reader, Box::new(std::io::empty()));
+        let writer = std::mem::replace(&mut self.writer, Box::new(std::io::sink()));
+        let child = self.child.take();
+        (reader, writer, child)
+    }
 }
 
 impl Drop for Connection {
@@ -247,41 +260,132 @@ impl Drop for Connection {
 /// transport failures terminate the agent, and a clean end-of-stream (the
 /// controller going away without a [`Request::Shutdown`]) is a successful
 /// exit.
-pub fn serve_agent<R: Read, W: Write>(input: R, output: W) -> Result<()> {
+pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> {
     let mut input = input;
-    let mut output = output;
+    let output = std::sync::Mutex::new(output);
 
     // Exchange handshakes. Ours goes out first so that a version mismatch is
     // diagnosable from either side.
-    send_frame(&mut output, &local_handshake()).context("unable to send handshake")?;
+    {
+        let mut output = output.lock().expect("the output lock is never poisoned");
+        send_frame(&mut *output, &local_handshake()).context("unable to send handshake")?;
+    }
     let peer: Handshake = receive_frame(&mut input).context("unable to receive handshake")?;
     verify_handshake(&peer)?;
 
-    // Initialize the endpoint. A failure here is reported to the controller
-    // (which would otherwise see only an opaque disconnect) before exiting.
-    let initialize: Initialize =
-        receive_frame(&mut input).context("unable to receive initialization")?;
-    let mut endpoint = match create_endpoint(&initialize) {
-        Ok(endpoint) => {
-            send_frame(&mut output, &Response::Initialized)
-                .context("unable to send initialization response")?;
-            endpoint
-        }
-        Err(error) => {
-            send_frame(&mut output, &Response::Error(format!("{error:#}")))
-                .context("unable to send initialization failure")?;
-            return Ok(());
-        }
-    };
+    // One connection carries any number of session channels, each served by
+    // its own thread over its own endpoint — a channel blocked in a change
+    // wait (or a slow transfer) never stalls its siblings. The dispatch
+    // below is the only reader; responses interleave through the shared
+    // writer, one whole frame at a time.
+    std::thread::scope(|scope| -> Result<()> {
+        let mut channels: std::collections::HashMap<u32, std::sync::mpsc::Sender<Request>> =
+            std::collections::HashMap::new();
+        let result = (|| -> Result<()> {
+            loop {
+                let frame: protocol::MuxRequest = match read_frame(&mut input)? {
+                    Some(frame) => {
+                        bincode::deserialize(&frame).context("unable to decode frame")?
+                    }
+                    // A clean end-of-stream is the controller going away, which
+                    // ends every channel (the scope joins their threads once
+                    // their senders drop below).
+                    None => return Ok(()),
+                };
+                match frame {
+                    protocol::MuxRequest::Open {
+                        channel,
+                        initialize,
+                    } => {
+                        if channels.contains_key(&channel) {
+                            serve_send(
+                                &output,
+                                channel,
+                                Response::Error(
+                                    "protocol error: the channel is already open".into(),
+                                ),
+                            )?;
+                            continue;
+                        }
+                        // Endpoint creation failures answer on the channel (the
+                        // controller would otherwise see only silence) without
+                        // affecting the connection's other channels.
+                        let endpoint = match create_endpoint(&initialize) {
+                            Ok(endpoint) => endpoint,
+                            Err(error) => {
+                                serve_send(
+                                    &output,
+                                    channel,
+                                    Response::Error(format!("{error:#}")),
+                                )?;
+                                continue;
+                            }
+                        };
+                        let (sender, receiver) = std::sync::mpsc::channel::<Request>();
+                        channels.insert(channel, sender);
+                        let output = &output;
+                        scope.spawn(move || serve_channel(channel, endpoint, receiver, output));
+                        serve_send(output, channel, Response::Initialized)?;
+                    }
+                    protocol::MuxRequest::Request { channel, request } => {
+                        match channels.get(&channel) {
+                            // A send failure means the channel thread died; the
+                            // stale entry drops so the error isn't repeated.
+                            Some(sender) => {
+                                if sender.send(request).is_err() {
+                                    channels.remove(&channel);
+                                    serve_send(
+                                        &output,
+                                        channel,
+                                        Response::Error(
+                                            "protocol error: the channel has failed".into(),
+                                        ),
+                                    )?;
+                                }
+                            }
+                            None => {
+                                serve_send(
+                                    &output,
+                                    channel,
+                                    Response::Error(
+                                        "protocol error: the channel is not open".into(),
+                                    ),
+                                )?;
+                            }
+                        }
+                    }
+                    protocol::MuxRequest::Close { channel } => {
+                        // Dropping the sender ends the channel thread after any
+                        // in-flight request completes.
+                        channels.remove(&channel);
+                    }
+                    protocol::MuxRequest::Shutdown => return Ok(()),
+                }
+            }
+        })();
+        // Dropping every sender is what lets the channel threads finish;
+        // without this, the scope's implicit join would deadlock against
+        // threads blocked on their (still-live) request queues whenever the
+        // controller disappears abruptly.
+        channels.clear();
+        result
+    })
+}
 
-    // Service requests until shutdown or disconnection.
-    loop {
-        let request: Request = match read_frame(&mut input)? {
-            Some(frame) => bincode::deserialize(&frame).context("unable to decode request")?,
-            None => return Ok(()),
-        };
+/// Serves one channel: requests in order, each answered on the shared
+/// writer. The thread ends when the dispatcher drops the channel's sender.
+fn serve_channel<W: Write>(
+    channel: u32,
+    mut endpoint: LocalEndpoint,
+    requests: std::sync::mpsc::Receiver<Request>,
+    output: &std::sync::Mutex<W>,
+) {
+    while let Ok(request) = requests.recv() {
         let result = match request {
-            Request::Shutdown => return Ok(()),
+            // A channel-level shutdown request ends this channel only (kept
+            // for symmetry; the controller normally closes channels via the
+            // multiplexer).
+            Request::Shutdown => return,
             Request::Scan => endpoint.scan().map(Response::Scan),
             Request::StageBegin(files) => endpoint.stage_begin(files).map(Response::StageBegin),
             Request::SupplyOpen(needs) => {
@@ -301,8 +405,23 @@ pub fn serve_agent<R: Read, W: Write>(input: R, output: W) -> Result<()> {
                 .map(Response::AwaitChanges),
         };
         let response = result.unwrap_or_else(|error| Response::Error(format!("{error:#}")));
-        send_frame(&mut output, &response).context("unable to send response")?;
+        // A write failure means the connection is gone; the dispatcher is
+        // failing too, so this thread just ends.
+        if serve_send(output, channel, response).is_err() {
+            return;
+        }
     }
+}
+
+/// Sends one channel-tagged response frame through the shared writer.
+fn serve_send<W: Write>(
+    output: &std::sync::Mutex<W>,
+    channel: u32,
+    response: Response,
+) -> Result<()> {
+    let mut output = output.lock().expect("the output lock is never poisoned");
+    send_frame(&mut *output, &protocol::MuxResponse { channel, response })
+        .context("unable to send response")
 }
 
 /// Creates the agent's local endpoint from the controller's initialization

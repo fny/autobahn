@@ -1,92 +1,59 @@
-//! The remote endpoint: a client proxy speaking the agent protocol over a
-//! transport byte stream.
+//! The remote endpoint: a client proxy speaking the agent protocol over one
+//! channel of a (possibly shared) multiplexed agent connection.
 //!
-//! Every [`Endpoint`] method is a synchronous exchange: one request frame out,
-//! one response frame back. The agent answers request-level failures with
-//! [`Response::Error`], which becomes an ordinary error here (prefixed to
-//! keep the far side's message distinguishable from local failures), while a
-//! response that doesn't correspond to the request is a protocol error —
-//! version skew that slipped past the handshake, or a desynchronized stream.
+//! Every [`Endpoint`] method is a synchronous exchange on the endpoint's
+//! channel: one request frame out, one response frame back. The agent
+//! answers request-level failures with [`Response::Error`], which becomes an
+//! ordinary error here (prefixed to keep the far side's message
+//! distinguishable from local failures), while a response that doesn't
+//! correspond to the request is a protocol error. Channels on the same
+//! connection interleave freely — see [`crate::transport::mux`].
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
-use crate::protocol::{Handshake, Initialize, Request, Response};
+use crate::protocol::{Initialize, Request, Response};
+use crate::transport::mux::{AgentChannel, AgentConnection, AgentPool};
 use crate::transport::{self, Connection};
 use crate::tree::{Change, Snapshot};
 
-/// A remote endpoint backed by an agent process.
+/// A remote endpoint backed by one channel of an agent connection.
 ///
-/// Dropping the endpoint shuts the agent down (best-effort) and reaps its
-/// process; [`close`](RemoteEndpoint::close) does the same with error
-/// reporting for callers that want it.
+/// Dropping the endpoint closes its channel; when that channel was the
+/// connection's last, the connection shuts the agent down and reaps its
+/// process.
 pub struct RemoteEndpoint {
-    /// The framed connection to the agent (`None` only after an explicit
-    /// close, so that dropping doesn't shut down twice).
-    connection: Option<Connection>,
+    /// The endpoint's channel.
+    channel: AgentChannel,
 }
 
 impl RemoteEndpoint {
-    /// Establishes a remote endpoint over the provided connection:
-    /// exchanges handshakes (enforcing version equality) and initializes
-    /// the agent with the session's root and policy.
+    /// Establishes a remote endpoint as the sole session over a dedicated
+    /// connection: exchanges handshakes (enforcing version equality) and
+    /// opens one channel with the session's root and policy.
     pub fn connect(connection: Connection, initialize: Initialize) -> Result<RemoteEndpoint> {
-        let mut connection = connection;
-
-        // Exchange handshakes. Ours goes out first (the agent does the same),
-        // so neither side blocks waiting for the other to speak.
-        connection
-            .send(&transport::local_handshake())
-            .context("unable to send handshake")?;
-        let peer: Handshake = connection
-            .receive()
-            .context("unable to receive the agent's handshake")?;
-        transport::verify_handshake(&peer)?;
-
-        // Initialize the agent's endpoint.
-        connection
-            .send(&initialize)
-            .context("unable to send initialization")?;
-        let response: Response = connection
-            .receive()
-            .context("unable to receive the initialization response")?;
-        match response {
-            Response::Initialized => Ok(RemoteEndpoint {
-                connection: Some(connection),
-            }),
-            Response::Error(message) => Err(remote_error(message)),
-            response => Err(unexpected_response(&response, "initialization")),
-        }
+        let connection = AgentConnection::connect(connection)?;
+        let channel = connection.open(initialize)?;
+        Ok(RemoteEndpoint { channel })
     }
 
-    /// Terminates the endpoint, asking the agent to shut down before closing
-    /// the connection (and reaping the agent process, if the connection owns
-    /// one).
-    pub fn close(mut self) -> Result<()> {
-        let Some(mut connection) = self.connection.take() else {
-            return Ok(());
-        };
-        // A failure here means the agent is already gone, which the close
-        // below will diagnose more precisely.
-        let _ = connection.send(&Request::Shutdown);
-        connection.close()
+    /// Wraps an already-open channel (the pooled path).
+    pub(crate) fn from_channel(channel: AgentChannel) -> RemoteEndpoint {
+        RemoteEndpoint { channel }
     }
 
-    /// Performs one request/response exchange, translating a remote failure
-    /// into a local error. The returned response is guaranteed not to be
+    /// Terminates the endpoint. This is the drop behavior with a name, for
+    /// callers that want the closure to be visible in the code.
+    pub fn close(self) -> Result<()> {
+        drop(self);
+        Ok(())
+    }
+
+    /// Performs one exchange, translating a remote failure into a local
+    /// error. The returned response is guaranteed not to be
     /// [`Response::Error`].
     fn exchange(&mut self, request: Request) -> Result<Response> {
-        let connection = self
-            .connection
-            .as_mut()
-            .ok_or_else(|| anyhow!("the endpoint has been closed"))?;
-        connection
-            .send(&request)
-            .context("unable to send request to the agent")?;
-        let response: Response = connection
-            .receive()
-            .context("unable to receive response from the agent")?;
-        match response {
+        match self.channel.exchange(request)? {
             Response::Error(message) => Err(remote_error(message)),
             response => Ok(response),
         }
@@ -103,14 +70,21 @@ impl RemoteEndpoint {
 /// required, and older controllers keep using their own older agents
 /// untouched.
 pub fn connect_ssh(destination: &str, initialize: Initialize) -> Result<RemoteEndpoint> {
+    let connection = establish_ssh(destination)?;
+    let channel = connection.open(initialize)?;
+    Ok(RemoteEndpoint::from_channel(channel))
+}
+
+/// Establishes a multiplexed connection to a remote SSH host, with the
+/// install-and-retry behavior of [`connect_ssh`].
+fn establish_ssh(destination: &str) -> Result<AgentConnection> {
+    use anyhow::Context;
     let remote_command = transport::install::versioned_remote_command();
     let argv = Connection::ssh_argv(destination, Some(&remote_command));
-    let attempt = || -> Result<RemoteEndpoint> {
-        let connection = Connection::spawn(&argv)?;
-        RemoteEndpoint::connect(connection, initialize.clone())
-    };
+    let attempt =
+        || -> Result<AgentConnection> { AgentConnection::connect(Connection::spawn(&argv)?) };
     let initial = match attempt() {
-        Ok(endpoint) => return Ok(endpoint),
+        Ok(connection) => return Ok(connection),
         Err(error) => error,
     };
     // The versioned agent is missing or unusable; install it and retry
@@ -128,18 +102,24 @@ pub fn connect_ssh(destination: &str, initialize: Initialize) -> Result<RemoteEn
     })
 }
 
-impl Drop for RemoteEndpoint {
-    fn drop(&mut self) {
-        // Shut the agent down and reap it, best-effort: sessions construct
-        // and drop endpoints per cycle, and every drop must leave neither a
-        // running agent nor a zombie behind. Failures are ignored — there is
-        // no useful way to report them from a destructor, and close()
-        // remains available to callers that want them.
-        if let Some(mut connection) = self.connection.take() {
-            let _ = connection.send(&Request::Shutdown);
-            let _ = connection.close();
-        }
-    }
+/// Opens a remote endpoint through a connection pool: sessions with the
+/// same spawn command share one connection (one SSH process, one
+/// authentication, one entry against any per-IP connection limit), each on
+/// its own channel.
+pub fn connect_pooled(
+    pool: &AgentPool,
+    destination: Option<&str>,
+    argv: &[String],
+    initialize: Initialize,
+) -> Result<RemoteEndpoint> {
+    let channel = pool.channel(argv, initialize, || match destination {
+        // The SSH path installs the agent on first contact; under the
+        // pool's per-key lock, concurrent sessions for one host wait for
+        // this single bootstrap instead of racing their own.
+        Some(destination) => establish_ssh(destination),
+        None => AgentConnection::connect(Connection::spawn(argv)?),
+    })?;
+    Ok(RemoteEndpoint::from_channel(channel))
 }
 
 impl Endpoint for RemoteEndpoint {
@@ -186,8 +166,9 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
-        // The agent blocks for up to the requested timeout before answering,
-        // so callers should keep individual awaits short and loop.
+        // The agent blocks this channel for up to the requested timeout
+        // before answering (other channels proceed), so callers keep
+        // individual awaits short and loop.
         match self.exchange(Request::AwaitChanges(timeout.as_millis() as u64))? {
             Response::AwaitChanges(changed) => Ok(changed),
             response => Err(unexpected_response(&response, "await changes")),
@@ -229,7 +210,8 @@ fn response_kind(response: &Response) -> &'static str {
 mod tests {
     use super::*;
 
-    use crate::protocol;
+    use crate::protocol::{self, Handshake, MuxRequest, MuxResponse};
+    use crate::scan::SymlinkMode;
     use crate::transport::tests::connected_pair;
 
     /// Builds a test initialization for the specified root.
@@ -238,15 +220,16 @@ mod tests {
             root: root.into(),
             session: "session-1".into(),
             ignores: vec!["*.tmp".into()],
-            symlink_mode: crate::scan::SymlinkMode::Raw,
+            symlink_mode: SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
         }
     }
 
-    /// Runs a scripted agent over one end of a connected pair: the handshake
-    /// and initialization, then one canned response per request, in order.
-    /// This exercises the protocol without a `LocalEndpoint` (or a process).
+    /// Runs a scripted agent over one end of a connected pair: the
+    /// handshake, a channel open, then one canned response per request, in
+    /// order. This exercises the protocol without a `LocalEndpoint` (or a
+    /// process).
     fn scripted_agent(
         mut connection: Connection,
         responses: Vec<Response>,
@@ -255,11 +238,22 @@ mod tests {
             let peer: Handshake = connection.receive()?;
             transport::verify_handshake(&peer)?;
             connection.send(&transport::local_handshake())?;
-            let initialize: Initialize = connection.receive()?;
-            connection.send(&Response::Initialized)?;
+            let MuxRequest::Open {
+                channel,
+                initialize,
+            } = connection.receive()?
+            else {
+                anyhow::bail!("expected a channel open");
+            };
+            connection.send(&MuxResponse {
+                channel,
+                response: Response::Initialized,
+            })?;
             for response in responses {
-                let _: Request = connection.receive()?;
-                connection.send(&response)?;
+                let MuxRequest::Request { channel, .. } = connection.receive()? else {
+                    anyhow::bail!("expected a channel request");
+                };
+                connection.send(&MuxResponse { channel, response })?;
             }
             Ok(initialize)
         })
@@ -309,13 +303,14 @@ mod tests {
         );
         assert!(message.contains("scan"), "unexpected error: {message}");
 
-        let initialize = agent
+        drop(endpoint);
+        let received = agent
             .join()
             .expect("agent thread panicked")
             .expect("agent failed");
-        assert_eq!(initialize.root, "/home/user/project");
-        assert_eq!(initialize.session, "session-1");
-        assert_eq!(initialize.ignores, vec!["*.tmp".to_owned()]);
+        assert_eq!(received.root, "/home/user/project");
+        assert_eq!(received.session, "session-1");
+        assert_eq!(received.ignores, vec!["*.tmp".to_owned()]);
     }
 
     #[test]
@@ -351,8 +346,13 @@ mod tests {
         let agent = std::thread::spawn(move || -> Result<()> {
             let _: Handshake = agent.receive()?;
             agent.send(&transport::local_handshake())?;
-            let _: Initialize = agent.receive()?;
-            agent.send(&Response::Error("no such directory".into()))?;
+            let MuxRequest::Open { channel, .. } = agent.receive()? else {
+                anyhow::bail!("expected a channel open");
+            };
+            agent.send(&MuxResponse {
+                channel,
+                response: Response::Error("no such directory".into()),
+            })?;
             Ok(())
         });
 

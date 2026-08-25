@@ -935,6 +935,65 @@ fn agents_install_automatically_over_ssh() {
 }
 
 #[test]
+fn sessions_on_one_host_share_one_agent_connection() {
+    let world = World::new();
+    let alpha_one = world.directory("alpha-one");
+    let alpha_two = world.directory("alpha-two");
+    let beta_one = world.directory("beta-one");
+    let beta_two = world.directory("beta-two");
+    write(&alpha_one, "one.txt", "one");
+    write(&alpha_two, "two.txt", "two");
+
+    // The wrapper counts agent launches: two sessions with the same spawn
+    // command must share one pooled connection, and therefore one process.
+    let counter = world.path("launch-count");
+    let script = world.path("counting-agent.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho launch >> {counter}\nexec {agent} agent\n",
+            counter = counter.display(),
+            agent = agent_binary()
+        ),
+    )
+    .expect("script should be writable");
+    let mut permissions = fs::metadata(&script).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&script, permissions).expect("script should be executable");
+
+    let plans = world.plans(&format!(
+        r#"
+        [defaults]
+        mode = "two-way-safe"
+
+        [groups.one]
+        alpha = "{alpha_one}"
+        agent_command = "{script}"
+        betas = ["shared-host:{beta_one}"]
+
+        [groups.two]
+        alpha = "{alpha_two}"
+        agent_command = "{script}"
+        betas = ["shared-host:{beta_two}"]
+        "#,
+        script = script.display(),
+        alpha_one = alpha_one.display(),
+        alpha_two = alpha_two.display(),
+        beta_one = beta_one.display(),
+        beta_two = beta_two.display(),
+    ));
+    let outcomes = world.run_once(plans);
+    assert_all_synchronized(&outcomes);
+
+    // Both sessions synchronized...
+    assert_eq!(read(&beta_one, "one.txt"), "one");
+    assert_eq!(read(&beta_two, "two.txt"), "two");
+    // ...through exactly one agent process.
+    let launches = fs::read_to_string(&counter).expect("the counter should exist");
+    assert_eq!(launches.lines().count(), 1, "{launches:?}");
+}
+
+#[test]
 fn policy_flows_through_the_agent_protocol() {
     let world = World::new();
     let alpha = world.directory("alpha");

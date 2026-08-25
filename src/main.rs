@@ -204,7 +204,7 @@ enum Command {
 fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout().lock()),
+        Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
         Command::Up {
             config,
             once,

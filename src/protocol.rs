@@ -99,6 +99,47 @@ pub enum Response {
     Error(String),
 }
 
+/// A controller-to-agent frame on a multiplexed connection.
+///
+/// One agent connection carries any number of sessions, each on its own
+/// channel: channels are opened with an [`Initialize`], speak the ordinary
+/// request/response protocol, and close independently. Channel identifiers
+/// are assigned by the controller and never reused within a connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum MuxRequest {
+    /// Open a channel, initializing its endpoint. The agent answers on the
+    /// channel with [`Response::Initialized`] or [`Response::Error`].
+    Open {
+        /// The new channel's identifier.
+        channel: u32,
+        /// The endpoint initialization.
+        initialize: Initialize,
+    },
+    /// A request on an open channel.
+    Request {
+        /// The channel the request belongs to.
+        channel: u32,
+        /// The request itself.
+        request: Request,
+    },
+    /// Close a channel (its endpoint is dropped; no answer is sent).
+    Close {
+        /// The channel to close.
+        channel: u32,
+    },
+    /// Terminate the agent (all channels included).
+    Shutdown,
+}
+
+/// An agent-to-controller frame on a multiplexed connection.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MuxResponse {
+    /// The channel the response belongs to.
+    pub channel: u32,
+    /// The response itself.
+    pub response: Response,
+}
+
 /// Returns the version string used for handshake validation.
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_owned()

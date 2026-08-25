@@ -27,10 +27,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{mode_name, BetaTarget, SessionPlan};
 use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
-use crate::endpoint::remote::RemoteEndpoint;
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
 use crate::session::{CycleReport, Session, SessionLock, SessionLockHeld};
+use crate::transport::mux::AgentPool;
 use crate::transport::Connection;
 
 /// The maximum delay between attempts for a failing session.
@@ -112,6 +112,9 @@ pub struct Supervisor {
     state_root: PathBuf,
     /// Whether or not to log per-cycle activity to standard output.
     verbose: bool,
+    /// The agent connection pool: sessions on the same host share one
+    /// connection, each as its own channel.
+    pool: AgentPool,
 }
 
 impl Supervisor {
@@ -122,6 +125,7 @@ impl Supervisor {
             plans,
             state_root,
             verbose,
+            pool: AgentPool::default(),
         }
     }
 
@@ -138,7 +142,8 @@ impl Supervisor {
                 .iter()
                 .map(|plan| {
                     scope.spawn(move || {
-                        let mut worker = Worker::new(plan, &self.state_root, self.verbose);
+                        let mut worker =
+                            Worker::new(plan, &self.state_root, &self.pool, self.verbose);
                         let result = worker.attempt();
                         let recorded = worker.conclude(&result);
                         let result = match (result, recorded) {
@@ -228,7 +233,7 @@ impl Supervisor {
                         .min(plan.interval);
                     sleep_interruptible(stagger, stop);
 
-                    let mut worker = Worker::new(plan, &self.state_root, self.verbose);
+                    let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
                     let identifier = plan.identifier();
                     let mut failures = 0u32;
                     while !stop.load(Ordering::Relaxed) {
@@ -271,6 +276,8 @@ struct Worker<'a> {
     plan: &'a SessionPlan,
     /// The state root.
     state_root: &'a Path,
+    /// The shared agent connection pool.
+    pool: &'a AgentPool,
     /// Whether or not to log activity.
     verbose: bool,
     /// The live session, if the last attempt (if any) succeeded.
@@ -281,10 +288,16 @@ struct Worker<'a> {
 
 impl<'a> Worker<'a> {
     /// Creates a worker for a plan.
-    fn new(plan: &'a SessionPlan, state_root: &'a Path, verbose: bool) -> Worker<'a> {
+    fn new(
+        plan: &'a SessionPlan,
+        state_root: &'a Path,
+        pool: &'a AgentPool,
+        verbose: bool,
+    ) -> Worker<'a> {
         Worker {
             plan,
             state_root,
+            pool,
             verbose,
             session: None,
             cycles: 0,
@@ -302,7 +315,7 @@ impl<'a> Worker<'a> {
     fn attempt(&mut self) -> Result<(CycleDigest, CycleReport)> {
         let result = (|| {
             if self.session.is_none() {
-                self.session = Some(connect(self.plan, self.state_root)?);
+                self.session = Some(connect(self.plan, self.state_root, self.pool)?);
             }
             run_cycles(self.session.as_mut().expect("the session was just created"))
         })();
@@ -551,7 +564,7 @@ fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
 /// Builds a live session for a plan: a local alpha endpoint, a local or
 /// remote beta endpoint, and the persisted session state under the state
 /// root.
-fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
+fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Session> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
 
@@ -598,15 +611,25 @@ fn connect(plan: &SessionPlan, state_root: &Path) -> Result<Session> {
                 file_mode: plan.file_mode,
                 directory_mode: plan.directory_mode,
             };
+            // Sessions sharing a spawn command share one pooled connection,
+            // each as its own channel — one SSH process per host, however
+            // many sessions target it.
             match agent_command {
-                Some(argv) => {
-                    let connection = Connection::spawn(argv)?;
-                    Box::new(RemoteEndpoint::connect(connection, initialize)?)
-                }
-                None => Box::new(crate::endpoint::remote::connect_ssh(
-                    destination,
-                    initialize,
+                Some(argv) => Box::new(crate::endpoint::remote::connect_pooled(
+                    pool, None, argv, initialize,
                 )?),
+                None => {
+                    let argv = Connection::ssh_argv(
+                        destination,
+                        Some(&crate::transport::install::versioned_remote_command()),
+                    );
+                    Box::new(crate::endpoint::remote::connect_pooled(
+                        pool,
+                        Some(destination),
+                        &argv,
+                        initialize,
+                    )?)
+                }
             }
         }
     };

@@ -13,10 +13,12 @@
 
 mod apply;
 mod diff;
+mod executability;
 mod reconcile;
 
 pub use apply::apply;
 pub use diff::{diff, diff_at};
+pub use executability::propagate_executability;
 pub use reconcile::{reconcile, Reconciliation};
 
 use std::sync::Arc;

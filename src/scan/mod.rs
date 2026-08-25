@@ -1,6 +1,7 @@
 //! Filesystem scanning.
 
 pub mod ignore;
+pub mod probes;
 
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
@@ -14,6 +15,7 @@ use anyhow::{bail, Context, Result};
 use crate::tree::{path_join, Content, Digest, FileMetadata, Node, Snapshot};
 
 pub use ignore::IgnoreSet;
+pub use probes::{probe, recompose, FilesystemBehavior};
 
 /// The size of the fixed buffer used to stream file contents through the
 /// digester.
@@ -45,7 +47,12 @@ const NON_UTF8_SUFFIX: &str = " (non-UTF-8)";
 /// Ignored entries and unsupported filesystem types appear as untracked
 /// content; unreadable entries appear as problematic content. A missing root
 /// yields a snapshot with no content.
-pub fn scan(root: &Path, baseline: Option<&Snapshot>, ignores: &IgnoreSet) -> Result<Snapshot> {
+pub fn scan(
+    root: &Path,
+    baseline: Option<&Snapshot>,
+    ignores: &IgnoreSet,
+    behavior: &FilesystemBehavior,
+) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
     let metadata = match fs::symlink_metadata(root) {
@@ -53,7 +60,7 @@ pub fn scan(root: &Path, baseline: Option<&Snapshot>, ignores: &IgnoreSet) -> Re
         Err(error) if error.kind() == ErrorKind::NotFound => {
             return Ok(Snapshot {
                 root: None,
-                preserves_executability: true,
+                preserves_executability: behavior.preserves_executability,
                 ..Snapshot::default()
             });
         }
@@ -67,15 +74,14 @@ pub fn scan(root: &Path, baseline: Option<&Snapshot>, ignores: &IgnoreSet) -> Re
         bail!("synchronization root {} is not a directory", root.display());
     }
 
-    let mut scanner = Scanner::new(ignores);
+    let mut scanner = Scanner::new(ignores, behavior);
     let content = scanner.scan_directory(root, "", baseline.and_then(|s| s.root.as_ref()));
     Ok(Snapshot {
         root: Some(Node {
             name: String::new(),
             content,
         }),
-        // Scanning is Unix-only, where executability is always preserved.
-        preserves_executability: true,
+        preserves_executability: behavior.preserves_executability,
         directories: scanner.directories,
         files: scanner.files,
         symlinks: scanner.symlinks,
@@ -88,6 +94,8 @@ pub fn scan(root: &Path, baseline: Option<&Snapshot>, ignores: &IgnoreSet) -> Re
 struct Scanner<'a> {
     /// The ignore set consulted for every entry.
     ignores: &'a IgnoreSet,
+    /// The behavior of the filesystem being scanned.
+    behavior: &'a FilesystemBehavior,
     /// The digest streaming buffer, allocated once per scan.
     buffer: Vec<u8>,
     /// The number of synchronizable directories scanned.
@@ -102,9 +110,10 @@ struct Scanner<'a> {
 
 impl<'a> Scanner<'a> {
     /// Creates a scanner applying the specified ignore set.
-    fn new(ignores: &'a IgnoreSet) -> Scanner<'a> {
+    fn new(ignores: &'a IgnoreSet, behavior: &'a FilesystemBehavior) -> Scanner<'a> {
         Scanner {
             ignores,
+            behavior,
             buffer: vec![0u8; DIGEST_BUFFER_SIZE],
             directories: 0,
             files: 0,
@@ -143,6 +152,11 @@ impl<'a> Scanner<'a> {
             let non_utf8 = raw_name.to_str().is_none();
             let name = if non_utf8 {
                 format!("{lossy_name}{NON_UTF8_SUFFIX}")
+            } else if self.behavior.decomposes_unicode {
+                // A decomposing volume stores names NFD; the hierarchy
+                // model carries NFC, so recompose on the way in (the
+                // creation path writes NFC and lets the volume decompose).
+                probes::recompose(&lossy_name)
             } else {
                 lossy_name.into_owned()
             };
@@ -462,14 +476,53 @@ mod tests {
     }
 
     fn scan_fixture(root: &Path, baseline: Option<&Snapshot>) -> Snapshot {
-        scan(root, baseline, &ignores(&["excluded/"])).expect("scan should succeed")
+        scan(
+            root,
+            baseline,
+            &ignores(&["excluded/"]),
+            &FilesystemBehavior::default(),
+        )
+        .expect("scan should succeed")
+    }
+
+    #[test]
+    fn decomposing_volumes_yield_recomposed_names() {
+        // The test filesystem stores bytes verbatim, so an NFD name written
+        // here simulates exactly what a decomposing volume would report.
+        let directory = tempdir().expect("temporary directory should be creatable");
+        write(directory.path(), "cafe\u{0301}.txt", "decomposed on disk");
+        let behavior = FilesystemBehavior {
+            decomposes_unicode: true,
+            ..FilesystemBehavior::default()
+        };
+        let snapshot =
+            scan(directory.path(), None, &ignores(&[]), &behavior).expect("scan should succeed");
+        let root = snapshot.root.expect("root should exist");
+        assert!(root.child("caf\u{00E9}.txt").is_some(), "{root:?}");
+        assert!(root.child("cafe\u{0301}.txt").is_none());
+
+        // Without the flag, names pass through byte-exact.
+        let snapshot = scan(
+            directory.path(),
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+        )
+        .expect("scan should succeed");
+        let root = snapshot.root.expect("root should exist");
+        assert!(root.child("cafe\u{0301}.txt").is_some());
     }
 
     #[test]
     fn missing_root_yields_empty_snapshot() {
         let directory = tempdir().expect("temporary directory should be creatable");
-        let snapshot = scan(&directory.path().join("absent"), None, &ignores(&[]))
-            .expect("a missing root is not an error");
+        let snapshot = scan(
+            &directory.path().join("absent"),
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+        )
+        .expect("a missing root is not an error");
         assert!(snapshot.root.is_none());
         assert!(snapshot.preserves_executability);
         assert_eq!(snapshot.directories, 0);
@@ -482,7 +535,13 @@ mod tests {
     fn non_directory_root_is_rejected() {
         let directory = tempdir().expect("temporary directory should be creatable");
         write(directory.path(), "file.txt", "contents");
-        assert!(scan(&directory.path().join("file.txt"), None, &ignores(&[])).is_err());
+        assert!(scan(
+            &directory.path().join("file.txt"),
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default()
+        )
+        .is_err());
     }
 
     #[test]
@@ -659,7 +718,13 @@ mod tests {
         write(root_path, "Ünicode.txt", "u");
         write(root_path, "日本語/файл.txt", "b");
         write(root_path, "a.txt", "a");
-        let snapshot = scan(root_path, None, &ignores(&[])).expect("scan should succeed");
+        let snapshot = scan(
+            root_path,
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+        )
+        .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
 
         // Sorting is by UTF-8 byte order, so ASCII precedes the rest.
@@ -684,7 +749,13 @@ mod tests {
         }
         write(root_path, "plain.txt", "plain");
 
-        let snapshot = scan(root_path, None, &ignores(&[])).expect("scan should succeed");
+        let snapshot = scan(
+            root_path,
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+        )
+        .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
         // The colliding entries collapse into a single marked node, and the
         // hierarchy remains sorted and unique.
@@ -710,7 +781,8 @@ mod tests {
         write(root_path, "vendor/keep.txt", "keep");
         write(root_path, "src/main.rs", "fn main() {}");
         let set = ignores(&["vendor", "!vendor/keep.txt"]);
-        let snapshot = scan(root_path, None, &set).expect("scan should succeed");
+        let snapshot = scan(root_path, None, &set, &FilesystemBehavior::default())
+            .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
 
         let vendor = child(root, "vendor");
@@ -728,7 +800,13 @@ mod tests {
         let locked = root_path.join("locked");
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000))
             .expect("permissions should be settable");
-        let snapshot = scan(root_path, None, &ignores(&[])).expect("scan should succeed");
+        let snapshot = scan(
+            root_path,
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+        )
+        .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
         let problems = root.problems();
         // Running as root defeats the permission bits, in which case the

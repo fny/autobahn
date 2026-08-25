@@ -15,7 +15,8 @@ use anyhow::{bail, Context, Result};
 
 use crate::endpoint::{Endpoint, FileRequest, TransitionOutcome};
 use crate::tree::{
-    apply, path_join, reconcile, Change, Conflict, Content, Node, Problem, SyncMode,
+    apply, path_join, propagate_executability, reconcile, Change, Conflict, Content, Node, Problem,
+    SyncMode,
 };
 
 /// The number of transfer frames pumped between endpoints per round trip
@@ -176,14 +177,29 @@ impl Session {
             report.beta_scan_problems = root.problems();
         }
 
+        // On a side whose filesystem can't preserve executability bits, the
+        // scanned bits are noise; graft the ancestor's bits on so that
+        // reconciliation sees only real content changes rather than phantom
+        // permission churn.
+        let alpha_root = if alpha_snapshot.preserves_executability {
+            alpha_snapshot.root.clone()
+        } else {
+            propagate_executability(self.ancestor.as_ref(), alpha_snapshot.root.as_ref())
+        };
+        let beta_root = if beta_snapshot.preserves_executability {
+            beta_snapshot.root.clone()
+        } else {
+            propagate_executability(self.ancestor.as_ref(), beta_snapshot.root.as_ref())
+        };
+
         // Safety: if the ancestor root was a directory with non-trivial
         // content and exactly one side now presents an empty (or absent)
         // root, then halt rather than propagate what is more likely an
         // unmounted or wiped filesystem than an intentional mass deletion.
         if one_side_emptied_root(
             self.ancestor.as_ref(),
-            alpha_snapshot.root.as_ref(),
-            beta_snapshot.root.as_ref(),
+            alpha_root.as_ref(),
+            beta_root.as_ref(),
         ) {
             bail!(SafetyHalt::RootEmptied);
         }
@@ -191,8 +207,8 @@ impl Session {
         // Reconcile.
         let reconciliation = reconcile(
             self.ancestor.as_ref(),
-            alpha_snapshot.root.as_ref(),
-            beta_snapshot.root.as_ref(),
+            alpha_root.as_ref(),
+            beta_root.as_ref(),
             self.mode,
         );
         report.conflicts = reconciliation.conflicts;
@@ -576,6 +592,119 @@ mod tests {
         let path = directory.path().join("ancestor");
         fs::write(&path, b"garbage").unwrap();
         assert!(load_ancestor(&path).is_err());
+    }
+
+    /// An endpoint that replays a queue of snapshots (repeating the last)
+    /// and acknowledges transitions as fully achieved.
+    struct ScriptedEndpoint {
+        snapshots: std::collections::VecDeque<crate::tree::Snapshot>,
+        last: Option<crate::tree::Snapshot>,
+    }
+
+    impl ScriptedEndpoint {
+        fn new(snapshots: Vec<crate::tree::Snapshot>) -> ScriptedEndpoint {
+            ScriptedEndpoint {
+                snapshots: snapshots.into(),
+                last: None,
+            }
+        }
+    }
+
+    impl Endpoint for ScriptedEndpoint {
+        fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+            if let Some(next) = self.snapshots.pop_front() {
+                self.last = Some(next);
+            }
+            Ok(self.last.clone().expect("a snapshot should be scripted"))
+        }
+
+        fn stage_begin(
+            &mut self,
+            _files: Vec<FileRequest>,
+        ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+            Ok(Vec::new())
+        }
+
+        fn supply_open(&mut self, _needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+            unreachable!("no staging needs are ever reported")
+        }
+
+        fn supply_pull(
+            &mut self,
+            _max_frames: usize,
+        ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+            unreachable!("no staging needs are ever reported")
+        }
+
+        fn stage_push(&mut self, _frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+            unreachable!("no staging needs are ever reported")
+        }
+
+        fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+            Ok(TransitionOutcome {
+                results: transitions.iter().map(|t| t.new.clone()).collect(),
+                problems: Vec::new(),
+                missing_staged_files: false,
+            })
+        }
+    }
+
+    #[test]
+    fn executability_noise_from_non_preserving_filesystems_is_suppressed() {
+        use crate::tree::Snapshot;
+
+        let tool = |executable: bool| Node {
+            name: "tool".into(),
+            content: Content::File {
+                digest: [9u8; 32] as Digest,
+                executable,
+                metadata: FileMetadata::default(),
+            },
+        };
+        let snapshot = |root: Node, preserves: bool| Snapshot {
+            root: Some(root),
+            preserves_executability: preserves,
+            ..Snapshot::default()
+        };
+
+        // Alpha preserves executability; beta doesn't, and after the first
+        // cycle its scans report the file spuriously executable (the classic
+        // FAT-style noise). The third alpha scan carries a *real*
+        // executability change.
+        let alpha = ScriptedEndpoint::new(vec![
+            snapshot(Node::directory("", vec![tool(false)]), true),
+            snapshot(Node::directory("", vec![tool(false)]), true),
+            snapshot(Node::directory("", vec![tool(true)]), true),
+        ]);
+        let beta = ScriptedEndpoint::new(vec![
+            snapshot(Node::directory("", vec![]), false),
+            snapshot(Node::directory("", vec![tool(true)]), false),
+            snapshot(Node::directory("", vec![tool(true)]), false),
+        ]);
+
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            Box::new(alpha),
+            Box::new(beta),
+            SyncMode::TwoWaySafe,
+            state.path().join("session"),
+        )
+        .expect("the session should construct");
+
+        // Cycle 1 creates the file on beta and establishes the ancestor.
+        let report = session.run_cycle().expect("cycle 1");
+        assert_eq!(report.beta_transitions, 1);
+
+        // Cycle 2: beta's spurious bit is grafted away; nothing propagates
+        // (without propagation this would emit a transition to alpha).
+        let report = session.run_cycle().expect("cycle 2");
+        assert!(!report.changed(), "{report:?}");
+        assert!(report.conflicts.is_empty());
+
+        // Cycle 3: alpha's *real* change still propagates to beta.
+        let report = session.run_cycle().expect("cycle 3");
+        assert_eq!(report.beta_transitions, 1, "{report:?}");
+        assert_eq!(report.alpha_transitions, 0);
     }
 
     #[test]

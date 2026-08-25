@@ -35,7 +35,7 @@ use anyhow::{bail, Context, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
 use crate::rsync::{self, Signature};
-use crate::scan::{self, IgnoreSet};
+use crate::scan::{self, recompose, FilesystemBehavior, IgnoreSet};
 use crate::tree::{path_join, Change, Content, Digest, FileMetadata, Node, Problem, Snapshot};
 
 /// The name prefix shared by every temporary file this module creates. It
@@ -66,6 +66,10 @@ pub struct LocalEndpoint {
     staging_root: PathBuf,
     /// The ignore set applied to scans.
     ignores: IgnoreSet,
+    /// The probed behavior of the root's filesystem, determined at the
+    /// first scan that finds the root present and cached for the endpoint's
+    /// lifetime.
+    behavior: Option<FilesystemBehavior>,
     /// The most recent scan, used as the digest cache for the next scan, as
     /// the local-content index for staging, and as the record that
     /// transitions validate against.
@@ -97,6 +101,7 @@ impl LocalEndpoint {
             root,
             staging_root,
             ignores,
+            behavior: None,
             last_snapshot: None,
             supply: None,
             receive: None,
@@ -302,12 +307,25 @@ impl LocalEndpoint {
 
 impl Endpoint for LocalEndpoint {
     fn scan(&mut self) -> Result<Snapshot> {
+        // Filesystem behavior is probed at the first scan that finds the
+        // root present, then cached: the properties are per-volume, and the
+        // volume doesn't change under a live endpoint.
+        if self.behavior.is_none() && fs::symlink_metadata(&self.root).is_ok() {
+            self.behavior = Some(scan::probe(&self.root));
+        }
+        let behavior = self.behavior.unwrap_or_default();
+
         // The retained snapshot is the scanner's baseline, which is what
         // turns a rescan into a walk of what changed rather than a re-read of
         // everything. Cloning it is cheap: directory children are shared
         // through `Arc`.
-        let snapshot = scan::scan(&self.root, self.last_snapshot.as_ref(), &self.ignores)
-            .with_context(|| format!("unable to scan {}", self.root.display()))?;
+        let snapshot = scan::scan(
+            &self.root,
+            self.last_snapshot.as_ref(),
+            &self.ignores,
+            &behavior,
+        )
+        .with_context(|| format!("unable to scan {}", self.root.display()))?;
         self.last_snapshot = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -431,6 +449,7 @@ impl Endpoint for LocalEndpoint {
             root: &self.root,
             staging_root: &self.staging_root,
             scanned: self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()),
+            behavior: self.behavior.unwrap_or_default(),
             problems: Vec::new(),
             missing_staged_files: false,
         };
@@ -586,6 +605,9 @@ struct Transitioner<'a> {
     staging_root: &'a Path,
     /// The last scan's hierarchy, which all validation is performed against.
     scanned: Option<&'a Node>,
+    /// The behavior of the root's filesystem, governing how on-disk names
+    /// are matched against the hierarchy's (NFC, case-exact) names.
+    behavior: FilesystemBehavior,
     /// The problems accumulated so far.
     problems: Vec<Problem>,
     /// Whether or not any staged content was found missing.
@@ -795,12 +817,26 @@ impl Transitioner<'_> {
     /// that its siblings still land.
     fn create_children(&mut self, path: &str, directory: &Path, children: &[Node]) -> Vec<Node> {
         let mut created = Vec::with_capacity(children.len());
+        // On a case-insensitive volume, sibling names that differ only by
+        // case denote a single on-disk entry; creating the second would
+        // corrupt the first, so it's refused up front.
+        let mut folded: HashMap<String, ()> = HashMap::new();
         for child in children {
             let child_path = path_join(path, &child.name);
             if let Err(message) = validate_name(&child.name) {
                 self.problem(
                     &child_path,
                     format!("refusing to create this name: {message}"),
+                );
+                continue;
+            }
+            if self.behavior.case_insensitive
+                && folded.insert(child.name.to_lowercase(), ()).is_some()
+            {
+                self.problem(
+                    &child_path,
+                    "refusing to create this entry: its name collides with a sibling's on \
+                     this case-insensitive filesystem",
                 );
                 continue;
             }
@@ -1001,6 +1037,16 @@ impl Transitioner<'_> {
                 unexpected = true;
                 continue;
             };
+            // On a decomposing volume the on-disk name is NFD while the
+            // expectation (like every hierarchy name) is NFC; recompose
+            // before matching, or every non-ASCII name would read as
+            // unexpected content.
+            let name = if self.behavior.decomposes_unicode {
+                recompose(name)
+            } else {
+                name.to_owned()
+            };
+            let name = name.as_str();
             let child_path = path_join(path, name);
             match expectation.child(name) {
                 Some(child) => {
@@ -1992,6 +2038,80 @@ mod tests {
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert_eq!(read(&fixture.beta_root, "entry"), "now a file");
+    }
+
+    #[test]
+    fn decomposed_on_disk_names_match_nfc_expectations() {
+        let mut fixture = Fixture::new();
+        // NFD on disk simulates a decomposing volume on our byte-preserving
+        // test filesystem.
+        write(&fixture.beta_root, "dir/cafe\u{0301}.txt", "content");
+        fixture.beta.behavior = Some(FilesystemBehavior {
+            decomposes_unicode: true,
+            ..FilesystemBehavior::default()
+        });
+        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        // The scan records the NFC spelling.
+        let expectation = node_at(&snapshot, "dir");
+        assert!(expectation.child("caf\u{00E9}.txt").is_some());
+
+        // Removing the directory must match the NFD dirent against the NFC
+        // expectation; without recomposition this would refuse with
+        // "unexpected content".
+        let outcome = fixture
+            .beta
+            .transition(vec![Change {
+                path: "dir".into(),
+                old: Some(expectation),
+                new: None,
+            }])
+            .expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert!(!fixture.beta_root.join("dir").exists());
+    }
+
+    #[test]
+    fn case_collisions_are_refused_on_case_insensitive_volumes() {
+        let mut fixture = Fixture::new();
+        fixture.beta.behavior = Some(FilesystemBehavior {
+            case_insensitive: true,
+            ..FilesystemBehavior::default()
+        });
+        fixture.beta.scan().expect("scan should succeed");
+
+        let digest = *blake3::hash(b"content").as_bytes();
+        let child = |name: &str| Node {
+            name: name.into(),
+            content: Content::File {
+                digest,
+                executable: false,
+                metadata: FileMetadata::default(),
+            },
+        };
+        // Stage the content so creation can proceed for the survivor.
+        fs::create_dir_all(&fixture.beta.staging_root).expect("staging root");
+        fs::write(fixture.beta.staged_path(&digest), b"content").expect("staged content");
+
+        let outcome = fixture
+            .beta
+            .transition(vec![Change {
+                path: "d".into(),
+                old: None,
+                new: Some(Node::directory(
+                    "d",
+                    vec![child("File.txt"), child("file.txt")],
+                )),
+            }])
+            .expect("transition should succeed");
+        assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
+        assert!(
+            outcome.problems[0].message.contains("case-insensitive"),
+            "{}",
+            outcome.problems[0].message
+        );
+        // Exactly one of the pair landed, and the result says which.
+        let result = outcome.results[0].as_ref().expect("directory result");
+        assert_eq!(result.children().len(), 1);
     }
 
     #[test]

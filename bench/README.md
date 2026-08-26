@@ -34,15 +34,12 @@ measured (the *floor* phase) and reported alongside.
 
 | File | Role |
 |---|---|
-| `partitions.py` | At image-bake time: full deterministic walk of each corpus, manifest (path, size, digest), and per-cell agent partitions with disjointness *asserted*, all written as JSON consumed identically by both hosts. |
-| `observer.py` | Destination-side verifier. Also implements the floor mode, where it writes the announced payload itself so the harness path is measured with no sync tool in the loop. |
-| `agents.py` | The edit workload. Partition-file driven; the measuring agent's working set is fixed at 40 files **regardless of agent count**, so agent count varies load only. |
-| `sampler.py` | One resource series per tool: timestamped RSS and CPU-jiffy totals for a process tree, sliced per phase by timestamps recorded in the results — never process-lifetime peaks. |
-| `job.py` | Runs one job on host A: for each tool — clean state, cold sync (content-verified), quiescence (verified), idle CPU, workload, final divergence check, teardown. Emits JSONL. |
-| `toysync.py` | A deliberately dumb local "sync tool" (watch + copy loop) used by the smoke test to validate the measurement plumbing end to end without EC2 or either real tool. |
-| `smoke.sh` | Local end-to-end test of the harness itself. Run it after any harness change. |
-| `orchestrate.py` | AWS lifecycle: bake the golden image (corpus cloned once, subsets and partitions computed once — byte-identical on every host), launch pairs, dispatch jobs, collect, aggregate, terminate. |
-| `aggregate.py` | Turns collected JSONL into the report tables: median across repeats, spread, and every caveat the data carries. |
+| `harness/` | **The measurement plane, in Rust, as one static binary** (`benchmark`): tree walks and manifests, partition generation and verification, the observer, the agent workload, the floor, and the resource sampler. Compiled so both hosts run byte-identical instruments, the walk rules exist once, a hundred agents are threads in one small process, and the observer polls at 500µs. |
+| `job.py` | Runs one job on host A: for each tool — clean state (verified), cold sync (digest-verified), quiescence (digest-verified), idle window, workload, reconvergence check, teardown. Emits JSONL with full provenance. Supports a local mode for the smoke test. |
+| `toysync.py` | A deliberately dumb local "sync tool" (copy loop) used by the smoke test as a subject with known behavior. |
+| `smoke.sh` | Local end-to-end test of the harness itself, including a complete `job.py` run against toysync and an `aggregate.py` pass over its output. Run it after any harness change. |
+| `orchestrate.py` | AWS lifecycle: bake the golden image (corpus cloned once, symlinks stripped, subsets and partitions computed once — byte-identical on every host), launch pairs, wire and *verify* observers, persist the full plan before dispatch, collect results and logs, destroy everything including the AMI. |
+| `aggregate.py` | Turns collected JSONL into report tables: pooled-sample percentiles with censored attempts carried as "over deadline", medians across repeats with spread, phase-windowed clock-offset-corrected resources, delivered-vs-planned accounting, and tainted-run exclusion. |
 
 ## Invariants the design enforces
 
@@ -71,15 +68,26 @@ Each of these answers a specific defect found in the previous harness.
    starts are recorded but kept out of the percentiles.
 8. **Timeouts are censored data, not crashes.** A sample that exceeds the
    per-edit deadline is recorded as `>deadline` and counted; it neither
-   kills the run nor silently vanishes.
+   kills the run nor silently vanishes — and it occupies its position in
+   the percentiles, so a percentile landing among censored attempts
+   reports a lower bound, never a flattering finite number.
 9. **Every record carries provenance**: schema version, run id, pair, job,
-   cell, repeat, tool, tool versions, commit, and phase timestamps. Every
-   run that starts is either completed or recorded as failed — nothing is
-   dropped without a record. (Previously a valid run was discarded
+   cell, repeat, tool, tool versions, binary digest, and phase timestamps.
+   Every run that starts is either completed or recorded as failed, and
+   delivered results are reconciled against the persisted plan — nothing
+   is dropped without a record. (Previously a valid run was discarded
    silently.)
 10. **State is destroyed between tools and between jobs** — sessions,
-    staging, daemons, destination trees — and the cleanliness is checked,
-    not assumed.
+    staging, daemons, installed agents, destination trees — and the
+    cleanliness is checked, not assumed.
+11. **The workload is open-loop.** The measuring agent issues edits on its
+    cadence regardless of pending acknowledgements, so a slow tool faces
+    the same offered load as a fast one. Payload streams are seeded from a
+    per-run nonce, so no earlier run's content can satisfy a verification.
+12. **Process hygiene cannot kill the harness.** Cleanup matches exact
+    process names and full executable paths, never command-line substrings
+    (the job spec itself contains both tools' names), and local test mode
+    touches nothing but the toy subject.
 
 ## Known limits, stated up front
 

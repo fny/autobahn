@@ -1,50 +1,73 @@
 #!/usr/bin/env python3
 """Runs one job — one cell, both tools, on this host pair — and emits JSONL.
 
-Host A (this host) is the source and driver; host B (reachable as the SSH
-alias `dest`, private IP in ~/bench/peer-ip) is the destination and runs
-the observers. Every record carries the run/pair/job/cell/repeat identity
-and a schema version; every phase records its wall-clock boundaries so the
-resource series can be sliced honestly afterwards.
+Host A (this host) is the source and driver; host B (SSH alias `dest`,
+private IP in ~/bench/peer-ip) is the destination and runs the observers.
+Every record carries run/pair/job/cell/repeat identity, a schema version,
+and tool/binary provenance; every phase records wall-clock boundaries plus
+a measured A↔B clock offset, so resource series can be sliced honestly.
 
-The tool order comes from the caller (the orchestrator randomizes it per
-job). State is destroyed and *verified* destroyed between tools.
+Tool order comes from the caller (randomized per job by the orchestrator).
+State is destroyed and *verified* destroyed between tools — including both
+tools' installed remote agents, so every run pays first-contact
+installation identically.
+
+Process cleanup matches by exact executable paths and comm names, never by
+substring of a command line: this driver's own argv contains the words
+"mutagen" and "autobahn" (they are in the job spec), and a substring pkill
+would kill the driver itself — the previous harness did exactly that.
+
+For local testing (`smoke.sh`), BENCH_LOCAL=1 makes `peer` run locally and
+the spec may name the `toysync` tool.
 
 Usage:
   job.py --spec '<json>' --output results.jsonl
-
-Spec:
-  {"run": ..., "pair": ..., "job": ..., "repeat": ...,
-   "cell": {"name": ..., "corpora": ["chromium"], "agents": 10,
-            "bidirectional": false},
-   "tools": ["mutagen", "autobahn"]}
 """
 
 import argparse
-import hashlib
 import json
 import os
 import shlex
 import subprocess
 import time
 
-SCHEMA = 2
-HOME = os.path.expanduser("~")
+SCHEMA = 3
+HOME = os.environ.get("BENCH_HOME", os.path.expanduser("~"))
+LOCAL = os.environ.get("BENCH_LOCAL") == "1"
 BENCH = f"{HOME}/bench"
 CORPUS = f"{HOME}/corpus"
 DEST = f"{HOME}/dest"
-OBSERVER_BASE_PORT = 9911
+BINARY = f"{BENCH}/benchmark"
+OBSERVER_BASE_PORT = int(os.environ.get("BENCH_OBSERVER_PORT", "9911"))
+REVERSE_OBSERVER_BASE_PORT = OBSERVER_BASE_PORT + 100
 COLD_SYNC_TIMEOUT_SECONDS = 3600
 POLL_SECONDS = 5
-QUIESCENCE_CHECKS = 2
-QUIESCENCE_GAP_SECONDS = 10
 IDLE_WINDOW_SECONDS = 60
-WORKLOAD_SECONDS = 150
+WORKLOAD_SECONDS = int(os.environ.get("BENCH_WORKLOAD_SECONDS", "150"))
 
-TOOL_PATTERNS = {
-    # (local sampler pattern, remote sampler pattern, local kill, remote kill)
-    "autobahn": ("autobahn up", "autobahn-", "[a]utobahn up", "[a]utobahn-"),
-    "mutagen": ("mutagen daemon run", "mutagen-agent", "[m]utagen", "[m]utagen-agent"),
+TOOLS = {
+    # pattern: sampler seed pattern (command-line substring unique to the
+    #          tool's processes and impossible in this driver's argv,
+    #          because it includes the executable's path);
+    # comm:    exact process names for cleanup, local and remote.
+    "autobahn": {
+        "local_pattern": f"{HOME}/autobahn up",
+        "remote_pattern": ".autobahn/bin/autobahn-",
+        "local_comms": ["autobahn"],
+        "remote_comms": ["autobahn-.*"],
+    },
+    "mutagen": {
+        "local_pattern": f"{HOME}/mutagen daemon run",
+        "remote_pattern": ".mutagen/agents/",
+        "local_comms": ["mutagen"],
+        "remote_comms": ["mutagen-agent"],
+    },
+    "toysync": {
+        "local_pattern": f"{BENCH}/toysync.py",
+        "remote_pattern": f"{BENCH}/toysync.py",
+        "local_comms": [],  # cleaned by pattern below, which is safe: the
+        "remote_comms": [],  # driver's argv never contains toysync.py.
+    },
 }
 
 
@@ -58,69 +81,121 @@ class Emitter:
 
 
 def run(command, check=False, timeout=None):
+    """Runs a shell command locally. Anything measurement-adjacent goes
+    through argv lists instead (see run_argv); shell=True here is for
+    plumbing only and never receives interpolated labels or specs."""
     return subprocess.run(
         command, shell=True, check=check, timeout=timeout,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
     )
 
 
+def run_argv(argv, check=False, timeout=None):
+    return subprocess.run(
+        argv, check=check, timeout=timeout,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+
+
 def peer(command, timeout=None):
-    # Single-quoted so this host's shell cannot expand anything meant for
-    # the peer, and -n so ssh never consumes our stdin.
+    """Runs a shell command on host B. Single-quoted so this host's shell
+    cannot expand anything, and -n so ssh never consumes stdin."""
+    if LOCAL:
+        return run(command, timeout=timeout)
     return run(f"ssh -n dest {shlex.quote(command)}", timeout=timeout)
 
 
 def peer_ip():
+    if LOCAL:
+        return "127.0.0.1"
     with open(f"{BENCH}/peer-ip") as handle:
         return handle.read().strip()
 
 
 def self_ip():
+    if LOCAL:
+        return "127.0.0.1"
     with open(f"{BENCH}/self-ip") as handle:
         return handle.read().strip()
 
 
+def clock_offset():
+    """Estimates B's wall clock minus A's, bracketing B's reading between
+    two local readings. Accuracy is ± half the probe's round trip, which
+    is recorded alongside so the aggregator can judge it."""
+    before = time.time()
+    remote = float(peer("date +%s.%N").stdout.strip().splitlines()[-1])
+    after = time.time()
+    return {"offset_s": remote - (before + after) / 2, "uncertainty_s": (after - before) / 2}
+
+
 # ── state hygiene ────────────────────────────────────────────────────
 
-def destroy_tool_state(emitter):
-    """Kills both tools and removes all their state, then verifies both
-    hosts are actually clean. A dirty starting condition is a failed job,
-    not a warning."""
-    run(f"pkill -f '[a]utobahn up' 2>/dev/null; pkill -f '[m]utagen' 2>/dev/null; true")
-    peer("pkill -f '[a]utobahn-' 2>/dev/null; pkill -f '[m]utagen-agent' 2>/dev/null; true")
+def kill_tools():
+    """Kills both tools everywhere, by exact comm or full executable path
+    — never by a substring that could appear in this driver's argv.
+
+    In LOCAL mode only toysync is touched: local mode runs on a developer
+    machine that may host *real* synchronization processes, and killing a
+    production agent from a smoke test is precisely the kind of collateral
+    this harness exists to rule out."""
+    # The bracket makes the pattern not match its own shell wrapper.
+    run(f"pkill -f 'python3 {BENCH}/[t]oysync.py'; true")
+    if LOCAL:
+        time.sleep(1)
+        return
+    run("pkill -x autobahn; pkill -x mutagen; true")
+    peer("pkill '^autobahn-'; pkill -x mutagen-agent; true")
     time.sleep(2)
-    run(f"rm -rf {HOME}/.autobahn/sessions {HOME}/.autobahn/status {HOME}/.mutagen {HOME}/ab.toml")
-    peer(f"rm -rf {HOME}/.autobahn/staging {HOME}/.mutagen")
-    leftovers = run(
-        "pgrep -af '[a]utobahn up|[m]utagen' | grep -v pgrep; true"
-    ).stdout.strip()
-    remote_leftovers = peer(
-        "pgrep -af '[a]utobahn-|[m]utagen-agent' | grep -v pgrep; true"
-    ).stdout.strip()
+
+
+def destroy_tool_state(emitter):
+    """Removes all tool state on both hosts and verifies cleanliness.
+    Both tools lose their installed remote agents too, so every cold sync
+    pays first-contact installation — the same cost for both."""
+    kill_tools()
+    result = run(f"rm -rf {HOME}/.autobahn {HOME}/.mutagen {HOME}/ab.toml")
+    if result.returncode != 0:
+        raise RuntimeError(f"local state removal failed: {result.stdout[-300:]}")
+    result = peer(f"rm -rf {HOME}/.autobahn {HOME}/.mutagen")
+    if result.returncode != 0:
+        raise RuntimeError(f"remote state removal failed: {result.stdout[-300:]}")
+    if LOCAL:
+        leftovers = run(f"pgrep -f 'python3 {BENCH}/[t]oysync.py'; true").stdout.strip()
+        remote_leftovers = ""
+    else:
+        leftovers = run(
+            "pgrep -x autobahn; pgrep -x mutagen; true"
+        ).stdout.strip()
+        remote_leftovers = peer(
+            "pgrep '^autobahn-'; pgrep -x mutagen-agent; true"
+        ).stdout.strip()
     if leftovers or remote_leftovers:
-        emitter.emit({
-            "measurement": "hygiene_failure",
-            "local": leftovers, "remote": remote_leftovers,
-        })
+        emitter.emit({"measurement": "hygiene_failure",
+                      "local": leftovers, "remote": remote_leftovers})
         raise RuntimeError("tool processes survived cleanup")
 
 
 def clear_destinations(corpora):
     for corpus in corpora:
-        peer(f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}")
+        result = peer(f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}")
+        if result.returncode != 0:
+            raise RuntimeError(f"destination reset failed: {result.stdout[-300:]}")
 
 
 # ── convergence ──────────────────────────────────────────────────────
 
 def summary(kind, root, remote):
-    command = f"{BENCH}/benchmark manifest {kind} {root}"
+    command = f"{BINARY} manifest {kind} {root}"
     result = peer(command, timeout=1800) if remote else run(command, timeout=1800)
+    if result.returncode != 0:
+        return f"<error: {result.stdout.strip()[-200:]}>"
     return result.stdout.strip().splitlines()[-1]
 
 
 def await_cold_sync(corpora, emitter, tool):
-    """Waits for every corpus to converge: cheap match first, then a full
-    digest verification as the arbiter. Returns per-corpus timings."""
+    """Cheap match first, then the full digest summary as the arbiter.
+    Both timestamps are reported; the *verified* one is the headline."""
     expectations = {c: summary("cheap", f"{CORPUS}/{c}", remote=False) for c in corpora}
     started = time.monotonic()
     timings = {}
@@ -134,29 +209,39 @@ def await_cold_sync(corpora, emitter, tool):
                 source_full = summary("full", f"{CORPUS}/{corpus}", remote=False)
                 destination_full = summary("full", f"{DEST}/{corpus}", remote=True)
                 verified = time.monotonic() - started
-                if source_full == destination_full:
+                if source_full == destination_full and "<error" not in source_full:
                     timings[corpus] = {
                         "count_matched_s": round(count_matched, 1),
                         "digest_verified_s": round(verified, 1),
                         "verified": True,
                     }
                     remaining.discard(corpus)
-                # A cheap match with a digest mismatch means the tree is
-                # still moving (or wrong); keep polling either way.
     for corpus in remaining:
         timings[corpus] = {"verified": False, "timeout_s": COLD_SYNC_TIMEOUT_SECONDS}
     return timings
 
 
 def await_quiescence(corpora):
-    """True once every destination is stable across consecutive checks."""
-    for _ in range(60):
-        before = {c: summary("cheap", f"{DEST}/{c}", remote=True) for c in corpora}
+    """Settled means the source and destination *content* agree and stay
+    agreed across a gap — full summaries, not counts. Idle CPU sampled
+    without this is 'shortly after convergence', which the previous run
+    discovered is not the same thing."""
+    for _ in range(30):
+        pairs = {}
         stable = True
-        for _ in range(QUIESCENCE_CHECKS):
-            time.sleep(QUIESCENCE_GAP_SECONDS)
-            after = {c: summary("cheap", f"{DEST}/{c}", remote=True) for c in corpora}
-            if after != before:
+        for corpus in corpora:
+            source = summary("full", f"{CORPUS}/{corpus}", remote=False)
+            destination = summary("full", f"{DEST}/{corpus}", remote=True)
+            if source != destination or "<error" in source:
+                stable = False
+                break
+            pairs[corpus] = source
+        if not stable:
+            time.sleep(POLL_SECONDS)
+            continue
+        time.sleep(10)
+        for corpus in corpora:
+            if summary("full", f"{DEST}/{corpus}", remote=True) != pairs[corpus]:
                 stable = False
                 break
         if stable:
@@ -165,10 +250,6 @@ def await_quiescence(corpora):
 
 
 def await_reconvergence(corpora, timeout_seconds=600):
-    """After a workload, waits until both sides hold identical content
-    again — the end-to-end no-divergence check. Both sides changed during
-    a bidirectional workload, so the arbiter compares current full
-    summaries of A and B to each other."""
     started = time.monotonic()
     results = {}
     for corpus in corpora:
@@ -176,7 +257,7 @@ def await_reconvergence(corpora, timeout_seconds=600):
         while time.monotonic() - started < timeout_seconds:
             source = summary("full", f"{CORPUS}/{corpus}", remote=False)
             destination = summary("full", f"{DEST}/{corpus}", remote=True)
-            if source == destination:
+            if source == destination and "<error" not in source:
                 converged = True
                 break
             time.sleep(POLL_SECONDS)
@@ -187,25 +268,30 @@ def await_reconvergence(corpora, timeout_seconds=600):
 # ── samplers ─────────────────────────────────────────────────────────
 
 def start_samplers(tool):
-    local_pattern, remote_pattern, _, _ = TOOL_PATTERNS[tool]
-    run("pkill -f '[b]enchmark sampler' 2>/dev/null; true")
-    peer("pkill -f '[b]enchmark sampler' 2>/dev/null; true")
-    run(f"setsid nohup {BENCH}/benchmark sampler {shlex.quote(local_pattern)} "
+    patterns = TOOLS[tool]
+    run(f"pkill -f '{BINARY} sampler' 2>/dev/null; true")
+    peer(f"pkill -f '{BINARY} sampler' 2>/dev/null; true")
+    run(f"setsid nohup {BINARY} sampler {shlex.quote(patterns['local_pattern'])} "
         f"{HOME}/rss-local.log >/dev/null 2>&1 < /dev/null &")
-    peer(f"setsid nohup {BENCH}/benchmark sampler {shlex.quote(remote_pattern)} "
+    peer(f"setsid nohup {BINARY} sampler {shlex.quote(patterns['remote_pattern'])} "
          f"{HOME}/rss-remote.log >/dev/null 2>&1 < /dev/null &")
 
 
 def collect_series():
     local = run(f"cat {HOME}/rss-local.log 2>/dev/null").stdout
     remote = peer(f"cat {HOME}/rss-remote.log 2>/dev/null").stdout
+
     def parse(text):
         rows = []
         for line in text.strip().splitlines():
             parts = line.split()
             if len(parts) == 4:
-                rows.append([float(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])])
+                try:
+                    rows.append([float(parts[0]), int(parts[1]), int(parts[2]), int(parts[3])])
+                except ValueError:
+                    continue
         return rows
+
     return {"local": parse(local), "remote": parse(remote)}
 
 
@@ -228,23 +314,29 @@ def start_tool(tool, corpora):
             handle.write("\n".join(lines))
         run(f"setsid nohup {HOME}/autobahn up --config {HOME}/ab.toml "
             f"> {HOME}/ab.log 2>&1 < /dev/null &")
-    else:
+    elif tool == "mutagen":
         run(f"{HOME}/mutagen daemon start", check=True)
         for corpus in corpora:
             run(f"{HOME}/mutagen sync create --name={corpus} --sync-mode=two-way-safe "
                 f"--ignore=/.git --ignore=/out --watch-polling-interval=5 "
                 f"{CORPUS}/{corpus} dest:{DEST}/{corpus}", check=True)
+    elif tool == "toysync":
+        for corpus in corpora:
+            run(f"setsid nohup python3 {BENCH}/toysync.py {CORPUS}/{corpus} "
+                f"{DEST}/{corpus} > /dev/null 2>&1 < /dev/null &")
+    else:
+        raise RuntimeError(f"unknown tool {tool}")
 
 
-# ── the floor ────────────────────────────────────────────────────────
+# ── measurements ─────────────────────────────────────────────────────
 
-def measure_floor(emitter):
-    """The harness's own end-to-end latency with no sync tool anywhere,
-    measured by the same binary that measures the tools."""
-    result = run(
-        f"{BENCH}/benchmark floor --observer {peer_ip()}:{OBSERVER_BASE_PORT} "
-        f"--dest-root {DEST}", timeout=300,
-    )
+def measure_floor(emitter, nonce):
+    result = run_argv([
+        BINARY, "floor",
+        "--observer", f"{peer_ip()}:{OBSERVER_BASE_PORT}",
+        "--dest-root", DEST,
+        "--nonce", str(nonce),
+    ], timeout=300)
     peer(f"rm -rf {DEST}/floor-probe")
     parsed = None
     for line in result.stdout.strip().splitlines():
@@ -255,57 +347,82 @@ def measure_floor(emitter):
     emitter.emit(parsed or {"measurement": "floor", "error": result.stdout[-500:]})
 
 
-# ── workload ─────────────────────────────────────────────────────────
-
-def run_workload(cell, emitter, tool):
+def run_workload(cell, emitter, tool, nonce):
     corpora = cell["corpora"]
-    # Paranoia that costs nothing: both hosts re-assert partition
-    # disjointness against the same baked file before any edit happens.
     for corpus in corpora:
         partitions = f"{CORPUS}/{corpus}.bench/partitions.json"
-        run(f"{BENCH}/benchmark verify-partitions {partitions}", check=True)
-        peer(f"{BENCH}/benchmark verify-partitions {partitions}")
+        run_argv([BINARY, "verify-partitions", partitions], check=True)
+        verify = peer(f"{BINARY} verify-partitions {partitions}")
+        if verify.returncode != 0:
+            raise RuntimeError(f"peer partition verification failed: {verify.stdout[-300:]}")
+
+    # Launch all workload processes (argv lists — no shell parses a label),
+    # wait for them all, close the phase, and only then collect remote
+    # outputs, so result collection never dilutes the workload window.
     processes = []
     for index, corpus in enumerate(corpora):
-        arguments = (
-            f"--root {CORPUS}/{corpus} --peer-root {DEST}/{corpus} "
-            f"--observer {peer_ip()}:{OBSERVER_BASE_PORT + index} "
-            f"--partitions {CORPUS}/{corpus}.bench/partitions.json "
-            f"--side a --agents {cell['agents']} --seconds {WORKLOAD_SECONDS} "
-            f"--label {corpus}:A->B"
-        )
+        argv = [
+            BINARY, "agents",
+            "--root", f"{CORPUS}/{corpus}",
+            "--peer-root", f"{DEST}/{corpus}",
+            "--observer", f"{peer_ip()}:{OBSERVER_BASE_PORT + index}",
+            "--partitions", f"{CORPUS}/{corpus}.bench/partitions.json",
+            "--side", "a",
+            "--agents", str(cell["agents"]),
+            "--seconds", str(WORKLOAD_SECONDS),
+            "--label", f"{corpus} a-to-b",
+            "--nonce", str(nonce * 1000 + index),
+        ]
         processes.append((
-            f"{corpus}:A->B", None,
-            subprocess.Popen(
-                f"{BENCH}/benchmark agents {arguments}", shell=True,
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True),
+            f"{corpus}:a-to-b", None,
+            subprocess.Popen(argv, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True),
         ))
         if cell.get("bidirectional"):
-            remote_result = f"{HOME}/bda-{index}.json"
-            remote_arguments = (
-                f"--root {DEST}/{corpus} --peer-root {CORPUS}/{corpus} "
-                f"--observer {self_ip()}:{OBSERVER_BASE_PORT + 100 + index} "
-                f"--partitions {CORPUS}/{corpus}.bench/partitions.json "
-                f"--side b --agents {cell['agents']} --seconds {WORKLOAD_SECONDS} "
-                f"--label {corpus}:B->A"
-            )
-            processes.append((
-                f"{corpus}:B->A", remote_result,
-                subprocess.Popen(
-                    ["ssh", "-n", "dest",
-                     f"{BENCH}/benchmark agents {remote_arguments} "
-                     f"> {remote_result} 2> {remote_result}.err"],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
-            ))
+            remote_result = f"{HOME}/bench-b-{index}.json"
+            remote_command = " ".join(shlex.quote(part) for part in [
+                BINARY, "agents",
+                "--root", f"{DEST}/{corpus}",
+                "--peer-root", f"{CORPUS}/{corpus}",
+                "--observer", f"{self_ip()}:{REVERSE_OBSERVER_BASE_PORT + index}",
+                "--partitions", f"{CORPUS}/{corpus}.bench/partitions.json",
+                "--side", "b",
+                "--agents", str(cell["agents"]),
+                "--seconds", str(WORKLOAD_SECONDS),
+                "--label", f"{corpus} b-to-a",
+                "--nonce", str(nonce * 1000 + 500 + index),
+            ]) + f" > {remote_result} 2> {remote_result}.err"
+            if LOCAL:
+                process = subprocess.Popen(remote_command, shell=True,
+                                           stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+            else:
+                process = subprocess.Popen(
+                    ["ssh", "-n", "dest", remote_command],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            processes.append((f"{corpus}:b-to-a", remote_result, process))
 
+    outputs = []
     for direction, remote_result, process in processes:
         if remote_result is None:
-            output = process.communicate()[0]
+            outputs.append((direction, process.communicate()[0]))
         else:
             process.wait()
+            outputs.append((direction, None, remote_result))
+
+    return outputs
+
+
+def collect_workload(outputs, emitter, tool):
+    clean = True
+    for entry in outputs:
+        if len(entry) == 2:
+            direction, output = entry
+        else:
+            direction, _, remote_result = entry
             output = peer(f"cat {remote_result} {remote_result}.err 2>/dev/null").stdout
         parsed = None
-        for line in output.strip().splitlines():
+        for line in (output or "").strip().splitlines():
             try:
                 parsed = json.loads(line)
             except json.JSONDecodeError:
@@ -314,19 +431,20 @@ def run_workload(cell, emitter, tool):
         if parsed:
             record.update(parsed)
         else:
-            record["error"] = output.strip()[-1000:]
+            record["error"] = (output or "").strip()[-1000:]
+            clean = False
         emitter.emit(record)
+    return clean
 
 
 # ── one tool, one cell ───────────────────────────────────────────────
 
-def run_tool(tool, cell, emitter):
+def run_tool(tool, cell, emitter, nonce):
     corpora = cell["corpora"]
     phases = {}
 
     def phase(name):
-        phases[name] = phases.get(name, {})
-        phases[name]["start"] = time.time()
+        phases[name] = {"start": time.time()}
 
     def phase_end(name):
         phases[name]["end"] = time.time()
@@ -334,44 +452,54 @@ def run_tool(tool, cell, emitter):
     destroy_tool_state(emitter)
     clear_destinations(corpora)
     start_samplers(tool)
+    offset = clock_offset()
     time.sleep(1)
 
+    status = "ok"
     phase("cold_sync")
     start_tool(tool, corpora)
     timings = await_cold_sync(corpora, emitter, tool)
     phase_end("cold_sync")
     emitter.emit({"measurement": "cold_sync", "tool": tool, "timings": timings})
     if not all(t.get("verified") for t in timings.values()):
-        emitter.emit({"measurement": "abort", "tool": tool, "reason": "cold sync unverified"})
+        emitter.emit({"measurement": "abort", "tool": tool,
+                      "reason": "cold sync unverified"})
         destroy_tool_state(emitter)
-        return
+        return "cold_sync_failed"
 
-    phase("quiescence")
     settled = await_quiescence(corpora)
-    phase_end("quiescence")
-
     phase("idle")
     time.sleep(IDLE_WINDOW_SECONDS)
     phase_end("idle")
     emitter.emit({"measurement": "idle_window", "tool": tool, "settled": settled})
+    if not settled:
+        status = "unsettled_idle"
 
     phase("workload")
-    run_workload(cell, emitter, tool)
+    outputs = run_workload(cell, emitter, tool, nonce)
     phase_end("workload")
+    if not collect_workload(outputs, emitter, tool):
+        status = "workload_error"
 
     phase("reconvergence")
     converged = await_reconvergence(corpora)
     phase_end("reconvergence")
-    emitter.emit({
-        "measurement": "reconvergence", "tool": tool, "converged": converged,
-    })
+    emitter.emit({"measurement": "reconvergence", "tool": tool, "converged": converged})
+    if not all(converged.values()):
+        status = "diverged"
 
-    series = collect_series()
     emitter.emit({
         "measurement": "resources", "tool": tool,
-        "phases": phases, "series": series,
+        "phases": phases, "clock_offset": offset, "series": collect_series(),
     })
     destroy_tool_state(emitter)
+    return status
+
+
+def binary_digest():
+    import hashlib
+    with open(BINARY, "rb") as handle:
+        return hashlib.sha256(handle.read()).hexdigest()[:16]
 
 
 def main():
@@ -384,26 +512,39 @@ def main():
     identity = {key: spec[key] for key in ("run", "pair", "job", "repeat")}
     identity["cell"] = spec["cell"]["name"]
     emitter = Emitter(arguments.output, identity)
+
+    versions = {}
+    for tool in spec["tools"]:
+        if tool == "toysync":
+            versions[tool] = "toysync"
+        else:
+            versions[tool] = run(f"{HOME}/{tool} --version 2>/dev/null || {HOME}/{tool} version") \
+                .stdout.strip().splitlines()[-1]
     emitter.emit({
-        "measurement": "job_start",
-        "spec": spec,
-        "autobahn_version": run(f"{HOME}/autobahn --version").stdout.strip(),
-        "mutagen_version": run(f"{HOME}/mutagen version").stdout.strip(),
+        "measurement": "job_start", "spec": spec,
+        "tool_versions": versions,
+        "benchmark_binary_sha256": binary_digest(),
     })
 
-    measure_floor(emitter)
-    for tool in spec["tools"]:
+    # The nonce makes every payload stream unique to (run, job, tool):
+    # a payload from any earlier run can never satisfy this run's verify.
+    base_nonce = abs(hash((spec["run"], spec["job"]))) % (1 << 32)
+
+    measure_floor(emitter, base_nonce)
+    statuses = {}
+    for tool_index, tool in enumerate(spec["tools"]):
         try:
-            run_tool(tool, spec["cell"], emitter)
-        except Exception as error:  # noqa: BLE001 — a failed tool must be recorded, not raised past
-            emitter.emit({
-                "measurement": "tool_error", "tool": tool, "error": repr(error),
-            })
+            statuses[tool] = run_tool(tool, spec["cell"], emitter,
+                                      base_nonce + tool_index + 1)
+        except Exception as error:  # noqa: BLE001 — recorded, not raised past
+            emitter.emit({"measurement": "tool_error", "tool": tool,
+                          "error": repr(error)})
+            statuses[tool] = "error"
             try:
                 destroy_tool_state(emitter)
             except Exception:
                 pass
-    emitter.emit({"measurement": "job_complete"})
+    emitter.emit({"measurement": "job_complete", "statuses": statuses})
 
 
 if __name__ == "__main__":

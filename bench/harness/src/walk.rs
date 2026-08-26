@@ -30,6 +30,18 @@ fn temporary(name: &str) -> bool {
 /// one deterministic sorted order. The walk is complete — never
 /// early-stopped — so identical trees yield identical lists on any host.
 pub fn files(root: &Path) -> std::io::Result<Vec<(String, u64)>> {
+    files_with_errors(root).map(|(files, _)| files)
+}
+
+/// The walk, with its failures counted rather than swallowed. A missing
+/// root is a hard error — an absent tree must never summarize as an empty
+/// one — and any unreadable directory below it increments the error count,
+/// which both summaries include, so two incomplete walks can only compare
+/// equal by failing identically at the same count (and the count being
+/// nonzero is itself visible to the caller).
+pub fn files_with_errors(root: &Path) -> std::io::Result<(Vec<(String, u64)>, u64)> {
+    std::fs::metadata(root)?;
+    let mut errors = 0u64;
     let mut collected = Vec::new();
     let mut stack = vec![PathBuf::new()];
     while let Some(relative_dir) = stack.pop() {
@@ -37,8 +49,12 @@ pub fn files(root: &Path) -> std::io::Result<Vec<(String, u64)>> {
         let mut entries: Vec<_> = match std::fs::read_dir(&absolute) {
             Ok(entries) => entries.filter_map(Result::ok).collect(),
             // A directory that vanished mid-walk belongs to an in-flight
-            // change; the caller compares summaries and retries.
-            Err(_) => continue,
+            // change; it is counted, which poisons summary equality until
+            // a later walk sees a stable tree.
+            Err(_) => {
+                errors += 1;
+                continue;
+            }
         };
         entries.sort_by_key(|entry| entry.file_name());
         for entry in entries {
@@ -67,14 +83,14 @@ pub fn files(root: &Path) -> std::io::Result<Vec<(String, u64)>> {
         }
     }
     collected.sort();
-    Ok(collected)
+    Ok((collected, errors))
 }
 
 /// `<count> <bytes>` — for cheap convergence polling.
 pub fn print_cheap(root: &Path) -> Result<(), String> {
-    let files = files(root).map_err(|error| error.to_string())?;
+    let (files, errors) = files_with_errors(root).map_err(|error| error.to_string())?;
     let bytes: u64 = files.iter().map(|(_, size)| size).sum();
-    println!("{} {}", files.len(), bytes);
+    println!("{} {} errors={errors}", files.len(), bytes);
     Ok(())
 }
 
@@ -83,7 +99,7 @@ pub fn print_cheap(root: &Path) -> Result<(), String> {
 /// read mid-walk (an in-flight edit) contributes a sentinel, which makes
 /// the summaries unequal — the correct verdict for an unstable tree.
 pub fn print_full(root: &Path) -> Result<(), String> {
-    let files = files(root).map_err(|error| error.to_string())?;
+    let (files, errors) = files_with_errors(root).map_err(|error| error.to_string())?;
     let bytes: u64 = files.iter().map(|(_, size)| size).sum();
     let mut listing = blake3::Hasher::new();
     for (relative, size) in &files {
@@ -93,6 +109,11 @@ pub fn print_full(root: &Path) -> Result<(), String> {
         };
         listing.update(format!("{relative}\0{size}\0{content}\n").as_bytes());
     }
-    println!("{} {} {}", files.len(), bytes, listing.finalize().to_hex());
+    println!(
+        "{} {} {} errors={errors}",
+        files.len(),
+        bytes,
+        listing.finalize().to_hex()
+    );
     Ok(())
 }

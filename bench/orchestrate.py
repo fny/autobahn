@@ -67,6 +67,11 @@ sudo apt-get update -qq && sudo apt-get install -y -qq git python3 > /dev/null
 mkdir -p ~/bench ~/corpus ~/dest
 cd ~/corpus
 git clone --depth 1 --single-branch https://github.com/chromium/chromium.git chromium
+git -C chromium rev-parse HEAD > chromium.commit
+# Symbolic links are stripped from the corpus: the tools' symlink policies
+# differ enough to make convergence ambiguous, and links are noise for a
+# latency benchmark. The walk excludes them for the same reason.
+find chromium -type l -delete
 python3 - <<'EOF'
 import os, shutil
 # Subsets built from whole top-level directories of chromium, disjoint
@@ -135,6 +140,11 @@ def bake(options):
         (f"{HERE}/job.py", "~/bench/job.py"),
         (os.path.expanduser("~/Workspace/autobahn/target/x86_64-unknown-linux-musl/release/autobahn"), "~/autobahn"),
         (os.path.expanduser("~/Workspace/mutagen-bench/bin-stock/mutagen"), "~/mutagen"),
+        # Mutagen requires its agent bundle beside the executable; without
+        # it every SSH session creation fails outright.
+        (os.path.expanduser("~/Workspace/mutagen-bench/bin-stock/mutagen-agents.tar.gz"),
+         "~/mutagen-agents.tar.gz"),
+        (f"{HERE}/toysync.py", "~/bench/toysync.py"),
     ]:
         run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} {source} ubuntu@{address}:{target}")
     run(f"{ssh} 'chmod +x ~/bench/benchmark ~/autobahn ~/mutagen; "
@@ -255,12 +265,21 @@ def dispatch(options):
             f"  StrictHostKeyChecking accept-new\\n\" >> ~/.ssh/config; "
             f"echo {b_private} > ~/bench/peer-ip; echo {a_private} > ~/bench/self-ip; "
             f"ssh -o ConnectTimeout=5 dest true'")
-        # Observers on both hosts (B for A->B, A for B->A).
+        # Observers on both hosts (B for a-to-b, A for b-to-a), started
+        # and then *proven* listening before any job is dispatched.
         run(f"ssh -i {key_path(key)} ubuntu@{b_public} "
             f"'for p in 9911 9912; do setsid nohup ~/bench/benchmark observer $p "
             f"> ~/observer-$p.log 2>&1 < /dev/null & done'")
         run(f"{ssh_a} 'for p in 10011 10012; do setsid nohup ~/bench/benchmark observer $p "
             f"> ~/observer-$p.log 2>&1 < /dev/null & done'")
+        for host, ports in ((b_public, "9911 9912"), (a_public, "10011 10012")):
+            ready = run(
+                f"ssh -i {key_path(key)} ubuntu@{host} "
+                f"'for i in $(seq 1 20); do "
+                f"ok=1; for p in {ports}; do ss -ltn | grep -q :$p || ok=0; done; "
+                f"[ $ok = 1 ] && echo READY && exit; sleep 1; done; echo NOT-READY'")
+            if "READY" not in ready.stdout or "NOT-READY" in ready.stdout:
+                raise RuntimeError(f"observers on {host} never came up: {ready.stdout}")
 
     # Jobs: cells × repeats, shuffled; tool order randomized per job.
     jobs = []
@@ -282,28 +301,45 @@ def dispatch(options):
         job["pair"] = f"pair-{pair_index}"
         assignments[pair_index].append(job)
 
+    # The complete plan is persisted before anything runs — locally and on
+    # every pair — so a pair that dies leaves evidence of what it owed, and
+    # the aggregator can compare delivered results against this manifest
+    # instead of trusting whatever happened to come back.
+    os.makedirs(f"results-{run_id}", exist_ok=True)
+    plan = {"run": run_id, "seed": seed, "ami": options.ami,
+            "pairs": options.pairs, "repeats": options.repeats,
+            "cells": [c[0] for c in CELLS], "jobs": jobs}
+    with open(f"results-{run_id}/plan.json", "w") as handle:
+        json.dump(plan, handle, indent=2)
+
     print(f"{len(jobs)} jobs over {len(pairs)} pairs (seed {seed})")
     processes = []
     for pair_index, (a, _) in enumerate(pairs):
         a_public, _ = addresses[a]
-        script_lines = ["set -u", "rm -f ~/results.jsonl"]
+        with open(f"results-{run_id}/assignment-pair-{pair_index}.json", "w") as handle:
+            json.dump(assignments[pair_index], handle)
+        run(f"scp -i {key_path(key)} results-{run_id}/assignment-pair-{pair_index}.json "
+            f"ubuntu@{a_public}:~/assignment.json")
+        script_lines = ["set -u", "rm -f ~/results.jsonl ~/driver.log"]
         for job in assignments[pair_index]:
             spec = json.dumps(json.dumps(job))  # shell-quoted JSON
             script_lines.append(
                 f"python3 ~/bench/job.py --spec {spec} --output ~/results.jsonl"
-                f" || echo job-failed >> ~/results.err"
+                f" >> ~/driver.log 2>&1"
+                f" || echo {json.dumps(job['job'])} >> ~/results.err"
             )
-        script = " && ".join(["true"] + script_lines[:1]) + "; " + "; ".join(script_lines[1:])
+        script = "; ".join(script_lines)
         processes.append((pair_index, a_public, subprocess.Popen(
-            ["ssh", "-i", key_path(key), f"ubuntu@{a_public}", script],
+            ["ssh", "-n", "-i", key_path(key), f"ubuntu@{a_public}", script],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
 
-    os.makedirs(f"results-{run_id}", exist_ok=True)
     for pair_index, a_public, process in processes:
         process.wait()
-        run(f"scp -i {key_path(key)} ubuntu@{a_public}:~/results.jsonl "
-            f"results-{run_id}/pair-{pair_index}.jsonl", check=False)
-    print(f"collected into results-{run_id}/; destroy with: "
+        for artifact in ("results.jsonl", "results.err", "driver.log"):
+            run(f"scp -i {key_path(key)} ubuntu@{a_public}:~/{artifact} "
+                f"results-{run_id}/pair-{pair_index}-{artifact}", check=False)
+    print(f"collected into results-{run_id}/; aggregate with: "
+          f"orchestrate.py aggregate results-{run_id}/; destroy with: "
           f"orchestrate.py destroy --profile {options.profile} "
           f"--region {options.region} --run {run_id}")
 
@@ -326,6 +362,21 @@ def destroy(options):
         f"ec2 delete-key-pair --key-name {options.run}-key", check=False)
     if os.path.exists(key_path(f"{options.run}-key")):
         os.remove(key_path(f"{options.run}-key"))
+    # The golden AMI and its snapshots are billed storage; a destroyed run
+    # leaves nothing behind unless --keep-ami was given.
+    if not getattr(options, "keep_ami", False):
+        for image in aws(options.profile, options.region,
+                         f"ec2 describe-images --owners self "
+                         f"--filters Name=name,Values={options.run}-golden "
+                         "--query 'Images[].ImageId' --output text").split():
+            snapshots = aws(options.profile, options.region,
+                            f"ec2 describe-images --image-ids {image} "
+                            "--query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' "
+                            "--output text").split()
+            aws(options.profile, options.region, f"ec2 deregister-image --image-id {image}")
+            for snapshot in snapshots:
+                aws(options.profile, options.region,
+                    f"ec2 delete-snapshot --snapshot-id {snapshot}")
     print("destroyed")
 
 
@@ -345,6 +396,7 @@ def main():
             s.add_argument("--group", default=None)
         if stage == "destroy":
             s.add_argument("--run", required=True)
+            s.add_argument("--keep-ami", action="store_true")
     aggregate_parser = sub.add_parser("aggregate")
     aggregate_parser.add_argument("directory")
     options = parser.parse_args()

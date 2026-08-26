@@ -149,6 +149,13 @@ pub fn verify_file(path: &Path) -> Result<(), String> {
 fn verify(partitions: &Partitions) -> Result<(), String> {
     let mut all: std::collections::BTreeMap<&str, HashSet<&String>> = Default::default();
     for (side, by_count) in &partitions.sides {
+        // The design's central invariant: the measured working set is the
+        // same at every agent count, so agent count varies load only.
+        let measured_sets: Vec<&Vec<String>> =
+            by_count.values().map(|sets| &sets.measured).collect();
+        if measured_sets.windows(2).any(|pair| pair[0] != pair[1]) {
+            return Err(format!("side {side}: measured set varies with agent count"));
+        }
         let side_all = all.entry(side.as_str()).or_default();
         for (count, sets) in by_count {
             let measured: HashSet<&String> = sets.measured.iter().collect();

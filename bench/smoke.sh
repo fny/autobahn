@@ -52,19 +52,20 @@ cmp -s "$WORK/partitions.json" "$WORK/partitions2.json" \
 python3 - "$WORK/partitions.json" <<'EOF'
 import json, sys
 p = json.load(open(sys.argv[1]))
-a = p["sides"]["a"]
-# The measured set must be identical at every agent count.
-sets = [tuple(a[str(n)]["measured"]) for n in (1, 10, 100)]
-assert len(set(sets)) == 1, "measured set varies with agent count"
-assert len(sets[0]) == 40, f"measured set is {len(sets[0])} files"
-assert len(a["100"]["background"]) == 99
+for side in ("a", "b"):
+    s = p["sides"][side]
+    # The measured set must be identical at every agent count, on both sides.
+    sets = [tuple(s[str(n)]["measured"]) for n in (1, 10, 100)]
+    assert len(set(sets)) == 1, f"side {side}: measured set varies with agent count"
+    assert len(sets[0]) == 40, f"side {side}: measured set is {len(sets[0])} files"
+    assert len(s["100"]["background"]) == 99
 EOF
 
 echo "== observer + floor =="
 mkdir -p "$WORK/dst"
 "$BINARY" observer 19911 > "$WORK/observer.log" 2>&1 &
 sleep 0.5
-FLOOR=$("$BINARY" floor --observer 127.0.0.1:19911 --dest-root "$WORK/dst")
+FLOOR=$("$BINARY" floor --observer 127.0.0.1:19911 --dest-root "$WORK/dst" --nonce 7)
 echo "  floor: $FLOOR"
 python3 - "$FLOOR" <<'EOF'
 import json, sys
@@ -80,7 +81,7 @@ python3 "$HERE/toysync.py" "$WORK/src-run" "$WORK/dst" &
 REPORT=$("$BINARY" agents \
   --root "$WORK/src-run" --peer-root "$WORK/dst" \
   --observer 127.0.0.1:19911 --partitions "$WORK/partitions.json" \
-  --side a --agents 10 --seconds 20 --label smoke)
+  --side a --agents 10 --seconds 20 --label smoke --nonce 11)
 echo "  agents: $(echo "$REPORT" | python3 -c 'import json,sys; r=json.load(sys.stdin); print({k: r[k] for k in ("samples","warmup_samples","censored","p50_ms","p90_ms")})')"
 python3 - "$REPORT" <<'EOF'
 import json, sys
@@ -99,16 +100,71 @@ echo "== censoring engages when nothing propagates =="
 # the run must complete rather than hang or crash. A short deadline via the
 # observer is simulated by pointing at a directory nothing writes to.
 rm -rf "$WORK/void" && mkdir -p "$WORK/void"
+# The window must outlast the 10s warmup, since warmup edits are excluded
+# from censoring by design; the drain then waits out the 120s deadline.
 CENSORED=$(timeout 400 "$BINARY" agents \
   --root "$WORK/src-run" --peer-root "$WORK/void" \
   --observer 127.0.0.1:19911 --partitions "$WORK/partitions.json" \
-  --side b --agents 1 --seconds 8 --label censored)
+  --side b --agents 1 --seconds 15 --label censored --nonce 13)
 python3 - "$CENSORED" <<'EOF'
 import json, sys
 report = json.loads(sys.argv[1])
 assert report["samples"] == 0, report
 assert report["censored"] >= 1, report
 assert report["censored_over_ms"] == 120000, report
+# With every attempt censored, no percentile may report a finite number.
+assert report["p50_ms"] is None, report
+EOF
+
+echo "== job.py end to end, locally, with toysync as the subject =="
+JOBHOME="$WORK/jobhome"
+mkdir -p "$JOBHOME/bench" "$JOBHOME/corpus" "$JOBHOME/dest"
+cp "$BINARY" "$JOBHOME/bench/benchmark"
+cp "$HERE/toysync.py" "$JOBHOME/bench/toysync.py"
+cp -r "$WORK/src" "$JOBHOME/corpus/smoke"
+mkdir -p "$JOBHOME/corpus/smoke.bench"
+"$JOBHOME/bench/benchmark" partitions "$JOBHOME/corpus/smoke"   "$JOBHOME/corpus/smoke.bench/partitions.json" > /dev/null
+SPEC='{"run":"smoke-run","pair":"pair-0","job":"smoke-job","repeat":0,
+       "cell":{"name":"smoke","corpora":["smoke"],"agents":10,"bidirectional":false},
+       "tools":["toysync"]}'
+BENCH_HOME="$JOBHOME" BENCH_LOCAL=1 BENCH_OBSERVER_PORT=19911   BENCH_WORKLOAD_SECONDS=20   python3 "$HERE/job.py" --spec "$SPEC" --output "$JOBHOME/results.jsonl"
+python3 - "$JOBHOME/results.jsonl" <<'EOF'
+import json, sys
+records = [json.loads(l) for l in open(sys.argv[1])]
+kinds = {r["measurement"] for r in records}
+for expected in ("job_start", "floor", "cold_sync", "idle_window",
+                 "workload", "reconvergence", "resources", "job_complete"):
+    assert expected in kinds, f"missing {expected} record"
+cold = next(r for r in records if r["measurement"] == "cold_sync")
+assert all(t["verified"] for t in cold["timings"].values()), cold
+workload = next(r for r in records if r["measurement"] == "workload")
+assert workload.get("samples", 0) >= 3, workload
+assert workload.get("censored", 1) == 0, workload
+reconv = next(r for r in records if r["measurement"] == "reconvergence")
+assert all(reconv["converged"].values()), reconv
+complete = next(r for r in records if r["measurement"] == "job_complete")
+assert complete["statuses"] == {"toysync": "ok"}, complete
+resources = next(r for r in records if r["measurement"] == "resources")
+assert set(resources["phases"]) >= {"cold_sync", "idle", "workload"}
+assert "offset_s" in resources["clock_offset"]
+EOF
+
+echo "== aggregate over the job output =="
+mkdir -p "$WORK/results"
+cp "$JOBHOME/results.jsonl" "$WORK/results/pair-0-results.jsonl"
+python3 "$HERE/aggregate.py" "$WORK/results" > "$WORK/aggregate.json"
+python3 - "$WORK/aggregate.json" <<'EOF'
+import json, sys
+report = json.load(open(sys.argv[1]))
+assert report["jobs"]["started"] == 1 and report["jobs"]["completed"] == 1
+assert not report["jobs"]["started_but_unfinished"]
+assert not report["tainted_runs"], report["tainted_runs"]
+latency = report["latency"]["smoke/toysync/smoke:a-to-b"]
+assert isinstance(latency["p50_ms"], (int, float)), latency
+assert latency["pooled_samples"] >= 3
+assert report["floor_p50_ms"] is not None
+cold = report["cold_sync_s"]["smoke/toysync/smoke"]
+assert cold["digest_verified"] is not None
 EOF
 
 echo "== sampler attributes by pattern and window =="

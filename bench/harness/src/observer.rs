@@ -1,33 +1,39 @@
 //! The destination-side verifier.
 //!
-//! One thread per connection, newline-delimited JSON. For each announced
-//! edit the observer polls the named path until it holds exactly the
-//! announced bytes, then acknowledges. The writer holds both clocks; the
-//! observer's whole job is to answer truthfully and fast — its poll
-//! interval and hash cost are inside every measured latency, which is why
-//! they are small here and why the `floor` operation exists to measure
-//! them.
+//! One connection per measuring agent; newline-delimited JSON. Every
+//! verification request runs on its own worker thread and replies are
+//! multiplexed back by sequence number, so the writer can keep multiple
+//! measured edits in flight — a slow verification never blocks the next
+//! one, which is what keeps the workload open-loop.
 //!
 //! Requests:
-//!   {"seq", "path", "digest", "size", "deadline_s"}   verify propagation
-//!   {"seq", "op": "ping"}                             round-trip probe
-//!   {"seq", "op": "floor", "path", "payload_hex"}     the observer writes
-//!         the payload itself (same atomic-write path as the workload),
-//!         then detects and verifies it exactly as it would a sync tool's
-//!         output — the harness measured with no tool in the loop.
+//!   {"seq", "path", "digest", "size", "deadline_s"}   verify: acknowledge
+//!         when the path holds exactly the announced bytes.
+//!   {"seq", "op": "ping"}                             round-trip probe.
+//!   {"seq", "op": "floor_arm", "path", "payload_hex"} stage a floor probe:
+//!         remember the payload and start a verify worker for it.
+//!   {"seq", "op": "floor_write"}                      write the staged
+//!         payload (buffered atomic rename, as a tool's destination write
+//!         is); the already-armed verify worker acknowledges when it sees
+//!         the content. The writer times floor_write → acknowledgement,
+//!         which mirrors the workload's measured interval (detection +
+//!         verification + ack return) plus one inbound trip and the write
+//!         itself — a stated, bounded overestimate.
 //!
-//! Responses: {"seq", "ok"} plus "reason" on failure.
+//! Responses: {"seq", "ok"} plus "reason" on failure. Replies are not
+//! ordered; the writer matches by seq.
 
+use std::collections::HashMap;
 use std::io::BufReader;
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-/// The detection poll. Small enough that its expected contribution
-/// (half the interval) is a fraction of a millisecond; the floor phase
-/// reports the realized total rather than this theoretical one.
+/// The detection poll. Its expected contribution is half the interval;
+/// the floor reports the realized total rather than this theoretical one.
 const POLL: Duration = Duration::from_micros(500);
 
 pub fn serve(port: u16) -> Result<(), String> {
@@ -44,72 +50,97 @@ pub fn serve(port: u16) -> Result<(), String> {
     Ok(())
 }
 
+/// A staged floor probe: where to write, and what.
+type StagedProbes = HashMap<u64, (PathBuf, Vec<u8>)>;
+
 fn handle(connection: TcpStream) -> std::io::Result<()> {
     let mut reader = BufReader::new(connection.try_clone()?);
-    let mut writer = connection;
+    let writer = Arc::new(Mutex::new(connection));
+    // Floor probes staged by floor_arm, waiting for their floor_write.
+    let staged: Arc<Mutex<StagedProbes>> = Default::default();
+
     while let Some(request) = crate::read_message(&mut reader)? {
-        let seq = request["seq"].clone();
-        let response = match request["op"].as_str() {
-            Some("ping") => json!({"seq": seq, "ok": true}),
-            Some("floor") => {
-                let path = request["path"].as_str().unwrap_or_default().to_owned();
+        let seq = request["seq"].as_u64().unwrap_or(0);
+        match request["op"].as_str() {
+            Some("ping") => {
+                reply(&writer, seq, true, None);
+            }
+            Some("floor_arm") => {
+                let path = PathBuf::from(request["path"].as_str().unwrap_or_default());
                 match crate::from_hex(request["payload_hex"].as_str().unwrap_or_default()) {
                     Ok(payload) => {
                         let digest = blake3::hash(&payload).to_hex().to_string();
                         let size = payload.len() as u64;
-                        match write_buffered(Path::new(&path), &payload) {
-                            Ok(()) => {
-                                let ok = await_content(
-                                    Path::new(&path),
-                                    &digest,
-                                    size,
-                                    Duration::from_secs(30),
-                                );
-                                json!({"seq": seq, "ok": ok})
-                            }
-                            Err(error) =>
-
-                                json!({"seq": seq, "ok": false, "reason": error.to_string()}),
-                        }
+                        staged
+                            .lock()
+                            .expect("staged lock")
+                            .insert(seq, (path.clone(), payload));
+                        // The verify worker is armed *now*, before the
+                        // write exists — exactly as a workload verify is
+                        // armed before the tool can have propagated.
+                        let writer = Arc::clone(&writer);
+                        std::thread::spawn(move || {
+                            let ok = await_content(
+                                &path,
+                                &digest,
+                                size,
+                                Duration::from_secs(30),
+                            );
+                            reply(&writer, seq, ok, (!ok).then_some("deadline"));
+                        });
                     }
-                    Err(error) => json!({"seq": seq, "ok": false, "reason": error}),
+                    Err(error) => reply(&writer, seq, false, Some(&error)),
+                }
+            }
+            Some("floor_write") => {
+                // No reply of its own: the armed verify worker's reply is
+                // the acknowledgement the writer is timing.
+                if let Some((path, payload)) = staged.lock().expect("staged lock").remove(&seq) {
+                    let _ = write_buffered(&path, &payload);
                 }
             }
             _ => {
-                let path = request["path"].as_str().unwrap_or_default().to_owned();
+                let path = PathBuf::from(request["path"].as_str().unwrap_or_default());
                 let digest = request["digest"].as_str().unwrap_or_default().to_owned();
                 let size = request["size"].as_u64().unwrap_or(0);
                 let deadline =
-                    Duration::from_secs_f64(request["deadline_s"].as_f64().unwrap_or(120.0));
-                let ok = await_content(Path::new(&path), &digest, size, deadline);
-                if ok {
-                    json!({"seq": seq, "ok": true})
-                } else {
-                    json!({"seq": seq, "ok": false, "reason": "deadline"})
-                }
+                    Duration::from_secs_f64(request["deadline_s"].as_f64().unwrap_or(180.0));
+                let writer = Arc::clone(&writer);
+                std::thread::spawn(move || {
+                    let ok = await_content(&path, &digest, size, deadline);
+                    reply(&writer, seq, ok, (!ok).then_some("deadline"));
+                });
             }
-        };
-        crate::send_message(&mut writer, &response)?;
+        }
     }
     Ok(())
 }
 
-/// The floor's stand-in for "the tool wrote the destination file":
-/// atomic rename, but *without* fsync — synchronization tools buffer their
-/// destination writes, and a floor that pays a durability cost the tools
-/// don't would overstate the harness's share of every measurement.
+fn reply(writer: &Arc<Mutex<TcpStream>>, seq: u64, ok: bool, reason: Option<&str>) {
+    let mut message = json!({"seq": seq, "ok": ok});
+    if let Some(reason) = reason {
+        message["reason"] = json!(reason);
+    }
+    let mut guard = writer.lock().expect("writer lock");
+    let _ = crate::send_message(&mut *guard, &message);
+}
+
+/// The floor's stand-in for "the tool wrote the destination file": atomic
+/// rename without fsync, as tools' destination writes are.
 fn write_buffered(path: &Path, payload: &[u8]) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let temporary = std::path::PathBuf::from(format!("{}.floor-tmp", path.display()));
+    let temporary = PathBuf::from(format!("{}.floor-tmp", path.display()));
     std::fs::write(&temporary, payload)?;
     std::fs::rename(&temporary, path)
 }
 
 /// Polls until the path holds exactly the expected content. The size gate
-/// keeps the poll loop from hashing partially written files; the digest
-/// is the actual verdict — a size match alone never acknowledges.
+/// keeps the loop from hashing files mid-write; the digest is the verdict —
+/// a size match alone never acknowledges, so a tool that writes in place
+/// (or stages then renames) cannot produce a false early acknowledgement:
+/// wrong or partial bytes hash wrong, and the loop simply polls again.
 fn await_content(path: &Path, expected_digest: &str, expected_size: u64, deadline: Duration) -> bool {
     let end = Instant::now() + deadline;
     while Instant::now() < end {

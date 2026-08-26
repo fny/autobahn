@@ -50,6 +50,10 @@ struct Shared {
     stopping: bool,
     /// Whether the writer thread is between writes with nothing queued.
     idle: bool,
+    /// Whether the writer thread has stopped for good. A thread that dies
+    /// — including by panicking inside an encoder — must not leave a
+    /// waiter blocked on a signal nobody will send.
+    finished: bool,
 }
 
 /// A background writer for one state file.
@@ -66,6 +70,23 @@ impl StateWriter {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let worker = Arc::clone(&state);
         let thread = std::thread::spawn(move || {
+            // Marks the writer finished however the loop is left — a
+            // return, or an unwinding panic from an encoder — and releases
+            // anyone waiting on it.
+            struct Retire<'a>(&'a (Mutex<Shared>, Condvar));
+            impl Drop for Retire<'_> {
+                fn drop(&mut self) {
+                    let (lock, signal) = self.0;
+                    let mut shared = match lock.lock() {
+                        Ok(shared) => shared,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    shared.finished = true;
+                    shared.idle = true;
+                    signal.notify_all();
+                }
+            }
+            let _retire = Retire(&worker);
             let (lock, signal) = &*worker;
             loop {
                 let pending = {
@@ -115,11 +136,15 @@ impl StateWriter {
     /// the cycle path deliberately does not.
     pub fn flush(&self) {
         let (lock, signal) = &*self.state;
-        let mut shared = lock.lock().expect("the writer lock is never poisoned");
-        while shared.pending.is_some() || !shared.idle {
-            shared = signal
-                .wait(shared)
-                .expect("the writer lock is never poisoned");
+        let mut shared = match lock.lock() {
+            Ok(shared) => shared,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        while !shared.finished && (shared.pending.is_some() || !shared.idle) {
+            shared = match signal.wait(shared) {
+                Ok(shared) => shared,
+                Err(poisoned) => poisoned.into_inner(),
+            };
         }
     }
 }
@@ -186,6 +211,20 @@ mod tests {
             std::fs::read(&path).expect("state should exist"),
             b"final".to_vec()
         );
+    }
+
+    #[test]
+    fn a_panicking_encoder_does_not_strand_a_flusher() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let writer = StateWriter::new();
+        writer.store(keep.path().join("state"), || panic!("encoder failed"));
+        // The writer thread dies, but a waiter must still be released
+        // rather than blocking on a signal that can never come.
+        writer.flush();
+        // Later stores are accepted and simply never written; the state is
+        // derived, so the cost is a slower next cycle, not a hang.
+        writer.store(keep.path().join("state"), || Some(b"ignored".to_vec()));
+        writer.flush();
     }
 
     #[test]

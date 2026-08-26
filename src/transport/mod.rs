@@ -405,6 +405,13 @@ fn serve_channel<W: Write>(
     // leaving the endpoint holding a tree the controller has never seen.
     let mut last_sent: Option<Snapshot> = None;
     while let Ok(request) = requests.recv() {
+        // What `last_sent` should become *if* this response reaches the
+        // controller. It is committed only after a successful send: a
+        // response that fails to encode or transmit (an oversized frame,
+        // say) leaves the controller with its previous model, and recording
+        // the new one here would make the next rescan report "unchanged"
+        // against a tree the controller never received.
+        let mut sent_if_delivered: Option<Option<Snapshot>> = None;
         let result = match request {
             Request::Scan => endpoint.scan().map(|snapshot| {
                 let unchanged = last_sent.as_ref().is_some_and(|sent| {
@@ -414,7 +421,7 @@ fn serve_channel<W: Write>(
                 if unchanged {
                     Response::ScanUnchanged
                 } else {
-                    last_sent = Some(snapshot.clone());
+                    sent_if_delivered = Some(Some(snapshot.clone()));
                     Response::Scan(snapshot)
                 }
             }),
@@ -437,7 +444,7 @@ fn serve_channel<W: Write>(
                 // otherwise untouched destination report itself unchanged,
                 // which is the common case under one-directional editing.
                 if outcome.is_ok() && last_sent.is_some() {
-                    last_sent = endpoint.snapshot().cloned();
+                    sent_if_delivered = Some(endpoint.snapshot().cloned());
                 }
                 outcome.map(Response::Transition)
             }
@@ -451,7 +458,18 @@ fn serve_channel<W: Write>(
         // healthy; a small error frame keeps the controller from waiting
         // forever. If even that fails, the connection is gone and the
         // dispatcher is failing with it.
-        if let Err(error) = serve_send(output, channel, response) {
+        let delivered = serve_send(output, channel, response);
+        if delivered.is_ok() {
+            if let Some(snapshot) = sent_if_delivered {
+                last_sent = snapshot;
+            }
+        } else {
+            // The controller's model is now whatever it held before this
+            // exchange, so the agent's must be too — otherwise a retry
+            // would answer "unchanged" against a tree that never arrived.
+            last_sent = None;
+        }
+        if let Err(error) = delivered {
             let fallback = Response::Error(format!("unable to send the response: {error:#}"));
             if serve_send(output, channel, fallback).is_err() {
                 return;

@@ -80,8 +80,6 @@ pub struct Session {
     ancestor_path: PathBuf,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
-    /// The background writer that persists the ancestor.
-    ancestor_writer: crate::persist::StateWriter,
     /// Whether the last cycle finished with the two sides synchronized and
     /// nothing outstanding — the precondition for skipping a cycle whose
     /// scans reproduce [`settled_alpha`](Self::settled_alpha) and
@@ -159,7 +157,6 @@ impl Session {
             mode,
             ancestor_path,
             ancestor,
-            ancestor_writer: crate::persist::StateWriter::new(),
             quiesced: false,
             settled_alpha: None,
             settled_beta: None,
@@ -361,19 +358,22 @@ impl Session {
                 root.validate(true)
                     .map_err(|message| anyhow::anyhow!("new ancestor is invalid: {message}"))?;
             }
-            // Validation stays on this thread: it is the safety net against
-            // a reconciliation defect reaching disk, and it must fail the
-            // cycle rather than a background thread. Only the encoding and
-            // the write — tens of megabytes on a large tree — are handed
-            // off. Order is preserved by the writer, and an ancestor that
-            // lags the filesystem is a state this session already enters on
-            // any crash in the same window: reconciliation re-derives from
-            // it without losing content.
-            let ancestor = new_ancestor.clone();
-            self.ancestor_writer
-                .store(self.ancestor_path.clone(), move || {
-                    bincode::serialize(&ancestor).ok()
-                });
+            // The ancestor is written synchronously, and a failure fails
+            // the cycle. Unlike the scan caches — which only ever save work
+            // — the ancestor carries *provenance*: it is what distinguishes
+            // "this side changed" from "the other side did". A stale
+            // ancestor is therefore not merely out of date, it is
+            // misleading, and one case makes that concrete: content
+            // deliberately reverted to an earlier state is indistinguishable
+            // from content that never changed. Reconciled against a stale
+            // ancestor, that revert reads as "unchanged" while the peer
+            // reads as "modified", and the peer's content silently
+            // overwrites the revert — in every mode. Deferring this write
+            // would widen the window in which that can happen from the gap
+            // between two statements to however long encoding and writing
+            // the whole hierarchy takes: ample time for someone to make
+            // exactly that edit.
+            save_ancestor(&self.ancestor_path, new_ancestor.as_ref())?;
             self.ancestor = new_ancestor;
         }
 
@@ -617,14 +617,15 @@ impl SessionLock {
 /// Loads a persisted ancestor, treating a missing file as an absent
 /// ancestor and failing on corruption (an unreadable ancestor must not be
 /// silently discarded, since that would resurrect deletions).
-/// Writes an ancestor file synchronously. The session itself persists
-/// through its background writer; this exists so that tests can construct
-/// and round-trip ancestor files through exactly the encoding the loader
-/// expects.
-#[cfg(test)]
+/// Writes an ancestor file, atomically and synchronously. Failures are
+/// reported rather than swallowed: an ancestor that silently failed to
+/// persist misleads the next session's reconciliation exactly as a stale
+/// one does.
 fn save_ancestor(path: &Path, ancestor: Option<&Node>) -> Result<()> {
     let data = bincode::serialize(&ancestor.cloned()).context("unable to encode ancestor")?;
-    crate::persist::write_atomically(path, &data);
+    let temporary = path.with_extension("tmp");
+    fs::write(&temporary, data).context("unable to write ancestor")?;
+    fs::rename(&temporary, path).context("unable to publish ancestor")?;
     Ok(())
 }
 

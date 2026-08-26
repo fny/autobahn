@@ -386,8 +386,9 @@ def measure_floor(emitter, nonce):
     emitter.emit(parsed or {"measurement": "floor", "error": result.stdout[-500:]})
 
 
-def run_workload(cell, emitter, tool, nonce):
-    corpora = cell["corpora"]
+def verify_partitions(corpora):
+    """Runs on both hosts *before* the workload phase window opens, so
+    this setup walk never dilutes the workload's resource attribution."""
     for corpus in corpora:
         partitions = f"{CORPUS}/{corpus}.bench/partitions.json"
         run_argv([BINARY, "verify-partitions", partitions], check=True)
@@ -395,6 +396,9 @@ def run_workload(cell, emitter, tool, nonce):
         if verify.returncode != 0:
             raise RuntimeError(f"peer partition verification failed: {verify.stdout[-300:]}")
 
+
+def run_workload(cell, emitter, tool, nonce):
+    corpora = cell["corpora"]
     # Launch all workload processes (argv lists — no shell parses a label),
     # wait for them all, close the phase, and only then collect remote
     # outputs, so result collection never dilutes the workload window.
@@ -515,6 +519,7 @@ def run_tool(tool, cell, emitter, nonce):
     if not settled:
         status = "unsettled_idle"
 
+    verify_partitions(corpora)
     phase("workload")
     outputs = run_workload(cell, emitter, tool, nonce)
     phase_end("workload")

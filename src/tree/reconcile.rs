@@ -90,6 +90,20 @@ impl Reconciler {
             return;
         }
 
+        // A single untracked side over an existing ancestor is content that
+        // synchronization deliberately leaves alone (a file that crossed a
+        // size limit, an entry that stopped being synchronizable). It
+        // neither offers changes nor can receive them, and it must never
+        // read as a deletion — so both sides and the ancestor are
+        // preserved, and content crossing back into tracked scope later
+        // resumes as an ordinary three-way update against that ancestor.
+        // (Without an ancestor, the existing disagreement handling already
+        // surfaces such content as a conflict rather than propagating.)
+        let untracked = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Untracked));
+        if (untracked(alpha) || untracked(beta)) && ancestor.is_some() {
+            return;
+        }
+
         // If alpha and beta agree (shallowly) at this path, then recurse.
         if shallow_equal(alpha, beta) {
             // If the ancestor disagrees, then record an ancestor update at
@@ -410,6 +424,30 @@ impl Reconciler {
         alpha: Option<&Node>,
         beta: Option<&Node>,
     ) {
+        // Alpha carrying untracked content cannot be mirrored — and must
+        // not read as "nothing", which would delete beta's copy of content
+        // that synchronization merely excludes (an oversized file, say).
+        // It surfaces as a conflict, matching the treatment of beta-side
+        // content that mirroring can't remove.
+        let alpha_untracked =
+            matches!(alpha, Some(node) if matches!(node.content, Content::Untracked));
+        if alpha_untracked {
+            self.result.conflicts.push(Conflict {
+                root: path.to_owned(),
+                alpha_changes: vec![Change {
+                    path: path.to_owned(),
+                    old: ancestor.cloned(),
+                    new: alpha.cloned(),
+                }],
+                beta_changes: vec![Change {
+                    path: path.to_owned(),
+                    old: ancestor.cloned(),
+                    new: beta.cloned(),
+                }],
+            });
+            return;
+        }
+
         // Exact mirroring: overwrite beta with alpha's synchronizable
         // content, unless beta carries unsynchronizable content (which can't
         // be removed), in which case indicate a conflict.
@@ -460,6 +498,56 @@ mod tests {
 
     fn dir(name: &str, children: Vec<Node>) -> Node {
         Node::directory(name, children)
+    }
+
+    #[test]
+    fn content_leaving_tracked_scope_never_reads_as_deletion() {
+        // A synchronized file crosses a size limit (or otherwise stops
+        // being synchronizable) on one side: it scans as untracked there
+        // while the peer and the ancestor still carry the file. Nothing may
+        // propagate — in any mode — and the ancestor must survive, so the
+        // file resumes as an ordinary update if it re-enters tracked scope.
+        let ancestor = dir("", vec![file("big.bin", 1, false)]);
+        let with_untracked = dir(
+            "",
+            vec![Node {
+                name: "big.bin".into(),
+                content: Content::Untracked,
+            }],
+        );
+        for mode in [
+            SyncMode::TwoWaySafe,
+            SyncMode::TwoWayResolved,
+            SyncMode::OneWaySafe,
+            SyncMode::OneWayReplica,
+        ] {
+            let result = reconcile(
+                Some(&ancestor),
+                Some(&with_untracked),
+                Some(&ancestor),
+                mode,
+            );
+            assert!(result.alpha_transitions.is_empty(), "{mode:?}");
+            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+            assert!(result.ancestor_changes.is_empty(), "{mode:?}");
+            // The reverse orientation (beta untracked) must hold too.
+            let result = reconcile(
+                Some(&ancestor),
+                Some(&ancestor),
+                Some(&with_untracked),
+                mode,
+            );
+            assert!(result.alpha_transitions.is_empty(), "{mode:?}");
+            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+            assert!(result.ancestor_changes.is_empty(), "{mode:?}");
+
+            // The ancestor-less case (the ancestor was cleared while both
+            // sides were untracked, then one re-entered tracked scope) must
+            // not delete either: at most it surfaces a conflict.
+            let result = reconcile(None, Some(&with_untracked), Some(&ancestor), mode);
+            assert!(result.alpha_transitions.is_empty(), "{mode:?}");
+            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+        }
     }
 
     #[test]

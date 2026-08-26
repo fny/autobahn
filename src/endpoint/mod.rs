@@ -18,6 +18,25 @@ use serde::{Deserialize, Serialize};
 use crate::rsync::Signature;
 use crate::tree::{Change, Digest, Node, Problem, Snapshot};
 
+/// Where an endpoint keeps its staging directory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StagingMode {
+    /// In the endpoint's state area: the session state directory for local
+    /// endpoints, `~/.autobahn/staging/<session>` for agents.
+    #[default]
+    State,
+    /// A sibling of the synchronization root — on the root's parent
+    /// filesystem, which normally guarantees that publishing staged files
+    /// is a same-device rename rather than a copy, and charges staged
+    /// content to the root's own volume.
+    BesideRoot,
+    /// Inside the synchronization root itself (as a scan-excluded hidden
+    /// directory) — the only placement guaranteed to share the root's
+    /// filesystem even when the root is a mount point, and the right choice
+    /// when the root is the only writable, persistent location on its host.
+    InsideRoot,
+}
+
 /// A request for a file's content, identified by its transition path and
 /// expected digest.
 #[derive(Clone, Debug, Serialize, Deserialize)]

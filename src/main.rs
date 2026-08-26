@@ -74,13 +74,13 @@ impl From<SymlinkModeArgument> for SymlinkMode {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Synchronize two roots: a local alpha and a local or remote beta.
+    /// Synchronize two roots, each a local path or a remote specification.
     ///
-    /// Beta accepts a local path or an scp-style remote specification
-    /// ([user@]host:path), which connects over SSH and requires autobahn (of
-    /// the same version) to be installed on the remote host.
+    /// Either root accepts a local path or an scp-style remote specification
+    /// ([user@]host:path), which connects over SSH (installing the matching
+    /// agent on the remote host on first contact).
     Sync {
-        /// The alpha synchronization root (a local path).
+        /// The alpha synchronization root (a local path or [user@]host:path).
         alpha: String,
         /// The beta synchronization root (a local path or [user@]host:path).
         beta: String,
@@ -114,6 +114,11 @@ enum Command {
         /// root path. Used for testing and custom transports.
         #[arg(long)]
         beta_agent: Option<String>,
+        /// Advanced: connect alpha through this agent command (whitespace
+        /// split into argv) instead of SSH, treating ALPHA as the remote
+        /// root path. Used for testing and custom transports.
+        #[arg(long)]
+        alpha_agent: Option<String>,
     },
     /// Run every session the groups configuration describes, supervising
     /// them continuously (or once with --once).
@@ -125,7 +130,7 @@ enum Command {
     /// others.
     Up {
         /// The configuration file (defaults to
-        /// $XDG_CONFIG_HOME/autobahn/config.toml).
+        /// ~/.autobahn/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
         /// Run a single pass over every session and exit (non-zero if any
@@ -140,7 +145,7 @@ enum Command {
     /// group (optionally filtered by group and host).
     Status {
         /// The configuration file (defaults to
-        /// $XDG_CONFIG_HOME/autobahn/config.toml).
+        /// ~/.autobahn/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
         /// Override the state root (defaults to ~/.autobahn).
@@ -267,9 +272,19 @@ fn main() {
             interval,
             state_dir,
             beta_agent,
+            alpha_agent,
         } => parse_policy(symlink_mode, file_mode, directory_mode).and_then(|policy| {
             run_sync(
-                alpha, beta, mode, ignores, policy, watch, interval, state_dir, beta_agent,
+                alpha,
+                beta,
+                mode,
+                ignores,
+                policy,
+                watch,
+                interval,
+                state_dir,
+                beta_agent,
+                alpha_agent,
             )
         }),
     };
@@ -334,25 +349,24 @@ fn run_sync(
     interval: u64,
     state_dir: Option<PathBuf>,
     beta_agent: Option<String>,
+    alpha_agent: Option<String>,
 ) -> Result<()> {
-    // Resolve the alpha root.
-    let alpha_root = PathBuf::from(&alpha);
-    let alpha_canonical = alpha_root
-        .canonicalize()
-        .with_context(|| format!("unable to resolve alpha root {alpha}"))?;
-
     // Compute the session identity and state directory. Local paths are
     // resolved to their physical identity, so a session created here shares
     // its identity (and therefore its state lock) with any supervisor
     // session over the same roots, even when the two spell them differently.
-    let beta_identity = if beta_agent.is_some() || parse_remote(&beta).is_some() {
-        beta.clone()
-    } else {
-        paths::resolve_for_identity(&PathBuf::from(&beta))
-            .to_string_lossy()
-            .into_owned()
+    let identity_of = |spec: &str, agent: &Option<String>| -> String {
+        if agent.is_some() || parse_remote(spec).is_some() {
+            spec.to_owned()
+        } else {
+            paths::resolve_for_identity(&PathBuf::from(spec))
+                .to_string_lossy()
+                .into_owned()
+        }
     };
-    let identifier = session_identifier(&alpha_canonical.to_string_lossy(), &beta_identity);
+    let alpha_identity = identity_of(&alpha, &alpha_agent);
+    let beta_identity = identity_of(&beta, &beta_agent);
+    let identifier = session_identifier(&alpha_identity, &beta_identity);
     let state_directory = match state_dir {
         Some(directory) => directory,
         None => paths::default_state_root()?
@@ -360,56 +374,76 @@ fn run_sync(
             .join(&identifier),
     };
 
-    // Construct the alpha endpoint.
+    // Construct the endpoints: an agent connection (SSH or explicit
+    // command) for remote specifications, a local endpoint otherwise.
     let options = || -> Result<EndpointOptions> {
         Ok(EndpointOptions {
             ignores: IgnoreSet::new(&ignores)?,
             symlink_mode: policy.symlink_mode,
             file_mode: policy.file_mode,
             directory_mode: policy.directory_mode,
+            max_file_size: None,
+            max_entry_count: None,
+            default_owner: None,
+            default_group: None,
         })
     };
-    let initialize = |root: String| Initialize {
+    let initialize = |root: String, side: &str| Initialize {
         root,
         session: identifier.clone(),
         ignores: ignores.clone(),
         symlink_mode: policy.symlink_mode,
         file_mode: policy.file_mode,
         directory_mode: policy.directory_mode,
+        side: side.to_owned(),
+        staging: Default::default(),
+        max_file_size: None,
+        max_entry_count: None,
+        default_owner: None,
+        default_group: None,
     };
-    let alpha_endpoint: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
-        alpha_canonical,
-        state_directory.join("staging-alpha"),
-        options()?,
-    )?);
-
-    // Construct the beta endpoint: an agent connection (SSH or explicit
-    // command) for remote specifications, a local endpoint otherwise.
-    let beta_endpoint: Box<dyn Endpoint + Send> = if let Some(command) = beta_agent {
-        let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
-        if argv.is_empty() {
-            bail!("empty beta agent command");
-        }
-        let connection = Connection::spawn(&argv)?;
-        Box::new(RemoteEndpoint::connect(
-            connection,
-            initialize(beta.clone()),
-        )?)
-    } else if let Some((host, path)) = parse_remote(&beta) {
-        Box::new(autobahn::endpoint::remote::connect_ssh(
-            host,
-            initialize(path.to_owned()),
-        )?)
-    } else {
-        let beta_root = PathBuf::from(&beta)
-            .canonicalize()
-            .with_context(|| format!("unable to resolve beta root {beta}"))?;
-        Box::new(LocalEndpoint::new(
-            beta_root,
-            state_directory.join("staging-beta"),
-            options()?,
-        )?)
-    };
+    let endpoint =
+        |spec: &str, agent: Option<String>, side: &str| -> Result<Box<dyn Endpoint + Send>> {
+            if let Some(command) = agent {
+                let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+                if argv.is_empty() {
+                    bail!("empty {side} agent command");
+                }
+                let connection = Connection::spawn(&argv)?;
+                return Ok(Box::new(RemoteEndpoint::connect(
+                    connection,
+                    initialize(spec.to_owned(), side),
+                )?));
+            }
+            if let Some((host, path)) = parse_remote(spec) {
+                return Ok(Box::new(autobahn::endpoint::remote::connect_ssh(
+                    host,
+                    initialize(path.to_owned(), side),
+                )?));
+            }
+            // A missing *beta* root is a legitimate state (the transition
+            // creates it); a missing alpha stays an error, since a mistyped
+            // source combined with a mirroring mode would otherwise empty
+            // the destination.
+            let lexical = PathBuf::from(spec);
+            let root = match lexical.canonicalize() {
+                Ok(root) => root,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound && side != "alpha" => {
+                    lexical
+                }
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("unable to resolve {side} root {spec}"));
+                }
+            };
+            Ok(Box::new(LocalEndpoint::new(
+                root,
+                state_directory.join(format!("staging-{side}")),
+                options()?,
+            )?))
+        };
+    let alpha_endpoint = endpoint(&alpha, alpha_agent, "alpha")?;
+    let beta_endpoint = endpoint(&beta, beta_agent, "beta")?;
 
     // Create the session and run.
     let mut session = Session::new(alpha_endpoint, beta_endpoint, mode.into(), state_directory)?;

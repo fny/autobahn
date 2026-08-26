@@ -21,6 +21,7 @@
 
 pub mod config;
 pub mod endpoint;
+pub mod ownership;
 pub mod paths;
 pub mod protocol;
 pub mod rsync;

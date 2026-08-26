@@ -443,26 +443,41 @@ fn serve_send<W: Write>(
 }
 
 /// Creates the agent's local endpoint from the controller's initialization
-/// request. Staging state lives under the agent user's home directory, keyed
-/// by session identifier so that concurrent sessions (and interrupted
-/// cycles) never share staging space.
+/// request. State-mode staging lives under the agent user's home directory,
+/// keyed by session identifier and side so that concurrent sessions (and
+/// interrupted cycles, and the two sides of one session) never share
+/// staging space; the root-relative placements follow the controller's
+/// staging mode.
 fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
     let home = std::env::var("HOME")
         .context("unable to determine the agent's home directory (HOME is not set)")?;
-    let staging_root = PathBuf::from(home)
-        .join(".autobahn")
-        .join("staging")
-        .join(&initialize.session);
+    // Expand a home-relative root against this agent's home directory, so
+    // that a configuration like `alpha = "~/project"` fanned out to several
+    // hosts lands in each host's own home rather than a literal `~`.
+    let root = crate::paths::expand_tilde(&initialize.root)?;
+    let staging_area = PathBuf::from(home).join(".autobahn").join("staging");
+    // Earlier versions keyed staging by session alone; such a directory can
+    // only belong to this same session under an older agent, so it is
+    // retired (best-effort) rather than left to hold stale content forever.
+    let _ = std::fs::remove_dir_all(staging_area.join(&initialize.session));
+    let state_staging = staging_area.join(format!("{}-{}", initialize.session, initialize.side));
+    let staging_root = crate::endpoint::local::staging_root_for(
+        initialize.staging,
+        &root,
+        state_staging,
+        &initialize.session,
+        &initialize.side,
+    )?;
     let options = EndpointOptions {
         ignores: IgnoreSet::new(&initialize.ignores).context("unable to compile ignores")?,
         symlink_mode: initialize.symlink_mode,
         file_mode: initialize.file_mode,
         directory_mode: initialize.directory_mode,
+        max_file_size: initialize.max_file_size,
+        max_entry_count: initialize.max_entry_count,
+        default_owner: initialize.default_owner.clone(),
+        default_group: initialize.default_group.clone(),
     };
-    // Expand a home-relative root against this agent's home directory, so
-    // that a configuration like `alpha = "~/project"` fanned out to several
-    // hosts lands in each host's own home rather than a literal `~`.
-    let root = crate::paths::expand_tilde(&initialize.root)?;
     LocalEndpoint::new(root, staging_root, options)
         .with_context(|| format!("unable to create an endpoint for {}", initialize.root))
 }

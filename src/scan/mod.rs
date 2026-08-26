@@ -96,6 +96,7 @@ pub fn scan(
     ignores: &IgnoreSet,
     behavior: &FilesystemBehavior,
     symlink_mode: SymlinkMode,
+    max_file_size: Option<u64>,
 ) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
@@ -118,7 +119,7 @@ pub fn scan(
         bail!("synchronization root {} is not a directory", root.display());
     }
 
-    let mut scanner = Scanner::new(ignores, behavior, symlink_mode);
+    let mut scanner = Scanner::new(ignores, behavior, symlink_mode, max_file_size);
     let content = scanner.scan_directory(root, "", baseline.and_then(|s| s.root.as_ref()));
     Ok(Snapshot {
         root: Some(Node {
@@ -142,6 +143,8 @@ struct Scanner<'a> {
     behavior: &'a FilesystemBehavior,
     /// The treatment of symbolic links.
     symlink_mode: SymlinkMode,
+    /// The per-file size limit (`None` for unlimited).
+    max_file_size: Option<u64>,
     /// The digest streaming buffer, allocated once per scan.
     buffer: Vec<u8>,
     /// The number of synchronizable directories scanned.
@@ -160,11 +163,13 @@ impl<'a> Scanner<'a> {
         ignores: &'a IgnoreSet,
         behavior: &'a FilesystemBehavior,
         symlink_mode: SymlinkMode,
+        max_file_size: Option<u64>,
     ) -> Scanner<'a> {
         Scanner {
             ignores,
             behavior,
             symlink_mode,
+            max_file_size,
             buffer: vec![0u8; DIGEST_BUFFER_SIZE],
             directories: 0,
             files: 0,
@@ -303,6 +308,17 @@ impl<'a> Scanner<'a> {
         baseline: Option<&Node>,
     ) -> Content {
         let mut recorded = file_metadata(metadata);
+
+        // A file over the size limit is deliberately excluded from
+        // synchronization: it scans as *untracked* content — present, and
+        // never mistakable for a deletion — and is never opened or
+        // digested. Crossing the limit in either direction just flips this
+        // classification on the next scan.
+        if let Some(limit) = self.max_file_size {
+            if recorded.size > limit {
+                return Content::Untracked;
+            }
+        }
 
         // The digest is only recomputed when the metadata that would have
         // accompanied it has changed. This is the difference between a scan
@@ -544,6 +560,7 @@ mod tests {
             &ignores(&["excluded/"]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed")
     }
@@ -564,6 +581,7 @@ mod tests {
                 &ignores(&[]),
                 &FilesystemBehavior::default(),
                 mode,
+                None,
             )
             .expect("scan should succeed")
         };
@@ -627,6 +645,7 @@ mod tests {
             &ignores(&[]),
             &behavior,
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -640,6 +659,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -655,6 +675,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("a missing root is not an error");
         assert!(snapshot.root.is_none());
@@ -675,6 +696,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .is_err());
     }
@@ -859,6 +881,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -891,6 +914,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -924,6 +948,7 @@ mod tests {
             &set,
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -949,6 +974,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");

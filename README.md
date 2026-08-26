@@ -61,11 +61,12 @@ or ignored (`--symlink-mode`, or `symlink_mode` per group).
 ### Supervising many sessions
 
 For more than a one-off sync, a declarative configuration fans **groups** —
-one local alpha directory each — out to any number of destinations, and a
-supervisor runs every resulting session in parallel:
+one alpha root each (usually a local directory, optionally a remote
+`host:path`) — out to any number of destinations, and a supervisor runs
+every resulting session in parallel:
 
 ```toml
-# ~/.config/autobahn/config.toml
+# ~/.autobahn/config.toml
 # Top-level keys (like `disabled`) must precede the first section header.
 disabled = ["flaky.example.com"]
 
@@ -99,10 +100,17 @@ autobahn reset project  # discard the baseline: next cycle merges both
                         # sides additively (resurrects deletions)
 ```
 
-A beta is remote (`[user@]host[:path]`) unless it visibly denotes a local
-path (a leading `.`, `/`, or `~`, or a `/` before any `:`). A remote beta
-without a path inherits the group's alpha path as written, so a
-home-relative alpha resolves against each remote host's own home. The
+An endpoint is remote (`[user@]host[:path]`) unless it visibly denotes a
+local path (a leading `.`, `/`, or `~`, or a `/` before any `:`). A remote
+beta without a path inherits the group's alpha path as written, so a
+home-relative alpha resolves against each remote host's own home; a remote
+*alpha* must name its path explicitly. Groups also accept `max_file_size`
+(larger files are left in place but excluded from synchronization),
+`max_entry_count` (a scan exceeding it fails the cycle — a guard against
+synchronizing the wrong tree), `staging` (`state`, `beside-root`, or
+`inside-root` placement of the staging directory), and
+`default_owner`/`default_group` (ownership applied to created entries,
+resolved on each endpoint's own host). The
 configuration is the source of truth: there is no session registry to drift
 from it, and no reachability probe to go stale — a session whose destination
 is down simply fails its cycle, backs off exponentially, and heals the

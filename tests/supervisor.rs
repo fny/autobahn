@@ -121,6 +121,40 @@ fn assert_all_synchronized(outcomes: &[SessionOutcome]) {
 }
 
 #[test]
+fn a_remote_alpha_synchronizes_through_a_real_agent() {
+    let world = World::new();
+    let remote_alpha = world.directory("remote-src");
+    let local_beta = world.directory("local-dst");
+    write(&remote_alpha, "artifact.bin", "built content");
+    write(&remote_alpha, "nested/report.txt", "report");
+    write(&local_beta, "local-note.txt", "kept");
+
+    // The alpha is a *remote* specification reached through a real agent
+    // subprocess; the beta is a plain local directory.
+    let plans = world.plans(&format!(
+        r#"
+        [groups.pull]
+        alpha = "remote-host:{remote_alpha}"
+        mode = "two-way-safe"
+        agent_command = "{agent} agent"
+        betas = ["{local_beta}"]
+        "#,
+        remote_alpha = remote_alpha.display(),
+        agent = agent_binary(),
+        local_beta = local_beta.display(),
+    ));
+    assert_eq!(plans.len(), 1);
+
+    let outcomes = world.run_once(plans);
+    assert_all_synchronized(&outcomes);
+
+    // Content flowed in both directions across the remote alpha.
+    assert_eq!(read(&local_beta, "artifact.bin"), "built content");
+    assert_eq!(read(&local_beta, "nested/report.txt"), "report");
+    assert_eq!(read(&remote_alpha, "local-note.txt"), "kept");
+}
+
+#[test]
 fn a_configuration_file_drives_multiple_groups_and_hosts() {
     let world = World::new();
     let alpha_one = world.directory("project");

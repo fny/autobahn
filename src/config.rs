@@ -1,6 +1,7 @@
 //! The groups configuration: a declarative description of synchronization
-//! sessions, organized as groups that fan one local directory (the alpha)
-//! out to any number of destinations (the betas).
+//! sessions, organized as groups that fan one root (the alpha — a local
+//! directory or a remote `host:path`) out to any number of destinations
+//! (the betas).
 //!
 //! The configuration is the source of truth: the supervisor derives its
 //! session list from it on every start, so what is running is always what
@@ -39,6 +40,7 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 
+use crate::endpoint::StagingMode;
 use crate::paths::{expand_tilde, resolve_for_identity};
 use crate::scan::{IgnoreSet, SymlinkMode};
 use crate::session::session_identifier;
@@ -55,7 +57,8 @@ pub struct Config {
     /// Settings inherited by every group.
     #[serde(default)]
     pub defaults: Defaults,
-    /// Hosts excluded from every group's betas.
+    /// Hosts excluded from every group. A disabled beta host drops that
+    /// beta; a disabled alpha host drops the whole group.
     #[serde(default)]
     pub disabled: Vec<String>,
     /// The synchronization groups, keyed by name.
@@ -80,6 +83,31 @@ pub struct Defaults {
     pub file_mode: Option<String>,
     /// The default permission bits (octal) for created directories.
     pub directory_mode: Option<String>,
+    /// The default per-file size limit: larger files are left on disk but
+    /// excluded from synchronization. Accepts bytes or a suffixed string
+    /// ("100MB", "2GiB").
+    pub max_file_size: Option<SizeSpec>,
+    /// The default limit on entries (files, directories, symlinks) per
+    /// root. A scan exceeding it fails the session's cycle.
+    pub max_entry_count: Option<u64>,
+    /// The default staging placement (`state`, `beside-root`, or
+    /// `inside-root`).
+    pub staging: Option<String>,
+    /// The default owner (name or `id:N`) for created entries.
+    pub default_owner: Option<String>,
+    /// The default group (name or `id:N`) for created entries.
+    pub default_group: Option<String>,
+}
+
+/// A size limit as written in the configuration: a raw byte count or a
+/// suffixed string.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SizeSpec {
+    /// A raw byte count.
+    Bytes(u64),
+    /// A suffixed size string ("100MB", "2GiB", "512K").
+    Text(String),
 }
 
 /// One synchronization group: a local alpha directory fanned out to one or
@@ -87,7 +115,8 @@ pub struct Defaults {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
-    /// The alpha synchronization root (a local path; `~` is expanded).
+    /// The alpha synchronization root: a local path (`~` is expanded) or a
+    /// remote `[user@]host:path` specification.
     pub alpha: String,
     /// The beta destinations (remote `[user@]host[:path]` or local paths).
     #[serde(default)]
@@ -108,9 +137,28 @@ pub struct Group {
     /// The permission bits (octal) for created directories (falls back to
     /// the defaults).
     pub directory_mode: Option<String>,
-    /// Advanced: connect this group's remote betas through this command
+    /// The per-file size limit (falls back to the defaults): larger files
+    /// are left on disk but excluded from synchronization.
+    pub max_file_size: Option<SizeSpec>,
+    /// The limit on entries per root (falls back to the defaults). A scan
+    /// exceeding it fails the session's cycle.
+    pub max_entry_count: Option<u64>,
+    /// The staging placement: `state` (the session state directory),
+    /// `beside-root` (a sibling of the synchronization root, guaranteeing
+    /// same-filesystem renames), or `inside-root` (within the root itself,
+    /// for roots on otherwise unwritable-home hosts). Falls back to the
+    /// defaults.
+    pub staging: Option<String>,
+    /// The owner (name or `id:N`) for created entries, applied by each
+    /// endpoint on its own host (falls back to the defaults). Requires the
+    /// endpoint to have chown rights.
+    pub default_owner: Option<String>,
+    /// The group (name or `id:N`) for created entries, applied by each
+    /// endpoint on its own host (falls back to the defaults).
+    pub default_group: Option<String>,
+    /// Advanced: connect this group's remote endpoints through this command
     /// (whitespace split into argv) instead of SSH. Used for testing and
-    /// custom transports; the beta's host is then informational only.
+    /// custom transports; the endpoint's host is then informational only.
     pub agent_command: Option<String>,
 }
 
@@ -122,13 +170,13 @@ pub struct SessionPlan {
     pub group: String,
     /// The destination label: the remote host, or the local beta path.
     pub host: String,
-    /// The alpha root, tilde-expanded.
-    pub alpha: PathBuf,
-    /// The alpha root as written in the configuration (used for session
-    /// identity and for remote path inheritance).
+    /// The alpha endpoint (a tilde-expanded local path, or a remote root).
+    pub alpha: EndpointTarget,
+    /// The alpha root as written in the configuration (used for display
+    /// and for remote path inheritance).
     pub alpha_spec: String,
     /// The beta destination.
-    pub beta: BetaTarget,
+    pub beta: EndpointTarget,
     /// The synchronization mode.
     pub mode: SyncMode,
     /// The combined ignore patterns (defaults first, then the group's).
@@ -143,6 +191,16 @@ pub struct SessionPlan {
     /// The permission bits for created directories (`None` for the endpoint
     /// default).
     pub directory_mode: Option<u32>,
+    /// The per-file size limit in bytes (`None` for unlimited).
+    pub max_file_size: Option<u64>,
+    /// The per-root entry limit (`None` for unlimited).
+    pub max_entry_count: Option<u64>,
+    /// The staging placement for both endpoints.
+    pub staging: StagingMode,
+    /// The owner for created entries (`None` to leave ownership alone).
+    pub default_owner: Option<String>,
+    /// The group for created entries (`None` to leave ownership alone).
+    pub default_group: Option<String>,
     /// The stable identifier isolating this session's state, derived from
     /// the *resolved* endpoint identities (see
     /// [`resolve_for_identity`](crate::paths::resolve_for_identity)) so that
@@ -152,9 +210,9 @@ pub struct SessionPlan {
     identifier: String,
 }
 
-/// A resolved beta destination.
+/// A resolved synchronization endpoint: either side of a session.
 #[derive(Clone, Debug, PartialEq)]
-pub enum BetaTarget {
+pub enum EndpointTarget {
     /// A local directory (tilde-expanded).
     Local(PathBuf),
     /// A remote root reached through an agent.
@@ -178,8 +236,8 @@ impl SessionPlan {
     /// Returns the beta specification string used for session identity.
     pub fn beta_spec(&self) -> String {
         match &self.beta {
-            BetaTarget::Local(path) => path.to_string_lossy().into_owned(),
-            BetaTarget::Remote {
+            EndpointTarget::Local(path) => path.to_string_lossy().into_owned(),
+            EndpointTarget::Remote {
                 destination, path, ..
             } => format!("{destination}:{path}"),
         }
@@ -191,13 +249,13 @@ impl SessionPlan {
     }
 }
 
-/// Computes a session identity string for a beta target: the resolved
+/// Computes a session identity string for an endpoint target: the resolved
 /// physical path for a local target, the textual `destination:path` for a
 /// remote one (whose paths can only be resolved on the remote side).
-fn beta_identity(beta: &BetaTarget) -> String {
-    match beta {
-        BetaTarget::Local(path) => resolve_for_identity(path).to_string_lossy().into_owned(),
-        BetaTarget::Remote {
+fn target_identity(target: &EndpointTarget) -> String {
+    match target {
+        EndpointTarget::Local(path) => resolve_for_identity(path).to_string_lossy().into_owned(),
+        EndpointTarget::Remote {
             destination, path, ..
         } => format!("{destination}:{path}"),
     }
@@ -226,7 +284,7 @@ impl Config {
         // form — are caught, not just textual repeats. (Nested or otherwise
         // overlapping roots are a different hazard that no pairwise identity
         // can detect.)
-        let mut identities: HashMap<(PathBuf, String), String> = HashMap::new();
+        let mut identities: HashMap<(String, String), String> = HashMap::new();
 
         for (name, group) in &self.groups {
             let mode = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
@@ -250,23 +308,6 @@ impl Config {
             if group.betas.is_empty() {
                 errors.push(format!("group '{name}' has no betas"));
             }
-            let alpha = match expand_tilde(&group.alpha) {
-                // A relative alpha would resolve against whatever working
-                // directory the supervisor happened to start in — a
-                // different tree under a service than in a shell.
-                Ok(alpha) if !group.alpha.is_empty() && !alpha.is_absolute() => {
-                    errors.push(format!(
-                        "group '{name}' alpha '{}' must be an absolute (or ~-relative) path",
-                        group.alpha
-                    ));
-                    None
-                }
-                Ok(alpha) => Some(alpha),
-                Err(error) => {
-                    errors.push(format!("group '{name}': {error:#}"));
-                    None
-                }
-            };
             let agent_command = match &group.agent_command {
                 None => None,
                 Some(command) => {
@@ -278,6 +319,45 @@ impl Config {
                         Some(argv)
                     }
                 }
+            };
+
+            // The alpha side accepts the same specifications as a beta,
+            // except that a remote alpha must carry an explicit path (there
+            // is nothing for it to inherit one from).
+            let alpha = if group.alpha.is_empty() {
+                None
+            } else {
+                match parse_endpoint(&group.alpha, None, agent_command.clone()) {
+                    Ok(EndpointTarget::Local(path)) if !path.is_absolute() => {
+                        // A relative alpha would resolve against whatever
+                        // working directory the supervisor happened to start
+                        // in — a different tree under a service than in a
+                        // shell.
+                        errors.push(format!(
+                            "group '{name}' alpha '{}' must be an absolute (or ~-relative) path",
+                            group.alpha
+                        ));
+                        None
+                    }
+                    Ok(target) => Some(target),
+                    Err(message) => {
+                        errors.push(format!("group '{name}' alpha '{}': {message}", group.alpha));
+                        None
+                    }
+                }
+            };
+            // A disabled alpha host takes the whole group with it: every
+            // session of the group flows through that endpoint.
+            if let Some(EndpointTarget::Remote { destination, .. }) = &alpha {
+                if self.disabled.iter().any(|d| d == host_of(destination)) {
+                    continue;
+                }
+            }
+            // The path a remote beta inherits when it names none: the
+            // alpha's path portion, as written.
+            let inherited_path = match &alpha {
+                Some(EndpointTarget::Remote { path, .. }) => path.clone(),
+                _ => group.alpha.clone(),
             };
 
             let mut ignores = self.defaults.ignores.clone();
@@ -333,20 +413,72 @@ impl Config {
                     .or(self.defaults.directory_mode.as_deref()),
                 true,
             );
+            let max_file_size = match group
+                .max_file_size
+                .as_ref()
+                .or(self.defaults.max_file_size.as_ref())
+            {
+                None => None,
+                Some(spec) => match parse_size(spec) {
+                    Ok(bytes) => Some(bytes),
+                    Err(message) => {
+                        errors.push(format!("group '{name}': {message}"));
+                        None
+                    }
+                },
+            };
+            let max_entry_count = group.max_entry_count.or(self.defaults.max_entry_count);
+            let staging = match group
+                .staging
+                .as_deref()
+                .or(self.defaults.staging.as_deref())
+            {
+                None => StagingMode::default(),
+                Some(mode) => match parse_staging_mode(mode) {
+                    Ok(mode) => mode,
+                    Err(message) => {
+                        errors.push(format!("group '{name}': {message}"));
+                        StagingMode::default()
+                    }
+                },
+            };
+            let mut ownership = |value: Option<&str>, kind: &str| match value {
+                None => None,
+                Some("") => {
+                    errors.push(format!("group '{name}' has an empty {kind}"));
+                    None
+                }
+                Some(spec) => Some(spec.to_owned()),
+            };
+            let default_owner = ownership(
+                group
+                    .default_owner
+                    .as_deref()
+                    .or(self.defaults.default_owner.as_deref()),
+                "default_owner",
+            );
+            let default_group = ownership(
+                group
+                    .default_group
+                    .as_deref()
+                    .or(self.defaults.default_group.as_deref()),
+                "default_group",
+            );
 
             for beta in &group.betas {
                 if beta.is_empty() {
                     errors.push(format!("group '{name}' has an empty beta"));
                     continue;
                 }
-                let target = match parse_beta(beta, &group.alpha, agent_command.clone()) {
-                    Ok(target) => target,
-                    Err(message) => {
-                        errors.push(format!("group '{name}' beta '{beta}': {message}"));
-                        continue;
-                    }
-                };
-                if let BetaTarget::Local(path) = &target {
+                let target =
+                    match parse_endpoint(beta, Some(&inherited_path), agent_command.clone()) {
+                        Ok(target) => target,
+                        Err(message) => {
+                            errors.push(format!("group '{name}' beta '{beta}': {message}"));
+                            continue;
+                        }
+                    };
+                if let EndpointTarget::Local(path) = &target {
                     // The same working-directory hazard as a relative alpha,
                     // and the trap that catches unexpanded `~user` forms.
                     if !path.is_absolute() {
@@ -358,10 +490,10 @@ impl Config {
                     }
                 }
                 let host = match &target {
-                    BetaTarget::Local(path) => path.to_string_lossy().into_owned(),
-                    BetaTarget::Remote { destination, .. } => host_of(destination).to_owned(),
+                    EndpointTarget::Local(path) => path.to_string_lossy().into_owned(),
+                    EndpointTarget::Remote { destination, .. } => host_of(destination).to_owned(),
                 };
-                if let BetaTarget::Remote { .. } = &target {
+                if let EndpointTarget::Remote { .. } = &target {
                     if self.disabled.iter().any(|disabled| disabled == &host) {
                         continue;
                     }
@@ -369,10 +501,9 @@ impl Config {
                 let (Some(mode), Some(alpha)) = (mode, alpha.clone()) else {
                     continue;
                 };
-                let alpha_identity = resolve_for_identity(&alpha);
-                let beta_identity = beta_identity(&target);
-                let identifier =
-                    session_identifier(&alpha_identity.to_string_lossy(), &beta_identity);
+                let alpha_identity = target_identity(&alpha);
+                let beta_identity = target_identity(&target);
+                let identifier = session_identifier(&alpha_identity, &beta_identity);
                 let plan = SessionPlan {
                     group: name.clone(),
                     host,
@@ -385,6 +516,11 @@ impl Config {
                     symlink_mode,
                     file_mode,
                     directory_mode,
+                    max_file_size,
+                    max_entry_count,
+                    staging,
+                    default_owner: default_owner.clone(),
+                    default_group: default_group.clone(),
                     identifier,
                 };
                 if let Some(previous) =
@@ -442,6 +578,51 @@ pub fn parse_permission_mode(mode: &str, directory: bool) -> Result<u32, String>
     Ok(bits)
 }
 
+/// Parses a staging placement name.
+pub fn parse_staging_mode(mode: &str) -> Result<StagingMode, String> {
+    match mode {
+        "state" => Ok(StagingMode::State),
+        "beside-root" => Ok(StagingMode::BesideRoot),
+        "inside-root" => Ok(StagingMode::InsideRoot),
+        other => Err(format!(
+            "unknown staging placement '{other}' (expected one of: state, beside-root, \
+             inside-root)"
+        )),
+    }
+}
+
+/// Parses a size limit: a raw byte count, or an integer with a decimal
+/// (`KB`, `MB`, `GB`, `TB`) or binary (`K`/`KiB`, `M`/`MiB`, `G`/`GiB`,
+/// `T`/`TiB`) suffix. Matching is case-insensitive.
+pub fn parse_size(spec: &SizeSpec) -> Result<u64, String> {
+    let text = match spec {
+        SizeSpec::Bytes(bytes) => return Ok(*bytes),
+        SizeSpec::Text(text) => text.trim(),
+    };
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, suffix) = text.split_at(split);
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid size '{text}'"))?;
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "kb" => 1000,
+        "mb" => 1000_u64.pow(2),
+        "gb" => 1000_u64.pow(3),
+        "tb" => 1000_u64.pow(4),
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1 << 40,
+        other => return Err(format!("invalid size suffix '{other}' in '{text}'")),
+    };
+    value
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("size '{text}' overflows"))
+}
+
 /// Parses a synchronization mode name.
 pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
     match mode {
@@ -466,40 +647,44 @@ pub fn mode_name(mode: SyncMode) -> &'static str {
     }
 }
 
-/// Indicates whether or not a beta entry denotes a local path (rather than a
-/// remote host): it does when it visibly looks like one — a `/` before any
-/// `:`, or a leading `.`, `/`, or `~`.
-fn is_local(beta: &str) -> bool {
-    if beta.starts_with('.') || beta.starts_with('/') || beta.starts_with('~') {
+/// Indicates whether or not an endpoint entry denotes a local path (rather
+/// than a remote host): it does when it visibly looks like one — a `/`
+/// before any `:`, or a leading `.`, `/`, or `~`.
+fn is_local(spec: &str) -> bool {
+    if spec.starts_with('.') || spec.starts_with('/') || spec.starts_with('~') {
         return true;
     }
-    match (beta.find('/'), beta.find(':')) {
+    match (spec.find('/'), spec.find(':')) {
         (Some(_), None) => true,
         (Some(slash), Some(colon)) => slash < colon,
         _ => false,
     }
 }
 
-/// Parses one beta entry against its group's alpha (whose path a remote
-/// entry inherits when it specifies none).
-fn parse_beta(
-    beta: &str,
-    alpha: &str,
+/// Parses one endpoint entry. A remote entry naming no path inherits
+/// `inherit_path` when one is given (the beta case), and is an error
+/// otherwise (the alpha case, which has nothing to inherit from).
+fn parse_endpoint(
+    spec: &str,
+    inherit_path: Option<&str>,
     agent_command: Option<Vec<String>>,
-) -> Result<BetaTarget, String> {
-    if is_local(beta) {
-        let path = expand_tilde(beta).map_err(|error| format!("{error:#}"))?;
-        return Ok(BetaTarget::Local(path));
+) -> Result<EndpointTarget, String> {
+    if is_local(spec) {
+        let path = expand_tilde(spec).map_err(|error| format!("{error:#}"))?;
+        return Ok(EndpointTarget::Local(path));
     }
-    let (destination, path) = match beta.find(':') {
+    let (destination, path) = match spec.find(':') {
         Some(colon) => {
-            let path = &beta[colon + 1..];
+            let path = &spec[colon + 1..];
             if path.is_empty() {
                 return Err("empty path after ':'".into());
             }
-            (&beta[..colon], path.to_owned())
+            (&spec[..colon], path.to_owned())
         }
-        None => (beta, alpha.to_owned()),
+        None => match inherit_path {
+            Some(inherited) => (spec, inherited.to_owned()),
+            None => return Err("a remote alpha must include a path (host:path)".into()),
+        },
     };
     if destination.is_empty() || host_of(destination).is_empty() {
         return Err("empty host".into());
@@ -510,7 +695,7 @@ fn parse_beta(
     if destination.starts_with('-') {
         return Err("host begins with '-'".into());
     }
-    Ok(BetaTarget::Remote {
+    Ok(EndpointTarget::Remote {
         destination: destination.to_owned(),
         path,
         agent_command,
@@ -531,6 +716,124 @@ mod tests {
 
     fn parse(text: &str) -> Config {
         toml::from_str(text).expect("configuration should parse")
+    }
+
+    #[test]
+    fn a_remote_alpha_fans_out_and_shares_its_path_with_bare_betas() {
+        let config = parse(
+            r#"
+            [groups.pull]
+            alpha = "build.example.com:/srv/artifacts"
+            mode = "one-way-safe"
+            betas = ["/data/artifacts", "mirror.example.com"]
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(plans.len(), 2);
+        assert_eq!(
+            plans[0].alpha,
+            EndpointTarget::Remote {
+                destination: "build.example.com".into(),
+                path: "/srv/artifacts".into(),
+                agent_command: None,
+            }
+        );
+        // A bare remote beta inherits the remote alpha's *path*.
+        assert_eq!(
+            plans[1].beta,
+            EndpointTarget::Remote {
+                destination: "mirror.example.com".into(),
+                path: "/srv/artifacts".into(),
+                agent_command: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_remote_alpha_requires_an_explicit_path() {
+        let config = parse(
+            r#"
+            [groups.pull]
+            alpha = "build.example.com"
+            mode = "two-way-safe"
+            betas = ["/data"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans must fail"));
+        assert!(error.contains("must include a path"), "{error}");
+    }
+
+    #[test]
+    fn a_disabled_alpha_host_drops_the_whole_group() {
+        let config = parse(
+            r#"
+            disabled = ["build.example.com"]
+
+            [groups.pull]
+            alpha = "build.example.com:/srv/artifacts"
+            mode = "two-way-safe"
+            betas = ["/data/artifacts", "mirror.example.com:/srv/artifacts"]
+            "#,
+        );
+        assert!(config.plans().expect("plans should derive").is_empty());
+    }
+
+    #[test]
+    fn limits_staging_and_ownership_resolve_with_group_precedence() {
+        let config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-safe"
+            max_file_size = "100MB"
+            max_entry_count = 500000
+            staging = "state"
+            default_owner = "www-data"
+
+            [groups.data]
+            alpha = "/data"
+            betas = ["host.example.com:/data"]
+            max_file_size = "2GiB"
+            staging = "beside-root"
+            default_group = "id:33"
+            "#,
+        );
+        let plans = config.plans().expect("plans should derive");
+        assert_eq!(plans[0].max_file_size, Some(2 << 30));
+        assert_eq!(plans[0].max_entry_count, Some(500_000));
+        assert_eq!(plans[0].staging, StagingMode::BesideRoot);
+        assert_eq!(plans[0].default_owner.as_deref(), Some("www-data"));
+        assert_eq!(plans[0].default_group.as_deref(), Some("id:33"));
+    }
+
+    #[test]
+    fn size_specifications_parse_in_both_notations() {
+        assert_eq!(parse_size(&SizeSpec::Bytes(1234)).unwrap(), 1234);
+        assert_eq!(
+            parse_size(&SizeSpec::Text("100MB".into())).unwrap(),
+            100_000_000
+        );
+        assert_eq!(parse_size(&SizeSpec::Text("2GiB".into())).unwrap(), 2 << 30);
+        assert_eq!(
+            parse_size(&SizeSpec::Text("512K".into())).unwrap(),
+            512 << 10
+        );
+        assert_eq!(parse_size(&SizeSpec::Text("64".into())).unwrap(), 64);
+        assert!(parse_size(&SizeSpec::Text("10 furlongs".into())).is_err());
+        assert!(parse_size(&SizeSpec::Text("".into())).is_err());
+    }
+
+    #[test]
+    fn staging_placements_parse_by_name() {
+        assert_eq!(parse_staging_mode("state").unwrap(), StagingMode::State);
+        assert_eq!(
+            parse_staging_mode("beside-root").unwrap(),
+            StagingMode::BesideRoot
+        );
+        assert_eq!(
+            parse_staging_mode("inside-root").unwrap(),
+            StagingMode::InsideRoot
+        );
+        assert!(parse_staging_mode("neighboring").is_err());
     }
 
     #[test]
@@ -569,7 +872,7 @@ mod tests {
         assert_eq!(plans[0].interval, Duration::from_secs(300));
         assert_eq!(
             plans[0].beta,
-            BetaTarget::Local(PathBuf::from("/mnt/backup/data"))
+            EndpointTarget::Local(PathBuf::from("/mnt/backup/data"))
         );
         // The defaults' ignores apply even where the group adds none.
         assert_eq!(plans[0].ignores, vec![".git".to_owned()]);
@@ -585,7 +888,7 @@ mod tests {
         // resolves against the remote home.
         assert_eq!(
             plans[1].beta,
-            BetaTarget::Remote {
+            EndpointTarget::Remote {
                 destination: "build.example.com".into(),
                 path: "~/project".into(),
                 agent_command: None,
@@ -595,7 +898,7 @@ mod tests {
         assert_eq!(plans[2].display(), "project@lab.example.com");
         assert_eq!(
             plans[2].beta,
-            BetaTarget::Remote {
+            EndpointTarget::Remote {
                 destination: "user@lab.example.com".into(),
                 path: "/srv/project".into(),
                 agent_command: None,
@@ -610,8 +913,8 @@ mod tests {
     fn beta_entries_are_classified_as_local_or_remote() {
         let local = |beta: &str| {
             matches!(
-                parse_beta(beta, "~/x", None).expect("should parse"),
-                BetaTarget::Local(_)
+                parse_endpoint(beta, Some("~/x"), None).expect("should parse"),
+                EndpointTarget::Local(_)
             )
         };
         assert!(local("/absolute/path"));
@@ -627,12 +930,12 @@ mod tests {
 
     #[test]
     fn malformed_beta_entries_are_rejected() {
-        assert!(parse_beta("host:", "~/x", None).is_err());
-        assert!(parse_beta(":path", "~/x", None).is_err());
-        assert!(parse_beta("user@:path", "~/x", None).is_err());
+        assert!(parse_endpoint("host:", Some("~/x"), None).is_err());
+        assert!(parse_endpoint(":path", Some("~/x"), None).is_err());
+        assert!(parse_endpoint("user@:path", Some("~/x"), None).is_err());
         // A destination that could read as an SSH option is never a host.
-        assert!(parse_beta("-oProxyCommand=evil:path", "~/x", None).is_err());
-        assert!(parse_beta("-host", "~/x", None).is_err());
+        assert!(parse_endpoint("-oProxyCommand=evil:path", Some("~/x"), None).is_err());
+        assert!(parse_endpoint("-host", Some("~/x"), None).is_err());
     }
 
     #[test]
@@ -728,14 +1031,17 @@ mod tests {
         let plans = config.plans().expect("plans should derive");
         assert_eq!(
             plans[0].beta,
-            BetaTarget::Remote {
+            EndpointTarget::Remote {
                 destination: "host".into(),
                 path: "/a".into(),
                 agent_command: Some(vec!["custom-agent".into(), "--flag".into()]),
             }
         );
         // Local betas never involve an agent.
-        assert_eq!(plans[1].beta, BetaTarget::Local(PathBuf::from("/local")));
+        assert_eq!(
+            plans[1].beta,
+            EndpointTarget::Local(PathBuf::from("/local"))
+        );
     }
 
     #[test]

@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{mode_name, BetaTarget, SessionPlan};
+use crate::config::{mode_name, EndpointTarget, SessionPlan};
 use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
@@ -561,9 +561,8 @@ fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
     }
 }
 
-/// Builds a live session for a plan: a local alpha endpoint, a local or
-/// remote beta endpoint, and the persisted session state under the state
-/// root.
+/// Builds a live session for a plan: alpha and beta endpoints (each local
+/// or remote) and the persisted session state under the state root.
 fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Session> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
@@ -574,66 +573,95 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
     // on the network, and has remote side effects.
     let lock = SessionLock::acquire(state_directory.clone())?;
 
-    let options = || -> Result<EndpointOptions> {
-        Ok(EndpointOptions {
-            ignores: IgnoreSet::new(&plan.ignores)?,
-            symlink_mode: plan.symlink_mode,
-            file_mode: plan.file_mode,
-            directory_mode: plan.directory_mode,
-        })
-    };
-    let alpha_root = plan
-        .alpha
-        .canonicalize()
-        .with_context(|| format!("unable to resolve alpha root {}", plan.alpha.display()))?;
-    let alpha: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
-        alpha_root,
-        state_directory.join("staging-alpha"),
-        options()?,
-    )?);
-
-    let beta: Box<dyn Endpoint + Send> = match &plan.beta {
-        BetaTarget::Local(path) => Box::new(LocalEndpoint::new(
-            path.clone(),
-            state_directory.join("staging-beta"),
-            options()?,
-        )?),
-        BetaTarget::Remote {
-            destination,
-            path,
-            agent_command,
-        } => {
-            let initialize = crate::protocol::Initialize {
-                root: path.clone(),
-                session: identifier.clone(),
-                ignores: plan.ignores.clone(),
-                symlink_mode: plan.symlink_mode,
-                file_mode: plan.file_mode,
-                directory_mode: plan.directory_mode,
-            };
-            // Sessions sharing a spawn command share one pooled connection,
-            // each as its own channel — one SSH process per host, however
-            // many sessions target it.
-            match agent_command {
-                Some(argv) => Box::new(crate::endpoint::remote::connect_pooled(
-                    pool, None, argv, initialize,
-                )?),
-                None => {
-                    let argv = Connection::ssh_argv(
-                        destination,
-                        Some(&crate::transport::install::versioned_remote_command()),
-                    );
-                    Box::new(crate::endpoint::remote::connect_pooled(
-                        pool,
-                        Some(destination),
-                        &argv,
-                        initialize,
-                    )?)
+    let endpoint = |target: &EndpointTarget, side: &str| -> Result<Box<dyn Endpoint + Send>> {
+        match target {
+            EndpointTarget::Local(path) => {
+                // A missing *beta* root is a legitimate synchronization
+                // state (one a transition resolves by creating it), so it
+                // passes through lexically. A missing alpha stays an error:
+                // combined with a mirroring mode, a mistyped source path
+                // would otherwise read as "the source is empty" and empty
+                // the destination.
+                let root = match path.canonicalize() {
+                    Ok(root) => root,
+                    Err(error)
+                        if error.kind() == std::io::ErrorKind::NotFound && side != "alpha" =>
+                    {
+                        path.clone()
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!("unable to resolve {side} root {}", path.display())
+                        });
+                    }
+                };
+                let staging = crate::endpoint::local::staging_root_for(
+                    plan.staging,
+                    &root,
+                    state_directory.join(format!("staging-{side}")),
+                    &identifier,
+                    side,
+                )?;
+                Ok(Box::new(LocalEndpoint::new(
+                    root,
+                    staging,
+                    EndpointOptions {
+                        ignores: IgnoreSet::new(&plan.ignores)?,
+                        symlink_mode: plan.symlink_mode,
+                        file_mode: plan.file_mode,
+                        directory_mode: plan.directory_mode,
+                        max_file_size: plan.max_file_size,
+                        max_entry_count: plan.max_entry_count,
+                        default_owner: plan.default_owner.clone(),
+                        default_group: plan.default_group.clone(),
+                    },
+                )?))
+            }
+            EndpointTarget::Remote {
+                destination,
+                path,
+                agent_command,
+            } => {
+                let initialize = crate::protocol::Initialize {
+                    root: path.clone(),
+                    session: identifier.clone(),
+                    ignores: plan.ignores.clone(),
+                    symlink_mode: plan.symlink_mode,
+                    file_mode: plan.file_mode,
+                    directory_mode: plan.directory_mode,
+                    side: side.to_owned(),
+                    staging: plan.staging,
+                    max_file_size: plan.max_file_size,
+                    max_entry_count: plan.max_entry_count,
+                    default_owner: plan.default_owner.clone(),
+                    default_group: plan.default_group.clone(),
+                };
+                // Sessions sharing a spawn command share one pooled
+                // connection, each as its own channel — one SSH process per
+                // host, however many sessions (and sides) target it.
+                match agent_command {
+                    Some(argv) => Ok(Box::new(crate::endpoint::remote::connect_pooled(
+                        pool, None, argv, initialize,
+                    )?)),
+                    None => {
+                        let argv = Connection::ssh_argv(
+                            destination,
+                            Some(&crate::transport::install::versioned_remote_command()),
+                        );
+                        Ok(Box::new(crate::endpoint::remote::connect_pooled(
+                            pool,
+                            Some(destination),
+                            &argv,
+                            initialize,
+                        )?))
+                    }
                 }
             }
         }
     };
 
+    let alpha = endpoint(&plan.alpha, "alpha")?;
+    let beta = endpoint(&plan.beta, "beta")?;
     Session::with_lock(alpha, beta, plan.mode, lock)
 }
 

@@ -92,6 +92,18 @@ pub struct EndpointOptions {
     pub file_mode: Option<u32>,
     /// The permission bits for created directories (`None` for the default).
     pub directory_mode: Option<u32>,
+    /// The per-file size limit: larger files are scanned as untracked
+    /// content, excluded from synchronization (`None` for unlimited).
+    pub max_file_size: Option<u64>,
+    /// The per-root entry limit: a scan exceeding it fails (`None` for
+    /// unlimited).
+    pub max_entry_count: Option<u64>,
+    /// The owner (name or `id:N`) applied to created entries (`None` to
+    /// leave ownership alone). Resolved on this endpoint's host.
+    pub default_owner: Option<String>,
+    /// The group (name or `id:N`) applied to created entries (`None` to
+    /// leave ownership alone). Resolved on this endpoint's host.
+    pub default_group: Option<String>,
 }
 
 /// A local filesystem endpoint.
@@ -108,6 +120,14 @@ pub struct LocalEndpoint {
     file_mode: u32,
     /// The permission bits for created directories.
     directory_mode: u32,
+    /// The per-file size limit (`None` for unlimited).
+    max_file_size: Option<u64>,
+    /// The per-root entry limit (`None` for unlimited).
+    max_entry_count: Option<u64>,
+    /// The owner ID applied to created entries (`None` to leave alone).
+    owner: Option<u32>,
+    /// The group ID applied to created entries (`None` to leave alone).
+    group: Option<u32>,
     /// The probed behavior of the root's filesystem, determined at the
     /// first scan that finds the root present and cached for the endpoint's
     /// lifetime.
@@ -173,12 +193,24 @@ impl LocalEndpoint {
         staging_root: PathBuf,
         options: EndpointOptions,
     ) -> Result<LocalEndpoint> {
-        fs::create_dir_all(&staging_root).with_context(|| {
-            format!(
-                "unable to create staging directory {}",
-                staging_root.display()
-            )
-        })?;
+        // The staging directory is created on first use (stage_begin), not
+        // here: an inside-root placement would otherwise conjure a missing
+        // synchronization root into existence as an empty directory —
+        // reading as an emptied root to safety checks, or as an authoritative
+        // empty source to mirroring modes.
+        // Ownership specifications resolve here, against this endpoint's
+        // own user and group databases, so a bad name is a construction
+        // error rather than a per-entry surprise at transition time.
+        let owner = options
+            .default_owner
+            .as_deref()
+            .map(crate::ownership::resolve_user)
+            .transpose()?;
+        let group = options
+            .default_group
+            .as_deref()
+            .map(crate::ownership::resolve_group)
+            .transpose()?;
         Ok(LocalEndpoint {
             root,
             staging_root,
@@ -186,6 +218,10 @@ impl LocalEndpoint {
             symlink_mode: options.symlink_mode,
             file_mode: options.file_mode.unwrap_or(DEFAULT_FILE_MODE) & 0o777,
             directory_mode: options.directory_mode.unwrap_or(DEFAULT_DIRECTORY_MODE) & 0o777,
+            max_file_size: options.max_file_size,
+            max_entry_count: options.max_entry_count,
+            owner,
+            group,
             behavior: None,
             last_snapshot: None,
             supply: None,
@@ -587,8 +623,24 @@ impl Endpoint for LocalEndpoint {
             &self.ignores,
             &behavior,
             self.symlink_mode,
+            self.max_file_size,
         )
         .with_context(|| format!("unable to scan {}", self.root.display()))?;
+
+        // The entry limit is a guard against synchronizing the wrong tree
+        // entirely (a home directory, a build output volume), so exceeding
+        // it fails the scan — and with it the cycle — rather than making
+        // partial progress on a probable mistake.
+        if let Some(limit) = self.max_entry_count {
+            let entries = snapshot.directories + snapshot.files + snapshot.symlinks;
+            if entries > limit {
+                bail!(
+                    "the scan of {} found {entries} entries, exceeding the configured limit \
+                     of {limit}",
+                    self.root.display()
+                );
+            }
+        }
 
         // Persist the cache when the hierarchy actually changed (an
         // unchanged scan shares its root storage with the baseline, so the
@@ -800,6 +852,8 @@ impl Endpoint for LocalEndpoint {
             symlink_mode: self.symlink_mode,
             file_mode: self.file_mode,
             directory_mode: self.directory_mode,
+            owner: self.owner,
+            group: self.group,
             staged_uses,
             problems: Vec::new(),
             missing_staged_files: false,
@@ -1030,6 +1084,10 @@ struct Transitioner<'a> {
     file_mode: u32,
     /// The permission bits for created directories.
     directory_mode: u32,
+    /// The owner ID applied to created entries (`None` to leave alone).
+    owner: Option<u32>,
+    /// The group ID applied to created entries (`None` to leave alone).
+    group: Option<u32>,
     /// Per digest, how many publishes this batch could still require. A
     /// count reaching zero marks a staged file's last possible use, letting
     /// it be moved into place rather than copied. Counts are upper bounds
@@ -1180,6 +1238,7 @@ impl Transitioner<'_> {
                     format!("unable to set the synchronization root's permissions: {error}"),
                 );
             }
+            self.apply_ownership(path, root);
             let created = self.create_children(path, root, children);
             return Some(Node::directory(new.name.clone(), created));
         }
@@ -1218,6 +1277,7 @@ impl Transitioner<'_> {
                         format!("unable to set directory permissions: {error}"),
                     );
                 }
+                self.apply_ownership(path, &target);
                 let created = self.create_children(path, &target, children);
                 Some(Node::directory(name, created))
             }
@@ -1262,6 +1322,7 @@ impl Transitioner<'_> {
                     self.problem(path, format!("unable to create symbolic link: {error}"));
                     return None;
                 }
+                self.apply_ownership(path, &target);
                 Some(Node {
                     name: name.to_owned(),
                     content: node.content.clone(),
@@ -1399,6 +1460,8 @@ impl Transitioner<'_> {
             }
         }
 
+        self.apply_ownership(path, target);
+
         // The metadata recorded on the result node comes from the file as it
         // now exists, so that the ancestor (and any scan warmed by it)
         // describes reality rather than intent.
@@ -1408,6 +1471,19 @@ impl Transitioner<'_> {
                 self.problem(path, format!("unable to probe the created file: {error}"));
                 Some(FileMetadata::default())
             }
+        }
+    }
+
+    /// Applies the configured ownership to a created entry (best-effort:
+    /// a failure is a reported problem, not a reason to abandon content
+    /// that is already correctly in place). `lchown` never follows the
+    /// final path component, so it is safe for every entry kind.
+    fn apply_ownership(&mut self, path: &str, disk_path: &Path) {
+        if self.owner.is_none() && self.group.is_none() {
+            return;
+        }
+        if let Err(error) = std::os::unix::fs::lchown(disk_path, self.owner, self.group) {
+            self.problem(path, format!("unable to set ownership: {error}"));
         }
     }
 
@@ -1742,6 +1818,38 @@ fn count_staged_uses(node: &Node, uses: &mut HashMap<Digest, usize>) {
     }
 }
 
+/// Computes the staging root for a placement mode. `state_staging` is the
+/// state-area location used by [`StagingMode::State`]; the root-relative
+/// placements build a hidden, scan-excluded directory name from the session
+/// identifier and side so that concurrent sessions (and the two sides of
+/// one session) never share staging space.
+pub fn staging_root_for(
+    mode: crate::endpoint::StagingMode,
+    root: &Path,
+    state_staging: PathBuf,
+    session: &str,
+    side: &str,
+) -> Result<PathBuf> {
+    use crate::endpoint::StagingMode;
+    let name = || format!("{TEMPORARY_PREFIX}-staging-{session}-{side}");
+    match mode {
+        StagingMode::State => Ok(state_staging),
+        StagingMode::BesideRoot => {
+            let parent = root
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+                .with_context(|| {
+                    format!(
+                        "the synchronization root {} has no parent to stage beside",
+                        root.display()
+                    )
+                })?;
+            Ok(parent.join(name()))
+        }
+        StagingMode::InsideRoot => Ok(root.join(name())),
+    }
+}
+
 /// Renders a digest as the lowercase hex name its staged content lives under.
 fn digest_hex(digest: &Digest) -> String {
     use std::fmt::Write;
@@ -1935,6 +2043,185 @@ mod tests {
             }
             needs
         }
+    }
+
+    #[test]
+    fn oversized_files_scan_as_untracked_and_are_never_digested() {
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        fs::write(root.join("small.txt"), b"fits").expect("file should be writable");
+        fs::write(root.join("large.bin"), vec![7u8; 4096]).expect("file should be writable");
+
+        let mut endpoint = LocalEndpoint::new(
+            root,
+            keep.path().join("staging"),
+            EndpointOptions {
+                max_file_size: Some(1024),
+                ..EndpointOptions::default()
+            },
+        )
+        .expect("endpoint should be creatable");
+        let snapshot = endpoint.scan().expect("scan should succeed");
+        assert_eq!(snapshot.files, 1);
+        let root_node = snapshot.root.as_ref().expect("root should exist");
+        assert!(matches!(
+            root_node.child("large.bin").expect("recorded").content,
+            Content::Untracked
+        ));
+        assert!(matches!(
+            root_node.child("small.txt").expect("recorded").content,
+            Content::File { .. }
+        ));
+    }
+
+    #[test]
+    fn exceeding_the_entry_limit_fails_the_scan() {
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        for index in 0..5 {
+            fs::write(root.join(format!("file{index}.txt")), b"x")
+                .expect("file should be writable");
+        }
+        let mut endpoint = LocalEndpoint::new(
+            root,
+            keep.path().join("staging"),
+            EndpointOptions {
+                max_entry_count: Some(3),
+                ..EndpointOptions::default()
+            },
+        )
+        .expect("endpoint should be creatable");
+        let error = format!("{:#}", endpoint.scan().expect_err("the scan must fail"));
+        assert!(error.contains("exceeding the configured limit"), "{error}");
+    }
+
+    #[test]
+    fn staging_placements_compute_scan_excluded_locations() {
+        use crate::endpoint::StagingMode;
+        let root = Path::new("/data/project");
+        let state = PathBuf::from("/state/staging-beta");
+        assert_eq!(
+            staging_root_for(StagingMode::State, root, state.clone(), "s1", "beta").unwrap(),
+            state
+        );
+        let beside =
+            staging_root_for(StagingMode::BesideRoot, root, state.clone(), "s1", "beta").unwrap();
+        assert_eq!(beside, PathBuf::from("/data/.autobahn-tmp-staging-s1-beta"));
+        let inside =
+            staging_root_for(StagingMode::InsideRoot, root, state.clone(), "s1", "beta").unwrap();
+        assert_eq!(
+            inside,
+            PathBuf::from("/data/project/.autobahn-tmp-staging-s1-beta")
+        );
+        // The root of the filesystem has nothing to stage beside.
+        assert!(
+            staging_root_for(StagingMode::BesideRoot, Path::new("/"), state, "s1", "beta").is_err()
+        );
+    }
+
+    #[test]
+    fn inside_root_staging_is_invisible_to_synchronization() {
+        use crate::endpoint::StagingMode;
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let alpha_root = keep.path().join("alpha");
+        let beta_root = keep.path().join("beta");
+        fs::create_dir_all(&alpha_root).expect("alpha root should be creatable");
+        fs::create_dir_all(&beta_root).expect("beta root should be creatable");
+        fs::write(alpha_root.join("file.txt"), b"content").expect("file should be writable");
+
+        let staging = |root: &Path, side: &str| {
+            staging_root_for(
+                StagingMode::InsideRoot,
+                root,
+                PathBuf::new(),
+                "session-x",
+                side,
+            )
+            .expect("staging root should compute")
+        };
+        let mut alpha = LocalEndpoint::new(
+            alpha_root.clone(),
+            staging(&alpha_root, "alpha"),
+            EndpointOptions::default(),
+        )
+        .expect("endpoint should be creatable");
+        let mut beta = LocalEndpoint::new(
+            beta_root.clone(),
+            staging(&beta_root, "beta"),
+            EndpointOptions::default(),
+        )
+        .expect("endpoint should be creatable");
+
+        // The staging directories live inside the roots, but never appear
+        // in a scan.
+        let snapshot = alpha.scan().expect("alpha scan should succeed");
+        let root_node = snapshot.root.as_ref().expect("root should exist");
+        assert_eq!(root_node.children().len(), 1);
+        let snapshot = beta.scan().expect("beta scan should succeed");
+        assert_eq!(
+            snapshot
+                .root
+                .as_ref()
+                .expect("root should exist")
+                .children()
+                .len(),
+            0
+        );
+    }
+
+    #[test]
+    fn created_entries_receive_the_configured_ownership() {
+        // Chown to one's own IDs is permitted without privileges, so the
+        // application path is exercised for real, if tautologically.
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let alpha_root = keep.path().join("alpha");
+        let beta_root = keep.path().join("beta");
+        fs::create_dir_all(&alpha_root).expect("alpha root should be creatable");
+        fs::create_dir_all(&beta_root).expect("beta root should be creatable");
+        write(&alpha_root, "dir/file.txt", "content");
+
+        let mut alpha = endpoint(&alpha_root, &keep.path().join("staging-alpha"));
+        let mut beta = LocalEndpoint::new(
+            beta_root.clone(),
+            keep.path().join("staging-beta"),
+            EndpointOptions {
+                default_owner: Some(format!("id:{uid}")),
+                default_group: Some(format!("id:{gid}")),
+                ..EndpointOptions::default()
+            },
+        )
+        .expect("endpoint should be creatable");
+
+        let alpha_snapshot = alpha.scan().expect("alpha scan should succeed");
+        let beta_snapshot = beta.scan().expect("beta scan should succeed");
+        let changes = crate::tree::reconcile(
+            None,
+            alpha_snapshot.root.as_ref(),
+            beta_snapshot.root.as_ref(),
+            crate::tree::SyncMode::TwoWaySafe,
+        )
+        .beta_transitions;
+        let needs = beta
+            .stage_begin(transition_dependencies(&changes))
+            .expect("staging should begin");
+        alpha.supply_open(needs).expect("supply should open");
+        loop {
+            let frames = alpha.supply_pull(usize::MAX).expect("supply should pull");
+            if frames.is_empty() {
+                break;
+            }
+            beta.stage_push(frames).expect("push should succeed");
+        }
+        let outcome = beta.transition(changes).expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        let metadata =
+            fs::symlink_metadata(beta_root.join("dir/file.txt")).expect("file should exist");
+        assert_eq!(metadata.uid(), uid);
+        assert_eq!(metadata.gid(), gid);
     }
 
     fn endpoint(root: &Path, staging: &Path) -> LocalEndpoint {
@@ -2756,6 +3043,7 @@ mod tests {
         .expect("endpoint should be creatable");
         beta.scan().expect("scan should succeed");
         let digest = *blake3::hash(b"content").as_bytes();
+        fs::create_dir_all(&beta.staging_root).expect("staging should be creatable");
         fs::write(beta.staged_path(&digest), b"content").expect("staged content");
         let outcome = beta
             .transition(vec![Change {

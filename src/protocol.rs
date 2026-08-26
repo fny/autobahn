@@ -50,6 +50,22 @@ pub struct Initialize {
     /// The permission bits for created directories (`None` for the agent's
     /// default).
     pub directory_mode: Option<u32>,
+    /// Which side of the session this endpoint is ("alpha" or "beta") —
+    /// part of the agent's staging namespace, so the two sides of one
+    /// session never share staging space even on one host.
+    pub side: String,
+    /// The staging placement on the agent's filesystem.
+    pub staging: crate::endpoint::StagingMode,
+    /// The per-file size limit (`None` for unlimited).
+    pub max_file_size: Option<u64>,
+    /// The per-root entry limit (`None` for unlimited).
+    pub max_entry_count: Option<u64>,
+    /// The owner (name or `id:N`) for created entries, resolved on the
+    /// agent's host (`None` to leave ownership alone).
+    pub default_owner: Option<String>,
+    /// The group (name or `id:N`) for created entries, resolved on the
+    /// agent's host (`None` to leave ownership alone).
+    pub default_group: Option<String>,
 }
 
 /// A request from the controller to the agent.

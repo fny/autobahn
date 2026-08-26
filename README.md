@@ -2,18 +2,19 @@
 
 **Fast, safe file synchronization over SSH.**
 
-Autobahn keeps directories in sync — between two folders on your machine,
-or between your machine and any host you can `ssh` into. Edit locally,
-and your changes appear on the remote side in a fraction of a second.
-Changes made remotely flow back just as fast.
+Autobahn keeps directories in sync across machines. Describe your folders
+once in a config file, run `autobahn up`, and every edit — yours or a
+remote agent's — appears on the other side in a fraction of a second.
 
-```sh
-autobahn sync ~/project dev-server:~/project
-```
+## Motivation
 
-That's the whole setup. No daemon to run, nothing to install on the remote
-host — autobahn installs its own agent over the same SSH connection on
-first contact.
+ - I don't like running agents on my computer.
+ - I have a several VMs where my agents have free reign to `rm -rf`
+ - I want to see edits live on my machine.
+ - I want my agents to see edits live on their machines.
+ - I want to use tools on my machine to interact with my code.
+
+Enter [Mutagen](https://github.com/mutagen-io/mutagen) which promised snappy file sync. Aside from the clunky UX, it scaled well to tens of thousands of files but at hundreds of thousands of files, RAM began to explode.
 
 ## Why autobahn?
 
@@ -22,6 +23,9 @@ first contact.
   side in ~150ms. Transfers send only deltas, LZ4-compressed.
 - **Light.** The remote agent uses ~9MB of memory. The supervisor managing
   many sessions uses ~40MB. There is no background daemon.
+- **Zero remote setup.** Nothing to install on the far side — autobahn
+  streams its own agent over the same SSH connection on first contact,
+  and upgrades roll out host by host the same way.
 - **Safe by default.** Three-way reconciliation against a remembered
   baseline means autobahn knows the difference between "you deleted this
   file" and "this file never existed here" — so it never propagates a
@@ -53,34 +57,11 @@ tar xzf autobahn-agents.tar.gz -C ~/.local/bin   # creates ~/.local/bin/agents/
 
 Or build from source with `cargo build --release` (Rust stable, Unix only).
 
-## Your first sync
+## Getting started
 
-```sh
-# Two local folders, bidirectional:
-autobahn sync ~/project /mnt/backup/project
-
-# Local ↔ remote over SSH (key-based auth):
-autobahn sync ~/project user@host:/srv/project
-
-# Keep watching and syncing until interrupted:
-autobahn sync ~/project user@host:/srv/project --watch
-
-# Mirror exactly (remote becomes a replica), ignoring build artifacts:
-autobahn sync ~/project host:/srv/project \
-    --watch --mode one-way-replica --ignore target --ignore '*.log'
-```
-
-Remote roots use the scp-style `[user@]host:path` syntax you already know,
-and *either* side may be remote — you can pull from a build server, or even
-relay between two remote hosts through your machine. Both sides watch
-their filesystems natively (inotify/FSEvents), so `--watch` reacts to
-changes on either end within a fraction of a second.
-
-## Keeping many things in sync
-
-One-off `sync` commands are fine for experiments. For the syncs you want
-*always* running, describe them once in a config file and let the
-supervisor run them all:
+Describe what should stay in sync in `~/.autobahn/config.toml`. Each
+**group** fans one source root (the *alpha*) out to any number of
+destinations (the *betas*):
 
 ```toml
 # ~/.autobahn/config.toml
@@ -106,8 +87,23 @@ mode = "one-way-replica"
 betas = ["build.example.com"]
 ```
 
+Then run it:
+
 ```sh
 autobahn up                 # run every configured session, forever
+```
+
+That's the whole setup. Both sides watch their filesystems natively
+(inotify/FSEvents), so edits on either end propagate within a fraction of
+a second; the configured interval is only a fallback heartbeat. Remote
+endpoints use the scp-style `[user@]host:path` syntax you already know,
+key-based SSH auth, and *either* side of a group may be remote — you can
+pull from a build server, or relay between two remote hosts through your
+machine.
+
+Working with a running (or stopped) supervisor:
+
+```sh
 autobahn up --once         # one pass over everything, then exit
 autobahn status            # what every session last did
 autobahn status project    # ...filtered to one group
@@ -158,6 +154,33 @@ a local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
 | `two-way-resolved` | Both ways; conflicts resolve in alpha's favor. | You edit on both sides but alpha is the truth when they collide. |
 | `one-way-safe` | Alpha → beta only; beta's own changes are never overwritten. | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
 | `one-way-replica` | Beta is an exact mirror of alpha. | Backups, artifact distribution — beta should be *identical*. |
+
+## One-off syncs and scripting
+
+Underneath the supervisor sits a single-session command, useful for
+trying a pairing before committing it to the config, and for scripts that
+need a sync that converges and *exits* with a status code:
+
+```sh
+# One bidirectional pass, then exit:
+autobahn sync ~/project /mnt/backup/project
+
+# Local ↔ remote over SSH:
+autobahn sync ~/project user@host:/srv/project
+
+# Keep watching, like a one-group supervisor:
+autobahn sync ~/project user@host:/srv/project --watch
+
+# Mirror exactly, ignoring build artifacts:
+autobahn sync ~/project host:/srv/project \
+    --watch --mode one-way-replica --ignore target --ignore '*.log'
+```
+
+One-shots share session state with the supervisor (same roots → same
+session), so deletions propagate correctly across runs, conflicts are
+detected across runs, and interrupted transfers resume. A `sync` and a
+supervisor can never race the same pairing: each session's state is
+exclusively locked while it runs.
 
 ## What's happening under the hood
 

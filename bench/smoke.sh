@@ -122,6 +122,9 @@ mkdir -p "$JOBHOME/bench" "$JOBHOME/corpus" "$JOBHOME/dest"
 cp "$BINARY" "$JOBHOME/bench/benchmark"
 cp "$HERE/toysync.py" "$JOBHOME/bench/toysync.py"
 cp -r "$WORK/src" "$JOBHOME/corpus/smoke"
+# A pristine copy, as bake produces, so the source-restore path runs.
+mkdir -p "$JOBHOME/corpus-pristine"
+cp -r "$WORK/src" "$JOBHOME/corpus-pristine/smoke"
 mkdir -p "$JOBHOME/corpus/smoke.bench"
 "$JOBHOME/bench/benchmark" partitions "$JOBHOME/corpus/smoke"   "$JOBHOME/corpus/smoke.bench/partitions.json" > /dev/null
 SPEC='{"run":"smoke-run","pair":"pair-0","job":"smoke-job","repeat":0,

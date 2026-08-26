@@ -35,10 +35,11 @@ pub fn files(root: &Path) -> std::io::Result<Vec<(String, u64)>> {
 
 /// The walk, with its failures counted rather than swallowed. A missing
 /// root is a hard error — an absent tree must never summarize as an empty
-/// one — and any unreadable directory below it increments the error count,
-/// which both summaries include, so two incomplete walks can only compare
-/// equal by failing identically at the same count (and the count being
-/// nonzero is itself visible to the caller).
+/// one — and every failure below it (an unreadable directory, a dropped
+/// entry, an unstattable file) increments the error count, which both
+/// summaries include. The driver requires errors=0 before it accepts a
+/// verification verdict, so two walks failing identically can never
+/// certify two trees equal.
 pub fn files_with_errors(root: &Path) -> std::io::Result<(Vec<(String, u64)>, u64)> {
     std::fs::metadata(root)?;
     let mut errors = 0u64;
@@ -47,7 +48,15 @@ pub fn files_with_errors(root: &Path) -> std::io::Result<(Vec<(String, u64)>, u6
     while let Some(relative_dir) = stack.pop() {
         let absolute = root.join(&relative_dir);
         let mut entries: Vec<_> = match std::fs::read_dir(&absolute) {
-            Ok(entries) => entries.filter_map(Result::ok).collect(),
+            Ok(entries) => entries
+                .filter_map(|entry| match entry {
+                    Ok(entry) => Some(entry),
+                    Err(_) => {
+                        errors += 1;
+                        None
+                    }
+                })
+                .collect(),
             // A directory that vanished mid-walk belongs to an in-flight
             // change; it is counted, which poisons summary equality until
             // a later walk sees a stable tree.
@@ -61,7 +70,10 @@ pub fn files_with_errors(root: &Path) -> std::io::Result<(Vec<(String, u64)>, u6
             let name = entry.file_name().to_string_lossy().into_owned();
             let file_type = match entry.file_type() {
                 Ok(file_type) => file_type,
-                Err(_) => continue,
+                Err(_) => {
+                    errors += 1;
+                    continue;
+                }
             };
             let relative = if relative_dir.as_os_str().is_empty() {
                 PathBuf::from(&name)
@@ -73,8 +85,11 @@ pub fn files_with_errors(root: &Path) -> std::io::Result<(Vec<(String, u64)>, u6
                     stack.push(relative);
                 }
             } else if file_type.is_file() && !temporary(&name) {
-                if let Ok(metadata) = entry.metadata() {
-                    collected.push((relative.to_string_lossy().into_owned(), metadata.len()));
+                match entry.metadata() {
+                    Ok(metadata) => {
+                        collected.push((relative.to_string_lossy().into_owned(), metadata.len()))
+                    }
+                    Err(_) => errors += 1,
                 }
             }
             // Symbolic links are excluded from summaries: the corpora are
@@ -99,13 +114,16 @@ pub fn print_cheap(root: &Path) -> Result<(), String> {
 /// read mid-walk (an in-flight edit) contributes a sentinel, which makes
 /// the summaries unequal — the correct verdict for an unstable tree.
 pub fn print_full(root: &Path) -> Result<(), String> {
-    let (files, errors) = files_with_errors(root).map_err(|error| error.to_string())?;
+    let (files, mut errors) = files_with_errors(root).map_err(|error| error.to_string())?;
     let bytes: u64 = files.iter().map(|(_, size)| size).sum();
     let mut listing = blake3::Hasher::new();
     for (relative, size) in &files {
         let content = match crate::digest_file(&root.join(relative)) {
             Ok(digest) => digest.to_hex().to_string(),
-            Err(_) => "<unreadable>".to_owned(),
+            Err(_) => {
+                errors += 1;
+                "<unreadable>".to_owned()
+            }
         };
         listing.update(format!("{relative}\0{size}\0{content}\n").as_bytes());
     }

@@ -63,7 +63,7 @@ CELLS = [
 
 BAKE_SCRIPT = r"""#!/bin/bash
 set -euo pipefail
-sudo apt-get update -qq && sudo apt-get install -y -qq git python3 > /dev/null
+sudo apt-get update -qq && sudo apt-get install -y -qq git python3 rsync > /dev/null
 mkdir -p ~/bench ~/corpus ~/dest
 cd ~/corpus
 git clone --depth 1 --single-branch https://github.com/chromium/chromium.git chromium
@@ -104,6 +104,29 @@ for c in chromium sub40k-a sub40k-b sub4k; do
   mkdir -p ~/corpus/$c.bench
   mv ~/corpus/$c.bench-partitions.json ~/corpus/$c.bench/partitions.json
 done
+# Pristine copies of exactly the files a workload may edit (the union of
+# every partition), so each tool-run starts from identical source content.
+python3 - <<'EOF'
+import json, os, subprocess
+home = os.path.expanduser("~")
+for c in ("chromium", "sub40k-a", "sub40k-b", "sub4k"):
+    with open(f"{home}/corpus/{c}.bench/partitions.json") as handle:
+        partitions = json.load(handle)
+    files = set()
+    for by_count in partitions["sides"].values():
+        for sets in by_count.values():
+            files.update(sets["measured"])
+            for background in sets["background"]:
+                files.update(background)
+    listing = f"{home}/pristine-list.txt"
+    with open(listing, "w") as handle:
+        handle.write("\n".join(sorted(files)) + "\n")
+    os.makedirs(f"{home}/corpus-pristine/{c}", exist_ok=True)
+    subprocess.run(["rsync", "-a", f"--files-from={listing}",
+                    f"{home}/corpus/{c}/", f"{home}/corpus-pristine/{c}/"],
+                   check=True)
+os.remove(listing)
+EOF
 """
 
 
@@ -306,7 +329,12 @@ def dispatch(options):
     # the aggregator can compare delivered results against this manifest
     # instead of trusting whatever happened to come back.
     os.makedirs(f"results-{run_id}", exist_ok=True)
+    a0_public, _ = addresses[pairs[0][0]]
+    chromium_commit = run(
+        f"ssh -i {key_path(key)} ubuntu@{a0_public} 'cat ~/corpus/chromium.commit'",
+        check=False).stdout.strip() or None
     plan = {"run": run_id, "seed": seed, "ami": options.ami,
+            "chromium_commit": chromium_commit,
             "pairs": options.pairs, "repeats": options.repeats,
             "cells": [c[0] for c in CELLS], "jobs": jobs}
     with open(f"results-{run_id}/plan.json", "w") as handle:

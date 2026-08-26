@@ -58,6 +58,9 @@ fn handle(connection: TcpStream) -> std::io::Result<()> {
     let writer = Arc::new(Mutex::new(connection));
     // Floor probes staged by floor_arm, waiting for their floor_write.
     let staged: Arc<Mutex<StagedProbes>> = Default::default();
+    // Set when the connection ends, so verify workers stop polling
+    // instead of surviving into the next phase or the next tool.
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     while let Some(request) = crate::read_message(&mut reader)? {
         let seq = request["seq"].as_u64().unwrap_or(0);
@@ -79,12 +82,14 @@ fn handle(connection: TcpStream) -> std::io::Result<()> {
                         // write exists — exactly as a workload verify is
                         // armed before the tool can have propagated.
                         let writer = Arc::clone(&writer);
+                        let closed = Arc::clone(&closed);
                         std::thread::spawn(move || {
                             let ok = await_content(
                                 &path,
                                 &digest,
                                 size,
                                 Duration::from_secs(30),
+                                &closed,
                             );
                             reply(&writer, seq, ok, (!ok).then_some("deadline"));
                         });
@@ -106,13 +111,15 @@ fn handle(connection: TcpStream) -> std::io::Result<()> {
                 let deadline =
                     Duration::from_secs_f64(request["deadline_s"].as_f64().unwrap_or(180.0));
                 let writer = Arc::clone(&writer);
+                let closed = Arc::clone(&closed);
                 std::thread::spawn(move || {
-                    let ok = await_content(&path, &digest, size, deadline);
+                    let ok = await_content(&path, &digest, size, deadline, &closed);
                     reply(&writer, seq, ok, (!ok).then_some("deadline"));
                 });
             }
         }
     }
+    closed.store(true, std::sync::atomic::Ordering::Relaxed);
     Ok(())
 }
 
@@ -141,9 +148,15 @@ fn write_buffered(path: &Path, payload: &[u8]) -> std::io::Result<()> {
 /// a size match alone never acknowledges, so a tool that writes in place
 /// (or stages then renames) cannot produce a false early acknowledgement:
 /// wrong or partial bytes hash wrong, and the loop simply polls again.
-fn await_content(path: &Path, expected_digest: &str, expected_size: u64, deadline: Duration) -> bool {
+fn await_content(
+    path: &Path,
+    expected_digest: &str,
+    expected_size: u64,
+    deadline: Duration,
+    closed: &std::sync::atomic::AtomicBool,
+) -> bool {
     let end = Instant::now() + deadline;
-    while Instant::now() < end {
+    while Instant::now() < end && !closed.load(std::sync::atomic::Ordering::Relaxed) {
         if let Ok(metadata) = std::fs::metadata(path) {
             if metadata.len() == expected_size {
                 if let Ok(digest) = crate::digest_file(path) {

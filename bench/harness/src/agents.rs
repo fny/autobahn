@@ -141,16 +141,18 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
 
     let report = measure(&options, &sets.measured);
     stop.store(true, Ordering::Relaxed);
+    let mut background_panics = 0u64;
     for worker in workers {
         if worker.join().is_err() {
-            // A panicked background worker means the offered load was not
-            // what the report claims; surface it hard.
-            eprintln!("background agent panicked");
+            background_panics += 1;
         }
     }
     let mut report = report?;
     report["background_edits"] = json!(edits.load(Ordering::Relaxed));
     report["background_write_errors"] = json!(write_errors.load(Ordering::Relaxed));
+    // A panicked worker means the offered load was not what this report
+    // claims; the aggregator treats a nonzero count as a problem.
+    report["background_panics"] = json!(background_panics);
     println!("{}", serde_json::to_string(&report).expect("serializable"));
     Ok(())
 }
@@ -200,10 +202,12 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
     let in_flight: Arc<Mutex<HashMap<u64, InFlight>>> = Default::default();
     let busy: Arc<Mutex<std::collections::HashSet<usize>>> = Default::default();
     let outcomes: Arc<Mutex<Vec<(f64, bool)>>> = Default::default(); // (ms, warmup)
+    let censored = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
     let reader_in_flight = Arc::clone(&in_flight);
     let reader_busy = Arc::clone(&busy);
     let reader_outcomes = Arc::clone(&outcomes);
+    let reader_censored = Arc::clone(&censored);
     let reader_done = Arc::clone(&done);
     let reader_thread = std::thread::spawn(move || {
         while !reader_done.load(Ordering::Relaxed) {
@@ -217,15 +221,19 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
             let entry = reader_in_flight.lock().expect("in-flight lock").remove(&seq);
             if let Some(entry) = entry {
                 reader_busy.lock().expect("busy lock").remove(&entry.file_index);
-                if message["ok"].as_bool() == Some(true) {
-                    let elapsed = entry.started.elapsed().as_secs_f64() * 1000.0;
+                let elapsed = entry.started.elapsed();
+                // The deadline is judged here too: an acknowledgement that
+                // arrives after the deadline is censored, not a sample —
+                // otherwise a late ack racing the periodic sweep would be
+                // reported as a finite latency.
+                if message["ok"].as_bool() == Some(true) && elapsed <= DEADLINE {
                     reader_outcomes
                         .lock()
                         .expect("outcomes lock")
-                        .push((elapsed, entry.warmup));
+                        .push((elapsed.as_secs_f64() * 1000.0, entry.warmup));
+                } else if !entry.warmup {
+                    reader_censored.fetch_add(1, Ordering::Relaxed);
                 }
-                // A negative acknowledgement leaves the edit to the
-                // deadline sweep below, which classifies it as censored.
             }
         }
     });
@@ -234,7 +242,6 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
     let mut payload = vec![0u8; EDIT_SIZE.1];
     let started = Instant::now();
     let window = Duration::from_secs(options.seconds);
-    let mut censored = 0usize;
     let mut skipped_ticks = 0usize;
     let mut sequence = 0u64;
 
@@ -253,7 +260,7 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
                 if let Some(entry) = in_flight.remove(&seq) {
                     busy_set.remove(&entry.file_index);
                     if !entry.warmup {
-                        censored += 1;
+                        censored.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
@@ -278,6 +285,23 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
                 let size = EDIT_SIZE.0 + rng.index(EDIT_SIZE.1 - EDIT_SIZE.0);
                 rng.fill(&mut payload[..size]);
                 let digest = blake3::hash(&payload[..size]).to_hex().to_string();
+                // Registration precedes the announcement, so no reply can
+                // ever find its sequence unknown. The provisional start is
+                // refined to the true T0 the moment the local write
+                // completes; a reply consuming the entry in that gap (a
+                // tool faster than a local fsync, effectively impossible)
+                // would measure from the announcement — an overestimate,
+                // which is the conservative direction.
+                let warmup = started.elapsed() < WARMUP;
+                busy.lock().expect("busy lock").insert(file_index);
+                in_flight.lock().expect("in-flight lock").insert(
+                    sequence,
+                    InFlight {
+                        file_index,
+                        started: Instant::now(),
+                        warmup,
+                    },
+                );
                 crate::send_message(
                     &mut writer,
                     &json!({
@@ -294,18 +318,15 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
                 std::thread::sleep(ANNOUNCE_LEAD);
                 crate::write_atomic(&options.root.join(relative), &payload[..size])
                     .map_err(|error| error.to_string())?;
-                // T0 is now: the local write is complete and the content
-                // is the tool's to propagate.
-                let warmup = started.elapsed() < WARMUP;
-                busy.lock().expect("busy lock").insert(file_index);
-                in_flight.lock().expect("in-flight lock").insert(
-                    sequence,
-                    InFlight {
-                        file_index,
-                        started: Instant::now(),
-                        warmup,
-                    },
-                );
+                // T0: the local write is complete and the content is the
+                // tool's to propagate.
+                if let Some(entry) = in_flight
+                    .lock()
+                    .expect("in-flight lock")
+                    .get_mut(&sequence)
+                {
+                    entry.started = Instant::now();
+                }
                 sequence += 1;
             }
         }
@@ -326,7 +347,7 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
         let mut in_flight = in_flight.lock().expect("in-flight lock");
         for (_, entry) in in_flight.drain() {
             if !entry.warmup {
-                censored += 1;
+                censored.fetch_add(1, Ordering::Relaxed);
             }
         }
     }
@@ -335,6 +356,7 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
     drop(writer);
     let _ = reader_thread.join();
 
+    let censored = censored.load(Ordering::Relaxed) as usize;
     let recorded = outcomes.lock().expect("outcomes lock").clone();
     let mut samples: Vec<f64> = recorded
         .iter()
@@ -431,6 +453,7 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
     let mut rng = Rng::new(nonce ^ 0xF100);
     let mut payload = vec![0u8; EDIT_SIZE.1];
     let mut samples = Vec::new();
+    let mut failures = 0u32;
     for seq in 0..50u64 {
         let size = EDIT_SIZE.0 + rng.index(EDIT_SIZE.1 - EDIT_SIZE.0);
         rng.fill(&mut payload[..size]);
@@ -454,6 +477,8 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
             .ok_or("observer closed the connection")?;
         if response["ok"].as_bool() == Some(true) {
             samples.push(start.elapsed().as_secs_f64() * 1000.0);
+        } else {
+            failures += 1;
         }
     }
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
@@ -470,6 +495,7 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
         json!({
             "measurement": "floor",
             "samples": samples.len(),
+            "failures": failures,
             "p50_ms": value(0.50),
             "p90_ms": value(0.90),
             "max_ms": value(1.0),

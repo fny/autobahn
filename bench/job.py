@@ -176,6 +176,33 @@ def destroy_tool_state(emitter):
         raise RuntimeError("tool processes survived cleanup")
 
 
+def restore_sources(corpora):
+    """Restores every file a workload may have edited from the pristine
+    copy baked into the image, so each tool (and each job on this pair)
+    starts from identical source content. The set of restorable files is
+    exactly the union of all partitions — nothing else is ever edited."""
+    for corpus in corpora:
+        pristine = f"{HOME}/corpus-pristine/{corpus}"
+        if not os.path.isdir(pristine):
+            if LOCAL:
+                continue  # the smoke test owns its own corpus lifecycle
+            raise RuntimeError(f"pristine copy missing: {pristine}")
+        with open(f"{CORPUS}/{corpus}.bench/partitions.json") as handle:
+            partitions = json.load(handle)
+        files = set()
+        for by_count in partitions["sides"].values():
+            for sets in by_count.values():
+                files.update(sets["measured"])
+                for background in sets["background"]:
+                    files.update(background)
+        listing = f"{HOME}/restore-list.txt"
+        with open(listing, "w") as handle:
+            handle.write("\n".join(sorted(files)) + "\n")
+        result = run(f"rsync -a --files-from={listing} {pristine}/ {CORPUS}/{corpus}/")
+        if result.returncode != 0:
+            raise RuntimeError(f"source restore failed: {result.stdout[-300:]}")
+
+
 def clear_destinations(corpora):
     for corpus in corpora:
         result = peer(f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}")
@@ -191,6 +218,13 @@ def summary(kind, root, remote):
     if result.returncode != 0:
         return f"<error: {result.stdout.strip()[-200:]}>"
     return result.stdout.strip().splitlines()[-1]
+
+
+def clean(summary_text):
+    """A summary is usable for verification only when its walk saw no
+    errors: two walks failing identically must not certify two trees
+    equal."""
+    return "<error" not in summary_text and summary_text.endswith("errors=0")
 
 
 def await_cold_sync(corpora, emitter, tool):
@@ -209,7 +243,7 @@ def await_cold_sync(corpora, emitter, tool):
                 source_full = summary("full", f"{CORPUS}/{corpus}", remote=False)
                 destination_full = summary("full", f"{DEST}/{corpus}", remote=True)
                 verified = time.monotonic() - started
-                if source_full == destination_full and "<error" not in source_full:
+                if source_full == destination_full and clean(source_full):
                     timings[corpus] = {
                         "count_matched_s": round(count_matched, 1),
                         "digest_verified_s": round(verified, 1),
@@ -232,7 +266,7 @@ def await_quiescence(corpora):
         for corpus in corpora:
             source = summary("full", f"{CORPUS}/{corpus}", remote=False)
             destination = summary("full", f"{DEST}/{corpus}", remote=True)
-            if source != destination or "<error" in source:
+            if source != destination or not clean(source):
                 stable = False
                 break
             pairs[corpus] = source
@@ -257,7 +291,7 @@ def await_reconvergence(corpora, timeout_seconds=600):
         while time.monotonic() - started < timeout_seconds:
             source = summary("full", f"{CORPUS}/{corpus}", remote=False)
             destination = summary("full", f"{DEST}/{corpus}", remote=True)
-            if source == destination and "<error" not in source:
+            if source == destination and clean(source):
                 converged = True
                 break
             time.sleep(POLL_SECONDS)
@@ -267,10 +301,15 @@ def await_reconvergence(corpora, timeout_seconds=600):
 
 # ── samplers ─────────────────────────────────────────────────────────
 
+def stop_samplers():
+    # The bracket keeps the pattern from matching its own shell wrapper.
+    run(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
+    peer(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
+
+
 def start_samplers(tool):
     patterns = TOOLS[tool]
-    run(f"pkill -f '{BINARY} sampler' 2>/dev/null; true")
-    peer(f"pkill -f '{BINARY} sampler' 2>/dev/null; true")
+    stop_samplers()
     run(f"setsid nohup {BINARY} sampler {shlex.quote(patterns['local_pattern'])} "
         f"{HOME}/rss-local.log >/dev/null 2>&1 < /dev/null &")
     peer(f"setsid nohup {BINARY} sampler {shlex.quote(patterns['remote_pattern'])} "
@@ -450,6 +489,7 @@ def run_tool(tool, cell, emitter, nonce):
         phases[name]["end"] = time.time()
 
     destroy_tool_state(emitter)
+    restore_sources(corpora)
     clear_destinations(corpora)
     start_samplers(tool)
     offset = clock_offset()
@@ -492,14 +532,25 @@ def run_tool(tool, cell, emitter, nonce):
         "measurement": "resources", "tool": tool,
         "phases": phases, "clock_offset": offset, "series": collect_series(),
     })
+    stop_samplers()
     destroy_tool_state(emitter)
     return status
 
 
-def binary_digest():
+def digest_of(path):
     import hashlib
-    with open(BINARY, "rb") as handle:
-        return hashlib.sha256(handle.read()).hexdigest()[:16]
+    try:
+        with open(path, "rb") as handle:
+            return hashlib.sha256(handle.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def stable_nonce(text):
+    """A nonce derived stably from the run identity — Python's hash() is
+    salted per process and would make recorded nonces unreproducible."""
+    import hashlib
+    return int.from_bytes(hashlib.sha256(text.encode()).digest()[:4], "big")
 
 
 def main():
@@ -523,12 +574,19 @@ def main():
     emitter.emit({
         "measurement": "job_start", "spec": spec,
         "tool_versions": versions,
-        "benchmark_binary_sha256": binary_digest(),
+        "binaries_sha256": {
+            "benchmark": digest_of(BINARY),
+            "autobahn": digest_of(f"{HOME}/autobahn"),
+            "mutagen": digest_of(f"{HOME}/mutagen"),
+        },
+        "chromium_commit": (open(f"{CORPUS}/chromium.commit").read().strip()
+                            if os.path.exists(f"{CORPUS}/chromium.commit") else None),
     })
 
-    # The nonce makes every payload stream unique to (run, job, tool):
-    # a payload from any earlier run can never satisfy this run's verify.
-    base_nonce = abs(hash((spec["run"], spec["job"]))) % (1 << 32)
+    # The nonce makes every payload stream unique to (run, job): a payload
+    # from any earlier run can never satisfy this run's verification. It
+    # is derived stably so the recorded value reproduces the streams.
+    base_nonce = stable_nonce(f"{spec['run']}/{spec['job']}")
 
     measure_floor(emitter, base_nonce)
     statuses = {}

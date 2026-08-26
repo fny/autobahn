@@ -69,6 +69,13 @@ def find_tainted(records):
             t.get("verified") for t in record.get("timings", {}).values()
         ):
             tainted[key] = "cold_sync_unverified"
+        elif kind == "job_complete":
+            # The driver's verdict covers the whole tool-run: a workload
+            # error in either direction taints every latency sample that
+            # tool produced in this job.
+            for tool, status in record.get("statuses", {}).items():
+                if status in ("workload_error", "diverged", "error"):
+                    tainted.setdefault((record.get("job"), tool), status)
     return tainted
 
 
@@ -133,11 +140,18 @@ def main():
         kind = record.get("measurement")
         if kind in ("tool_error", "hygiene_failure", "abort", "corrupt_line"):
             problems.append(record)
-        elif kind == "workload" and ("error" in record or record.get("censored")):
+        elif kind == "workload" and (
+            "error" in record or record.get("censored")
+            or record.get("background_write_errors")
+            or record.get("background_panics")
+            or record.get("skipped_ticks")
+        ):
             problems.append({k: record.get(k) for k in
                              ("measurement", "cell", "tool", "direction",
-                              "repeat", "job", "censored", "error")})
-        elif kind == "floor" and "error" in record:
+                              "repeat", "job", "censored", "error",
+                              "background_write_errors", "background_panics",
+                              "skipped_ticks")})
+        elif kind == "floor" and ("error" in record or record.get("failures")):
             problems.append(record)
         elif kind == "reconvergence" and not all(record.get("converged", {}).values()):
             problems.append(record)

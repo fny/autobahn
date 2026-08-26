@@ -58,7 +58,9 @@ Each of these answers a specific defect found in the previous harness.
    confounding the tool comparison.)
 4. **Convergence is content-verified.** Cold sync completes when the
    destination's manifest — sizes and digests, not a file count — matches
-   the source's. Idle CPU is sampled only after verified quiescence.
+   the source's, and only a walk that saw zero errors can certify it: two
+   walks failing identically never compare two trees equal. Idle CPU is
+   sampled only after verified quiescence.
 5. **Resources are windowed.** Peaks and means are computed per phase from
    a timestamped series. (Previously lifetime peaks were captioned as
    per-workload peaks.)
@@ -70,7 +72,9 @@ Each of these answers a specific defect found in the previous harness.
    per-edit deadline is recorded as `>deadline` and counted; it neither
    kills the run nor silently vanishes — and it occupies its position in
    the percentiles, so a percentile landing among censored attempts
-   reports a lower bound, never a flattering finite number.
+   reports a lower bound, never a flattering finite number. The censoring
+   verdict is made at acknowledgement-match time on the writer's clock, so
+   a late acknowledgement can never convert a timeout into a fast sample.
 9. **Every record carries provenance**: schema version, run id, pair, job,
    cell, repeat, tool, tool versions, binary digest, and phase timestamps.
    Every run that starts is either completed or recorded as failed, and
@@ -79,7 +83,9 @@ Each of these answers a specific defect found in the previous harness.
    silently.)
 10. **State is destroyed between tools and between jobs** — sessions,
     staging, daemons, installed agents, destination trees — and the
-    cleanliness is checked, not assumed.
+    cleanliness is checked, not assumed. Edited source files are restored
+    from a pristine baked copy before each tool, so the second tool syncs
+    the same bytes the first one did.
 11. **The workload is open-loop.** The measuring agent issues edits on its
     cadence regardless of pending acknowledgements, so a slow tool faces
     the same offered load as a fast one. Payload streams are seeded from a

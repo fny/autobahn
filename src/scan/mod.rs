@@ -34,6 +34,57 @@ const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 /// The suffix appended to the lossy rendering of a non-UTF-8 entry name.
 const NON_UTF8_SUFFIX: &str = " (non-UTF-8)";
 
+/// A set of paths whose on-disk state may have changed since the baseline
+/// scan, as a trie over path components.
+///
+/// An *incremental* scan consults this set instead of walking the whole
+/// hierarchy: a directory with no marked descendant is adopted from the
+/// baseline whole (one `Arc` clone, no `readdir`, no `stat`), so the cost
+/// of a scan falls from the size of the tree to the size of what actually
+/// changed. Correctness rests on the marks being complete — the caller is
+/// responsible for falling back to a full scan whenever they might not be
+/// (a watcher that dropped events, a freshly established watch, or simply
+/// often enough to bound the damage from a missed notification).
+#[derive(Debug, Default)]
+pub struct DirtyPaths {
+    /// The hierarchy root's node.
+    root: DirtyNode,
+}
+
+/// One entry in a [`DirtyPaths`] trie.
+#[derive(Debug, Default)]
+struct DirtyNode {
+    /// Whether this directory's entries must be listed again — set on the
+    /// *parent* of every marked path, since creation and removal are only
+    /// observable by listing.
+    relist: bool,
+    /// Marked entries beneath this one, by name.
+    children: std::collections::HashMap<String, DirtyNode>,
+}
+
+impl DirtyPaths {
+    /// Marks a root-relative path (`""` for the root itself) as changed:
+    /// the entry is rescanned, and its parent is listed again so that its
+    /// creation or removal is observed.
+    pub fn mark(&mut self, path: &str) {
+        let mut components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
+        let name = components.pop();
+        let mut node = &mut self.root;
+        for component in components {
+            node = node.children.entry(component.to_owned()).or_default();
+        }
+        node.relist = true;
+        if let Some(name) = name {
+            node.children.entry(name.to_owned()).or_default();
+        }
+    }
+
+    /// Indicates whether nothing at all is marked.
+    pub fn is_empty(&self) -> bool {
+        !self.root.relist && self.root.children.is_empty()
+    }
+}
+
 /// The treatment of symbolic links during scanning and transitioning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SymlinkMode {
@@ -97,6 +148,7 @@ pub fn scan(
     behavior: &FilesystemBehavior,
     symlink_mode: SymlinkMode,
     max_file_size: Option<u64>,
+    dirty: Option<&DirtyPaths>,
 ) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
@@ -119,9 +171,19 @@ pub fn scan(
         bail!("synchronization root {} is not a directory", root.display());
     }
 
-    let mut scanner = Scanner::new(ignores, behavior, symlink_mode, max_file_size);
-    let content = scanner.scan_directory(root, "", baseline.and_then(|s| s.root.as_ref()));
-    Ok(Snapshot {
+    // An incremental scan is only meaningful against a baseline: without
+    // one there is nothing to adopt, and everything must be read anyway.
+    let baseline_root = baseline.and_then(|s| s.root.as_ref());
+    let dirty = dirty.filter(|_| baseline_root.is_some());
+    let mut scanner = Scanner::new(
+        ignores,
+        behavior,
+        symlink_mode,
+        max_file_size,
+        dirty.is_some(),
+    );
+    let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
+    let mut snapshot = Snapshot {
         root: Some(Node {
             name: String::new(),
             content,
@@ -131,7 +193,45 @@ pub fn scan(
         files: scanner.files,
         symlinks: scanner.symlinks,
         total_file_size: scanner.total_file_size,
-    })
+    };
+    // An incremental scan only counts what it visited, so the statistics
+    // are recomputed from the assembled hierarchy (a pointer walk, with no
+    // filesystem access, over a tree that is mostly shared storage).
+    if dirty.is_some() {
+        recount(&mut snapshot);
+    }
+    Ok(snapshot)
+}
+
+/// Recomputes a snapshot's statistics from its hierarchy: every
+/// synchronizable directory (the root included), file, and symbolic link.
+pub fn recount(snapshot: &mut Snapshot) {
+    fn count(node: &Node, tallies: &mut (u64, u64, u64, u64)) {
+        match &node.content {
+            Content::Directory(children) => {
+                tallies.0 += 1;
+                for child in children.iter() {
+                    count(child, tallies);
+                }
+            }
+            Content::File { metadata, .. } => {
+                tallies.1 += 1;
+                tallies.3 += metadata.size;
+            }
+            Content::Symlink { .. } => tallies.2 += 1,
+            _ => {}
+        }
+    }
+    let mut tallies = (0, 0, 0, 0);
+    if let Some(root) = &snapshot.root {
+        count(root, &mut tallies);
+    }
+    (
+        snapshot.directories,
+        snapshot.files,
+        snapshot.symlinks,
+        snapshot.total_file_size,
+    ) = tallies;
 }
 
 /// The mutable state of a single scan operation: the ignore set being
@@ -145,6 +245,9 @@ struct Scanner<'a> {
     symlink_mode: SymlinkMode,
     /// The per-file size limit (`None` for unlimited).
     max_file_size: Option<u64>,
+    /// Whether this scan may adopt unmarked baseline content rather than
+    /// reading it (set when the caller supplied a set of changed paths).
+    incremental: bool,
     /// The digest streaming buffer, allocated once per scan.
     buffer: Vec<u8>,
     /// The number of synchronizable directories scanned.
@@ -164,12 +267,14 @@ impl<'a> Scanner<'a> {
         behavior: &'a FilesystemBehavior,
         symlink_mode: SymlinkMode,
         max_file_size: Option<u64>,
+        incremental: bool,
     ) -> Scanner<'a> {
         Scanner {
             ignores,
             behavior,
             symlink_mode,
             max_file_size,
+            incremental,
             buffer: vec![0u8; DIGEST_BUFFER_SIZE],
             directories: 0,
             files: 0,
@@ -181,7 +286,69 @@ impl<'a> Scanner<'a> {
     /// Scans the directory at `disk_path`, whose root-relative path is
     /// `path`, using `baseline` (the node observed at the same position by a
     /// previous scan, if any) for digest reuse and structural sharing.
-    fn scan_directory(&mut self, disk_path: &Path, path: &str, baseline: Option<&Node>) -> Content {
+    ///
+    /// `dirty` carries the incremental scan's marks for this position:
+    /// `None` means nothing beneath this directory changed, so the
+    /// baseline's subtree is adopted whole without touching the filesystem.
+    fn scan_directory(
+        &mut self,
+        disk_path: &Path,
+        path: &str,
+        baseline: Option<&Node>,
+        dirty: Option<&DirtyNode>,
+    ) -> Content {
+        // Nothing marked beneath this directory: adopt the baseline whole.
+        // This is what makes an incremental scan cost the size of the
+        // change rather than the size of the tree.
+        if let (Some(baseline), true) = (baseline, self.incremental) {
+            if dirty.is_none() {
+                if let Content::Directory(_) = &baseline.content {
+                    return baseline.content.clone();
+                }
+            }
+        }
+
+        // With the entry list itself unchanged, the baseline's children can
+        // be walked directly: only the marked ones are re-examined, and the
+        // rest are adopted as they stand. (A decomposing volume is excluded:
+        // its on-disk names are NFD while the hierarchy carries NFC, so a
+        // disk path cannot be reconstructed from a recorded name.)
+        let relist = dirty.map(|node| node.relist).unwrap_or(true)
+            || self.behavior.decomposes_unicode
+            || !matches!(
+                baseline.map(|node| &node.content),
+                Some(Content::Directory(_))
+            );
+        if !relist {
+            let baseline = baseline.expect("a non-relisted directory has a baseline");
+            let dirty = dirty.expect("a non-relisted directory is marked");
+            self.directories += 1;
+            let mut children = Vec::with_capacity(baseline.children().len());
+            for baseline_child in baseline.children() {
+                let Some(child_dirty) = dirty.children.get(&baseline_child.name) else {
+                    children.push(baseline_child.clone());
+                    continue;
+                };
+                let child_path = path_join(path, &baseline_child.name);
+                let entry_path = disk_path.join(&baseline_child.name);
+                if let Some(node) = self.scan_entry(
+                    baseline_child.name.clone(),
+                    &entry_path,
+                    &child_path,
+                    Some(baseline_child),
+                    Some(child_dirty),
+                ) {
+                    children.push(node);
+                }
+            }
+            if let Content::Directory(baseline_children) = &baseline.content {
+                if adoptable(&children, baseline_children) {
+                    return Content::Directory(baseline_children.clone());
+                }
+            }
+            return Content::Directory(Arc::new(children));
+        }
+
         // The full listing is materialized up front so that it can be
         // sorted: the hierarchy model requires name-sorted children, and
         // sorted children are what make baseline lookups and reconciliation
@@ -218,57 +385,49 @@ impl<'a> Scanner<'a> {
             };
             let child_path = path_join(path, &name);
 
-            // The entry's type is needed both to dispatch the scan and to
-            // resolve directory-only ignore patterns, so it's fetched (again
-            // without following symbolic links) before anything else.
-            let metadata = match fs::symlink_metadata(&entry_path) {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    // Without a type there's nothing to classify, not even
-                    // for the purposes of the ignore set.
-                    children.push(Node {
-                        name,
-                        content: problematic(format!("unable to probe entry: {error}")),
-                    });
-                    continue;
-                }
-            };
-            let file_type = metadata.file_type();
-
-            // Ignores are consulted before any descent, which is what keeps
-            // ignored subtrees from costing anything at all.
-            if self.ignores.ignored(&child_path, file_type.is_dir()) {
-                children.push(Node {
-                    name,
-                    content: Content::Untracked,
-                });
-                continue;
-            }
-            if non_utf8 {
-                children.push(Node {
-                    name,
-                    content: problematic("non-UTF-8 filename"),
-                });
-                continue;
-            }
-
             // The baseline is tracked in parallel with the walk, so the
             // counterpart of an entry is one binary search into the current
             // directory's baseline children rather than a walk from the
             // hierarchy root.
             let baseline_child = baseline.and_then(|node| node.child(&name));
-            let content = if file_type.is_dir() {
-                self.scan_directory(&entry_path, &child_path, baseline_child)
-            } else if file_type.is_file() {
-                self.scan_file(&entry_path, &metadata, baseline_child)
-            } else if file_type.is_symlink() {
-                self.scan_symlink(&entry_path, &child_path)
-            } else {
-                // Sockets, FIFOs, and device nodes have no portable
-                // representation and aren't synchronized.
-                Content::Untracked
-            };
-            children.push(Node { name, content });
+            let child_dirty = dirty.and_then(|node| node.children.get(&name));
+
+            // An unmarked entry with usable baseline content is adopted
+            // without so much as a stat: the listing established that it
+            // still exists, and the marks establish that it hasn't changed.
+            // (Problematic content is always retried — its problem may have
+            // resolved without any event to announce it.)
+            if self.incremental && child_dirty.is_none() && !non_utf8 {
+                if let Some(baseline_child) = baseline_child {
+                    if !matches!(baseline_child.content, Content::Problematic { .. }) {
+                        children.push(baseline_child.clone());
+                        continue;
+                    }
+                }
+            }
+
+            if non_utf8 {
+                // Classification still needs the entry's type for the
+                // ignore set, so probe before recording the problem.
+                let ignored = fs::symlink_metadata(&entry_path)
+                    .map(|metadata| self.ignores.ignored(&child_path, metadata.is_dir()))
+                    .unwrap_or(false);
+                children.push(Node {
+                    name,
+                    content: if ignored {
+                        Content::Untracked
+                    } else {
+                        problematic("non-UTF-8 filename")
+                    },
+                });
+                continue;
+            }
+
+            if let Some(node) =
+                self.scan_entry(name, &entry_path, &child_path, baseline_child, child_dirty)
+            {
+                children.push(node);
+            }
         }
 
         // Entries were processed in on-disk name order, which is also the
@@ -296,6 +455,58 @@ impl<'a> Scanner<'a> {
             }
         }
         Content::Directory(Arc::new(unique))
+    }
+
+    /// Scans one directory entry, returning its node — or `None` when the
+    /// entry has vanished since it was listed (or was never there: an
+    /// incremental walk of baseline children can reach a removed entry
+    /// whose parent listing hasn't been repeated).
+    fn scan_entry(
+        &mut self,
+        name: String,
+        entry_path: &Path,
+        child_path: &str,
+        baseline: Option<&Node>,
+        dirty: Option<&DirtyNode>,
+    ) -> Option<Node> {
+        // The entry's type is needed both to dispatch the scan and to
+        // resolve directory-only ignore patterns, so it's fetched (without
+        // following symbolic links) before anything else.
+        let metadata = match fs::symlink_metadata(entry_path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == ErrorKind::NotFound => return None,
+            Err(error) => {
+                // Without a type there's nothing to classify, not even for
+                // the purposes of the ignore set.
+                return Some(Node {
+                    name,
+                    content: problematic(format!("unable to probe entry: {error}")),
+                });
+            }
+        };
+        let file_type = metadata.file_type();
+
+        // Ignores are consulted before any descent, which is what keeps
+        // ignored subtrees from costing anything at all.
+        if self.ignores.ignored(child_path, file_type.is_dir()) {
+            return Some(Node {
+                name,
+                content: Content::Untracked,
+            });
+        }
+
+        let content = if file_type.is_dir() {
+            self.scan_directory(entry_path, child_path, baseline, dirty)
+        } else if file_type.is_file() {
+            self.scan_file(entry_path, &metadata, baseline)
+        } else if file_type.is_symlink() {
+            self.scan_symlink(entry_path, child_path)
+        } else {
+            // Sockets, FIFOs, and device nodes have no portable
+            // representation and aren't synchronized.
+            Content::Untracked
+        };
+        Some(Node { name, content })
     }
 
     /// Scans the file at `disk_path`, whose (already fetched) metadata is
@@ -561,8 +772,154 @@ mod tests {
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
             None,
+            None,
         )
         .expect("scan should succeed")
+    }
+
+    /// Scans `root` twice from the same baseline — once reading everything,
+    /// once consulting only `marks` — and asserts the two agree exactly.
+    /// This is the incremental scan's whole contract.
+    fn assert_incremental_matches_full(root: &Path, baseline: &Snapshot, marks: &[&str]) {
+        let mut dirty = DirtyPaths::default();
+        for mark in marks {
+            dirty.mark(mark);
+        }
+        let ignores = ignores(&["excluded/"]);
+        let full = scan(
+            root,
+            Some(baseline),
+            &ignores,
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            None,
+        )
+        .expect("full scan should succeed");
+        let incremental = scan(
+            root,
+            Some(baseline),
+            &ignores,
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            Some(&dirty),
+        )
+        .expect("incremental scan should succeed");
+        assert!(
+            full.content_equal(&incremental),
+            "incremental scan disagreed with a full scan\nfull: {:#?}\nincremental: {:#?}",
+            full.root,
+            incremental.root
+        );
+        assert_eq!(full.files, incremental.files, "file counts differ");
+        assert_eq!(
+            full.directories, incremental.directories,
+            "directory counts differ"
+        );
+        assert_eq!(full.symlinks, incremental.symlinks, "symlink counts differ");
+        assert_eq!(
+            full.total_file_size, incremental.total_file_size,
+            "sizes differ"
+        );
+    }
+
+    #[test]
+    fn incremental_scans_agree_with_full_scans() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "top.txt", "top");
+        write(root, "a/one.txt", "one");
+        write(root, "a/b/two.txt", "two");
+        write(root, "a/b/three.txt", "three");
+        write(root, "c/four.txt", "four");
+        let baseline = scan_fixture(root, None);
+
+        // A modification deep in the tree.
+        write(root, "a/b/two.txt", "two, revised");
+        assert_incremental_matches_full(root, &baseline, &["a/b/two.txt"]);
+
+        // A creation (its parent must be listed again to see it).
+        write(root, "a/b/new.txt", "new");
+        assert_incremental_matches_full(root, &baseline, &["a/b/two.txt", "a/b/new.txt"]);
+
+        // A removal.
+        fs::remove_file(root.join("a/b/three.txt")).expect("file should be removable");
+        assert_incremental_matches_full(
+            root,
+            &baseline,
+            &["a/b/two.txt", "a/b/new.txt", "a/b/three.txt"],
+        );
+
+        // A whole new subtree.
+        write(root, "d/deep/deeper/five.txt", "five");
+        assert_incremental_matches_full(
+            root,
+            &baseline,
+            &["a/b/two.txt", "a/b/new.txt", "a/b/three.txt", "d"],
+        );
+
+        // A directory removed with content beneath it.
+        fs::remove_dir_all(root.join("c")).expect("directory should be removable");
+        assert_incremental_matches_full(
+            root,
+            &baseline,
+            &["a/b/two.txt", "a/b/new.txt", "a/b/three.txt", "d", "c"],
+        );
+
+        // A file replaced by a directory of the same name.
+        fs::remove_file(root.join("top.txt")).expect("file should be removable");
+        write(root, "top.txt/inside.txt", "inside");
+        assert_incremental_matches_full(
+            root,
+            &baseline,
+            &[
+                "a/b/two.txt",
+                "a/b/new.txt",
+                "a/b/three.txt",
+                "d",
+                "c",
+                "top.txt",
+            ],
+        );
+    }
+
+    #[test]
+    fn an_unmarked_tree_is_adopted_whole() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "a/one.txt", "one");
+        write(root, "a/b/two.txt", "two");
+        let baseline = scan_fixture(root, None);
+
+        // With nothing marked, an incremental scan reproduces the baseline
+        // without reading the filesystem at all — so even a change made
+        // behind its back is invisible (which is exactly why the caller
+        // must fall back to full scans when its marks may be incomplete).
+        write(root, "a/b/two.txt", "changed behind the scan's back");
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("unrelated/elsewhere.txt");
+        let incremental = scan(
+            root,
+            Some(&baseline),
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            Some(&dirty),
+        )
+        .expect("incremental scan should succeed");
+        assert!(incremental.content_equal(&baseline));
+        // The adopted subtree is the baseline's own storage, not a copy.
+        let (Some(before), Some(after)) = (&baseline.root, &incremental.root) else {
+            panic!("both scans should have roots");
+        };
+        let (Content::Directory(before), Content::Directory(after)) =
+            (&before.content, &after.content)
+        else {
+            panic!("both roots should be directories");
+        };
+        assert!(Arc::ptr_eq(before, after));
     }
 
     #[test]
@@ -581,6 +938,7 @@ mod tests {
                 &ignores(&[]),
                 &FilesystemBehavior::default(),
                 mode,
+                None,
                 None,
             )
             .expect("scan should succeed")
@@ -646,6 +1004,7 @@ mod tests {
             &behavior,
             SymlinkMode::default(),
             None,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -659,6 +1018,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
             None,
         )
         .expect("scan should succeed");
@@ -675,6 +1035,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
             None,
         )
         .expect("a missing root is not an error");
@@ -696,6 +1057,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
             None,
         )
         .is_err());
@@ -882,6 +1244,7 @@ mod tests {
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
             None,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -914,6 +1277,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
             None,
         )
         .expect("scan should succeed");
@@ -949,6 +1313,7 @@ mod tests {
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
             None,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -974,6 +1339,7 @@ mod tests {
             &ignores(&[]),
             &FilesystemBehavior::default(),
             SymlinkMode::default(),
+            None,
             None,
         )
         .expect("scan should succeed");

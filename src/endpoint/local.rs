@@ -30,6 +30,7 @@ use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 
@@ -145,38 +146,122 @@ pub struct LocalEndpoint {
     /// The filesystem watcher, created lazily at the first
     /// [`await_change`](Endpoint::await_change) that finds the root present.
     watcher: Option<ChangeWatcher>,
+    /// When the last *full* scan completed. A fresh watch has no history to
+    /// scan incrementally against, so `None` forces the next scan to be
+    /// full.
+    last_full_scan: Option<std::time::Instant>,
 }
 
-/// A recursive filesystem watcher over the synchronization root, delivering
-/// events through a bounded channel.
+/// The number of changed paths a watcher will accumulate before giving up
+/// on tracking them individually. Past this point a full scan is cheaper
+/// than an incremental one anyway, so the paths are discarded and the next
+/// scan reads everything.
+const MAXIMUM_PENDING_PATHS: usize = 8192;
+
+/// The longest an endpoint will go on incremental scans alone. Watching is
+/// best-effort — events can be missed when a directory is created and
+/// populated faster than a recursive watch can follow it, and network
+/// filesystems may report nothing at all — so a full scan runs at least
+/// this often to bound how long such a miss can persist.
+const FULL_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The changed paths accumulated by a watcher since the last scan.
+#[derive(Default)]
+struct PendingChanges {
+    /// The absolute paths reported as changed.
+    paths: Vec<PathBuf>,
+    /// Whether the record is incomplete — too many paths, an event the
+    /// backend flagged for rescan, or a watcher error. The next scan must
+    /// then read everything.
+    incomplete: bool,
+}
+
+impl PendingChanges {
+    /// Records that the change record can no longer be trusted, releasing
+    /// the paths accumulated so far (a full scan supersedes them).
+    fn give_up(&mut self) {
+        self.incomplete = true;
+        self.paths.clear();
+        self.paths.shrink_to_fit();
+    }
+
+    /// Indicates whether anything at all has been recorded.
+    fn is_empty(&self) -> bool {
+        !self.incomplete && self.paths.is_empty()
+    }
+}
+
+/// A recursive filesystem watcher over the synchronization root, recording
+/// changed paths for incremental scanning and signaling waiters.
 struct ChangeWatcher {
     /// The watcher itself, retained for its lifetime side effect.
     _watcher: notify::RecommendedWatcher,
-    /// The event stream.
-    receiver: std::sync::mpsc::Receiver<notify::Result<notify::Event>>,
+    /// The changed paths recorded since the last scan consumed them.
+    pending: Arc<Mutex<PendingChanges>>,
+    /// The wake stream: one token per delivered event (coalesced by the
+    /// bounded channel, which is only ever a signal — the paths themselves
+    /// live in `pending`).
+    wake: std::sync::mpsc::Receiver<()>,
 }
 
 impl ChangeWatcher {
     /// Establishes a recursive watch over `root`.
     fn new(root: &Path) -> Result<ChangeWatcher> {
         use notify::Watcher;
-        // The channel is bounded and overflow is *dropped*: consumers only
-        // ever ask "did anything change?", so once at least one event is
-        // queued, further events carry no additional information — and an
-        // unbounded queue would let a write burst during a long cycle grow
-        // memory without limit.
-        let (sender, receiver) = std::sync::mpsc::sync_channel(64);
-        let mut watcher = notify::recommended_watcher(move |event| {
-            let _ = sender.try_send(event);
-        })
-        .context("unable to create a filesystem watcher")?;
+        // The wake channel holds a single token: it exists to interrupt a
+        // waiter, and the accumulated paths (not the token count) are what
+        // describe the change.
+        let (sender, wake) = std::sync::mpsc::sync_channel(1);
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let recorder = Arc::clone(&pending);
+        let mut watcher =
+            notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                {
+                    let mut pending = recorder.lock().expect("the pending lock is never poisoned");
+                    match event {
+                        // A backend that lost events (a kernel queue overflow)
+                        // flags the fact rather than reporting the paths.
+                        Ok(event) if event.need_rescan() => pending.give_up(),
+                        Ok(event) => {
+                            if pending.paths.len() + event.paths.len() > MAXIMUM_PENDING_PATHS {
+                                pending.give_up();
+                            } else if !pending.incomplete {
+                                pending.paths.extend(event.paths);
+                            }
+                        }
+                        Err(_) => pending.give_up(),
+                    }
+                }
+                let _ = sender.try_send(());
+            })
+            .context("unable to create a filesystem watcher")?;
         watcher
             .watch(root, notify::RecursiveMode::Recursive)
             .with_context(|| format!("unable to watch {}", root.display()))?;
         Ok(ChangeWatcher {
             _watcher: watcher,
-            receiver,
+            pending,
+            wake,
         })
+    }
+
+    /// Takes the changes recorded since the last call.
+    fn take(&self) -> PendingChanges {
+        std::mem::take(
+            &mut *self
+                .pending
+                .lock()
+                .expect("the pending lock is never poisoned"),
+        )
+    }
+
+    /// Indicates whether any change is currently recorded.
+    fn has_changes(&self) -> bool {
+        !self
+            .pending
+            .lock()
+            .expect("the pending lock is never poisoned")
+            .is_empty()
     }
 }
 
@@ -227,6 +312,7 @@ impl LocalEndpoint {
             supply: None,
             receive: None,
             watcher: None,
+            last_full_scan: None,
         })
     }
 
@@ -302,6 +388,55 @@ impl LocalEndpoint {
             collect(root, "", &mut index);
         }
         index
+    }
+
+    /// Determines the changed paths for an incremental scan, or `None` when
+    /// this scan must read the whole hierarchy.
+    ///
+    /// A full scan is required when there is no baseline to adopt from, when
+    /// no watcher is established (or one was just established, whose record
+    /// begins after changes that may already have happened), when the
+    /// watcher's record is incomplete, and periodically regardless — see
+    /// [`FULL_SCAN_INTERVAL`].
+    fn dirty_paths(
+        &self,
+        baseline: Option<&Snapshot>,
+        behavior: &FilesystemBehavior,
+    ) -> Option<scan::DirtyPaths> {
+        let watcher = self.watcher.as_ref()?;
+        let changes = watcher.take();
+        baseline?;
+        let due = match self.last_full_scan {
+            None => true,
+            Some(last) => last.elapsed() >= FULL_SCAN_INTERVAL,
+        };
+        if due || changes.incomplete {
+            return None;
+        }
+
+        let mut dirty = scan::DirtyPaths::default();
+        for path in &changes.paths {
+            // A path outside the root (or one that can't be expressed in
+            // the hierarchy's naming) can't be marked, and silently
+            // ignoring it would be a missed change.
+            let relative = path.strip_prefix(&self.root).ok()?;
+            let mut components = Vec::new();
+            for component in relative.components() {
+                let std::path::Component::Normal(component) = component else {
+                    return None;
+                };
+                let component = component.to_str()?;
+                // The hierarchy carries NFC names; a decomposing volume
+                // reports NFD ones.
+                components.push(if behavior.decomposes_unicode {
+                    scan::recompose(component)
+                } else {
+                    component.to_owned()
+                });
+            }
+            dirty.mark(&components.join("/"));
+        }
+        Some(dirty)
     }
 
     /// Reports whether the last scan recorded a regular file at a
@@ -605,6 +740,9 @@ impl Endpoint for LocalEndpoint {
         // snapshot's view of the world is taken.
         if self.watcher.is_none() {
             self.watcher = ChangeWatcher::new(&self.root).ok();
+            // A watch just established has no record of what happened
+            // before it existed, so the scan it precedes must be full.
+            self.last_full_scan = None;
         }
 
         // The retained snapshot is the scanner's baseline, which is what
@@ -617,6 +755,13 @@ impl Endpoint for LocalEndpoint {
             None => self.load_scan_cache(),
         };
         let baseline = self.last_snapshot.as_ref().or(cached.as_ref());
+
+        // Decide between a full scan and an incremental one. The watcher's
+        // record of changed paths is consumed *before* the walk: a change
+        // arriving during the scan then stays pending for the next one,
+        // which at worst repeats work — where consuming it afterwards could
+        // discard a notification for content this scan never saw.
+        let dirty = self.dirty_paths(baseline, &behavior);
         let snapshot = scan::scan(
             &self.root,
             baseline,
@@ -624,8 +769,12 @@ impl Endpoint for LocalEndpoint {
             &behavior,
             self.symlink_mode,
             self.max_file_size,
+            dirty.as_ref(),
         )
         .with_context(|| format!("unable to scan {}", self.root.display()))?;
+        if dirty.is_none() {
+            self.last_full_scan = Some(std::time::Instant::now());
+        }
 
         // The entry limit is a guard against synchronizing the wrong tree
         // entirely (a home directory, a build output volume), so exceeding
@@ -812,13 +961,15 @@ impl Endpoint for LocalEndpoint {
             }
         }
         let watcher = self.watcher.as_ref().expect("the watcher was just created");
-        match watcher.receiver.recv_timeout(timeout) {
-            Ok(_) => {
-                // Coalesce whatever else is already queued; one wake covers
-                // any number of events.
-                while watcher.receiver.try_recv().is_ok() {}
-                Ok(true)
-            }
+        // Changes recorded while the caller was busy elsewhere count: the
+        // wake token for them may already have been consumed.
+        if watcher.has_changes() {
+            return Ok(true);
+        }
+        match watcher.wake.recv_timeout(timeout) {
+            // The paths themselves accumulate in the watcher; one wake
+            // covers any number of events.
+            Ok(()) => Ok(true),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 // The watcher backend died; drop it (to be re-established)
@@ -891,7 +1042,7 @@ impl Endpoint for LocalEndpoint {
             match crate::tree::apply(snapshot.root.as_ref(), &achieved) {
                 Ok(root) => {
                     snapshot.root = root;
-                    recount(snapshot);
+                    scan::recount(snapshot);
                     let snapshot = snapshot.clone();
                     self.store_scan_cache(&snapshot);
                 }
@@ -903,38 +1054,6 @@ impl Endpoint for LocalEndpoint {
         }
         Ok(outcome)
     }
-}
-
-/// Recomputes a snapshot's statistics from its hierarchy, mirroring the
-/// scanner's counting: every synchronizable directory (the root included),
-/// file, and symbolic link.
-fn recount(snapshot: &mut Snapshot) {
-    fn count(node: &Node, tallies: &mut (u64, u64, u64, u64)) {
-        match &node.content {
-            Content::Directory(children) => {
-                tallies.0 += 1;
-                for child in children.iter() {
-                    count(child, tallies);
-                }
-            }
-            Content::File { metadata, .. } => {
-                tallies.1 += 1;
-                tallies.3 += metadata.size;
-            }
-            Content::Symlink { .. } => tallies.2 += 1,
-            _ => {}
-        }
-    }
-    let mut tallies = (0, 0, 0, 0);
-    if let Some(root) = &snapshot.root {
-        count(root, &mut tallies);
-    }
-    (
-        snapshot.directories,
-        snapshot.files,
-        snapshot.symlinks,
-        snapshot.total_file_size,
-    ) = tallies;
 }
 
 /// The state of an open supply stream: the needs being supplied, the index of

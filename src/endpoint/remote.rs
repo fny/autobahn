@@ -34,6 +34,9 @@ pub struct RemoteEndpoint {
     channel: AgentChannel,
     /// The number of staging pushes sent but not yet acknowledged.
     pending_pushes: usize,
+    /// The most recent snapshot the agent sent, retained so that an
+    /// unchanged rescan needs no snapshot on the wire at all.
+    last_snapshot: Option<Snapshot>,
 }
 
 impl RemoteEndpoint {
@@ -51,6 +54,7 @@ impl RemoteEndpoint {
         RemoteEndpoint {
             channel,
             pending_pushes: 0,
+            last_snapshot: None,
         }
     }
 
@@ -170,7 +174,18 @@ pub fn connect_pooled(
 impl Endpoint for RemoteEndpoint {
     fn scan(&mut self) -> Result<Snapshot> {
         match self.exchange(Request::Scan)? {
-            Response::Scan(snapshot) => Ok(snapshot),
+            Response::Scan(snapshot) => {
+                self.last_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+            // The agent reports "unchanged" only against a snapshot it has
+            // actually sent, so having nothing to reproduce means the two
+            // sides disagree about what was transmitted. That is a protocol
+            // defect, and silently rescanning would paper over it.
+            Response::ScanUnchanged => self
+                .last_snapshot
+                .clone()
+                .ok_or_else(|| anyhow!("the agent reported an unchanged scan before sending one")),
             response => Err(unexpected_response(&response, "scan")),
         }
     }
@@ -224,8 +239,18 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
-        match self.exchange(Request::Transition(transitions))? {
-            Response::Transition(outcome) => Ok(outcome),
+        match self.exchange(Request::Transition(transitions.clone()))? {
+            Response::Transition(outcome) => {
+                // Model the agent's own fold of the achieved results, so the
+                // cached snapshot keeps describing what the agent holds. The
+                // two sides run the same fold over the same inputs; a fold
+                // this side cannot perform simply drops the cache, and the
+                // agent then resends in full.
+                self.last_snapshot = self.last_snapshot.as_ref().and_then(|snapshot| {
+                    super::fold_transition(snapshot, &transitions, &outcome.results)
+                });
+                Ok(outcome)
+            }
             response => Err(unexpected_response(&response, "transition")),
         }
     }
@@ -261,6 +286,7 @@ fn response_kind(response: &Response) -> &'static str {
     match response {
         Response::Initialized => "initialized",
         Response::Scan(_) => "scan",
+        Response::ScanUnchanged => "scan (unchanged)",
         Response::StageBegin(_) => "stage begin",
         Response::SupplyOpened => "supply opened",
         Response::SupplyPull(_) => "supply pull",
@@ -382,6 +408,49 @@ mod tests {
         assert_eq!(received.root, "/home/user/project");
         assert_eq!(received.session, "session-1");
         assert_eq!(received.ignores, vec!["*.tmp".to_owned()]);
+    }
+
+    #[test]
+    fn an_unchanged_scan_reuses_the_cached_snapshot() {
+        let (client, agent) = connected_pair();
+        let snapshot = Snapshot {
+            files: 7,
+            ..Snapshot::default()
+        };
+        let agent = scripted_agent(
+            agent,
+            vec![
+                Response::Scan(snapshot.clone()),
+                Response::ScanUnchanged,
+                Response::ScanUnchanged,
+            ],
+        );
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        let first = endpoint.scan().expect("the first scan should succeed");
+        assert_eq!(first.files, 7);
+        // Two unchanged reports reproduce the same snapshot without the
+        // agent resending it.
+        for _ in 0..2 {
+            assert_eq!(endpoint.scan().expect("scan should succeed").files, 7);
+        }
+        drop(endpoint);
+        agent.join().expect("agent thread panicked").expect("agent");
+    }
+
+    #[test]
+    fn an_unchanged_report_without_a_cached_snapshot_is_an_error() {
+        let (client, agent) = connected_pair();
+        let agent = scripted_agent(agent, vec![Response::ScanUnchanged]);
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        // Reporting "unchanged" before anything was sent means the two
+        // sides disagree about what was transmitted; that must be loud
+        // rather than silently resolved by rescanning.
+        let error = format!("{:#}", endpoint.scan().expect_err("the scan must fail"));
+        assert!(error.contains("unchanged scan before"), "{error}");
+        drop(endpoint);
+        let _ = agent.join();
     }
 
     #[test]

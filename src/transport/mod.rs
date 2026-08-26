@@ -47,6 +47,7 @@ use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::protocol::{self, Handshake, Initialize, Request, Response};
 use crate::scan::IgnoreSet;
+use crate::tree::Snapshot;
 
 /// The remote command used by [`Connection::ssh_argv`] when no override is
 /// provided.
@@ -396,9 +397,27 @@ fn serve_channel<W: Write>(
             return;
         }
     };
+    // The snapshot this channel last transmitted. It is compared by
+    // storage identity, not equality: an unchanged rescan adopts its
+    // baseline's children, so the comparison is a pointer check. It must
+    // track what was *sent* rather than the endpoint's latest snapshot,
+    // because transitions fold their achieved results into the latter —
+    // leaving the endpoint holding a tree the controller has never seen.
+    let mut last_sent: Option<Snapshot> = None;
     while let Ok(request) = requests.recv() {
         let result = match request {
-            Request::Scan => endpoint.scan().map(Response::Scan),
+            Request::Scan => endpoint.scan().map(|snapshot| {
+                let unchanged = last_sent.as_ref().is_some_and(|sent| {
+                    crate::tree::roots_share_storage(sent.root.as_ref(), snapshot.root.as_ref())
+                        && sent.preserves_executability == snapshot.preserves_executability
+                });
+                if unchanged {
+                    Response::ScanUnchanged
+                } else {
+                    last_sent = Some(snapshot.clone());
+                    Response::Scan(snapshot)
+                }
+            }),
             Request::StageBegin(files) => endpoint.stage_begin(files).map(Response::StageBegin),
             Request::SupplyOpen(needs) => {
                 endpoint.supply_open(needs).map(|()| Response::SupplyOpened)
@@ -410,7 +429,17 @@ fn serve_channel<W: Write>(
                 endpoint.stage_push(frames).map(|()| Response::StagePushed)
             }
             Request::Transition(transitions) => {
-                endpoint.transition(transitions).map(Response::Transition)
+                let outcome = endpoint.transition(transitions);
+                // The transition folded its results into the endpoint's
+                // snapshot, and the controller folds its own model the same
+                // way — so what the controller now believes is exactly this
+                // tree. Re-anchoring here is what lets the *next* scan of an
+                // otherwise untouched destination report itself unchanged,
+                // which is the common case under one-directional editing.
+                if outcome.is_ok() && last_sent.is_some() {
+                    last_sent = endpoint.snapshot().cloned();
+                }
+                outcome.map(Response::Transition)
             }
             Request::AwaitChanges(milliseconds) => endpoint
                 .await_change(std::time::Duration::from_millis(milliseconds))

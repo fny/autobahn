@@ -150,6 +150,8 @@ pub struct LocalEndpoint {
     /// scan incrementally against, so `None` forces the next scan to be
     /// full.
     last_full_scan: Option<std::time::Instant>,
+    /// The background writer for this endpoint's scan cache.
+    writer: crate::persist::StateWriter,
 }
 
 /// The number of changed paths a watcher will accumulate before giving up
@@ -313,7 +315,27 @@ impl LocalEndpoint {
             receive: None,
             watcher: None,
             last_full_scan: None,
+            writer: crate::persist::StateWriter::new(),
         })
+    }
+
+    /// Returns the endpoint's most recent snapshot, if any.
+    ///
+    /// An agent uses this after a transition to re-anchor what it has
+    /// transmitted: transitions fold their results into this snapshot, so
+    /// the tree an unchanged rescan will adopt is *this* one — and
+    /// comparing against it is what lets an unchanged scan be reported
+    /// without resending the hierarchy.
+    pub fn snapshot(&self) -> Option<&Snapshot> {
+        self.last_snapshot.as_ref()
+    }
+
+    /// Blocks until this endpoint's pending state writes have completed.
+    /// The cycle path never calls this — the whole point of the background
+    /// writer is that it doesn't — but a caller that needs to observe the
+    /// state on disk (a test, an orderly shutdown) can wait for it.
+    pub fn flush_state(&self) {
+        self.writer.flush();
     }
 
     /// Returns the path at which content with the specified digest lives once
@@ -348,19 +370,53 @@ impl LocalEndpoint {
         Some(snapshot)
     }
 
-    /// Persists the scan cache, best-effort and atomically. Failures are
-    /// invisible by design: the cache only ever saves work.
+    /// Persists the scan cache, best-effort and atomically, on the
+    /// endpoint's background writer.
+    ///
+    /// The cache is a pure optimization artifact — losing it costs one full
+    /// scan and nothing else — so neither its serialization nor its write
+    /// belongs on a cycle's critical path. On a large tree that is tens of
+    /// megabytes of work removed from the latency between saving a file and
+    /// seeing it arrive.
     fn store_scan_cache(&self, snapshot: &Snapshot) {
-        let Ok(data) = bincode::serialize(snapshot) else {
-            return;
-        };
-        let path = self.scan_cache_path();
-        let temporary = self
-            .staging_root
-            .with_extension(format!("scancache.{}.tmp", std::process::id()));
-        if fs::write(&temporary, data).is_ok() && fs::rename(&temporary, &path).is_err() {
-            let _ = fs::remove_file(&temporary);
+        let snapshot = snapshot.clone();
+        self.writer.store(self.scan_cache_path(), move || {
+            bincode::serialize(&snapshot).ok()
+        });
+    }
+
+    /// Decides whether the local-content index is worth building for a
+    /// batch of requests.
+    ///
+    /// Only requests for paths that hold no file today can plausibly be
+    /// satisfied from elsewhere in the root: a *modification* asks for
+    /// content that is new by definition, so indexing to look for it is
+    /// wasted work. Creations — the second half of a copy or a rename, and
+    /// every entry of a cold synchronization — are where the index pays.
+    ///
+    /// The index costs one visit and one path allocation per file in the
+    /// root, while each request it satisfies saves a transfer. Requiring
+    /// the potential savings to outweigh that walk keeps a single renamed
+    /// file from indexing half a million entries, while a bulk copy (or a
+    /// cold start) still indexes as before.
+    fn local_reuse_is_worthwhile(&self, files: &[FileRequest]) -> bool {
+        /// How many file visits satisfying one request is taken to be
+        /// worth. A transfer is orders of magnitude more expensive than a
+        /// node visit; this is deliberately conservative.
+        const VISITS_PER_SAVED_TRANSFER: u64 = 1_000;
+        let candidates = files
+            .iter()
+            .filter(|request| !self.snapshot_records_file(&request.path))
+            .count() as u64;
+        if candidates == 0 {
+            return false;
         }
+        let indexed_files = self
+            .last_snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.files)
+            .unwrap_or(0);
+        candidates.saturating_mul(VISITS_PER_SAVED_TRANSFER) >= indexed_files
     }
 
     /// Builds an index from content digest to root-relative path over the
@@ -833,9 +889,12 @@ impl Endpoint for LocalEndpoint {
             })
             .unwrap_or_default();
 
-        // The local-content index is only built if a request actually misses
-        // staging, and only once per staging operation.
-        let mut index: Option<HashMap<Digest, String>> = None;
+        // Building the local-content index walks every file node in the
+        // last scan and allocates a path for each, so it is built only when
+        // the batch stands to gain more than the walk costs.
+        let mut index: Option<HashMap<Digest, String>> = self
+            .local_reuse_is_worthwhile(&files)
+            .then(|| self.digest_index());
         let mut needs = Vec::new();
         for request in files {
             // Already staged by an interrupted previous cycle, satisfied
@@ -852,11 +911,12 @@ impl Endpoint for LocalEndpoint {
             }
 
             // Identical content elsewhere in the root is faster to copy (and
-            // verify) than to transfer.
-            let source = index
-                .get_or_insert_with(|| self.digest_index())
-                .get(&request.digest)
-                .cloned();
+            // verify) than to transfer — but only when the index is worth
+            // building at all (see `local_reuse_is_worthwhile`).
+            let source = match &mut index {
+                Some(index) => index.get(&request.digest).cloned(),
+                None => None,
+            };
             if let Some(source) = source {
                 // A digest mismatch (the file changed since the scan that
                 // indexed it) or a read failure just means the content has to
@@ -1029,27 +1089,26 @@ impl Endpoint for LocalEndpoint {
         // difference between a metadata sweep and rehashing the whole tree.
         // Refusals and partial applications are safe to fold too: they
         // describe what is actually on disk.
-        if let Some(snapshot) = self.last_snapshot.as_mut() {
-            let achieved: Vec<Change> = transitions
-                .iter()
-                .zip(outcome.results.iter())
-                .map(|(transition, result)| Change {
-                    path: transition.path.clone(),
-                    old: None,
-                    new: result.clone(),
-                })
-                .collect();
-            match crate::tree::apply(snapshot.root.as_ref(), &achieved) {
-                Ok(root) => {
-                    snapshot.root = root;
-                    scan::recount(snapshot);
-                    let snapshot = snapshot.clone();
-                    self.store_scan_cache(&snapshot);
+        // A problem means the filesystem disagreed with the snapshot the
+        // transition was validated against, so the snapshot is known to be
+        // wrong somewhere. Incremental scanning trusts the snapshot for
+        // everything a watcher has not flagged, and a watcher notification
+        // may not even have been delivered yet — so the next scan reads
+        // everything rather than adopting a record already proven stale.
+        if !outcome.problems.is_empty() {
+            self.last_full_scan = None;
+        }
+
+        if let Some(snapshot) = self.last_snapshot.as_ref() {
+            match super::fold_transition(snapshot, &transitions, &outcome.results) {
+                Some(folded) => {
+                    self.store_scan_cache(&folded);
+                    self.last_snapshot = Some(folded);
                 }
                 // A graft failure (which real transition results shouldn't
                 // produce) just drops the baseline, degrading the next scan
                 // to a full walk.
-                Err(_) => self.last_snapshot = None,
+                None => self.last_snapshot = None,
             }
         }
         Ok(outcome)
@@ -1221,6 +1280,13 @@ struct Transitioner<'a> {
 
 impl Transitioner<'_> {
     /// Records a problem at a root-relative path.
+    ///
+    /// Every problem here is a place where the filesystem did not match
+    /// what the last scan recorded — a refusal to act on stale
+    /// expectations, or an operation that could not complete. Either way
+    /// the snapshot no longer describes reality at that path, which the
+    /// endpoint uses to decide that its next scan must read rather than
+    /// adopt.
     fn problem(&mut self, path: &str, message: impl Into<String>) {
         self.problems.push(Problem {
             path: path.to_owned(),
@@ -3362,6 +3428,7 @@ mod tests {
             LocalEndpoint::new(root.clone(), staging.clone(), EndpointOptions::default())
                 .expect("endpoint should be creatable");
         let snapshot = first.scan().expect("scan should succeed");
+        first.flush_state();
         let cache_path = first.scan_cache_path();
         assert!(cache_path.exists(), "the cache should persist");
         drop(first);

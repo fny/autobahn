@@ -283,20 +283,27 @@ impl Node {
     /// Collects problems from problematic nodes in the hierarchy, with paths
     /// computed relative to this node as the synchronization root.
     pub fn problems(&self) -> Vec<Problem> {
-        fn collect(node: &Node, path: &str, problems: &mut Vec<Problem>) {
+        // The walk carries the components of the current path rather than a
+        // joined string, and materializes one only where a problem is
+        // actually recorded. Problems are rare and hierarchies are large,
+        // so building a path per visited node allocated once for every
+        // entry in the tree to describe a handful of them.
+        fn collect<'a>(node: &'a Node, components: &mut Vec<&'a str>, problems: &mut Vec<Problem>) {
             if let Content::Problematic { message } = &node.content {
                 problems.push(Problem {
-                    path: path.to_owned(),
+                    path: components.join("/"),
                     message: message.clone(),
                 });
                 return;
             }
             for child in node.children() {
-                collect(child, &path_join(path, &child.name), problems);
+                components.push(&child.name);
+                collect(child, components, problems);
+                components.pop();
             }
         }
         let mut problems = Vec::new();
-        collect(self, "", &mut problems);
+        collect(self, &mut Vec::new(), &mut problems);
         problems
     }
 
@@ -353,6 +360,27 @@ impl Node {
                 }
             }
         }
+    }
+}
+
+/// Reports whether two optional hierarchies are the *same storage* — the
+/// pointer check that copy-on-write sharing makes meaningful: an unchanged
+/// scan adopts its baseline's children wholesale, so an unchanged tree
+/// compares equal here in constant time, however large it is.
+pub fn roots_share_storage(a: Option<&Node>, b: Option<&Node>) -> bool {
+    match (a, b) {
+        (
+            Some(Node {
+                content: Content::Directory(a),
+                ..
+            }),
+            Some(Node {
+                content: Content::Directory(b),
+                ..
+            }),
+        ) => Arc::ptr_eq(a, b),
+        (None, None) => true,
+        _ => false,
     }
 }
 

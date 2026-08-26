@@ -97,6 +97,11 @@ pub enum Response {
     Initialized,
     /// A scan result.
     Scan(Snapshot),
+    /// The scan produced exactly the snapshot this channel last sent, so
+    /// the snapshot itself is not repeated. Answering an unchanged root
+    /// this way is what keeps a heartbeat from costing a full snapshot
+    /// serialization, transfer, and decode on every cycle.
+    ScanUnchanged,
     /// The staging needs resulting from StageBegin.
     StageBegin(Vec<StagingNeed>),
     /// Acknowledgement of SupplyOpen.

@@ -80,6 +80,17 @@ pub struct Session {
     ancestor_path: PathBuf,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
+    /// The background writer that persists the ancestor.
+    ancestor_writer: crate::persist::StateWriter,
+    /// Whether the last cycle finished with the two sides synchronized and
+    /// nothing outstanding — the precondition for skipping a cycle whose
+    /// scans reproduce [`settled_alpha`](Self::settled_alpha) and
+    /// [`settled_beta`](Self::settled_beta).
+    quiesced: bool,
+    /// Alpha's hierarchy as of the last quiesced cycle.
+    settled_alpha: Option<Node>,
+    /// Beta's hierarchy as of the last quiesced cycle.
+    settled_beta: Option<Node>,
     /// The exclusive lock on the session state directory, held for the
     /// session's lifetime (released when the file closes on drop).
     _lock: SessionLock,
@@ -148,6 +159,10 @@ impl Session {
             mode,
             ancestor_path,
             ancestor,
+            ancestor_writer: crate::persist::StateWriter::new(),
+            quiesced: false,
+            settled_alpha: None,
+            settled_beta: None,
             _lock: lock,
         })
     }
@@ -197,6 +212,27 @@ impl Session {
         };
         let alpha_snapshot = alpha_snapshot.context("alpha scan failed")?;
         let beta_snapshot = beta_snapshot.context("beta scan failed")?;
+
+        // If both sides produced the very same hierarchies as the last cycle
+        // — the same storage, not merely equal content — then nothing can
+        // have changed since that cycle reconciled them, and reconciling
+        // again would reach the same conclusion by the same full-tree walk.
+        // The cycle that established this state is what makes the shortcut
+        // sound: it is only taken after a cycle that had nothing left to do,
+        // so "the same as last time" means "still synchronized".
+        if self.quiesced
+            && crate::tree::roots_share_storage(
+                self.settled_alpha.as_ref(),
+                alpha_snapshot.root.as_ref(),
+            )
+            && crate::tree::roots_share_storage(
+                self.settled_beta.as_ref(),
+                beta_snapshot.root.as_ref(),
+            )
+        {
+            return Ok(report);
+        }
+
         if let Some(root) = &alpha_snapshot.root {
             report.alpha_scan_problems = root.problems();
         }
@@ -325,8 +361,40 @@ impl Session {
                 root.validate(true)
                     .map_err(|message| anyhow::anyhow!("new ancestor is invalid: {message}"))?;
             }
-            save_ancestor(&self.ancestor_path, new_ancestor.as_ref())?;
+            // Validation stays on this thread: it is the safety net against
+            // a reconciliation defect reaching disk, and it must fail the
+            // cycle rather than a background thread. Only the encoding and
+            // the write — tens of megabytes on a large tree — are handed
+            // off. Order is preserved by the writer, and an ancestor that
+            // lags the filesystem is a state this session already enters on
+            // any crash in the same window: reconciliation re-derives from
+            // it without losing content.
+            let ancestor = new_ancestor.clone();
+            self.ancestor_writer
+                .store(self.ancestor_path.clone(), move || {
+                    bincode::serialize(&ancestor).ok()
+                });
             self.ancestor = new_ancestor;
+        }
+
+        // A cycle that applied nothing, hit no conflicts, and saw no
+        // problems leaves the two sides synchronized as scanned. Recording
+        // that storage lets the next cycle recognize an untouched pair
+        // without walking either tree.
+        self.quiesced = report.alpha_transitions == 0
+            && report.beta_transitions == 0
+            && report.conflicts.is_empty()
+            && !report.missing_staged_files
+            && report.alpha_scan_problems.is_empty()
+            && report.beta_scan_problems.is_empty()
+            && report.alpha_transition_problems.is_empty()
+            && report.beta_transition_problems.is_empty();
+        if self.quiesced {
+            self.settled_alpha = alpha_snapshot.root.clone();
+            self.settled_beta = beta_snapshot.root.clone();
+        } else {
+            self.settled_alpha = None;
+            self.settled_beta = None;
         }
 
         Ok(report)
@@ -549,6 +617,17 @@ impl SessionLock {
 /// Loads a persisted ancestor, treating a missing file as an absent
 /// ancestor and failing on corruption (an unreadable ancestor must not be
 /// silently discarded, since that would resurrect deletions).
+/// Writes an ancestor file synchronously. The session itself persists
+/// through its background writer; this exists so that tests can construct
+/// and round-trip ancestor files through exactly the encoding the loader
+/// expects.
+#[cfg(test)]
+fn save_ancestor(path: &Path, ancestor: Option<&Node>) -> Result<()> {
+    let data = bincode::serialize(&ancestor.cloned()).context("unable to encode ancestor")?;
+    crate::persist::write_atomically(path, &data);
+    Ok(())
+}
+
 fn load_ancestor(path: &PathBuf) -> Result<Option<Node>> {
     let data = match fs::read(path) {
         Ok(data) => data,
@@ -562,15 +641,6 @@ fn load_ancestor(path: &PathBuf) -> Result<Option<Node>> {
             .map_err(|message| anyhow::anyhow!("persisted ancestor is invalid: {message}"))?;
     }
     Ok(ancestor)
-}
-
-/// Persists the ancestor atomically (write-temporary-then-rename).
-fn save_ancestor(path: &PathBuf, ancestor: Option<&Node>) -> Result<()> {
-    let data = bincode::serialize(&ancestor.cloned()).context("unable to encode ancestor")?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, data).context("unable to write ancestor")?;
-    fs::rename(&temporary, path).context("unable to publish ancestor")?;
-    Ok(())
 }
 
 #[cfg(test)]

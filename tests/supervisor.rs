@@ -121,6 +121,64 @@ fn assert_all_synchronized(outcomes: &[SessionOutcome]) {
 }
 
 #[test]
+fn repeated_one_way_edits_keep_synchronizing_through_a_real_agent() {
+    // Exercises the unchanged-scan and fold-tracking paths against a real
+    // agent subprocess: after each cycle the agent's snapshot is the tree
+    // the controller already models, so it reports itself unchanged — and
+    // synchronization must still be exactly correct through many rounds.
+    let world = World::new();
+    let alpha = world.directory("source");
+    let beta = world.directory("mirror");
+    for index in 0..20 {
+        write(
+            &alpha,
+            &format!("dir{}/file{index}.txt", index % 3),
+            "initial",
+        );
+    }
+
+    let plans = world.plans(&format!(
+        r#"
+        [groups.churn]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        agent_command = "{agent} agent"
+        betas = ["remote-host:{beta}"]
+        "#,
+        alpha = alpha.display(),
+        agent = agent_binary(),
+        beta = beta.display(),
+    ));
+
+    assert_all_synchronized(&world.run_once(plans.clone()));
+    assert_eq!(read(&beta, "dir0/file0.txt"), "initial");
+
+    // Round after round of one-directional edits: only alpha changes, so
+    // beta's every scan after the first reports itself unchanged.
+    for round in 1..=5 {
+        write(&alpha, "dir0/file0.txt", &format!("round {round}"));
+        write(
+            &alpha,
+            &format!("dir1/file{round}.txt"),
+            &format!("new {round}"),
+        );
+        assert_all_synchronized(&world.run_once(plans.clone()));
+        assert_eq!(read(&beta, "dir0/file0.txt"), format!("round {round}"));
+        assert_eq!(
+            read(&beta, &format!("dir1/file{round}.txt")),
+            format!("new {round}")
+        );
+    }
+
+    // A deletion and a beta-side edit must still cross correctly.
+    fs::remove_file(alpha.join("dir2/file2.txt")).expect("file should be removable");
+    write(&beta, "beta-only.txt", "from the far side");
+    assert_all_synchronized(&world.run_once(plans));
+    assert!(!beta.join("dir2/file2.txt").exists());
+    assert_eq!(read(&alpha, "beta-only.txt"), "from the far side");
+}
+
+#[test]
 fn a_remote_alpha_synchronizes_through_a_real_agent() {
     let world = World::new();
     let remote_alpha = world.directory("remote-src");

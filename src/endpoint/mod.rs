@@ -90,6 +90,37 @@ pub struct TransitionOutcome {
     pub missing_staged_files: bool,
 }
 
+/// Folds a transition's achieved results into a snapshot of the endpoint
+/// that applied them, returning the endpoint's state as it now stands.
+///
+/// The results describe what is actually on disk after the attempt —
+/// including refusals and partial applications — so grafting them onto the
+/// pre-transition snapshot yields a faithful record without rescanning.
+/// Both the endpoint and any controller modelling it fold with this same
+/// function on the same inputs, so their views cannot drift apart.
+/// `None` means the graft failed (which real results should not produce)
+/// and the caller must fall back to reading the filesystem.
+pub fn fold_transition(
+    snapshot: &Snapshot,
+    transitions: &[Change],
+    results: &[Option<Node>],
+) -> Option<Snapshot> {
+    let achieved: Vec<Change> = transitions
+        .iter()
+        .zip(results.iter())
+        .map(|(transition, result)| Change {
+            path: transition.path.clone(),
+            old: None,
+            new: result.clone(),
+        })
+        .collect();
+    let root = crate::tree::apply(snapshot.root.as_ref(), &achieved).ok()?;
+    let mut folded = snapshot.clone();
+    folded.root = root;
+    crate::scan::recount(&mut folded);
+    Some(folded)
+}
+
 /// A synchronization endpoint.
 ///
 /// Methods are `&mut self`: the controller serializes endpoint operations

@@ -26,6 +26,13 @@ fn diff_recursive(
         return;
     }
 
+    // Identical storage cannot hold differing content: an unchanged scan
+    // adopts its baseline's children, so whole subtrees compare here in
+    // constant time instead of being walked to prove they agree.
+    if super::roots_share_storage(base, target) {
+        return;
+    }
+
     // The content was equal at this path, so diff children with a linear
     // merge over the (name-sorted) child lists.
     let base_children = base.map(Node::children).unwrap_or(&[]);

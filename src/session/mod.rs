@@ -66,6 +66,20 @@ impl CycleReport {
     pub fn changed(&self) -> bool {
         self.alpha_transitions > 0 || self.beta_transitions > 0
     }
+
+    /// Indicates that the cycle left nothing outstanding: nothing applied,
+    /// nothing in conflict, nothing reported. Only after such a cycle can
+    /// the next one treat unchanged scans as proof that the two sides are
+    /// still synchronized.
+    fn settled(&self) -> bool {
+        !self.changed()
+            && self.conflicts.is_empty()
+            && !self.missing_staged_files
+            && self.alpha_scan_problems.is_empty()
+            && self.beta_scan_problems.is_empty()
+            && self.alpha_transition_problems.is_empty()
+            && self.beta_transition_problems.is_empty()
+    }
 }
 
 /// A synchronization session between two endpoints.
@@ -193,6 +207,12 @@ impl Session {
 
     /// Runs one synchronization cycle: scan both endpoints, reconcile,
     /// stage and apply transitions, and update the persisted ancestor.
+    ///
+    /// When both scans reproduce the hierarchies of a previous cycle that
+    /// left nothing outstanding, the cycle returns an empty report without
+    /// reconciling — the two sides cannot have diverged since the cycle
+    /// that established that state. An empty report therefore means "found
+    /// nothing to do", whether or not the work of looking was performed.
     pub fn run_cycle(&mut self) -> Result<CycleReport> {
         let mut report = CycleReport::default();
 
@@ -218,11 +238,11 @@ impl Session {
         // sound: it is only taken after a cycle that had nothing left to do,
         // so "the same as last time" means "still synchronized".
         if self.quiesced
-            && crate::tree::roots_share_storage(
+            && crate::tree::nodes_share_storage(
                 self.settled_alpha.as_ref(),
                 alpha_snapshot.root.as_ref(),
             )
-            && crate::tree::roots_share_storage(
+            && crate::tree::nodes_share_storage(
                 self.settled_beta.as_ref(),
                 beta_snapshot.root.as_ref(),
             )
@@ -327,13 +347,7 @@ impl Session {
         // achieved content becomes the ancestor's new content at that path.
         let mut ancestor_changes = reconciliation.ancestor_changes;
         let mut fold = |transitions: &[Change], outcome: &TransitionOutcome| {
-            for (transition, result) in transitions.iter().zip(outcome.results.iter()) {
-                ancestor_changes.push(Change {
-                    path: transition.path.clone(),
-                    old: None,
-                    new: result.clone(),
-                });
-            }
+            ancestor_changes.extend(crate::endpoint::achieved_changes(transitions, outcome));
         };
         if let Some(outcome) = &beta_outcome {
             fold(&reconciliation.beta_transitions, outcome);
@@ -381,14 +395,7 @@ impl Session {
         // problems leaves the two sides synchronized as scanned. Recording
         // that storage lets the next cycle recognize an untouched pair
         // without walking either tree.
-        self.quiesced = report.alpha_transitions == 0
-            && report.beta_transitions == 0
-            && report.conflicts.is_empty()
-            && !report.missing_staged_files
-            && report.alpha_scan_problems.is_empty()
-            && report.beta_scan_problems.is_empty()
-            && report.alpha_transition_problems.is_empty()
-            && report.beta_transition_problems.is_empty();
+        self.quiesced = report.settled();
         if self.quiesced {
             self.settled_alpha = alpha_snapshot.root.clone();
             self.settled_beta = beta_snapshot.root.clone();
@@ -614,9 +621,6 @@ impl SessionLock {
     }
 }
 
-/// Loads a persisted ancestor, treating a missing file as an absent
-/// ancestor and failing on corruption (an unreadable ancestor must not be
-/// silently discarded, since that would resurrect deletions).
 /// Writes an ancestor file, atomically and synchronously. Failures are
 /// reported rather than swallowed: an ancestor that silently failed to
 /// persist misleads the next session's reconciliation exactly as a stale
@@ -629,7 +633,10 @@ fn save_ancestor(path: &Path, ancestor: Option<&Node>) -> Result<()> {
     Ok(())
 }
 
-fn load_ancestor(path: &PathBuf) -> Result<Option<Node>> {
+/// Loads a persisted ancestor, treating a missing file as an absent
+/// ancestor and failing on corruption (an unreadable ancestor must not be
+/// silently discarded, since that would resurrect deletions).
+fn load_ancestor(path: &Path) -> Result<Option<Node>> {
     let data = match fs::read(path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -782,6 +789,157 @@ mod tests {
                 problems: Vec::new(),
                 missing_staged_files: false,
             })
+        }
+    }
+
+    /// A scripted endpoint that counts how often it was asked to
+    /// transition, so a test can tell a skipped cycle from a cycle that ran
+    /// and found nothing.
+    struct CountingEndpoint {
+        inner: ScriptedEndpoint,
+        transitions: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Endpoint for CountingEndpoint {
+        fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+            self.inner.scan()
+        }
+        fn stage_begin(
+            &mut self,
+            files: Vec<FileRequest>,
+        ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+            self.inner.stage_begin(files)
+        }
+        fn supply_open(&mut self, needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+            self.inner.supply_open(needs)
+        }
+        fn supply_pull(
+            &mut self,
+            max_frames: usize,
+        ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+            self.inner.supply_pull(max_frames)
+        }
+        fn stage_push(&mut self, frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+            self.inner.stage_push(frames)
+        }
+        fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+            self.transitions
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.transition(transitions)
+        }
+    }
+
+    /// Builds a snapshot around a root, sharing the root's storage across
+    /// clones — which is what an unchanged rescan produces.
+    fn scripted(root: Node) -> crate::tree::Snapshot {
+        crate::tree::Snapshot {
+            root: Some(root),
+            preserves_executability: true,
+            ..crate::tree::Snapshot::default()
+        }
+    }
+
+    #[test]
+    fn an_unchanged_pair_skips_reconciliation_only_after_a_settled_cycle() {
+        let alpha_root = Node::directory("", vec![file("shared", 1)]);
+        let beta_root = Node::directory("", vec![file("shared", 1)]);
+        // Every scan reproduces the same storage, as an unchanged rescan
+        // does. The first cycle must still reconcile — nothing has settled
+        // yet — and later ones may skip.
+        let alpha = ScriptedEndpoint::new(vec![scripted(alpha_root)]);
+        let beta = ScriptedEndpoint::new(vec![scripted(beta_root)]);
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            Box::new(alpha),
+            Box::new(beta),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .expect("session should be creatable");
+
+        for cycle in 0..4 {
+            let report = session.run_cycle().expect("cycle should succeed");
+            assert!(!report.changed(), "cycle {cycle} applied transitions");
+            assert!(report.conflicts.is_empty(), "cycle {cycle} conflicted");
+        }
+        // The shortcut engaged after the first cycle established the state.
+        assert!(session.quiesced);
+    }
+
+    #[test]
+    fn a_change_after_a_settled_cycle_is_still_propagated() {
+        let settled = Node::directory("", vec![file("shared", 1)]);
+        let edited = Node::directory("", vec![file("shared", 2)]);
+        // Two identical scans settle the session; the third carries a real
+        // change on alpha, which must not be skipped.
+        let alpha = ScriptedEndpoint::new(vec![
+            scripted(settled.clone()),
+            scripted(settled.clone()),
+            scripted(edited),
+        ]);
+        let applied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let beta = CountingEndpoint {
+            inner: ScriptedEndpoint::new(vec![scripted(settled.clone()), scripted(settled)]),
+            transitions: std::sync::Arc::clone(&applied),
+        };
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            Box::new(alpha),
+            Box::new(beta),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .expect("session should be creatable");
+
+        assert!(!session.run_cycle().expect("cycle should succeed").changed());
+        assert!(!session.run_cycle().expect("cycle should succeed").changed());
+        assert!(session.quiesced, "two identical cycles should settle");
+
+        // Alpha's edit arrives on a settled session: the shortcut must not
+        // fire, because alpha's storage no longer matches what settled.
+        let report = session.run_cycle().expect("cycle should succeed");
+        assert_eq!(report.beta_transitions, 1, "the edit was not propagated");
+        assert_eq!(applied.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(
+            !session.quiesced,
+            "a cycle that applied work is not settled"
+        );
+    }
+
+    #[test]
+    fn an_unsettled_cycle_does_not_arm_the_shortcut() {
+        // A cycle that reports a scan problem has *not* settled, so an
+        // identical pair of scans afterwards must still be reconciled —
+        // the problem has to be reported again rather than skipped into
+        // silence.
+        let problematic = Node::directory(
+            "",
+            vec![Node {
+                name: "broken".into(),
+                content: Content::Problematic {
+                    message: "unreadable".into(),
+                },
+            }],
+        );
+        let alpha = ScriptedEndpoint::new(vec![scripted(problematic.clone())]);
+        let beta = ScriptedEndpoint::new(vec![scripted(problematic)]);
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            Box::new(alpha),
+            Box::new(beta),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .expect("session should be creatable");
+
+        for cycle in 0..3 {
+            let report = session.run_cycle().expect("cycle should succeed");
+            assert_eq!(
+                report.alpha_scan_problems.len(),
+                1,
+                "cycle {cycle} stopped reporting the problem"
+            );
+            assert!(!session.quiesced);
         }
     }
 

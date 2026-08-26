@@ -155,17 +155,19 @@ fn repeated_one_way_edits_keep_synchronizing_through_a_real_agent() {
 
     // Round after round of one-directional edits: only alpha changes, so
     // beta's every scan after the first reports itself unchanged.
+    // Each round makes exactly one modification and one creation; the
+    // created names lie outside the range the fixture already wrote.
     for round in 1..=5 {
         write(&alpha, "dir0/file0.txt", &format!("round {round}"));
         write(
             &alpha,
-            &format!("dir1/file{round}.txt"),
+            &format!("dir1/added{round}.txt"),
             &format!("new {round}"),
         );
         assert_all_synchronized(&world.run_once(plans.clone()));
         assert_eq!(read(&beta, "dir0/file0.txt"), format!("round {round}"));
         assert_eq!(
-            read(&beta, &format!("dir1/file{round}.txt")),
+            read(&beta, &format!("dir1/added{round}.txt")),
             format!("new {round}")
         );
     }

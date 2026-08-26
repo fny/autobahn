@@ -319,13 +319,9 @@ impl LocalEndpoint {
         })
     }
 
-    /// Returns the endpoint's most recent snapshot, if any.
-    ///
-    /// An agent uses this after a transition to re-anchor what it has
-    /// transmitted: transitions fold their results into this snapshot, so
-    /// the tree an unchanged rescan will adopt is *this* one — and
-    /// comparing against it is what lets an unchanged scan be reported
-    /// without resending the hierarchy.
+    /// Returns the endpoint's most recent snapshot — the last scan, with
+    /// any subsequent transition's achieved results folded in. This is the
+    /// tree an unchanged rescan will adopt.
     pub fn snapshot(&self) -> Option<&Snapshot> {
         self.last_snapshot.as_ref()
     }
@@ -400,9 +396,9 @@ impl LocalEndpoint {
     /// file from indexing half a million entries, while a bulk copy (or a
     /// cold start) still indexes as before.
     fn local_reuse_is_worthwhile(&self, files: &[FileRequest]) -> bool {
-        /// How many file visits satisfying one request is taken to be
-        /// worth. A transfer is orders of magnitude more expensive than a
-        /// node visit; this is deliberately conservative.
+        /// The number of index visits that one saved transfer is worth
+        /// paying for. A transfer costs orders of magnitude more than
+        /// visiting a node, so this is deliberately conservative.
         const VISITS_PER_SAVED_TRANSFER: u64 = 1_000;
         let candidates = files
             .iter()
@@ -852,7 +848,7 @@ impl Endpoint for LocalEndpoint {
         // comparison is a pointer check, not a tree walk). A cold-start scan
         // that adopted the loaded cache's storage unchanged needs no rewrite
         // either: the file on disk already describes exactly this hierarchy.
-        if !roots_share_storage(
+        if !crate::tree::nodes_share_storage(
             baseline.and_then(|snapshot| snapshot.root.as_ref()),
             snapshot.root.as_ref(),
         ) {
@@ -892,7 +888,7 @@ impl Endpoint for LocalEndpoint {
         // Building the local-content index walks every file node in the
         // last scan and allocates a path for each, so it is built only when
         // the batch stands to gain more than the walk costs.
-        let mut index: Option<HashMap<Digest, String>> = self
+        let index: Option<HashMap<Digest, String>> = self
             .local_reuse_is_worthwhile(&files)
             .then(|| self.digest_index());
         let mut needs = Vec::new();
@@ -913,10 +909,10 @@ impl Endpoint for LocalEndpoint {
             // Identical content elsewhere in the root is faster to copy (and
             // verify) than to transfer — but only when the index is worth
             // building at all (see `local_reuse_is_worthwhile`).
-            let source = match &mut index {
-                Some(index) => index.get(&request.digest).cloned(),
-                None => None,
-            };
+            let source = index
+                .as_ref()
+                .and_then(|index| index.get(&request.digest))
+                .cloned();
             if let Some(source) = source {
                 // A digest mismatch (the file changed since the scan that
                 // indexed it) or a read failure just means the content has to
@@ -1081,14 +1077,6 @@ impl Endpoint for LocalEndpoint {
             missing_staged_files: transitioner.missing_staged_files,
         };
 
-        // Fold the achieved results into the retained snapshot and its
-        // persisted cache. The results carry the metadata of the entries as
-        // created, so the next scan (in this process or the next) re-digests
-        // only what changed *after* the transition instead of treating every
-        // published file as unknown — on a large cold sync, that's the
-        // difference between a metadata sweep and rehashing the whole tree.
-        // Refusals and partial applications are safe to fold too: they
-        // describe what is actually on disk.
         // A problem means the filesystem disagreed with the snapshot the
         // transition was validated against, so the snapshot is known to be
         // wrong somewhere. Incremental scanning trusts the snapshot for
@@ -1099,8 +1087,16 @@ impl Endpoint for LocalEndpoint {
             self.last_full_scan = None;
         }
 
+        // Fold the achieved results into the retained snapshot and its
+        // persisted cache. The results carry the metadata of the entries as
+        // created, so the next scan (in this process or the next) re-digests
+        // only what changed *after* the transition instead of treating every
+        // published file as unknown — on a large cold sync, that's the
+        // difference between a metadata sweep and rehashing the whole tree.
+        // Refusals and partial applications are safe to fold too: they
+        // describe what is actually on disk.
         if let Some(snapshot) = self.last_snapshot.as_ref() {
-            match super::fold_transition(snapshot, &transitions, &outcome.results) {
+            match super::fold_transition(snapshot, &transitions, &outcome) {
                 Some(folded) => {
                     self.store_scan_cache(&folded);
                     self.last_snapshot = Some(folded);
@@ -1953,28 +1949,6 @@ impl Transitioner<'_> {
 /// path the ancestor simply doesn't describe, rather than to a failed cycle.
 fn sanitize(result: Option<Node>) -> Option<Node> {
     result.as_ref().and_then(Node::synchronizable_subtree)
-}
-
-/// Indicates whether two snapshot roots share their child storage (the
-/// scanner's adoption guarantee for a fully unchanged hierarchy): both are
-/// directories whose children are the same allocation. A deserialized cache
-/// baseline never shares storage, so the first scan after a cold start
-/// always refreshes the cache — exactly once per process.
-fn roots_share_storage(baseline: Option<&Node>, fresh: Option<&Node>) -> bool {
-    match (baseline, fresh) {
-        (
-            Some(Node {
-                content: Content::Directory(a),
-                ..
-            }),
-            Some(Node {
-                content: Content::Directory(b),
-                ..
-            }),
-        ) => std::sync::Arc::ptr_eq(a, b),
-        (None, None) => true,
-        _ => false,
-    }
 }
 
 /// Computes the permission bits for a created file: the configured file

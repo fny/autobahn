@@ -405,23 +405,26 @@ fn serve_channel<W: Write>(
     // leaving the endpoint holding a tree the controller has never seen.
     let mut last_sent: Option<Snapshot> = None;
     while let Ok(request) = requests.recv() {
-        // What `last_sent` should become *if* this response reaches the
-        // controller. It is committed only after a successful send: a
-        // response that fails to encode or transmit (an oversized frame,
-        // say) leaves the controller with its previous model, and recording
-        // the new one here would make the next rescan report "unchanged"
-        // against a tree the controller never received.
-        let mut sent_if_delivered: Option<Option<Snapshot>> = None;
+        // What becomes of the record of what this channel has transmitted,
+        // *if* this response reaches the controller. It is applied only
+        // after a successful send: a response that fails to encode or
+        // transmit (an oversized frame, say) leaves the controller with its
+        // previous model, and recording the new one here would make the
+        // next rescan report "unchanged" against a tree it never received.
+        let mut anchor = Anchor::Keep;
         let result = match request {
             Request::Scan => endpoint.scan().map(|snapshot| {
+                // Root identity settles the whole snapshot: its statistics
+                // are derived from the hierarchy, leaving only the probed
+                // executability behavior to compare alongside it.
                 let unchanged = last_sent.as_ref().is_some_and(|sent| {
-                    crate::tree::roots_share_storage(sent.root.as_ref(), snapshot.root.as_ref())
+                    crate::tree::nodes_share_storage(sent.root.as_ref(), snapshot.root.as_ref())
                         && sent.preserves_executability == snapshot.preserves_executability
                 });
                 if unchanged {
                     Response::ScanUnchanged
                 } else {
-                    sent_if_delivered = Some(Some(snapshot.clone()));
+                    anchor = Anchor::To(Some(snapshot.clone()));
                     Response::Scan(snapshot)
                 }
             }),
@@ -443,8 +446,12 @@ fn serve_channel<W: Write>(
                 // tree. Re-anchoring here is what lets the *next* scan of an
                 // otherwise untouched destination report itself unchanged,
                 // which is the common case under one-directional editing.
+                // Only re-anchor when something *was* sent: with nothing
+                // transmitted yet the controller has no model to fold, so
+                // claiming this tree as its own would let the next scan
+                // answer "unchanged" for a hierarchy it never received.
                 if outcome.is_ok() && last_sent.is_some() {
-                    sent_if_delivered = Some(endpoint.snapshot().cloned());
+                    anchor = Anchor::To(endpoint.snapshot().cloned());
                 }
                 outcome.map(Response::Transition)
             }
@@ -459,15 +466,15 @@ fn serve_channel<W: Write>(
         // forever. If even that fails, the connection is gone and the
         // dispatcher is failing with it.
         let delivered = serve_send(output, channel, response);
-        if delivered.is_ok() {
-            if let Some(snapshot) = sent_if_delivered {
-                last_sent = snapshot;
-            }
-        } else {
-            // The controller's model is now whatever it held before this
-            // exchange, so the agent's must be too — otherwise a retry
-            // would answer "unchanged" against a tree that never arrived.
-            last_sent = None;
+        match (&delivered, anchor) {
+            (Ok(()), Anchor::To(snapshot)) => last_sent = snapshot,
+            (Ok(()), Anchor::Keep) => {}
+            // Forgetting everything costs one full resend and avoids having
+            // to reason about which send failures leave the controller's
+            // model intact and which do not. Claiming otherwise is the
+            // expensive mistake: it would let a later scan report
+            // "unchanged" against a tree that never arrived.
+            (Err(_), _) => last_sent = None,
         }
         if let Err(error) = delivered {
             let fallback = Response::Error(format!("unable to send the response: {error:#}"));
@@ -487,6 +494,15 @@ fn serve_send<W: Write>(
     let mut output = output.lock().expect("the output lock is never poisoned");
     send_frame(&mut *output, &protocol::MuxResponse { channel, response })
         .context("unable to send response")
+}
+
+/// What a delivered response implies about the snapshot a channel has
+/// transmitted.
+enum Anchor {
+    /// The response says nothing about it; leave the record alone.
+    Keep,
+    /// The controller now holds this hierarchy (`None` for "nothing").
+    To(Option<Snapshot>),
 }
 
 /// Creates the agent's local endpoint from the controller's initialization

@@ -1,10 +1,23 @@
 # Autobahn
 
-**Fast, safe file synchronization over SSH.**
+*Real-time sync with unmatched speed and German safety standards.*
 
-Autobahn keeps directories in sync across machines. Describe your folders
-once in a config file, run `autobahn up`, and every edit — yours or a
-remote agent's — appears on the other side in a fraction of a second.
+## What
+
+Autobahn keeps directories in sync across machines in fractions of a second.
+
+```toml
+# ~/.autobahn/config.toml
+[groups.formel1]
+alpha = "~/golfwagen"
+betas = [
+  "audi.de",
+  "mercedes-benz.de",
+  "porsche.de"
+  "man.eu"
+]
+```
+
 
 ## Motivation
 

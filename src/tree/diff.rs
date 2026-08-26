@@ -29,7 +29,7 @@ fn diff_recursive(
     // Identical storage cannot hold differing content: an unchanged scan
     // adopts its baseline's children, so whole subtrees compare here in
     // constant time instead of being walked to prove they agree.
-    if super::roots_share_storage(base, target) {
+    if super::nodes_share_storage(base, target) {
         return;
     }
 

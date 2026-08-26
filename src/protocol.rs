@@ -112,9 +112,11 @@ pub enum Response {
     /// this way is what keeps a heartbeat from costing a full snapshot
     /// serialization, transfer, and decode on every cycle.
     ///
-    /// New variants are appended: the encoding numbers them in
-    /// declaration order, so inserting one would silently reinterpret
-    /// every response after it when the two sides differ.
+    /// Adding, removing, or reordering a variant changes the wire format —
+    /// the encoding numbers them by declaration order — so any such change
+    /// requires a version bump. Version equality is enforced by the
+    /// handshake, which is what keeps two builds that disagree about this
+    /// enum from ever exchanging a frame.
     ScanUnchanged,
     /// Whether AwaitChanges observed a change.
     AwaitChanges(bool),

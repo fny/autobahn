@@ -159,7 +159,12 @@ continuous rescan of 500k files on both ends — two thirds of a core
 burned on each machine to observe that nothing happened. Autobahn's
 12% is its own remaining inefficiency (see below), not watching cost.
 
-## What limits autobahn now
+## What limited autobahn at the time of this benchmark
+
+> **Since addressed.** Items 1 and 2 below were fixed in 0.3.0, along
+> with a per-cycle full-snapshot exchange that later measurement showed
+> to be the largest cost of all. These numbers describe 0.2.0 and have
+> not been re-measured since.
 
 The measurements point at three specific costs, none of which are
 transfer or watching:

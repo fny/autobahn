@@ -90,6 +90,25 @@ pub struct TransitionOutcome {
     pub missing_staged_files: bool,
 }
 
+/// Expresses a transition's outcome as changes: each transition's path now
+/// holds whatever the attempt actually achieved — the target content on
+/// success, the old content on refusal, partial content where a directory
+/// was only partly created.
+///
+/// Both the endpoints' own records and the ancestor are updated from this
+/// one rendering, so they cannot disagree about what a cycle accomplished.
+pub fn achieved_changes(transitions: &[Change], outcome: &TransitionOutcome) -> Vec<Change> {
+    transitions
+        .iter()
+        .zip(outcome.results.iter())
+        .map(|(transition, result)| Change {
+            path: transition.path.clone(),
+            old: None,
+            new: result.clone(),
+        })
+        .collect()
+}
+
 /// Folds a transition's achieved results into a snapshot of the endpoint
 /// that applied them, returning the endpoint's state as it now stands.
 ///
@@ -103,18 +122,13 @@ pub struct TransitionOutcome {
 pub fn fold_transition(
     snapshot: &Snapshot,
     transitions: &[Change],
-    results: &[Option<Node>],
+    outcome: &TransitionOutcome,
 ) -> Option<Snapshot> {
-    let achieved: Vec<Change> = transitions
-        .iter()
-        .zip(results.iter())
-        .map(|(transition, result)| Change {
-            path: transition.path.clone(),
-            old: None,
-            new: result.clone(),
-        })
-        .collect();
-    let root = crate::tree::apply(snapshot.root.as_ref(), &achieved).ok()?;
+    let root = crate::tree::apply(
+        snapshot.root.as_ref(),
+        &achieved_changes(transitions, outcome),
+    )
+    .ok()?;
     let mut folded = snapshot.clone();
     folded.root = root;
     crate::scan::recount(&mut folded);

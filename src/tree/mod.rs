@@ -285,9 +285,9 @@ impl Node {
     pub fn problems(&self) -> Vec<Problem> {
         // The walk carries the components of the current path rather than a
         // joined string, and materializes one only where a problem is
-        // actually recorded. Problems are rare and hierarchies are large,
-        // so building a path per visited node allocated once for every
-        // entry in the tree to describe a handful of them.
+        // actually recorded. Problems are rare and hierarchies are large:
+        // building a path at every node allocated one string per entry in
+        // the tree in order to describe a handful of them.
         fn collect<'a>(node: &'a Node, components: &mut Vec<&'a str>, problems: &mut Vec<Problem>) {
             if let Content::Problematic { message } = &node.content {
                 problems.push(Problem {
@@ -363,11 +363,19 @@ impl Node {
     }
 }
 
-/// Reports whether two optional hierarchies are the *same storage* — the
-/// pointer check that copy-on-write sharing makes meaningful: an unchanged
-/// scan adopts its baseline's children wholesale, so an unchanged tree
-/// compares equal here in constant time, however large it is.
-pub fn roots_share_storage(a: Option<&Node>, b: Option<&Node>) -> bool {
+/// Reports whether two optional nodes are backed by the *same storage* —
+/// the pointer check that copy-on-write sharing makes meaningful.
+///
+/// An unchanged scan adopts its baseline's children wholesale, so an
+/// unchanged subtree compares equal here in constant time however large it
+/// is. Two absent nodes agree; anything that is not a pair of directories
+/// does not, since only directories carry shared storage to compare.
+///
+/// Sharing is an artifact of how a hierarchy was *produced*, not of what it
+/// contains: a hierarchy decoded from disk or from the wire shares nothing,
+/// so equal content can and does answer `false` here. Callers may therefore
+/// use this to prove agreement, never to prove difference.
+pub fn nodes_share_storage(a: Option<&Node>, b: Option<&Node>) -> bool {
     match (a, b) {
         (
             Some(Node {

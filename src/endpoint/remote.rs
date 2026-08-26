@@ -34,8 +34,10 @@ pub struct RemoteEndpoint {
     channel: AgentChannel,
     /// The number of staging pushes sent but not yet acknowledged.
     pending_pushes: usize,
-    /// The most recent snapshot the agent sent, retained so that an
-    /// unchanged rescan needs no snapshot on the wire at all.
+    /// The controller's model of the agent's snapshot: the last one
+    /// received, with each subsequent transition's results folded in by the
+    /// same fold the agent applies. Retaining it is what lets an unchanged
+    /// rescan cost nothing on the wire.
     last_snapshot: Option<Snapshot>,
 }
 
@@ -239,6 +241,8 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+        // The transitions are cloned because the fold below needs them
+        // after the request has consumed them.
         match self.exchange(Request::Transition(transitions.clone()))? {
             Response::Transition(outcome) => {
                 // Model the agent's own fold of the achieved results, so the
@@ -246,9 +250,10 @@ impl Endpoint for RemoteEndpoint {
                 // two sides run the same fold over the same inputs; a fold
                 // this side cannot perform simply drops the cache, and the
                 // agent then resends in full.
-                self.last_snapshot = self.last_snapshot.as_ref().and_then(|snapshot| {
-                    super::fold_transition(snapshot, &transitions, &outcome.results)
-                });
+                self.last_snapshot = self
+                    .last_snapshot
+                    .as_ref()
+                    .and_then(|snapshot| super::fold_transition(snapshot, &transitions, &outcome));
                 Ok(outcome)
             }
             response => Err(unexpected_response(&response, "transition")),

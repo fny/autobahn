@@ -1,32 +1,25 @@
 //! Background persistence of derived state.
 //!
-//! Session state — the scan caches and the synchronization ancestor — is
-//! large (tens of megabytes on a large tree) and is rewritten whenever
-//! content moves. Serializing and writing it on the cycle's own thread put
-//! that cost directly into the latency a user sees between saving a file
-//! and seeing it appear on the far side.
+//! Scan caches are large — tens of megabytes on a large tree — and are
+//! rewritten whenever content moves. Serializing and writing them on the
+//! cycle's own thread put that cost directly into the latency between
+//! saving a file and seeing it appear on the far side.
 //!
-//! A [`StateWriter`] moves that work to a thread of its own. Two properties
-//! make it safe:
+//! A [`StateWriter`] moves that work to a thread of its own. What makes
+//! this safe is what a scan cache *is*: a record of work already done,
+//! carrying no information that cannot be recovered by reading the
+//! filesystem. Losing one, or writing an old one, costs a single full scan
+//! and nothing else.
 //!
-//! * **Order is preserved.** One writer thread consumes one slot, so a
-//!   later state can never land before an earlier one. What is on disk is
-//!   always a state this session actually passed through, never a mixture.
-//! * **Lagging is already a supported condition.** Every one of these files
-//!   describes work that has *already* been applied to a filesystem, so a
-//!   crash between the work and the write leaves the file behind — which is
-//!   true today, synchronously, for any crash in that window. Writing in
-//!   the background widens the window without changing its character: a
-//!   stale ancestor causes reconciliation to re-derive (both sides agreeing
-//!   converges, a propagated deletion re-propagates as a no-op), and a
-//!   stale scan cache costs one full scan. Neither loses content. The
-//!   dangerous direction — a file *ahead* of the filesystem, claiming work
-//!   that never happened — cannot arise, because state is only ever queued
-//!   after the work it describes has been applied.
+//! The synchronization ancestor is deliberately **not** written this way,
+//! despite being the same shape and size. It carries provenance — which
+//! side changed — and a stale one actively misleads reconciliation rather
+//! than merely slowing it. See `Session::run_cycle` for the case that
+//! settles it.
 //!
 //! Only the newest queued state for a target is written: a burst of cycles
 //! collapses to one write, since the intermediate states are already
-//! superseded.
+//! superseded, and order is preserved by there being a single writer.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
@@ -66,6 +59,10 @@ pub struct StateWriter {
 
 impl StateWriter {
     /// Starts a writer thread.
+    //
+    // Deliberately no `Default`: constructing one spawns a thread, which is
+    // not what a reader expects `default()` to do.
+    #[allow(clippy::new_without_default)]
     pub fn new() -> StateWriter {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let worker = Arc::clone(&state);
@@ -77,10 +74,7 @@ impl StateWriter {
             impl Drop for Retire<'_> {
                 fn drop(&mut self) {
                     let (lock, signal) = self.0;
-                    let mut shared = match lock.lock() {
-                        Ok(shared) => shared,
-                        Err(poisoned) => poisoned.into_inner(),
-                    };
+                    let mut shared = lock_shared(lock);
                     shared.finished = true;
                     shared.idle = true;
                     signal.notify_all();
@@ -90,7 +84,7 @@ impl StateWriter {
             let (lock, signal) = &*worker;
             loop {
                 let pending = {
-                    let mut shared = lock.lock().expect("the writer lock is never poisoned");
+                    let mut shared = lock_shared(lock);
                     while shared.pending.is_none() && !shared.stopping {
                         shared.idle = true;
                         signal.notify_all();
@@ -107,7 +101,10 @@ impl StateWriter {
                     }
                 };
                 if let Some(data) = (pending.encode)() {
-                    write_atomically(&pending.path, &data);
+                    // The writer is the one caller entitled to ignore a
+                    // failure: everything it writes is derived state, and a
+                    // later cycle will queue a newer version regardless.
+                    let _ = write_atomically(&pending.path, &data);
                 }
             }
         });
@@ -123,7 +120,7 @@ impl StateWriter {
     /// is dropped without ever being encoded.
     pub fn store(&self, path: PathBuf, encode: impl FnOnce() -> Option<Vec<u8>> + Send + 'static) {
         let (lock, signal) = &*self.state;
-        let mut shared = lock.lock().expect("the writer lock is never poisoned");
+        let mut shared = lock_shared(lock);
         shared.pending = Some(Pending {
             encode: Box::new(encode),
             path,
@@ -136,10 +133,7 @@ impl StateWriter {
     /// the cycle path deliberately does not.
     pub fn flush(&self) {
         let (lock, signal) = &*self.state;
-        let mut shared = match lock.lock() {
-            Ok(shared) => shared,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let mut shared = lock_shared(lock);
         while !shared.finished && (shared.pending.is_some() || !shared.idle) {
             shared = match signal.wait(shared) {
                 Ok(shared) => shared,
@@ -149,17 +143,11 @@ impl StateWriter {
     }
 }
 
-impl Default for StateWriter {
-    fn default() -> StateWriter {
-        StateWriter::new()
-    }
-}
-
 impl Drop for StateWriter {
     fn drop(&mut self) {
         {
             let (lock, signal) = &*self.state;
-            let mut shared = lock.lock().expect("the writer lock is never poisoned");
+            let mut shared = lock_shared(lock);
             shared.stopping = true;
             signal.notify_all();
         }
@@ -171,13 +159,30 @@ impl Drop for StateWriter {
     }
 }
 
-/// Writes a file by way of a temporary and a rename, so that a reader never
-/// observes a partially written state.
-pub fn write_atomically(path: &Path, data: &[u8]) {
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    if std::fs::write(&temporary, data).is_ok() && std::fs::rename(&temporary, path).is_err() {
-        let _ = std::fs::remove_file(&temporary);
+/// Takes the shared state, tolerating poisoning.
+///
+/// A panic in an encoder poisons this lock on its way out, and the state
+/// it guards is a queue of derived data — nothing a panic can leave
+/// half-updated in a way that matters. Refusing to proceed would turn a
+/// failed write into a hang for everyone waiting on the writer.
+fn lock_shared(lock: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
+    match lock.lock() {
+        Ok(shared) => shared,
+        Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+/// Writes a file by way of a temporary and a rename, so that a reader never
+/// observes a partially written state. The temporary is removed if the
+/// rename fails, so a failed write leaves nothing behind.
+pub fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
+    std::fs::write(&temporary, data)?;
+    if let Err(error) = std::fs::rename(&temporary, path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -185,7 +190,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queued_state_reaches_disk_in_order() {
+    fn the_latest_queued_state_is_what_lands() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let path = keep.path().join("state");
         let writer = StateWriter::new();
@@ -193,8 +198,8 @@ mod tests {
             writer.store(path.clone(), move || Some(vec![generation; 16]));
         }
         writer.flush();
-        // Coalescing means intermediate generations may be skipped, but the
-        // last one queued is always what lands.
+        // Coalescing means intermediate generations are skipped; what must
+        // hold is that the newest queued state is the one on disk.
         let written = std::fs::read(&path).expect("state should exist");
         assert_eq!(written, vec![49u8; 16]);
     }
@@ -232,7 +237,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let path = keep.path().join("state");
         std::fs::write(&path, b"original").expect("state should be writable");
-        write_atomically(&path, b"replacement");
+        write_atomically(&path, b"replacement").expect("the write should succeed");
         assert_eq!(
             std::fs::read(&path).expect("state should exist"),
             b"replacement".to_vec()

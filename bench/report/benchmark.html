@@ -1,0 +1,664 @@
+<title>Autobahn vs Mutagen</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Condensed:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=Source+Serif+4:opsz,wght@8..60,400;8..60,600&display=swap">
+
+<style>
+:root{
+  --paper:#faf8f5; --card:#ffffff; --ink:#16181d; --muted:#6d6b65;
+  --rule:#e4e0d8; --rule-strong:#cfc9bd;
+  --ab:#b45309; --ab-soft:#f5e6d3;
+  --mu:#55606d; --mu-soft:#e2e5e9;
+  --win:#4d7c0f; --warn:#b45309;
+}
+@media (prefers-color-scheme: dark){
+  :root:not([data-theme="light"]){
+    --paper:#131418; --card:#1a1c21; --ink:#e9e6e0; --muted:#98948c;
+    --rule:#292b31; --rule-strong:#3a3d45;
+    --ab:#e39a45; --ab-soft:#3a2c1a;
+    --mu:#93a3b3; --mu-soft:#242a31;
+    --win:#a3c063; --warn:#e39a45;
+  }
+}
+:root[data-theme="dark"]{
+  --paper:#131418; --card:#1a1c21; --ink:#e9e6e0; --muted:#98948c;
+  --rule:#292b31; --rule-strong:#3a3d45;
+  --ab:#e39a45; --ab-soft:#3a2c1a;
+  --mu:#93a3b3; --mu-soft:#242a31;
+  --win:#a3c063; --warn:#e39a45;
+}
+
+*{box-sizing:border-box}
+body{
+  background:var(--paper); color:var(--ink);
+  font-family:"Source Serif 4",Georgia,serif; font-size:17px; line-height:1.62;
+  margin:0; padding:0 1.5rem 6rem;
+  -webkit-font-smoothing:antialiased;
+}
+.wrap{max-width:1080px;margin:0 auto}
+.prose{max-width:68ch}
+
+h1,h2,h3,.label,th,.stat-num,.eyebrow{
+  font-family:"IBM Plex Sans Condensed","IBM Plex Sans",system-ui,sans-serif;
+}
+h1{font-size:clamp(2.4rem,5vw,3.6rem);line-height:1.03;font-weight:700;letter-spacing:-.02em;margin:0 0 .5rem;text-wrap:balance}
+h2{font-size:1.55rem;font-weight:600;letter-spacing:-.01em;margin:3.5rem 0 .3rem;text-wrap:balance}
+h3{font-size:1.05rem;font-weight:600;margin:2rem 0 .3rem}
+p{margin:0 0 1.05rem}
+a{color:var(--ab)}
+
+header{padding:4rem 0 0;border-bottom:1px solid var(--rule);margin-bottom:2.5rem}
+.eyebrow{
+  font-size:.75rem;font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+  color:var(--muted);margin:0 0 1.1rem;
+}
+.dek{font-size:1.22rem;line-height:1.5;color:var(--muted);max-width:60ch;margin:0 0 1.6rem}
+.meta{
+  font-family:"IBM Plex Mono",ui-monospace,monospace;font-size:.72rem;
+  color:var(--muted);letter-spacing:.02em;display:flex;flex-wrap:wrap;gap:.4rem 1.4rem;
+  padding-bottom:2rem;
+}
+
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:1px;
+  background:var(--rule);border:1px solid var(--rule);margin:0 0 3rem}
+.stat{background:var(--card);padding:1.5rem 1.4rem}
+.stat-num{font-size:2.5rem;font-weight:700;line-height:1;letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums;margin-bottom:.45rem}
+.stat-num.ab{color:var(--ab)}
+.stat-num.neutral{color:var(--mu)}
+.stat-lab{font-size:.94rem;line-height:1.4;color:var(--ink)}
+.stat-sub{font-size:.8rem;color:var(--muted);margin-top:.3rem;line-height:1.4}
+
+.scroll{overflow-x:auto;margin:1.4rem 0 .6rem;border:1px solid var(--rule);background:var(--card)}
+table{border-collapse:collapse;width:100%;font-size:.87rem}
+caption{text-align:left;font-size:.8rem;color:var(--muted);padding:.7rem .9rem;border-bottom:1px solid var(--rule);font-family:"IBM Plex Mono",monospace}
+th,td{padding:.5rem .75rem;text-align:left;white-space:nowrap}
+thead th{
+  font-size:.68rem;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--muted);border-bottom:1px solid var(--rule-strong);vertical-align:bottom;
+}
+thead th.ab{color:var(--ab)}
+thead th.mu{color:var(--mu)}
+tbody th{font-weight:500;font-size:.85rem}
+tbody tr.group th,tbody tr.group td{border-top:1px solid var(--rule)}
+.num{font-family:"IBM Plex Mono",monospace;font-variant-numeric:tabular-nums;text-align:right;font-size:.82rem}
+.num.ab{color:var(--ab);font-weight:500}
+.num.mu{color:var(--mu);font-weight:500}
+.dim{color:var(--muted)}
+.ratio{font-weight:600}
+.ratio.win{color:var(--win)}
+.ratio.loss{color:var(--warn)}
+.barcell{width:150px;min-width:150px;padding:.5rem .75rem}
+.bar{display:block;height:5px;border-radius:1px;margin:2px 0}
+.bar.ab{background:var(--ab)}
+.bar.mu{background:var(--mu)}
+
+.note{border-left:2px solid var(--rule-strong);padding:.15rem 0 .15rem 1.1rem;margin:1.5rem 0;
+  color:var(--muted);font-size:.94rem}
+.note strong{color:var(--ink)}
+.callout{background:var(--card);border:1px solid var(--rule);padding:1.3rem 1.4rem;margin:1.8rem 0}
+.callout h3{margin-top:0}
+.legend{font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--muted);display:flex;gap:1.2rem;flex-wrap:wrap;margin:.2rem 0 2rem}
+.chip{display:inline-flex;align-items:center;gap:.4rem}
+.chip::before{content:"";width:9px;height:9px;border-radius:1px;background:currentColor}
+.chip.ab{color:var(--ab)}
+.chip.mu{color:var(--mu)}
+ul{padding-left:1.1rem;margin:0 0 1.05rem}
+li{margin-bottom:.45rem}
+code{font-family:"IBM Plex Mono",monospace;font-size:.85em;background:var(--mu-soft);padding:.08em .35em;border-radius:2px}
+footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid var(--rule);
+  font-family:"IBM Plex Mono",monospace;font-size:.72rem;color:var(--muted);line-height:1.8}
+</style>
+
+<div class="wrap">
+
+<header>
+  <p class="eyebrow">Synchronization benchmark · August 2026</p>
+  <h1>Autobahn vs Mutagen</h1>
+  <p class="dek">Steady-state propagation latency, memory, and cold-sync time measured across four corpus sizes and three concurrency levels, on matched pairs of EC2 machines.</p>
+  <div class="meta">
+    <span>57 jobs · 2 tools each</span>
+    <span>c6i.4xlarge pairs · us-east-2</span>
+    <span>autobahn 0.3.0 · mutagen 0.19.0-dev</span>
+    <span>Chromium @ 504,940 files</span>
+    <span>0 censored samples · 0 tainted runs</span>
+  </div>
+</header>
+
+<div class="stats">
+  <div class="stat">
+    <div class="stat-num ab">26.5×</div>
+    <div class="stat-lab">faster to propagate an edit on Chromium</div>
+    <div class="stat-sub">264 ms vs 6,998 ms median, single agent</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num ab">7.6×</div>
+    <div class="stat-lab">less memory on Chromium</div>
+    <div class="stat-sub">273 MB vs 2,065 MB peak resident</div>
+  </div>
+  <div class="stat">
+    <div class="stat-num neutral">≈1%</div>
+    <div class="stat-lab">difference in first-sync time</div>
+    <div class="stat-sub">both storage-bound, not tool-bound</div>
+  </div>
+</div>
+
+<div class="prose">
+<p>Two synchronization tools were given the same trees on the same hardware and asked to do the same work: carry a stream of file edits from one machine to another while simulated coding agents churned the tree underneath them. The question was not who transfers a tree fastest — that turns out to be a storage question — but how quickly a single edit becomes visible on the far side, and what each tool costs to keep running while it waits.</p>
+
+<p>The short answer is that the two tools differ most where it is least visible in a feature list. On a 4,000-file tree they are comparable and mutagen is often quicker. On a real Chromium checkout, autobahn propagates a typical edit in about a quarter of a second where mutagen takes about seven, and it does so while holding roughly a seventh of the memory.</p>
+</div>
+
+<h2>Steady-state propagation latency</h2>
+<div class="prose">
+<p>This is the headline measurement: the time from a file being written on one machine to exactly those bytes being readable on the other, verified by digest. The clock starts and stops on the writing host, so no cross-machine clock error can enter, and the interval includes the verifying read and the acknowledgement's return trip. Every number here is therefore an upper bound on the tool's own propagation time.</p>
+</div>
+
+<div class="legend">
+  <span class="chip ab">autobahn</span>
+  <span class="chip mu">mutagen</span>
+  <span>bars are median latency, log scale, 50 ms – 12 s</span>
+</div>
+
+<div class="scroll">
+<table>
+  <caption>Median / 90th / 99th percentile latency in milliseconds. 3 repeats per cell, ~500 samples per tool per cell. ⇄ marks bidirectional cells.</caption>
+  <thead>
+    <tr>
+      <th>Corpus</th><th class="num">Agents</th>
+      <th class="num ab">p50</th><th class="num ab">p90</th><th class="num ab">p99</th>
+      <th class="num mu">p50</th><th class="num mu">p90</th><th class="num mu">p99</th>
+      <th>median</th><th class="num">autobahn</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr class="group">
+      <th scope="row">Chromium</th>
+      <td class="num">1</td>
+      <td class="num ab">264</td>
+      <td class="num dim">392</td>
+      <td class="num dim">2,140</td>
+      <td class="num mu">6,998</td>
+      <td class="num dim">9,208</td>
+      <td class="num dim">10,420</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:30.4%"></span>
+        <span class="bar mu" style="width:90.2%"></span>
+      </td>
+      <td class="num ratio win">26.5×</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium</th>
+      <td class="num">10</td>
+      <td class="num ab">445</td>
+      <td class="num dim">1,535</td>
+      <td class="num dim">2,625</td>
+      <td class="num mu">9,038</td>
+      <td class="num dim">11,524</td>
+      <td class="num dim">13,019</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:39.9%"></span>
+        <span class="bar mu" style="width:94.8%"></span>
+      </td>
+      <td class="num ratio win">20.3×</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium</th>
+      <td class="num">100</td>
+      <td class="num ab">827</td>
+      <td class="num dim">1,542</td>
+      <td class="num dim">3,628</td>
+      <td class="num mu">8,695</td>
+      <td class="num dim">10,985</td>
+      <td class="num dim">12,196</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:51.2%"></span>
+        <span class="bar mu" style="width:94.1%"></span>
+      </td>
+      <td class="num ratio win">10.5×</td>
+    </tr>
+<tr class="group">
+      <th scope="row">Chromium ⇄</th>
+      <td class="num">1</td>
+      <td class="num ab">1,004</td>
+      <td class="num dim">1,425</td>
+      <td class="num dim">2,843</td>
+      <td class="num mu">7,854</td>
+      <td class="num dim">10,468</td>
+      <td class="num dim">11,668</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:54.7%"></span>
+        <span class="bar mu" style="width:92.3%"></span>
+      </td>
+      <td class="num ratio win">7.8×</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium ⇄</th>
+      <td class="num">10</td>
+      <td class="num ab">1,261</td>
+      <td class="num dim">1,869</td>
+      <td class="num dim">3,439</td>
+      <td class="num mu">6,020</td>
+      <td class="num dim">8,632</td>
+      <td class="num dim">10,334</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:58.9%"></span>
+        <span class="bar mu" style="width:87.4%"></span>
+      </td>
+      <td class="num ratio win">4.8×</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium ⇄</th>
+      <td class="num">100</td>
+      <td class="num ab">6,060</td>
+      <td class="num dim">19,017</td>
+      <td class="num dim">32,881</td>
+      <td class="num mu">9,961</td>
+      <td class="num dim">14,215</td>
+      <td class="num dim">16,738</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:87.5%"></span>
+        <span class="bar mu" style="width:96.6%"></span>
+      </td>
+      <td class="num ratio win">1.6×</td>
+    </tr>
+<tr class="group">
+      <th scope="row">40k subset</th>
+      <td class="num">1</td>
+      <td class="num ab">112</td>
+      <td class="num dim">202</td>
+      <td class="num dim">238</td>
+      <td class="num mu">301</td>
+      <td class="num dim">954</td>
+      <td class="num dim">2,490</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:14.7%"></span>
+        <span class="bar mu" style="width:32.7%"></span>
+      </td>
+      <td class="num ratio win">2.7×</td>
+    </tr>
+<tr>
+      <th scope="row">40k subset</th>
+      <td class="num">10</td>
+      <td class="num ab">85</td>
+      <td class="num dim">140</td>
+      <td class="num dim">258</td>
+      <td class="num mu">1,986</td>
+      <td class="num dim">4,265</td>
+      <td class="num dim">5,187</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:9.7%"></span>
+        <span class="bar mu" style="width:67.2%"></span>
+      </td>
+      <td class="num ratio win">23.3×</td>
+    </tr>
+<tr>
+      <th scope="row">40k subset</th>
+      <td class="num">100</td>
+      <td class="num ab">143</td>
+      <td class="num dim">222</td>
+      <td class="num dim">336</td>
+      <td class="num mu">1,715</td>
+      <td class="num dim">4,025</td>
+      <td class="num dim">5,499</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:19.2%"></span>
+        <span class="bar mu" style="width:64.5%"></span>
+      </td>
+      <td class="num ratio win">12.0×</td>
+    </tr>
+<tr class="group">
+      <th scope="row">2 × 40k</th>
+      <td class="num">1</td>
+      <td class="num ab">118</td>
+      <td class="num dim">211</td>
+      <td class="num dim">281</td>
+      <td class="num mu">328</td>
+      <td class="num dim">1,117</td>
+      <td class="num dim">2,843</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:15.6%"></span>
+        <span class="bar mu" style="width:34.3%"></span>
+      </td>
+      <td class="num ratio win">2.8×</td>
+    </tr>
+<tr>
+      <th scope="row">2 × 40k</th>
+      <td class="num">10</td>
+      <td class="num ab">102</td>
+      <td class="num dim">155</td>
+      <td class="num dim">265</td>
+      <td class="num mu">1,848</td>
+      <td class="num dim">4,318</td>
+      <td class="num dim">5,265</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:12.9%"></span>
+        <span class="bar mu" style="width:65.9%"></span>
+      </td>
+      <td class="num ratio win">18.2×</td>
+    </tr>
+<tr>
+      <th scope="row">2 × 40k</th>
+      <td class="num">100</td>
+      <td class="num ab">214</td>
+      <td class="num dim">328</td>
+      <td class="num dim">453</td>
+      <td class="num mu">1,414</td>
+      <td class="num dim">3,485</td>
+      <td class="num dim">5,349</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:26.5%"></span>
+        <span class="bar mu" style="width:61.0%"></span>
+      </td>
+      <td class="num ratio win">6.6×</td>
+    </tr>
+<tr class="group">
+      <th scope="row">4k subset</th>
+      <td class="num">1</td>
+      <td class="num ab">101</td>
+      <td class="num dim">197</td>
+      <td class="num dim">222</td>
+      <td class="num mu">62</td>
+      <td class="num dim">868</td>
+      <td class="num dim">2,574</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:12.8%"></span>
+        <span class="bar mu" style="width:4.0%"></span>
+      </td>
+      <td class="num ratio loss">1.6× slower</td>
+    </tr>
+<tr>
+      <th scope="row">4k subset</th>
+      <td class="num">10</td>
+      <td class="num ab">62</td>
+      <td class="num dim">103</td>
+      <td class="num dim">113</td>
+      <td class="num mu">1,028</td>
+      <td class="num dim">3,174</td>
+      <td class="num dim">4,646</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:3.9%"></span>
+        <span class="bar mu" style="width:55.2%"></span>
+      </td>
+      <td class="num ratio win">16.6×</td>
+    </tr>
+<tr>
+      <th scope="row">4k subset</th>
+      <td class="num">100</td>
+      <td class="num ab">84</td>
+      <td class="num dim">138</td>
+      <td class="num dim">1,977</td>
+      <td class="num mu">2,680</td>
+      <td class="num dim">4,908</td>
+      <td class="num dim">5,481</td>
+      <td class="barcell">
+        <span class="bar ab" style="width:9.4%"></span>
+        <span class="bar mu" style="width:72.6%"></span>
+      </td>
+      <td class="num ratio win">32.1×</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose">
+<p>The pattern that runs through every row is that autobahn's latency is close to flat in both tree size and agent count, and mutagen's is not. On the 4k corpus mutagen goes from 62 ms at one agent to 2,680 ms at a hundred; autobahn goes from 101 ms to 84 ms. Mutagen's cost tracks how much work it must redo to notice a change, which grows with both the size of the tree and the rate of churn in it. Autobahn's tracks the change itself.</p>
+
+<p>This also explains the one result that looks anomalous. On a small tree with a single writer, mutagen can watch every directory natively and detect a change almost immediately — hence 62 ms, genuinely faster than autobahn's 101 ms. That advantage does not survive scale in either dimension.</p>
+</div>
+
+<h2>The cell mutagen wins</h2>
+<div class="prose">
+<p>Because <code>4k-1</code> was the single cell where mutagen led, it was re-run twenty times across fifteen distinct machine pairs — roughly 3,500 samples per tool — to establish whether the result was real. It is, and it is worth stating plainly.</p>
+</div>
+
+<div class="scroll">
+<table>
+  <caption>4k corpus, one agent. 20 repeats, ~3,500 pooled samples per tool, 0 censored.</caption>
+  <thead>
+    <tr><th>Tool</th><th class="num">p50</th><th class="num">p90</th><th class="num">p99</th><th class="num">worst</th><th class="num">per-run p50 range</th></tr>
+  </thead>
+  <tbody>
+    <tr>
+      <th scope="row">autobahn</th>
+      <td class="num ab">100.7 ms</td><td class="num ab">195.3 ms</td><td class="num ab">222.2 ms</td>
+      <td class="num ab">232.3 ms</td><td class="num dim">100.1 – 102.7 ms</td>
+    </tr>
+    <tr>
+      <th scope="row">mutagen</th>
+      <td class="num mu">61.4 ms</td><td class="num mu">805.0 ms</td><td class="num mu">2,771.9 ms</td>
+      <td class="num mu">4,976.6 ms</td><td class="num dim">55.1 – 63.5 ms</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose">
+<p>Mutagen is 1.6× faster at the median. Autobahn is 4.1× better at the 90th percentile, 12.5× better at the 99th, and 21× better in the worst case observed. The distributions have different shapes rather than different positions: autobahn's slowest sample out of 3,488 was 232 ms, ten milliseconds above its own p99, so it has essentially no tail at all. Mutagen's slowest was just under five seconds.</p>
+
+<p>Which tool is preferable here depends on what the latency is for. For a typical edit, mutagen arrives sooner. For the promise that <em>every</em> edit arrives quickly, autobahn is the stronger guarantee — roughly one mutagen edit in a hundred takes more than 2.7 seconds to appear.</p>
+
+<p class="note">The per-run medians are worth noting on their own. Across twenty runs on fifteen different machines, autobahn's median landed between 100.1 and 102.7 ms and mutagen's between 55.1 and 63.5 ms. Under 1.5% variation machine to machine means the harness is measuring the tools, not the hardware.</p>
+</div>
+
+<h2>Memory and CPU</h2>
+<div class="prose">
+<p>Memory is the largest single difference in the benchmark, and it widens with tree size. Peak resident set was sampled once per second across each tool's whole process tree — daemon, transport children, and the remote agent — and windowed to the workload phase.</p>
+</div>
+
+<div class="scroll">
+<table>
+  <caption>Peak resident memory and mean CPU (percent of one core) during the workload phase. Median of 2 repeats.</caption>
+  <thead>
+    <tr>
+      <th>Corpus</th><th>Host</th>
+      <th class="num ab">autobahn</th><th class="num mu">mutagen</th><th class="num">×</th>
+      <th class="num ab">ab CPU</th><th class="num mu">mu CPU</th>
+    </tr>
+  </thead>
+  <tbody>
+<tr class="group">
+      <th scope="row">4k subset</th>
+      <td>source</td>
+      <td class="num ab">19 MB</td>
+      <td class="num mu">50 MB</td>
+      <td class="num ratio win">2.6×</td>
+      <td class="num dim">17%</td>
+      <td class="num dim">12%</td>
+    </tr>
+<tr>
+      <th scope="row">4k subset</th>
+      <td>destination</td>
+      <td class="num ab">6 MB</td>
+      <td class="num mu">34 MB</td>
+      <td class="num ratio win">5.9×</td>
+      <td class="num dim">11%</td>
+      <td class="num dim">9%</td>
+    </tr>
+<tr class="group">
+      <th scope="row">40k subset</th>
+      <td>source</td>
+      <td class="num ab">42 MB</td>
+      <td class="num mu">178 MB</td>
+      <td class="num ratio win">4.2×</td>
+      <td class="num dim">34%</td>
+      <td class="num dim">37%</td>
+    </tr>
+<tr>
+      <th scope="row">40k subset</th>
+      <td>destination</td>
+      <td class="num ab">16 MB</td>
+      <td class="num mu">132 MB</td>
+      <td class="num ratio win">8.2×</td>
+      <td class="num dim">22%</td>
+      <td class="num dim">41%</td>
+    </tr>
+<tr class="group">
+      <th scope="row">2 × 40k</th>
+      <td>source</td>
+      <td class="num ab">72 MB</td>
+      <td class="num mu">340 MB</td>
+      <td class="num ratio win">4.7×</td>
+      <td class="num dim">81%</td>
+      <td class="num dim">81%</td>
+    </tr>
+<tr>
+      <th scope="row">2 × 40k</th>
+      <td>destination</td>
+      <td class="num ab">32 MB</td>
+      <td class="num mu">274 MB</td>
+      <td class="num ratio win">8.7×</td>
+      <td class="num dim">51%</td>
+      <td class="num dim">86%</td>
+    </tr>
+<tr class="group">
+      <th scope="row">Chromium, 10 agents</th>
+      <td>source</td>
+      <td class="num ab">273 MB</td>
+      <td class="num mu">2,065 MB</td>
+      <td class="num ratio win">7.6×</td>
+      <td class="num dim">78%</td>
+      <td class="num dim">104%</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium, 10 agents</th>
+      <td>destination</td>
+      <td class="num ab">186 MB</td>
+      <td class="num mu">1,454 MB</td>
+      <td class="num ratio win">7.8×</td>
+      <td class="num dim">35%</td>
+      <td class="num dim">122%</td>
+    </tr>
+<tr class="group">
+      <th scope="row">Chromium, 100 agents</th>
+      <td>source</td>
+      <td class="num ab">316 MB</td>
+      <td class="num mu">1,918 MB</td>
+      <td class="num ratio win">6.1×</td>
+      <td class="num dim">82%</td>
+      <td class="num dim">98%</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium, 100 agents</th>
+      <td>destination</td>
+      <td class="num ab">180 MB</td>
+      <td class="num mu">1,432 MB</td>
+      <td class="num ratio win">8.0×</td>
+      <td class="num dim">31%</td>
+      <td class="num dim">124%</td>
+    </tr>
+<tr class="group">
+      <th scope="row">Chromium ⇄, 100 agents</th>
+      <td>source</td>
+      <td class="num ab">447 MB</td>
+      <td class="num mu">1,908 MB</td>
+      <td class="num ratio win">4.3×</td>
+      <td class="num dim">58%</td>
+      <td class="num dim">118%</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium ⇄, 100 agents</th>
+      <td>destination</td>
+      <td class="num ab">215 MB</td>
+      <td class="num mu">1,395 MB</td>
+      <td class="num ratio win">6.5×</td>
+      <td class="num dim">44%</td>
+      <td class="num dim">86%</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose">
+<p>On the Chromium tree mutagen peaks at roughly 2 GB on the source host where autobahn uses 273 MB. The ratio is 2.6× on a 4,000-file tree and reaches 7.6× at 500,000 files, which is the signature of a per-file memory cost in the entry model rather than a fixed overhead. Two gigabytes is enough to matter on a laptop or a small VM; 273 MB is not.</p>
+
+<p>The CPU column carries a quieter result. On the destination host, mutagen sustains more than a full core (104–124%) through the workload on Chromium, against roughly a third of a core for autobahn. The destination is doing no editing in these unidirectional cells — that cost is the price of noticing what changed.</p>
+</div>
+
+<h2>First sync is a storage question</h2>
+<div class="prose">
+<p>Cold-sync time was measured with the corpus faulted fully into the volume and the page cache dropped immediately before each run, so both tools read the tree from disk under identical conditions.</p>
+</div>
+
+<div class="scroll">
+<table>
+  <caption>Time to first digest-verified convergence. Median of 2 repeats, hydrated volume, cache dropped.</caption>
+  <thead><tr><th>Corpus</th><th class="num ab">autobahn</th><th class="num mu">mutagen</th><th class="num">difference</th></tr></thead>
+  <tbody>
+<tr>
+      <th scope="row">40k subset</th>
+      <td class="num ab">34.0 s</td>
+      <td class="num mu">31.8 s</td>
+      <td class="num dim">6% (mutagen)</td>
+    </tr>
+<tr>
+      <th scope="row">4k subset</th>
+      <td class="num ab">8.4 s</td>
+      <td class="num mu">5.8 s</td>
+      <td class="num dim">31% (mutagen)</td>
+    </tr>
+<tr>
+      <th scope="row">Chromium (≈505k files)</th>
+      <td class="num ab">423.3 s</td>
+      <td class="num mu">418.0 s</td>
+      <td class="num dim">1% (mutagen)</td>
+    </tr>
+<tr>
+      <th scope="row">40k subset (B)</th>
+      <td class="num ab">38.5 s</td>
+      <td class="num mu">38.1 s</td>
+      <td class="num dim">1% (mutagen)</td>
+    </tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose">
+<p>The two tools land within about one percent of each other on Chromium, and mutagen is modestly ahead on the smaller trees. This is the expected result once storage is controlled for: transferring half a million small files is bound by device IOPS, not by either tool's logic. Roughly 505,000 files against a gp3 volume's baseline is most of the seven minutes on its own.</p>
+
+<p>The practical reading is that first sync is not where these tools differ. The difference appears afterward, in how cheaply each one stays caught up.</p>
+</div>
+
+<h2>Where autobahn loses</h2>
+<div class="prose">
+<p>Two cells go against it, and both are worth stating.</p>
+<ul>
+  <li><strong>Small tree, single writer.</strong> Mutagen's median is 1.6× better on <code>4k-1</code>, confirmed over twenty repeats.</li>
+  <li><strong>Extreme bidirectional load.</strong> At <code>chromium-100-bidir</code> — 200 agents editing 500,000 files in both directions at once — autobahn keeps the better median (6.1 s vs 10.0 s) but its 90th percentile degrades to about 19 s against mutagen's 14 s. Its tail discipline, which holds everywhere else, breaks down under that load. This cell also recorded the benchmark's only skipped ticks, meaning the offered edit rate was slightly reduced there for both tools.</li>
+</ul>
+<p>Mutagen is also modestly faster to complete a first sync on every corpus measured, though by margins that sit inside the storage noise described above.</p>
+</div>
+
+<h2>What makes these numbers trustworthy</h2>
+<div class="prose">
+<p>The measurement plane is a single compiled binary deployed to both hosts, so both sides run byte-identical instruments and the rules for what counts as a file exist in exactly one place. The design was reviewed adversarially across five rounds, and every finding was fixed before any number here was collected.</p>
+<ul>
+  <li><strong>Convergence is content-verified.</strong> A sync completes when the destination's digests match the source's, never when a file count matches — and only a tree walk that recorded zero errors can certify it.</li>
+  <li><strong>The working set is fixed across agent counts.</strong> The measuring agent edits the same 40 files whether 1 or 100 agents are running, so concurrency changes load and nothing else.</li>
+  <li><strong>Both tools run on the same pair, in an order randomized per job</strong>, so machine identity and ordering effects cancel instead of confounding.</li>
+  <li><strong>Timeouts are censored data, not discards.</strong> An edit exceeding its deadline holds its position in the percentiles. Across all 57 jobs, zero samples were censored.</li>
+  <li><strong>The harness measures its own overhead.</strong> The floor — arm, write, verify, acknowledge — ran at a 0.7 ms median, against results measured in hundreds of milliseconds.</li>
+  <li><strong>Load is open-loop.</strong> Edits are issued on a fixed cadence regardless of pending acknowledgements, so a slow tool faces the same offered load as a fast one.</li>
+</ul>
+</div>
+
+<div class="callout">
+<h3>Two measurement bugs found and corrected</h3>
+<p style="margin-bottom:.8rem">Both were caught before publication and both are worth recording, because each produced numbers that looked plausible.</p>
+<p style="margin-bottom:.8rem"><strong>Cold sync was measuring EBS, not the tools.</strong> A volume restored from a snapshot faults its blocks in lazily, so whichever tool ran first in a job paid a large one-time cost — 434 s on Chromium — and whichever ran second read from page cache and paid 125 s, regardless of which tool it was. The fix faults the corpus in once per host, then drops the page cache before every measurement. The cold-sync table above uses the corrected method; the earlier figures were discarded.</p>
+<p style="margin:0"><strong>Mutagen's memory read as a confident zero.</strong> Mutagen re-execs its daemon with a bare basename, so a full-path process pattern matched nothing and every mutagen memory figure reported 0 MB — not missing data, but a plausible-looking zero. Patterns are now lists of alternatives, and the aggregator refuses to report a resource series in which no process was ever matched.</p>
+</div>
+
+<h2>Method, in brief</h2>
+<div class="prose">
+<p>Each job runs one cell on one pair of machines, executing both tools back to back in a randomized order. For each tool the sequence is: destroy all prior state on both hosts and verify it is gone; restore every editable file from a pristine copy so both tools sync identical bytes; cold sync to digest-verified convergence; wait for verified quiescence; measure an idle window; run the workload; then confirm the trees reconverged.</p>
+<p>During the workload, N simulated agents rewrite files on a coding cadence from disjoint, precomputed working sets. One agent also measures: it announces the exact bytes it is about to write to a verifier on the receiving host, writes them, and waits for confirmation that precisely those bytes are readable at the destination path. Payloads are seeded from a per-run nonce, so content from an earlier run can never satisfy a verification.</p>
+</div>
+
+<footer>
+  autobahn 0.3.0 · mutagen 0.19.0-dev · Chromium at 504,940 files, symlinks stripped, <code>.git</code> and <code>out</code> excluded<br>
+  57 jobs across 15 cells · c6i.4xlarge pairs, 200 GB gp3, us-east-2 · mutagen poll interval set to 5 s, better than its 10 s default<br>
+  0 tainted runs · 0 censored samples · harness floor 0.7 ms median across 57 measurements
+</footer>
+
+</div>

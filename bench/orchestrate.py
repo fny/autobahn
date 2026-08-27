@@ -153,7 +153,9 @@ def bake(options):
     print(f"run id: {run_id}")
     key, group = provision_network(options, run_id)
     instance = launch(options, run_id, BUILDER_TYPE, group, key, count=1)[0]
-    address = wait_for_address(options, [instance])[instance]
+    # wait_for_address yields (public, private); the builder is reached on
+    # its public address.
+    address, _ = wait_for_address(options, [instance])[instance]
     wait_for_ssh(address, key)
 
     ssh = f"ssh -o StrictHostKeyChecking=accept-new -i {key_path(key)} ubuntu@{address}"

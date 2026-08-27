@@ -302,6 +302,41 @@ def prepare_cold_sync(corpora):
             raise RuntimeError(f"{where} cache drop failed: {result.stdout[-300:]}")
 
 
+def seed_destinations(corpora, emitter):
+    """Puts the destinations into the state a completed first sync would
+    leave them in, without transferring anything.
+
+    Cold sync on the Chromium tree is a disk problem rather than a tool
+    problem — the two tools finished within one percent of each other — yet
+    it costs more than half of such a job, and a fan-out multiplies it by
+    the number of destinations. So for a pre-seeded cell the destinations
+    are filled from the corpus already baked into every machine's image: a
+    local copy, all destinations at once, with the source uninvolved.
+
+    The seed is then *verified by digest* before anything is measured. An
+    approximate seed would be worse than none: the tool would open with a
+    large catch-up transfer, and the workload would measure that instead of
+    what it means to.
+    """
+    for corpus in corpora:
+        command = (f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus} && "
+                   f"cp -a {CORPUS}/{corpus}/. {DEST}/{corpus}/")
+        for host, result in zip(destinations(),
+                                on_every_destination(command, timeout=3600)):
+            if result.returncode != 0:
+                raise RuntimeError(f"seeding {corpus} on {host} failed: {result.stdout[-300:]}")
+
+    # The seed only counts if every destination matches the source exactly.
+    for corpus in corpora:
+        source = summary("full", f"{CORPUS}/{corpus}", remote=False)
+        seeded = summary("full", f"{DEST}/{corpus}", remote=True)
+        if source != seeded or not clean(source):
+            raise RuntimeError(
+                f"seeded {corpus} does not match the source: "
+                f"source={source[:60]} destinations={seeded[:60]}")
+    emitter.emit({"measurement": "seeded", "corpora": list(corpora)})
+
+
 def clear_destinations(corpora):
     for corpus in corpora:
         command = f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}"
@@ -348,9 +383,16 @@ def clean(summary_text):
     return "<error" not in summary_text and summary_text.endswith("errors=0")
 
 
-def await_cold_sync(corpora, emitter, tool):
+def await_cold_sync(corpora, emitter, tool, pre_seeded=False):
     """Cheap match first, then the full digest summary as the arbiter.
-    Both timestamps are reported; the *verified* one is the headline."""
+    Both timestamps are reported; the *verified* one is the headline.
+
+    A pre-seeded cell has no first sync to time: the destinations already
+    hold the content, verified by digest. It reports that explicitly rather
+    than a zero, which would read as an impossibly fast sync.
+    """
+    if pre_seeded:
+        return {corpus: {"verified": True, "pre_seeded": True} for corpus in corpora}
     expectations = {c: summary("cheap", f"{CORPUS}/{c}", remote=False) for c in corpora}
     started = time.monotonic()
     timings = {}
@@ -666,11 +708,19 @@ def run_tool(tool, cell, emitter, nonce):
 
     destroy_tool_state(emitter)
     restore_sources(corpora)
-    clear_destinations(corpora)
+    # A pre-seeded cell starts from a converged destination, so there is
+    # no first sync to time. Chromium cold sync is storage-bound — the two
+    # tools finished within one percent — and it costs more than half of
+    # such a job, so those cells buy nothing by paying for it.
+    pre_seeded = bool(cell.get("pre_seeded"))
+    if not pre_seeded:
+        clear_destinations(corpora)
     # Whatever happens below — a partial sampler start, a cold-sync
     # abort, an exception on its way to run_job's handler — the samplers
     # never outlive this tool.
     try:
+        if pre_seeded:
+            seed_destinations(corpora, emitter)
         start_samplers(tool)
         prepare_cold_sync(corpora)
         offset = clock_offset()
@@ -679,7 +729,7 @@ def run_tool(tool, cell, emitter, nonce):
         status = "ok"
         phase("cold_sync")
         start_tool(tool, corpora)
-        timings = await_cold_sync(corpora, emitter, tool)
+        timings = await_cold_sync(corpora, emitter, tool, pre_seeded=pre_seeded)
         phase_end("cold_sync")
         emitter.emit({"measurement": "cold_sync", "tool": tool, "timings": timings})
         if not all(t.get("verified") for t in timings.values()):
@@ -696,13 +746,21 @@ def run_tool(tool, cell, emitter, nonce):
         if not settled:
             status = "unsettled_idle"
 
-        verify_partitions(corpora)
-        phase("workload")
-        outputs = run_workload(cell, emitter, tool, nonce)
-        phase_end("workload")
-        clean, reports = collect_workload(outputs, emitter, tool)
-        if not clean:
-            status = "workload_error"
+        # A cell with no agents is measuring the first synchronization and
+        # nothing else: there is no workload to run, and running one would
+        # only add churn to a number that is about transfer.
+        if cell["agents"] == 0:
+            emitter.emit({"measurement": "workload", "tool": tool,
+                          "direction": "none", "skipped": "cold sync only"})
+            reports = []
+        else:
+            verify_partitions(corpora)
+            phase("workload")
+            outputs = run_workload(cell, emitter, tool, nonce)
+            phase_end("workload")
+            clean, reports = collect_workload(outputs, emitter, tool)
+            if not clean:
+                status = "workload_error"
         # Background editing stops when the offered-load window ends, so
         # the window the agents report — not launch-to-drain, whose tail
         # is a tool-dependent drain of up to the full deadline — is the

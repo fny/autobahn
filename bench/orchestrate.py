@@ -50,27 +50,51 @@ CELLS = [
     # pair at 1. At 10 it is a fan-out: one alpha, ten betas, which asks a
     # different question — autobahn fans a config group into one session
     # per beta, so ten betas means ten sessions scanning the same source.
-    ("chromium-1", ["chromium"], 1, False, 1),
-    ("chromium-10", ["chromium"], 10, False, 1),
-    ("chromium-100", ["chromium"], 100, False, 1),
-    ("chromium-1-bidir", ["chromium"], 1, True, 1),
-    ("chromium-10-bidir", ["chromium"], 10, True, 1),
-    ("chromium-100-bidir", ["chromium"], 100, True, 1),
-    ("50k-1", ["sub50k"], 1, False, 1),
-    ("50k-10", ["sub50k"], 10, False, 1),
-    ("50k-100", ["sub50k"], 100, False, 1),
-    ("two50k-1", ["sub50k", "sub50k-b"], 1, False, 1),
-    ("two50k-10", ["sub50k", "sub50k-b"], 10, False, 1),
-    ("two50k-100", ["sub50k", "sub50k-b"], 100, False, 1),
-    ("5k-1", ["sub5k"], 1, False, 1),
-    ("5k-10", ["sub5k"], 10, False, 1),
-    ("5k-100", ["sub5k"], 100, False, 1),
+    #
+    # `seed` fills the destinations from the copy already in the image
+    # rather than timing a first synchronization.
+    #
+    # Cold sync and steady-state latency are separate questions and are
+    # measured separately. A latency cell wants the tools already caught
+    # up, so it seeds; the first-sync cells below measure the transfer on
+    # its own, where its cost buys a result instead of a delay. Mixing the
+    # two made every latency job pay for a transfer it was not reporting —
+    # more than half of a Chromium job, multiplied by the destination
+    # count in a fan-out.
+    ("chromium-1", ["chromium"], 1, False, 1, True),
+    ("chromium-10", ["chromium"], 10, False, 1, True),
+    ("chromium-100", ["chromium"], 100, False, 1, True),
+    ("chromium-1-bidir", ["chromium"], 1, True, 1, True),
+    ("chromium-10-bidir", ["chromium"], 10, True, 1, True),
+    ("chromium-100-bidir", ["chromium"], 100, True, 1, True),
+    ("50k-1", ["sub50k"], 1, False, 1, True),
+    ("50k-10", ["sub50k"], 10, False, 1, True),
+    ("50k-100", ["sub50k"], 100, False, 1, True),
+    ("two50k-1", ["sub50k", "sub50k-b"], 1, False, 1, True),
+    ("two50k-10", ["sub50k", "sub50k-b"], 10, False, 1, True),
+    ("two50k-100", ["sub50k", "sub50k-b"], 100, False, 1, True),
+    ("5k-1", ["sub5k"], 1, False, 1, True),
+    ("5k-10", ["sub5k"], 10, False, 1, True),
+    ("5k-100", ["sub5k"], 100, False, 1, True),
     # Fan-out: one alpha, ten betas, at a fixed agent count so that width
     # is the only variable.
-    ("5k-10-fan", ["sub5k"], 10, False, 10),
-    ("50k-10-fan", ["sub50k"], 10, False, 10),
-    ("two50k-10-fan", ["sub50k", "sub50k-b"], 10, False, 10),
-    ("chromium-10-fan", ["chromium"], 10, False, 10),
+    ("5k-10-fan", ["sub5k"], 10, False, 10, True),
+    ("50k-10-fan", ["sub50k"], 10, False, 10, True),
+    ("two50k-10-fan", ["sub50k", "sub50k-b"], 10, False, 10, True),
+    ("chromium-10-fan", ["chromium"], 10, False, 10, True),
+
+    # First synchronization, measured on its own. These do not seed — the
+    # transfer *is* the measurement. Agents are 0: nothing edits, so the
+    # number is the transfer and nothing else. Each corpus is measured
+    # to one destination and to ten, which is the question a fan-out
+    # actually raises for a first sync: does a source pay per destination,
+    # or does it share the work?
+    ("coldsync-5k", ["sub5k"], 0, False, 1, False),
+    ("coldsync-50k", ["sub50k"], 0, False, 1, False),
+    ("coldsync-chromium", ["chromium"], 0, False, 1, False),
+    ("coldsync-5k-fan", ["sub5k"], 0, False, 10, False),
+    ("coldsync-50k-fan", ["sub50k"], 0, False, 10, False),
+    ("coldsync-chromium-fan", ["chromium"], 0, False, 10, False),
 ]
 
 
@@ -171,10 +195,24 @@ def cell_instance(cell):
 
 
 def cell_cost(cell):
-    """A job's rough duration, for scheduling. Two tools, and a fan-out
-    multiplies the transfer but not the source's scan."""
+    """A job's rough duration, for scheduling.
+
+    A latency cell seeds, so it pays only the fixed workload, idle and
+    reconvergence time plus a verification pass. A cold-sync cell pays the
+    transfer instead, which is the whole point of it, multiplied by the
+    number of destinations the source must serve.
+    """
     corpus = sum(CORPUS_COST[c] for c in cell[1])
-    return corpus * (1 + 0.4 * (cell[4] - 1)) * (2 if cell[3] else 1)
+    directions = 2 if cell[3] else 1
+    if len(cell) > 5 and cell[5]:
+        return (1.0 + 0.2 * corpus) * directions
+    # Not seeded: a first-synchronization measurement. The source pushes
+    # the whole tree to every destination, but the transfers overlap and
+    # read the same files, so the page cache serves most of the repeats.
+    # Scaling as the square root of the destination count is a guess in
+    # between "free" and "ten times" — and how wrong it is happens to be
+    # what these cells measure.
+    return corpus * (cell[4] ** 0.5) * directions
 
 
 def schedule(groups, jobs):
@@ -517,13 +555,14 @@ def dispatch(options):
     # Jobs: cells × repeats, shuffled; tool order randomized per job.
     jobs = []
     for repeat in range(options.repeats):
-        for name, corpora, agents, bidirectional, betas in selected:
+        for name, corpora, agents, bidirectional, betas, seed in selected:
             tools = ["autobahn", "mutagen"]
             rng.shuffle(tools)
             jobs.append({
                 "run": run_id, "repeat": repeat, "job": f"{name}-r{repeat}",
                 "cell": {"name": name, "corpora": corpora, "agents": agents,
-                         "bidirectional": bidirectional, "betas": betas},
+                         "bidirectional": bidirectional, "betas": betas,
+                         "pre_seeded": seed},
                 "tools": tools,
             })
     rng.shuffle(jobs)

@@ -174,6 +174,32 @@ assert restored == pristine, f"restore left {victim} corrupted"
 print(f"  restored {victim} ({len(pristine)} bytes)")
 EOF
 
+echo "== a pre-seeded cell starts converged and skips cold sync =="
+# Seeding fills the destination from the corpus already present, then
+# verifies by digest. A cell that seeds must report cold sync as
+# pre_seeded rather than as an impossibly fast measurement.
+SEEDSPEC='{"run":"smoke-run","pair":"pair-0","job":"seed-job","repeat":0,
+       "cell":{"name":"seeded","corpora":["smoke"],"agents":1,"bidirectional":false,
+               "pre_seeded":true},
+       "tools":["toysync"]}'
+BENCH_HOME="$JOBHOME" BENCH_LOCAL=1 BENCH_OBSERVER_PORT=19911 BENCH_WORKLOAD_SECONDS=10 \
+  python3 "$HERE/job.py" --spec "$SEEDSPEC" --output "$JOBHOME/seed.jsonl"
+python3 - "$JOBHOME/seed.jsonl" <<'EOF'
+import json, sys
+records = [json.loads(l) for l in open(sys.argv[1])]
+kinds = [r["measurement"] for r in records]
+assert "seeded" in kinds, "the seed step never ran"
+cold = next(r for r in records if r["measurement"] == "cold_sync")
+for corpus, timing in cold["timings"].items():
+    assert timing.get("pre_seeded"), f"{corpus} did not report as pre-seeded: {timing}"
+    assert timing.get("verified"), timing
+    # A seeded cell must not invent a duration.
+    assert "digest_verified_s" not in timing, timing
+complete = next(r for r in records if r["measurement"] == "job_complete")
+assert complete["statuses"] == {"toysync": "ok"}, complete
+EOF
+echo "  seeded cell: cold sync reported as pre-seeded, job ok"
+
 SPEC='{"run":"smoke-run","pair":"pair-0","job":"smoke-job","repeat":0,
        "cell":{"name":"smoke","corpora":["smoke"],"agents":10,"bidirectional":false},
        "tools":["toysync"]}'

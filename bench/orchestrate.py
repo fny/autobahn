@@ -23,7 +23,7 @@ interrupted orchestration is always cleanly collectable.
 
 Usage:
   orchestrate.py bake --profile P --region R
-  orchestrate.py run  --profile P --region R --ami AMI --pairs 15 --repeats 3
+  orchestrate.py run  --profile P --region R --ami AMI --budget 1000 --repeats 10
   orchestrate.py destroy --profile P --region R --run RUN_ID
   orchestrate.py aggregate results/
 """
@@ -148,23 +148,123 @@ EOF
 """
 
 
-def plan_widths(selected, pairwise_groups, fan_groups):
-    """How wide each group must be, given the cells selected.
+# Instance size per corpus, from the peak CPU each actually reached in the
+# ten-repeat matrix: 4k 0.7 cores, 50k 1.7, two-50k 2.3, chromium 3.3 —
+# against the 16 vCPUs every host used to get. The size leaves room for the
+# tool, the load generator's threads and the observer's polling on the same
+# host, and nothing more. Since the quota is counted in vCPUs, right-sizing
+# is what buys parallelism.
+CORPUS_SIZE = {
+    "sub5k": "c6i.xlarge",       # 4 vCPU
+    "sub50k": "c6i.2xlarge",     # 8 vCPU
+    "sub50k-b": "c6i.2xlarge",
+    "chromium": "c6i.4xlarge",   # 16 vCPU — the only corpus that needs them
+}
+VCPUS = {"c6i.xlarge": 4, "c6i.2xlarge": 8, "c6i.4xlarge": 16}
+# Rough job cost, for longest-first packing. Only the ratios matter.
+CORPUS_COST = {"sub5k": 1, "sub50k": 2, "sub50k-b": 2, "chromium": 10}
 
-    Pairwise cells need two machines. A fan-out cell needs one source plus
-    its betas, and cannot be split, so the run needs at least one group of
-    that width. Wide groups are scarce and expensive, so only as many as
-    asked for are built, and pairwise work fills whatever is left over.
+
+def cell_instance(cell):
+    """The smallest instance every corpus in this cell can run on."""
+    return max((CORPUS_SIZE[corpus] for corpus in cell[1]), key=lambda t: VCPUS[t])
+
+
+def cell_cost(cell):
+    """A job's rough duration, for scheduling. Two tools, and a fan-out
+    multiplies the transfer but not the source's scan."""
+    corpus = sum(CORPUS_COST[c] for c in cell[1])
+    return corpus * (1 + 0.4 * (cell[4] - 1)) * (2 if cell[3] else 1)
+
+
+def schedule(groups, jobs):
+    """Places jobs on groups longest-first and returns the makespan.
+
+    A group can take any job that fits: wide enough for its destinations,
+    and on an instance at least as large as the job needs. Size is a floor,
+    not a match — a chromium group can run a 5k job, which is what lets the
+    scheduler fill idle capacity instead of stranding it.
+
+    Longest-first is the standard heuristic and matters here because one
+    chromium job outweighs ten small ones: start the big ones last and they
+    become the tail nothing can hide.
     """
-    widths = [2] * max(0, pairwise_groups)
-    fan_widths = sorted({1 + cell[4] for cell in selected if cell[4] > 1}, reverse=True)
-    if fan_widths:
-        if fan_groups < 1:
-            raise RuntimeError(
-                "the selection includes fan-out cells, so --fan-groups must be at least 1")
-        for index in range(fan_groups):
-            widths.append(fan_widths[index % len(fan_widths)])
-    return widths
+    loads = [0.0] * len(groups)
+    placement = [[] for _ in groups]
+    for job in sorted(jobs, key=lambda job: -job["cost"]):
+        fits = [
+            index for index, (width, instance) in enumerate(groups)
+            if width >= job["machines"] and VCPUS[instance] >= VCPUS[job["instance"]]
+        ]
+        if not fits:
+            return None, None
+        chosen = min(fits, key=lambda index: (loads[index], VCPUS[groups[index][1]]))
+        loads[chosen] += job["cost"]
+        placement[chosen].append(job)
+    return max(loads), placement
+
+
+def plan_groups(selected, repeats, budget_vcpus):
+    """Chooses which machine groups to build, to finish soonest.
+
+    Jobs of different shapes cannot share groups — a fan-out job needs
+    eleven machines, a chromium job needs large ones — so the budget has to
+    be split between shapes. For a shape holding `cost` units of work on
+    `n` groups, that shape finishes at `cost / n`. Everything finishes when
+    the slowest shape does, so the split that finishes soonest is the one
+    where every shape finishes together.
+
+    Setting `cost_s / n_s = T` for every shape and spending the whole
+    budget gives `T = sum(cost_s × vcpu_s) / budget` and `n_s = cost_s / T`
+    directly, with no search. Integer rounding is then spent where it helps
+    most.
+    """
+    shapes = {}
+    for cell in selected:
+        shape = (1 + cell[4], cell_instance(cell))
+        shapes[shape] = shapes.get(shape, 0.0) + cell_cost(cell) * repeats
+
+    vcpus = {shape: shape[0] * VCPUS[shape[1]] for shape in shapes}
+    base = sum(vcpus.values())
+    if base > budget_vcpus:
+        raise RuntimeError(
+            f"one group of each shape needs {base} vCPUs, beyond the budget of "
+            f"{budget_vcpus}. Narrow the selection with --cells.")
+
+    # The continuous optimum, then floored to whole groups.
+    weighted = sum(shapes[shape] * vcpus[shape] for shape in shapes) or 1.0
+    horizon = weighted / budget_vcpus
+    counts = {shape: max(1, int(shapes[shape] / horizon)) for shape in shapes}
+
+    # More groups than jobs of a shape cannot help.
+    limit = {}
+    for cell in selected:
+        shape = (1 + cell[4], cell_instance(cell))
+        limit[shape] = limit.get(shape, 0) + repeats
+    for shape in counts:
+        counts[shape] = min(counts[shape], limit[shape])
+
+    spent = sum(counts[shape] * vcpus[shape] for shape in counts)
+    while spent > budget_vcpus:
+        # Over budget after rounding: take from whichever shape loses least.
+        shape = max((s for s in counts if counts[s] > 1),
+                    key=lambda s: shapes[s] / counts[s] - shapes[s] / (counts[s] - 1))
+        counts[shape] -= 1
+        spent -= vcpus[shape]
+
+    # Spend what rounding left over on whichever shape is slowest.
+    while True:
+        affordable = [s for s in counts
+                      if spent + vcpus[s] <= budget_vcpus and counts[s] < limit[s]]
+        if not affordable:
+            break
+        shape = max(affordable, key=lambda s: shapes[s] / counts[s])
+        counts[shape] += 1
+        spent += vcpus[shape]
+
+    groups = [shape for shape, count in counts.items() for _ in range(count)]
+    groups.sort(key=lambda shape: (-VCPUS[shape[1]], -shape[0]))
+    return groups
 
 
 def run(command, check=True, capture=True):
@@ -321,8 +421,33 @@ def dispatch(options):
             key, group = provision_network(
                 argparse.Namespace(profile=options.profile, region=options.region), run_id)
 
-    instances = launch(options, run_id, INSTANCE_TYPE, group, key,
-                       count=options.pairs * 2, ami=options.ami)
+    # Which cells are in play decides how many machines of which size are
+    # needed, so the selection is resolved before anything is launched.
+    selected = CELLS
+    if getattr(options, "cells", None):
+        wanted = set(options.cells.split(","))
+        selected = [c for c in CELLS if c[0] in wanted]
+        missing = wanted - {c[0] for c in selected}
+        if missing:
+            raise RuntimeError(f"unknown cells: {sorted(missing)}")
+        print(f"cell filter: {[c[0] for c in selected]}")
+
+    planned = plan_groups(selected, options.repeats, options.budget)
+    from collections import Counter
+    print(f"{len(planned)} group(s), {sum(w for w, _ in planned)} machines, "
+          f"{sum(w * VCPUS[t] for w, t in planned)} of {options.budget} vCPU")
+    for (width, instance), count in sorted(Counter(planned).items()):
+        print(f"    {count} × {width} machines of {instance}")
+
+    # Launch each instance type in one call, then hand them out in the
+    # order the groups were planned.
+    by_type, instances = {}, []
+    for instance_type in sorted({t for _, t in planned}):
+        needed = sum(w for w, t in planned if t == instance_type)
+        launched = launch(options, run_id, instance_type, group, key,
+                          count=needed, ami=options.ami)
+        by_type[instance_type] = launched
+        instances.extend(launched)
     addresses = wait_for_address(options, instances)
     for instance in instances:
         wait_for_ssh(addresses[instance], key)
@@ -332,11 +457,12 @@ def dispatch(options):
     # 11. Wiring is the same either way — the source learns every
     # destination as `dest1`..`destN`, with `dest` aliased to the first so
     # nothing that assumes a single destination has to change.
-    groups = []
-    cursor = 0
-    for width in options.widths:
-        groups.append(instances[cursor:cursor + width])
-        cursor += width
+    groups, taken = [], {t: 0 for t in by_type}
+    for width, instance_type in planned:
+        start = taken[instance_type]
+        groups.append(by_type[instance_type][start:start + width])
+        taken[instance_type] = start + width
+    group_types = [instance_type for _, instance_type in planned]
 
     for index, members in enumerate(groups):
         source = members[0]
@@ -389,14 +515,6 @@ def dispatch(options):
                 raise RuntimeError(f"observers on {host} never came up: {ready.stdout}")
 
     # Jobs: cells × repeats, shuffled; tool order randomized per job.
-    selected = CELLS
-    if getattr(options, "cells", None):
-        wanted = set(options.cells.split(","))
-        selected = [c for c in CELLS if c[0] in wanted]
-        missing = wanted - {c[0] for c in selected}
-        if missing:
-            raise RuntimeError(f"unknown cells: {sorted(missing)}")
-        print(f"cell filter: {[c[0] for c in selected]}")
     jobs = []
     for repeat in range(options.repeats):
         for name, corpora, agents, bidirectional, betas in selected:
@@ -444,7 +562,8 @@ def dispatch(options):
         check=False).stdout.strip() or None
     plan = {"run": run_id, "seed": seed, "ami": options.ami,
             "chromium_commit": chromium_commit,
-            "pairs": options.pairs, "repeats": options.repeats,
+            "groups": [[width, instance] for width, instance in planned],
+            "repeats": options.repeats,
             "cells": [c[0] for c in selected], "jobs": jobs}
     with open(f"results-{run_id}/plan.json", "w") as handle:
         json.dump(plan, handle, indent=2)
@@ -532,7 +651,9 @@ def main():
         s.add_argument("--region", required=True)
         if stage == "run":
             s.add_argument("--ami", required=True)
-            s.add_argument("--pairs", type=int, default=15)
+            s.add_argument("--budget", type=int, default=1000,
+                           help="vCPUs to spend; the planner picks how many "
+                                "machines of which size, to finish soonest")
             s.add_argument("--repeats", type=int, default=3)
             s.add_argument("--seed", type=int, default=1)
             s.add_argument("--run", default=None)

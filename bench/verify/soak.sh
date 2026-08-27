@@ -12,7 +12,11 @@ BM=~/bench/benchmark
 OUT=~/soak
 mkdir -p "$OUT"; rm -f "$OUT"/*.log "$OUT"/*.jsonl
 
-rm -rf ~/.autobahn ~/.autobahn-dev ~/dest/$CORPUS
+rm -rf ~/.autobahn ~/.autobahn-dev
+ssh -n dest "rm -rf ~/dest/$CORPUS && mkdir -p ~/dest/$CORPUS"
+# The observer lives on the destination, watching the tree it receives.
+ssh -n dest "pkill -f 'benchmark [o]bserver' 2>/dev/null; setsid nohup ~/bench/benchmark observer 9911 > ~/observer.log 2>&1 < /dev/null &"
+sleep 2
 cat > "$OUT/ab.toml" <<TOML
 [groups.soak]
 alpha = "$HOME/corpus/$CORPUS"
@@ -47,8 +51,13 @@ END=$(( $(date +%s) + HOURS*3600 ))
 ROUND=0
 while [ "$(date +%s)" -lt "$END" ]; do
   ROUND=$((ROUND+1))
+  # The observer must run on the DESTINATION host and watch the
+  # destination's own copy. Pointing it at 127.0.0.1 measures a path that
+  # does not exist on this host, so every edit is correctly censored and
+  # the run yields resource data but no latency. Learned the hard way.
   "$BM" agents --root ~/corpus/$CORPUS --peer-root ~/dest/$CORPUS \
-    --observer 127.0.0.1:9911 --partitions ~/corpus/$CORPUS.bench/partitions.json \
+    --observer "$(cat ~/bench/peer-ip | head -1):9911" \
+    --partitions ~/corpus/$CORPUS.bench/partitions.json \
     --side a --agents 10 --seconds 600 --label "soak-$ROUND" --nonce $((RANDOM*ROUND+7)) \
     >> "$OUT/agents.jsonl" 2>> "$OUT/agents.err"
   echo "round $ROUND done at $(date -u +%H:%M:%S)" >> "$OUT/progress.log"

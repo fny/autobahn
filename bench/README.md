@@ -27,11 +27,11 @@ python3 orchestrate.py bake --profile PROFILE --region REGION
 
 # Run the matrix. Prints the run id and the destroy command.
 python3 orchestrate.py run --profile PROFILE --region REGION \
-    --ami AMI --pairs 32 --repeats 10
+    --ami AMI --budget 2000 --repeats 10
 
 # One cell only, for a before/after on a single change.
 python3 orchestrate.py run --profile PROFILE --region REGION \
-    --ami AMI --pairs 10 --repeats 10 --cells 5k-1
+    --ami AMI --budget 400 --repeats 10 --cells 5k-1
 
 # Turn JSONL into tables.
 python3 aggregate.py results-RUN_ID/
@@ -48,14 +48,43 @@ result. It is the harness's contract with itself.
 
 ---
 
+## How many machines, and which
+
+`--budget` is a number of vCPUs, not a number of machines, because that is
+what the account's quota actually limits. The planner spends it.
+
+Cells run on the smallest instance their corpus needs, measured rather than
+guessed — peak CPU was 0.7 cores on 5k, 1.7 on 50k, 2.3 on two 50k trees
+and 3.3 on Chromium. Giving every host sixteen vCPUs wasted most of the
+quota, and the quota is what caps parallelism.
+
+Groups come in shapes: a width (one source plus its destinations) and an
+instance size. Jobs of one shape cannot run on a smaller one, so the budget
+has to be divided between shapes. A shape holding C units of work on N
+groups finishes at C/N, and the whole run finishes when the slowest shape
+does — so the fastest split is the one where every shape finishes together.
+Setting C/N equal across shapes and spending the whole budget gives N
+directly, with no search.
+
+Jobs are then placed longest-first, and instance size is a floor rather
+than a match: a Chromium group will take a 5k job when it would otherwise
+sit idle.
+
+One consequence worth knowing before planning a run: `chromium-10-fan` —
+ten destinations each pulling half a million files — costs more than every
+other cell combined. Dropping it, or running it at fewer repeats, roughly
+halves a full matrix.
+
+---
+
 ## Vocabulary
 
 | Term | Meaning |
 |---|---|
-| **Cell** | One configuration: corpus × agent count × direction. `chromium-10` is Chromium with ten agents, one direction. |
+| **Cell** | One configuration: corpus × agent count × direction × destinations. `chromium-10` is Chromium with ten agents to one destination; `chromium-10-fan` is the same source feeding ten. |
 | **Job** | One cell executed on one host pair, running **both tools back to back in a randomized order**. The unit of scheduling. |
 | **Repeat** | The whole set of jobs, run again. Statistics are computed across repeats. |
-| **Pair** | Two hosts. A is source and driver, B is destination. A pair runs its jobs serially; pairs run concurrently. |
+| **Group** | One source host followed by its destinations. Two machines for a pairwise cell, eleven for a fan-out. A group runs its jobs serially; groups run concurrently. |
 | **Agent** | A thread simulating a developer's editor, rewriting files on a coding cadence. One agent per editing side also measures. |
 | **Floor** | The harness's own contribution to a measured latency, measured per pair before any tool runs. |
 | **Censored** | An edit that exceeded its deadline. Counted and held in the percentiles, never dropped. |

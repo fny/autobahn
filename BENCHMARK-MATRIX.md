@@ -57,12 +57,17 @@ Chromium with a single writer.
 in tree size and a 100× change in concurrency. mutagen's moves from 62 ms to
 11,600 ms, a factor of 187.
 
-**The 99th percentile is where autobahn is imperfect.** In several cells it
-sits far above the 90th — 16,188 ms against 286 ms on `chromium-1`. Per-run
-medians are tight across the ten machines, so this is systematic. Roughly
-one edit in a hundred stalls for seconds. The cause is open; the leading
-candidate on large trees is the 120-second periodic full scan that bounds
-how long a missed filesystem event can persist.
+**The 99th percentile carries a defect, not a scaling limit.** In several
+cells autobahn's 99th percentile sits far above its 90th. The cause is a
+self-inflicted session restart: under churn a file is rewritten between
+staging and application, the cycle reports missing staged content, and after
+six such cycles autobahn fails the whole attempt even though each cycle
+applied dozens of other changes. The supervisor then drops the session,
+backs off, reconnects and rescans, and nothing propagates meanwhile.
+Restarts number 30 across `chromium-100-bidir`, 8 across `4k-100`, and 2 in
+a single `chromium-1` run. Every cell with a multi-second outlier has them,
+and every cell without them has a clean tail. Details in
+[BENCHMARK.md](BENCHMARK.md#where-autobahn-is-weakest).
 
 **mutagen's ordering is not monotonic in agent count.** On the 40k corpus it
 is slower at 10 agents (1,854 ms) than at 100 (1,602 ms). Both are far above

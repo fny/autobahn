@@ -627,12 +627,32 @@ footer{margin-top:4rem;padding-top:1.5rem;border-top:1px solid var(--rule);
 
 <h2>Where autobahn is weakest</h2>
 <div class="prose">
-<p>Autobahn leads every cell at the median, so its weaknesses are in the tail rather than in the ranking. Two are worth stating plainly.</p>
-<ul>
-  <li><strong>Heavy bidirectional load.</strong> At <code>chromium-100-bidir</code> — 200 agents editing 505,000 files in both directions at once — autobahn keeps the better median (5,413 ms against 11,600 ms) but its 90th percentile is <em>worse</em>: 16,451 ms against 15,831 ms. Its tail discipline holds everywhere else and breaks here. This cell also produced most of the run's skipped ticks, so the offered edit rate fell slightly short for both tools.</li>
-  <li><strong>Occasional multi-second outliers.</strong> In several cells autobahn's 99th percentile sits far above its 90th — on <code>chromium-1</code>, 16,188 ms against 286 ms. Per-run medians are tight across the ten machines (182.7–202.0 ms), so this is systematic rather than one bad run: roughly one edit in a hundred stalls for seconds.</li>
-</ul>
-<p>The cause of the second is not established. The leading candidate on large trees is the 120-second periodic full scan, which exists to bound how long a missed filesystem event can persist and which takes seconds on a 505,000-file tree. That does not explain a 4,204 ms 99th percentile on the 4,000-file corpus, so a second mechanism is likely. This is open work, and it is the kind of defect only many repeats can surface — three would not have shown it.</p>
+<p>Autobahn leads every cell at the median, so its weakness is in the tail — and investigation traced both of its poor results to a single defect rather than to a scaling limit.</p>
+
+<p>Under sustained churn a file can be rewritten between the moment autobahn stages it and the moment it applies it. The cycle reports missing staged content and retries. That retry is capped at six cycles, after which autobahn <strong>fails the whole attempt</strong> — even though every one of those cycles successfully applied dozens of other changes. The supervisor treats the failure as a dead session: it drops the session, waits out a retry interval, reconnects, and rescans. Nothing propagates for several seconds, the open-loop workload queues behind it, and the queue releases at once. That is why the outliers form an arithmetic ramp rather than a spread.</p>
+
+<p>The resource traces show it directly: both hosts fall to zero CPU together, resident memory drops on each side as the session's trees are freed, then CPU spikes as the replacement session rescans.</p>
+</div>
+
+<div class="scroll">
+<table>
+  <caption>Session restarts counted from the resource traces, against the worst latency observed in that cell.</caption>
+  <thead><tr><th>cell</th><th class="num">runs with a restart</th><th class="num">restarts</th><th class="num">worst latency</th></tr></thead>
+  <tbody>
+    <tr><th scope="row">chromium-100-bidir</th><td class="num">9 of 10</td><td class="num">30</td><td class="num">40,532 ms</td></tr>
+    <tr><th scope="row">4k-100</th><td class="num">6 of 10</td><td class="num">8</td><td class="num">6,239 ms</td></tr>
+    <tr><th scope="row">chromium-1</th><td class="num">1 of 10</td><td class="num">2</td><td class="num">30,380 ms</td></tr>
+    <tr><th scope="row">chromium-10-bidir</th><td class="num">1 of 10</td><td class="num">1</td><td class="num">30,912 ms</td></tr>
+  </tbody>
+</table>
+</div>
+
+<div class="prose">
+<p>Every cell with a multi-second outlier has restarts. Every cell without them has a clean tail — <code>chromium-1</code>'s pooled 99th percentile of 16,188 ms comes entirely from one run in ten, while the other nine peak near 2,000 ms. It reproduces locally in a single run, and autobahn names it in its own log: <code>staged content was still missing after 6 cycles; source content is changing faster than it can be transferred</code>.</p>
+
+<p>It requires the network path. The identical workload local-to-local never triggers it, because local staging is a copy fast enough to win the race against the writers.</p>
+
+<p class="note"><strong>This is a defect, not a limit.</strong> The retry cap counts cycles rather than lack of progress, so a busy tree exhausts it while synchronizing perfectly well — and restarting is the worst available response, costing a reconnection and a full rescan during which nothing moves. Failing only when a cycle applies no transitions at all would separate a genuinely stuck session from a merely busy one.</p>
 </div>
 
 <h2>What makes these numbers trustworthy</h2>

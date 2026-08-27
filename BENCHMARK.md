@@ -116,21 +116,54 @@ the matrix.
 **Heavy bidirectional load.** At `chromium-100-bidir` — 200 agents editing
 505,000 files in both directions at once — autobahn keeps the better median
 (5,413 ms against 11,600 ms) but its 90th percentile is **worse**: 16,451 ms
-against mutagen's 15,831 ms. Its tail discipline holds everywhere else and
-breaks here. This cell also produced most of the run's skipped ticks, so the
-offered edit rate fell slightly short for both tools.
+against mutagen's 15,831 ms. This is not the engine degrading under load. It
+is the session-restart defect described next, which fired 30 times across
+this cell's ten runs. This cell also produced most of the run's skipped
+ticks, so the offered edit rate fell slightly short for both tools.
 
-**Occasional multi-second outliers.** In several cells autobahn's 99th
-percentile is far above its 90th. On `chromium-1` the 90th percentile is
-286 ms and the 99th is 16,188 ms. The per-run medians are tight — 182.7 ms
-to 202.0 ms across ten machines — so this is systematic, not one bad run.
-About one edit in a hundred stalls for seconds.
+**Occasional multi-second outliers, from a self-inflicted session restart.**
+In several cells autobahn's 99th percentile is far above its 90th. The cause
+is now established, and it is the same cause as the bidirectional result
+above.
 
-The cause is not yet established. The leading candidate on large trees is
-the 120-second periodic full scan, which exists to bound how long a missed
-filesystem event can persist and which takes seconds on a 505,000-file tree.
-That does not explain the 4,204 ms 99th percentile on the 4,000-file corpus
-at 100 agents, so there is probably a second mechanism. This is open work.
+Under sustained churn, a file can be rewritten between the moment autobahn
+stages it and the moment it applies it. The cycle then reports missing
+staged content and retries. `MAXIMUM_FOLLOW_UP_CYCLES` bounds that retry at
+six cycles and then **fails the whole attempt**, even when every one of
+those cycles successfully applied dozens of other changes. The supervisor
+treats the failure as a dead session: it drops the session, waits out a
+retry interval, reconnects, and rescans. Nothing propagates for several
+seconds, the open-loop workload queues, and every queued edit completes at
+once — which is why the outliers form an arithmetic ramp rather than a
+spread.
+
+The resource traces show it directly. Both hosts fall to zero CPU together,
+resident memory drops on both sides as the session's trees are freed, then
+CPU spikes as the replacement session rescans. Counting those events:
+
+| cell | runs with a restart | restarts | worst latency |
+|---|---|---|---|
+| `chromium-100-bidir` | 9 of 10 | 30 | 40.5 s |
+| `4k-100` | 6 of 10 | 8 | 6.2 s |
+| `chromium-1` | 1 of 10 | 2 | 30.4 s |
+| `chromium-10-bidir` | 1 of 10 | 1 | 30.9 s |
+
+Every cell with a multi-second outlier has restarts. Every cell without
+restarts has a clean tail. It reproduces locally in one run with 100 agents
+against a 4,000-file corpus over SSH, and autobahn names it in its own log:
+`staged content was still missing after 6 cycles; source content is changing
+faster than it can be transferred`.
+
+It needs the network path. The identical workload local-to-local never
+triggers it, because local staging is a copy that wins the race against the
+writers.
+
+**This is a defect, not a limit.** The retry cap counts cycles rather than
+lack of progress, so a busy tree exhausts it while synchronizing perfectly
+well. Restarting is also the worst available response: it costs a
+reconnection and a full rescan, during which nothing moves at all. Failing
+only when a cycle applies *no* transitions would distinguish a genuinely
+stuck session from a merely busy one.
 
 ## Confidence
 

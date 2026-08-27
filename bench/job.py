@@ -103,19 +103,47 @@ def run_argv(argv, check=False, timeout=None):
     )
 
 
-def peer(command, timeout=None):
-    """Runs a shell command on host B. Single-quoted so this host's shell
-    cannot expand anything, and -n so ssh never consumes stdin."""
+def destinations():
+    """The SSH aliases of every destination, in order.
+
+    A pairwise job has one, reached as `dest`. A fan-out job has several,
+    reached as `dest1`..`destN`, and `dest` is an alias for the first, so
+    every single-destination path in this file keeps working unchanged.
+    The orchestrator writes these into the driver's ssh config.
+    """
+    if LOCAL:
+        return ["dest"]
+    listed = os.environ.get("BENCH_DESTINATIONS", "").strip()
+    return listed.split(",") if listed else ["dest"]
+
+
+def peer(command, timeout=None, host="dest"):
+    """Runs a shell command on a destination. Single-quoted so this host's
+    shell cannot expand anything, and -n so ssh never consumes stdin."""
     if LOCAL:
         return run(command, timeout=timeout)
-    return run(f"ssh -n dest {shlex.quote(command)}", timeout=timeout)
+    return run(f"ssh -n {host} {shlex.quote(command)}", timeout=timeout)
+
+
+def on_every_destination(command, timeout=None):
+    """Runs a command on every destination, returning the results in order.
+    A failure anywhere is the caller's to notice — this only collects."""
+    return [peer(command, timeout=timeout, host=host) for host in destinations()]
 
 
 def peer_ip():
+    """The first destination's private address."""
+    return peer_ips()[0]
+
+
+def peer_ips():
+    """Every destination's private address, in destination order. The
+    orchestrator writes one per line."""
     if LOCAL:
-        return "127.0.0.1"
+        return ["127.0.0.1"]
     with open(f"{BENCH}/peer-ip") as handle:
-        return handle.read().strip()
+        listed = [line.strip() for line in handle if line.strip()]
+    return listed or ["127.0.0.1"]
 
 
 def self_ip():
@@ -151,12 +179,12 @@ def kill_tools():
     # editing the corpus; they would contaminate the next tool's restore,
     # floor, and cold sync. The "agents" word never matches an observer.
     run(f"pkill -f '{BINARY} [a]gents'; true")
-    peer(f"pkill -f '{BINARY} [a]gents'; true")
+    on_every_destination(f"pkill -f '{BINARY} [a]gents'; true")
     if LOCAL:
         time.sleep(1)
         return
     run("pkill -x autobahn; pkill -x mutagen; true")
-    peer("pkill '^autobahn-'; pkill -x mutagen-agent; true")
+    on_every_destination("pkill '^autobahn-'; pkill -x mutagen-agent; true")
     time.sleep(2)
 
 
@@ -176,9 +204,9 @@ def destroy_tool_state(emitter):
     result = run(f"rm -rf {state} {HOME}/ab.toml")
     if result.returncode != 0:
         raise RuntimeError(f"local state removal failed: {result.stdout[-300:]}")
-    result = peer(f"rm -rf {state}")
-    if result.returncode != 0:
-        raise RuntimeError(f"remote state removal failed: {result.stdout[-300:]}")
+    for host, result in zip(destinations(), on_every_destination(f"rm -rf {state}")):
+        if result.returncode != 0:
+            raise RuntimeError(f"state removal failed on {host}: {result.stdout[-300:]}")
     if LOCAL:
         leftovers = run(f"pgrep -f 'python3 {BENCH}/[t]oysync.py'; true").stdout.strip()
         remote_leftovers = ""
@@ -186,16 +214,22 @@ def destroy_tool_state(emitter):
         leftovers = run(
             "pgrep -x autobahn; pgrep -x mutagen; true"
         ).stdout.strip()
-        remote_leftovers = peer(
-            "pgrep '^autobahn-'; pgrep -x mutagen-agent; true"
-        ).stdout.strip()
+        remote_leftovers = "".join(
+            result.stdout.strip()
+            for result in on_every_destination(
+                "pgrep '^autobahn-'; pgrep -x mutagen-agent; true")
+        )
     # Workload agents are the harness's own; a survivor in any mode means
     # the best-effort kill above failed and must be an error, not a
     # silently contaminated next run.
     leftovers += run(f"pgrep -f '{BINARY} [a]gents'; true").stdout.strip()
-    remote_leftovers += peer(f"pgrep -f '{BINARY} [a]gents'; true").stdout.strip()
+    remote_leftovers += "".join(
+        result.stdout.strip()
+        for result in on_every_destination(f"pgrep -f '{BINARY} [a]gents'; true"))
     surviving = run(f"ls -d {state} 2>/dev/null; true").stdout.strip()
-    remote_surviving = peer(f"ls -d {state} 2>/dev/null; true").stdout.strip()
+    remote_surviving = "".join(
+        result.stdout.strip()
+        for result in on_every_destination(f"ls -d {state} 2>/dev/null; true"))
     if leftovers or remote_leftovers or surviving or remote_surviving:
         emitter.emit({"measurement": "hygiene_failure",
                       "local": leftovers, "remote": remote_leftovers,
@@ -270,19 +304,41 @@ def prepare_cold_sync(corpora):
 
 def clear_destinations(corpora):
     for corpus in corpora:
-        result = peer(f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}")
-        if result.returncode != 0:
-            raise RuntimeError(f"destination reset failed: {result.stdout[-300:]}")
+        command = f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}"
+        for host, result in zip(destinations(), on_every_destination(command)):
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"destination reset failed on {host}: {result.stdout[-300:]}")
 
 
 # ── convergence ──────────────────────────────────────────────────────
 
 def summary(kind, root, remote):
+    """A manifest of `root`, locally or across every destination.
+
+    For a fan-out, every destination must agree *and* match the source, so
+    this returns a single summary only when they all agree — otherwise it
+    returns a marker that can never compare equal to the source. That makes
+    "converged" mean "converged everywhere" with no extra logic at the call
+    sites."""
     command = f"{BINARY} manifest {kind} {root}"
-    result = peer(command, timeout=1800) if remote else run(command, timeout=1800)
-    if result.returncode != 0:
-        return f"<error: {result.stdout.strip()[-200:]}>"
-    return result.stdout.strip().splitlines()[-1]
+    if not remote:
+        result = run(command, timeout=1800)
+        if result.returncode != 0:
+            return f"<error: {result.stdout.strip()[-200:]}>"
+        return result.stdout.strip().splitlines()[-1]
+
+    seen = []
+    for host, result in zip(destinations(), on_every_destination(command, timeout=1800)):
+        if result.returncode != 0:
+            return f"<error on {host}: {result.stdout.strip()[-200:]}>"
+        seen.append(result.stdout.strip().splitlines()[-1])
+    if len(set(seen)) != 1:
+        # Destinations disagree with each other, so the fan-out is still in
+        # flight. Naming them keeps the record diagnosable.
+        return "<destinations disagree: " + " | ".join(
+            f"{host}={text[:40]}" for host, text in zip(destinations(), seen)) + ">"
+    return seen[0]
 
 
 def clean(summary_text):
@@ -378,13 +434,15 @@ def start_samplers(tool):
     stop_samplers()
     run(f"setsid nohup {BINARY} sampler {shlex.quote(patterns['local_pattern'])} "
         f"{HOME}/rss-local.log >/dev/null 2>&1 < /dev/null &")
-    peer(f"setsid nohup {BINARY} sampler {shlex.quote(patterns['remote_pattern'])} "
-         f"{HOME}/rss-remote.log >/dev/null 2>&1 < /dev/null &")
+    on_every_destination(
+        f"setsid nohup {BINARY} sampler {shlex.quote(patterns['remote_pattern'])} "
+        f"{HOME}/rss-remote.log >/dev/null 2>&1 < /dev/null &")
 
 
 def collect_series():
     local = run(f"cat {HOME}/rss-local.log 2>/dev/null").stdout
-    remote = peer(f"cat {HOME}/rss-remote.log 2>/dev/null").stdout
+    remotes = [result.stdout
+               for result in on_every_destination(f"cat {HOME}/rss-remote.log 2>/dev/null")]
 
     def parse(text):
         rows = []
@@ -397,7 +455,22 @@ def collect_series():
                     continue
         return rows
 
-    return {"local": parse(local), "remote": parse(remote)}
+    parsed = [parse(text) for text in remotes]
+    if len(parsed) == 1:
+        return {"local": parse(local), "remote": parsed[0]}
+    # Several destinations: sum them per second, so "remote" is the whole
+    # cost of serving this source rather than one arbitrary machine's share.
+    # Rows are aligned by their own timestamps, to the nearest second.
+    merged = {}
+    for series in parsed:
+        for epoch, rss, jiffies, count in series:
+            slot = merged.setdefault(round(epoch), [round(epoch), 0, 0, 0])
+            slot[1] += rss
+            slot[2] += jiffies
+            slot[3] += count
+    return {"local": parse(local),
+            "remote": [merged[key] for key in sorted(merged)],
+            "remote_hosts": len(parsed)}
 
 
 # ── tools ────────────────────────────────────────────────────────────
@@ -412,7 +485,8 @@ def start_tool(tool, corpora):
                 'mode = "two-way-safe"',
                 "interval = 5",
                 'ignores = ["/.git", "/out"]',
-                f'betas = ["dest:{DEST}/{corpus}"]',
+                "betas = [" + ", ".join(
+                    f'"{host}:{DEST}/{corpus}"' for host in destinations()) + "]",
                 "",
             ]
         with open(f"{HOME}/ab.toml", "w") as handle:
@@ -422,9 +496,14 @@ def start_tool(tool, corpora):
     elif tool == "mutagen":
         run(f"{HOME}/mutagen daemon start", check=True)
         for corpus in corpora:
-            run(f"{HOME}/mutagen sync create --name={corpus} --sync-mode=two-way-safe "
-                f"--ignore=/.git --ignore=/out --watch-polling-interval=5 "
-                f"{CORPUS}/{corpus} dest:{DEST}/{corpus}", check=True)
+            # mutagen has no fan-out concept, so a fan-out cell becomes one
+            # session per destination — which is what autobahn's config also
+            # expands to internally, so the comparison stays fair.
+            for index, host in enumerate(destinations()):
+                name = corpus if len(destinations()) == 1 else f"{corpus}-{index}"
+                run(f"{HOME}/mutagen sync create --name={name} --sync-mode=two-way-safe "
+                    f"--ignore=/.git --ignore=/out --watch-polling-interval=5 "
+                    f"{CORPUS}/{corpus} {host}:{DEST}/{corpus}", check=True)
     elif tool == "toysync":
         for corpus in corpora:
             run(f"setsid nohup python3 {BENCH}/toysync.py {CORPUS}/{corpus} "
@@ -474,7 +553,8 @@ def run_workload(cell, emitter, tool, nonce):
             BINARY, "agents",
             "--root", f"{CORPUS}/{corpus}",
             "--peer-root", f"{DEST}/{corpus}",
-            "--observer", f"{peer_ip()}:{OBSERVER_BASE_PORT + index}",
+            "--observer", ",".join(
+                f"{address}:{OBSERVER_BASE_PORT + index}" for address in peer_ips()),
             "--partitions", f"{CORPUS}/{corpus}.bench/partitions.json",
             "--side", "a",
             "--agents", str(cell["agents"]),

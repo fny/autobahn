@@ -46,6 +46,10 @@ const ANNOUNCE_LEAD: Duration = Duration::from_millis(50);
 /// a ~0.75s cadence, 32 in flight means a tool ~24s behind — beyond that
 /// new edits skip ticks (recorded) rather than queue without bound.
 const MAX_IN_FLIGHT: usize = 32;
+/// How long a destination has to answer the opening ping. A destination
+/// that accepts a connection and then says nothing must fail the run, not
+/// stall it indefinitely.
+const PING_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Options {
     root: PathBuf,
@@ -186,12 +190,23 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
     Ok(())
 }
 
-/// One in-flight measured edit.
+/// One in-flight measured edit, across every destination it must reach.
+///
+/// A fan-out edit is not finished when *a* destination has it — it is
+/// finished when they all do. So the entry survives until the last
+/// acknowledgement, and the sample is measured to that one. The first
+/// acknowledgement is kept too, because the gap between first and last is
+/// the interesting thing about a fan-out: it says whether destinations
+/// converge together or straggle.
 struct InFlight {
     file_index: usize,
     started: Instant,
     /// Whether T0 fell inside the warmup window.
     warmup: bool,
+    /// Acknowledgements still outstanding, one per destination.
+    remaining: usize,
+    /// When the first destination confirmed the content.
+    first_ack: Option<Instant>,
 }
 
 fn measure(
@@ -200,32 +215,70 @@ fn measure(
     go_background: &AtomicBool,
     stop_background: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
-    let connection = TcpStream::connect(&options.observer)
-        .map_err(|error| format!("observer {}: {error}", options.observer))?;
-    let _ = connection.set_nodelay(true);
-    let reader_stream = connection.try_clone().map_err(|e| e.to_string())?;
-    // The reader wakes periodically to check for shutdown: a blocked
-    // read_line would otherwise pin the thread forever, because dropping
-    // the writer clone does not close a socket the reader still holds.
-    reader_stream
-        .set_read_timeout(Some(Duration::from_millis(500)))
-        .map_err(|error| error.to_string())?;
-    let shutdown_handle = connection.try_clone().map_err(|e| e.to_string())?;
-    let mut writer = connection;
+    // One connection per destination. A pairwise cell passes one address;
+    // a fan-out cell passes one per beta.
+    let addresses: Vec<&str> = options
+        .observer
+        .split(',')
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .collect();
+    if addresses.is_empty() {
+        return Err("--observer needs at least one address".into());
+    }
+    let destinations = addresses.len();
+
+    let mut writers = Vec::with_capacity(destinations);
+    let mut readers = Vec::with_capacity(destinations);
+    let mut shutdown_handles = Vec::with_capacity(destinations);
+    for address in &addresses {
+        let connection = TcpStream::connect(address)
+            .map_err(|error| format!("observer {address}: {error}"))?;
+        let _ = connection.set_nodelay(true);
+        let reader_stream = connection.try_clone().map_err(|e| e.to_string())?;
+        // The reader wakes periodically to check for shutdown: a blocked
+        // read would otherwise pin the thread forever, because dropping
+        // the writer clone does not close a socket the reader still holds.
+        reader_stream
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .map_err(|error| error.to_string())?;
+        shutdown_handles.push(connection.try_clone().map_err(|e| e.to_string())?);
+        readers.push(BufReader::new(reader_stream));
+        writers.push(connection);
+    }
 
     // Control-channel round trips, taken exactly like a sample would be.
-    let mut reader = BufReader::new(reader_stream);
+    // The slowest destination is the one that bounds a fan-out edit, so the
+    // reported round trip is the worst of them.
     let mut rtts = Vec::new();
     for seq in 0..20u64 {
         let start = Instant::now();
-        crate::send_message(&mut writer, &json!({"seq": seq, "op": "ping"}))
-            .map_err(|error| error.to_string())?;
-        loop {
-            match crate::read_message(&mut reader) {
-                Ok(Some(_)) => break,
-                Ok(None) => return Err("observer closed during ping".into()),
-                Err(error) if is_timeout(&error) => continue,
-                Err(error) => return Err(error.to_string()),
+        for writer in writers.iter_mut() {
+            crate::send_message(writer, &json!({"seq": seq, "op": "ping"}))
+                .map_err(|error| error.to_string())?;
+        }
+        for (index, reader) in readers.iter_mut().enumerate() {
+            // Bounded: a destination that accepts the connection but never
+            // answers must fail the run rather than hang it. With ten
+            // destinations that is no longer a remote possibility, and a
+            // silent hang would look like a slow benchmark rather than a
+            // broken one.
+            let give_up = Instant::now() + PING_TIMEOUT;
+            loop {
+                if Instant::now() > give_up {
+                    return Err(format!(
+                        "observer {} never answered a ping within {:?}",
+                        addresses[index], PING_TIMEOUT
+                    ));
+                }
+                match crate::read_message(reader) {
+                    Ok(Some(_)) => break,
+                    Ok(None) => {
+                        return Err(format!("observer {} closed during ping", addresses[index]))
+                    }
+                    Err(error) if is_timeout(&error) => continue,
+                    Err(error) => return Err(error.to_string()),
+                }
             }
         }
         rtts.push(start.elapsed().as_secs_f64() * 1000.0);
@@ -235,42 +288,77 @@ fn measure(
     // records latencies; the main thread issues edits on its cadence.
     let in_flight: Arc<Mutex<HashMap<u64, InFlight>>> = Default::default();
     let busy: Arc<Mutex<std::collections::HashSet<usize>>> = Default::default();
-    let outcomes: Arc<Mutex<Vec<(f64, bool)>>> = Default::default(); // (ms, warmup)
+    // (ms to the last destination, ms between first and last, warmup)
+    let outcomes: Arc<Mutex<Vec<(f64, f64, bool)>>> = Default::default();
     let censored = Arc::new(AtomicU64::new(0));
     let done = Arc::new(AtomicBool::new(false));
-    let reader_in_flight = Arc::clone(&in_flight);
-    let reader_busy = Arc::clone(&busy);
-    let reader_outcomes = Arc::clone(&outcomes);
-    let reader_censored = Arc::clone(&censored);
-    let reader_done = Arc::clone(&done);
-    let reader_thread = std::thread::spawn(move || {
-        while !reader_done.load(Ordering::Relaxed) {
-            let message = match crate::read_message(&mut reader) {
-                Ok(Some(message)) => message,
-                Ok(None) => break,
-                Err(error) if is_timeout(&error) => continue,
-                Err(_) => break,
-            };
-            let seq = message["seq"].as_u64().unwrap_or(u64::MAX);
-            let entry = reader_in_flight.lock().expect("in-flight lock").remove(&seq);
-            if let Some(entry) = entry {
+
+    // One reader per destination. They share the in-flight table, so an
+    // edit is retired by whichever thread delivers its final
+    // acknowledgement — no thread owns an edit, and none has to wait on
+    // another.
+    let mut reader_threads = Vec::with_capacity(destinations);
+    for mut reader in readers {
+        let reader_in_flight = Arc::clone(&in_flight);
+        let reader_busy = Arc::clone(&busy);
+        let reader_outcomes = Arc::clone(&outcomes);
+        let reader_censored = Arc::clone(&censored);
+        let reader_done = Arc::clone(&done);
+        reader_threads.push(std::thread::spawn(move || {
+            while !reader_done.load(Ordering::Relaxed) {
+                let message = match crate::read_message(&mut reader) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => break,
+                    Err(error) if is_timeout(&error) => continue,
+                    Err(_) => break,
+                };
+                let seq = message["seq"].as_u64().unwrap_or(u64::MAX);
+                let accepted = message["ok"].as_bool() == Some(true);
+                let mut table = reader_in_flight.lock().expect("in-flight lock");
+                let Some(entry) = table.get_mut(&seq) else {
+                    continue;
+                };
+                let now = Instant::now();
+                entry.first_ack.get_or_insert(now);
+                // A refusal from any destination fails the whole edit: the
+                // content did not reach everywhere it was meant to.
+                if !accepted {
+                    let entry = table.remove(&seq).expect("just looked it up");
+                    drop(table);
+                    reader_busy.lock().expect("busy lock").remove(&entry.file_index);
+                    if !entry.warmup {
+                        reader_censored.fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
+                entry.remaining -= 1;
+                if entry.remaining > 0 {
+                    continue; // other destinations still owe an answer
+                }
+                let entry = table.remove(&seq).expect("just looked it up");
+                drop(table);
                 reader_busy.lock().expect("busy lock").remove(&entry.file_index);
                 let elapsed = entry.started.elapsed();
+                let spread = entry
+                    .first_ack
+                    .map(|first| now.duration_since(first).as_secs_f64() * 1000.0)
+                    .unwrap_or(0.0);
                 // The deadline is judged here too: an acknowledgement that
                 // arrives after the deadline is censored, not a sample —
                 // otherwise a late ack racing the periodic sweep would be
                 // reported as a finite latency.
-                if message["ok"].as_bool() == Some(true) && elapsed <= DEADLINE {
-                    reader_outcomes
-                        .lock()
-                        .expect("outcomes lock")
-                        .push((elapsed.as_secs_f64() * 1000.0, entry.warmup));
+                if elapsed <= DEADLINE {
+                    reader_outcomes.lock().expect("outcomes lock").push((
+                        elapsed.as_secs_f64() * 1000.0,
+                        spread,
+                        entry.warmup,
+                    ));
                 } else if !entry.warmup {
                     reader_censored.fetch_add(1, Ordering::Relaxed);
                 }
             }
-        }
-    });
+        }));
+    }
 
     let mut rng = Rng::new(options.nonce ^ 0x9999);
     let mut payload = vec![0u8; EDIT_SIZE.1];
@@ -336,21 +424,23 @@ fn measure(
                         file_index,
                         started: Instant::now(),
                         warmup,
+                        remaining: destinations,
+                        first_ack: None,
                     },
                 );
-                crate::send_message(
-                    &mut writer,
-                    &json!({
-                        "seq": sequence,
-                        "path": options.peer_root.join(relative).to_string_lossy(),
-                        "digest": digest,
-                        "size": size,
-                        // The observer's own deadline is generous; the
-                        // writer's own clock decides censoring.
-                        "deadline_s": DEADLINE.as_secs() + 60,
-                    }),
-                )
-                .map_err(|error| error.to_string())?;
+                let announcement = json!({
+                    "seq": sequence,
+                    "path": options.peer_root.join(relative).to_string_lossy(),
+                    "digest": digest,
+                    "size": size,
+                    // The observer's own deadline is generous; the
+                    // writer's own clock decides censoring.
+                    "deadline_s": DEADLINE.as_secs() + 60,
+                });
+                for writer in writers.iter_mut() {
+                    crate::send_message(writer, &announcement)
+                        .map_err(|error| error.to_string())?;
+                }
                 std::thread::sleep(ANNOUNCE_LEAD);
                 crate::write_atomic(&options.root.join(relative), &payload[..size])
                     .map_err(|error| error.to_string())?;
@@ -398,16 +488,26 @@ fn measure(
         }
     }
     done.store(true, Ordering::Relaxed);
-    let _ = shutdown_handle.shutdown(std::net::Shutdown::Both);
-    drop(writer);
-    let _ = reader_thread.join();
+    for handle in &shutdown_handles {
+        let _ = handle.shutdown(std::net::Shutdown::Both);
+    }
+    drop(writers);
+    for thread in reader_threads {
+        let _ = thread.join();
+    }
 
     let censored = censored.load(Ordering::Relaxed) as usize;
     let recorded = outcomes.lock().expect("outcomes lock").clone();
+    let mut spreads: Vec<f64> = recorded
+        .iter()
+        .filter(|(_, _, warmup)| !warmup)
+        .map(|(_, spread, _)| *spread)
+        .collect();
+    spreads.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
     let mut samples: Vec<f64> = recorded
         .iter()
-        .filter(|(_, warmup)| !warmup)
-        .map(|(ms, _)| *ms)
+        .filter(|(_, _, warmup)| !warmup)
+        .map(|(ms, _, _)| *ms)
         .collect();
     let warmup_samples = recorded.len() - samples.len();
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
@@ -437,6 +537,12 @@ fn measure(
         "agents": options.agents,
         "seconds": options.seconds,
         "nonce": options.nonce,
+        "destinations": destinations,
+        // How far apart the first and last destination confirmed the same
+        // edit. Zero for a single destination; for a fan-out it is the
+        // straggle, which is what a fan-out is really being asked about.
+        "spread_p50_ms": spreads.get(spreads.len() / 2).map(|v| (v * 10.0).round() / 10.0),
+        "spread_max_ms": spreads.last().map(|v| (v * 10.0).round() / 10.0),
         "window_start_epoch": window_start_epoch,
         "window_end_epoch": window_end_epoch,
         "samples": samples.len(),

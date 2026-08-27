@@ -33,6 +33,7 @@ import base64
 import json
 import os
 import random
+import shlex
 import subprocess
 import sys
 import time
@@ -43,23 +44,39 @@ BUILDER_TYPE = "c6i.2xlarge"
 VOLUME_GB = 200
 
 CELLS = [
-    # name, corpora, agents, bidirectional
-    ("chromium-1", ["chromium"], 1, False),
-    ("chromium-10", ["chromium"], 10, False),
-    ("chromium-100", ["chromium"], 100, False),
-    ("chromium-1-bidir", ["chromium"], 1, True),
-    ("chromium-10-bidir", ["chromium"], 10, True),
-    ("chromium-100-bidir", ["chromium"], 100, True),
-    ("50k-1", ["sub50k"], 1, False),
-    ("50k-10", ["sub50k"], 10, False),
-    ("50k-100", ["sub50k"], 100, False),
-    ("two50k-1", ["sub50k", "sub50k-b"], 1, False),
-    ("two50k-10", ["sub50k", "sub50k-b"], 10, False),
-    ("two50k-100", ["sub50k", "sub50k-b"], 100, False),
-    ("5k-1", ["sub5k"], 1, False),
-    ("5k-10", ["sub5k"], 10, False),
-    ("5k-100", ["sub5k"], 100, False),
+    # name, corpora, agents, bidirectional, betas
+    #
+    # `betas` is how many destinations one source feeds. Everything is a
+    # pair at 1. At 10 it is a fan-out: one alpha, ten betas, which asks a
+    # different question — autobahn fans a config group into one session
+    # per beta, so ten betas means ten sessions scanning the same source.
+    ("chromium-1", ["chromium"], 1, False, 1),
+    ("chromium-10", ["chromium"], 10, False, 1),
+    ("chromium-100", ["chromium"], 100, False, 1),
+    ("chromium-1-bidir", ["chromium"], 1, True, 1),
+    ("chromium-10-bidir", ["chromium"], 10, True, 1),
+    ("chromium-100-bidir", ["chromium"], 100, True, 1),
+    ("50k-1", ["sub50k"], 1, False, 1),
+    ("50k-10", ["sub50k"], 10, False, 1),
+    ("50k-100", ["sub50k"], 100, False, 1),
+    ("two50k-1", ["sub50k", "sub50k-b"], 1, False, 1),
+    ("two50k-10", ["sub50k", "sub50k-b"], 10, False, 1),
+    ("two50k-100", ["sub50k", "sub50k-b"], 100, False, 1),
+    ("5k-1", ["sub5k"], 1, False, 1),
+    ("5k-10", ["sub5k"], 10, False, 1),
+    ("5k-100", ["sub5k"], 100, False, 1),
+    # Fan-out: one alpha, ten betas, at a fixed agent count so that width
+    # is the only variable.
+    ("5k-10-fan", ["sub5k"], 10, False, 10),
+    ("50k-10-fan", ["sub50k"], 10, False, 10),
+    ("two50k-10-fan", ["sub50k", "sub50k-b"], 10, False, 10),
+    ("chromium-10-fan", ["chromium"], 10, False, 10),
 ]
+
+
+def machines_for(cell):
+    """One source, plus its destinations."""
+    return 1 + cell[4]
 
 BAKE_SCRIPT = r"""#!/bin/bash
 set -euo pipefail
@@ -129,6 +146,25 @@ for c in ("chromium", "sub50k", "sub50k-b", "sub5k"):
 os.remove(listing)
 EOF
 """
+
+
+def plan_widths(selected, pairwise_groups, fan_groups):
+    """How wide each group must be, given the cells selected.
+
+    Pairwise cells need two machines. A fan-out cell needs one source plus
+    its betas, and cannot be split, so the run needs at least one group of
+    that width. Wide groups are scarce and expensive, so only as many as
+    asked for are built, and pairwise work fills whatever is left over.
+    """
+    widths = [2] * max(0, pairwise_groups)
+    fan_widths = sorted({1 + cell[4] for cell in selected if cell[4] > 1}, reverse=True)
+    if fan_widths:
+        if fan_groups < 1:
+            raise RuntimeError(
+                "the selection includes fan-out cells, so --fan-groups must be at least 1")
+        for index in range(fan_groups):
+            widths.append(fan_widths[index % len(fan_widths)])
+    return widths
 
 
 def run(command, check=True, capture=True):
@@ -291,30 +327,59 @@ def dispatch(options):
     for instance in instances:
         wait_for_ssh(addresses[instance], key)
 
-    # Pairing is positional; each A learns its B's private IP.
-    pairs = [(instances[2 * i], instances[2 * i + 1]) for i in range(options.pairs)]
-    for index, (a, b) in enumerate(pairs):
-        a_public, _ = addresses[a]
-        b_public, b_private = addresses[b]
-        _, a_private = addresses[a]
+    # Groups are positional and variable width: one source followed by its
+    # destinations. A pairwise group is width 2; a fan-out group is width
+    # 11. Wiring is the same either way — the source learns every
+    # destination as `dest1`..`destN`, with `dest` aliased to the first so
+    # nothing that assumes a single destination has to change.
+    groups = []
+    cursor = 0
+    for width in options.widths:
+        groups.append(instances[cursor:cursor + width])
+        cursor += width
+
+    for index, members in enumerate(groups):
+        source = members[0]
+        followers = members[1:]
+        a_public, a_private = addresses[source]
         ssh_a = f"ssh -i {key_path(key)} ubuntu@{a_public}"
-        run(f"{ssh_a} 'ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519 -q || true; "
-            f"cat ~/.ssh/id_ed25519.pub'")
+        run(f"{ssh_a} 'ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519 -q || true'")
         public_key = run(f"{ssh_a} 'cat ~/.ssh/id_ed25519.pub'").stdout.strip()
-        run(f"ssh -i {key_path(key)} ubuntu@{b_public} "
-            f"'echo {json.dumps(public_key)} >> ~/.ssh/authorized_keys'")
-        run(f"{ssh_a} 'printf \"Host dest\\n  HostName {b_private}\\n  User ubuntu\\n"
-            f"  StrictHostKeyChecking accept-new\\n\" >> ~/.ssh/config; "
-            f"echo {b_private} > ~/bench/peer-ip; echo {a_private} > ~/bench/self-ip; "
-            f"ssh -o ConnectTimeout=5 dest true'")
-        # Observers on both hosts (B for a-to-b, A for b-to-a), started
-        # and then *proven* listening before any job is dispatched.
-        run(f"ssh -i {key_path(key)} ubuntu@{b_public} "
-            f"'for p in 9911 9912; do setsid nohup ~/bench/benchmark observer $p "
-            f"> ~/observer-$p.log 2>&1 < /dev/null & done'")
-        run(f"{ssh_a} 'for p in 10011 10012; do setsid nohup ~/bench/benchmark observer $p "
-            f"> ~/observer-$p.log 2>&1 < /dev/null & done'")
-        for host, ports in ((b_public, "9911 9912"), (a_public, "10011 10012")):
+
+        aliases, privates, config = [], [], []
+        for position, follower in enumerate(followers, start=1):
+            b_public, b_private = addresses[follower]
+            run(f"ssh -i {key_path(key)} ubuntu@{b_public} "
+                f"'echo {json.dumps(public_key)} >> ~/.ssh/authorized_keys'")
+            alias = f"dest{position}"
+            aliases.append(alias)
+            privates.append(b_private)
+            config.append(f"Host {alias}\n  HostName {b_private}\n  User ubuntu\n"
+                          f"  StrictHostKeyChecking accept-new\n")
+            if position == 1:
+                # `dest` is the first destination, so every single-
+                # destination path keeps working untouched.
+                config.append(f"Host dest\n  HostName {b_private}\n  User ubuntu\n"
+                              f"  StrictHostKeyChecking accept-new\n")
+        run(f"{ssh_a} 'printf {shlex.quote("".join(config))} >> ~/.ssh/config; "
+            f"printf {shlex.quote(chr(10).join(privates) + chr(10))} > ~/bench/peer-ip; "
+            f"echo {a_private} > ~/bench/self-ip; "
+            f"printf {shlex.quote(",".join(aliases))} > ~/bench/destinations'")
+        for alias in aliases:
+            reachable = run(f"{ssh_a} 'ssh -o ConnectTimeout=5 {alias} true && echo OK'")
+            if "OK" not in reachable.stdout:
+                raise RuntimeError(f"group {index}: source cannot reach {alias}")
+
+        # Observers on every destination (for a-to-b) and on the source
+        # (for b-to-a), started and then *proven* listening before any job
+        # is dispatched.
+        listeners = [(addresses[f][0], "9911 9912") for f in followers]
+        listeners.append((a_public, "10011 10012"))
+        for host, ports in listeners:
+            run(f"ssh -i {key_path(key)} ubuntu@{host} "
+                f"'for p in {ports}; do setsid nohup ~/bench/benchmark observer $p "
+                f"> ~/observer-$p.log 2>&1 < /dev/null & done'")
+        for host, ports in listeners:
             ready = run(
                 f"ssh -i {key_path(key)} ubuntu@{host} "
                 f"'for i in $(seq 1 20); do "
@@ -334,22 +399,39 @@ def dispatch(options):
         print(f"cell filter: {[c[0] for c in selected]}")
     jobs = []
     for repeat in range(options.repeats):
-        for name, corpora, agents, bidirectional in selected:
+        for name, corpora, agents, bidirectional, betas in selected:
             tools = ["autobahn", "mutagen"]
             rng.shuffle(tools)
             jobs.append({
                 "run": run_id, "repeat": repeat, "job": f"{name}-r{repeat}",
                 "cell": {"name": name, "corpora": corpora, "agents": agents,
-                         "bidirectional": bidirectional},
+                         "bidirectional": bidirectional, "betas": betas},
                 "tools": tools,
             })
     rng.shuffle(jobs)
 
-    assignments = {index: [] for index in range(len(pairs))}
-    for index, job in enumerate(jobs):
-        pair_index = index % len(pairs)
-        job["pair"] = f"pair-{pair_index}"
-        assignments[pair_index].append(job)
+    # A job can only run on a group with enough destinations, so assignment
+    # is a fit rather than a rotation. Widest jobs are placed first — a
+    # fan-out job fits almost nowhere, while a pairwise job fits anywhere,
+    # so placing the fussy ones first keeps the wide groups from filling up
+    # with work that any group could have taken. Within a width, the least
+    # loaded group wins, which keeps the finishing times close together.
+    assignments = {index: [] for index in range(len(groups))}
+    capacity = [len(members) - 1 for members in groups]
+    for job in sorted(jobs, key=lambda job: -job["cell"]["betas"]):
+        needed = job["cell"]["betas"]
+        candidates = [i for i, width in enumerate(capacity) if width >= needed]
+        if not candidates:
+            raise RuntimeError(
+                f"cell {job['cell']['name']} needs {needed} destinations, but the widest "
+                f"group has {max(capacity) if capacity else 0}")
+        # Prefer the narrowest group that fits, then the least loaded, so a
+        # pairwise job does not occupy an eleven-machine group.
+        chosen = min(candidates, key=lambda i: (capacity[i], len(assignments[i]), i))
+        job["pair"] = f"pair-{chosen}"
+        assignments[chosen].append(job)
+    for index in assignments:
+        rng.shuffle(assignments[index])
 
     # The complete plan is persisted before anything runs — locally and on
     # every pair — so a pair that dies leaves evidence of what it owed, and
@@ -367,15 +449,21 @@ def dispatch(options):
     with open(f"results-{run_id}/plan.json", "w") as handle:
         json.dump(plan, handle, indent=2)
 
-    print(f"{len(jobs)} jobs over {len(pairs)} pairs (seed {seed})")
+    print(f"{len(jobs)} jobs over {len(groups)} group(s) (seed {seed})")
     processes = []
-    for pair_index, (a, _) in enumerate(pairs):
-        a_public, _ = addresses[a]
+    for pair_index, members in enumerate(groups):
+        a_public, _ = addresses[members[0]]
         with open(f"results-{run_id}/assignment-pair-{pair_index}.json", "w") as handle:
             json.dump(assignments[pair_index], handle)
         run(f"scp -i {key_path(key)} results-{run_id}/assignment-pair-{pair_index}.json "
             f"ubuntu@{a_public}:~/assignment.json")
-        script_lines = ["set -u", "rm -f ~/results.jsonl ~/driver.log"]
+        script_lines = [
+            "set -u",
+            "rm -f ~/results.jsonl ~/driver.log",
+            # The aliases the orchestrator wired, so job.py addresses every
+            # destination rather than assuming one.
+            'export BENCH_DESTINATIONS="$(cat ~/bench/destinations)"',
+        ]
         for job in assignments[pair_index]:
             spec = json.dumps(json.dumps(job))  # shell-quoted JSON
             script_lines.append(

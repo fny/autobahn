@@ -50,15 +50,15 @@ CELLS = [
     ("chromium-1-bidir", ["chromium"], 1, True),
     ("chromium-10-bidir", ["chromium"], 10, True),
     ("chromium-100-bidir", ["chromium"], 100, True),
-    ("40k-1", ["sub40k-a"], 1, False),
-    ("40k-10", ["sub40k-a"], 10, False),
-    ("40k-100", ["sub40k-a"], 100, False),
-    ("two40k-1", ["sub40k-a", "sub40k-b"], 1, False),
-    ("two40k-10", ["sub40k-a", "sub40k-b"], 10, False),
-    ("two40k-100", ["sub40k-a", "sub40k-b"], 100, False),
-    ("4k-1", ["sub4k"], 1, False),
-    ("4k-10", ["sub4k"], 10, False),
-    ("4k-100", ["sub4k"], 100, False),
+    ("50k-1", ["sub50k"], 1, False),
+    ("50k-10", ["sub50k"], 10, False),
+    ("50k-100", ["sub50k"], 100, False),
+    ("two50k-1", ["sub50k", "sub50k-b"], 1, False),
+    ("two50k-10", ["sub50k", "sub50k-b"], 10, False),
+    ("two50k-100", ["sub50k", "sub50k-b"], 100, False),
+    ("5k-1", ["sub5k"], 1, False),
+    ("5k-10", ["sub5k"], 10, False),
+    ("5k-100", ["sub5k"], 100, False),
 ]
 
 BAKE_SCRIPT = r"""#!/bin/bash
@@ -75,7 +75,8 @@ find chromium -type l -delete
 python3 - <<'EOF'
 import os, shutil
 # Subsets built from whole top-level directories of chromium, disjoint
-# between the two 40k subsets, targeted counts approximate by design.
+# between the two 50k subsets, targeted counts approximate by design.
+# The sizes are decades of the whole tree: 5k, 50k, ~505k.
 root = "chromium"
 dirs = []
 for d in sorted(os.listdir(root)):
@@ -95,11 +96,11 @@ def build(name, target, skip):
         shutil.copytree(p, os.path.join(name, d), symlinks=True)
         total += n; used.append(d)
     return used
-a = build("sub40k-a", 40000, set())
-b = build("sub40k-b", 40000, set(a))
-build("sub4k", 4000, set())
+a = build("sub50k", 50000, set())
+b = build("sub50k-b", 50000, set(a))
+build("sub5k", 5000, set())
 EOF
-for c in chromium sub40k-a sub40k-b sub4k; do
+for c in chromium sub50k sub50k-b sub5k; do
   ~/bench/benchmark partitions ~/corpus/$c ~/corpus/$c.bench-partitions.json
   mkdir -p ~/corpus/$c.bench
   mv ~/corpus/$c.bench-partitions.json ~/corpus/$c.bench/partitions.json
@@ -109,7 +110,7 @@ done
 python3 - <<'EOF'
 import json, os, subprocess
 home = os.path.expanduser("~")
-for c in ("chromium", "sub40k-a", "sub40k-b", "sub4k"):
+for c in ("chromium", "sub50k", "sub50k-b", "sub5k"):
     with open(f"{home}/corpus/{c}.bench/partitions.json") as handle:
         partitions = json.load(handle)
     files = set()

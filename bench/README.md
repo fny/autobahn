@@ -31,7 +31,7 @@ python3 orchestrate.py run --profile PROFILE --region REGION \
 
 # One cell only, for a before/after on a single change.
 python3 orchestrate.py run --profile PROFILE --region REGION \
-    --ami AMI --pairs 10 --repeats 10 --cells 4k-1
+    --ami AMI --pairs 10 --repeats 10 --cells 5k-1
 
 # Turn JSONL into tables.
 python3 aggregate.py results-RUN_ID/
@@ -109,9 +109,9 @@ recorded by commit SHA in `plan.json`:
 | Corpus | Contents |
 |---|---|
 | `chromium` | The full checkout, ~505,000 files |
-| `sub40k-a` | Whole top-level directories totalling ≈40,000 files |
-| `sub40k-b` | Different directories, disjoint from `sub40k-a` |
-| `sub4k` | ≈4,000 files |
+| `sub50k` | Whole top-level directories totalling ≈50,000 files — a tenth |
+| `sub50k-b` | Different directories, disjoint from `sub50k` |
+| `sub5k` | ≈5,000 files — a hundredth |
 
 Symbolic links are deleted from the corpus at bake time. The two tools
 have different symlink policies, which would make convergence ambiguous

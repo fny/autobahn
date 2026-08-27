@@ -164,6 +164,7 @@ def destroy_tool_state(emitter):
     """Removes all tool state on both hosts and verifies cleanliness.
     Both tools lose their installed remote agents too, so every cold sync
     pays first-contact installation — the same cost for both."""
+    kill_tools()
     # Development builds of either tool use a *-dev data directory
     # (mutagen 0.19.0-dev installs its remote agent under
     # ~/.mutagen-dev/agents/, not ~/.mutagen/agents/). Removing only the

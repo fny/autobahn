@@ -1,204 +1,149 @@
-# Chromium-scale benchmark: autobahn vs mutagen
+# Benchmark: autobahn vs mutagen
 
-A head-to-head measurement of bidirectional synchronization of the
-Chromium source tree between two EC2 instances, covering cold
-synchronization, edit-propagation latency, memory, and idle CPU.
+autobahn 0.3.0 against mutagen 0.19.0-dev, on matched pairs of
+`c6i.4xlarge` instances in one AWS availability zone. Four corpus sizes,
+three concurrency levels, ten repeats of each of fifteen cells: **150 jobs,
+300 tool-runs, ~440,000 latency samples.**
 
-**Headline:** autobahn synchronized the same tree with **6.4× less
-controller memory**, propagated edits **7.5× faster**, and used **5×
-less CPU while idle**. Cold synchronization was 1.2× faster. Every
-number below is an externally verified measurement, not a tool's own
-report of itself.
+The full per-cell tables are in [BENCHMARK-MATRIX.md](BENCHMARK-MATRIX.md).
+The method, and the defects it was designed to prevent, are in
+[bench/README.md](bench/README.md). An implementation explanation of the
+gaps is in [docs/MUTAGEN.md](docs/MUTAGEN.md).
 
-## Setup
+## Headline
 
-| | |
-|---|---|
-| Hosts | 2 × EC2 `c5.2xlarge` (8 vCPU, 15GB RAM), us-east-2, same subnet, 150GB gp3 (6000 IOPS / 500 MB/s) |
-| OS | Ubuntu 24.04, kernel 6.14 |
-| Corpus | Chromium `src` @ depth-1 clone of `github.com/chromium/chromium` |
-| Corpus size | **504,528 files, 46,127 directories, 19 symlinks, 5.5GB** (`.git` excluded) |
-| autobahn | 0.2.0 (`77314fa`), release build, static musl |
-| mutagen | 0.19.0-dev, release build |
-| Mode | `two-way-safe`, both tools |
-| Ignores | `/.git`, `/out` — verified to yield identical path sets on both tools |
-| Fallback interval | 5s on both (`interval = 5`, `--watch-polling-interval=5`) |
-| SSH | key-based, no external multiplexing, agent auto-installed by both tools |
-
-Both tools ran one at a time, never concurrently. Destination roots
-were empty at the start of each cold run, and both tools installed
-their own remote agent on first contact.
-
-## Methodology
-
-The benchmark design was reviewed by an independent model (GPT-5.6) with
-an explicit brief to find measurements that would lie. Three of its
-corrections shaped what is reported here.
-
-**Latency is measured in one clock domain.** Timestamps from two hosts
-cannot be subtracted — clock skew would silently become part of the
-result. Instead, a destination-side observer is told in advance what
-content to expect; the writer performs the edit, records `T0` from
-`CLOCK_MONOTONIC_RAW` immediately after the final `rename()` returns,
-and records `T1` when the observer's acknowledgement arrives over a
-persistent TCP connection. Both timestamps come from the *same* clock on
-the writing host. The observer acknowledges only after reading the file
-and confirming its SHA-256 matches, so a creation event alone never
-counts as propagation. The measured interval therefore *includes* the
-destination's verification read and the acknowledgement's return trip:
-every latency below is a conservative upper bound. The control channel's
-own round trip was 0.17ms (p50) and is not subtracted.
-
-**Completion is verified externally.** No tool's status output is
-trusted to define "done". The destination is polled independently until
-its file count reaches the expected 504,528, giving a bracket at 10s
-granularity, and the result is then verified by comparing full path
-manifests and content digests between the two hosts.
-
-**Memory is sampled from the whole process tree.** Both tools spawn
-children (SSH, session workers, agents) whose memory belongs to them, so
-RSS is summed across each tool's process tree once per second rather
-than read from a single PID.
-
-## Results
-
-### Cold synchronization
-
-First contact: no agent installed, empty destination, tool not running.
-
-| | mutagen | autobahn | |
+| | autobahn | mutagen | |
 |---|---|---|---|
-| Cold sync, 504k files / 5.5GB | **125.0s** | **101.4s** | autobahn 1.23× faster |
-| (10s poll bracket) | 113–125s | 91–101s | |
-| First bytes at destination | ~57s | ~55s | comparable |
+| Propagate one edit, Chromium, 1 agent | **188 ms** | 7,118 ms | 37.8× |
+| Propagate one edit, 40k files, 10 agents | **52 ms** | 1,854 ms | 35.4× |
+| Peak memory, Chromium | **249 MB** | 2,033 MB | 8.2× |
+| CPU while idle, Chromium | **0.2%** | 50% | 250× |
+| First sync, Chromium | 423 s | 418 s | ~1% |
 
-Both tools spend the first ~55 seconds the same way: scanning half a
-million files on each side, reconciling, and beginning to stage. The
-difference is in the transfer and application phase that follows.
+**autobahn is faster in every one of the fifteen cells**, by between 1.5×
+and 37.8×.
 
-**Correctness verified.** After autobahn's run, the two trees had
-identical path sets (`md5` of sorted `find` output matched exactly:
-`210da4b6…`), identical entry counts (550,674), and identical content
-across a 1,009-file digest sample (`e461d71a…`). The only difference was
-directory permission bits (775 on the source, 700 on the destination) —
-autobahn's configured `directory_mode` default, not a synchronization
-error.
+## What was measured
 
-### Edit propagation latency
+The time from a file being written on one machine to exactly those bytes
+being readable on the other, confirmed by digest. Both timestamps come from
+one clock on the writing host, so no clock difference between machines can
+enter a sample. Each sample includes the confirming read and the reply's
+network trip, so every number is an upper bound on the tool's own time. The
+harness measures its own overhead separately: **0.6 ms median across all
+150 jobs.**
 
-Time from a completed write on one host to verified identical content on
-the other. 40 trials, 64KB atomic replacements (temp file + `rename`).
+While that agent measures, other agents edit their own disjoint file sets at
+a coding cadence. The agent count varies the load and nothing else — the
+measured agent always edits the same fixed 40 files.
 
-| | mutagen | autobahn | |
+## Latency
+
+Median propagation, milliseconds, ten repeats of each cell:
+
+| corpus | 1 agent | 10 agents | 100 agents |
 |---|---|---|---|
-| p50 | **9,692ms** | **1,298ms** | autobahn 7.5× faster |
-| p90 | 9,765ms | 1,310ms | |
-| p99 | 9,769ms | 1,322ms | |
-| min–max | 9,342–9,771ms | 1,233–1,399ms | |
+| **4k files** | 41 / 62 | 40 / 1,037 | 78 / 2,690 |
+| **40k files** | 52 / 286 | 52 / 1,854 | 128 / 1,602 |
+| **2 × 40k files** | 56 / 329 | 59 / 1,924 | 170 / 1,771 |
+| **Chromium (505k)** | 188 / 7,118 | 356 / 8,521 | 782 / 7,664 |
 
-A second variant repeatedly edits one file, which is mutagen's most
-favorable case — its portable watching natively tracks only recently
-modified content, so a first touch of a "cold" path waits for a polling
-cycle:
+*autobahn / mutagen. Bidirectional cells are in the matrix document.*
 
-| Repeated edits to a single file | mutagen | autobahn |
+One pattern runs through every row. **autobahn's latency barely moves with
+tree size or agent count. mutagen's moves with both.** On the 4k corpus
+mutagen goes from 62 ms to 2,690 ms as agents go from 1 to 100, on a tree
+that never grew. autobahn goes from 41 ms to 78 ms.
+
+The reason is structural and is set out in [docs/MUTAGEN.md](docs/MUTAGEN.md):
+no official mutagen build has recursive watching on Linux, so every change
+event triggers a full scan of the whole tree. autobahn scans only what
+changed.
+
+## Memory and CPU
+
+Peak resident memory during the workload, and CPU as a percentage of one
+core:
+
+| corpus | autobahn | mutagen | ratio |
+|---|---|---|---|
+| 4k files | 16 MB | 48 MB | 3.1× |
+| 40k files | 33 MB | 171 MB | 5.2× |
+| 2 × 40k files | 71 MB | 330 MB | 4.7× |
+| Chromium, 1 agent | 249 MB | 2,033 MB | 8.2× |
+| Chromium, 100 agents | 321 MB | 1,903 MB | 5.9× |
+
+The ratio grows with file count, which is the signature of a per-file cost
+rather than fixed overhead. The marginal cost of one more file is
+approximately 4,022 bytes for mutagen and 507 bytes for autobahn.
+
+Two CPU results are worth separating out.
+
+**Idle.** With the tree synchronized and nothing happening, autobahn used
+**0.2%** of a core on Chromium. mutagen used **50%** — half a core,
+permanently, to poll a tree that is not changing.
+
+**The destination host.** In the one-direction cells the destination does no
+editing. mutagen still used 117–125% of a core there, against 16–35% for
+autobahn. The receiving side rescans and reserializes the whole tree on
+every cycle.
+
+## First sync is a storage question
+
+| corpus | autobahn | mutagen |
 |---|---|---|
-| p50 | 4,441ms | **1,367ms** |
-| min–max | 4,310–7,630ms | 1,186–1,438ms |
+| Chromium (505k files) | 423 s | 418 s |
+| 40k files | 34.0 s | 31.8 s |
+| 4k files | 8.4 s | 5.8 s |
 
-Even on its warm path mutagen is 3.2× slower than autobahn is on a cold
-one. This is the clearest effect of the incremental scanning work: a
-cycle no longer pays a full metadata sweep of half a million files just
-to discover that one of them changed.
+The two tools land within about one percent of each other on Chromium.
+Transferring half a million small files is bound by device IOPS, not by
+either tool. mutagen is modestly ahead on the smaller trees.
 
-### Under a 10-agent workload
+**First sync is not where these tools differ.** The difference is in what it
+costs to stay caught up afterward.
 
-Ten concurrent processes editing files across the tree on a
-coding-agent-like cadence (a few files per second each, atomic replace,
-random sizes 2–64KB), while one of them measures verified round trips.
+These numbers were taken with the corpus faulted fully into the volume and
+the page cache dropped before each run. Without that control the measurement
+reports storage behavior rather than tool behavior — see
+[bench/README.md](bench/README.md#lessons-paid-for).
 
-| | mutagen | autobahn | |
-|---|---|---|---|
-| p50 | **9,424ms** | **2,276ms** | autobahn 4.1× faster |
-| p90 | 13,033ms | 2,656ms | 4.9× |
-| p99 | 13,510ms | 4,440ms | 3.0× |
-| max | 13,556ms | 4,729ms | |
+## Where autobahn is weakest
 
-Both degrade under churn, as expected — a cycle that finishes finds more
-work waiting. Autobahn's tail stays bounded at ~4.7s where mutagen's
-reaches ~13.6s.
+Two results go against it, and both are reported here rather than left in
+the matrix.
 
-### Memory
+**Heavy bidirectional load.** At `chromium-100-bidir` — 200 agents editing
+505,000 files in both directions at once — autobahn keeps the better median
+(5,413 ms against 11,600 ms) but its 90th percentile is **worse**: 16,451 ms
+against mutagen's 15,831 ms. Its tail discipline holds everywhere else and
+breaks here. This cell also produced most of the run's skipped ticks, so the
+offered edit rate fell slightly short for both tools.
 
-Summed RSS across each tool's process tree.
+**Occasional multi-second outliers.** In several cells autobahn's 99th
+percentile is far above its 90th. On `chromium-1` the 90th percentile is
+286 ms and the 99th is 16,188 ms. The per-run medians are tight — 182.7 ms
+to 202.0 ms across ten machines — so this is systematic, not one bad run.
+About one edit in a hundred stalls for seconds.
 
-| | mutagen | autobahn | |
-|---|---|---|---|
-| Controller, peak | **2,123MB** | **333MB** | 6.4× less |
-| Controller, steady | 1,633MB | 264MB | 6.2× less |
-| Remote agent, peak | 1,501MB | 307MB | 4.9× less |
-| Remote agent, steady | 1,078MB | 102MB | 10.6× less |
-| **Total footprint (steady)** | **2,711MB** | **366MB** | **7.4× less** |
+The cause is not yet established. The leading candidate on large trees is
+the 120-second periodic full scan, which exists to bound how long a missed
+filesystem event can persist and which takes seconds on a 505,000-file tree.
+That does not explain the 4,204 ms 99th percentile on the 4,000-file corpus
+at 100 agents, so there is probably a second mechanism. This is open work.
 
-This is the difference the project was started over, measured at the
-scale where it matters: keeping half a million files in sync costs
-mutagen roughly 2.7GB across both machines, and autobahn roughly 0.37GB.
+## Confidence
 
-### Idle CPU
+- **150 of 150 jobs completed.** One run was excluded: a destination host
+  became network-unreachable mid-job, the cleanliness check could not verify
+  the remote state, and the run was recorded as failed rather than reported.
+- **Zero censored samples.** No edit anywhere exceeded the 120-second
+  deadline.
+- **Per-run medians cluster within a few percent** across ten different
+  machine pairs, so the results reflect the tools rather than the hardware.
+- **Both tools ran in every job**, back to back on the same pair, in an
+  order randomized per job, so machine identity and ordering cancel out.
+- mutagen ran with a 5-second poll interval, which is better than its
+  10-second default.
 
-No changes being made; both tools watching and heartbeating on a 5s
-interval.
-
-| | mutagen | autobahn | |
-|---|---|---|---|
-| Controller | **64%** of a core | **12%** of a core | 5.3× less |
-| Remote agent | 68% of a core | 3% of a core | 22× less |
-
-Mutagen's portable watching polls, which at this tree size means a
-continuous rescan of 500k files on both ends — two thirds of a core
-burned on each machine to observe that nothing happened. Autobahn's
-12% is its own remaining inefficiency (see below), not watching cost.
-
-## What limited autobahn at the time of this benchmark
-
-> **Since addressed.** Items 1 and 2 below were fixed in 0.3.0, along
-> with a per-cycle full-snapshot exchange that later measurement showed
-> to be the largest cost of all. These numbers describe 0.2.0 and have
-> not been re-measured since.
-
-The measurements point at three specific costs, none of which are
-transfer or watching:
-
-1. **The ancestor and scan cache are 52MB each and rewritten whenever
-   content changes.** At 104MB of serialization per changed cycle, this
-   is a large part of the ~1.3s propagation floor. Persisting the
-   ancestor incrementally, or asynchronously, would attack it directly.
-2. **Reconciliation walks the whole tree every cycle.** Scanning is now
-   incremental, but the three-way merge still visits all 550k nodes even
-   when both sides share the same `Arc`. A pointer-equality short-circuit
-   would make reconciliation proportional to the change rather than the
-   tree, and would also account for most of the 12% idle CPU.
-3. **Cycles are not paced.** Under sustained churn the only spacing is a
-   100ms settle window, so cycles run back to back. A minimum inter-cycle
-   cooldown would trade a little latency for a lot of CPU headroom.
-
-## Caveats
-
-- Cold-sync timing has 10s granularity from the completion poll; the
-  brackets are reported rather than a false-precision midpoint.
-- Latency samples are 40 per configuration (15 for the single-file
-  variant) — enough to separate effects of this size, not enough for
-  confident tail statistics beyond p90.
-- Both tools ran with their own wire encoding (autobahn LZ4-framed with
-  SSH compression disabled; mutagen its own). Internal compression is
-  treated as part of each product rather than something to be equalized.
-- mutagen ran in its default portable watch mode. This is its
-  recommended configuration, but it is polling-assisted rather than
-  purely native, which is visible in both the idle CPU and the
-  cold-path latency numbers.
-- `.git` was excluded from the corpus, per mutagen's own guidance for
-  synchronizing source trees. A run including it would be a different
-  (and harsher) test for both tools.
-- Instances were not pinned against EBS or network burst-credit
-  variation beyond choosing a non-burstable instance family and
-  provisioned gp3 throughput.
+Raw JSONL for every job is in `bench/results-bench-1787811723/`.

@@ -206,4 +206,26 @@ pub trait Endpoint: Send {
         std::thread::sleep(timeout);
         Ok(false)
     }
+
+    /// A monotone measure of how much change this endpoint has recorded but
+    /// not yet had consumed by a scan, used to tell a burst of writes from a
+    /// single one. Two samples that agree mean nothing arrived in between.
+    ///
+    /// The default implementation cannot observe this and reports `None`,
+    /// which callers read as "no evidence of an ongoing burst" — settling
+    /// then falls back to its lower bound rather than its upper one.
+    fn change_activity(&mut self) -> Option<ChangeActivity> {
+        None
+    }
+}
+
+/// How much unconsumed change an endpoint has recorded. Compared between
+/// samples; the values themselves carry no meaning beyond inequality.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ChangeActivity {
+    /// Distinct paths recorded since the last scan consumed them.
+    pub paths: usize,
+    /// Whether the record was abandoned in favour of a full rescan, which
+    /// is itself a change in state worth noticing.
+    pub incomplete: bool,
 }

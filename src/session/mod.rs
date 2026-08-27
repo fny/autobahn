@@ -205,6 +205,50 @@ impl Session {
         }
     }
 
+    /// Waits out a write burst before cycling, and no longer.
+    ///
+    /// A fixed settle delay is paid by every change equally, so an isolated
+    /// edit — the common case for a person typing in an editor — waits the
+    /// full window for a burst that never comes. That delay dominated
+    /// measured propagation latency: essentially all of it was waiting, not
+    /// working.
+    ///
+    /// Instead, sample how much change each endpoint has recorded, wait a
+    /// short quiet slice, and sample again. Growth means writing is still in
+    /// progress and is worth coalescing; two agreeing samples mean the burst
+    /// is over and there is nothing left to wait for. `maximum` still caps
+    /// the total, so a sustained burst settles exactly as before and the
+    /// worst case is unchanged.
+    ///
+    /// An endpoint that cannot report activity (any remote one) contributes
+    /// no evidence of a burst, which shortens the settle rather than
+    /// lengthening it: cycles are idempotent, so the cost of cycling a
+    /// little eagerly is work, never correctness.
+    pub fn settle(&mut self, maximum: std::time::Duration, quiet: std::time::Duration) {
+        let deadline = std::time::Instant::now() + maximum;
+        let sample = |session: &mut Self| {
+            (
+                session.alpha.change_activity(),
+                session.beta.change_activity(),
+            )
+        };
+        let mut previous = sample(self);
+        while std::time::Instant::now() < deadline {
+            let slice = quiet.min(deadline.saturating_duration_since(std::time::Instant::now()));
+            if slice.is_zero() {
+                break;
+            }
+            std::thread::sleep(slice);
+            let current = sample(self);
+            // Neither side recorded anything new across the slice: whatever
+            // triggered this settle has finished arriving.
+            if current == previous {
+                break;
+            }
+            previous = current;
+        }
+    }
+
     /// Runs one synchronization cycle: scan both endpoints, reconcile,
     /// stage and apply transitions, and update the persisted ancestor.
     ///

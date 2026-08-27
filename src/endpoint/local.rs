@@ -258,6 +258,18 @@ impl ChangeWatcher {
     }
 
     /// Indicates whether any change is currently recorded.
+    /// The current size of the unconsumed change record.
+    fn activity(&self) -> crate::endpoint::ChangeActivity {
+        let pending = self
+            .pending
+            .lock()
+            .expect("the pending lock is never poisoned");
+        crate::endpoint::ChangeActivity {
+            paths: pending.paths.len(),
+            incomplete: pending.incomplete,
+        }
+    }
+
     fn has_changes(&self) -> bool {
         !self
             .pending
@@ -1000,6 +1012,10 @@ impl Endpoint for LocalEndpoint {
         let result = self.push_frames(&mut state, frames);
         self.receive = Some(state);
         result
+    }
+
+    fn change_activity(&mut self) -> Option<crate::endpoint::ChangeActivity> {
+        self.watcher.as_ref().map(ChangeWatcher::activity)
     }
 
     fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {

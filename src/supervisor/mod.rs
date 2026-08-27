@@ -347,7 +347,10 @@ impl<'a> Worker<'a> {
         stop: &AtomicBool,
         flags: &control::WorkerControl,
     ) {
+        // The ceiling on coalescing a burst, and the slice of quiet that
+        // ends it early. An isolated write now costs QUIET, not SETTLE.
         const SETTLE: Duration = Duration::from_millis(100);
+        const QUIET: Duration = Duration::from_millis(20);
         let deadline = std::time::Instant::now() + interval;
         while !stop.load(Ordering::Relaxed) {
             if flags.wake.swap(false, Ordering::Relaxed)
@@ -364,7 +367,7 @@ impl<'a> Worker<'a> {
             match self.session.as_mut() {
                 Some(session) => match session.await_change(slice) {
                     Ok(true) => {
-                        std::thread::sleep(SETTLE.min(interval));
+                        session.settle(SETTLE.min(interval), QUIET);
                         return;
                     }
                     Ok(false) => {}

@@ -463,7 +463,7 @@ fn run_sync(
         // An await failure is deliberately ignored here: the next cycle
         // surfaces the underlying problem with full context.
         if let Ok(true) = session.await_change(Duration::from_secs(interval.max(1))) {
-            std::thread::sleep(Duration::from_millis(100));
+            session.settle(Duration::from_millis(100), Duration::from_millis(20));
         }
     }
     Ok(())

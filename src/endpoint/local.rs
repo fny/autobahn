@@ -1080,6 +1080,7 @@ impl Endpoint for LocalEndpoint {
             staged_uses,
             problems: Vec::new(),
             missing_staged_files: false,
+            missing_staged: Vec::new(),
         };
         let mut results = Vec::with_capacity(transitions.len());
         for change in &transitions {
@@ -1091,6 +1092,7 @@ impl Endpoint for LocalEndpoint {
             results,
             problems: transitioner.problems,
             missing_staged_files: transitioner.missing_staged_files,
+            missing_staged: transitioner.missing_staged,
         };
 
         // A problem means the filesystem disagreed with the snapshot the
@@ -1288,6 +1290,8 @@ struct Transitioner<'a> {
     problems: Vec<Problem>,
     /// Whether or not any staged content was found missing.
     missing_staged_files: bool,
+    /// The content confirmed absent from staging, by path and digest.
+    missing_staged: Vec<crate::endpoint::FileRequest>,
 }
 
 impl Transitioner<'_> {
@@ -1635,6 +1639,10 @@ impl Transitioner<'_> {
                 );
                 if missing(&error) && staged_absent {
                     self.missing_staged_files = true;
+                    self.missing_staged.push(crate::endpoint::FileRequest {
+                        path: path.to_owned(),
+                        digest: *digest,
+                    });
                     self.problem(
                         path,
                         "staged content is unavailable; it will be retransferred on the next \

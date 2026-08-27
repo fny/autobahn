@@ -59,6 +59,10 @@ pub struct CycleReport {
     /// Whether or not either endpoint reported missing staged content
     /// (warranting an immediate follow-up cycle).
     pub missing_staged_files: bool,
+    /// Which content was confirmed absent from staging this cycle, by path
+    /// and digest, across both endpoints. A follow-up that reports the same
+    /// pair again is not looking at a changing file.
+    pub missing_staged: Vec<crate::endpoint::FileRequest>,
 }
 
 impl CycleReport {
@@ -398,12 +402,14 @@ impl Session {
             report.beta_transitions = reconciliation.beta_transitions.len();
             report.beta_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
+            report.missing_staged.extend(outcome.missing_staged.iter().cloned());
         }
         if let Some(outcome) = &alpha_outcome {
             fold(&reconciliation.alpha_transitions, outcome);
             report.alpha_transitions = reconciliation.alpha_transitions.len();
             report.alpha_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
+            report.missing_staged.extend(outcome.missing_staged.iter().cloned());
         }
 
         // Apply the ancestor changes, validate the result (the ancestor must
@@ -832,6 +838,7 @@ mod tests {
                 results: transitions.iter().map(|t| t.new.clone()).collect(),
                 problems: Vec::new(),
                 missing_staged_files: false,
+                missing_staged: Vec::new(),
             })
         }
     }

@@ -447,13 +447,29 @@ fn run_sync(
 
     // Create the session and run.
     let mut session = Session::new(alpha_endpoint, beta_endpoint, mode.into(), state_directory)?;
+    let mut follow_ups = 0u32;
     loop {
         let report = session.run_cycle()?;
         print_report(&report);
         if report.missing_staged_files {
-            // Concurrent modification during staging: run a follow-up cycle
-            // immediately.
-            continue;
+            // Content changed between staging and transition. A follow-up
+            // usually settles it, but a tree under continuous writing can
+            // sustain this indefinitely — so the follow-ups are bounded.
+            // Past the bound a watching run falls through to its watcher,
+            // which paces the next attempt on an actual change rather than
+            // spinning, and a single pass reports that it did not finish.
+            follow_ups += 1;
+            if follow_ups <= autobahn::supervisor::MAXIMUM_FOLLOW_UP_CYCLES {
+                continue;
+            }
+            if !watch {
+                bail!(
+                    "staged content was still missing after {follow_ups} cycles; source \
+                     content is changing faster than it can be transferred"
+                );
+            }
+        } else {
+            follow_ups = 0;
         }
         if !watch {
             break;

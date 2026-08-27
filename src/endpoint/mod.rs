@@ -88,6 +88,14 @@ pub struct TransitionOutcome {
     /// (indicating concurrent modification between staging and transition,
     /// warranting an immediate follow-up cycle).
     pub missing_staged_files: bool,
+    /// Which content was confirmed absent from staging, by path and digest.
+    ///
+    /// The identity is what separates a busy tree from a broken one. Source
+    /// churn requests a *fresh* digest on every follow-up, because the
+    /// cycle rescans and sees the rewritten file. The same path and digest
+    /// going missing twice running therefore cannot be churn: staging is
+    /// failing to produce that content at all.
+    pub missing_staged: Vec<FileRequest>,
 }
 
 /// Expresses a transition's outcome as changes: each transition's path now

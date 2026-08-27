@@ -37,9 +37,15 @@ use crate::transport::Connection;
 const MAXIMUM_BACKOFF: Duration = Duration::from_secs(300);
 
 /// The number of immediate follow-up cycles permitted when an endpoint
-/// reports missing staged content, bounding the retry loop that a
-/// continuously churning file could otherwise sustain.
-const MAXIMUM_FOLLOW_UP_CYCLES: u32 = 5;
+/// reports missing staged content.
+///
+/// This is a loop boundary, not a failure threshold. Reaching it returns
+/// control to the worker, which checks stop, pause, reset and flush, writes
+/// status, and then paces the next attempt on the watcher — so a busy tree
+/// stays responsive instead of spinning inside one attempt. The follow-up
+/// exists only to save a watcher round trip in the common case where the
+/// content settles immediately.
+pub const MAXIMUM_FOLLOW_UP_CYCLES: u32 = 5;
 
 /// The granularity at which sleeping workers check for a stop request.
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -147,6 +153,17 @@ impl Supervisor {
                         let result = worker.attempt();
                         let recorded = worker.conclude(&result);
                         let result = match (result, recorded) {
+                            // A single pass must not report success while
+                            // content is known to be missing: the watching
+                            // supervisor can wait for a busy tree to settle,
+                            // but a one-shot run has nothing left to wait
+                            // with, and automation reads its exit status.
+                            (Ok((_, report)), Ok(())) if report.missing_staged_files => {
+                                Err("staged content was still missing when the pass ended; \
+                                     source content is changing faster than it can be \
+                                     transferred"
+                                    .to_owned())
+                            }
                             (Ok((digest, _)), Ok(())) => Ok(digest),
                             (Ok(_), Err(record_error)) => Err(format!(
                                 "synchronized, but unable to record status: {record_error:#}"
@@ -327,8 +344,9 @@ impl<'a> Worker<'a> {
 
     /// Concludes an attempt: records its status (while any held lock is
     /// still ours), then, on failure, drops the session so the next attempt
-    /// reconnects from scratch (which also shuts down and reaps any agent
-    /// process).
+    /// reconnects from scratch. That closes this session's channels; a
+    /// pooled agent process outlives them and is reaped only once its last
+    /// channel and handle are gone.
     fn conclude(&mut self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
         let recorded = self.record(result);
         if result.is_err() {
@@ -544,6 +562,8 @@ impl<'a> Worker<'a> {
 /// be transferred, and automation must not read that as "synchronized".
 fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
     let mut digest = CycleDigest::default();
+    let mut previously_missing: std::collections::HashMap<String, crate::tree::Digest> =
+        std::collections::HashMap::new();
     loop {
         let report = session.run_cycle()?;
         digest.cycles += 1;
@@ -554,13 +574,38 @@ fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
         if !report.missing_staged_files {
             return Ok((digest, report));
         }
-        if digest.cycles > MAXIMUM_FOLLOW_UP_CYCLES as u64 {
+
+        // The same path at the same digest, missing twice running, is not a
+        // file being rewritten: a rewrite changes the digest, because the
+        // follow-up rescanned and asked for the new content. Staging is
+        // failing to produce this content at all — a wiped staging
+        // directory, a cleaner, a supply defect — and that is worth an
+        // error and the backoff that follows one.
+        if report
+            .missing_staged
+            .iter()
+            .any(|request| previously_missing.get(&request.path) == Some(&request.digest))
+        {
             bail!(
-                "staged content was still missing after {} cycles; source content is \
-                 changing faster than it can be transferred",
-                digest.cycles
+                "staged content failed to appear across consecutive cycles; staging is \
+                 failing rather than racing the source"
             );
         }
+
+        // Otherwise the source is simply being written faster than it can be
+        // transferred. That is a busy tree, not a broken session: return the
+        // work that was done, with the flag still set. The caller decides
+        // what it means — a one-shot run treats it as incomplete, while a
+        // watching supervisor keeps its session, its watcher and its warm
+        // state, and lets the next change schedule the next attempt.
+        if digest.cycles > MAXIMUM_FOLLOW_UP_CYCLES as u64 {
+            return Ok((digest, report));
+        }
+        previously_missing = report
+            .missing_staged
+            .iter()
+            .map(|request| (request.path.clone(), request.digest))
+            .collect();
     }
 }
 
@@ -882,16 +927,33 @@ mod tests {
             &mut self,
             transitions: Vec<crate::tree::Change>,
         ) -> Result<crate::endpoint::TransitionOutcome> {
+            let missing = transitions
+                .iter()
+                .filter_map(|change| match &change.new {
+                    Some(crate::tree::Node {
+                        content: crate::tree::Content::File { digest, .. },
+                        ..
+                    }) => Some(crate::endpoint::FileRequest {
+                        path: change.path.clone(),
+                        digest: *digest,
+                    }),
+                    _ => None,
+                })
+                .collect();
             Ok(crate::endpoint::TransitionOutcome {
                 results: vec![None; transitions.len()],
                 problems: Vec::new(),
                 missing_staged_files: true,
+                missing_staged: missing,
             })
         }
     }
 
+    /// Staging that never produces the *same* content is a real failure,
+    /// and must surface as one: the digest never changes, so nothing about
+    /// this is a file being rewritten.
     #[test]
-    fn exhausting_the_follow_up_cap_is_an_error_not_a_success() {
+    fn content_that_never_appears_is_an_error_not_a_success() {
         use crate::tree::{Content, FileMetadata, Node, SyncMode};
 
         let alpha_root = Node::directory(
@@ -916,8 +978,113 @@ mod tests {
         )
         .expect("the session should construct");
 
-        let error = run_cycles(&mut session).expect_err("the cap must surface as an error");
-        assert!(format!("{error:#}").contains("still missing"), "{error:#}");
+        let error =
+            run_cycles(&mut session).expect_err("unappearing content must surface as an error");
+        assert!(format!("{error:#}").contains("staging is failing"), "{error:#}");
+    }
+
+    /// A tree being written faster than it transfers is busy, not broken.
+    /// The cap still bounds the attempt, but it returns the work that was
+    /// done — with the flag still set — so the worker keeps its session and
+    /// paces the next attempt on its watcher.
+    #[test]
+    fn churning_content_returns_the_work_done_rather_than_an_error() {
+        use crate::tree::{Content, FileMetadata, Node, SyncMode};
+
+        /// Reports a *different* digest each cycle, as a rewritten file
+        /// does: the follow-up rescans and asks for the new content.
+        struct RotatingEndpoint {
+            root: Node,
+            round: std::cell::Cell<u8>,
+        }
+        impl crate::endpoint::Endpoint for RotatingEndpoint {
+            fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+                let round = self.round.get().wrapping_add(1);
+                self.round.set(round);
+                let mut root = self.root.clone();
+                if let Content::Directory(children) = &mut root.content {
+                    for child in std::sync::Arc::make_mut(children) {
+                        if let Content::File { digest, .. } = &mut child.content {
+                            *digest = [round; 32];
+                        }
+                    }
+                }
+                Ok(crate::tree::Snapshot {
+                    root: Some(root),
+                    ..crate::tree::Snapshot::default()
+                })
+            }
+            fn stage_begin(
+                &mut self,
+                _requests: Vec<crate::endpoint::FileRequest>,
+            ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+                Ok(Vec::new())
+            }
+            fn supply_open(&mut self, _needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+                unreachable!("no staging needs are ever reported")
+            }
+            fn supply_pull(
+                &mut self,
+                _max_frames: usize,
+            ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+                unreachable!("no staging needs are ever reported")
+            }
+            fn stage_push(&mut self, _frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+                unreachable!("no staging needs are ever reported")
+            }
+            fn transition(
+                &mut self,
+                transitions: Vec<crate::tree::Change>,
+            ) -> Result<crate::endpoint::TransitionOutcome> {
+                let missing = transitions
+                    .iter()
+                    .filter_map(|change| match &change.new {
+                        Some(Node {
+                            content: Content::File { digest, .. },
+                            ..
+                        }) => Some(crate::endpoint::FileRequest {
+                            path: change.path.clone(),
+                            digest: *digest,
+                        }),
+                        _ => None,
+                    })
+                    .collect();
+                Ok(crate::endpoint::TransitionOutcome {
+                    results: vec![None; transitions.len()],
+                    problems: Vec::new(),
+                    missing_staged_files: true,
+                    missing_staged: missing,
+                })
+            }
+        }
+
+        let file = |name: &str| Node {
+            name: name.into(),
+            content: Content::File {
+                digest: [1u8; 32],
+                executable: false,
+                metadata: FileMetadata::default(),
+            },
+        };
+        let state = tempfile::tempdir().expect("temporary directory should be creatable");
+        let mut session = Session::new(
+            Box::new(RotatingEndpoint {
+                root: Node::directory("", vec![file("churning.txt")]),
+                round: std::cell::Cell::new(0),
+            }),
+            Box::new(RotatingEndpoint {
+                root: Node::directory("", Vec::new()),
+                round: std::cell::Cell::new(100),
+            }),
+            SyncMode::TwoWaySafe,
+            state.path().join("session"),
+        )
+        .expect("the session should construct");
+
+        let (digest, report) =
+            run_cycles(&mut session).expect("churn must not be reported as a failure");
+        assert!(report.missing_staged_files, "the flag must survive the cap");
+        assert_eq!(digest.cycles, MAXIMUM_FOLLOW_UP_CYCLES as u64 + 1);
     }
 
     #[test]

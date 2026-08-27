@@ -1,0 +1,193 @@
+{
+  "run": "bench-1787806744",
+  "seed": 31,
+  "ami": "ami-0b750c8a5ed6b0297",
+  "chromium_commit": "e811e2392615415b88904d76696a15b9bd223787",
+  "pairs": 10,
+  "repeats": 10,
+  "cells": [
+    "4k-1"
+  ],
+  "jobs": [
+    {
+      "run": "bench-1787806744",
+      "repeat": 7,
+      "job": "4k-1-r7",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-0"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 5,
+      "job": "4k-1-r5",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-1"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 9,
+      "job": "4k-1-r9",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-2"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 3,
+      "job": "4k-1-r3",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-3"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 4,
+      "job": "4k-1-r4",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-4"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 6,
+      "job": "4k-1-r6",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 1,
+      "job": "4k-1-r1",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 8,
+      "job": "4k-1-r8",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 0,
+      "job": "4k-1-r0",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1787806744",
+      "repeat": 2,
+      "job": "4k-1-r2",
+      "cell": {
+        "name": "4k-1",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 1,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-9"
+    }
+  ]
+}

@@ -50,7 +50,13 @@ pub struct WorkingSets {
 }
 
 pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
-    let files = crate::walk::files(root).map_err(|error| error.to_string())?;
+    // An incomplete walk must never produce "verified" partitions: a
+    // sampling frame missing part of the tree would bias the working
+    // sets toward whatever happened to be readable at bake time.
+    let (files, errors) = crate::walk::files_with_errors(root).map_err(|error| error.to_string())?;
+    if errors > 0 {
+        return Err(format!("walk saw {errors} errors; refusing to sample from an incomplete frame"));
+    }
     let editable: Vec<&String> = files
         .iter()
         .filter(|(_, size)| (EDITABLE_SIZE.0..=EDITABLE_SIZE.1).contains(size))

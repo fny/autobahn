@@ -32,9 +32,17 @@ use std::time::{Duration, Instant};
 
 use serde_json::json;
 
-/// The detection poll. Its expected contribution is half the interval;
-/// the floor reports the realized total rather than this theoretical one.
-const POLL: Duration = Duration::from_micros(500);
+/// The detection poll: fine-grained at first, backing off once a wait
+/// is clearly not about to resolve. The backoff bounds verifier
+/// contention — with many slow verifications in flight, fine polling
+/// would put tens of thousands of metadata reads per second on the
+/// destination host, a load correlated with exactly the tool being
+/// measured. The added detection error after backoff is at most half of
+/// POLL_SLOW — well under a millisecond against the multi-second
+/// latencies that reach that state. The floor reports realized totals.
+const POLL_FAST: Duration = Duration::from_micros(500);
+const POLL_SLOW: Duration = Duration::from_millis(1);
+const POLL_BACKOFF_AFTER: Duration = Duration::from_secs(1);
 
 pub fn serve(port: u16) -> Result<(), String> {
     let listener =
@@ -62,7 +70,10 @@ fn handle(connection: TcpStream) -> std::io::Result<()> {
     // instead of surviving into the next phase or the next tool.
     let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-    while let Some(request) = crate::read_message(&mut reader)? {
+    // Any exit — clean EOF or a read error — must mark the connection
+    // closed, or verify workers would outlive an abnormal disconnect
+    // and poll into the next phase.
+    while let Ok(Some(request)) = crate::read_message(&mut reader) {
         let seq = request["seq"].as_u64().unwrap_or(0);
         match request["op"].as_str() {
             Some("ping") => {
@@ -155,7 +166,8 @@ fn await_content(
     deadline: Duration,
     closed: &std::sync::atomic::AtomicBool,
 ) -> bool {
-    let end = Instant::now() + deadline;
+    let start = Instant::now();
+    let end = start + deadline;
     while Instant::now() < end && !closed.load(std::sync::atomic::Ordering::Relaxed) {
         if let Ok(metadata) = std::fs::metadata(path) {
             if metadata.len() == expected_size {
@@ -166,7 +178,11 @@ fn await_content(
                 }
             }
         }
-        std::thread::sleep(POLL);
+        std::thread::sleep(if start.elapsed() < POLL_BACKOFF_AFTER {
+            POLL_FAST
+        } else {
+            POLL_SLOW
+        });
     }
     false
 }

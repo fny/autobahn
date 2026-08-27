@@ -75,6 +75,7 @@ Each of these answers a specific defect found in the previous harness.
    reports a lower bound, never a flattering finite number. The censoring
    verdict is made at acknowledgement-match time on the writer's clock, so
    a late acknowledgement can never convert a timeout into a fast sample.
+   Failed floor probes occupy censored percentile positions the same way.
 9. **Every record carries provenance**: schema version, run id, pair, job,
    cell, repeat, tool, tool versions, binary digest, and phase timestamps.
    Every run that starts is either completed or recorded as failed, and
@@ -99,6 +100,17 @@ Each of these answers a specific defect found in the previous harness.
 
 - Latencies include observer verification and one network return trip by
   design; they are upper bounds. The floor phase bounds the overhead.
+- The floor is sequential; the workload can hold up to 32 verifications
+  in flight per direction, and the floor does not characterize that
+  concurrency. The observer bounds the contention instead: each pending
+  verification polls at 500µs for its first second, then backs off to
+  1ms, capping steady-state metadata load at ~1k polls/s per stuck
+  verification set while adding at most ~0.5ms to multi-second samples.
+- The open loop is bounded at 32 in-flight measured edits; a tool slow
+  enough to saturate the bound gets fewer offered edits. Skipped ticks
+  are reported in every latency row rather than used to discard runs —
+  discarding would delete the censored counts, which are the evidence of
+  the very slowness that caused the skipping.
 - mutagen runs its default portable watch mode, which on a stock Linux
   build reifies to poll-assisted watching (native recursive watching
   exists only behind SSPL fanotify builds). This is the configuration a

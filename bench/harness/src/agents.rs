@@ -139,7 +139,7 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
         }));
     }
 
-    let report = measure(&options, &sets.measured);
+    let report = measure(&options, &sets.measured, &stop);
     stop.store(true, Ordering::Relaxed);
     let mut background_panics = 0u64;
     for worker in workers {
@@ -165,7 +165,11 @@ struct InFlight {
     warmup: bool,
 }
 
-fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Value, String> {
+fn measure(
+    options: &Options,
+    measured_set: &[String],
+    stop_background: &AtomicBool,
+) -> Result<serde_json::Value, String> {
     let connection = TcpStream::connect(&options.observer)
         .map_err(|error| format!("observer {}: {error}", options.observer))?;
     let _ = connection.set_nodelay(true);
@@ -241,6 +245,7 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
     let mut rng = Rng::new(options.nonce ^ 0x9999);
     let mut payload = vec![0u8; EDIT_SIZE.1];
     let started = Instant::now();
+    let window_start_epoch = epoch_seconds();
     let window = Duration::from_secs(options.seconds);
     let mut skipped_ticks = 0usize;
     let mut sequence = 0u64;
@@ -326,6 +331,9 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
                     .get_mut(&sequence)
                 {
                     entry.started = Instant::now();
+                    // Warmup is a property of the true T0, not of the
+                    // tick that scheduled the edit.
+                    entry.warmup = started.elapsed() < WARMUP;
                 }
                 sequence += 1;
             }
@@ -334,6 +342,13 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
             + rng.index((EDIT_INTERVAL_MS.1 - EDIT_INTERVAL_MS.0) as usize) as u64;
         std::thread::sleep(Duration::from_millis(pause));
     }
+
+    // The offered load ends here: background agents stop *now*, so the
+    // drain that follows adds no editing activity and the resource
+    // window can end with the load window instead of a tool-dependent
+    // drain of up to the full deadline.
+    stop_background.store(true, Ordering::Relaxed);
+    let window_end_epoch = epoch_seconds();
 
     // Drain: give stragglers up to the deadline, then classify.
     let drain_deadline = Instant::now() + DEADLINE;
@@ -391,6 +406,8 @@ fn measure(options: &Options, measured_set: &[String]) -> Result<serde_json::Val
         "agents": options.agents,
         "seconds": options.seconds,
         "nonce": options.nonce,
+        "window_start_epoch": window_start_epoch,
+        "window_end_epoch": window_end_epoch,
         "samples": samples.len(),
         "warmup_samples": warmup_samples,
         "censored": censored,
@@ -482,13 +499,21 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
         }
     }
     samples.sort_by(|a, b| a.partial_cmp(b).expect("no NaN"));
+    // Percentiles over *attempts*: failed probes occupy the top
+    // positions, exactly as censored workload edits do, so a percentile
+    // landing among failures reports null rather than a flattering
+    // finite number computed from the successes alone.
+    let attempts = samples.len() + failures as usize;
     let value = |fraction: f64| -> Option<f64> {
-        if samples.is_empty() {
+        if attempts == 0 {
             return None;
         }
-        let index = ((fraction * (samples.len() - 1) as f64).round() as usize)
-            .min(samples.len() - 1);
-        Some((samples[index] * 100.0).round() / 100.0)
+        let index = (fraction * (attempts - 1) as f64).round() as usize;
+        if index < samples.len() {
+            Some((samples[index] * 100.0).round() / 100.0)
+        } else {
+            None
+        }
     };
     println!(
         "{}",
@@ -496,10 +521,19 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
             "measurement": "floor",
             "samples": samples.len(),
             "failures": failures,
+            "attempts": attempts,
             "p50_ms": value(0.50),
             "p90_ms": value(0.90),
-            "max_ms": value(1.0),
+            "max_ms": samples.last().map(|v| (v * 100.0).round() / 100.0),
         })
     );
     Ok(())
+}
+
+/// Wall-clock seconds, for phase windows correlated with the sampler.
+fn epoch_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
 }

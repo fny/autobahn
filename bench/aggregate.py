@@ -69,12 +69,21 @@ def find_tainted(records):
             t.get("verified") for t in record.get("timings", {}).values()
         ):
             tainted[key] = "cold_sync_unverified"
+        elif kind == "workload" and (
+            record.get("background_write_errors") or record.get("background_panics")
+        ):
+            # The offered load was not what the report claims; every
+            # latency sample this tool-run produced is suspect.
+            tainted.setdefault(key, "background_load_failure")
         elif kind == "job_complete":
             # The driver's verdict covers the whole tool-run: a workload
             # error in either direction taints every latency sample that
-            # tool produced in this job.
+            # tool produced in this job, and a tool that never settled
+            # before the workload was measured with a pre-existing
+            # backlog.
             for tool, status in record.get("statuses", {}).items():
-                if status in ("workload_error", "diverged", "error"):
+                if status in ("workload_error", "diverged", "error",
+                              "unsettled_idle"):
                     tainted.setdefault((record.get("job"), tool), status)
     return tainted
 
@@ -170,6 +179,7 @@ def main():
     # Latency: pooled raw samples per (cell, tool, direction), tainted
     # runs excluded and counted.
     pools = defaultdict(lambda: {"samples": [], "censored": 0,
+                                 "skipped_ticks": 0,
                                  "per_run_p50": [], "runs": 0, "tainted": 0,
                                  "deadline_ms": 120000})
     for record in records:
@@ -185,6 +195,7 @@ def main():
         pool["runs"] += 1
         pool["samples"].extend(record.get("samples_ms", []))
         pool["censored"] += record.get("censored", 0)
+        pool["skipped_ticks"] += record.get("skipped_ticks", 0)
         if record.get("censored_over_ms"):
             pool["deadline_ms"] = record["censored_over_ms"]
         if isinstance(record.get("p50_ms"), (int, float)):
@@ -197,6 +208,11 @@ def main():
             "tainted_runs_excluded": pool["tainted"],
             "pooled_samples": len(pool["samples"]),
             "censored": pool["censored"],
+            # Ticks the measuring agent skipped at full in-flight capacity:
+            # an offered-load shortfall that qualifies this row. Nonzero
+            # means the tool was slow enough to saturate the 32-edit bound,
+            # and the row's censored count is the evidence of that.
+            "skipped_ticks": pool["skipped_ticks"],
             "p50_ms": percentile_from_pool(pool["samples"], pool["censored"], 0.50, pool["deadline_ms"]),
             "p90_ms": percentile_from_pool(pool["samples"], pool["censored"], 0.90, pool["deadline_ms"]),
             "p99_ms": percentile_from_pool(pool["samples"], pool["censored"], 0.99, pool["deadline_ms"]),

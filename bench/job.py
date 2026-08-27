@@ -141,6 +141,11 @@ def kill_tools():
     this harness exists to rule out."""
     # The bracket makes the pattern not match its own shell wrapper.
     run(f"pkill -f 'python3 {BENCH}/[t]oysync.py'; true")
+    # A driver that died mid-workload can leave orphaned workload agents
+    # editing the corpus; they would contaminate the next tool's restore,
+    # floor, and cold sync. The "agents" word never matches an observer.
+    run(f"pkill -f '{BINARY} [a]gents'; true")
+    peer(f"pkill -f '{BINARY} [a]gents'; true")
     if LOCAL:
         time.sleep(1)
         return
@@ -275,7 +280,8 @@ def await_quiescence(corpora):
             continue
         time.sleep(10)
         for corpus in corpora:
-            if summary("full", f"{DEST}/{corpus}", remote=True) != pairs[corpus]:
+            if (summary("full", f"{CORPUS}/{corpus}", remote=False) != pairs[corpus]
+                    or summary("full", f"{DEST}/{corpus}", remote=True) != pairs[corpus]):
                 stable = False
                 break
         if stable:
@@ -417,12 +423,15 @@ def run_workload(cell, emitter, tool, nonce):
             "--nonce", str(nonce * 1000 + index),
         ]
         processes.append((
-            f"{corpus}:a-to-b", None,
+            f"{corpus}:a-to-b", None, nonce * 1000 + index,
             subprocess.Popen(argv, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True),
         ))
         if cell.get("bidirectional"):
             remote_result = f"{HOME}/bench-b-{index}.json"
+            # A failed SSH launch must never let a previous run's file be
+            # read as this run's result.
+            peer(f"rm -f {remote_result} {remote_result}.err")
             remote_command = " ".join(shlex.quote(part) for part in [
                 BINARY, "agents",
                 "--root", f"{DEST}/{corpus}",
@@ -443,41 +452,64 @@ def run_workload(cell, emitter, tool, nonce):
                 process = subprocess.Popen(
                     ["ssh", "-n", "dest", remote_command],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            processes.append((f"{corpus}:b-to-a", remote_result, process))
+            processes.append((f"{corpus}:b-to-a", remote_result,
+                              nonce * 1000 + 500 + index, process))
 
     outputs = []
-    for direction, remote_result, process in processes:
+    for direction, remote_result, expected_nonce, process in processes:
         if remote_result is None:
-            outputs.append((direction, process.communicate()[0]))
+            outputs.append({"direction": direction, "local": True,
+                            "nonce": expected_nonce,
+                            "output": process.communicate()[0],
+                            "returncode": process.returncode})
         else:
             process.wait()
-            outputs.append((direction, None, remote_result))
+            outputs.append({"direction": direction, "local": False,
+                            "nonce": expected_nonce,
+                            "remote_result": remote_result,
+                            "returncode": process.returncode})
 
     return outputs
 
 
 def collect_workload(outputs, emitter, tool):
+    """Parses each direction's report. A report is accepted only when the
+    launcher exited zero AND the parsed JSON carries this run's exact
+    nonce — so a stale result file, or a launch that failed before its
+    redirection ran, can never masquerade as a measurement."""
     clean = True
+    reports = []
     for entry in outputs:
-        if len(entry) == 2:
-            direction, output = entry
+        if entry["local"]:
+            output = entry["output"]
         else:
-            direction, _, remote_result = entry
-            output = peer(f"cat {remote_result} {remote_result}.err 2>/dev/null").stdout
+            output = peer(
+                f"cat {entry['remote_result']} {entry['remote_result']}.err 2>/dev/null"
+            ).stdout
         parsed = None
         for line in (output or "").strip().splitlines():
             try:
                 parsed = json.loads(line)
             except json.JSONDecodeError:
                 continue
-        record = {"measurement": "workload", "tool": tool, "direction": direction}
-        if parsed:
+        record = {"measurement": "workload", "tool": tool,
+                  "direction": entry["direction"]}
+        if parsed and parsed.get("nonce") != entry["nonce"]:
+            record["error"] = (f"nonce mismatch: expected {entry['nonce']}, "
+                               f"report carries {parsed.get('nonce')} — stale result")
+            clean = False
+        elif parsed and entry["returncode"] != 0:
+            record["error"] = f"launcher exited {entry['returncode']} despite parseable output"
+            clean = False
+        elif parsed:
             record.update(parsed)
+            record["local"] = entry["local"]
+            reports.append(record)
         else:
             record["error"] = (output or "").strip()[-1000:]
             clean = False
         emitter.emit(record)
-    return clean
+    return clean, reports
 
 
 # ── one tool, one cell ───────────────────────────────────────────────
@@ -496,50 +528,67 @@ def run_tool(tool, cell, emitter, nonce):
     restore_sources(corpora)
     clear_destinations(corpora)
     start_samplers(tool)
-    offset = clock_offset()
-    time.sleep(1)
+    # Whatever happens below — a cold-sync abort, an exception on its
+    # way to run_job's handler — the samplers never outlive this tool.
+    try:
+        offset = clock_offset()
+        time.sleep(1)
 
-    status = "ok"
-    phase("cold_sync")
-    start_tool(tool, corpora)
-    timings = await_cold_sync(corpora, emitter, tool)
-    phase_end("cold_sync")
-    emitter.emit({"measurement": "cold_sync", "tool": tool, "timings": timings})
-    if not all(t.get("verified") for t in timings.values()):
-        emitter.emit({"measurement": "abort", "tool": tool,
-                      "reason": "cold sync unverified"})
+        status = "ok"
+        phase("cold_sync")
+        start_tool(tool, corpora)
+        timings = await_cold_sync(corpora, emitter, tool)
+        phase_end("cold_sync")
+        emitter.emit({"measurement": "cold_sync", "tool": tool, "timings": timings})
+        if not all(t.get("verified") for t in timings.values()):
+            emitter.emit({"measurement": "abort", "tool": tool,
+                          "reason": "cold sync unverified"})
+            destroy_tool_state(emitter)
+            return "cold_sync_failed"
+
+        settled = await_quiescence(corpora)
+        phase("idle")
+        time.sleep(IDLE_WINDOW_SECONDS)
+        phase_end("idle")
+        emitter.emit({"measurement": "idle_window", "tool": tool, "settled": settled})
+        if not settled:
+            status = "unsettled_idle"
+
+        verify_partitions(corpora)
+        phase("workload")
+        outputs = run_workload(cell, emitter, tool, nonce)
+        phase_end("workload")
+        clean, reports = collect_workload(outputs, emitter, tool)
+        if not clean:
+            status = "workload_error"
+        # Background editing stops when the offered-load window ends, so the
+        # window the agents report — not launch-to-drain, whose tail is a
+        # tool-dependent drain of up to the full deadline — is the honest
+        # resource window. Only local reports are used: remote epochs live on
+        # the other host's clock.
+        local_windows = [r for r in reports
+                         if r.get("local") and r.get("window_start_epoch")]
+        if local_windows:
+            phases["workload"] = {
+                "start": min(r["window_start_epoch"] for r in local_windows),
+                "end": max(r["window_end_epoch"] for r in local_windows),
+            }
+
+        phase("reconvergence")
+        converged = await_reconvergence(corpora)
+        phase_end("reconvergence")
+        emitter.emit({"measurement": "reconvergence", "tool": tool, "converged": converged})
+        if not all(converged.values()):
+            status = "diverged"
+
+        emitter.emit({
+            "measurement": "resources", "tool": tool,
+            "phases": phases, "clock_offset": offset, "series": collect_series(),
+        })
         destroy_tool_state(emitter)
-        return "cold_sync_failed"
-
-    settled = await_quiescence(corpora)
-    phase("idle")
-    time.sleep(IDLE_WINDOW_SECONDS)
-    phase_end("idle")
-    emitter.emit({"measurement": "idle_window", "tool": tool, "settled": settled})
-    if not settled:
-        status = "unsettled_idle"
-
-    verify_partitions(corpora)
-    phase("workload")
-    outputs = run_workload(cell, emitter, tool, nonce)
-    phase_end("workload")
-    if not collect_workload(outputs, emitter, tool):
-        status = "workload_error"
-
-    phase("reconvergence")
-    converged = await_reconvergence(corpora)
-    phase_end("reconvergence")
-    emitter.emit({"measurement": "reconvergence", "tool": tool, "converged": converged})
-    if not all(converged.values()):
-        status = "diverged"
-
-    emitter.emit({
-        "measurement": "resources", "tool": tool,
-        "phases": phases, "clock_offset": offset, "series": collect_series(),
-    })
-    stop_samplers()
-    destroy_tool_state(emitter)
-    return status
+        return status
+    finally:
+        stop_samplers()
 
 
 def digest_of(path):

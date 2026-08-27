@@ -27,13 +27,9 @@ fn temporary(name: &str) -> bool {
 }
 
 /// Every synchronizable file under the root: `(relative path, size)`, in
-/// one deterministic sorted order. The walk is complete — never
-/// early-stopped — so identical trees yield identical lists on any host.
-pub fn files(root: &Path) -> std::io::Result<Vec<(String, u64)>> {
-    files_with_errors(root).map(|(files, _)| files)
-}
-
-/// The walk, with its failures counted rather than swallowed. A missing
+/// one deterministic sorted order, with failures counted rather than
+/// swallowed. The walk is complete — never early-stopped — so identical
+/// trees yield identical lists on any host. A missing
 /// root is a hard error — an absent tree must never summarize as an empty
 /// one — and every failure below it (an unreadable directory, a dropped
 /// entry, an unstattable file) increments the error count, which both

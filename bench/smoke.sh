@@ -127,6 +127,28 @@ mkdir -p "$JOBHOME/corpus-pristine"
 cp -r "$WORK/src" "$JOBHOME/corpus-pristine/smoke"
 mkdir -p "$JOBHOME/corpus/smoke.bench"
 "$JOBHOME/bench/benchmark" partitions "$JOBHOME/corpus/smoke"   "$JOBHOME/corpus/smoke.bench/partitions.json" > /dev/null
+
+echo "== source restoration actually restores =="
+# Corrupt a partition-listed file, restore, and demand the pristine bytes
+# back — this fails if restore_sources() is a successful no-op.
+BENCH_HOME="$JOBHOME" BENCH_LOCAL=1 python3 - "$HERE" "$JOBHOME" <<'EOF'
+import importlib.util, json, os, sys
+here, jobhome = sys.argv[1], sys.argv[2]
+spec = importlib.util.spec_from_file_location("job", os.path.join(here, "job.py"))
+job = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(job)
+partitions = json.load(open(f"{jobhome}/corpus/smoke.bench/partitions.json"))
+victim = partitions["sides"]["a"]["10"]["measured"][0]
+path = f"{jobhome}/corpus/smoke/{victim}"
+pristine = open(f"{jobhome}/corpus-pristine/smoke/{victim}", "rb").read()
+with open(path, "wb") as handle:
+    handle.write(b"CORRUPTED BY SMOKE TEST")
+job.restore_sources(["smoke"])
+restored = open(path, "rb").read()
+assert restored == pristine, f"restore left {victim} corrupted"
+print(f"  restored {victim} ({len(pristine)} bytes)")
+EOF
+
 SPEC='{"run":"smoke-run","pair":"pair-0","job":"smoke-job","repeat":0,
        "cell":{"name":"smoke","corpora":["smoke"],"agents":10,"bidirectional":false},
        "tools":["toysync"]}'

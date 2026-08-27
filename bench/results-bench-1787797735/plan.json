@@ -1,0 +1,236 @@
+{
+  "run": "bench-1787797735",
+  "seed": 21,
+  "ami": "ami-079e4df5379b8ef8b",
+  "chromium_commit": "dd4ecbed66210bdea39068c603edcb143bbb8b06",
+  "pairs": 12,
+  "repeats": 2,
+  "cells": [
+    "chromium-10",
+    "chromium-100",
+    "chromium-100-bidir",
+    "40k-100",
+    "two40k-100",
+    "4k-100"
+  ],
+  "jobs": [
+    {
+      "run": "bench-1787797735",
+      "repeat": 0,
+      "job": "two40k-100-r0",
+      "cell": {
+        "name": "two40k-100",
+        "corpora": [
+          "sub40k-a",
+          "sub40k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-0"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 1,
+      "job": "two40k-100-r1",
+      "cell": {
+        "name": "two40k-100",
+        "corpora": [
+          "sub40k-a",
+          "sub40k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-1"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 1,
+      "job": "chromium-100-bidir-r1",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-2"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 1,
+      "job": "chromium-100-r1",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-3"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 0,
+      "job": "chromium-10-r0",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-4"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 0,
+      "job": "4k-100-r0",
+      "cell": {
+        "name": "4k-100",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 1,
+      "job": "4k-100-r1",
+      "cell": {
+        "name": "4k-100",
+        "corpora": [
+          "sub4k"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 0,
+      "job": "40k-100-r0",
+      "cell": {
+        "name": "40k-100",
+        "corpora": [
+          "sub40k-a"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 0,
+      "job": "chromium-100-bidir-r0",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 0,
+      "job": "chromium-100-r0",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-9"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 1,
+      "job": "chromium-10-r1",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-10"
+    },
+    {
+      "run": "bench-1787797735",
+      "repeat": 1,
+      "job": "40k-100-r1",
+      "cell": {
+        "name": "40k-100",
+        "corpora": [
+          "sub40k-a"
+        ],
+        "agents": 100,
+        "bidirectional": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-11"
+    }
+  ]
+}

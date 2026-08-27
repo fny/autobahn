@@ -164,11 +164,18 @@ def destroy_tool_state(emitter):
     """Removes all tool state on both hosts and verifies cleanliness.
     Both tools lose their installed remote agents too, so every cold sync
     pays first-contact installation — the same cost for both."""
-    kill_tools()
-    result = run(f"rm -rf {HOME}/.autobahn {HOME}/.mutagen {HOME}/ab.toml")
+    # Development builds of either tool use a *-dev data directory
+    # (mutagen 0.19.0-dev installs its remote agent under
+    # ~/.mutagen-dev/agents/, not ~/.mutagen/agents/). Removing only the
+    # release paths left the installed agent in place, so one tool
+    # skipped first-contact installation on a pair's later jobs while the
+    # other paid it every time. Both variants go, for both tools.
+    state = " ".join(f"{HOME}/{name}" for name in
+                     (".autobahn", ".autobahn-dev", ".mutagen", ".mutagen-dev"))
+    result = run(f"rm -rf {state} {HOME}/ab.toml")
     if result.returncode != 0:
         raise RuntimeError(f"local state removal failed: {result.stdout[-300:]}")
-    result = peer(f"rm -rf {HOME}/.autobahn {HOME}/.mutagen")
+    result = peer(f"rm -rf {state}")
     if result.returncode != 0:
         raise RuntimeError(f"remote state removal failed: {result.stdout[-300:]}")
     if LOCAL:
@@ -186,10 +193,13 @@ def destroy_tool_state(emitter):
     # silently contaminated next run.
     leftovers += run(f"pgrep -f '{BINARY} [a]gents'; true").stdout.strip()
     remote_leftovers += peer(f"pgrep -f '{BINARY} [a]gents'; true").stdout.strip()
-    if leftovers or remote_leftovers:
+    surviving = run(f"ls -d {state} 2>/dev/null; true").stdout.strip()
+    remote_surviving = peer(f"ls -d {state} 2>/dev/null; true").stdout.strip()
+    if leftovers or remote_leftovers or surviving or remote_surviving:
         emitter.emit({"measurement": "hygiene_failure",
-                      "local": leftovers, "remote": remote_leftovers})
-        raise RuntimeError("tool processes survived cleanup")
+                      "local": leftovers, "remote": remote_leftovers,
+                      "local_state": surviving, "remote_state": remote_surviving})
+        raise RuntimeError("tool processes or state survived cleanup")
 
 
 def restore_sources(corpora):

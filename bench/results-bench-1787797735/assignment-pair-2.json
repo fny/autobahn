@@ -1,0 +1,1 @@
+[{"run": "bench-1787797735", "repeat": 1, "job": "chromium-100-bidir-r1", "cell": {"name": "chromium-100-bidir", "corpora": ["chromium"], "agents": 100, "bidirectional": true}, "tools": ["mutagen", "autobahn"], "pair": "pair-2"}]

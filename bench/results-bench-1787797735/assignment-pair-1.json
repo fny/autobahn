@@ -1,0 +1,1 @@
+[{"run": "bench-1787797735", "repeat": 1, "job": "two40k-100-r1", "cell": {"name": "two40k-100", "corpora": ["sub40k-a", "sub40k-b"], "agents": 100, "bidirectional": false}, "tools": ["mutagen", "autobahn"], "pair": "pair-1"}]

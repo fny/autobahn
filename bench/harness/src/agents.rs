@@ -113,16 +113,30 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
     // failure is counted, not swallowed — an agent that stopped editing
     // would silently reduce the offered load.
     let stop = Arc::new(AtomicBool::new(false));
+    let go = Arc::new(AtomicBool::new(false));
     let edits = Arc::new(AtomicU64::new(0));
     let write_errors = Arc::new(AtomicU64::new(0));
     let mut workers = Vec::new();
     for (index, files) in sets.background.iter().enumerate() {
         let files: Vec<PathBuf> = files.iter().map(|f| options.root.join(f)).collect();
         let stop = Arc::clone(&stop);
+        let go = Arc::clone(&go);
         let edits = Arc::clone(&edits);
         let write_errors = Arc::clone(&write_errors);
         let mut rng = Rng::new(options.nonce ^ (0x9000 + index as u64));
         workers.push(std::thread::spawn(move || {
+            // Editing starts only when the measuring agent opens its
+            // window — otherwise background load precedes
+            // window_start_epoch (observer connection and control pings
+            // happen first, and a stall there would extend the gap
+            // unboundedly), and the resource window would not cover the
+            // whole offered load.
+            while !go.load(Ordering::Relaxed) {
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
             let mut payload = vec![0u8; EDIT_SIZE.1];
             while !stop.load(Ordering::Relaxed) {
                 let size = EDIT_SIZE.0 + rng.index(EDIT_SIZE.1 - EDIT_SIZE.0);
@@ -139,7 +153,7 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
         }));
     }
 
-    let report = measure(&options, &sets.measured, &stop);
+    let report = measure(&options, &sets.measured, &go, &stop);
     stop.store(true, Ordering::Relaxed);
     let mut background_panics = 0u64;
     for worker in workers {
@@ -168,6 +182,7 @@ struct InFlight {
 fn measure(
     options: &Options,
     measured_set: &[String],
+    go_background: &AtomicBool,
     stop_background: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
     let connection = TcpStream::connect(&options.observer)
@@ -246,6 +261,7 @@ fn measure(
     let mut payload = vec![0u8; EDIT_SIZE.1];
     let started = Instant::now();
     let window_start_epoch = epoch_seconds();
+    go_background.store(true, Ordering::Relaxed);
     let window = Duration::from_secs(options.seconds);
     let mut skipped_ticks = 0usize;
     let mut sequence = 0u64;
@@ -524,7 +540,11 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
             "attempts": attempts,
             "p50_ms": value(0.50),
             "p90_ms": value(0.90),
-            "max_ms": samples.last().map(|v| (v * 100.0).round() / 100.0),
+            "max_ms": if failures > 0 {
+                None // the true maximum is censored above the deadline
+            } else {
+                samples.last().map(|v| (v * 100.0).round() / 100.0)
+            },
         })
     );
     Ok(())

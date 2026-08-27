@@ -175,6 +175,11 @@ def destroy_tool_state(emitter):
         remote_leftovers = peer(
             "pgrep '^autobahn-'; pgrep -x mutagen-agent; true"
         ).stdout.strip()
+    # Workload agents are the harness's own; a survivor in any mode means
+    # the best-effort kill above failed and must be an error, not a
+    # silently contaminated next run.
+    leftovers += run(f"pgrep -f '{BINARY} [a]gents'; true").stdout.strip()
+    remote_leftovers += peer(f"pgrep -f '{BINARY} [a]gents'; true").stdout.strip()
     if leftovers or remote_leftovers:
         emitter.emit({"measurement": "hygiene_failure",
                       "local": leftovers, "remote": remote_leftovers})
@@ -527,10 +532,11 @@ def run_tool(tool, cell, emitter, nonce):
     destroy_tool_state(emitter)
     restore_sources(corpora)
     clear_destinations(corpora)
-    start_samplers(tool)
-    # Whatever happens below — a cold-sync abort, an exception on its
-    # way to run_job's handler — the samplers never outlive this tool.
+    # Whatever happens below — a partial sampler start, a cold-sync
+    # abort, an exception on its way to run_job's handler — the samplers
+    # never outlive this tool.
     try:
+        start_samplers(tool)
         offset = clock_offset()
         time.sleep(1)
 
@@ -561,17 +567,26 @@ def run_tool(tool, cell, emitter, nonce):
         clean, reports = collect_workload(outputs, emitter, tool)
         if not clean:
             status = "workload_error"
-        # Background editing stops when the offered-load window ends, so the
-        # window the agents report — not launch-to-drain, whose tail is a
-        # tool-dependent drain of up to the full deadline — is the honest
-        # resource window. Only local reports are used: remote epochs live on
-        # the other host's clock.
-        local_windows = [r for r in reports
-                         if r.get("local") and r.get("window_start_epoch")]
-        if local_windows:
+        # Background editing stops when the offered-load window ends, so
+        # the window the agents report — not launch-to-drain, whose tail
+        # is a tool-dependent drain of up to the full deadline — is the
+        # honest resource window. Remote reports' epochs live on the
+        # other host's clock and are converted with the measured offset.
+        # The override applies only when every direction reported: a
+        # partial window would silently omit load at the edges (and an
+        # incomplete run is tainted, so its resources are excluded by
+        # the aggregator anyway).
+        windows = []
+        for r in reports:
+            if not r.get("window_start_epoch"):
+                continue
+            shift = 0.0 if r.get("local") else offset.get("offset_s", 0.0)
+            windows.append((r["window_start_epoch"] - shift,
+                            r["window_end_epoch"] - shift))
+        if clean and len(windows) == len(outputs):
             phases["workload"] = {
-                "start": min(r["window_start_epoch"] for r in local_windows),
-                "end": max(r["window_end_epoch"] for r in local_windows),
+                "start": min(start for start, _ in windows),
+                "end": max(end for _, end in windows),
             }
 
         phase("reconvergence")

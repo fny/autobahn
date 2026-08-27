@@ -208,10 +208,11 @@ def main():
             "tainted_runs_excluded": pool["tainted"],
             "pooled_samples": len(pool["samples"]),
             "censored": pool["censored"],
-            # Ticks the measuring agent skipped at full in-flight capacity:
-            # an offered-load shortfall that qualifies this row. Nonzero
-            # means the tool was slow enough to saturate the 32-edit bound,
-            # and the row's censored count is the evidence of that.
+            # Ticks the measuring agent skipped — at full in-flight
+            # capacity, or because its eight random probes all hit files
+            # with a verification already in flight. An offered-load
+            # shortfall that qualifies this row; the censored count is
+            # the companion evidence when the cause is tool slowness.
             "skipped_ticks": pool["skipped_ticks"],
             "p50_ms": percentile_from_pool(pool["samples"], pool["censored"], 0.50, pool["deadline_ms"]),
             "p90_ms": percentile_from_pool(pool["samples"], pool["censored"], 0.90, pool["deadline_ms"]),
@@ -239,6 +240,8 @@ def main():
     for record in records:
         if record.get("measurement") != "resources":
             continue
+        if run_key(record) in tainted:
+            continue  # a run that misbehaved yields no headline resources
         for phase in ("cold_sync", "idle", "workload"):
             if phase == "idle" and run_key(record) not in settled_runs:
                 continue

@@ -184,7 +184,10 @@ def bake(options):
               f"--query ImageId --output text")
     aws(options.profile, options.region, f"ec2 wait image-available --image-ids {ami}")
     aws(options.profile, options.region, f"ec2 terminate-instances --instance-ids {instance}")
-    print(f"AMI ready: {ami}  (key/SG kept for the run: reuse --run {run_id})")
+    print(f"AMI ready: {ami}")
+    print(f"dispatch with: run --run {run_id} --ami {ami}   "
+          f"(the run's key and security group are found by name)")
+    print(f"destroy with:  destroy --run {run_id}")
     print(json.dumps({"run": run_id, "ami": ami, "key": key, "group": group}))
 
 
@@ -263,8 +266,21 @@ def dispatch(options):
     seed = options.seed
     rng = random.Random(seed)
 
-    key, group = (f"{run_id}-key", options.group) if options.group else provision_network(
-        argparse.Namespace(profile=options.profile, region=options.region), run_id)
+    if options.group:
+        key, group = f"{run_id}-key", options.group
+    else:
+        # The bake's network is named deterministically; an existing one
+        # for this run id is reused rather than re-created (which would
+        # fail on the duplicate key pair).
+        existing = aws(options.profile, options.region,
+                       f"ec2 describe-security-groups --filters "
+                       f"Name=group-name,Values={run_id}-sg "
+                       "--query 'SecurityGroups[0].GroupId' --output text")
+        if existing and existing != "None" and os.path.exists(key_path(f"{run_id}-key")):
+            key, group = f"{run_id}-key", existing
+        else:
+            key, group = provision_network(
+                argparse.Namespace(profile=options.profile, region=options.region), run_id)
 
     instances = launch(options, run_id, INSTANCE_TYPE, group, key,
                        count=options.pairs * 2, ami=options.ami)

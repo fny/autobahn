@@ -104,13 +104,20 @@ Each of these answers a specific defect found in the previous harness.
   in flight per direction, and the floor does not characterize that
   concurrency. The observer bounds the contention instead: each pending
   verification polls at 500µs for its first second, then backs off to
-  1ms, capping steady-state metadata load at ~1k polls/s per stuck
-  verification set while adding at most ~0.5ms to multi-second samples.
+  1ms — about 1,000 polls per second per pending verification, so up to
+  ~32,000 metadata reads per second per direction at full in-flight
+  capacity. The backoff's worst-case added detection delay is one slow
+  poll interval, ~1ms, against the multi-second latencies that reach the
+  backed-off state.
 - The open loop is bounded at 32 in-flight measured edits; a tool slow
   enough to saturate the bound gets fewer offered edits. Skipped ticks
-  are reported in every latency row rather than used to discard runs —
-  discarding would delete the censored counts, which are the evidence of
-  the very slowness that caused the skipping.
+  count both causes of a skipped edit — full in-flight capacity, and all
+  eight random file probes landing on files with a verification already
+  in flight — so a nonzero count is an offered-load shortfall, not proof
+  of bound saturation. They are reported in every latency row rather
+  than used to discard runs — discarding would delete the censored
+  counts, which are the evidence of the very slowness that caused the
+  skipping.
 - mutagen runs its default portable watch mode, which on a stock Linux
   build reifies to poll-assisted watching (native recursive watching
   exists only behind SSPL fanotify builds). This is the configuration a

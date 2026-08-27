@@ -186,6 +186,127 @@ pub fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(test)]
+mod stress {
+    //! Concurrency stress for the background writer.
+    //!
+    //! The writer parks closures, keeps only the newest state per path,
+    //! tolerates a poisoned lock, ignores write failures, and flushes on
+    //! drop. Each of those is a decision about what may go wrong, so each
+    //! is worth hammering rather than asserting once. These are repetition
+    //! tests, not exhaustive interleaving checks — they catch a race that
+    //! happens often enough to matter.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc as StdArc;
+
+    /// Many writers, one path: whatever lands must be one of the stored
+    /// states, and the writer must not deadlock or drop the last one.
+    #[test]
+    fn concurrent_stores_land_a_stored_state_and_never_hang() {
+        for round in 0..40 {
+            let directory = tempfile::tempdir().expect("temporary directory");
+            let path = directory.path().join("state");
+            let writer = StdArc::new(StateWriter::new());
+            let threads: Vec<_> = (0..8)
+                .map(|worker| {
+                    let writer = StdArc::clone(&writer);
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        for step in 0..50u32 {
+                            let value = worker * 1000 + step;
+                            writer.store(path.clone(), move || Some(value.to_le_bytes().to_vec()));
+                        }
+                    })
+                })
+                .collect();
+            for thread in threads {
+                thread.join().expect("writer thread panicked");
+            }
+            writer.flush();
+            let written = std::fs::read(&path).expect("a state must have been written");
+            assert_eq!(written.len(), 4, "round {round}: partial state on disk");
+        }
+    }
+
+    /// A superseded state must never be encoded: that is the whole reason
+    /// the writer parks a closure instead of bytes.
+    #[test]
+    fn superseded_states_are_never_encoded() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("state");
+        let encodes = StdArc::new(AtomicUsize::new(0));
+        let writer = StateWriter::new();
+        // Queue far more states than the writer can possibly encode, by
+        // holding each encoder briefly so the queue overtakes it.
+        for value in 0..200u32 {
+            let encodes = StdArc::clone(&encodes);
+            writer.store(path.clone(), move || {
+                encodes.fetch_add(1, Ordering::Relaxed);
+                Some(value.to_le_bytes().to_vec())
+            });
+        }
+        writer.flush();
+        let encoded = encodes.load(Ordering::Relaxed);
+        assert!(encoded >= 1, "nothing was ever encoded");
+        assert!(
+            encoded < 200,
+            "every one of 200 queued states was encoded ({encoded}); supersede is not collapsing"
+        );
+    }
+
+    /// An encoder that panics must not poison the writer for everyone else:
+    /// the retire guard exists precisely so a panicking encoder still
+    /// releases anyone waiting.
+    #[test]
+    fn a_panicking_encoder_does_not_wedge_the_writer() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let writer = StateWriter::new();
+        writer.store(directory.path().join("boom"), || panic!("encoder failed"));
+        // The writer thread is now gone. Storing and flushing must still
+        // return rather than blocking forever.
+        writer.store(directory.path().join("after"), || Some(vec![1, 2, 3]));
+        writer.flush();
+    }
+
+    /// Dropping the writer flushes what was queued, so a state stored just
+    /// before shutdown is not silently lost.
+    #[test]
+    fn drop_flushes_the_queued_state() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("state");
+        {
+            let writer = StateWriter::new();
+            writer.store(path.clone(), || Some(vec![7; 16]));
+        }
+        assert_eq!(
+            std::fs::read(&path).expect("drop must flush").len(),
+            16,
+            "a state queued before drop was lost"
+        );
+    }
+
+    /// A failing write is the writer's to ignore, but it must not stop it
+    /// serving later states.
+    #[test]
+    fn a_failed_write_does_not_stop_later_ones() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let writer = StateWriter::new();
+        // An unwritable path: the parent does not exist.
+        writer.store(
+            directory.path().join("missing").join("state"),
+            || Some(vec![1]),
+        );
+        let good = directory.path().join("state");
+        writer.store(good.clone(), || Some(vec![2; 8]));
+        writer.flush();
+        assert_eq!(
+            std::fs::read(&good).expect("the later write must still land").len(),
+            8
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

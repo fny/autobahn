@@ -713,6 +713,140 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
 }
 
 #[cfg(test)]
+mod adversarial {
+    //! The frame decoder reads from a peer across a trust boundary. These
+    //! feed it input no honest peer would send — random bytes, crafted
+    //! headers, truncation at every offset — and demand that it always
+    //! returns an error rather than panicking, hanging, or allocating on
+    //! the strength of a number the peer chose.
+    use super::*;
+
+    /// A tiny deterministic generator, so a failure reproduces from its seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn bytes(&mut self, count: usize) -> Vec<u8> {
+            (0..count).map(|_| (self.next() & 0xff) as u8).collect()
+        }
+    }
+
+    /// Random bytes must never panic the decoder.
+    #[test]
+    fn random_input_is_rejected_without_panicking() {
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        for _ in 0..20_000 {
+            let length = (rng.next() % 64) as usize;
+            let bytes = rng.bytes(length);
+            let _ = read_frame(&mut bytes.as_slice());
+        }
+    }
+
+    /// A frame truncated at any offset must be an error, never a panic and
+    /// never a silent partial read.
+    #[test]
+    fn truncation_at_every_offset_is_rejected() {
+        let body = b"\x00some plausible payload";
+        let mut framed = (body.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(body);
+        for cut in 0..framed.len() {
+            let truncated = &framed[..cut];
+            match read_frame(&mut &truncated[..]) {
+                Ok(None) => {}          // clean end of stream
+                Ok(Some(_)) if cut == framed.len() => {}
+                Ok(Some(_)) => panic!("a truncated frame decoded at offset {cut}"),
+                Err(_) => {}            // reported, which is the contract
+            }
+        }
+    }
+
+    /// A declared length beyond the cap must be refused on the strength of
+    /// the number alone, before the decoder sizes a buffer from it.
+    ///
+    /// Note the allowance: the outer length legitimately covers the
+    /// compression header, so a value a few bytes past the nominal cap is
+    /// accepted for reading and then fails as a short frame. Only a value
+    /// past cap-plus-header is refused by the cap itself.
+    #[test]
+    fn an_oversized_length_prefix_is_refused_not_allocated() {
+        let over_the_cap = protocol::MAXIMUM_FRAME_SIZE + COMPRESSED_HEADER_SIZE as u32 + 1;
+        for declared in [over_the_cap, protocol::MAXIMUM_FRAME_SIZE * 2, u32::MAX] {
+            let prefix = declared.to_le_bytes();
+            let error = read_frame(&mut &prefix[..]).expect_err("must be refused");
+            assert!(
+                format!("{error:#}").contains("maximum frame size"),
+                "declared {declared}: {error:#}"
+            );
+        }
+        // Just inside the allowance is still an error, by way of the short
+        // read rather than the cap — the point is that it never succeeds.
+        let prefix = (protocol::MAXIMUM_FRAME_SIZE + 1).to_le_bytes();
+        read_frame(&mut &prefix[..]).expect_err("a short frame must be refused");
+    }
+
+    /// A compressed frame that claims to expand to far more than it carries
+    /// is the classic decompression bomb. The declared size is capped, and
+    /// a body that does not actually produce it must fail rather than
+    /// yielding a partially filled buffer.
+    #[test]
+    fn a_decompression_bomb_is_refused() {
+        let mut rng = Rng(0xDEAD_BEEF_CAFE_F00D);
+        for declared in [protocol::MAXIMUM_FRAME_SIZE, 1 << 20, 4096] {
+            let mut payload = vec![FRAME_COMPRESSED];
+            payload.extend_from_slice(&declared.to_le_bytes());
+            payload.extend_from_slice(&rng.bytes(16));
+            let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&payload);
+            if let Ok(Some(body)) = read_frame(&mut framed.as_slice()) {
+                assert!(
+                    body.len() <= declared as usize,
+                    "decoded {} bytes against a declared {declared}",
+                    body.len()
+                );
+            }
+        }
+        // And one that declares more than the cap must be refused outright.
+        let mut payload = vec![FRAME_COMPRESSED];
+        payload.extend_from_slice(&(protocol::MAXIMUM_FRAME_SIZE + 1).to_le_bytes());
+        payload.extend_from_slice(&[0u8; 8]);
+        let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+        framed.extend_from_slice(&payload);
+        read_frame(&mut framed.as_slice()).expect_err("an over-cap expansion must be refused");
+    }
+
+    /// An unknown flag byte is a protocol violation, not something to guess at.
+    #[test]
+    fn an_unknown_frame_flag_is_refused() {
+        for flag in [2u8, 7, 200, 255] {
+            let payload = vec![flag, 1, 2, 3];
+            let mut framed = (payload.len() as u32).to_le_bytes().to_vec();
+            framed.extend_from_slice(&payload);
+            read_frame(&mut framed.as_slice()).expect_err("unknown flags must be refused");
+        }
+        // An empty frame carries no flag at all.
+        let framed = 0u32.to_le_bytes().to_vec();
+        read_frame(&mut framed.as_slice()).expect_err("an empty frame must be refused");
+    }
+
+    /// Whatever survives framing still has to decode as a message. Random
+    /// bodies must be rejected by the message decoder, not panic it.
+    #[test]
+    fn random_bodies_do_not_panic_the_message_decoder() {
+        let mut rng = Rng(0x0123_4567_89AB_CDEF);
+        for _ in 0..20_000 {
+            let length = (rng.next() % 128) as usize;
+            let body = rng.bytes(length);
+            let _ = bincode::deserialize::<protocol::MuxRequest>(&body);
+            let _ = bincode::deserialize::<protocol::MuxResponse>(&body);
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
 

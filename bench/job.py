@@ -213,6 +213,44 @@ def restore_sources(corpora):
             raise RuntimeError(f"source restore failed: {result.stdout[-300:]}")
 
 
+def prepare_cold_sync(corpora):
+    """Makes cold sync measure the tool, not the storage.
+
+    Two distinct effects otherwise dominate and they pull in opposite
+    directions. A volume restored from a snapshot loads its blocks
+    lazily, so the *first* read of the corpus pays a large one-time
+    fault-in cost; and once any tool has read the corpus, it sits in page
+    cache, so the *next* tool reads from RAM instead of disk. Whichever
+    tool runs first therefore looks slow and the second looks fast, by a
+    margin that scales with corpus size and has nothing to do with either
+    tool.
+
+    So: fault the whole corpus in once per host (recorded by a marker, as
+    the effect is permanent for the volume), then drop the page cache
+    before every measurement. Both tools then read a hydrated volume from
+    disk, which is the state a real cold sync runs in."""
+    if LOCAL:
+        # Local mode runs on a developer machine: never drop its page
+        # cache, and never block on its sudo prompt.
+        return
+    marker = f"{HOME}/.corpus-hydrated"
+    hydrate = (
+        f"test -f {marker} || {{ "
+        f"find {CORPUS} -type f -print0 | xargs -0 -P 8 -n 64 cat > /dev/null 2>&1; "
+        f"touch {marker}; }}"
+    )
+    # Dropping caches needs root; it is the one privileged step and its
+    # failure must be visible rather than silently skewing a measurement.
+    drop = "sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null"
+    for where, execute in (("local", run), ("remote", peer)):
+        result = execute(hydrate, timeout=1800)
+        if result.returncode != 0:
+            raise RuntimeError(f"{where} corpus hydration failed: {result.stdout[-300:]}")
+        result = execute(drop, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(f"{where} cache drop failed: {result.stdout[-300:]}")
+
+
 def clear_destinations(corpora):
     for corpus in corpora:
         result = peer(f"rm -rf {DEST}/{corpus} && mkdir -p {DEST}/{corpus}")
@@ -537,6 +575,7 @@ def run_tool(tool, cell, emitter, nonce):
     # never outlive this tool.
     try:
         start_samplers(tool)
+        prepare_cold_sync(corpora)
         offset = clock_offset()
         time.sleep(1)
 

@@ -323,9 +323,17 @@ def dispatch(options):
                 raise RuntimeError(f"observers on {host} never came up: {ready.stdout}")
 
     # Jobs: cells × repeats, shuffled; tool order randomized per job.
+    selected = CELLS
+    if getattr(options, "cells", None):
+        wanted = set(options.cells.split(","))
+        selected = [c for c in CELLS if c[0] in wanted]
+        missing = wanted - {c[0] for c in selected}
+        if missing:
+            raise RuntimeError(f"unknown cells: {sorted(missing)}")
+        print(f"cell filter: {[c[0] for c in selected]}")
     jobs = []
     for repeat in range(options.repeats):
-        for name, corpora, agents, bidirectional in CELLS:
+        for name, corpora, agents, bidirectional in selected:
             tools = ["autobahn", "mutagen"]
             rng.shuffle(tools)
             jobs.append({
@@ -354,7 +362,7 @@ def dispatch(options):
     plan = {"run": run_id, "seed": seed, "ami": options.ami,
             "chromium_commit": chromium_commit,
             "pairs": options.pairs, "repeats": options.repeats,
-            "cells": [c[0] for c in CELLS], "jobs": jobs}
+            "cells": [c[0] for c in selected], "jobs": jobs}
     with open(f"results-{run_id}/plan.json", "w") as handle:
         json.dump(plan, handle, indent=2)
 
@@ -440,6 +448,8 @@ def main():
             s.add_argument("--seed", type=int, default=1)
             s.add_argument("--run", default=None)
             s.add_argument("--group", default=None)
+            s.add_argument("--cells", default=None,
+                           help="comma-separated cell names; default is the whole matrix")
         if stage == "destroy":
             s.add_argument("--run", required=True)
             s.add_argument("--keep-ami", action="store_true")

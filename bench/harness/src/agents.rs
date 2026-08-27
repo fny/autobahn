@@ -116,6 +116,12 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
     let go = Arc::new(AtomicBool::new(false));
     let edits = Arc::new(AtomicU64::new(0));
     let write_errors = Arc::new(AtomicU64::new(0));
+    // Epoch milliseconds of the last *completed* background write. A
+    // worker can be inside write_atomic when the stop flag flips, so the
+    // window end reported below is extended to cover that final rename —
+    // otherwise the tool work it triggers would fall just outside the
+    // advertised resource window.
+    let last_write_end = Arc::new(AtomicU64::new(0));
     let mut workers = Vec::new();
     for (index, files) in sets.background.iter().enumerate() {
         let files: Vec<PathBuf> = files.iter().map(|f| options.root.join(f)).collect();
@@ -123,6 +129,7 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
         let go = Arc::clone(&go);
         let edits = Arc::clone(&edits);
         let write_errors = Arc::clone(&write_errors);
+        let last_write_end = Arc::clone(&last_write_end);
         let mut rng = Rng::new(options.nonce ^ (0x9000 + index as u64));
         workers.push(std::thread::spawn(move || {
             // Editing starts only when the measuring agent opens its
@@ -146,6 +153,7 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
                     Ok(()) => edits.fetch_add(1, Ordering::Relaxed),
                     Err(_) => write_errors.fetch_add(1, Ordering::Relaxed),
                 };
+                last_write_end.fetch_max((epoch_seconds() * 1000.0) as u64, Ordering::Relaxed);
                 let pause = EDIT_INTERVAL_MS.0
                     + rng.index((EDIT_INTERVAL_MS.1 - EDIT_INTERVAL_MS.0) as usize) as u64;
                 std::thread::sleep(Duration::from_millis(pause));
@@ -162,6 +170,13 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
         }
     }
     let mut report = report?;
+    // Workers are joined by now, so this covers every completed write.
+    let background_end = last_write_end.load(Ordering::Relaxed) as f64 / 1000.0;
+    if let Some(end) = report["window_end_epoch"].as_f64() {
+        if background_end > end {
+            report["window_end_epoch"] = json!(background_end);
+        }
+    }
     report["background_edits"] = json!(edits.load(Ordering::Relaxed));
     report["background_write_errors"] = json!(write_errors.load(Ordering::Relaxed));
     // A panicked worker means the offered load was not what this report

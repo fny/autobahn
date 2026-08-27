@@ -37,9 +37,10 @@ use serde_json::json;
 /// contention — with many slow verifications in flight, fine polling
 /// would put tens of thousands of metadata reads per second on the
 /// destination host, a load correlated with exactly the tool being
-/// measured. The added detection error after backoff is at most half of
-/// POLL_SLOW — well under a millisecond against the multi-second
-/// latencies that reach that state. The floor reports realized totals.
+/// measured. After backoff the expected added detection delay is half
+/// of POLL_SLOW and the worst case is one full interval — ~1ms against
+/// the multi-second latencies that reach that state. The floor reports
+/// realized totals.
 const POLL_FAST: Duration = Duration::from_micros(500);
 const POLL_SLOW: Duration = Duration::from_millis(1);
 const POLL_BACKOFF_AFTER: Duration = Duration::from_secs(1);

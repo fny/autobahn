@@ -1,364 +1,281 @@
 # How autobahn works
 
-An implementation tour of autobahn 0.3.0, for people who change the code.
-Each claim gives a `file:line` reference.
+This document explains the design of autobahn: the problem it solves, the
+decisions that shape it, and what those decisions cost. Code references
+support the argument. They are not the structure of it.
 
-## The parts
+## The problem
 
-There is one binary. The command `autobahn agent` makes it the remote half
-(`src/main.rs:206`). Every other command makes it the controller. Both ends
-are the same build, so the version handshake needs an exact match
-(`src/transport/mod.rs:560`).
+Keep two directory trees identical across a network. Do it continuously,
+while people edit both sides. Never lose an edit.
 
-The controller is a hub. The two endpoints never talk to each other
-(`src/endpoint/mod.rs:5`). All data goes through the controller. This costs
-one network hop in the rare remote-to-remote case. It gives one place where
-reconciliation happens, with one model of both sides.
+That statement hides four hard constraints, and every important decision in
+autobahn answers one of them.
 
-A missing beta root is legal, because a transition creates it. A missing
-alpha root is an error (`src/main.rs:425`). Without this rule, a typo in a
-source path plus a mirroring mode empties the destination.
+**You cannot know what changed without looking, and looking is expensive.**
+A tree of 500,000 files takes seconds to walk and longer to hash. A design
+that walks the tree on every cycle cannot run every second.
 
-The supervisor runs one thread for each session (`src/supervisor/mod.rs:185`).
-Each thread runs a cycle, records status, then waits for activity. After a
-failure it backs off. The backoff doubles up to 300 seconds, then adds up to
-24% jitter (`src/supervisor/mod.rs:693`). The jitter comes after the cap, so
-saturated sessions stay spread out.
+**Filesystem events are fast but unreliable.** The kernel drops them when
+its queue overflows. A watch can be evicted. A tool that trusts events
+alone will silently miss a change and stay wrong forever.
 
-## The tree
+**Two sides that both changed cannot be merged by looking at them.** If
+alpha holds A and beta holds B, the current state cannot say who edited and
+who is stale. You need a third thing: what both sides agreed on last. That
+is the ancestor, and it is what separates a propagation from a conflict.
 
-```rust
-pub struct Node { pub name: String, pub content: Content }   // src/tree/mod.rs:82
-pub enum Content {                                           // src/tree/mod.rs:53
-    Directory(Arc<Vec<Node>>),
-    File { digest: Digest, executable: bool, metadata: FileMetadata },
-    Symlink { target: String },
-    Untracked,
-    Problematic { message: String },
-}
-```
+**Being wrong is worse than being slow.** A sync tool that overwrites a
+deliberate edit has destroyed work that may exist nowhere else.
 
-A `Node` is 96 bytes. Three properties do most of the work.
+## The central idea: make "nothing changed" free
 
-**Children are a sorted `Vec`, not a map.** The code sorts them at
-construction (`src/tree/mod.rs:176`). Lookup is a binary search. Sorted
-children make reconciliation and diff linear merges of two lists.
+Most of the time, most of a tree has not changed. A design that spends
+effort proportional to the tree size will spend nearly all of it confirming
+that nothing happened.
 
-**Digests are inline on the file node**, next to the metadata that justifies
-their reuse. There is no separate cache to keep in step.
+Autobahn makes that case cost almost nothing, and the mechanism is one
+decision: **the tree is immutable and shared.**
 
-**Children sit behind an `Arc`,** so successive trees share storage. A tree
-of one million files costs approximately 96 MB. The next scan of an
-unchanged tree adds almost nothing.
+A scanned tree is a `Node` whose children sit behind an `Arc`
+(`src/tree/mod.rs:53`). When a scan finds a subtree unchanged, it does not
+rebuild it. It clones one pointer. The new tree and the old tree are then
+the *same memory* for that subtree.
 
-Copy-on-write is a property of the type system. Mutation goes through
-`Arc::make_mut` (`src/tree/apply.rs:39`), which clones a child list only
-when something else holds it.
+That turns an expensive question into a cheap one. "Did anything change
+here?" stops being a walk and becomes a pointer comparison
+(`nodes_share_storage`, `src/tree/mod.rs:378`).
 
-### nodes_share_storage
+The payoff is not one optimization. It is the same optimization appearing at
+four different layers:
 
-```rust
-pub fn nodes_share_storage(a: Option<&Node>, b: Option<&Node>) -> bool  // src/tree/mod.rs:378
-```
-
-This function compares pointers, not content. Storage sharing tells you how
-a tree was made, not what it holds. A tree read from disk shares nothing.
-Two trees with equal content can answer `false`.
-
-**Callers can use this function to prove agreement. They must not use it to
-prove difference.** Four things depend on it: the cycle short-circuit
-(`src/session/mod.rs:284`), diff pruning (`src/tree/diff.rs:32`), scan-cache
-write elision (`src/endpoint/local.rs:863`), and the `ScanUnchanged` reply
-(`src/transport/mod.rs:420`).
-
-Two content kinds matter later. `Untracked` is content on disk that stays
-outside synchronization, such as an ignored or oversized file.
-`Problematic` is content that the scan could not read. The ancestor holds
-neither (`src/tree/mod.rs:346`).
-
-## Scanning
-
-A scan reads the tree and builds a `Node` (`src/scan/mod.rs:144`). The
-previous tree, called the baseline, accelerates two separate things.
-
-The scan reuses a digest only if the mtime seconds, mtime nanoseconds,
-size, inode, and file type all match (`src/scan/mod.rs:650`). It adopts a
-subtree only if the directories are pointer-equal and the file metadata is
-identical (`src/scan/mod.rs:676`). Adoption starts at the bottom, so an
-unchanged subtree becomes one `Arc` clone.
-
-The scan reads ignore rules before it descends (`src/scan/mod.rs:491`), so
-an ignored subtree costs nothing. A file above `max_file_size` becomes
-`Untracked` without an open (`src/scan/mod.rs:528`). It is present, and it
-can never look like a deletion.
-
-The scan measures filesystem behavior instead of assuming it
-(`src/scan/probes.rs`). It probes executability, Unicode decomposition,
-normalization, and case sensitivity once for each endpoint.
-
-### The incremental path
-
-This is what makes a scan cost the size of the change, not the size of the
-tree.
-
-`DirtyPaths` is a trie of path components (`src/scan/mod.rs:48`). The
-function `mark(path)` sets `relist` on the **parent** and adds a node for
-the leaf (`src/scan/mod.rs:69`). It marks the parent because only a
-directory listing shows a creation or a removal.
-
-A directory scan then has three cases (`src/scan/mod.rs:293`):
-
-- **Not marked, with a baseline directory.** The scan adopts the baseline
-  content. It makes one `Arc` clone and reads nothing.
-- **Marked, but `relist` is false.** The scan walks the baseline children.
-  It clones the unmarked ones and rescans the marked ones.
-- **`relist` is true.** The scan lists the directory. Even here it adopts an
-  unmarked entry without a stat, because the listing proves the entry
-  exists and the marks prove it did not change (`src/scan/mod.rs:400`).
-
-Tests assert the contract in both directions. An incremental scan must
-agree with a full scan from the same baseline (`src/scan/mod.rs:783`). With
-nothing marked, a change made behind the scan stays invisible
-(`src/scan/mod.rs:888`).
-
-A full scan happens if there is no watcher, no baseline, or an incomplete
-watch record (`src/endpoint/local.rs:465`). It also happens every 120
-seconds, which bounds how long a missed event can persist. A transition
-problem sets `last_full_scan` to `None` (`src/endpoint/local.rs:1102`),
-because the filesystem disagreed with the tree and the record is stale.
-
-## The cycle
-
-One cycle does this (`src/session/mod.rs:260`):
-
-1. Scan both endpoints in parallel.
-2. Return early if the session is quiesced.
-3. Collect scan problems.
-4. Graft executability bits on a filesystem that cannot store them.
-5. Halt if one side presents an empty root and the ancestor had children.
-6. Reconcile.
-7. Stage and apply transitions, beta first.
-8. Fold the achieved changes into the ancestor.
-9. Validate and write the ancestor synchronously.
-
-### The quiesced short-circuit
-
-The gate opens only if the session is quiesced and both fresh roots share
-storage with the recorded roots (`src/session/mod.rs:284`). Two facts make
-this safe.
-
-The flag is set only after a cycle that left nothing outstanding
-(`src/session/mod.rs:74`). That cycle applied no transitions, found no
-conflicts, and reported no problems. Thus "the same as last time" means
-"still synchronized".
-
-Only a scan that adopted its baseline whole can produce pointer identity.
-Equal content that was freshly built answers `false`. So the gate cannot
-open for a tree that the scan actually re-read.
-
-### Folding achieved changes
-
-A transition returns one result for each request, in order
-(`src/endpoint/mod.rs:79`). The result describes what is on disk after the
-attempt. **Four** parties consume this one rendering
-(`src/endpoint/mod.rs:98`): the ancestor, the local endpoint's tree, the
-controller's model of the agent, and the agent's `last_sent` anchor. They
-cannot disagree about what the cycle did, because they read the same
-answer.
-
-The results carry the metadata of the entries as created
-(`src/endpoint/local.rs:1106`). Thus the next scan re-digests only what
-changed after the transition.
-
-## Watching and the settle
-
-`ChangeWatcher` holds the changed paths and a one-slot wake channel
-(`src/endpoint/local.rs:196`). If the record overflows 8192 paths, or the
-kernel queue overflows, the watcher gives up its paths and asks for a full
-scan (`src/endpoint/local.rs:184`).
-
-A root that cannot be watched waits out the timeout. Watch failures cost
-latency, never correctness.
-
-After a change arrives, the session waits before it cycles. This groups a
-burst of writes into one cycle. Until 0.3.0 the wait was a fixed 100 ms, so
-every isolated edit paid the full window. Against a 0.7 ms measurement
-floor, a p50 of 100.7 ms was almost all waiting.
-
-```rust
-pub fn settle(&mut self, maximum: Duration, quiet: Duration)  // src/session/mod.rs:227
-```
-
-The method samples how much change each endpoint recorded, sleeps a short
-slice, then samples again. Growth means writes continue. Two equal samples
-mean the burst ended. Both callers pass 100 ms and 20 ms. An isolated edit
-now waits 20 ms. A long burst still stops at 100 ms, so the worst case does
-not move.
-
-The method samples counts because the watcher signal is standing state, not
-a stream of edges. The wake channel holds one token, so it cannot count
-arrivals. The token can also be consumed already. The path count is the only
-value that grows for each event, and no scan consumes it during a settle.
-
-A remote endpoint reports `None`. Two `None` values compare equal, so the
-settle ends after one slice. This is deliberate. An endpoint that cannot
-show a burst shortens the wait. Cycles are idempotent, so an early cycle
-costs work, never correctness.
-
-## Reconcile and transitions
-
-Reconciliation compares the ancestor, alpha, and beta
-(`src/tree/reconcile.rs:479`). The rules follow mutagen's semantics.
-
-If one side is untracked and the ancestor is present, the code keeps both
-sides and the ancestor (`src/tree/reconcile.rs:93`). A file that crossed a
-size limit never reads as a deletion, in any mode.
-
-In safe two-way mode a conflict is a report. The code applies no transition
-to either side. Resolution is manual, and the mechanism is pleasing: one
-side with only deletions loses to the other side
-(`src/tree/reconcile.rs:288`). To resolve a conflict, delete the side you do
-not want.
-
-The transition code refuses and reports instead of guessing
-(`src/endpoint/local.rs:1261`). It validates against the last scan, and the
-cycle guarantees that scan produced these transitions. It checks every path
-component with `symlink_metadata`, so a symlink on the way is a refusal.
-Before it writes a file, it needs the expected digest and identical
-metadata (`src/endpoint/local.rs:1377`). This check stands between a stale
-transition and somebody else's data.
-
-New content becomes visible by rename, so a transition is atomic. If a
-digest has no further use in the batch, the staged file is renamed onto the
-target (`src/endpoint/local.rs:1598`). This halves the write volume of a
-cold transfer. Removal works from the bottom up and must account for every
-entry on disk, because content that reconciliation never saw is content
-nobody decided to delete.
-
-Default modes are conservative: 0700 for directories and 0600 for files
-(`src/endpoint/local.rs:49`). Synchronized trees often hold credentials.
-
-## Transfer and staging
-
-Transfer is classic rsync, streamed (`src/rsync/mod.rs`). Memory stays
-bounded whatever the file size. The patch code validates block ranges
-before any read, so a hostile delta cannot read out of range
-(`src/rsync/mod.rs:362`).
-
-Three places decide whether to negotiate a delta or send the bytes. All
-three ask whether a usable base exists, and all three answer from the last
-scan (`src/endpoint/local.rs:943`, `:603`, `:730`). On a cold destination,
-autobahn does not probe the filesystem and does not open the target.
-
-Hashing is BLAKE3 everywhere. Compression is LZ4 for each frame, with a
-256-byte floor (`src/transport/mod.rs:590`). SSH compression is off
-(`src/transport/mod.rs:71`), because the stream is compressed already.
-
-Staging is content-addressed. Verified content lands at
-`<staging_root>/<digest-hex>` (`src/endpoint/local.rs:2029`). Idempotence,
-resumability, and deduplication follow from that one choice.
-
-The staging directory appears at first use, never at construction. An
-inside-root placement would otherwise create a missing root as an empty
-directory, and the safety checks would read that as an emptied root
-(`src/endpoint/local.rs:296`).
-
-## Persistence
-
-The scan cache is written by a background thread (`src/persist.rs:53`). The
-writer parks a closure, not bytes, so a superseded state is never encoded
-(`src/persist.rs:26`). Only the newest queued state survives. Write failures
-are ignored.
-
-That is safe because of what a scan cache is: a record of work already done.
-It holds nothing that a filesystem read cannot recover. A lost cache costs
-one full scan (`src/persist.rs:8`).
-
-**The ancestor is different, and the code writes it synchronously**
-(`src/session/mod.rs:419`). The ancestor carries provenance. It is what
-separates "this side changed" from "the other side changed".
-
-Here is the failure it prevents. Alpha holds v2, beta holds v2, and the
-ancestor says v2. A user reverts alpha to v1. If the ancestor write is lost,
-the ancestor still says v1. Alpha then differs from it in nothing, and beta
-differs from it in one file. The ordinary rule propagates beta's v2 over the
-deliberate revert. No conflict appears, because only one side looks
-modified. That is silent data loss, in every mode.
-
-A corrupt ancestor is an error at load, not a reset
-(`src/session/mod.rs:683`). A silent reset resurrects deletions.
-
-## The protocol
-
-The wire format is bincode frames behind a version handshake. `Initialize`
-carries the whole policy, so both endpoints run identical rules
-(`src/protocol.rs:37`). Ownership travels as names, and each host resolves
-against its own database (`src/ownership.rs:1`).
-
-One SSH process carries many sessions as channels
-(`src/transport/mux.rs:517`). Each channel has its own thread, so a channel
-that waits for changes never blocks a scan on another channel.
-
-### ScanUnchanged
-
-The agent channel keeps `last_sent`, the tree **this channel sent**, not the
-endpoint's newest tree (`src/transport/mod.rs:400`). The difference matters,
-because a transition folds results into the endpoint's tree and leaves the
-controller behind.
-
-If the sent root shares storage with the current root, the reply is one enum
-tag. The anchor moves only after a successful send
-(`src/transport/mod.rs:469`). A failed send leaves the controller with its
-old model, and a recorded anchor would then report "unchanged" for a tree
-that never arrived.
-
-After a successful transition, the anchor moves to the folded tree
-(`src/transport/mod.rs:441`). The controller folds its own model the same
-way, so the two agree. This is what lets the next scan of an untouched
-destination answer "unchanged".
-
-## Limits
-
-| Limit | Value | Where |
+| Question | Answer | Where |
 |---|---|---|
-| Frame size | 64 MiB | `src/protocol.rs:23` |
-| Pending watch paths | 8192 | `src/endpoint/local.rs:161` |
-| Full scan interval | 120 s | `src/endpoint/local.rs:168` |
-| Supply batch | 8 MiB / 16384 frames | `src/endpoint/local.rs:66` |
-| Backoff cap | 300 s | `src/supervisor/mod.rs:37` |
+| Is this whole session idle? | Compare two pointers | `src/session/mod.rs:284` |
+| Which subtrees differ? | Skip any that share storage | `src/tree/diff.rs:32` |
+| Must the scan cache be rewritten? | Not if it already describes this tree | `src/endpoint/local.rs:863` |
+| Must the agent send a tree over the wire? | No — send one byte | `src/transport/mod.rs:420` |
 
-`max_file_size` and `max_entry_count` are configurable. An entry count above
-the limit fails the scan and the cycle (`src/endpoint/local.rs:847`). The
-limit guards against synchronization of the wrong tree, such as a home
-directory.
+The last row matters most in practice. An idle remote endpoint answers a
+scan request with a single enum tag. No serialization, no transfer, no
+decode. A heartbeat over a half-million-file tree costs one round trip.
 
-### The frame cap
+This idea has a sharp edge, and the code states it as a contract
+(`src/tree/mod.rs:366`). Shared storage tells you how a tree was *built*,
+not what it *holds*. A tree read from disk shares nothing with an identical
+tree in memory. So two equal trees can answer `false`. **Callers can use the
+answer to prove agreement. They must never use it to prove difference.**
+Every use above is safe in that direction only.
 
-The 64 MiB check applies to the uncompressed length
-(`src/transport/mod.rs:604`), so compression gives no headroom. No code
-splits a `Scan` reply, a `Transition` request, or a `StageBegin` request.
+## Decision 2: trust the watcher for speed, never for correctness
 
-A file entry encodes to approximately 89 bytes. The ceiling is thus near
-**750,000 entries**, and lower with long names. Above that, the first cold
-scan of a remote root fails, and the cycle fails with it. A local session is
-not affected, because it serializes nothing.
+Autobahn watches the filesystem, and it uses those events to scan only what
+changed. A dirty-path trie records which directories to re-list
+(`src/scan/mod.rs:48`). An unmarked subtree is adopted whole, with no
+`readdir`, no `stat`, and no `open`.
 
-**This ceiling is measured, not specified.** The constant describes itself
-as a defense against corrupt length prefixes. That is true for file content,
-which streams in bounded batches. It does not cover snapshot and transition
-frames, which grow with the entry count. There is no pre-flight check and no
-chunking.
+That makes a scan cost the size of the change instead of the size of the
+tree. It also makes the scan exactly as trustworthy as the event stream,
+which is not trustworthy enough.
 
-### Platform
+So the design bounds the damage rather than assuming the events are
+complete:
 
-Unix only. The code uses `std::os::unix` and `libc` without cfg gating. The
-one `target_os` conditional is peer-credential retrieval
-(`src/supervisor/control.rs:211`), and it already has a `getpeereid` branch.
-So macOS works, and the BSDs probably need little more than a build target.
+- If the kernel queue overflows, or the record grows past 8192 paths, the
+  watcher discards its paths and demands a full scan
+  (`src/endpoint/local.rs:184`).
+- A full scan runs at least every 120 seconds regardless
+  (`src/endpoint/local.rs:168`). This is the ceiling on how long a missed
+  event can persist.
+- A transition problem clears the record (`src/endpoint/local.rs:1102`).
+  The filesystem disagreed with the tree, so the tree is proven stale.
+- A root that cannot be watched at all still works. It falls back to the
+  interval.
 
-### One sharp edge
+The rule this produces is worth stating plainly: **watch failures cost
+latency, never correctness.** The worst outcome is a slower cycle, never a
+wrong one.
 
-An ignore negation cannot recover content below an ignored **directory**,
-because a scan never descends into one (`src/scan/ignore.rs:9`). Write
-`node_modules/*` with `!node_modules/keep` instead of `node_modules` with a
-negation.
+The tests assert the contract in both directions. An incremental scan must
+agree exactly with a full scan (`src/scan/mod.rs:783`), and with nothing
+marked, a change made behind the scan must stay invisible
+(`src/scan/mod.rs:888`). The second test looks strange until you realize it
+is the caller's obligation written down.
+
+## Decision 3: the ancestor is sacred, everything else is disposable
+
+Autobahn writes two kinds of state, and treats them oppositely.
+
+**The scan cache is derived.** It records work already done. Losing it costs
+one full scan and nothing else. So it is written by a background thread that
+is allowed to fail silently, drop superseded states, and never block a cycle
+(`src/persist.rs:8`).
+
+**The ancestor is provenance.** It is the only thing that distinguishes
+"this side changed" from "the other side changed". A stale ancestor is not
+merely out of date. It is actively misleading.
+
+Here is the failure that justifies the cost. Alpha holds v2, beta holds v2,
+and the ancestor says v2. A user reverts alpha to v1. If that ancestor write
+is lost, the ancestor still says v1. Alpha now looks unchanged against it.
+Beta looks modified. The ordinary three-way rule propagates beta's v2 over
+the deliberate revert, and raises no conflict, because only one side appears
+to have changed.
+
+That is silent data loss, in every mode. So the ancestor is written
+synchronously and a failure fails the cycle (`src/session/mod.rs:419`). It
+is validated before it is written, and a corrupt ancestor is an error at
+load rather than a reset (`src/session/mod.rs:683`) — because a silent reset
+resurrects deletions.
+
+One write sits on the critical path. It is this one, and this is why.
+
+## Decision 4: one rendering of what happened
+
+After a cycle applies changes, four separate parties need to know what
+actually landed on disk: the ancestor, the local endpoint's tree, the
+controller's model of the remote agent, and the agent's own record of what
+it last sent.
+
+If those four derive that answer independently, they will eventually
+disagree, and a disagreement here means data loss.
+
+So they do not. A transition returns one result for each request, in order,
+describing what is on disk after the attempt — the new content on success,
+the surviving old content on refusal, a partial tree where a directory was
+only partly created (`src/endpoint/mod.rs:79`). All four parties consume
+that single rendering (`src/endpoint/mod.rs:98`).
+
+This also buys speed. The results carry the metadata of files as they were
+created, so the next scan re-digests only what changed *after* the
+transition (`src/endpoint/local.rs:1106`). On a cold sync that is the
+difference between a metadata sweep and rehashing everything you just
+wrote.
+
+## Decision 5: refuse rather than guess
+
+Reconciliation decides what should happen. Between that decision and the
+write, the filesystem can change underneath. The transition code treats
+that gap as hostile.
+
+Every write validates against **the exact scan the transitions were
+reconciled from** (`src/endpoint/local.rs:1056`). "Matches the last scan" is
+therefore the same statement as "nothing has changed since we decided this
+was safe". A file must have the expected digest and byte-identical
+metadata before it is replaced (`src/endpoint/local.rs:1377`).
+
+The supporting rules follow the same instinct. Every path component is
+checked with `symlink_metadata`, so a symlink anywhere on the way is a
+refusal rather than a redirection (`src/endpoint/local.rs:1337`). Removal
+works bottom-up and must account for every entry on disk, because content
+reconciliation never saw is content nobody decided to delete. New content
+becomes visible only by rename, so a reader never sees a half-written file.
+A refusal at one path never aborts the others.
+
+Two safety halts sit above all of this. If the ancestor had children and one
+side now presents an empty root, the cycle stops
+(`src/session/mod.rs:332`). An unmounted volume is far more likely than a
+deliberate deletion of everything.
+
+## What the design looks like from outside
+
+The decisions above produce the shape.
+
+**One binary, two roles.** The same executable runs as the controller or,
+with `autobahn agent`, as the remote half (`src/main.rs:206`). Both ends are
+the same build, so the version handshake demands an exact match. This is why
+the agent bundle must be updated together with the CLI.
+
+**The controller is a hub.** Endpoints never talk to each other
+(`src/endpoint/mod.rs:5`). Even a session between two remote roots routes
+through the controller. That costs a network hop in a rare case, and buys
+one place where reconciliation happens, with one model of both sides.
+
+**A cycle is the unit of work** (`src/session/mod.rs:260`). Scan both sides
+in parallel, return early if nothing moved, reconcile, stage, apply, fold
+the results, write the ancestor. Everything above is a property of one of
+those steps.
+
+**Sessions are independent.** The supervisor runs a thread for each
+(`src/supervisor/mod.rs:185`). A failure backs off with jitter applied after
+the cap, so sessions that all fail do not synchronize their retries
+(`src/supervisor/mod.rs:693`). One SSH process carries many sessions as
+channels, so a channel waiting for changes never blocks another channel's
+scan.
+
+### Why the cycle can return early, safely
+
+The early return is the most valuable path in the system, so its soundness
+deserves stating. It fires only if the session is quiesced *and* both fresh
+roots share storage with the recorded ones.
+
+Two independent facts make it safe. The quiesced flag is set only after a
+cycle that left nothing outstanding — no transitions, no conflicts, no
+problems (`src/session/mod.rs:74`). So "the same as last time" means "still
+synchronized", not "unchanged since a cycle that still had work to do". And
+only a scan that adopted its baseline whole can produce pointer identity, so
+the gate cannot open for a tree that was actually re-read.
+
+### The settle, as an illustration
+
+The design has one more habit worth showing, because it was recently wrong.
+
+When a change arrives, cycling immediately would fragment a burst of writes
+across many cycles. So autobahn waits. Until 0.3.0 that wait was a fixed
+100 ms, which meant every isolated edit paid the full window whether or not
+a burst followed. Measured against a 0.7 ms floor, a median latency of
+100.7 ms was almost entirely waiting.
+
+The fix keeps the ceiling and removes the floor. The session samples how
+much change each endpoint has recorded, sleeps a short slice, then samples
+again (`src/session/mod.rs:227`). Growth means writes continue. Two equal
+samples mean the burst ended. An isolated edit now waits 20 ms. A sustained
+burst still stops at 100 ms, so the worst case does not move.
+
+It samples counts rather than waiting for another event, because the
+watcher's signal is standing state rather than a stream of edges. The wake
+channel holds one token, so it cannot count arrivals, and the token may
+already be consumed. The path count is the only value that grows for each
+event.
+
+## What it costs
+
+Every decision above has a price, and these are the visible ones.
+
+**A hard ceiling near 750,000 files for a remote root.** The wire format
+caps a frame at 64 MiB (`src/protocol.rs:23`), the check is on the
+uncompressed length, and nothing chunks a scan reply or a transition
+request. A file entry encodes to approximately 89 bytes, so the first cold
+scan of a larger tree fails and takes the cycle with it. Local sessions are
+unaffected, because they serialize nothing.
+
+This ceiling is **measured, not specified.** The constant describes itself
+as a defense against corrupt length prefixes, which is true for file
+content — that streams in bounded batches. It does not acknowledge that
+snapshot frames grow with the entry count. There is no pre-flight check and
+no chunking, so the failure at scale is abrupt rather than graceful.
+
+**Up to 120 seconds of latency in the worst case.** If the watcher misses an
+event and the path is never touched again, the periodic full scan is what
+finds it. That is the price of not trusting events.
+
+**Unix only.** The code uses `std::os::unix` and `libc` without gating. The
+single platform conditional is peer-credential retrieval
+(`src/supervisor/control.rs:211`), which already has a `getpeereid` branch,
+so macOS works and the BSDs likely need little beyond a build target.
+Windows would be a port, not a build target.
+
+**One sharp edge in ignore rules.** A negation cannot recover content below
+an ignored *directory*, because a scan never descends into one
+(`src/scan/ignore.rs:9`). Write `node_modules/*` with `!node_modules/keep`
+rather than `node_modules` with a negation.
+
+## Where to start reading
+
+| To understand | Read |
+|---|---|
+| The tree and its sharing | `src/tree/mod.rs` |
+| How a scan reuses work | `src/scan/mod.rs:293` |
+| The cycle | `src/session/mod.rs:260` |
+| Why writes are safe | `src/endpoint/local.rs:1261` |
+| What crosses the wire | `src/protocol.rs`, `src/transport/mod.rs:400` |

@@ -95,6 +95,31 @@ assert 20 <= report["p50_ms"] <= 600, report["p50_ms"]
 assert report["warmup_samples"] >= 1, "warmup exclusion did not engage"
 EOF
 
+echo "== a fan-out edit waits for every destination =="
+# Two observers watching the same destination stand in for two machines.
+# The point is the plumbing: the agent must open a connection per
+# destination, announce to all of them, and only finish an edit once every
+# one has confirmed. A regression here would silently turn a fan-out
+# measurement back into a single-destination one.
+"$BINARY" observer 19912 > "$WORK/observer2.log" 2>&1 &
+sleep 0.5
+FANOUT=$("$BINARY" agents \
+  --root "$WORK/src-run" --peer-root "$WORK/dst" \
+  --observer 127.0.0.1:19911,127.0.0.1:19912 --partitions "$WORK/partitions.json" \
+  --side a --agents 10 --seconds 20 --label fanout --nonce 17)
+python3 - "$FANOUT" <<'EOF'
+import json, sys
+report = json.loads(sys.argv[1])
+assert report["destinations"] == 2, report
+assert report["samples"] >= 5, report
+assert report["censored"] == 0, report
+# Both destinations are the same directory here, so they confirm together
+# and the straggle is near zero. The field must still be reported.
+assert report["spread_p50_ms"] is not None, report
+assert report["spread_p50_ms"] < 200, report
+EOF
+echo "  fan-out: $(echo "$FANOUT" | python3 -c 'import json,sys; r=json.load(sys.stdin); print({k: r[k] for k in ("destinations","samples","censored","p50_ms","spread_p50_ms")})')"
+
 echo "== censoring engages when nothing propagates =="
 # No sync tool at all: every announced edit must come back censored, and
 # the run must complete rather than hang or crash. A short deadline via the

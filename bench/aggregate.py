@@ -164,6 +164,16 @@ def main():
             problems.append(record)
         elif kind == "reconvergence" and not all(record.get("converged", {}).values()):
             problems.append(record)
+        elif kind == "resources" and not any(
+            row[3] for host in ("local", "remote")
+            for row in record.get("series", {}).get(host, [])
+        ):
+            # Every sample saw zero processes: the sampler's patterns
+            # never matched this tool. Resource numbers would read as a
+            # confident zero, which is worse than no number at all.
+            problems.append({"measurement": "resource_sampling_never_matched",
+                             "cell": record.get("cell"), "tool": record.get("tool"),
+                             "job": record.get("job")})
         elif kind == "idle_window" and not record.get("settled"):
             problems.append({k: record.get(k) for k in
                              ("measurement", "cell", "tool", "job", "settled")})
@@ -242,6 +252,9 @@ def main():
             continue
         if run_key(record) in tainted:
             continue  # a run that misbehaved yields no headline resources
+        if not any(row[3] for host in ("local", "remote")
+                   for row in record.get("series", {}).get(host, [])):
+            continue  # the sampler never matched this tool; zero is not a measurement
         for phase in ("cold_sync", "idle", "workload"):
             if phase == "idle" and run_key(record) not in settled_runs:
                 continue

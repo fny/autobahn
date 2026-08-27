@@ -50,15 +50,21 @@ TOOLS = {
     #          tool's processes and impossible in this driver's argv,
     #          because it includes the executable's path);
     # comm:    exact process names for cleanup, local and remote.
+    # Patterns are comma-separated alternatives: a process matching any
+    # one of them seeds the sampled tree. Tools disagree about how they
+    # appear in /proc — mutagen re-execs its daemon with a bare basename
+    # ("mutagen daemon run", not the path it was launched from) — so a
+    # single pattern is one wrong guess away from silently sampling
+    # nothing at all.
     "autobahn": {
-        "local_pattern": f"{HOME}/autobahn up",
-        "remote_pattern": ".autobahn/bin/autobahn-",
+        "local_pattern": f"{HOME}/autobahn up,autobahn up",
+        "remote_pattern": ".autobahn/bin/autobahn-,autobahn-linux",
         "local_comms": ["autobahn"],
         "remote_comms": ["autobahn-.*"],
     },
     "mutagen": {
-        "local_pattern": f"{HOME}/mutagen daemon run",
-        "remote_pattern": ".mutagen/agents/",
+        "local_pattern": f"{HOME}/mutagen daemon run,mutagen daemon run",
+        "remote_pattern": "mutagen-agent,.mutagen/agents/",
         "local_comms": ["mutagen"],
         "remote_comms": ["mutagen-agent"],
     },

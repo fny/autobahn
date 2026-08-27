@@ -5,6 +5,15 @@
 //! line — a tool's SSH transport children and helpers belong to the tool
 //! even though their argv never mentions it.
 //!
+//! The pattern is a comma-separated list of alternatives and a process
+//! matching any one of them seeds the tree. Tools do not agree on how
+//! they present themselves in /proc — mutagen re-execs its daemon with a
+//! bare basename (`mutagen daemon run`) while its remote agent shows an
+//! install path — so a single pattern is one wrong guess away from
+//! silently measuring nothing. Alternatives make that failure need every
+//! guess to be wrong at once, and `--require-match` turns even that into
+//! a loud failure rather than a series of zeros.
+//!
 //! CPU is reported as a monotone cumulative total: per-PID jiffies are
 //! tracked between ticks, and a process that exits contributes its last
 //! observed count to a persistent base, so the series never decreases and
@@ -68,11 +77,18 @@ fn scan_processes() -> HashMap<u32, ProcessRecord> {
     table
 }
 
-/// Seeds plus every transitive descendant of a seed.
-fn tool_tree(table: &HashMap<u32, ProcessRecord>, pattern: &str, excluded: &HashSet<u32>) -> HashSet<u32> {
+/// Seeds plus every transitive descendant of a seed. Any one of the
+/// comma-separated alternatives seeds a process.
+fn tool_tree(
+    table: &HashMap<u32, ProcessRecord>,
+    patterns: &[String],
+    excluded: &HashSet<u32>,
+) -> HashSet<u32> {
     let mut members: HashSet<u32> = table
         .iter()
-        .filter(|(pid, record)| record.command.contains(pattern) && !excluded.contains(pid))
+        .filter(|(pid, record)| {
+            !excluded.contains(pid) && patterns.iter().any(|p| record.command.contains(p.as_str()))
+        })
         .map(|(&pid, _)| pid)
         .collect();
     loop {
@@ -92,6 +108,15 @@ fn tool_tree(table: &HashMap<u32, ProcessRecord>, pattern: &str, excluded: &Hash
 }
 
 pub fn run(pattern: &str, output: &Path) -> Result<(), String> {
+    let patterns: Vec<String> = pattern
+        .split(',')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_owned)
+        .collect();
+    if patterns.is_empty() {
+        return Err("sampler needs at least one pattern".into());
+    }
     let own = std::process::id();
     let parent = std::fs::read_to_string(format!("/proc/{own}/status"))
         .ok()
@@ -111,7 +136,7 @@ pub fn run(pattern: &str, output: &Path) -> Result<(), String> {
     let mut exited_base = 0u64;
     loop {
         let table = scan_processes();
-        let members = tool_tree(&table, pattern, &excluded);
+        let members = tool_tree(&table, &patterns, &excluded);
 
         // Anything tracked last tick that is gone (or no longer a member)
         // banks its final observed jiffies.

@@ -398,15 +398,30 @@ def key_path(key):
     return os.path.expanduser(f"~/.ssh/{key}.pem")
 
 
-def launch(options, run_id, instance_type, group, key, count, ami=None):
+def default_subnets(options):
+    """The default subnet in each availability zone, as {zone: subnet}.
+
+    One zone rarely has capacity for a hundred identical instances, so a
+    run spreads across zones. Groups are still placed *within* one zone —
+    a pair split across zones would measure cross-zone latency, which is
+    not what any cell is asking about.
+    """
+    output = aws(options.profile, options.region,
+                 "ec2 describe-subnets --filters Name=default-for-az,Values=true "
+                 "--query 'Subnets[].[AvailabilityZone,SubnetId]' --output json")
+    return {zone: subnet for zone, subnet in json.loads(output)}
+
+
+def launch(options, run_id, instance_type, group, key, count, ami=None, subnet=None):
     image = ami or aws(options.profile, options.region,
                        "ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/"
                        "stable/current/amd64/hvm/ebs-gp3/ami-id "
                        "--query Parameter.Value --output text")
+    placement = f"--subnet-id {subnet} " if subnet else ""
     identifiers = aws(
         options.profile, options.region,
         f"ec2 run-instances --image-id {image} --instance-type {instance_type} "
-        f"--count {count} --key-name {key} --security-group-ids {group} "
+        f"--count {count} --key-name {key} --security-group-ids {group} {placement}"
         f"--block-device-mappings '[{{\"DeviceName\":\"/dev/sda1\",\"Ebs\":"
         f"{{\"VolumeSize\":{VOLUME_GB},\"VolumeType\":\"gp3\",\"Iops\":6000,"
         f"\"Throughput\":500,\"DeleteOnTermination\":true}}}}]' "
@@ -477,15 +492,44 @@ def dispatch(options):
     for (width, instance), count in sorted(Counter(planned).items()):
         print(f"    {count} × {width} machines of {instance}")
 
-    # Launch each instance type in one call, then hand them out in the
-    # order the groups were planned.
-    by_type, instances = {}, []
-    for instance_type in sorted({t for _, t in planned}):
-        needed = sum(w for w, t in planned if t == instance_type)
-        launched = launch(options, run_id, instance_type, group, key,
-                          count=needed, ami=options.ami)
-        by_type[instance_type] = launched
-        instances.extend(launched)
+    # Groups are spread across availability zones, because one zone will
+    # not supply a hundred identical instances — but each group is launched
+    # *within* one zone, since a pair split across zones would measure
+    # cross-zone latency rather than the tool.
+    zones = default_subnets(options)
+    if not zones:
+        raise RuntimeError("no default subnets found; cannot place instances")
+    ordered_zones = sorted(zones)
+    placements = {}   # (zone, instance_type) -> machines needed
+    group_zone = []
+    for index, (width, instance_type) in enumerate(planned):
+        zone = ordered_zones[index % len(ordered_zones)]
+        group_zone.append(zone)
+        placements[(zone, instance_type)] = placements.get((zone, instance_type), 0) + width
+
+    pools, instances = {}, []
+    for (zone, instance_type), needed in sorted(placements.items()):
+        remaining, attempts = needed, []
+        # A zone that cannot supply its share hands the rest to another, so
+        # a single tight zone does not fail the run. Groups already placed
+        # in that zone keep their placement; only the overflow moves.
+        for candidate in [zone] + [z for z in ordered_zones if z != zone]:
+            if remaining == 0:
+                break
+            try:
+                launched = launch(options, run_id, instance_type, group, key,
+                                  count=remaining, ami=options.ami,
+                                  subnet=zones[candidate])
+            except subprocess.CalledProcessError:
+                attempts.append(candidate)
+                continue
+            pools.setdefault((zone, instance_type), []).extend(launched)
+            instances.extend(launched)
+            remaining = 0
+        if remaining:
+            raise RuntimeError(
+                f"no zone could supply {needed} × {instance_type} "
+                f"(tried {', '.join(attempts)})")
     addresses = wait_for_address(options, instances)
     for instance in instances:
         wait_for_ssh(addresses[instance], key)
@@ -495,11 +539,12 @@ def dispatch(options):
     # 11. Wiring is the same either way — the source learns every
     # destination as `dest1`..`destN`, with `dest` aliased to the first so
     # nothing that assumes a single destination has to change.
-    groups, taken = [], {t: 0 for t in by_type}
-    for width, instance_type in planned:
-        start = taken[instance_type]
-        groups.append(by_type[instance_type][start:start + width])
-        taken[instance_type] = start + width
+    groups, taken = [], {key_: 0 for key_ in pools}
+    for index, (width, instance_type) in enumerate(planned):
+        pool_key = (group_zone[index], instance_type)
+        start = taken[pool_key]
+        groups.append(pools[pool_key][start:start + width])
+        taken[pool_key] = start + width
     group_types = [instance_type for _, instance_type in planned]
 
     for index, members in enumerate(groups):
@@ -525,10 +570,20 @@ def dispatch(options):
                 # destination path keeps working untouched.
                 config.append(f"Host dest\n  HostName {b_private}\n  User ubuntu\n"
                               f"  StrictHostKeyChecking accept-new\n")
-        run(f"{ssh_a} 'printf {shlex.quote("".join(config))} >> ~/.ssh/config; "
-            f"printf {shlex.quote(chr(10).join(privates) + chr(10))} > ~/bench/peer-ip; "
-            f"echo {a_private} > ~/bench/self-ip; "
-            f"printf {shlex.quote(",".join(aliases))} > ~/bench/destinations'")
+        # One quoting boundary, not several: the remote command is built as
+        # plain text and quoted once. Embedding pre-quoted fragments inside
+        # an outer quote closes it at the first fragment, and the shell then
+        # reads the rest of the SSH config as commands.
+        wiring = (
+            f"printf %s {shlex.quote(''.join(config))} >> ~/.ssh/config; "
+            f"printf %s {shlex.quote(chr(10).join(privates) + chr(10))} > ~/bench/peer-ip; "
+            f"printf %s {shlex.quote(a_private + chr(10))} > ~/bench/self-ip; "
+            f"printf %s {shlex.quote(','.join(aliases))} > ~/bench/destinations"
+        )
+        result = run(f"ssh -n -i {key_path(key)} ubuntu@{a_public} {shlex.quote(wiring)}",
+                     check=False)
+        if result.returncode != 0:
+            raise RuntimeError(f"group {index}: wiring failed: {result.stdout[-400:]}")
         for alias in aliases:
             reachable = run(f"{ssh_a} 'ssh -o ConnectTimeout=5 {alias} true && echo OK'")
             if "OK" not in reachable.stdout:

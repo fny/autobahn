@@ -29,6 +29,9 @@ def main():
     parser.add_argument("--region", required=True)
     parser.add_argument("--ami", required=True)
     parser.add_argument("--pairs", type=int, default=1)
+    parser.add_argument("--fan", type=int, default=0,
+                        help="one source feeding N destinations, wired as "
+                             "dest1..destN (instead of --pairs)")
     parser.add_argument("--type", default="c6i.2xlarge")
     parser.add_argument("--run", default=None)
     options = parser.parse_args()
@@ -37,11 +40,15 @@ def main():
     print(f"run id: {run_id}")
     key, group = orchestrate.provision_network(options, run_id)
     orchestrate.INSTANCE_TYPE = options.type
+    count = 1 + options.fan if options.fan else options.pairs * 2
     instances = orchestrate.launch(options, run_id, options.type, group, key,
-                                   count=options.pairs * 2, ami=options.ami)
+                                   count=count, ami=options.ami)
     addresses = orchestrate.wait_for_address(options, instances)
     for instance in instances:
         orchestrate.wait_for_ssh(addresses[instance], key)
+
+    if options.fan:
+        return _wire_fan(options, run_id, key, group, instances, addresses)
 
     pairs = [(instances[2 * i], instances[2 * i + 1]) for i in range(options.pairs)]
     hosts = []
@@ -81,10 +88,66 @@ def main():
           f"--region {options.region} --run {run_id} --keep-ami")
 
 
-def _scripts():
+def _wire_fan(options, run_id, key, group, instances, addresses):
+    """One source, N destinations reachable as dest1..destN.
+
+    The pair wiring above gives each source exactly one destination named
+    `dest`, which is all a differential or soak test needs. Measuring fan-out
+    needs the destinations numbered and all reachable from the same source.
+    """
+    source, destinations = instances[0], instances[1:]
+    source_public, source_private = addresses[source]
+    identity = orchestrate.key_path(key)
+    ssh_source = (f"ssh -o StrictHostKeyChecking=accept-new -i {identity} "
+                  f"ubuntu@{source_public}")
+
+    orchestrate.run(f"{ssh_source} 'ssh-keygen -t ed25519 -N \"\" "
+                    f"-f ~/.ssh/id_ed25519 -q || true'")
+    public_key = orchestrate.run(f"{ssh_source} 'cat ~/.ssh/id_ed25519.pub'").stdout.strip()
+
+    config, hosts = [], []
+    for index, destination in enumerate(destinations, start=1):
+        public, private = addresses[destination]
+        orchestrate.run(f"ssh -o StrictHostKeyChecking=accept-new -i {identity} "
+                        f"ubuntu@{public} 'echo {json.dumps(public_key)} "
+                        f">> ~/.ssh/authorized_keys'")
+        config.append(f"Host dest{index}\\n  HostName {private}\\n  User ubuntu\\n"
+                      f"  StrictHostKeyChecking accept-new\\n")
+        hosts.append({"name": f"dest{index}", "public": public, "private": private})
+
+    orchestrate.run(f"{ssh_source} 'printf \"{''.join(config)}\" >> ~/.ssh/config'")
+    for index in range(1, len(destinations) + 1):
+        orchestrate.run(f"{ssh_source} 'ssh -o ConnectTimeout=10 dest{index} true'")
+
+    # The image carries baked binaries; push the current ones over them.
+    local = os.path.expanduser(
+        "~/Workspace/autobahn/target/x86_64-unknown-linux-musl/release/autobahn")
+    for public in [source_public] + [host["public"] for host in hosts]:
+        orchestrate.run(f"scp -o StrictHostKeyChecking=accept-new -i {identity} "
+                        f"{local} ubuntu@{public}:~/autobahn")
+        orchestrate.run(f"ssh -i {identity} ubuntu@{public} 'chmod +x ~/autobahn && "
+                        f"mkdir -p ~/agents && cp ~/autobahn ~/agents/autobahn-linux-x86_64 "
+                        f"&& rm -rf ~/.autobahn ~/.autobahn-dev'")
+
+    for name, script in sorted(_scripts(("coldfan.sh",)).items()):
+        orchestrate.run(f"ssh -i {identity} ubuntu@{source_public} "
+                        f"'cat > ~/{name} && chmod +x ~/{name}' <<'SCRIPT_EOF'\n{script}\nSCRIPT_EOF")
+
+    manifest = {"run": run_id, "key": identity, "group": group, "ami": options.ami,
+                "source": source_public, "source_private": source_private,
+                "destinations": hosts}
+    with open(f"{HERE}/hosts-{run_id}.json", "w") as handle:
+        json.dump(manifest, handle, indent=2)
+    print(json.dumps(manifest, indent=2))
+    print(f"\nssh -i {identity} ubuntu@{source_public}")
+    print(f"destroy with: python3 {ORCH} destroy --profile {options.profile} "
+          f"--region {options.region} --run {run_id} --keep-ami")
+
+
+def _scripts(names=("soak.sh", "differential.sh")):
     """Verification scripts copied to each driver host."""
     scripts = {}
-    for name in ("soak.sh", "differential.sh"):
+    for name in names:
         path = os.path.join(HERE, name)
         if os.path.exists(path):
             scripts[name] = open(path).read()

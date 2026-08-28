@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 use crate::endpoint::{Endpoint, FileRequest, TransitionOutcome};
+pub(crate) mod ancestor;
+
 use crate::tree::{
     apply, path_join, propagate_executability, reconcile, Change, Conflict, Content, Node, Problem,
     SyncMode,
@@ -95,7 +97,7 @@ pub struct Session {
     /// The synchronization mode.
     mode: SyncMode,
     /// The persisted ancestor path.
-    ancestor_path: PathBuf,
+    ancestor_store: ancestor::AncestorStore,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
     /// Whether the last cycle finished with the two sides synchronized and
@@ -168,12 +170,12 @@ impl Session {
         lock: SessionLock,
     ) -> Result<Session> {
         let ancestor_path = lock.state_directory().join("ancestor");
-        let ancestor = load_ancestor(&ancestor_path)?;
+        let (ancestor_store, ancestor) = ancestor::AncestorStore::open(&ancestor_path)?;
         Ok(Session {
             alpha,
             beta,
             mode,
-            ancestor_path,
+            ancestor_store,
             ancestor,
             quiesced: false,
             settled_alpha: None,
@@ -419,7 +421,11 @@ impl Session {
             let new_ancestor = apply(self.ancestor.as_ref(), &ancestor_changes)
                 .map_err(|message| anyhow::anyhow!("ancestor update failed: {message}"))?;
             if let Some(root) = &new_ancestor {
-                root.validate(true)
+                // Validated against the ancestor it was built from, which
+                // was itself validated before it was installed. apply()
+                // keeps the storage of every subtree it did not touch, so
+                // this walks the changed paths rather than the hierarchy.
+                root.validate_against(self.ancestor.as_ref(), true)
                     .map_err(|message| anyhow::anyhow!("new ancestor is invalid: {message}"))?;
             }
             // The ancestor is written synchronously, and a failure fails
@@ -437,7 +443,8 @@ impl Session {
             // between two statements to however long encoding and writing
             // the whole hierarchy takes: ample time for someone to make
             // exactly that edit.
-            save_ancestor(&self.ancestor_path, new_ancestor.as_ref())?;
+            self.ancestor_store
+                .record(&ancestor_changes, new_ancestor.as_ref())?;
             self.ancestor = new_ancestor;
         }
 
@@ -671,36 +678,6 @@ impl SessionLock {
     }
 }
 
-/// Writes an ancestor file, atomically and synchronously. Failures are
-/// reported rather than swallowed: an ancestor that silently failed to
-/// persist misleads the next session's reconciliation exactly as a stale
-/// one does.
-fn save_ancestor(path: &Path, ancestor: Option<&Node>) -> Result<()> {
-    let data = bincode::serialize(&ancestor.cloned()).context("unable to encode ancestor")?;
-    let temporary = path.with_extension("tmp");
-    fs::write(&temporary, data).context("unable to write ancestor")?;
-    fs::rename(&temporary, path).context("unable to publish ancestor")?;
-    Ok(())
-}
-
-/// Loads a persisted ancestor, treating a missing file as an absent
-/// ancestor and failing on corruption (an unreadable ancestor must not be
-/// silently discarded, since that would resurrect deletions).
-fn load_ancestor(path: &Path) -> Result<Option<Node>> {
-    let data = match fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error).context("unable to read ancestor"),
-    };
-    let ancestor: Option<Node> =
-        bincode::deserialize(&data).context("unable to decode ancestor")?;
-    if let Some(root) = &ancestor {
-        root.validate(true)
-            .map_err(|message| anyhow::anyhow!("persisted ancestor is invalid: {message}"))?;
-    }
-    Ok(ancestor)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -772,11 +749,27 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ancestor");
         let ancestor = Node::directory("", vec![file("a", 1)]);
-        save_ancestor(&path, Some(&ancestor)).unwrap();
-        let loaded = load_ancestor(&path).unwrap().unwrap();
-        assert!(loaded.content_equal(&ancestor, true));
-        save_ancestor(&path, None).unwrap();
-        assert!(load_ancestor(&path).unwrap().is_none());
+
+        let (mut store, empty) = ancestor::AncestorStore::open(&path).unwrap();
+        assert!(empty.is_none());
+        let change = Change {
+            path: String::new(),
+            old: None,
+            new: Some(ancestor.clone()),
+        };
+        store.record(&[change], Some(&ancestor)).unwrap();
+
+        let (mut store, loaded) = ancestor::AncestorStore::open(&path).unwrap();
+        assert!(loaded.unwrap().content_equal(&ancestor, true));
+
+        let deletion = Change {
+            path: String::new(),
+            old: Some(ancestor),
+            new: None,
+        };
+        store.record(&[deletion], None).unwrap();
+        let (_, loaded) = ancestor::AncestorStore::open(&path).unwrap();
+        assert!(loaded.is_none());
     }
 
     #[test]
@@ -784,7 +777,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("ancestor");
         fs::write(&path, b"garbage").unwrap();
-        assert!(load_ancestor(&path).is_err());
+        assert!(ancestor::AncestorStore::open(&path).is_err());
     }
 
     /// An endpoint that replays a queue of snapshots (repeating the last)

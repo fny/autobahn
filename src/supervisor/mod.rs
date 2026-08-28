@@ -436,14 +436,14 @@ impl<'a> Worker<'a> {
                 return;
             }
         };
-        if let Err(error) = std::fs::remove_file(state_directory.join("ancestor")) {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                eprintln!(
-                    "[{}] unable to reset the ancestor: {error}",
-                    self.plan.display()
-                );
-                return;
-            }
+        if let Err(error) =
+            crate::session::ancestor::AncestorStore::reset(&state_directory.join("ancestor"))
+        {
+            eprintln!(
+                "[{}] unable to reset the ancestor: {error:#}",
+                self.plan.display()
+            );
+            return;
         }
         if self.verbose {
             println!(

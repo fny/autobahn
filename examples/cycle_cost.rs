@@ -93,6 +93,20 @@ fn main() {
             .expect("valid");
         let validate_ms = started.elapsed().as_secs_f64() * 1000.0;
 
+        // The same validation, against the hierarchy it was derived from.
+        let derived = autobahn::tree::apply(settled.root.as_ref(), &result.beta_transitions)
+            .expect("applies");
+        let started = Instant::now();
+        derived
+            .as_ref()
+            .expect("root")
+            .validate_against(settled.root.as_ref(), true)
+            .expect("valid");
+        let incremental_ms = started.elapsed().as_secs_f64() * 1000.0;
+        println!(
+            "  validate {validate_ms:.1}ms full vs {incremental_ms:.2}ms incremental"
+        );
+
         let ancestor_path = staging.with_extension("ancestor");
         let started = Instant::now();
         let data = bincode::serialize(&edited.root.clone()).expect("ancestor encodes");

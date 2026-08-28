@@ -361,6 +361,81 @@ impl Node {
             }
         }
     }
+
+    /// Validates as [`validate`](Self::validate) does, but skips any subtree
+    /// that shares storage with `previous` — which must itself already have
+    /// been validated under the same `synchronizable_only`.
+    ///
+    /// A hierarchy built by [`apply`](crate::tree::apply) keeps the storage
+    /// of every subtree the change did not touch, so validating a new
+    /// ancestor against the old one revisits only the root-to-leaf path that
+    /// actually changed. On a large tree that is the difference between
+    /// walking half a million entries and walking a handful.
+    ///
+    /// The saving is sound only because sharing is proof of *identity*: the
+    /// two subtrees are one immutable allocation, so one having passed
+    /// validation is the other having passed it. Nothing weaker qualifies —
+    /// in particular, sharing with a scanned or transferred hierarchy proves
+    /// nothing here, because those are never validated under
+    /// `synchronizable_only` and may legitimately hold untracked or
+    /// problematic content.
+    pub fn validate_against(
+        &self,
+        previous: Option<&Node>,
+        synchronizable_only: bool,
+    ) -> Result<(), String> {
+        if nodes_share_storage(Some(self), previous) {
+            return Ok(());
+        }
+        let Content::Directory(children) = &self.content else {
+            // Only directories carry shareable storage, so everything else
+            // is validated exactly as it would be anyway.
+            return self.validate(synchronizable_only);
+        };
+        // This children vector differs from the previous one, so its own
+        // invariants hold nothing over from before and are checked in full.
+        // Only the children themselves may be skipped, and only individually.
+        let previous_children = match previous.map(|node| &node.content) {
+            Some(Content::Directory(children)) => Some(children),
+            _ => None,
+        };
+        let mut cursor = 0usize;
+        let mut last: Option<&str> = None;
+        for child in children.iter() {
+            if child.name.is_empty() {
+                return Err("empty child name".into());
+            }
+            if child.name == "." || child.name == ".." {
+                return Err("dot child name".into());
+            }
+            if child.name.contains('/') || child.name.contains('\0') {
+                return Err("child name contains path separator or NUL".into());
+            }
+            if let Some(last) = last {
+                if child.name.as_str() <= last {
+                    return Err("unsorted or duplicate child names".into());
+                }
+            }
+            last = Some(child.name.as_str());
+            // Both vectors are name-sorted, so the counterpart is found by
+            // advancing a single cursor rather than searching.
+            let mut counterpart = None;
+            if let Some(previous_children) = previous_children {
+                while cursor < previous_children.len()
+                    && previous_children[cursor].name.as_str() < child.name.as_str()
+                {
+                    cursor += 1;
+                }
+                if cursor < previous_children.len()
+                    && previous_children[cursor].name == child.name
+                {
+                    counterpart = Some(&previous_children[cursor]);
+                }
+            }
+            child.validate_against(counterpart, synchronizable_only)?;
+        }
+        Ok(())
+    }
 }
 
 /// Reports whether two optional nodes are backed by the *same storage* —

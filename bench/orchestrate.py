@@ -623,34 +623,43 @@ def dispatch(options):
     rng.shuffle(jobs)
 
     # A job can only run on a group with enough destinations, so assignment
-    # is a fit rather than a rotation. Widest jobs are placed first — a
-    # fan-out job fits almost nowhere, while a pairwise job fits anywhere,
-    # so placing the fussy ones first keeps the wide groups from filling up
-    # with work that any group could have taken. Within a width, the least
-    # loaded group wins, which keeps the finishing times close together.
+    # is a fit rather than a rotation. A job needs a group wide enough for
+    # its destinations AND on an instance at least as large as its corpus
+    # was sized for — a Chromium job on a machine sized for 5k would not
+    # measure the tool. Longest job first, because one Chromium job
+    # outweighs ten small ones and starting it last makes it the tail
+    # nothing can hide.
+    #
+    # This must agree with schedule(), which is what the planner used to
+    # decide how many groups of each shape to build; if the two disagree,
+    # the plan's makespan is a fiction.
     assignments = {index: [] for index in range(len(groups))}
     capacity = [len(members) - 1 for members in groups]
-    for job in sorted(jobs, key=lambda job: -job["cell"]["betas"]):
-        needed = job["cell"]["betas"]
-        candidates = [i for i, width in enumerate(capacity) if width >= needed]
+    load = [0.0] * len(groups)
+    by_name = {cell[0]: cell for cell in selected}
+    for job in sorted(jobs, key=lambda job: -cell_cost(by_name[job["cell"]["name"]])):
+        cell = by_name[job["cell"]["name"]]
+        needed, wanted = cell[4], VCPUS[cell_instance(cell)]
+        candidates = [index for index in range(len(groups))
+                      if capacity[index] >= needed
+                      and VCPUS[group_types[index]] >= wanted]
         if not candidates:
             raise RuntimeError(
-                f"cell {job['cell']['name']} needs {needed} destinations, but the widest "
-                f"group has {max(capacity) if capacity else 0}")
-        # Prefer the narrowest group that fits, then the least loaded, so a
-        # pairwise job does not occupy an eleven-machine group.
-        chosen = min(candidates, key=lambda i: (capacity[i], len(assignments[i]), i))
+                f"cell {cell[0]} needs {needed} destination(s) on "
+                f"{cell_instance(cell)} or larger, and no group provides that")
+        chosen = min(candidates,
+                     key=lambda index: (load[index], capacity[index],
+                                        VCPUS[group_types[index]], index))
+        load[chosen] += cell_cost(cell)
         job["pair"] = f"pair-{chosen}"
         assignments[chosen].append(job)
-    for index in assignments:
-        rng.shuffle(assignments[index])
 
     # The complete plan is persisted before anything runs — locally and on
     # every pair — so a pair that dies leaves evidence of what it owed, and
     # the aggregator can compare delivered results against this manifest
     # instead of trusting whatever happened to come back.
     os.makedirs(f"results-{run_id}", exist_ok=True)
-    a0_public, _ = addresses[pairs[0][0]]
+    a0_public, _ = addresses[groups[0][0]]
     chromium_commit = run(
         f"ssh -i {key_path(key)} ubuntu@{a0_public} 'cat ~/corpus/chromium.commit'",
         check=False).stdout.strip() or None

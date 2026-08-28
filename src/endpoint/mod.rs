@@ -10,6 +10,7 @@
 //! agent running the same binary).
 
 pub mod local;
+pub mod observer;
 pub mod remote;
 
 use anyhow::Result;

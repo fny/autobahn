@@ -113,26 +113,26 @@ pub struct LocalEndpoint {
     root: PathBuf,
     /// The directory holding staged content and staging temporaries.
     staging_root: PathBuf,
-    /// The ignore set applied to scans.
-    ignores: IgnoreSet,
-    /// The treatment of symbolic links.
+    /// The treatment of symbolic links, applied when creating them.
+
     symlink_mode: SymlinkMode,
     /// The permission bits for created non-executable files.
     file_mode: u32,
     /// The permission bits for created directories.
     directory_mode: u32,
-    /// The per-file size limit (`None` for unlimited).
-    max_file_size: Option<u64>,
     /// The per-root entry limit (`None` for unlimited).
     max_entry_count: Option<u64>,
     /// The owner ID applied to created entries (`None` to leave alone).
     owner: Option<u32>,
     /// The group ID applied to created entries (`None` to leave alone).
     group: Option<u32>,
-    /// The probed behavior of the root's filesystem, determined at the
-    /// first scan that finds the root present and cached for the endpoint's
-    /// lifetime.
-    behavior: Option<FilesystemBehavior>,
+    /// The shared observation of this root: one watcher, one scan, one
+    /// cache, however many sessions synchronize it. See
+    /// [`observer`](crate::endpoint::observer) for why.
+    observer: Arc<crate::endpoint::observer::RootObserver>,
+    /// The generation this endpoint's last scan reflects, so it waits only
+    /// for changes it has not already seen.
+    seen_generation: u64,
     /// The most recent scan, used as the digest cache for the next scan, as
     /// the local-content index for staging, and as the record that
     /// transitions validate against.
@@ -143,24 +143,6 @@ pub struct LocalEndpoint {
     ///
     /// [`stage_begin`]: Endpoint::stage_begin
     receive: Option<ReceiveState>,
-    /// The filesystem watcher, created lazily at the first
-    /// [`await_change`](Endpoint::await_change) that finds the root present.
-    watcher: Option<ChangeWatcher>,
-    /// When to next attempt a watch that failed to be created.
-    ///
-    /// Establishing a recursive watch walks every directory in the root, so
-    /// retrying on every wait turns an unwatchable root — a host at its
-    /// inotify limit, most likely — into a syscall storm:
-    /// `Session::await_change` slices at 125 ms, so the walk would run about
-    /// eight times a second, forever, on top of whatever exhausted the
-    /// limit to begin with.
-    watch_retry_after: Option<std::time::Instant>,
-    /// When the last *full* scan completed. A fresh watch has no history to
-    /// scan incrementally against, so `None` forces the next scan to be
-    /// full.
-    last_full_scan: Option<std::time::Instant>,
-    /// The background writer for this endpoint's scan cache.
-    writer: crate::persist::StateWriter,
 }
 
 /// The number of changed paths a watcher will accumulate before giving up
@@ -172,15 +154,6 @@ const MAXIMUM_PENDING_PATHS: usize = 8192;
 /// The longest an endpoint will go on incremental scans alone. Watching is
 /// best-effort — events can be missed when a directory is created and
 /// populated faster than a recursive watch can follow it, and network
-/// filesystems may report nothing at all — so a full scan runs at least
-/// this often to bound how long such a miss can persist.
-const FULL_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// How long to wait before trying again to establish a watch that failed.
-/// Long enough that a host already at its watch limit is not hammered;
-/// short enough that watching resumes promptly once room appears.
-const WATCH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
-
 /// The changed paths accumulated by a watcher since the last scan.
 #[derive(Default)]
 struct PendingChanges {
@@ -201,33 +174,31 @@ impl PendingChanges {
         self.paths.shrink_to_fit();
     }
 
-    /// Indicates whether anything at all has been recorded.
-    fn is_empty(&self) -> bool {
-        !self.incomplete && self.paths.is_empty()
-    }
 }
 
 /// A recursive filesystem watcher over the synchronization root, recording
 /// changed paths for incremental scanning and signaling waiters.
-struct ChangeWatcher {
+pub(crate) struct ChangeWatcher {
     /// The watcher itself, retained for its lifetime side effect.
     _watcher: notify::RecommendedWatcher,
     /// The changed paths recorded since the last scan consumed them.
     pending: Arc<Mutex<PendingChanges>>,
-    /// The wake stream: one token per delivered event (coalesced by the
-    /// bounded channel, which is only ever a signal — the paths themselves
-    /// live in `pending`).
-    wake: std::sync::mpsc::Receiver<()>,
 }
 
 impl ChangeWatcher {
-    /// Establishes a recursive watch over `root`.
-    fn new(root: &Path) -> Result<ChangeWatcher> {
+    /// Establishes a recursive watch over `root`, calling `notify` whenever
+    /// an event lands.
+    ///
+    /// The callback carries no payload: the paths accumulate in `pending`,
+    /// and what a waiter needs to know is only that *something* happened.
+    /// It runs on the watcher's own thread, so it must not block — the
+    /// observer's signal takes a lock it holds for a counter increment and
+    /// nothing more.
+    pub(crate) fn new(
+        root: &Path,
+        notify: impl Fn() + Send + 'static,
+    ) -> Result<ChangeWatcher> {
         use notify::Watcher;
-        // The wake channel holds a single token: it exists to interrupt a
-        // waiter, and the accumulated paths (not the token count) are what
-        // describe the change.
-        let (sender, wake) = std::sync::mpsc::sync_channel(1);
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
         let mut watcher =
@@ -248,7 +219,7 @@ impl ChangeWatcher {
                         Err(_) => pending.give_up(),
                     }
                 }
-                let _ = sender.try_send(());
+                notify();
             })
             .context("unable to create a filesystem watcher")?;
         watcher
@@ -257,8 +228,49 @@ impl ChangeWatcher {
         Ok(ChangeWatcher {
             _watcher: watcher,
             pending,
-            wake,
         })
+    }
+
+    /// Takes the changes recorded since the last call, as paths to re-read.
+    ///
+    /// Returns `None` when the record cannot be trusted — a kernel queue
+    /// overflow, too many paths to hold, or a path that cannot be expressed
+    /// in the hierarchy's naming — which asks the caller for a full walk.
+    /// Consuming here rather than after the walk means a change arriving
+    /// during a scan stays pending for the next one: at worst repeated
+    /// work, never a dropped notification.
+    pub(crate) fn take_dirty(
+        &mut self,
+        root: &Path,
+        behavior: &FilesystemBehavior,
+    ) -> Option<scan::DirtyPaths> {
+        let changes = self.take();
+        if changes.incomplete {
+            return None;
+        }
+        let mut dirty = scan::DirtyPaths::default();
+        for path in &changes.paths {
+            // A path outside the root, or one that cannot be expressed in
+            // the hierarchy's naming, cannot be marked — and silently
+            // ignoring it would be a missed change.
+            let relative = path.strip_prefix(root).ok()?;
+            let mut components = Vec::new();
+            for component in relative.components() {
+                let std::path::Component::Normal(component) = component else {
+                    return None;
+                };
+                let component = component.to_str()?;
+                // The hierarchy carries NFC names; a decomposing volume
+                // reports NFD ones.
+                components.push(if behavior.decomposes_unicode {
+                    scan::recompose(component)
+                } else {
+                    component.to_owned()
+                });
+            }
+            dirty.mark(&components.join("/"));
+        }
+        Some(dirty)
     }
 
     /// Takes the changes recorded since the last call.
@@ -273,7 +285,7 @@ impl ChangeWatcher {
 
     /// Indicates whether any change is currently recorded.
     /// The current size of the unconsumed change record.
-    fn activity(&self) -> crate::endpoint::ChangeActivity {
+    pub(crate) fn activity(&self) -> crate::endpoint::ChangeActivity {
         let pending = self
             .pending
             .lock()
@@ -284,13 +296,6 @@ impl ChangeWatcher {
         }
     }
 
-    fn has_changes(&self) -> bool {
-        !self
-            .pending
-            .lock()
-            .expect("the pending lock is never poisoned")
-            .is_empty()
-    }
 }
 
 impl LocalEndpoint {
@@ -324,25 +329,34 @@ impl LocalEndpoint {
             .as_deref()
             .map(crate::ownership::resolve_group)
             .transpose()?;
+        // The scan cache belongs to the observation, not to a session:
+        // one file per observed root rather than one per destination.
+        let cache_path = staging_root.with_extension("scancache");
+        let observer_root = root.clone();
+        let observer_ignores = options.ignores.clone();
         Ok(LocalEndpoint {
             root,
             staging_root,
-            ignores: options.ignores,
             symlink_mode: options.symlink_mode,
             file_mode: options.file_mode.unwrap_or(DEFAULT_FILE_MODE) & 0o777,
             directory_mode: options.directory_mode.unwrap_or(DEFAULT_DIRECTORY_MODE) & 0o777,
-            max_file_size: options.max_file_size,
             max_entry_count: options.max_entry_count,
             owner,
             group,
-            behavior: None,
+            observer: crate::endpoint::observer::observer_for(
+                crate::endpoint::observer::ObserverKey {
+                    root: crate::endpoint::observer::canonical_root(&observer_root),
+                    ignores: observer_ignores.key(),
+                    symlink_mode: options.symlink_mode,
+                    max_file_size: options.max_file_size,
+                },
+                observer_ignores,
+                cache_path,
+            ),
+            seen_generation: 0,
             last_snapshot: None,
             supply: None,
             receive: None,
-            watcher: None,
-            watch_retry_after: None,
-            last_full_scan: None,
-            writer: crate::persist::StateWriter::new(),
         })
     }
 
@@ -353,59 +367,29 @@ impl LocalEndpoint {
         self.last_snapshot.as_ref()
     }
 
-    /// Blocks until this endpoint's pending state writes have completed.
-    /// The cycle path never calls this — the whole point of the background
-    /// writer is that it doesn't — but a caller that needs to observe the
-    /// state on disk (a test, an orderly shutdown) can wait for it.
+    /// Blocks until pending state writes have completed. The cycle path
+    /// never calls this — the whole point of the background writer is that
+    /// it does not — but a caller that needs to observe the state on disk
+    /// (a test, an orderly shutdown) can wait for it.
     pub fn flush_state(&self) {
-        self.writer.flush();
+        self.observer.flush_state();
+    }
+
+    /// Where this endpoint's observation persists its scan cache.
+    pub fn scan_cache_path(&self) -> PathBuf {
+        self.observer.cache_path().to_path_buf()
+    }
+
+    /// Overrides the probed filesystem behavior for tests.
+    #[cfg(test)]
+    fn force_behavior(&self, behavior: FilesystemBehavior) {
+        self.observer.force_behavior(behavior);
     }
 
     /// Returns the path at which content with the specified digest lives once
     /// it has been fully received and verified.
     fn staged_path(&self, digest: &Digest) -> PathBuf {
         staged_path(&self.staging_root, digest)
-    }
-
-    /// Returns the path of the persisted scan cache (a sibling of the
-    /// staging directory, so it shares the staging state's lifecycle).
-    fn scan_cache_path(&self) -> PathBuf {
-        self.staging_root.with_extension("scancache")
-    }
-
-    /// Loads the persisted scan cache, if a valid one exists. The cache
-    /// seeds a cold start's first scan baseline, so unchanged files (by
-    /// full metadata match) skip re-digesting exactly as they would against
-    /// a same-process previous snapshot — which also means cached digests
-    /// can flow, metadata-gated, into that scan's snapshot and everything
-    /// downstream of it, transition validation included. The cache is
-    /// therefore *trusted state*, exactly like the ancestor it lives
-    /// beside: both share the state directory's protection, and an
-    /// unreadable or structurally invalid cache is ignored (it only ever
-    /// saves work). This is the same contract as Mutagen's persisted scan
-    /// cache.
-    fn load_scan_cache(&self) -> Option<Snapshot> {
-        let data = fs::read(self.scan_cache_path()).ok()?;
-        let snapshot: Snapshot = bincode::deserialize(&data).ok()?;
-        if let Some(root) = &snapshot.root {
-            root.validate(false).ok()?;
-        }
-        Some(snapshot)
-    }
-
-    /// Persists the scan cache, best-effort and atomically, on the
-    /// endpoint's background writer.
-    ///
-    /// The cache is a pure optimization artifact — losing it costs one full
-    /// scan and nothing else — so neither its serialization nor its write
-    /// belongs on a cycle's critical path. On a large tree that is tens of
-    /// megabytes of work removed from the latency between saving a file and
-    /// seeing it arrive.
-    fn store_scan_cache(&self, snapshot: &Snapshot) {
-        let snapshot = snapshot.clone();
-        self.writer.store(self.scan_cache_path(), move || {
-            bincode::serialize(&snapshot).ok()
-        });
     }
 
     /// Decides whether the local-content index is worth building for a
@@ -477,47 +461,6 @@ impl LocalEndpoint {
     /// begins after changes that may already have happened), when the
     /// watcher's record is incomplete, and periodically regardless — see
     /// [`FULL_SCAN_INTERVAL`].
-    fn dirty_paths(
-        &self,
-        baseline: Option<&Snapshot>,
-        behavior: &FilesystemBehavior,
-    ) -> Option<scan::DirtyPaths> {
-        let watcher = self.watcher.as_ref()?;
-        let changes = watcher.take();
-        baseline?;
-        let due = match self.last_full_scan {
-            None => true,
-            Some(last) => last.elapsed() >= FULL_SCAN_INTERVAL,
-        };
-        if due || changes.incomplete {
-            return None;
-        }
-
-        let mut dirty = scan::DirtyPaths::default();
-        for path in &changes.paths {
-            // A path outside the root (or one that can't be expressed in
-            // the hierarchy's naming) can't be marked, and silently
-            // ignoring it would be a missed change.
-            let relative = path.strip_prefix(&self.root).ok()?;
-            let mut components = Vec::new();
-            for component in relative.components() {
-                let std::path::Component::Normal(component) = component else {
-                    return None;
-                };
-                let component = component.to_str()?;
-                // The hierarchy carries NFC names; a decomposing volume
-                // reports NFD ones.
-                components.push(if behavior.decomposes_unicode {
-                    scan::recompose(component)
-                } else {
-                    component.to_owned()
-                });
-            }
-            dirty.mark(&components.join("/"));
-        }
-        Some(dirty)
-    }
-
     /// Reports whether the last scan recorded a regular file at a
     /// root-relative path — the gate for base-signature computation, saving
     /// a filesystem probe for every path known to hold nothing usable.
@@ -802,86 +745,14 @@ impl LocalEndpoint {
 
 impl Endpoint for LocalEndpoint {
     fn scan(&mut self) -> Result<Snapshot> {
-        // Filesystem behavior is probed at the first scan that finds the
-        // root present, then cached: the properties are per-volume, and the
-        // volume doesn't change under a live endpoint.
-        if self.behavior.is_none() && fs::symlink_metadata(&self.root).is_ok() {
-            self.behavior = Some(scan::probe(&self.root));
-        }
-        let behavior = self.behavior.unwrap_or_default();
-
-        // The watcher must exist *before* the scan, not lazily at the first
-        // await: a change landing between the scan and a later
-        // watcher creation would be invisible to
-        // [`await_change`](Endpoint::await_change), and a caller relying on
-        // change signals (rather than a tight heartbeat) would never learn
-        // of it. Established here, events queue from the moment the
-        // snapshot's view of the world is taken.
-        if self.watcher.is_none() {
-            self.watcher = ChangeWatcher::new(&self.root).ok();
-            // A watch just established has no record of what happened
-            // before it existed, so the scan it precedes must be full.
-            self.last_full_scan = None;
-        }
-
-        // The retained snapshot is the scanner's baseline, which is what
-        // turns a rescan into a walk of what changed rather than a re-read of
-        // everything. A cold start (no retained snapshot yet) seeds the
-        // baseline from the persisted scan cache instead, so even the first
-        // scan of a process re-digests only what changed since the last one.
-        let cached = match self.last_snapshot {
-            Some(_) => None,
-            None => self.load_scan_cache(),
-        };
-        let baseline = self.last_snapshot.as_ref().or(cached.as_ref());
-
-        // Decide between a full scan and an incremental one. The watcher's
-        // record of changed paths is consumed *before* the walk: a change
-        // arriving during the scan then stays pending for the next one,
-        // which at worst repeats work — where consuming it afterwards could
-        // discard a notification for content this scan never saw.
-        let dirty = self.dirty_paths(baseline, &behavior);
-        let snapshot = scan::scan(
-            &self.root,
-            baseline,
-            &self.ignores,
-            &behavior,
-            self.symlink_mode,
-            self.max_file_size,
-            dirty.as_ref(),
-        )
-        .with_context(|| format!("unable to scan {}", self.root.display()))?;
-        if dirty.is_none() {
-            self.last_full_scan = Some(std::time::Instant::now());
-        }
-
-        // The entry limit is a guard against synchronizing the wrong tree
-        // entirely (a home directory, a build output volume), so exceeding
-        // it fails the scan — and with it the cycle — rather than making
-        // partial progress on a probable mistake.
-        if let Some(limit) = self.max_entry_count {
-            let entries = snapshot.directories + snapshot.files + snapshot.symlinks;
-            if entries > limit {
-                bail!(
-                    "the scan of {} found {entries} entries, exceeding the configured limit \
-                     of {limit}",
-                    self.root.display()
-                );
-            }
-        }
-
-        // Persist the cache when the hierarchy actually changed (an
-        // unchanged scan shares its root storage with the baseline, so the
-        // comparison is a pointer check, not a tree walk). A cold-start scan
-        // that adopted the loaded cache's storage unchanged needs no rewrite
-        // either: the file on disk already describes exactly this hierarchy.
-        if !crate::tree::nodes_share_storage(
-            baseline.and_then(|snapshot| snapshot.root.as_ref()),
-            snapshot.root.as_ref(),
-        ) {
-            self.store_scan_cache(&snapshot);
-        }
-
+        // The observation is shared: one watcher, one walk and one cache
+        // per root, however many sessions synchronize it. What this
+        // endpoint keeps is the *lease* — the exact snapshot this scan
+        // returned — because transitions validate against the scan they
+        // were reconciled from, not against whatever the observer has
+        // published since.
+        let (snapshot, generation) = self.observer.scan(self.max_entry_count)?;
+        self.seen_generation = generation;
         self.last_snapshot = Some(snapshot.clone());
         Ok(snapshot)
     }
@@ -1029,69 +900,17 @@ impl Endpoint for LocalEndpoint {
         result
     }
 
-    fn change_activity(&mut self) -> Option<crate::endpoint::ChangeActivity> {
-        self.watcher.as_ref().map(ChangeWatcher::activity)
+    fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
+        // The observer holds one watcher for the root and advances a
+        // generation on every event. Waiting on the generation this
+        // endpoint last scanned at means it wakes for changes it has not
+        // seen — including ones that landed while it was busy elsewhere,
+        // which a wake token could have lost.
+        Ok(self.observer.await_change(self.seen_generation, timeout))
     }
 
-    fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
-        // The watcher is established lazily (the root may not exist yet) and
-        // re-established after failures. A root that can't be watched
-        // degrades to waiting out the timeout — the caller's heartbeat still
-        // cycles, so watching failures cost latency, never correctness.
-        if self.watcher.is_none() {
-            // A failed attempt is not retried immediately: the usual reason
-            // it fails is a host already at its watch limit, which another
-            // full registration walk would only aggravate.
-            if let Some(retry_after) = self.watch_retry_after {
-                if std::time::Instant::now() < retry_after {
-                    std::thread::sleep(timeout);
-                    return Ok(false);
-                }
-            }
-            match ChangeWatcher::new(&self.root) {
-                Ok(watcher) => {
-                    if self.watch_retry_after.take().is_some() {
-                        eprintln!("[{}] watching resumed", self.root.display());
-                    }
-                    self.watcher = Some(watcher);
-                }
-                Err(error) => {
-                    // Reported once per backoff period, not per attempt: a
-                    // silent fall back to interval polling is a large and
-                    // otherwise invisible change in latency.
-                    if self.watch_retry_after.is_none() {
-                        eprintln!(
-                            "[{}] unable to watch for changes ({error}); falling back to \
-                             interval polling, retrying every {}s",
-                            self.root.display(),
-                            WATCH_RETRY_INTERVAL.as_secs()
-                        );
-                    }
-                    self.watch_retry_after =
-                        Some(std::time::Instant::now() + WATCH_RETRY_INTERVAL);
-                    std::thread::sleep(timeout);
-                    return Ok(false);
-                }
-            }
-        }
-        let watcher = self.watcher.as_ref().expect("the watcher was just created");
-        // Changes recorded while the caller was busy elsewhere count: the
-        // wake token for them may already have been consumed.
-        if watcher.has_changes() {
-            return Ok(true);
-        }
-        match watcher.wake.recv_timeout(timeout) {
-            // The paths themselves accumulate in the watcher; one wake
-            // covers any number of events.
-            Ok(()) => Ok(true),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Ok(false),
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                // The watcher backend died; drop it (to be re-established)
-                // and report a change so the caller rescans.
-                self.watcher = None;
-                Ok(true)
-            }
-        }
+    fn change_activity(&mut self) -> Option<crate::endpoint::ChangeActivity> {
+        self.observer.activity()
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
@@ -1109,11 +928,24 @@ impl Endpoint for LocalEndpoint {
                 count_staged_uses(node, &mut staged_uses);
             }
         }
+        // The observation is about to stop describing the tree, so it is
+        // invalidated *before* the first write rather than after the last.
+        // The watcher's own events for these writes may arrive late, and a
+        // scan published in that gap would describe a tree that no longer
+        // exists — which every other session sharing this root would then
+        // reconcile against.
+        self.observer.invalidate();
+
         let mut transitioner = Transitioner {
             root: &self.root,
             staging_root: &self.staging_root,
+            // Validation runs against this endpoint's own lease: the exact
+            // scan these transitions were reconciled from, not whatever the
+            // observer has published since. That is what keeps "matches the
+            // last scan" meaning "unchanged since reconciliation decided
+            // this was safe" when a root is shared.
             scanned: self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()),
-            behavior: self.behavior.unwrap_or_default(),
+            behavior: self.observer.behavior(),
             symlink_mode: self.symlink_mode,
             file_mode: self.file_mode,
             directory_mode: self.directory_mode,
@@ -1144,7 +976,9 @@ impl Endpoint for LocalEndpoint {
         // may not even have been delivered yet — so the next scan reads
         // everything rather than adopting a record already proven stale.
         if !outcome.problems.is_empty() {
-            self.last_full_scan = None;
+            // Shared, so every session over this root is told: the baseline
+            // they would all adopt is the one proven wrong.
+            self.observer.distrust_baseline();
         }
 
         // Fold the achieved results into the retained snapshot and its
@@ -1158,7 +992,13 @@ impl Endpoint for LocalEndpoint {
         if let Some(snapshot) = self.last_snapshot.as_ref() {
             match super::fold_transition(snapshot, &transitions, &outcome) {
                 Some(folded) => {
-                    self.store_scan_cache(&folded);
+                    // Offered to the observer as the next scan's starting
+                    // point. It advances the baseline but not the published
+                    // generation, so the next scan still runs — it simply
+                    // starts from a tree that already knows about this
+                    // write instead of re-digesting what was just
+                    // published.
+                    self.observer.offer_baseline(folded.clone());
                     self.last_snapshot = Some(folded);
                 }
                 // A graft failure (which real transition results shouldn't
@@ -3340,7 +3180,7 @@ mod tests {
         // normalization-insensitive) volume; creating both would silently
         // replace the first with the second.
         let mut fixture = Fixture::new();
-        fixture.beta.behavior = Some(FilesystemBehavior {
+        fixture.beta.force_behavior(FilesystemBehavior {
             decomposes_unicode: true,
             normalization_insensitive: true,
             ..FilesystemBehavior::default()
@@ -3387,7 +3227,7 @@ mod tests {
         // NFD on disk simulates a decomposing volume on our byte-preserving
         // test filesystem.
         write(&fixture.beta_root, "dir/cafe\u{0301}.txt", "content");
-        fixture.beta.behavior = Some(FilesystemBehavior {
+        fixture.beta.force_behavior(FilesystemBehavior {
             decomposes_unicode: true,
             ..FilesystemBehavior::default()
         });
@@ -3414,7 +3254,7 @@ mod tests {
     #[test]
     fn case_collisions_are_refused_on_case_insensitive_volumes() {
         let mut fixture = Fixture::new();
-        fixture.beta.behavior = Some(FilesystemBehavior {
+        fixture.beta.force_behavior(FilesystemBehavior {
             case_insensitive: true,
             ..FilesystemBehavior::default()
         });

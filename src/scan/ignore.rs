@@ -103,6 +103,25 @@ impl Default for IgnoreSet {
 }
 
 impl IgnoreSet {
+    /// A stable rendering of this set, for deciding whether two endpoints
+    /// over one root would see the same tree — and so may share one
+    /// observation of it. Two sets render identically exactly when they
+    /// were compiled from the same patterns in the same order.
+    pub fn key(&self) -> String {
+        self.patterns
+            .iter()
+            .map(|pattern| {
+                format!(
+                    "{}{}{}",
+                    if pattern.negated { "!" } else { "" },
+                    pattern.matcher.glob().glob(),
+                    if pattern.directory_only { "/" } else { "" },
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Compiles an ignore set from patterns.
     pub fn new(patterns: &[String]) -> Result<IgnoreSet> {
         let mut compiled = Vec::with_capacity(patterns.len());

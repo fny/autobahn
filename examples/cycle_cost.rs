@@ -47,8 +47,8 @@ fn main() {
         let entries = count(settled.root.as_ref());
 
         // One file changes, exactly as a single save would do.
-        let victim = first_file(settled.root.as_ref(), String::new())
-            .expect("corpus should contain a file");
+        let victim =
+            first_file(settled.root.as_ref(), String::new()).expect("corpus should contain a file");
         let path = root.join(&victim);
         let mut content = std::fs::read(&path).expect("victim should be readable");
         content.extend_from_slice(b"\nedited\n");
@@ -118,7 +118,14 @@ fn main() {
 
         println!(
             "{:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8.1} {:>12}",
-            "", "", "", "", "", "ancestor", data.len() as f64 / 1_048_576.0, "MB"
+            "",
+            "",
+            "",
+            "",
+            "",
+            "ancestor",
+            data.len() as f64 / 1_048_576.0,
+            "MB"
         );
         std::fs::write(&path, &content[..content.len() - 8]).expect("victim should be restorable");
         let _ = std::fs::remove_file(&ancestor_path);

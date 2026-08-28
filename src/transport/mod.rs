@@ -35,6 +35,7 @@ pub(crate) fn receive_control_frame<R: Read, T: serde::de::DeserializeOwned>(
     receive_frame(reader)
 }
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -601,8 +602,52 @@ const COMPRESSION_THRESHOLD: usize = 256;
 /// The bytes the compressed-frame header adds to a payload.
 const COMPRESSED_HEADER_SIZE: usize = 5;
 
+// Scratch buffers for frame assembly, reused across sends on this thread.
+//
+// `bincode::serialize` traverses a message once to size it and again to
+// encode it, then hands back a fresh allocation; `serialize_into` a buffer
+// that already has capacity does one traversal into memory that is already
+// there. On a supply batch — megabytes of file content — the sizing pass is
+// most of the encoding cost.
+thread_local! {
+    static FRAME_SCRATCH: RefCell<FrameScratch> = const {
+        RefCell::new(FrameScratch { encoded: Vec::new(), compressed: Vec::new() })
+    };
+}
+
+/// Scratch above this size is released rather than retained: one oversized
+/// frame should not pin megabytes on a thread that goes back to sending
+/// acknowledgements.
+const SCRATCH_RETENTION_LIMIT: usize = 16 * 1024 * 1024;
+
+#[derive(Default)]
+struct FrameScratch {
+    encoded: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
 fn send_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
-    let encoded = bincode::serialize(message).context("unable to encode frame")?;
+    // The buffers are moved out for the duration rather than borrowed
+    // across the write, so a writer that re-entered this function on the
+    // same thread would find empty scratch rather than a panicking borrow.
+    let mut scratch = FRAME_SCRATCH.with(|cell| std::mem::take(&mut *cell.borrow_mut()));
+    let result = assemble_and_write(writer, message, &mut scratch);
+    if scratch.encoded.capacity() <= SCRATCH_RETENTION_LIMIT
+        && scratch.compressed.capacity() <= SCRATCH_RETENTION_LIMIT
+    {
+        FRAME_SCRATCH.with(|cell| *cell.borrow_mut() = scratch);
+    }
+    result
+}
+
+fn assemble_and_write<W: Write, T: Serialize>(
+    writer: &mut W,
+    message: &T,
+    scratch: &mut FrameScratch,
+) -> Result<()> {
+    scratch.encoded.clear();
+    bincode::serialize_into(&mut scratch.encoded, message).context("unable to encode frame")?;
+    let encoded = &scratch.encoded;
     if encoded.len() > protocol::MAXIMUM_FRAME_SIZE as usize {
         bail!(
             "outgoing frame of {} bytes exceeds the maximum frame size of {} bytes",
@@ -615,26 +660,45 @@ fn send_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()>
     // declaring which form it took, so the reader never guesses (and a
     // frame that doesn't shrink — already-compressed file content, mostly —
     // travels verbatim).
-    let mut payload = Vec::with_capacity(encoded.len() + COMPRESSED_HEADER_SIZE);
-    if encoded.len() >= COMPRESSION_THRESHOLD {
-        let compressed = lz4_flex::block::compress(&encoded);
-        if compressed.len() + COMPRESSED_HEADER_SIZE < encoded.len() {
-            payload.push(FRAME_COMPRESSED);
-            payload.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
-            payload.extend_from_slice(&compressed);
+    //
+    // The body is written straight from whichever buffer holds it. Copying
+    // it into an assembled payload first, as this once did, meant a third
+    // full-size pass over every frame purely to prepend five bytes.
+    let mut header = [0u8; 9];
+    let (header_len, body): (usize, &[u8]) = if encoded.len() >= COMPRESSION_THRESHOLD {
+        // Compress straight into the reused buffer. The buffer is only ever
+        // grown, so the zero-fill that sizing it requires is paid on the
+        // first large frame and not on the thousands that follow.
+        let capacity = lz4_flex::block::get_maximum_output_size(encoded.len());
+        if scratch.compressed.len() < capacity {
+            scratch.compressed.resize(capacity, 0);
         }
-    }
-    if payload.is_empty() {
-        payload.push(FRAME_UNCOMPRESSED);
-        payload.extend_from_slice(&encoded);
-    }
+        let size = lz4_flex::block::compress_into(encoded, &mut scratch.compressed[..capacity])
+            .context("unable to compress frame")?;
+        if size + COMPRESSED_HEADER_SIZE < encoded.len() {
+            let length = (size + COMPRESSED_HEADER_SIZE) as u32;
+            header[..4].copy_from_slice(&length.to_le_bytes());
+            header[4] = FRAME_COMPRESSED;
+            header[5..9].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
+            (9, &scratch.compressed[..size])
+        } else {
+            let length = (encoded.len() + 1) as u32;
+            header[..4].copy_from_slice(&length.to_le_bytes());
+            header[4] = FRAME_UNCOMPRESSED;
+            (5, encoded)
+        }
+    } else {
+        let length = (encoded.len() + 1) as u32;
+        header[..4].copy_from_slice(&length.to_le_bytes());
+        header[4] = FRAME_UNCOMPRESSED;
+        (5, encoded)
+    };
 
-    let length = payload.len() as u32;
     writer
-        .write_all(&length.to_le_bytes())
+        .write_all(&header[..header_len])
         .context("unable to write frame length")?;
     writer
-        .write_all(&payload)
+        .write_all(body)
         .context("unable to write frame payload")?;
     writer.flush().context("unable to flush frame")?;
     Ok(())
@@ -756,10 +820,10 @@ mod adversarial {
         for cut in 0..framed.len() {
             let truncated = &framed[..cut];
             match read_frame(&mut &truncated[..]) {
-                Ok(None) => {}          // clean end of stream
+                Ok(None) => {} // clean end of stream
                 Ok(Some(_)) if cut == framed.len() => {}
                 Ok(Some(_)) => panic!("a truncated frame decoded at offset {cut}"),
-                Err(_) => {}            // reported, which is the contract
+                Err(_) => {} // reported, which is the contract
             }
         }
     }
@@ -930,6 +994,50 @@ pub(crate) mod tests {
             Connection::from_streams(Box::new(first_reader), Box::new(second_writer)),
             Connection::from_streams(Box::new(second_reader), Box::new(first_writer)),
         )
+    }
+
+    /// The bytes on the wire are pinned, not just the round trip.
+    ///
+    /// Frame assembly writes the header and the body as two writes out of
+    /// reused scratch rather than copying both into one buffer, so a
+    /// mistake there would shift the layout while both ends still agreed
+    /// with each other — invisible to a round-trip test, fatal against a
+    /// peer built from other code. This asserts the exact prefix instead.
+    #[test]
+    fn frame_layout_is_a_length_then_a_flag_then_the_body() {
+        // Small frames travel uncompressed: [len(4)][flag=0][bincode].
+        let mut wire = Vec::new();
+        send_frame(&mut wire, &7u8).expect("unable to send");
+        assert_eq!(wire[4], FRAME_UNCOMPRESSED);
+        let length = u32::from_le_bytes(wire[..4].try_into().expect("length")) as usize;
+        assert_eq!(length, wire.len() - 4, "length must cover flag and body");
+        assert_eq!(&wire[5..], &bincode::serialize(&7u8).expect("encode")[..]);
+
+        // Compressible frames above the threshold carry the decompressed
+        // length after the flag: [len(4)][flag=1][original(4)][lz4].
+        let repetitive = vec![0xABu8; 64 * 1024];
+        let mut wire = Vec::new();
+        send_frame(&mut wire, &repetitive).expect("unable to send");
+        assert_eq!(wire[4], FRAME_COMPRESSED);
+        let length = u32::from_le_bytes(wire[..4].try_into().expect("length")) as usize;
+        assert_eq!(length, wire.len() - 4);
+        let original = u32::from_le_bytes(wire[5..9].try_into().expect("original")) as usize;
+        assert_eq!(
+            original,
+            bincode::serialize(&repetitive).expect("encode").len()
+        );
+        assert!(wire.len() < repetitive.len(), "compression should have won");
+
+        // And the scratch buffers must not leak between sends: a large
+        // frame followed by a small one must produce exactly the small
+        // frame, not the tail of its predecessor.
+        let mut wire = Vec::new();
+        send_frame(&mut wire, &repetitive).expect("unable to send");
+        let after_large = wire.len();
+        send_frame(&mut wire, &7u8).expect("unable to send");
+        let mut expected = Vec::new();
+        send_frame(&mut expected, &7u8).expect("unable to send");
+        assert_eq!(&wire[after_large..], &expected[..]);
     }
 
     #[test]

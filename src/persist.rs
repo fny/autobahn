@@ -49,12 +49,33 @@ struct Shared {
     finished: bool,
 }
 
+/// How long the writer waits for a newer state before encoding the one it
+/// holds.
+///
+/// One cycle stores the scan cache twice — once for the scan, once for the
+/// transition's folded result — separated by the reconcile and staging work
+/// between them. Encoding the first is waste whenever the second follows,
+/// and on a large tree that waste is tens of megabytes; a fan-out
+/// multiplies it by the destination count.
+///
+/// A tight pair already collapses, because the writer has not woken yet.
+/// This window extends that to pairs separated by a cycle's own work. It
+/// costs nothing that matters: the scan cache is derived state, written off
+/// the critical path, and losing it to a crash inside the window costs one
+/// full scan.
+const COALESCING_WINDOW: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// A background writer for one state file.
 pub struct StateWriter {
     /// The shared slot and its signal.
     state: Arc<(Mutex<Shared>, Condvar)>,
     /// The writer thread, joined on drop.
     thread: Option<std::thread::JoinHandle<()>>,
+    /// Encodes actually performed. Lets a test tell a state dropped
+    /// *before* serialization from one dropped after. Per writer rather
+    /// than global, because the suite runs in parallel.
+    #[cfg(test)]
+    encodes: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl StateWriter {
@@ -66,6 +87,10 @@ impl StateWriter {
     pub fn new() -> StateWriter {
         let state = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
         let worker = Arc::clone(&state);
+        #[cfg(test)]
+        let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        #[cfg(test)]
+        let worker_encodes = Arc::clone(&encodes);
         let thread = std::thread::spawn(move || {
             // Marks the writer finished however the loop is left — a
             // return, or an unwinding panic from an encoder — and releases
@@ -83,7 +108,7 @@ impl StateWriter {
             let _retire = Retire(&worker);
             let (lock, signal) = &*worker;
             loop {
-                let pending = {
+                let (pending, stopping) = {
                     let mut shared = lock_shared(lock);
                     while shared.pending.is_none() && !shared.stopping {
                         shared.idle = true;
@@ -94,12 +119,33 @@ impl StateWriter {
                     }
                     shared.idle = false;
                     match shared.pending.take() {
-                        Some(pending) => pending,
+                        Some(pending) => (pending, shared.stopping),
                         // Nothing queued and asked to stop: everything that
                         // was queued has been written.
                         None => return,
                     }
                 };
+
+                // Give a supersede a moment to arrive before paying to
+                // encode. One cycle stores twice — once for the scan and
+                // once for the transition's folded result — and claiming
+                // the first the instant it is queued means serializing a
+                // state that is about to be replaced. On a large tree that
+                // is tens of megabytes of work for nothing, and a fan-out
+                // multiplies it by the destination count.
+                //
+                // The wait costs nothing that matters: this is derived
+                // state, off the critical path, and losing it to a crash in
+                // the window costs one full scan.
+                let pending = if stopping {
+                    pending
+                } else {
+                    std::thread::sleep(COALESCING_WINDOW);
+                    let mut shared = lock_shared(lock);
+                    shared.pending.take().unwrap_or(pending)
+                };
+                #[cfg(test)]
+                worker_encodes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(data) = (pending.encode)() {
                     // The writer is the one caller entitled to ignore a
                     // failure: everything it writes is derived state, and a
@@ -111,6 +157,8 @@ impl StateWriter {
         StateWriter {
             state,
             thread: Some(thread),
+            #[cfg(test)]
+            encodes,
         }
     }
 
@@ -226,6 +274,31 @@ mod stress {
             let written = std::fs::read(&path).expect("a state must have been written");
             assert_eq!(written.len(), 4, "round {round}: partial state on disk");
         }
+    }
+
+    /// A state superseded before the writer finishes waiting must never be
+    /// encoded — including when the two stores are separated by real work,
+    /// as a cycle's scan store and transition store are.
+    #[test]
+    fn a_state_superseded_within_the_window_is_never_encoded() {
+        use std::sync::atomic::Ordering;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("state");
+        let writer = StateWriter::new();
+        writer.store(path.clone(), || Some(vec![1; 32]));
+        // Separated as a cycle separates them, by its reconcile and staging
+        // work. A tight pair collapses on its own; this is the case the
+        // coalescing window exists for.
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        writer.store(path.clone(), || Some(vec![2; 32]));
+        writer.flush();
+        assert_eq!(
+            writer.encodes.load(Ordering::Relaxed),
+            1,
+            "the superseded state was encoded anyway"
+        );
+        // And the state on disk is the newer one.
+        assert_eq!(std::fs::read(&path).expect("written")[0], 2);
     }
 
     /// A superseded state must never be encoded: that is the whole reason

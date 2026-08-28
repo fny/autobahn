@@ -146,6 +146,15 @@ pub struct LocalEndpoint {
     /// The filesystem watcher, created lazily at the first
     /// [`await_change`](Endpoint::await_change) that finds the root present.
     watcher: Option<ChangeWatcher>,
+    /// When to next attempt a watch that failed to be created.
+    ///
+    /// Establishing a recursive watch walks every directory in the root, so
+    /// retrying on every wait turns an unwatchable root — a host at its
+    /// inotify limit, most likely — into a syscall storm:
+    /// `Session::await_change` slices at 125 ms, so the walk would run about
+    /// eight times a second, forever, on top of whatever exhausted the
+    /// limit to begin with.
+    watch_retry_after: Option<std::time::Instant>,
     /// When the last *full* scan completed. A fresh watch has no history to
     /// scan incrementally against, so `None` forces the next scan to be
     /// full.
@@ -166,6 +175,11 @@ const MAXIMUM_PENDING_PATHS: usize = 8192;
 /// filesystems may report nothing at all — so a full scan runs at least
 /// this often to bound how long such a miss can persist.
 const FULL_SCAN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long to wait before trying again to establish a watch that failed.
+/// Long enough that a host already at its watch limit is not hammered;
+/// short enough that watching resumes promptly once room appears.
+const WATCH_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// The changed paths accumulated by a watcher since the last scan.
 #[derive(Default)]
@@ -326,6 +340,7 @@ impl LocalEndpoint {
             supply: None,
             receive: None,
             watcher: None,
+            watch_retry_after: None,
             last_full_scan: None,
             writer: crate::persist::StateWriter::new(),
         })
@@ -1024,9 +1039,36 @@ impl Endpoint for LocalEndpoint {
         // degrades to waiting out the timeout — the caller's heartbeat still
         // cycles, so watching failures cost latency, never correctness.
         if self.watcher.is_none() {
+            // A failed attempt is not retried immediately: the usual reason
+            // it fails is a host already at its watch limit, which another
+            // full registration walk would only aggravate.
+            if let Some(retry_after) = self.watch_retry_after {
+                if std::time::Instant::now() < retry_after {
+                    std::thread::sleep(timeout);
+                    return Ok(false);
+                }
+            }
             match ChangeWatcher::new(&self.root) {
-                Ok(watcher) => self.watcher = Some(watcher),
-                Err(_) => {
+                Ok(watcher) => {
+                    if self.watch_retry_after.take().is_some() {
+                        eprintln!("[{}] watching resumed", self.root.display());
+                    }
+                    self.watcher = Some(watcher);
+                }
+                Err(error) => {
+                    // Reported once per backoff period, not per attempt: a
+                    // silent fall back to interval polling is a large and
+                    // otherwise invisible change in latency.
+                    if self.watch_retry_after.is_none() {
+                        eprintln!(
+                            "[{}] unable to watch for changes ({error}); falling back to \
+                             interval polling, retrying every {}s",
+                            self.root.display(),
+                            WATCH_RETRY_INTERVAL.as_secs()
+                        );
+                    }
+                    self.watch_retry_after =
+                        Some(std::time::Instant::now() + WATCH_RETRY_INTERVAL);
                     std::thread::sleep(timeout);
                     return Ok(false);
                 }

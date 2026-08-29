@@ -30,6 +30,7 @@ Usage:
 
 import argparse
 import base64
+import concurrent.futures
 import json
 import os
 import random
@@ -512,6 +513,18 @@ def wait_for_address(options, instances):
     return {row[0]: (row[1], row[2]) for row in json.loads(output)}
 
 
+def _ssh_ready(address, key, attempts=48):
+    """Whether an instance answers SSH, without raising. Used to decide
+    which instances to replace rather than which run to abandon."""
+    public = address[0] if isinstance(address, tuple) else address
+    for _ in range(attempts):
+        if run(f"ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "
+               f"-i {key_path(key)} ubuntu@{public} true", check=False).returncode == 0:
+            return True
+        time.sleep(5)
+    return False
+
+
 def wait_for_ssh(address, key):
     public = address[0] if isinstance(address, tuple) else address
     for _ in range(60):
@@ -635,8 +648,39 @@ def _dispatch_body(options):
                 f"no zone could supply {needed} × {instance_type} "
                 f"(tried {', '.join(attempts)})")
     addresses = wait_for_address(options, instances)
-    for instance in instances:
-        wait_for_ssh(addresses[instance], key)
+    # Wait in parallel, and replace what never answers.
+    #
+    # Waiting serially is slow, but the real problem is that one bad
+    # instance used to abort the whole run. At this scale that is not an
+    # unlucky edge case: even a half-percent chance of an instance failing
+    # to boot gives better than even odds of at least one across a hundred
+    # and seventy-nine, so the common case was a dead run.
+    for attempt in range(3):
+        failed = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=32) as waiters:
+            futures = {
+                waiters.submit(_ssh_ready, addresses[instance], key): instance
+                for instance in instances
+            }
+            for future in concurrent.futures.as_completed(futures):
+                if not future.result():
+                    failed.append(futures[future])
+        if not failed:
+            break
+        print(f"{len(failed)} instance(s) never came up; replacing them "
+              f"(attempt {attempt + 1} of 3)")
+        aws(options.profile, options.region,
+            f"ec2 terminate-instances --instance-ids {' '.join(failed)}")
+        for dead in failed:
+            pool_key = next(k for k, members in pools.items() if dead in members)  # noqa: B023
+            zone, instance_type = pool_key
+            replacement = launch(options, run_id, instance_type, group, key,
+                                 count=1, ami=options.ami, subnet=zones[zone])[0]
+            pools[pool_key][pools[pool_key].index(dead)] = replacement
+            instances[instances.index(dead)] = replacement
+        addresses = wait_for_address(options, instances)
+    else:
+        raise RuntimeError("instances kept failing to come up after three rounds")
 
     # Groups are positional and variable width: one source followed by its
     # destinations. A pairwise group is width 2; a fan-out group is width

@@ -399,7 +399,16 @@ def await_cold_sync(corpora, emitter, tool, pre_seeded=False):
     timings = {}
     remaining = set(corpora)
     while remaining and time.monotonic() - started < COLD_SYNC_TIMEOUT_SECONDS:
-        time.sleep(POLL_SECONDS)
+        # Poll finely at first and back off. A fixed five-second poll that
+        # sleeps before its first check quantizes every result to a
+        # five-second bucket, which is fine for a Chromium sync of four
+        # hundred seconds and ruinous for a five-thousand-file one: a real
+        # difference of under two seconds between two tools was reported as
+        # five, because one landed in the first bucket and the other in the
+        # second. The probe itself costs an SSH round trip and a walk of the
+        # destination, so it cannot simply run flat out on a large tree.
+        elapsed = time.monotonic() - started
+        time.sleep(min(POLL_SECONDS, max(0.25, elapsed / 10)))
         for corpus in sorted(remaining):
             observed = summary("cheap", f"{DEST}/{corpus}", remote=True)
             if observed == expectations[corpus]:

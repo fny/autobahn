@@ -886,6 +886,11 @@ def _dispatch_body(options):
 
     for pair_index, a_public, process in processes:
         process.wait()
+        # Per-job tool logs come back too. An intermittent failure that
+        # leaves no log is far more expensive to chase than the transfer
+        # of a few megabytes of text.
+        run(f"scp -r -i {key_path(key)} ubuntu@{a_public}:~/logs "
+            f"results-{run_id}/pair-{pair_index}-logs", check=False)
         for artifact in ("results.jsonl", "results.err", "driver.log"):
             run(f"scp -i {key_path(key)} ubuntu@{a_public}:~/{artifact} "
                 f"results-{run_id}/pair-{pair_index}-{artifact}", check=False)

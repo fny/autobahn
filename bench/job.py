@@ -48,6 +48,13 @@ IDLE_WINDOW_SECONDS = 60
 # is nearly free: wall clock is set by the slowest group, which is a
 # Chromium cold sync with no workload phase at all.
 WORKLOAD_SECONDS = int(os.environ.get("BENCH_WORKLOAD_SECONDS", "450"))
+# Names this job's logs. Set from the spec; only a bare invocation leaves it
+# at the default.
+JOB_LABEL = "job"
+
+
+def job_label():
+    return JOB_LABEL
 
 TOOLS = {
     # pattern: sampler seed pattern (command-line substring unique to the
@@ -547,8 +554,12 @@ def start_tool(tool, corpora):
             ]
         with open(f"{HOME}/ab.toml", "w") as handle:
             handle.write("\n".join(lines))
+        # One log per job, not one per machine. An intermittent failure
+        # used to leave nothing to diagnose: chromium-1-bidir collapsed on
+        # one repeat in four, and by the time it was noticed the next job
+        # on that pair had overwritten the only log that could explain it.
         run(f"setsid nohup {HOME}/autobahn up --config {HOME}/ab.toml "
-            f"> {HOME}/ab.log 2>&1 < /dev/null &")
+            f"> {HOME}/logs/{job_label()}-autobahn.log 2>&1 < /dev/null &")
     elif tool == "mutagen":
         run(f"{HOME}/mutagen daemon start", check=True)
         for corpus in corpora:
@@ -872,6 +883,9 @@ def main():
     # from any earlier run can never satisfy this run's verification. It
     # is derived stably so the recorded value reproduces the streams.
     base_nonce = stable_nonce(f"{spec['run']}/{spec['job']}")
+    global JOB_LABEL
+    JOB_LABEL = spec["job"]
+    os.makedirs(f"{HOME}/logs", exist_ok=True)
 
     measure_floor(emitter, base_nonce)
     statuses = {}

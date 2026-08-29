@@ -86,7 +86,7 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 6 — provenance must survive policy changes
 
-- [ ] **C2.5** Reconciliation removes an ancestor entry only when both
+- [x] **C2.5** Reconciliation removes an ancestor entry only when both
       sides are genuinely absent; when either side is Untracked the
       entry is preserved, so provenance survives ignore/size/symlink
       policy changes and a deletion made while excluded stays a deletion.

@@ -77,9 +77,16 @@ impl Reconciler {
             return;
         }
 
-        // If both sides are nil or untracked, then just ensure the ancestor
-        // is nil at this path.
-        if nil_or_untracked(alpha) && nil_or_untracked(beta) {
+        // Both sides genuinely absent: the content is gone everywhere, and
+        // the ancestor entry goes with it. Both sides *untracked* is a
+        // different situation entirely — the content still exists, policy
+        // has merely excluded it — and the ancestor entry is preserved.
+        // Clearing it discarded provenance across a policy change: a file
+        // ignored on both sides for a while, deliberately deleted on one
+        // side during that window, was resurrected from the other side
+        // when the ignore was lifted, because without the ancestor the
+        // survivor read as a brand-new creation.
+        if alpha.is_none() && beta.is_none() {
             if ancestor.is_some() {
                 self.result.ancestor_changes.push(Change {
                     path: path.to_owned(),
@@ -87,6 +94,13 @@ impl Reconciler {
                     new: None,
                 });
             }
+            return;
+        }
+        if nil_or_untracked(alpha) && nil_or_untracked(beta) {
+            // At least one side is untracked (both-none returned above).
+            // Nothing to synchronize while policy excludes it; whatever
+            // the ancestor holds stays, so re-inclusion resumes as an
+            // ordinary three-way reconciliation with real provenance.
             return;
         }
 
@@ -498,6 +512,62 @@ mod tests {
 
     fn dir(name: &str, children: Vec<Node>) -> Node {
         Node::directory(name, children)
+    }
+
+    /// Provenance must survive mutual exclusion. Reproduced before the
+    /// fix: a file ignored on both sides had its ancestor entry cleared,
+    /// so a deletion made during the exclusion read as "beta holds a new
+    /// creation" when the ignore was lifted, and the deliberately deleted
+    /// content came back.
+    #[test]
+    fn mutual_exclusion_preserves_the_ancestor() {
+        let ancestor = Node::directory("", vec![file("secret", 1, false)]);
+        let both_untracked = Node::directory(
+            "",
+            vec![Node {
+                name: "secret".into(),
+                content: Content::Untracked,
+            }],
+        );
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&both_untracked),
+            Some(&both_untracked),
+            SyncMode::TwoWaySafe,
+        );
+        assert!(
+            result.ancestor_changes.is_empty(),
+            "exclusion must not clear provenance: {:?}",
+            result.ancestor_changes
+        );
+        assert!(result.alpha_transitions.is_empty() && result.beta_transitions.is_empty());
+
+        // Genuinely gone on both sides is different: the entry goes.
+        let empty = Node::directory("", vec![]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&empty),
+            Some(&empty),
+            SyncMode::TwoWaySafe,
+        );
+        assert_eq!(result.ancestor_changes.len(), 1);
+        assert!(result.ancestor_changes[0].new.is_none());
+
+        // And the payoff: after the exclusion lifts, the preserved
+        // ancestor lets the deletion made while excluded propagate.
+        let alpha_deleted = Node::directory("", vec![]);
+        let beta_kept = Node::directory("", vec![file("secret", 1, false)]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&alpha_deleted),
+            Some(&beta_kept),
+            SyncMode::TwoWaySafe,
+        );
+        assert_eq!(result.beta_transitions.len(), 1, "{result:?}");
+        assert!(
+            result.beta_transitions[0].new.is_none(),
+            "the deletion must propagate to beta, not resurrect"
+        );
     }
 
     #[test]

@@ -93,11 +93,11 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 7 — property-based reconcile, and the full gate
 
-- [ ] **V2** Property tests over generated trees: transitions converge
+- [x] **V2** Property tests over generated trees: transitions converge
       the sides absent conflicts; no transition touches an
       already-agreed path; one-way-safe never emits an alpha transition;
       untracked content never appears in an emitted `new`.
-- [ ] Full suite, clippy, fmt, crash script (single and fan-out), smoke.
+- [x] Full suite, clippy, fmt, crash script (single and fan-out), smoke.
 
 ## Documented rather than fixed, deliberately
 

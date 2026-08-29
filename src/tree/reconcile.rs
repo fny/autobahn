@@ -782,4 +782,188 @@ mod tests {
         assert_eq!(result.conflicts.len(), 1);
         assert!(result.beta_transitions.is_empty());
     }
+
+    // ── property-based reconciliation ────────────────────────────────
+    //
+    // Reconcile is a hand-port of the subtlest logic in the system, and a
+    // defect in it is silent data loss with no crash required. These
+    // properties hold over generated triples rather than remembered cases.
+
+    /// Builds a small tree from four instruction bytes: one child slot per
+    /// byte, each absent, a file (three possible contents), a symlink, a
+    /// subdirectory with its own file, or — when permitted — untracked.
+    fn generated_tree(spec: &[u8; 4], allow_untracked: bool) -> Option<Node> {
+        let names = ["a", "b", "c", "d"];
+        let mut children = Vec::new();
+        for (slot, byte) in spec.iter().enumerate() {
+            let content = match byte % 7 {
+                0 => continue,
+                1 => Content::File {
+                    digest: [1; crate::tree::DIGEST_SIZE],
+                    executable: false,
+                    metadata: crate::tree::FileMetadata::default(),
+                },
+                2 => Content::File {
+                    digest: [2; crate::tree::DIGEST_SIZE],
+                    executable: false,
+                    metadata: crate::tree::FileMetadata::default(),
+                },
+                3 => Content::Symlink {
+                    target: "elsewhere".into(),
+                },
+                4 => Content::Directory(std::sync::Arc::new(vec![Node {
+                    name: "inner".into(),
+                    content: Content::File {
+                        digest: [byte / 7 + 3; crate::tree::DIGEST_SIZE],
+                        executable: false,
+                        metadata: crate::tree::FileMetadata::default(),
+                    },
+                }])),
+                5 if allow_untracked => Content::Untracked,
+                _ => Content::File {
+                    digest: [9; crate::tree::DIGEST_SIZE],
+                    executable: true,
+                    metadata: crate::tree::FileMetadata::default(),
+                },
+            };
+            children.push(Node {
+                name: names[slot].into(),
+                content,
+            });
+        }
+        Some(Node::directory("", children))
+    }
+
+    fn trees_equal(left: Option<&Node>, right: Option<&Node>) -> bool {
+        match (left, right) {
+            (None, None) => true,
+            (Some(left), Some(right)) => left.content_equal(right, true),
+            _ => false,
+        }
+    }
+
+    fn no_unsynchronizable(node: &Node) -> bool {
+        match &node.content {
+            Content::Untracked | Content::Problematic { .. } => false,
+            Content::Directory(children) => children.iter().all(no_unsynchronizable),
+            _ => true,
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 256, ..Default::default()
+        })]
+
+        /// Absent conflicts, applying the emitted transitions to each side
+        /// leaves the two sides content-equal — synchronization actually
+        /// synchronizes — and applying the ancestor changes on top of the
+        /// old ancestor never fails.
+        #[test]
+        fn conflict_free_reconciliation_converges(
+            ancestor_spec in proptest::array::uniform4(0u8..49),
+            alpha_spec in proptest::array::uniform4(0u8..49),
+            beta_spec in proptest::array::uniform4(0u8..49),
+        ) {
+            let ancestor = generated_tree(&ancestor_spec, false);
+            let alpha = generated_tree(&alpha_spec, false);
+            let beta = generated_tree(&beta_spec, false);
+            let result = reconcile(
+                ancestor.as_ref(),
+                alpha.as_ref(),
+                beta.as_ref(),
+                SyncMode::TwoWaySafe,
+            );
+            if result.conflicts.is_empty() {
+                let alpha_after = apply(alpha.as_ref(), &result.alpha_transitions)
+                    .expect("alpha transitions apply");
+                let beta_after = apply(beta.as_ref(), &result.beta_transitions)
+                    .expect("beta transitions apply");
+                proptest::prop_assert!(
+                    trees_equal(alpha_after.as_ref(), beta_after.as_ref()),
+                    "conflict-free reconciliation did not converge:\n\
+                     alpha {alpha_after:?}\nbeta {beta_after:?}"
+                );
+            }
+            apply(ancestor.as_ref(), &result.ancestor_changes)
+                .expect("ancestor changes apply");
+        }
+
+        /// Three-way agreement is inert: when ancestor, alpha, and beta all
+        /// hold the same content, reconciliation has nothing to say.
+        #[test]
+        fn agreement_emits_nothing(spec in proptest::array::uniform4(0u8..49)) {
+            let tree = generated_tree(&spec, false);
+            let result = reconcile(
+                tree.as_ref(),
+                tree.as_ref(),
+                tree.as_ref(),
+                SyncMode::TwoWaySafe,
+            );
+            proptest::prop_assert!(result.alpha_transitions.is_empty());
+            proptest::prop_assert!(result.beta_transitions.is_empty());
+            proptest::prop_assert!(result.ancestor_changes.is_empty());
+            proptest::prop_assert!(result.conflicts.is_empty());
+        }
+
+        /// Unsynchronizable content never travels: no emitted transition
+        /// carries untracked or problematic nodes in its `new` side, in any
+        /// mode, whatever the inputs hold.
+        #[test]
+        fn unsynchronizable_content_never_travels(
+            ancestor_spec in proptest::array::uniform4(0u8..49),
+            alpha_spec in proptest::array::uniform4(0u8..49),
+            beta_spec in proptest::array::uniform4(0u8..49),
+            mode_index in 0usize..4,
+        ) {
+            let mode = [
+                SyncMode::TwoWaySafe,
+                SyncMode::TwoWayResolved,
+                SyncMode::OneWaySafe,
+                SyncMode::OneWayReplica,
+            ][mode_index];
+            let ancestor = generated_tree(&ancestor_spec, true);
+            let alpha = generated_tree(&alpha_spec, true);
+            let beta = generated_tree(&beta_spec, true);
+            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            for change in result
+                .alpha_transitions
+                .iter()
+                .chain(result.beta_transitions.iter())
+                .chain(result.ancestor_changes.iter())
+            {
+                if let Some(new) = &change.new {
+                    proptest::prop_assert!(
+                        no_unsynchronizable(new),
+                        "unsynchronizable content emitted at '{}'",
+                        change.path
+                    );
+                }
+            }
+        }
+
+        /// The one-way modes never write to alpha, whatever they see.
+        #[test]
+        fn one_way_modes_never_touch_alpha(
+            ancestor_spec in proptest::array::uniform4(0u8..49),
+            alpha_spec in proptest::array::uniform4(0u8..49),
+            beta_spec in proptest::array::uniform4(0u8..49),
+            replica in proptest::bool::ANY,
+        ) {
+            let mode = if replica {
+                SyncMode::OneWayReplica
+            } else {
+                SyncMode::OneWaySafe
+            };
+            let ancestor = generated_tree(&ancestor_spec, true);
+            let alpha = generated_tree(&alpha_spec, true);
+            let beta = generated_tree(&beta_spec, true);
+            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            proptest::prop_assert!(
+                result.alpha_transitions.is_empty(),
+                "a one-way mode emitted alpha transitions: {:?}",
+                result.alpha_transitions
+            );
+        }
+    }
 }

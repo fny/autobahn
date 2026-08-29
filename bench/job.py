@@ -43,7 +43,11 @@ REVERSE_OBSERVER_BASE_PORT = OBSERVER_BASE_PORT + 100
 COLD_SYNC_TIMEOUT_SECONDS = 3600
 POLL_SECONDS = 5
 IDLE_WINDOW_SECONDS = 60
-WORKLOAD_SECONDS = int(os.environ.get("BENCH_WORKLOAD_SECONDS", "150"))
+# Percentiles, and p99 especially, rest on the tail of one window.
+# Three times the window is three times the samples per repeat, and it
+# is nearly free: wall clock is set by the slowest group, which is a
+# Chromium cold sync with no workload phase at all.
+WORKLOAD_SECONDS = int(os.environ.get("BENCH_WORKLOAD_SECONDS", "450"))
 
 TOOLS = {
     # pattern: sampler seed pattern (command-line substring unique to the

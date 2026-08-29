@@ -110,6 +110,12 @@ CELLS = [
 ]
 
 
+# How long an instance may live without the orchestrator finishing. Long
+# enough for the slowest legitimate run, short enough that forgetting
+# costs one hour rather than a weekend.
+DEAD_MAN_MINUTES = 300
+
+
 def machines_for(cell):
     """One source, plus its destinations."""
     return 1 + cell[4]
@@ -396,7 +402,7 @@ def bake(options):
 # and costs a few seconds of rsync against files that are already there.
 PRISTINE_REPAIR = r"""
 python3 - <<'REPAIR_EOF'
-import json, os, subprocess
+import json, os, shutil
 home = os.path.expanduser("~")
 for c in ("chromium", "sub50k", "sub50k-b", "sub5k"):
     path = f"{home}/corpus/{c}.bench/partitions.json"
@@ -411,18 +417,23 @@ for c in ("chromium", "sub50k", "sub50k-b", "sub5k"):
             files.update(sets.get("large", []))
             for background in sets["background"]:
                 files.update(background)
-    listing = f"{home}/pristine-list.txt"
-    with open(listing, "w") as handle:
-        handle.write("\n".join(sorted(files)) + "\n")
-    os.makedirs(f"{home}/corpus-pristine/{c}", exist_ok=True)
-    result = subprocess.run(["rsync", "-a", f"--files-from={listing}",
-                             f"{home}/corpus/{c}/", f"{home}/corpus-pristine/{c}/"])
-    if result.returncode != 0:
-        raise SystemExit(f"pristine rebuild failed for {c}")
-    missing = [f for f in files if not os.path.exists(f"{home}/corpus-pristine/{c}/{f}")]
+    # Check first, copy only what is absent. rsync would compare every one
+    # of a corpus's several hundred thousand files on every machine, which
+    # cost this run nearly two hours of setup; a stat apiece costs seconds
+    # and the copy list is normally empty or a few hundred long.
+    root = f"{home}/corpus-pristine/{c}"
+    missing = [f for f in files if not os.path.exists(f"{root}/{f}")]
+    for relative in missing:
+        source = f"{home}/corpus/{c}/{relative}"
+        target = f"{root}/{relative}"
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        shutil.copy2(source, target)
+    still = [f for f in files if not os.path.exists(f"{root}/{f}")]
+    if still:
+        raise SystemExit(f"{c}: {len(still)} restorable files absent from the "
+                         f"pristine copy, e.g. {still[0]}")
     if missing:
-        raise SystemExit(f"{c}: {len(missing)} restorable files absent from the "
-                         f"pristine copy, e.g. {missing[0]}")
+        print(f"{c}: restored {len(missing)} missing file(s) to the pristine copy")
 print("pristine verified")
 REPAIR_EOF
 """
@@ -480,6 +491,7 @@ def launch(options, run_id, instance_type, group, key, count, ami=None, subnet=N
         options.profile, options.region,
         f"ec2 run-instances --image-id {image} --instance-type {instance_type} "
         f"--count {count} --key-name {key} --security-group-ids {group} {placement}"
+        f"--instance-initiated-shutdown-behavior terminate "
         f"--block-device-mappings '[{{\"DeviceName\":\"/dev/sda1\",\"Ebs\":"
         f"{{\"VolumeSize\":{VOLUME_GB},\"VolumeType\":\"gp3\",\"Iops\":6000,"
         f"\"Throughput\":500,\"DeleteOnTermination\":true}}}}]' "
@@ -511,8 +523,42 @@ def wait_for_ssh(address, key):
 
 
 def dispatch(options):
+    """Runs the matrix and tears the machines down, whatever happens.
+
+    The orchestrator used to print the destroy command and return, which
+    is fine until a run fails in its first ten minutes and nobody notices
+    for three and a half hours. Instances are cheap per minute and
+    expensive per afternoon, so teardown is not left to the operator.
+
+    `--keep` opts out, for when a run is being debugged and the machines
+    are the evidence.
+    """
+    try:
+        return _dispatch_body(options)
+    finally:
+        if getattr(options, "keep", False):
+            print("--keep: machines left running; destroy them yourself with "
+                  f"`orchestrate.py destroy --run {getattr(options, 'run', '<run>')}`")
+        else:
+            print("tearing down...")
+            try:
+                destroy(argparse.Namespace(
+                    profile=options.profile, region=options.region,
+                    run=options.run, keep_ami=True))
+            except Exception as error:                      # noqa: BLE001
+                # Never let a teardown failure mask the run's own error,
+                # but say so loudly: this is the expensive kind of quiet.
+                print(f"TEARDOWN FAILED ({error}); destroy by hand: "
+                      f"orchestrate.py destroy --profile {options.profile} "
+                      f"--region {options.region} --run {options.run}")
+
+
+def _dispatch_body(options):
     """Launches pairs, wires them, assigns jobs, runs them, collects."""
     run_id = options.run or f"bench-{int(time.time())}"
+    # Resolved back onto the options so the teardown wrapper can find the
+    # machines even when the id was generated here.
+    options.run = run_id
     seed = options.seed
     rng = random.Random(seed)
 
@@ -663,6 +709,17 @@ def dispatch(options):
             host = addresses[member][0]
             run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} "
                 f"{HERE}/job.py ubuntu@{host}:~/bench/job.py")
+            # Terminate regardless of what happens to the orchestrator.
+            # Auto-destroy below covers the tidy paths; this covers the
+            # untidy ones — a killed orchestrator, a lost laptop, a crash —
+            # which is the case that actually ran up a bill. Instances are
+            # launched to terminate on shutdown, so this ends them rather
+            # than stopping them.
+            subprocess.run(
+                ["ssh", "-n", "-o", "StrictHostKeyChecking=accept-new",
+                 "-i", key_path(key), f"ubuntu@{host}",
+                 f"sudo shutdown -h +{DEAD_MAN_MINUTES} 'benchmark dead-man timer'"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
             repairs.append((host, subprocess.Popen(
                 ["ssh", "-n", "-o", "StrictHostKeyChecking=accept-new",
                  "-i", key_path(key), f"ubuntu@{host}", PRISTINE_REPAIR],
@@ -845,6 +902,8 @@ def main():
             s.add_argument("--repeats", type=int, default=3)
             s.add_argument("--seed", type=int, default=1)
             s.add_argument("--run", default=None)
+            s.add_argument("--keep", action="store_true",
+                           help="leave the machines running when the run ends")
             s.add_argument("--group", default=None)
             s.add_argument("--cells", default=None,
                            help="comma-separated cell names; default is the whole matrix")

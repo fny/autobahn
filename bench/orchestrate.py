@@ -44,7 +44,7 @@ BUILDER_TYPE = "c6i.2xlarge"
 VOLUME_GB = 200
 
 CELLS = [
-    # name, corpora, agents, bidirectional, betas
+    # name, corpora, agents, bidirectional, betas, seed, mode
     #
     # `betas` is how many destinations one source feeds. Everything is a
     # pair at 1. At 10 it is a fan-out: one alpha, ten betas, which asks a
@@ -82,6 +82,18 @@ CELLS = [
     ("50k-10-fan", ["sub50k"], 10, False, 10, True),
     ("two50k-10-fan", ["sub50k", "sub50k-b"], 10, False, 10, True),
     ("chromium-10-fan", ["chromium"], 10, False, 10, True),
+
+    # Patch mode: the measured agent rewrites a region of a large file
+    # rather than replacing a small one whole. Every other cell replaces
+    # its file with fresh random content, which shares no blocks with what
+    # the destination holds, so the delta algorithm never has anything to
+    # find and a tool that always sent full content would score the same.
+    # These are the cells where transferring less is possible.
+    ("50k-1-patch", ["sub50k"], 1, False, 1, True, "patch"),
+    ("50k-10-patch", ["sub50k"], 10, False, 1, True, "patch"),
+    ("chromium-1-patch", ["chromium"], 1, False, 1, True, "patch"),
+    ("chromium-10-patch", ["chromium"], 10, False, 1, True, "patch"),
+    ("chromium-10-fan-patch", ["chromium"], 10, False, 10, True, "patch"),
 
     # First synchronization, measured on its own. These do not seed — the
     # transfer *is* the measurement. Agents are 0: nothing edits, so the
@@ -610,13 +622,16 @@ def dispatch(options):
     # Jobs: cells × repeats, shuffled; tool order randomized per job.
     jobs = []
     for repeat in range(options.repeats):
-        for name, corpora, agents, bidirectional, betas, seed in selected:
+        for cell in selected:
+            name, corpora, agents, bidirectional, betas, seed = cell[:6]
+            mode = cell[6] if len(cell) > 6 else "replace"
             tools = ["autobahn", "mutagen"]
             rng.shuffle(tools)
             jobs.append({
                 "run": run_id, "repeat": repeat, "job": f"{name}-r{repeat}",
                 "cell": {"name": name, "corpora": corpora, "agents": agents,
                          "bidirectional": bidirectional, "betas": betas,
+                         "mode": mode,
                          "pre_seeded": seed},
                 "tools": tools,
             })

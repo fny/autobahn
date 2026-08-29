@@ -254,6 +254,7 @@ def restore_sources(corpora):
         for by_count in partitions["sides"].values():
             for sets in by_count.values():
                 files.update(sets["measured"])
+                files.update(sets.get("large", []))
                 for background in sets["background"]:
                     files.update(background)
         listing = f"{HOME}/restore-list.txt"
@@ -603,6 +604,7 @@ def run_workload(cell, emitter, tool, nonce):
             "--seconds", str(WORKLOAD_SECONDS),
             "--label", f"{corpus} a-to-b",
             "--nonce", str(nonce * 1000 + index),
+            "--mode", cell.get("mode", "replace"),
         ]
         processes.append((
             f"{corpus}:a-to-b", None, nonce * 1000 + index,
@@ -625,6 +627,7 @@ def run_workload(cell, emitter, tool, nonce):
                 "--seconds", str(WORKLOAD_SECONDS),
                 "--label", f"{corpus} b-to-a",
                 "--nonce", str(nonce * 1000 + 500 + index),
+                "--mode", cell.get("mode", "replace"),
             ]) + f" > {remote_result} 2> {remote_result}.err"
             if LOCAL:
                 process = subprocess.Popen(remote_command, shell=True,

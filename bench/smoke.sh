@@ -24,6 +24,13 @@ for d in range(30):
     for f in range(80):
         with open(f"{directory}/file{f}.txt", "wb") as handle:
             handle.write(rng.randbytes(rng.randrange(300, 8000)))
+# A handful of files above a megabyte, so patch mode has somewhere to
+# land. Compressible content, since a random megabyte is neither typical
+# of a source tree nor kind to the delta being measured.
+os.makedirs(f"{work}/src/large")
+for f in range(6):
+    with open(f"{work}/src/large/blob{f}.bin", "wb") as handle:
+        handle.write((b"the quick brown fox jumps over the lazy dog\n" * 40000)[:1_500_000])
 # Content that must be excluded from every summary:
 os.makedirs(f"{work}/src/.git"); open(f"{work}/src/.git/junk", "w").write("x")
 os.makedirs(f"{work}/src/out"); open(f"{work}/src/out/artifact", "w").write("x")
@@ -33,7 +40,7 @@ EOF
 echo "== manifest excludes ignored content and temporaries =="
 CHEAP=$("$BINARY" manifest cheap "$WORK/src")
 COUNT=$(echo "$CHEAP" | cut -d' ' -f1)
-[ "$COUNT" = "2400" ] || { echo "FAIL: expected 2400 files, got $COUNT"; exit 1; }
+[ "$COUNT" = "2406" ] || { echo "FAIL: expected 2406 files (2400 small + 6 large), got $COUNT"; exit 1; }
 
 echo "== manifest full is deterministic and content-sensitive =="
 FULL1=$("$BINARY" manifest full "$WORK/src")
@@ -94,6 +101,37 @@ assert report["samples"] >= 5, report
 assert 20 <= report["p50_ms"] <= 600, report["p50_ms"]
 assert report["warmup_samples"] >= 1, "warmup exclusion did not engage"
 EOF
+
+echo "== patch mode edits a region of a large file =="
+# The point of patch mode: the destination keeps a base that differs from
+# the new content in one place, which is the only case a delta algorithm
+# can exploit. Every other cell replaces a file with fresh random bytes,
+# where a tool that always sent everything would score identically.
+rm -rf "$WORK/src-patch" "$WORK/dst-patch"
+cp -r "$WORK/src" "$WORK/src-patch"; cp -r "$WORK/src" "$WORK/dst-patch"
+"$BINARY" observer 19915 > "$WORK/observer-patch.log" 2>&1 &
+sleep 0.5
+BEFORE=$(find "$WORK/src-patch/large" -type f -printf '%s\n' | paste -sd+ | bc)
+python3 "$HERE/toysync.py" "$WORK/src-patch" "$WORK/dst-patch" &
+TOY=$!
+REPORT=$("$BINARY" agents \
+  --root "$WORK/src-patch" --peer-root "$WORK/dst-patch" \
+  --observer 127.0.0.1:19915 --partitions "$WORK/partitions.json" \
+  --side a --agents 1 --seconds 15 --label smoke-patch --nonce 21 --mode patch)
+kill $TOY 2>/dev/null || true
+AFTER=$(find "$WORK/src-patch/large" -type f -printf '%s\n' | paste -sd+ | bc)
+python3 - "$REPORT" "$BEFORE" "$AFTER" <<'EOF'
+import json, sys
+report = json.loads(sys.argv[1])
+before, after = int(sys.argv[2]), int(sys.argv[3])
+assert report["censored"] == 0, report
+assert report["samples"] >= 3, report
+# A patch rewrites a region and leaves the rest: the files must still be
+# large. A replace-mode edit would have shrunk them to at most 64 KiB.
+assert after > before * 0.9, (before, after)
+assert after / 6 > 1_000_000, "patched files should still be megabytes"
+EOF
+echo "  patch: $(echo "$REPORT" | python3 -c 'import json,sys; r=json.load(sys.stdin); print({k: r[k] for k in ("samples","censored","p50_ms")})')"
 
 echo "== a fan-out edit waits for every destination =="
 # Two observers watching the same destination stand in for two machines.

@@ -46,6 +46,10 @@ const ANNOUNCE_LEAD: Duration = Duration::from_millis(50);
 /// a ~0.75s cadence, 32 in flight means a tool ~24s behind — beyond that
 /// new edits skip ticks (recorded) rather than queue without bound.
 const MAX_IN_FLIGHT: usize = 32;
+/// The region rewritten by a patch-mode edit. Small against the files it
+/// lands in, so that what the tool transfers is a fair question rather
+/// than a foregone one.
+const PATCH_SIZE: (usize, usize) = (1024, 16 * 1024);
 /// How long a destination has to answer the opening ping. A destination
 /// that accepts a connection and then says nothing must fail the run, not
 /// stall it indefinitely.
@@ -61,6 +65,15 @@ struct Options {
     seconds: u64,
     label: String,
     nonce: u64,
+    /// `replace` rewrites a small file with fresh content; `patch` rewrites
+    /// a region of a large one, leaving the rest intact.
+    mode: Mode,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Replace,
+    Patch,
 }
 
 fn parse(arguments: &[&str]) -> Result<Options, String> {
@@ -87,6 +100,11 @@ fn parse(arguments: &[&str]) -> Result<Options, String> {
         seconds: take("seconds")?.parse().map_err(|_| "--seconds".to_owned())?,
         label: take("label")?,
         nonce: take("nonce")?.parse().map_err(|_| "--nonce".to_owned())?,
+        mode: match map.get("mode").map(String::as_str).unwrap_or("replace") {
+            "replace" => Mode::Replace,
+            "patch" => Mode::Patch,
+            other => return Err(format!("unknown --mode {other}")),
+        },
     })
 }
 
@@ -105,6 +123,22 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
                 options.side, options.agents
             )
         })?;
+    // In patch mode the measuring agent works the large files; the
+    // background agents keep to their own small ones, so load is generated
+    // the same way in both modes and only the measured edit differs.
+    let measured_set: Vec<String> = match options.mode {
+        Mode::Replace => sets.measured.clone(),
+        Mode::Patch => {
+            if sets.large.is_empty() {
+                return Err(format!(
+                    "patch mode needs large files, and side {} has none — \
+                     the corpus does not hold any of the required size",
+                    options.side
+                ));
+            }
+            sets.large.clone()
+        }
+    };
     if sets.background.len() != options.agents - 1 {
         return Err(format!(
             "partitions file has {} background sets for {} agents",
@@ -165,7 +199,7 @@ pub fn run(arguments: &[&str]) -> Result<(), String> {
         }));
     }
 
-    let report = measure(&options, &sets.measured, &go, &stop);
+    let report = measure(&options, &measured_set, &go, &stop);
     stop.store(true, Ordering::Relaxed);
     let mut background_panics = 0u64;
     for worker in workers {
@@ -406,9 +440,41 @@ fn measure(
             None => skipped_ticks += 1,
             Some(file_index) => {
                 let relative = &measured_set[file_index];
-                let size = EDIT_SIZE.0 + rng.index(EDIT_SIZE.1 - EDIT_SIZE.0);
-                rng.fill(&mut payload[..size]);
-                let digest = blake3::hash(&payload[..size]).to_hex().to_string();
+                // Replace mode writes fresh content over a small file, so
+                // the destination's base shares nothing with it and the
+                // whole file transfers. Patch mode rewrites a region of a
+                // large file and leaves the rest, which is the only shape
+                // of edit a delta algorithm can exploit — and the shape a
+                // person editing a file actually produces.
+                let content: Vec<u8> = match options.mode {
+                    Mode::Replace => {
+                        let size = EDIT_SIZE.0 + rng.index(EDIT_SIZE.1 - EDIT_SIZE.0);
+                        rng.fill(&mut payload[..size]);
+                        payload[..size].to_vec()
+                    }
+                    Mode::Patch => {
+                        let path = options.root.join(relative);
+                        let mut existing =
+                            std::fs::read(&path).map_err(|error| {
+                                format!("unable to read {} for patching: {error}", path.display())
+                            })?;
+                        if existing.len() <= PATCH_SIZE.1 {
+                            return Err(format!(
+                                "{} is {} bytes, too small to patch",
+                                path.display(),
+                                existing.len()
+                            ));
+                        }
+                        let length = PATCH_SIZE.0 + rng.index(PATCH_SIZE.1 - PATCH_SIZE.0);
+                        let offset = rng.index(existing.len() - length);
+                        rng.fill(&mut payload[..length]);
+                        existing[offset..offset + length]
+                            .copy_from_slice(&payload[..length]);
+                        existing
+                    }
+                };
+                let size = content.len();
+                let digest = blake3::hash(&content).to_hex().to_string();
                 // Registration precedes the announcement, so no reply can
                 // ever find its sequence unknown. The provisional start is
                 // refined to the true T0 the moment the local write
@@ -442,7 +508,7 @@ fn measure(
                         .map_err(|error| error.to_string())?;
                 }
                 std::thread::sleep(ANNOUNCE_LEAD);
-                crate::write_atomic(&options.root.join(relative), &payload[..size])
+                crate::write_atomic(&options.root.join(relative), &content)
                     .map_err(|error| error.to_string())?;
                 // T0: the local write is complete and the content is the
                 // tool's to propagate.

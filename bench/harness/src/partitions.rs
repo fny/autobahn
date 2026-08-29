@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Rng;
 
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 const SEED: u64 = 0xAB_BE_2C;
 const AGENT_COUNTS: &[usize] = &[1, 10, 100];
 const MEASURED_SET_SIZE: usize = 40;
@@ -32,6 +32,14 @@ const EDITABLE_SIZE: (u64, u64) = (256, 256 * 1024);
 /// Ten keeps a 100-agent bidirectional cell within reach of the smallest
 /// (~4k-file) corpus while still giving every agent a rotation.
 const BACKGROUND_FILES_PER_AGENT: usize = 10;
+/// Files large enough that patching a region of one is a materially
+/// different operation from rewriting it: the destination holds a base
+/// that differs from the new content in one place, which is the only
+/// situation in which a delta algorithm can do anything at all.
+const LARGE_SIZE: (u64, u64) = (1 << 20, 64 << 20);
+/// Few, because they are large and the point is the shape of the edit
+/// rather than the volume of it.
+const LARGE_SET_SIZE: usize = 8;
 
 #[derive(Serialize, Deserialize)]
 pub struct Partitions {
@@ -47,6 +55,11 @@ pub struct WorkingSets {
     pub measured: Vec<String>,
     /// One file list per background agent.
     pub background: Vec<Vec<String>>,
+    /// Files of a megabyte or more, for patch-mode edits. Empty when the
+    /// corpus does not hold enough of them, which is not an error — a
+    /// corpus of small files simply cannot pose this question.
+    #[serde(default)]
+    pub large: Vec<String>,
 }
 
 pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
@@ -62,6 +75,15 @@ pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
         .filter(|(_, size)| (EDITABLE_SIZE.0..=EDITABLE_SIZE.1).contains(size))
         .map(|(path, _)| path)
         .collect();
+    // Disjoint from `editable` by construction: the size ranges do not
+    // overlap, so no file can be drawn into both a replace-mode and a
+    // patch-mode working set.
+    let mut large: Vec<String> = files
+        .iter()
+        .filter(|(_, size)| (LARGE_SIZE.0..=LARGE_SIZE.1).contains(size))
+        .map(|(path, _)| path.clone())
+        .collect();
+    large.sort();
     let maximum = *AGENT_COUNTS.iter().max().expect("nonempty");
     let required = 2 * (MEASURED_SET_SIZE + maximum * BACKGROUND_FILES_PER_AGENT);
     if editable.len() < required {
@@ -93,7 +115,32 @@ pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
     let pool_b = take(&mut cursor, remainder - remainder / 2);
 
     let mut sides = std::collections::BTreeMap::new();
-    for (side, measured, pool) in [("a", &measured_a, &pool_a), ("b", &measured_b, &pool_b)] {
+    // Large files are shuffled with their own stream and split between the
+    // sides, so the two never patch the same file — an overlapping edit is
+    // a conflict, and a safe mode refuses to resolve it.
+    let mut large_rng = Rng::new(SEED ^ 0x1A_86_5E);
+    for i in (1..large.len()).rev() {
+        large.swap(i, large_rng.index(i + 1));
+    }
+    let per_side = (large.len() / 2).min(LARGE_SET_SIZE);
+    let large_a: Vec<String> = large.iter().take(per_side).cloned().collect();
+    let large_b: Vec<String> = large
+        .iter()
+        .skip(per_side)
+        .take(per_side)
+        .cloned()
+        .collect();
+    eprintln!(
+        "partitions: {} editable, {} large ({} per side)",
+        shuffled.len(),
+        large.len(),
+        per_side
+    );
+
+    for (side, measured, pool, large) in [
+        ("a", &measured_a, &pool_a, &large_a),
+        ("b", &measured_b, &pool_b, &large_b),
+    ] {
         let mut by_count = std::collections::BTreeMap::new();
         for &count in AGENT_COUNTS {
             let background: Vec<Vec<String>> = if count > 1 {
@@ -108,6 +155,7 @@ pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
                 WorkingSets {
                     measured: measured.clone(),
                     background,
+                    large: large.clone(),
                 },
             );
         }
@@ -162,10 +210,28 @@ fn verify(partitions: &Partitions) -> Result<(), String> {
         if measured_sets.windows(2).any(|pair| pair[0] != pair[1]) {
             return Err(format!("side {side}: measured set varies with agent count"));
         }
+        let large_sets: Vec<&Vec<String>> = by_count.values().map(|sets| &sets.large).collect();
+        if large_sets.windows(2).any(|pair| pair[0] != pair[1]) {
+            return Err(format!("side {side}: large set varies with agent count"));
+        }
         let side_all = all.entry(side.as_str()).or_default();
         for (count, sets) in by_count {
             let measured: HashSet<&String> = sets.measured.iter().collect();
             let mut seen: HashSet<&String> = measured.clone();
+            // The patch-mode set is drawn from a disjoint size range, so an
+            // overlap here means the ranges were changed into collision —
+            // which would put two agents on one file and measure a conflict
+            // as latency.
+            for file in &sets.large {
+                if measured.contains(file) {
+                    return Err(format!(
+                        "{side}/{count}: the large set overlaps the measured set at {file}"
+                    ));
+                }
+                if !seen.insert(file) {
+                    return Err(format!("{side}/{count}: {file} appears twice in the large set"));
+                }
+            }
             for (index, background) in sets.background.iter().enumerate() {
                 for file in background {
                     if measured.contains(file) {

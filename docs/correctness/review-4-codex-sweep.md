@@ -1,0 +1,270 @@
+# Second-pass correctness defects, ranked
+
+I treated every defect and upgrade in `/tmp/codex-correctness.md` and
+`/tmp/fable-correctness.md` as excluded. The list below contains distinct
+mechanisms only; in particular, it does not repackage the known emptied-root,
+ancestor-journal, stat-based digest-reuse, transition TOCTOU, path-component
+TOCTOU, or staged-file-trust defects.
+
+1. **An overlapping one-way-replica configuration can recursively delete its own alpha root.**
+
+   **Location:** Duplicate detection compares only exact ordered endpoint pairs
+   at `src/config.rs:279-287` and `src/config.rs:504-535`; the comment explicitly
+   leaves nested/overlapping roots unchecked. Reconciliation descends through
+   matching directory roots at `src/tree/reconcile.rs:107-177`, then replica
+   mode unconditionally makes beta match alpha's synchronizable content at
+   `src/tree/reconcile.rs:451-471`. The safety check recognizes only a deletion
+   whose transition path is empty at `src/session/mod.rs:355-363` and
+   `src/tree/mod.rs:121-125`. Directory removal is recursive at
+   `src/endpoint/local.rs:1585-1645` and `src/endpoint/local.rs:1652-1741`.
+
+   **Failure sequence:** Configure local alpha `/srv/tree/project`, local beta
+   `/srv/tree`, and `one-way-replica`, with no prior ancestor. The ordered pair
+   is unique, so `Config::plans()` accepts it. Alpha scans `project`'s contents;
+   beta scans the same content under its child named `project`. At the hierarchy
+   root both sides are directories, so reconciliation descends. At path
+   `project`, alpha has no child named `project` while beta has the directory
+   that is physically the alpha root. Replica mode emits a beta deletion for
+   path `project`. That is not an empty-path root deletion, so neither root
+   safety check fires. Applying the beta transition recursively removes
+   `/srv/tree/project` and all of its contents: the session deletes its own
+   source. This needs no race, crash, stale state, or external writer.
+
+   The code comment is too pessimistic: exact pair identity cannot find this,
+   but canonical local paths can be rejected when one is equal to or contained
+   by the other. Remote/local combinations need a documented limitation or a
+   remote-side overlap check.
+
+   **Category:** Catastrophic data loss; configuration safety check fails open.
+
+2. **A missing destination root is written before its filesystem's name-equivalence rules are known, so a cold sync can report two colliding files as created when only one exists, then propagate the fabricated deletion back to the source.**
+
+   **Location:** A missing beta is deliberately accepted at
+   `src/supervisor/mod.rs:627-645`, and a missing root scans as no content at
+   `src/scan/mod.rs:155-165`. `RootObserver` probes only an existing root and
+   otherwise supplies `FilesystemBehavior::default()` at
+   `src/endpoint/observer.rs:248-257` and `src/endpoint/observer.rs:404-410`;
+   that default says case-sensitive and normalization-sensitive at
+   `src/scan/probes.rs:45-53`. A root transition creates the root and immediately
+   creates its children without re-probing at `src/endpoint/local.rs:1286-1320`.
+   The sibling-collision guard is conditional on the (currently false) behavior
+   flags at `src/endpoint/local.rs:1415-1466`, and child creation calls
+   `create_node` directly, bypassing the ordinary absent-target check at
+   `src/endpoint/local.rs:1323-1331`. File publication uses replacement-capable
+   rename at `src/endpoint/local.rs:1471-1555`. The returned child nodes are
+   folded into both the endpoint snapshot and ancestor at
+   `src/endpoint/mod.rs:102-144` and `src/session/mod.rs:396-452`.
+
+   **Failure sequence:** Alpha is on a case-sensitive filesystem and contains
+   two distinct regular files, `A` and `a`, with different bytes. Beta is a
+   nonexistent path whose existing parent is on a case-insensitive filesystem
+   (the same sequence works for canonically equivalent Unicode names on a
+   normalization-insensitive volume). The beta scan cannot probe the missing
+   root, so the transitioner believes names do not fold. It creates the root,
+   publishes the first file, then publishes the second onto the same underlying
+   directory entry. Because `create_children` bypasses the top-level absence
+   check and the collision guard is disabled, the second rename can replace the
+   first without a problem. Nevertheless, `create_children` returns successful
+   nodes for both names, so the achieved result and newly persisted ancestor
+   claim that both files exist.
+
+   Once the root exists, a later full scan probes the real behavior and sees
+   only one directory entry. Whichever modeled sibling is absent now looks like
+   a beta-side deletion: alpha still matches the fabricated ancestor at that
+   name, while beta is `None`. In either bidirectional mode, the
+   `alpha_diff.is_empty()` branch at `src/tree/reconcile.rs:228-241` propagates
+   that apparent deletion to alpha. If the surviving on-disk spelling carries
+   the other file's bytes, reconciliation can additionally overwrite the
+   retained source name. Thus a normal cold sync to a missing backup directory
+   can first lie about success and later delete one of the two source files.
+
+   The root should be probed after `create_dir_all` and before any children are
+   created (or the parent volume must be probed safely before the transition).
+
+   **Category:** Data loss; corrupt achieved result; safety check fails open.
+
+3. **Session identity is resolved at plan construction but endpoint roots are resolved again at connect, with no equality check; a symlink retarget in between can attach one tree to another tree's ancestor.**
+
+   **Location:** Local identity follows the current physical path at
+   `src/config.rs:252-260` via `src/paths.rs:50-84`, and `Config::plans()` freezes
+   the resulting identifier at `src/config.rs:504-524`. Workers connect later
+   (and may intentionally stagger by up to three seconds) at
+   `src/supervisor/mod.rs:240-254`. `connect()` chooses and locks the state
+   directory from that frozen identifier at `src/supervisor/mod.rs:614-622`,
+   but only afterward canonicalizes the live endpoint path at
+   `src/supervisor/mod.rs:624-645`; it never verifies that this resolution is
+   the one used to derive the identifier.
+
+   **Failure sequence:** `/sync/source` is a symlink to tree A. A prior run has
+   ancestor `old` for tree A and beta; while autobahn is down, beta's file is
+   changed to `new`. Startup builds plans while the symlink still targets A, so
+   the plan selects A's session state. Before that worker reaches `connect()`
+   (the built-in stagger widens this window), the symlink is atomically
+   retargeted to unrelated tree B, whose same-named file contains `old`.
+   `connect()` canonicalizes the endpoint to B but loads A's ancestor. In
+   two-way-safe mode, B now appears unchanged relative to the stale A ancestor,
+   while beta appears modified, so `src/tree/reconcile.rs:207-241` authorizes
+   overwriting B's file with `new`. Had identity and endpoint resolution been
+   one atomic plan value, B would have selected a fresh/different state and the
+   two one-sided creations would conflict instead of using A's provenance.
+
+   This is not the previously reported component-symlink transition race: it
+   happens before the session exists and binds a valid endpoint to the wrong
+   persisted ancestor. Carry the resolved local path in `SessionPlan`, or reject
+   connect when re-resolution differs from the identity input.
+
+   **Category:** Data loss across unrelated roots; stale/wrong provenance.
+
+4. **The locks protect state-directory names, not endpoint roots, so alternate `--state-root`/`--state-dir` values allow two live sessions to reconcile the same trees from contradictory ancestors.**
+
+   **Location:** `up` exposes `--state-root` at `src/main.rs:131-142`, and manual
+   `sync` exposes an arbitrary `--state-dir` at `src/main.rs:108-111` and uses it
+   directly at `src/main.rs:354-375`. The supervisor-wide lock is only
+   `state_root/supervisor` at `src/supervisor/mod.rs:202-209`; each worker lock is
+   only its selected `state_root/sessions/<identifier>` at
+   `src/supervisor/mod.rs:614-622`. `SessionLock` locks a file in that state
+   directory at `src/session/mod.rs:630-662`. There is no independent lock keyed
+   by the live endpoint roots.
+
+   **Failure sequence:** State directory S1 records ancestor `A` for path `p`;
+   state directory S2, from a different earlier history, records ancestor `B`.
+   Actual alpha is `A` and actual beta is `B`. Start two watching sessions over
+   those exact roots, one using S1 and one using S2 (for example, `up` under one
+   state root plus `sync --state-dir` elsewhere). Both locks succeed. If both
+   scan before either writes, S1 classifies beta as the sole modifier and plans
+   alpha=`B`; S2 classifies alpha as the sole modifier and plans beta=`A`.
+   They validate and write different targets, so neither detects the other:
+   the result is alpha=`B`, beta=`A`, a silent swap. On the next cycle run by S1
+   alone, beta=`A` is the sole change relative to S1's newly recorded ancestor
+   `B`, so it overwrites alpha and both copies become `A`; version `B` is lost
+   (S2 winning instead loses `A`).
+
+   The existing lock is sound when every process selects the same state root;
+   the defect is that endpoint exclusivity is an unstated convention that the
+   supported state-directory overrides bypass. A small lock file keyed by
+   resolved endpoint identities in a fixed runtime-lock location would preserve
+   independent state placement without allowing concurrent ownership.
+
+   **Category:** Silent divergence followed by data loss; concurrency safety bypass.
+
+5. **When both sides exclude a previously synchronized path, reconciliation deletes its ancestor entry; a deletion made while excluded is therefore resurrected when the path is re-included.**
+
+   **Location:** Ignored entries scan as `Content::Untracked` at
+   `src/scan/mod.rs:491-497` (as do oversized files at
+   `src/scan/mod.rs:525-533` and ignored symlinks at
+   `src/scan/mod.rs:593-599`). If both sides are nil or untracked,
+   reconciliation explicitly removes any ancestor at that path at
+   `src/tree/reconcile.rs:80-90`; only the one-untracked-side case preserves it
+   at `src/tree/reconcile.rs:93-105`. Ignore and exclusion policies are not part
+   of the session identifier: the identifier is fixed from endpoints at
+   `src/config.rs:504-506`, while the policies are separate plan fields at
+   `src/config.rs:513-524`. With no ancestor, a one-sided beta file is copied to
+   alpha by bidirectional reconciliation at `src/tree/reconcile.rs:207-241`.
+
+   **Failure sequence:** In two-way-safe mode, `p` is synchronized on both sides
+   and is present in the ancestor. Restart with an ignore pattern for `p` on the
+   session. Both scans return `Untracked`; the cycle leaves both disk files
+   alone but persists an ancestor change deleting `p`. While `p` remains
+   ignored, the user deliberately deletes alpha's copy; beta's copy remains.
+   Restart after removing the ignore. The scans are now alpha=`None`, beta=`p`,
+   ancestor=`None`. With the deletion provenance discarded, reconciliation
+   treats beta's survivor as a new one-sided creation and copies it back to
+   alpha, resurrecting the deliberate deletion. The same sequence crosses a
+   `max_file_size` boundary or toggles symlink-ignore policy.
+
+   Mutually excluded content need not remain in the active tree snapshot, but
+   its last synchronized provenance must survive policy changes—either in the
+   ancestor or in a tombstone/exclusion record. Clearing it is not equivalent
+   to “leave it alone.”
+
+   **Category:** Resurrection; provenance loss across configuration changes.
+
+6. **Every user entry whose name merely starts with `.autobahn-tmp` is permanently invisible, not just temporaries actually owned by autobahn.**
+
+   **Location:** The reserved value is described as the prefix for transition
+   staging temporaries at `src/scan/mod.rs:30-32`, but scanning drops every
+   directory entry satisfying `starts_with(TEMPORARY_PREFIX)` before ignore,
+   metadata, or type handling at `src/scan/mod.rs:354-372`. Actual temporary
+   names are narrower constructions, including probe names at
+   `src/scan/probes.rs:86-93` and staging names at
+   `src/endpoint/local.rs:1893` and `src/endpoint/local.rs:1932`.
+
+   **Failure sequence:** A user creates a legitimate alpha file or directory
+   named `.autobahn-tmp-notes` without adding an ignore. Every full and
+   incremental scan silently omits it—there is no `Untracked` node and no scan
+   problem—so it is never copied to beta and never appears as a conflict. If an
+   independently created entry with that prefix exists on beta, replica mode
+   also cannot see it to remove it. The two roots can therefore diverge forever
+   while every cycle reports the visible hierarchy as synchronized. A backup
+   user can lose the only source copy believing a complete cold sync succeeded.
+
+   If this namespace is intentionally forbidden, configuration/startup must
+   document and enforce that reservation and surface existing collisions as
+   problems. Better, skip only names that match autobahn's complete temporary
+   grammar and session/side token rather than a broad user-visible prefix.
+
+   **Category:** Silent divergence; silent data omission.
+
+## Areas examined with no additional defect found
+
+- **The remaining reconciliation cases:** I walked all four modes through
+  identical edits, different edits, paired and partial deletions, creations,
+  and file/directory/symlink type changes. Aside from defects 1 and 5 above,
+  two-way-safe conflicts on competing non-deletions, two-way-resolved chooses
+  alpha only where documented (`src/tree/reconcile.rs:245-348`), one-way-safe
+  preserves beta-side non-deletion changes (`src/tree/reconcile.rs:351-417`),
+  and replica semantics are internally consistent. I found no additional
+  wrong-side transition.
+
+- **Partial transitions and folding:** `Transitioner::apply` returns one achieved
+  node per input change, preserving old content on refusal and partial children
+  on partial directory creation (`src/endpoint/local.rs:1189-1210` and
+  `src/endpoint/local.rs:1415-1468`). `achieved_changes` and `fold_transition`
+  graft those exact results (`src/endpoint/mod.rs:102-144`), and the session uses
+  the same rendering for its ancestor (`src/session/mod.rs:396-433`). For the
+  shipped local and same-version remote endpoint, result cardinality stays
+  aligned. I found no new ancestor lie here other than defect 2's false
+  low-level success.
+
+- **Staging concurrency:** Staging roots include session and side identity, and
+  temporary receive/copy names are process/counter-unique; same-digest work in
+  one content-addressed directory either converges on identical verified bytes
+  or reports missing content and retries. I found no cross-session or
+  cross-run corruption mechanism beyond the already-known trust/durability
+  issue excluded by the brief.
+
+- **Symlinks, permissions, ownership, and executability:** Raw, portable, and
+  ignore symlink policies are rechecked on creation; ownership failures are
+  reported; executability is borrowed only from a byte-identical trusted peer
+  or ancestor at `src/session/mod.rs:310-332`. Apart from the unprobed-filesystem
+  case in defect 2 and the previously known pathname race, I found no silent
+  propagation error.
+
+- **Scan-cache persistence:** Cache decoding and structural validation fail
+  closed to a fresh baseline at `src/endpoint/observer.rs:425-429`, and every new
+  observer starts with `last_full_scan: None` at
+  `src/endpoint/observer.rs:452-479`, forcing a full tree walk. A stale cache can
+  still reuse a digest when current metadata matches, but turning that into a
+  wrong-content transition requires the already-reported metadata-as-identity
+  defect; otherwise transfer digest verification fails closed. I found no
+  independent cache mechanism that silently changes user bytes.
+
+- **Protocol, multiplexing, reconnection, and version skew:** One router owns
+  the reader, channel IDs are monotonically allocated per connection, frames are
+  serialized under one writer mutex, and typed replies reject an unexpected
+  response (`src/transport/mux.rs:66-103`, `src/transport/mux.rs:108-150`, and
+  `src/transport/mux.rs:225-254`). A reconnect constructs a new connection and
+  namespace rather than reusing an old response queue. Controller/agent version
+  equality is enforced at handshake (`src/transport/mux.rs:108-132`). I found
+  no response-attribution path that silently applies a transition to the wrong
+  session. The already-known absence of an explicit on-disk schema version is
+  not repeated here.
+
+- **Lifecycle operations not listed above:** Pause/reset processing occurs in
+  the owning worker while it holds the session lock, and changing mode while
+  retaining the same endpoint pair does not by itself invalidate the ancestor:
+  the ancestor records common provenance, not policy. Moving an existing local
+  root between complete runs normally changes the resolved identifier; the
+  uncovered gap is specifically the plan/connect race in defect 3. With one
+  shared state root, supervisor and session locks prevent concurrent ownership;
+  defect 4 is the supported alternate-state-directory escape.

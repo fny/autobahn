@@ -768,7 +768,7 @@ impl Endpoint for LocalEndpoint {
         // One directory read inventories what previous cycles left staged,
         // replacing a per-request stat (on a cold destination, 40k stats
         // against an empty directory).
-        let mut staged: std::collections::HashSet<String> = fs::read_dir(&self.staging_root)
+        let inventory: std::collections::HashSet<String> = fs::read_dir(&self.staging_root)
             .map(|entries| {
                 entries
                     .filter_map(|entry| entry.ok())
@@ -776,6 +776,7 @@ impl Endpoint for LocalEndpoint {
                     .collect()
             })
             .unwrap_or_default();
+        let mut staged: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         // Building the local-content index walks every file node in the
         // last scan and allocates a path for each, so it is built only when
@@ -794,8 +795,22 @@ impl Endpoint for LocalEndpoint {
             // missing content, and the immediate follow-up cycle re-plans
             // from fresh scans, which drops any vanished or changed source
             // path from consideration.
-            if !staged.insert(digest_hex(&request.digest)) {
+            let hex = digest_hex(&request.digest);
+            if !staged.insert(hex.clone()) {
                 continue;
+            }
+            if inventory.contains(&hex) {
+                // A survivor from an interrupted earlier run carries only
+                // its name's claim to the content, and a crash can leave a
+                // correctly named file with truncated or missing bytes —
+                // this very content was mid-write when the run died.
+                // Rehash before trusting it; the read is paid only on
+                // reuse hits. A mismatch discards the file and transfers.
+                let survivor = staged_path(&self.staging_root, &request.digest);
+                if staged_content_matches(&survivor, &request.digest) {
+                    continue;
+                }
+                let _ = fs::remove_file(&survivor);
             }
 
             // Identical content elsewhere in the root is faster to copy (and
@@ -950,12 +965,27 @@ impl Endpoint for LocalEndpoint {
             missing_staged_files: false,
             missing_staged: Vec::new(),
         };
-        let mut results = Vec::with_capacity(transitions.len());
-        for change in &transitions {
+        // Deletions apply before creations and replacements. On a volume
+        // with name equivalence rules, a rename that only changes case
+        // arrives as a deletion of one spelling and a creation of the
+        // other; in emitted (name-sorted) order the creation can run
+        // first, find the old spelling through the folded lookup, refuse —
+        // and the deletion then leaves the file existing under *neither*
+        // name for a cycle. Deleting first frees the folded name. Results
+        // are still reported in input order: the controller matches them
+        // to transitions by position.
+        let mut order: Vec<usize> = (0..transitions.len()).collect();
+        order.sort_by_key(|&index| transitions[index].new.is_some());
+        let mut slots: Vec<Option<Option<Node>>> = vec![None; transitions.len()];
+        for index in order {
             // Each change is applied independently: a refusal at one path
             // must never abort the rest of the transition.
-            results.push(transitioner.apply(change));
+            slots[index] = Some(transitioner.apply(&transitions[index]));
         }
+        let results: Vec<Option<Node>> = slots
+            .into_iter()
+            .map(|slot| slot.expect("every transition slot is filled"))
+            .collect();
         let outcome = TransitionOutcome {
             results,
             problems: transitioner.problems,
@@ -1316,6 +1346,15 @@ impl Transitioner<'_> {
                 );
             }
             self.apply_ownership(path, root);
+            // The root did not exist when the observer probed, so the
+            // behavior in hand is a default that claims names never fold.
+            // Creating children under that assumption on a case- or
+            // normalization-insensitive volume published colliding
+            // siblings as two successes when only one directory entry
+            // existed — and the fabricated sibling later read as a
+            // deletion and propagated back to the source. Probe the real
+            // filesystem now that it exists.
+            self.behavior = crate::scan::probes::probe(root);
             let created = self.create_children(path, root, children);
             return Some(Node::directory(new.name.clone(), created));
         }
@@ -1361,7 +1400,8 @@ impl Transitioner<'_> {
             Content::File {
                 digest, executable, ..
             } => {
-                let metadata = self.publish_file(path, parent, &target, digest, *executable)?;
+                let metadata =
+                    self.publish_file(path, parent, &target, digest, *executable, false)?;
                 Some(Node {
                     name: name.to_owned(),
                     content: Content::File {
@@ -1482,6 +1522,7 @@ impl Transitioner<'_> {
         target: &Path,
         digest: &Digest,
         executable: bool,
+        replace: bool,
     ) -> Option<FileMetadata> {
         let staged = staged_path(self.staging_root, digest);
         let mode = creation_mode(self.file_mode, executable);
@@ -1518,10 +1559,46 @@ impl Transitioner<'_> {
                     .map(|metadata| file_metadata(&metadata));
                 published.is_some()
             }
-            && fs::rename(&staged, target).is_ok();
+            && publish_rename(&staged, target, replace).is_ok();
         if !moved {
             let temporary = parent.join(temporary_name("apply"));
-            if let Err(error) = fs::copy(&staged, &temporary) {
+            // The copy digests what it moves: staged content is normally
+            // verified when it is received, but a file surviving from an
+            // interrupted earlier run carries only its name's claim, and a
+            // crash can leave a correctly named file with truncated bytes.
+            // Publishing that would install content matching nothing and
+            // then model it as correct.
+            let copied = match copy_verifying(&staged, &temporary, digest) {
+                Ok(true) => Ok(()),
+                Ok(false) => {
+                    let _ = fs::remove_file(&temporary);
+                    let _ = fs::remove_file(&staged);
+                    self.missing_staged_files = true;
+                    self.missing_staged.push(crate::endpoint::FileRequest {
+                        path: path.to_owned(),
+                        digest: *digest,
+                    });
+                    self.problem(
+                        path,
+                        "staged content does not match its digest; it will be \
+                         retransferred on the next cycle",
+                    );
+                    return None;
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = copied {
+                let error = match error.downcast::<io::Error>() {
+                    Ok(io_error) => io_error,
+                    Err(other) => {
+                        let _ = fs::remove_file(&temporary);
+                        self.problem(
+                            path,
+                            format!("unable to stage content into place: {other:#}"),
+                        );
+                        return None;
+                    }
+                };
                 let _ = fs::remove_file(&temporary);
                 // NotFound can also mean the target's parent vanished
                 // concurrently, so the staged side is confirmed missing
@@ -1560,9 +1637,20 @@ impl Transitioner<'_> {
                     return None;
                 }
             }
-            if let Err(error) = fs::rename(&temporary, target) {
+            if let Err(error) = publish_rename(&temporary, target, replace) {
                 let _ = fs::remove_file(&temporary);
-                self.problem(path, format!("unable to publish content: {error}"));
+                if !replace && error.kind() == ErrorKind::AlreadyExists {
+                    // A creation carries no expectation about existing
+                    // content, so anything that appeared since the absence
+                    // check is someone else's work and must not be
+                    // replaced. The next cycle reconciles the newcomer.
+                    self.problem(
+                        path,
+                        "refusing to create over content that appeared concurrently",
+                    );
+                } else {
+                    self.problem(path, format!("unable to publish content: {error}"));
+                }
                 return None;
             }
         }
@@ -1826,7 +1914,8 @@ impl Transitioner<'_> {
                 });
             }
 
-            let Some(metadata) = self.publish_file(path, &parent, &target, new_digest, *executable)
+            let Some(metadata) =
+                self.publish_file(path, &parent, &target, new_digest, *executable, true)
             else {
                 return Some(old.clone());
             };
@@ -1948,6 +2037,66 @@ fn temporary_name(purpose: &str) -> String {
         "{TEMPORARY_PREFIX}-{purpose}-{}-{count}",
         std::process::id()
     )
+}
+
+/// Whether a staged file's bytes hash to the digest its name claims. Used
+/// before trusting content that survived from an earlier run; a fresh
+/// transfer is verified as it is received and never needs this.
+fn staged_content_matches(path: &Path, digest: &Digest) -> bool {
+    let Ok(mut file) = fs::File::open(path) else {
+        return false;
+    };
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 128 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                hasher.update(&buffer[..count]);
+            }
+            Err(_) => return false,
+        }
+    }
+    hasher.finalize().as_bytes() == digest
+}
+
+/// Renames staged content onto its target. A replacement uses the ordinary
+/// overwrite-capable rename; a *creation* refuses to replace anything: it
+/// carries no expectation about existing content, so a file that appeared
+/// between the absence check and this rename — an editor's save, most
+/// plainly — belongs to someone else. Linux enforces that atomically with
+/// `RENAME_NOREPLACE`; elsewhere the check-then-rename window remains and
+/// is documented as residual.
+fn publish_rename(source: &Path, target: &Path, replace: bool) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if !replace {
+        use std::os::unix::ffi::OsStrExt;
+        let source_c = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
+        let target_c = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
+        let result = unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source_c.as_ptr(),
+                libc::AT_FDCWD,
+                target_c.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // Filesystems without RENAME_NOREPLACE support report EINVAL;
+        // falling back to the plain rename there keeps the old (windowed)
+        // behavior rather than failing every creation.
+        if error.raw_os_error() != Some(libc::EINVAL) {
+            return Err(error);
+        }
+    }
+    let _ = replace;
+    fs::rename(source, target)
 }
 
 /// Streams a file into a temporary while digesting it, returning whether the
@@ -2297,6 +2446,102 @@ mod tests {
             fs::symlink_metadata(beta_root.join("dir/file.txt")).expect("file should exist");
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.gid(), gid);
+    }
+
+    /// A creation must refuse to replace content that appeared after its
+    /// absence check — RENAME_NOREPLACE closes the window atomically on
+    /// Linux, and this pins the helper's two behaviors.
+    #[test]
+    fn a_creation_rename_refuses_to_replace() {
+        let keep = tempdir().expect("temporary directory");
+        let source = keep.path().join("source");
+        let target = keep.path().join("target");
+        fs::write(&source, b"staged").expect("writes");
+        fs::write(&target, b"an editor's save").expect("writes");
+
+        let refused = publish_rename(&source, &target, false);
+        assert!(refused.is_err(), "a creation replaced existing content");
+        assert_eq!(
+            fs::read(&target).expect("reads"),
+            b"an editor's save",
+            "the concurrent content must survive"
+        );
+
+        let replaced = publish_rename(&source, &target, true);
+        assert!(replaced.is_ok(), "a replacement must still replace");
+        assert_eq!(fs::read(&target).expect("reads"), b"staged");
+    }
+
+    /// A root created by a transition is probed before its children are:
+    /// the observer's behavior for a missing root is a default, and
+    /// creating children under a wrong default published colliding names
+    /// as two successes on folding volumes — or, in this inverted fixture,
+    /// refused non-colliding names on a case-sensitive one.
+    #[test]
+    fn a_created_root_is_probed_before_its_children() {
+        let mut fixture = Fixture::new();
+        // The beta root goes missing, so its next scan probes nothing and
+        // a root-creating transition is planned.
+        fs::remove_dir_all(&fixture.beta_root).expect("beta root removes");
+        write(&fixture.alpha_root, "a", "lower");
+        write(&fixture.alpha_root, "A", "UPPER");
+        // The wrong conclusion a stale default would carry: the real
+        // filesystem is case-sensitive, so `a` and `A` are distinct — but
+        // a transitioner trusting this behavior refuses the second as a
+        // fold collision.
+        fixture.beta.force_behavior(FilesystemBehavior {
+            case_insensitive: true,
+            ..FilesystemBehavior::default()
+        });
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        let outcome = fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should apply");
+        assert!(
+            outcome.problems.is_empty(),
+            "distinct names on a case-sensitive volume were refused: {:?}",
+            outcome.problems
+        );
+        assert!(fixture.beta_root.join("a").exists() && fixture.beta_root.join("A").exists());
+    }
+
+    /// A staged survivor from an interrupted run is rehashed before its
+    /// name is trusted: a crash can leave a correctly named file holding
+    /// the wrong bytes, and publishing it would install content matching
+    /// nothing while modelling it as correct.
+    #[test]
+    fn a_corrupt_staged_survivor_is_retransferred_not_trusted() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let staging = keep.path().join("staging");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&staging).expect("staging");
+        let mut endpoint =
+            LocalEndpoint::new(root.clone(), staging.clone(), EndpointOptions::default())
+                .expect("endpoint");
+        let _ = endpoint.scan().expect("scan");
+
+        // The digest names honest content; the file holds something else.
+        let digest = *blake3::hash(b"the real content").as_bytes();
+        fs::write(staging.join(digest_hex(&digest)), b"crash-damaged bytes!!").expect("writes");
+
+        let needs = endpoint
+            .stage_begin(vec![crate::endpoint::FileRequest {
+                path: "file.txt".into(),
+                digest,
+            }])
+            .expect("stage_begin");
+        assert_eq!(
+            needs.len(),
+            1,
+            "a corrupt survivor must be scheduled for transfer, not trusted"
+        );
+        assert!(
+            !staging.join(digest_hex(&digest)).exists(),
+            "the corrupt survivor must be discarded"
+        );
     }
 
     fn endpoint(root: &Path, staging: &Path) -> LocalEndpoint {

@@ -64,15 +64,15 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 4 — transition hardening
 
-- [ ] **C1.4** Creations publish with RENAME_NOREPLACE on Linux (fall
+- [x] **C1.4** Creations publish with RENAME_NOREPLACE on Linux (fall
       back elsewhere): a creation carries no old-content expectation, so
       refusing to replace anything is strictly correct.
-- [ ] **C1.6** The publish copy path digests what it copies and refuses
+- [x] **C1.6** The publish copy path digests what it copies and refuses
       on mismatch; the rename path verifies staged content on reuse.
-- [ ] **C2.2** A created root is probed before its children are created,
+- [x] **C2.2** A created root is probed before its children are created,
       so name-folding filesystems are known before collisions can be
       published as successes.
-- [ ] **F2.5** Deletions apply before creations within a transition
+- [x] **F2.5** Deletions apply before creations within a transition
       batch, closing the case-fold rename transient.
 
 ## Phase 5 — identity and exclusivity

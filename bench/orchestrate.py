@@ -170,6 +170,11 @@ for c in ("chromium", "sub50k", "sub50k-b", "sub5k"):
     for by_count in partitions["sides"].values():
         for sets in by_count.values():
             files.update(sets["measured"])
+            # Patch-mode cells edit these, so they must be restorable too.
+            # This list and the one job.py restores from have to agree; a
+            # file in the restore list and not in the pristine copy fails
+            # every job before it measures anything.
+            files.update(sets.get("large", []))
             for background in sets["background"]:
                 files.update(background)
     listing = f"{home}/pristine-list.txt"
@@ -381,6 +386,47 @@ def bake(options):
 
 
 # ── launch and dispatch ──────────────────────────────────────────────
+
+# Rebuilt on every machine before any job runs, rather than trusted from
+# the image. The pristine copy and the list job.py restores from are two
+# separate renderings of the same set, and when they disagree every job
+# fails at restore before measuring anything — which is exactly what a
+# patch-mode cell's large files did, because they were added to one list
+# and not the other. Rebuilding here makes the image's vintage irrelevant
+# and costs a few seconds of rsync against files that are already there.
+PRISTINE_REPAIR = r"""
+python3 - <<'REPAIR_EOF'
+import json, os, subprocess
+home = os.path.expanduser("~")
+for c in ("chromium", "sub50k", "sub50k-b", "sub5k"):
+    path = f"{home}/corpus/{c}.bench/partitions.json"
+    if not os.path.exists(path):
+        continue
+    with open(path) as handle:
+        partitions = json.load(handle)
+    files = set()
+    for by_count in partitions["sides"].values():
+        for sets in by_count.values():
+            files.update(sets["measured"])
+            files.update(sets.get("large", []))
+            for background in sets["background"]:
+                files.update(background)
+    listing = f"{home}/pristine-list.txt"
+    with open(listing, "w") as handle:
+        handle.write("\n".join(sorted(files)) + "\n")
+    os.makedirs(f"{home}/corpus-pristine/{c}", exist_ok=True)
+    result = subprocess.run(["rsync", "-a", f"--files-from={listing}",
+                             f"{home}/corpus/{c}/", f"{home}/corpus-pristine/{c}/"])
+    if result.returncode != 0:
+        raise SystemExit(f"pristine rebuild failed for {c}")
+    missing = [f for f in files if not os.path.exists(f"{home}/corpus-pristine/{c}/{f}")]
+    if missing:
+        raise SystemExit(f"{c}: {len(missing)} restorable files absent from the "
+                         f"pristine copy, e.g. {missing[0]}")
+print("pristine verified")
+REPAIR_EOF
+"""
+
 
 def provision_network(options, run_id):
     key = f"{run_id}-key"
@@ -604,6 +650,21 @@ def dispatch(options):
         # Observers on every destination (for a-to-b) and on the source
         # (for b-to-a), started and then *proven* listening before any job
         # is dispatched.
+        # Every machine in the group, before anything measures.
+        repairs = []
+        for member in members:
+            host = addresses[member][0]
+            repairs.append((host, subprocess.Popen(
+                ["ssh", "-n", "-o", "StrictHostKeyChecking=accept-new",
+                 "-i", key_path(key), f"ubuntu@{host}", PRISTINE_REPAIR],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)))
+        for host, process in repairs:
+            output = process.communicate()[0]
+            if process.returncode != 0 or "pristine verified" not in output:
+                raise RuntimeError(
+                    f"group {index}: pristine rebuild failed on {host}: "
+                    f"{output[-400:]}")
+
         listeners = [(addresses[f][0], "9911 9912") for f in followers]
         listeners.append((a_public, "10011 10012"))
         for host, ports in listeners:

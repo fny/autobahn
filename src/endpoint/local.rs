@@ -1520,7 +1520,6 @@ impl Transitioner<'_> {
             }
             && fs::rename(&staged, target).is_ok();
         if !moved {
-            published = None;
             let temporary = parent.join(temporary_name("apply"));
             if let Err(error) = fs::copy(&staged, &temporary) {
                 let _ = fs::remove_file(&temporary);

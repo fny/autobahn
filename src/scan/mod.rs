@@ -591,7 +591,7 @@ impl<'a> Scanner<'a> {
         metadata: &Metadata,
         baseline: Option<&Node>,
     ) -> Content {
-        let mut recorded = file_metadata(metadata);
+        let recorded = file_metadata(metadata);
 
         // A file over the size limit is deliberately excluded from
         // synchronization: it scans as *untracked* content — present, and

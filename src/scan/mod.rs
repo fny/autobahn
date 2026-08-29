@@ -31,6 +31,50 @@ const MODE_EXECUTABLE_MASK: u32 = 0o111;
 /// invisible to scans.
 const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 
+/// Whether a name is one of autobahn's own temporary names, as opposed to a
+/// user's file that merely begins with the reserved prefix.
+///
+/// The scan used to skip *everything* starting with the prefix, which made
+/// a legitimate file named `.autobahn-tmp-notes` permanently invisible: it
+/// was never synchronized, never reported, and never conflicted — the two
+/// roots could diverge forever while every cycle reported success. Only
+/// names matching the grammars autobahn actually generates are its to hide:
+///
+/// - `.autobahn-tmp-staging-<session>-<side>` — a staging directory placed
+///   beside or inside the root;
+/// - `.autobahn-tmp-<purpose>-<pid>-<count>[-<token>]` — transition and
+///   probe temporaries, always carrying a numeric process id and counter.
+///
+/// Anything else in the reserved space is surfaced as a scan problem: not
+/// silently skipped (the divergence above), and not synchronized either
+/// (another process's in-flight temporary must never be transferred).
+fn autobahn_temporary(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(TEMPORARY_PREFIX) else {
+        return false;
+    };
+    let Some(rest) = rest.strip_prefix('-') else {
+        return false;
+    };
+    if let Some(staging) = rest.strip_prefix("staging-") {
+        return !staging.is_empty();
+    }
+    let mut parts = rest.splitn(2, '-');
+    let purpose = parts.next().unwrap_or("");
+    let Some(tail) = parts.next() else {
+        return false;
+    };
+    if purpose.is_empty() || !purpose.bytes().all(|byte| byte.is_ascii_lowercase()) {
+        return false;
+    }
+    let mut fields = tail.split('-');
+    let numeric = |field: Option<&str>| {
+        field.is_some_and(|field| {
+            !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    };
+    numeric(fields.next()) && numeric(fields.next())
+}
+
 /// The suffix appended to the lossy rendering of a non-UTF-8 entry name.
 const NON_UTF8_SUFFIX: &str = " (non-UTF-8)";
 
@@ -366,8 +410,21 @@ impl<'a> Scanner<'a> {
             let lossy_name = raw_name.to_string_lossy();
 
             // Staging temporaries belong to in-flight transitions, not to
-            // the synchronized hierarchy.
+            // the synchronized hierarchy. A user's name that merely enters
+            // the reserved space is a problem, not a secret.
             if lossy_name.starts_with(TEMPORARY_PREFIX) {
+                if autobahn_temporary(&lossy_name) {
+                    continue;
+                }
+                children.push(Node {
+                    name: lossy_name.into_owned(),
+                    content: Content::Problematic {
+                        message: format!(
+                            "the name prefix '{TEMPORARY_PREFIX}' is reserved for \
+                             autobahn temporaries; rename the entry to synchronize it"
+                        ),
+                    },
+                });
                 continue;
             }
 
@@ -762,8 +819,58 @@ mod tests {
             .expect("permissions should be settable");
         symlink("alpha.txt", root.join("link")).expect("symlink should be creatable");
         write(root, "excluded/secret.txt", "secret");
-        write(root, ".autobahn-tmp-staging", "staging");
+        write(root, ".autobahn-tmp-staging-s1-beta", "staging");
         directory
+    }
+
+    #[test]
+    fn reserved_prefix_hides_only_real_temporaries() {
+        // Reproduced before the fix: a user file named `.autobahn-tmp-notes`
+        // was silently invisible to every scan — never synchronized, never
+        // reported — while the roots diverged.
+        assert!(autobahn_temporary(".autobahn-tmp-staging-s1-beta"));
+        assert!(autobahn_temporary(".autobahn-tmp-recv-1234-7"));
+        assert!(autobahn_temporary(".autobahn-tmp-probe-1234-7-token"));
+        assert!(!autobahn_temporary(".autobahn-tmp-notes"));
+        assert!(!autobahn_temporary(".autobahn-tmp"));
+        assert!(!autobahn_temporary(".autobahn-tmp-"));
+        assert!(!autobahn_temporary(".autobahn-tmp-staging-"));
+        assert!(!autobahn_temporary(".autobahn-tmp-recv-x-7"));
+        assert!(!autobahn_temporary(".autobahn-tmpother"));
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        write(root, "normal.txt", "hello");
+        write(root, ".autobahn-tmp-notes", "user content");
+        write(root, ".autobahn-tmp-recv-1-1", "in-flight");
+        let snapshot = scan_fixture(root, None);
+        let names: Vec<&str> = snapshot
+            .root
+            .as_ref()
+            .expect("root")
+            .children()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert!(names.contains(&"normal.txt"));
+        assert!(
+            names.contains(&".autobahn-tmp-notes"),
+            "a user's reserved-prefix name must be visible: {names:?}"
+        );
+        assert!(
+            !names.contains(&".autobahn-tmp-recv-1-1"),
+            "a real temporary must stay hidden: {names:?}"
+        );
+        let notes = snapshot
+            .root
+            .as_ref()
+            .expect("root")
+            .child(".autobahn-tmp-notes")
+            .expect("present");
+        assert!(
+            matches!(notes.content, Content::Problematic { .. }),
+            "surfaced as a problem, not synchronized"
+        );
     }
 
     fn scan_fixture(root: &Path, baseline: Option<&Snapshot>) -> Snapshot {

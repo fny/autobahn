@@ -261,6 +261,30 @@ fn target_identity(target: &EndpointTarget) -> String {
     }
 }
 
+/// Reports how two endpoint identities overlap on disk, when that is
+/// determinable: equal, or one containing the other. Local identities are
+/// resolved physical paths, so containment is a path-prefix test on a
+/// component boundary. Remote identities can only be compared textually,
+/// and only against the same destination; a remote path that reaches the
+/// same tree through a different spelling is undetectable from here.
+fn overlap(alpha: &str, beta: &str) -> Option<&'static str> {
+    if alpha == beta {
+        return Some("the same tree");
+    }
+    let contains = |outer: &str, inner: &str| {
+        inner
+            .strip_prefix(outer)
+            .is_some_and(|rest| rest.starts_with('/'))
+    };
+    if contains(alpha, beta) {
+        return Some("a tree inside the alpha");
+    }
+    if contains(beta, alpha) {
+        return Some("a tree containing the alpha");
+    }
+    None
+}
+
 impl Config {
     /// Loads and parses a configuration file.
     pub fn load(path: &std::path::Path) -> Result<Config> {
@@ -523,6 +547,35 @@ impl Config {
                     default_group: default_group.clone(),
                     identifier,
                 };
+                // A beta that is the alpha, or nested either way around,
+                // makes the session consume its own output: reconciliation
+                // sees the copy as divergence and, in replica mode,
+                // deletes the alpha root through the beta path. This was
+                // reproduced, not hypothesized — the check is load-bearing.
+                // (Relays — one session's beta feeding another's alpha —
+                // remain legal: only overlap within a single session is
+                // self-referential.)
+                let comparable = matches!(
+                    (&plan.alpha, &plan.beta),
+                    (EndpointTarget::Local(_), EndpointTarget::Local(_))
+                ) || matches!(
+                    (&plan.alpha, &plan.beta),
+                    (
+                        EndpointTarget::Remote { destination: a, .. },
+                        EndpointTarget::Remote { destination: b, .. },
+                    ) if a == b
+                );
+                if comparable {
+                    if let Some(how) = overlap(&alpha_identity, &beta_identity) {
+                        errors.push(format!(
+                            "session '{}': the beta is {how}; a session cannot \
+                             synchronize a tree with itself or with a tree that \
+                             contains it",
+                            plan.display()
+                        ));
+                        continue;
+                    }
+                }
                 if let Some(previous) =
                     identities.insert((alpha_identity, beta_identity), plan.display())
                 {
@@ -1045,6 +1098,63 @@ mod tests {
     }
 
     #[test]
+    fn overlapping_roots_within_a_session_are_rejected() {
+        // Reproduced before it was fixed: with beta containing alpha, replica
+        // mode read its own output as beta-side divergence and recursively
+        // deleted the alpha root through the beta path.
+        for (alpha, beta, how) in [
+            ("/srv/tree/project", "/srv/tree", "containing the alpha"),
+            ("/srv/tree", "/srv/tree/project", "inside the alpha"),
+            ("/srv/tree", "/srv/tree", "the same tree"),
+            // Remote pairs on one destination are comparable textually.
+            (
+                "host:/srv/tree/project",
+                "host:/srv/tree",
+                "containing the alpha",
+            ),
+        ] {
+            let config = parse(&format!(
+                r#"
+                [groups.bad]
+                alpha = "{alpha}"
+                mode = "one-way-replica"
+                betas = ["{beta}"]
+                "#
+            ));
+            let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+            assert!(error.contains(how), "{alpha} vs {beta}: {error}");
+        }
+
+        // A prefix that is not a component boundary is a different tree.
+        let config = parse(
+            r#"
+            [groups.fine]
+            alpha = "/srv/tree"
+            mode = "two-way-safe"
+            betas = ["/srv/tree-backup"]
+            "#,
+        );
+        assert_eq!(config.plans().expect("plans should build").len(), 1);
+
+        // Relays — one session's beta feeding another's alpha — stay legal:
+        // only overlap within a single session is self-referential.
+        let config = parse(
+            r#"
+            [groups.first]
+            alpha = "/srv/a"
+            mode = "one-way-safe"
+            betas = ["/srv/hub"]
+
+            [groups.second]
+            alpha = "/srv/hub"
+            mode = "one-way-safe"
+            betas = ["/srv/final"]
+            "#,
+        );
+        assert_eq!(config.plans().expect("plans should build").len(), 2);
+    }
+
+    #[test]
     fn duplicate_sessions_are_rejected() {
         let config = parse(
             r#"
@@ -1121,21 +1231,29 @@ mod tests {
 
         // Betas that don't exist yet still alias when their *ancestors* do:
         // a missing mirror under a symlinked parent would be created at the
-        // same physical location as its direct spelling.
+        // same physical location as its direct spelling. (The betas live
+        // outside the alphas: overlap within a session is refused outright
+        // before duplicate detection would see it.)
+        let out = keep.path().join("out");
+        std::fs::create_dir_all(&out).expect("directory should be creatable");
+        let out_alias = keep.path().join("out-alias");
+        std::os::unix::fs::symlink(&out, &out_alias).expect("symlink should be creatable");
         let config = parse(&format!(
             r#"
             [groups.one]
             alpha = "{data}"
             mode = "two-way-safe"
-            betas = ["{data}/mirror/new"]
+            betas = ["{out}/mirror/new"]
 
             [groups.two]
             alpha = "{alias}"
             mode = "one-way-replica"
-            betas = ["{alias}/mirror/new"]
+            betas = ["{out_alias}/mirror/new"]
             "#,
             data = data.display(),
             alias = alias.display(),
+            out = out.display(),
+            out_alias = out_alias.display(),
         ));
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(

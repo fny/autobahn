@@ -20,14 +20,14 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 1 — configurations and guards that destroy data outright
 
-- [ ] **C2.1** Reject configurations where one local root contains
+- [x] **C2.1** Reject configurations where one local root contains
       another (same session and across sessions). Canonicalize and
       compare; remote overlaps documented as unverifiable.
-- [ ] **C1.1 + F1** Replace the emptied-root guard's child-count proxy
+- [x] **C1.1 + F1** Replace the emptied-root guard's child-count proxy
       with a magnitude check: halt when one side lost more than a
       threshold of the entries the ancestor holds, wherever in the tree
       the loss falls. Flip the test that pins the broken behaviour.
-- [ ] **C2.6** Skip only autobahn's actual temporary grammar, not every
+- [x] **C2.6** Skip only autobahn's actual temporary grammar, not every
       name starting with `.autobahn-tmp`; surface reserved-name
       collisions as scan problems rather than silence.
 

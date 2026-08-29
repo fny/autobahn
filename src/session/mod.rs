@@ -404,14 +404,18 @@ impl Session {
             report.beta_transitions = reconciliation.beta_transitions.len();
             report.beta_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
-            report.missing_staged.extend(outcome.missing_staged.iter().cloned());
+            report
+                .missing_staged
+                .extend(outcome.missing_staged.iter().cloned());
         }
         if let Some(outcome) = &alpha_outcome {
             fold(&reconciliation.alpha_transitions, outcome);
             report.alpha_transitions = reconciliation.alpha_transitions.len();
             report.alpha_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
-            report.missing_staged.extend(outcome.missing_staged.iter().cloned());
+            report
+                .missing_staged
+                .extend(outcome.missing_staged.iter().cloned());
         }
 
         // Apply the ancestor changes, validate the result (the ancestor must

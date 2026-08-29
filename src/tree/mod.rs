@@ -426,8 +426,7 @@ impl Node {
                 {
                     cursor += 1;
                 }
-                if cursor < previous_children.len()
-                    && previous_children[cursor].name == child.name
+                if cursor < previous_children.len() && previous_children[cursor].name == child.name
                 {
                     counterpart = Some(&previous_children[cursor]);
                 }

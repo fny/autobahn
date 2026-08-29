@@ -288,7 +288,9 @@ impl RootObserver {
             // scan shares storage with its baseline, so the comparison is a
             // pointer check rather than a walk.
             if !crate::tree::nodes_share_storage(
-                baseline.as_ref().and_then(|snapshot| snapshot.root.as_ref()),
+                baseline
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.root.as_ref()),
                 snapshot.root.as_ref(),
             ) {
                 self.store_cache(&snapshot);
@@ -393,12 +395,19 @@ impl RootObserver {
     /// decomposing and case-insensitive paths without such a volume.
     #[cfg(test)]
     pub(crate) fn force_behavior(&self, behavior: FilesystemBehavior) {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).behavior = Some(behavior);
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .behavior = Some(behavior);
     }
 
     /// The probed behavior of the root's filesystem.
     pub fn behavior(&self) -> FilesystemBehavior {
-        self.state.lock().unwrap_or_else(|e| e.into_inner()).behavior.unwrap_or_default()
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .behavior
+            .unwrap_or_default()
     }
 
     /// Blocks until pending cache writes complete.
@@ -541,9 +550,6 @@ mod tests {
         // alias of its existing ancestor.
         let link = directory.path().join("alias");
         std::os::unix::fs::symlink(&base, &link).expect("symlink");
-        assert_eq!(
-            canonical_root(&link.join("missing").join("deeper")),
-            two
-        );
+        assert_eq!(canonical_root(&link.join("missing").join("deeper")), two);
     }
 }

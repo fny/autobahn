@@ -114,7 +114,6 @@ pub struct LocalEndpoint {
     /// The directory holding staged content and staging temporaries.
     staging_root: PathBuf,
     /// The treatment of symbolic links, applied when creating them.
-
     symlink_mode: SymlinkMode,
     /// The permission bits for created non-executable files.
     file_mode: u32,
@@ -173,7 +172,6 @@ impl PendingChanges {
         self.paths.clear();
         self.paths.shrink_to_fit();
     }
-
 }
 
 /// A recursive filesystem watcher over the synchronization root, recording
@@ -194,10 +192,7 @@ impl ChangeWatcher {
     /// It runs on the watcher's own thread, so it must not block — the
     /// observer's signal takes a lock it holds for a counter increment and
     /// nothing more.
-    pub(crate) fn new(
-        root: &Path,
-        notify: impl Fn() + Send + 'static,
-    ) -> Result<ChangeWatcher> {
+    pub(crate) fn new(root: &Path, notify: impl Fn() + Send + 'static) -> Result<ChangeWatcher> {
         use notify::Watcher;
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
@@ -295,7 +290,6 @@ impl ChangeWatcher {
             incomplete: pending.incomplete,
         }
     }
-
 }
 
 impl LocalEndpoint {

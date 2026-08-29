@@ -103,9 +103,7 @@ fn main() {
             .validate_against(settled.root.as_ref(), true)
             .expect("valid");
         let incremental_ms = started.elapsed().as_secs_f64() * 1000.0;
-        println!(
-            "  validate {validate_ms:.1}ms full vs {incremental_ms:.2}ms incremental"
-        );
+        println!("  validate {validate_ms:.1}ms full vs {incremental_ms:.2}ms incremental");
 
         let ancestor_path = staging.with_extension("ancestor");
         let started = Instant::now();

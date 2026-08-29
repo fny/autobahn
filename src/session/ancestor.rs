@@ -427,7 +427,10 @@ mod tests {
         fs::write(&journal, &data).expect("writes");
 
         let (_, reloaded) = AncestorStore::open(&path).expect("opens despite the torn tail");
-        assert!(same(&reloaded, &first), "the intact record must still apply");
+        assert!(
+            same(&reloaded, &first),
+            "the intact record must still apply"
+        );
     }
 
     /// A complete record whose payload does not match its digest claimed to

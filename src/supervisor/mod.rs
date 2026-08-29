@@ -980,7 +980,10 @@ mod tests {
 
         let error =
             run_cycles(&mut session).expect_err("unappearing content must surface as an error");
-        assert!(format!("{error:#}").contains("staging is failing"), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("staging is failing"),
+            "{error:#}"
+        );
     }
 
     /// A tree being written faster than it transfers is busy, not broken.

@@ -86,7 +86,9 @@ impl DirtyPaths {
 }
 
 /// The treatment of symbolic links during scanning and transitioning.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash,
+)]
 pub enum SymlinkMode {
     /// Symbolic links are invisible: never scanned, never propagated.
     Ignore,

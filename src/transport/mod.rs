@@ -665,6 +665,13 @@ fn assemble_and_write<W: Write, T: Serialize>(
     // it into an assembled payload first, as this once did, meant a third
     // full-size pass over every frame purely to prepend five bytes.
     let mut header = [0u8; 9];
+    // One place assembles the header, so the three ways a frame can be
+    // framed cannot drift apart. Each returns the body to write beside it.
+    let uncompressed = |header: &mut [u8; 9]| -> usize {
+        header[..4].copy_from_slice(&((encoded.len() + 1) as u32).to_le_bytes());
+        header[4] = FRAME_UNCOMPRESSED;
+        5
+    };
     let (header_len, body): (usize, &[u8]) = if encoded.len() >= COMPRESSION_THRESHOLD {
         // Compress straight into the reused buffer. The buffer is only ever
         // grown, so the zero-fill that sizing it requires is paid on the
@@ -676,22 +683,15 @@ fn assemble_and_write<W: Write, T: Serialize>(
         let size = lz4_flex::block::compress_into(encoded, &mut scratch.compressed[..capacity])
             .context("unable to compress frame")?;
         if size + COMPRESSED_HEADER_SIZE < encoded.len() {
-            let length = (size + COMPRESSED_HEADER_SIZE) as u32;
-            header[..4].copy_from_slice(&length.to_le_bytes());
+            header[..4].copy_from_slice(&((size + COMPRESSED_HEADER_SIZE) as u32).to_le_bytes());
             header[4] = FRAME_COMPRESSED;
             header[5..9].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
             (9, &scratch.compressed[..size])
         } else {
-            let length = (encoded.len() + 1) as u32;
-            header[..4].copy_from_slice(&length.to_le_bytes());
-            header[4] = FRAME_UNCOMPRESSED;
-            (5, encoded)
+            (uncompressed(&mut header), encoded)
         }
     } else {
-        let length = (encoded.len() + 1) as u32;
-        header[..4].copy_from_slice(&length.to_le_bytes());
-        header[4] = FRAME_UNCOMPRESSED;
-        (5, encoded)
+        (uncompressed(&mut header), encoded)
     };
 
     writer

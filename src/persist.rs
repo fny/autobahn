@@ -365,15 +365,16 @@ mod stress {
         let directory = tempfile::tempdir().expect("temporary directory");
         let writer = StateWriter::new();
         // An unwritable path: the parent does not exist.
-        writer.store(
-            directory.path().join("missing").join("state"),
-            || Some(vec![1]),
-        );
+        writer.store(directory.path().join("missing").join("state"), || {
+            Some(vec![1])
+        });
         let good = directory.path().join("state");
         writer.store(good.clone(), || Some(vec![2; 8]));
         writer.flush();
         assert_eq!(
-            std::fs::read(&good).expect("the later write must still land").len(),
+            std::fs::read(&good)
+                .expect("the later write must still land")
+                .len(),
             8
         );
     }

@@ -217,6 +217,14 @@ pub fn scan(
         bail!("synchronization root {} is not a directory", root.display());
     }
 
+    // Captured before the walk begins: every digest this scan records was
+    // computed no earlier than this, which is what the racy-timestamp rule
+    // in `reusable_digest` compares file modification times against.
+    let scanned_at_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0);
+
     // An incremental scan is only meaningful against a baseline: without
     // one there is nothing to adopt, and everything must be read anyway.
     let baseline_root = baseline.and_then(|s| s.root.as_ref());
@@ -227,6 +235,7 @@ pub fn scan(
         symlink_mode,
         max_file_size,
         dirty.is_some(),
+        baseline.map(|snapshot| snapshot.scanned_at_seconds),
     );
     let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
     let mut snapshot = Snapshot {
@@ -239,6 +248,7 @@ pub fn scan(
         files: scanner.files,
         symlinks: scanner.symlinks,
         total_file_size: scanner.total_file_size,
+        scanned_at_seconds,
     };
     // An incremental scan only counts what it visited, so the statistics
     // are recomputed from the assembled hierarchy (a pointer walk, with no
@@ -294,6 +304,8 @@ struct Scanner<'a> {
     /// Whether this scan may adopt unmarked baseline content rather than
     /// reading it (set when the caller supplied a set of changed paths).
     incremental: bool,
+    /// When the baseline's scan started, for the racy-timestamp rule.
+    baseline_scanned_at: Option<i64>,
     /// The digest streaming buffer, allocated once per scan.
     buffer: Vec<u8>,
     /// The number of synchronizable directories scanned.
@@ -314,6 +326,7 @@ impl<'a> Scanner<'a> {
         symlink_mode: SymlinkMode,
         max_file_size: Option<u64>,
         incremental: bool,
+        baseline_scanned_at: Option<i64>,
     ) -> Scanner<'a> {
         Scanner {
             ignores,
@@ -321,6 +334,7 @@ impl<'a> Scanner<'a> {
             symlink_mode,
             max_file_size,
             incremental,
+            baseline_scanned_at,
             buffer: vec![0u8; DIGEST_BUFFER_SIZE],
             directories: 0,
             files: 0,
@@ -593,27 +607,24 @@ impl<'a> Scanner<'a> {
         // The digest is only recomputed when the metadata that would have
         // accompanied it has changed. This is the difference between a scan
         // that reads the whole hierarchy and one that reads only what moved.
-        let digest = match reusable_digest(baseline, &recorded) {
+        let digest = match reusable_digest(baseline, &recorded, self.baseline_scanned_at) {
             Some(digest) => digest,
             None => {
                 let (digest, read) = match self.digest_file(disk_path) {
                     Ok(result) => result,
                     Err(error) => return problematic(format!("unable to read file: {error:#}")),
                 };
-                if read != recorded.size {
-                    // The file changed size between the stat and the read,
-                    // so the digest describes content the recorded metadata
-                    // doesn't. Re-stat and record what's there now: the
-                    // digest is still a faithful record of some version of
-                    // the file, and any further change moves the mtime and
-                    // forces a re-read on the next scan.
-                    match fs::symlink_metadata(disk_path) {
-                        Ok(fresh) => recorded = file_metadata(&fresh),
-                        Err(error) => {
-                            return problematic(format!("unable to re-probe file: {error}"));
-                        }
-                    }
-                }
+                // A file that changed size between the stat and the read is
+                // being written. The digest describes bytes the recorded
+                // metadata does not — and the *original* stat is kept
+                // deliberately: the writer's finishing stat will differ
+                // from it, forcing a re-read on the next scan. Adopting a
+                // fresh stat here recorded the writer's final metadata next
+                // to a digest of a prefix, and if the writer finished
+                // inside that window the pair validated itself forever —
+                // the wrong digest survived every future scan, full scans
+                // included, and was persisted into the cache.
+                let _ = read;
                 digest
             }
         };
@@ -704,15 +715,40 @@ fn file_metadata(metadata: &Metadata) -> FileMetadata {
     }
 }
 
+/// The margin, in seconds, by which a file's modification time must
+/// predate the recording scan's start before its digest is trusted without
+/// a re-read. Two writes inside one mtime granule carry identical
+/// timestamps, and granules reach a full second on common network and
+/// legacy filesystems (two on FAT); a file modified this close to the scan
+/// that digested it may have been rewritten after the read without any
+/// metadata moving. The cost of the margin is one re-read, next scan, of
+/// exactly the files modified just before this one — the files most worth
+/// re-reading.
+const RACY_MTIME_MARGIN_SECONDS: i64 = 2;
+
 /// Returns the baseline node's digest if its metadata proves that the file's
 /// content matches what was observed at scan time.
-fn reusable_digest(baseline: Option<&Node>, fresh: &FileMetadata) -> Option<Digest> {
+fn reusable_digest(
+    baseline: Option<&Node>,
+    fresh: &FileMetadata,
+    baseline_scanned_at: Option<i64>,
+) -> Option<Digest> {
     let Some(Content::File {
         digest, metadata, ..
     }) = baseline.map(|node| &node.content)
     else {
         return None;
     };
+    // The racy-timestamp rule (git's, transplanted): a digest recorded for
+    // a file whose mtime was not comfortably older than the scan that read
+    // it cannot prove anything, because a same-granule rewrite after the
+    // read is metadata-invisible. `None` (a baseline without a recorded
+    // start) and zero (a pre-upgrade cache) both refuse everything, which
+    // downgrades once to a full re-read.
+    let start = baseline_scanned_at.unwrap_or(0);
+    if metadata.mtime_seconds >= start.saturating_sub(RACY_MTIME_MARGIN_SECONDS) {
+        return None;
+    }
     // Modification time, size, and inode together detect every content
     // change that doesn't deliberately forge them, and the type bits guard
     // against a path having become a different kind of file entirely.
@@ -871,6 +907,56 @@ mod tests {
             matches!(notes.content, Content::Problematic { .. }),
             "surfaced as a problem, not synchronized"
         );
+    }
+
+    /// The racy-timestamp rule: a rewrite that lands in the same mtime
+    /// granule as the write a scan digested is metadata-invisible, and the
+    /// only defense is refusing to trust digests recorded for files
+    /// modified around the scan that read them. Reproduced (as review
+    /// finding F2.2) before the rule existed: the second write was never
+    /// observed by any scan, full scans included, and a later transition
+    /// validated against the poisoned record and overwrote it.
+    #[test]
+    fn a_same_granule_rewrite_is_reread_not_trusted() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let moment = std::time::SystemTime::now();
+        let set_mtime = |path: &str| {
+            fs::File::options()
+                .write(true)
+                .open(root.join(path))
+                .expect("file should open")
+                .set_modified(moment)
+                .expect("mtime should be settable");
+        };
+
+        write(root, "racy.txt", "version-one");
+        set_mtime("racy.txt");
+        let baseline = scan_fixture(root, None);
+
+        // Same length, same forced mtime: the metadata cannot tell the
+        // versions apart. Only the racy rule forces the re-read.
+        write(root, "racy.txt", "version-TWO");
+        set_mtime("racy.txt");
+        let rescan = scan_fixture(root, Some(&baseline));
+        assert_eq!(
+            file_content(rescan.root.as_ref().expect("root"), "racy.txt").0,
+            digest_of("version-TWO"),
+            "a same-granule rewrite went unobserved"
+        );
+    }
+
+    /// Backdates a file's modification time so the racy-timestamp rule
+    /// does not (correctly) refuse to reuse its digest: these tests are
+    /// about metadata *matching*, and a freshly written fixture is exactly
+    /// the recently-modified case the rule re-reads on principle.
+    fn age(root: &Path, path: &str) {
+        let file = fs::File::options()
+            .write(true)
+            .open(root.join(path))
+            .expect("file should open");
+        file.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("mtime should be settable");
     }
 
     fn scan_fixture(root: &Path, baseline: Option<&Snapshot>) -> Snapshot {
@@ -1309,6 +1395,7 @@ mod tests {
     fn matching_metadata_reuses_the_baseline_digest() {
         let directory = fixture();
         let root_path = directory.path();
+        age(root_path, "alpha.txt");
         let mut baseline = scan_fixture(root_path, None);
 
         // Poison a baseline digest without touching the file. A scan that

@@ -1498,10 +1498,29 @@ impl Transitioner<'_> {
         // since vanished, and the controller runs another cycle immediately.
         let missing = |error: &io::Error| error.kind() == ErrorKind::NotFound;
 
+        // The achieved metadata is captured from the *staged* file, after
+        // its permissions are final and before the rename publishes it.
+        // Rename preserves inode, size, and modification time, so this is
+        // the same metadata a stat of the target would return when nothing
+        // interferes — with one decisive difference: it can never describe
+        // a foreign file. Stat'ing the target after the rename could catch
+        // an editor's save landing in that window, and the achieved node
+        // then paired the *requested* digest with the *editor's* metadata.
+        // Folded into the ancestor and the baseline, that pair made the
+        // editor's content invisible to every later scan and let a
+        // validated transition overwrite it.
+        let mut published: Option<FileMetadata> = None;
         let moved = last_use
             && fs::set_permissions(&staged, Permissions::from_mode(mode)).is_ok()
+            && {
+                published = fs::symlink_metadata(&staged)
+                    .ok()
+                    .map(|metadata| file_metadata(&metadata));
+                published.is_some()
+            }
             && fs::rename(&staged, target).is_ok();
         if !moved {
+            published = None;
             let temporary = parent.join(temporary_name("apply"));
             if let Err(error) = fs::copy(&staged, &temporary) {
                 let _ = fs::remove_file(&temporary);
@@ -1534,6 +1553,14 @@ impl Transitioner<'_> {
                 self.problem(path, format!("unable to set file permissions: {error}"));
                 return None;
             }
+            match fs::symlink_metadata(&temporary) {
+                Ok(metadata) => published = Some(file_metadata(&metadata)),
+                Err(error) => {
+                    let _ = fs::remove_file(&temporary);
+                    self.problem(path, format!("unable to probe staged content: {error}"));
+                    return None;
+                }
+            }
             if let Err(error) = fs::rename(&temporary, target) {
                 let _ = fs::remove_file(&temporary);
                 self.problem(path, format!("unable to publish content: {error}"));
@@ -1542,17 +1569,7 @@ impl Transitioner<'_> {
         }
 
         self.apply_ownership(path, target);
-
-        // The metadata recorded on the result node comes from the file as it
-        // now exists, so that the ancestor (and any scan warmed by it)
-        // describes reality rather than intent.
-        match fs::symlink_metadata(target) {
-            Ok(metadata) => Some(file_metadata(&metadata)),
-            Err(error) => {
-                self.problem(path, format!("unable to probe the created file: {error}"));
-                Some(FileMetadata::default())
-            }
-        }
+        published
     }
 
     /// Applies the configured ownership to a created entry (best-effort:
@@ -3296,6 +3313,14 @@ mod tests {
         let staging = keep.path().join("staging");
         fs::create_dir_all(&root).expect("root should be creatable");
         write(&root, "file.txt", "content");
+        // Backdated so the racy-timestamp rule does not (correctly) refuse
+        // reuse of a digest recorded for a just-written file.
+        fs::File::options()
+            .write(true)
+            .open(root.join("file.txt"))
+            .expect("file should open")
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(60))
+            .expect("mtime should be settable");
 
         // A first endpoint scans and persists the cache.
         let mut first =

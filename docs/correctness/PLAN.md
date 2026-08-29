@@ -53,12 +53,12 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 3 — the scan cannot be allowed to lie about content
 
-- [ ] **F2.1** On a size mismatch after read, keep the *original* stat's
+- [x] **F2.1** On a size mismatch after read, keep the *original* stat's
       metadata so the next scan is forced to re-read; never adopt the
       fresh stat beside a digest of bytes it does not describe.
-- [ ] **F2.2** The racy-timestamp rule: a digest is not reusable when its
+- [x] **F2.2** The racy-timestamp rule: a digest is not reusable when its
       recorded mtime is not strictly older than the scan's start.
-- [ ] **F1-chain** publish_file records metadata from a stat of the
+- [x] **F1-chain** publish_file records metadata from a stat of the
       *staged temporary* before the rename, never the target after it,
       so an achieved node can never describe a foreign file.
 

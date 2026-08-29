@@ -483,6 +483,16 @@ pub struct Snapshot {
     pub symlinks: u64,
     /// The total size of synchronizable file content.
     pub total_file_size: u64,
+    /// The wall-clock second at which the scan producing this snapshot
+    /// *started*. Digest reuse refuses any file whose recorded modification
+    /// time is not comfortably older than this: two writes landing in one
+    /// mtime granule are indistinguishable by metadata, so a file modified
+    /// around the time it was digested may have been rewritten afterwards
+    /// without moving its timestamp. Zero (the serde default, and what any
+    /// snapshot persisted before this field existed reports) makes nothing
+    /// reusable, which downgrades an old cache to one full re-read.
+    #[serde(default)]
+    pub scanned_at_seconds: i64,
 }
 
 impl Snapshot {

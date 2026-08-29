@@ -620,6 +620,34 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
     // with a remote agent — endpoint construction is expensive, can block
     // on the network, and has remote side effects.
     let lock = SessionLock::acquire(state_directory.clone())?;
+    // The pair lock is independent of the state root, so two supervisors
+    // pointed at different state directories cannot own the same trees.
+    let pair_lock =
+        crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
+
+    // The identity was resolved when the plan was built; between then and
+    // now a symlink along the path can have been retargeted, and connecting
+    // would bind whatever tree the path reaches *today* to the ancestor of
+    // the tree it reached *then* — provenance for the wrong root, which is
+    // how a deliberate revert gets silently overwritten. Refuse instead.
+    for (target, planned, side) in [
+        (&plan.alpha, &plan.alpha_identity, "alpha"),
+        (&plan.beta, &plan.beta_identity, "beta"),
+    ] {
+        if let EndpointTarget::Local(path) = target {
+            let resolved = crate::paths::resolve_for_identity(path)
+                .to_string_lossy()
+                .into_owned();
+            if &resolved != planned {
+                anyhow::bail!(
+                    "the {side} root {} no longer resolves to the tree it was planned \
+                     against ({planned} became {resolved}); refusing to attach its \
+                     session state to a different tree — restart to replan",
+                    path.display()
+                );
+            }
+        }
+    }
 
     let endpoint = |target: &EndpointTarget, side: &str| -> Result<Box<dyn Endpoint + Send>> {
         match target {
@@ -710,7 +738,9 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
 
     let alpha = endpoint(&plan.alpha, "alpha")?;
     let beta = endpoint(&plan.beta, "beta")?;
-    Session::with_lock(alpha, beta, plan.mode, lock)
+    let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
+    session.hold(pair_lock);
+    Ok(session)
 }
 
 /// Flattens a cycle report's problems into labeled lines.

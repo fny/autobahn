@@ -77,10 +77,10 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 5 — identity and exclusivity
 
-- [ ] **C2.3** The resolved local path travels in the SessionPlan;
+- [x] **C2.3** The resolved local path travels in the SessionPlan;
       connect() refuses when re-resolution differs from the identity the
       plan was built from.
-- [ ] **C2.4 / F2.4** An advisory lock keyed by resolved endpoint
+- [x] **C2.4 / F2.4** An advisory lock keyed by resolved endpoint
       identity, in a shared location independent of --state-root, so two
       state directories cannot own the same trees concurrently.
 

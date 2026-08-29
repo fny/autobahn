@@ -177,6 +177,14 @@ pub struct SessionPlan {
     pub alpha_spec: String,
     /// The beta destination.
     pub beta: EndpointTarget,
+    /// The alpha endpoint's resolved identity, frozen at plan time. The
+    /// worker that later connects re-resolves the live path and refuses to
+    /// proceed if the two disagree: between planning and connecting a
+    /// symlink can be retargeted, and a session that resolved one tree at
+    /// plan time must not bind another tree to the first one's ancestor.
+    pub alpha_identity: String,
+    /// The beta endpoint's resolved identity, frozen at plan time.
+    pub beta_identity: String,
     /// The synchronization mode.
     pub mode: SyncMode,
     /// The combined ignore patterns (defaults first, then the group's).
@@ -534,6 +542,8 @@ impl Config {
                     alpha,
                     alpha_spec: group.alpha.clone(),
                     beta: target,
+                    alpha_identity: alpha_identity.clone(),
+                    beta_identity: beta_identity.clone(),
                     mode,
                     ignores: ignores.clone(),
                     interval,

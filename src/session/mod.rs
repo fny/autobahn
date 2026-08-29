@@ -98,6 +98,9 @@ pub struct Session {
     mode: SyncMode,
     /// The persisted ancestor path.
     ancestor_store: ancestor::AncestorStore,
+    /// Exclusivity locks held for this session's lifetime (the endpoint
+    /// pair lock, when the caller acquired one).
+    held: Vec<EndpointPairLock>,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
     /// Whether the last cycle finished with the two sides synchronized and
@@ -158,6 +161,11 @@ impl Session {
         Session::with_lock(alpha, beta, mode, SessionLock::acquire(state_directory)?)
     }
 
+    /// Holds an exclusivity lock for this session's lifetime.
+    pub fn hold(&mut self, lock: EndpointPairLock) {
+        self.held.push(lock);
+    }
+
     /// Creates a session between the provided endpoints under an
     /// already-held state lock. This exists so that callers with expensive
     /// endpoint construction (spawning SSH, handshaking with an agent) can
@@ -172,6 +180,7 @@ impl Session {
         let ancestor_path = lock.state_directory().join("ancestor");
         let (ancestor_store, ancestor) = ancestor::AncestorStore::open(&ancestor_path)?;
         Ok(Session {
+            held: Vec::new(),
             alpha,
             beta,
             mode,
@@ -668,6 +677,66 @@ fn one_side_emptied_root(
     }
 }
 
+/// An exclusive lock on a *pair of endpoint identities*, machine-wide for
+/// this user, independent of any `--state-root` or `--state-dir` override.
+///
+/// The session lock guards a state directory, which is airtight only while
+/// every process selects the same state root. The supported overrides break
+/// that quietly: two state directories each hold their own ancestor for the
+/// same pair of trees, the two sessions reconcile from contradictory
+/// provenance, and content silently swaps sides before one of the versions
+/// is lost. This lock keys on what is actually being synchronized rather
+/// than on where its state lives. The pair is unordered, so the same two
+/// trees in opposite directions conflict as well; a fan-out (one alpha,
+/// many betas) and a relay (one's beta, another's alpha) key differently
+/// and stay legal.
+pub struct EndpointPairLock {
+    _lock: SessionLock,
+}
+
+impl EndpointPairLock {
+    /// Acquires the pair lock for two endpoint identities.
+    pub fn acquire(alpha_identity: &str, beta_identity: &str) -> Result<EndpointPairLock> {
+        // The *default* state root, deliberately — this directory must not
+        // move with the overrides whose divergence it exists to catch.
+        let root = crate::paths::default_state_root()?.join("endpoint-locks");
+        EndpointPairLock::acquire_in(&root, alpha_identity, beta_identity)
+    }
+
+    /// Acquires the pair lock under an explicit lock root (the seam tests
+    /// use so the mechanism can be exercised without touching the user's
+    /// real home directory).
+    fn acquire_in(
+        root: &Path,
+        alpha_identity: &str,
+        beta_identity: &str,
+    ) -> Result<EndpointPairLock> {
+        let (first, second) = if alpha_identity <= beta_identity {
+            (alpha_identity, beta_identity)
+        } else {
+            (beta_identity, alpha_identity)
+        };
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(first.as_bytes());
+        hasher.update(&[0]);
+        hasher.update(second.as_bytes());
+        let digest = hasher.finalize();
+        let mut key = String::with_capacity(32);
+        for byte in &digest.as_bytes()[..16] {
+            key.push_str(&format!("{byte:02x}"));
+        }
+        let directory = root.join(key);
+        let lock = SessionLock::acquire(directory).map_err(|error| {
+            anyhow::anyhow!(
+                "another session is already synchronizing these roots \
+                 ({first} and {second}), possibly under a different state \
+                 directory: {error:#}"
+            )
+        })?;
+        Ok(EndpointPairLock { _lock: lock })
+    }
+}
+
 /// How long lock acquisition keeps retrying before concluding the session
 /// genuinely belongs to someone else. See [`SessionLock::acquire`].
 const LOCK_ACQUISITION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -866,6 +935,29 @@ mod tests {
             Some(&empty),
             Some(&trivial)
         ));
+    }
+
+    /// The endpoint-pair lock is what keeps two state directories from
+    /// owning one pair of trees: direction-insensitive for the same pair,
+    /// and indifferent to pairs that merely share one endpoint (fan-out
+    /// and relay topologies stay legal).
+    #[test]
+    fn the_pair_lock_is_unordered_and_pair_scoped() {
+        let keep = tempfile::tempdir().unwrap();
+        let root = keep.path().join("locks");
+        let held = EndpointPairLock::acquire_in(&root, "/tree/a", "/tree/b")
+            .expect("first acquisition succeeds");
+        // The same pair, reversed, is the same two trees.
+        assert!(
+            EndpointPairLock::acquire_in(&root, "/tree/b", "/tree/a").is_err(),
+            "the reversed pair must conflict"
+        );
+        // Sharing one endpoint is a different pair.
+        EndpointPairLock::acquire_in(&root, "/tree/a", "/tree/c")
+            .expect("a fan-out pair must not conflict");
+        drop(held);
+        EndpointPairLock::acquire_in(&root, "/tree/b", "/tree/a")
+            .expect("the pair is free once released");
     }
 
     #[test]

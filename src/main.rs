@@ -447,6 +447,13 @@ fn run_sync(
 
     // Create the session and run.
     let mut session = Session::new(alpha_endpoint, beta_endpoint, mode.into(), state_directory)?;
+    // Exclusivity over the *trees*, not just the chosen state directory: a
+    // manual sync with --state-dir must not run beside a supervisor that
+    // owns the same pair under different state.
+    session.hold(autobahn::session::EndpointPairLock::acquire(
+        &alpha_identity,
+        &beta_identity,
+    )?);
     let mut follow_ups = 0u32;
     loop {
         let report = session.run_cycle()?;

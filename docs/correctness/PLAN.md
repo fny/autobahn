@@ -33,22 +33,22 @@ is), with verification infrastructure built *before* the fixes it checks.
 
 ## Phase 2 — the ancestor store, fixed under an enumerating adversary
 
-- [ ] **V1** Crash-point enumeration harness (proptest): drive
+- [x] **V1** Crash-point enumeration harness (proptest): drive
       record/checkpoint/reset/open sequences against an in-memory
       reference; for every byte-length prefix of the resulting files,
       reopen and assert acknowledged records survive and nothing
       unacknowledged is fabricated. Cut between the syscalls of
       checkpoint() and reset() as well. Expected to fail on C1.9, C1.10,
       C1.11 before the fixes; green after.
-- [ ] **C1.9 / C1.10** open() truncates what replay did not consume —
+- [x] **C1.9 / C1.10** open() truncates what replay did not consume —
       stale prefixes, torn tails, partial headers — so later appends can
       never sit behind dead bytes. Heals damaged journals on next open.
-- [ ] **C1.11** reset() removes the journal before the checkpoint.
-- [ ] **C1.8** checkpoint() syncs the temporary before rename and the
+- [x] **C1.11** reset() removes the journal before the checkpoint.
+- [x] **C1.8** checkpoint() syncs the temporary before rename and the
       directory before truncating the journal. Off the latency path.
-- [ ] **C1.12** Checkpoints carry the same truncated-BLAKE3 digest that
+- [x] **C1.12** Checkpoints carry the same truncated-BLAKE3 digest that
       journal records already do.
-- [ ] **C1.7** Correct the doc overclaim: the append is process-crash
+- [x] **C1.7** Correct the doc overclaim: the append is process-crash
       durable, not power-loss durable.
 
 ## Phase 3 — the scan cannot be allowed to lie about content

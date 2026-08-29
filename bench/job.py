@@ -755,7 +755,11 @@ def run_tool(tool, cell, emitter, nonce):
         if cell["agents"] == 0:
             emitter.emit({"measurement": "workload", "tool": tool,
                           "direction": "none", "skipped": "cold sync only"})
-            reports = []
+            # No workload ran, so there is nothing to have gone wrong with
+            # one and no outputs to account for. Both are read below, and
+            # leaving them unset raised UnboundLocalError on every cell
+            # with no agents.
+            clean, reports, outputs = True, [], []
         else:
             verify_partitions(corpora)
             phase("workload")
@@ -780,7 +784,9 @@ def run_tool(tool, cell, emitter, nonce):
             shift = 0.0 if r.get("local") else offset.get("offset_s", 0.0)
             windows.append((r["window_start_epoch"] - shift,
                             r["window_end_epoch"] - shift))
-        if clean and len(windows) == len(outputs):
+        # `windows` is empty for a cell that ran no workload, and an
+        # empty override would take min() of nothing.
+        if clean and windows and len(windows) == len(outputs):
             phases["workload"] = {
                 "start": min(start for start, _ in windows),
                 "end": max(end for _, end in windows),

@@ -651,9 +651,18 @@ def dispatch(options):
         # (for b-to-a), started and then *proven* listening before any job
         # is dispatched.
         # Every machine in the group, before anything measures.
+        #
+        # The driver is pushed rather than taken from the image. It is
+        # harness logic and changes far more often than the corpus it runs
+        # against, and a rebake to correct a Python file would re-clone a
+        # half-million-file repository. The harness binary stays baked,
+        # because the partitions it wrote are baked with it and the two
+        # have to agree.
         repairs = []
         for member in members:
             host = addresses[member][0]
+            run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} "
+                f"{HERE}/job.py ubuntu@{host}:~/bench/job.py")
             repairs.append((host, subprocess.Popen(
                 ["ssh", "-n", "-o", "StrictHostKeyChecking=accept-new",
                  "-i", key_path(key), f"ubuntu@{host}", PRISTINE_REPAIR],

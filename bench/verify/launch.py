@@ -63,6 +63,15 @@ def main():
         orchestrate.run(
             f"{ssh_a} 'printf \"Host dest\\n  HostName {b_private}\\n  User ubuntu\\n"
             f"  StrictHostKeyChecking accept-new\\n\" >> ~/.ssh/config; ssh -o ConnectTimeout=5 dest true'")
+        # The peer and self addresses, as dispatch writes them. Verification
+        # scripts read these to place observers; without them the address
+        # resolves to an empty string and every sample is censored.
+        orchestrate.run(
+            f"{ssh_a} 'mkdir -p ~/bench && echo {b_private} > ~/bench/peer-ip "
+            f"&& echo {a_private} > ~/bench/self-ip'")
+        orchestrate.run(
+            f"{ssh_b} 'mkdir -p ~/bench && echo {a_private} > ~/bench/peer-ip "
+            f"&& echo {b_private} > ~/bench/self-ip'")
 
         # Push the current tools over the baked ones, on both hosts.
         local = os.path.expanduser("~/Workspace/autobahn/target/x86_64-unknown-linux-musl/release/autobahn")
@@ -116,6 +125,10 @@ def _wire_fan(options, run_id, key, group, instances, addresses):
         hosts.append({"name": f"dest{index}", "public": public, "private": private})
 
     orchestrate.run(f"{ssh_source} 'printf \"{''.join(config)}\" >> ~/.ssh/config'")
+    privates = "\n".join(host["private"] for host in hosts)
+    orchestrate.run(
+        f"{ssh_source} 'mkdir -p ~/bench && printf {json.dumps(privates + chr(10))} "
+        f"> ~/bench/peer-ip && echo {source_private} > ~/bench/self-ip'")
     for index in range(1, len(destinations) + 1):
         orchestrate.run(f"{ssh_source} 'ssh -o ConnectTimeout=10 dest{index} true'")
 

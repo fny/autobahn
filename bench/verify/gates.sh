@@ -22,7 +22,7 @@ ssh -n dest "pkill -x 'autobahn(-linux-x86_64)?' 2>/dev/null; sleep 1; \
   rm -rf ~/dest/$C ~/.autobahn ~/.autobahn-dev ~/poll.sh; mkdir -p ~/dest; \
   cp -a ~/corpus/$C ~/dest/$C" >/dev/null 2>&1
 pkill -x autobahn 2>/dev/null
-pkill -f 'poll.sh' 2>/dev/null
+pkill -f '[p]oll\.sh' 2>/dev/null
 rm -rf ~/.autobahn ~/.autobahn-dev ~/state ~/arrivals.txt; mkdir -p ~/state
 rm -rf "$SRC/probe"; mkdir -p "$SRC/probe"
 ssh -n dest "rm -rf ~/dest/$C/probe" >/dev/null 2>&1
@@ -37,13 +37,15 @@ AUTOBAHN_SHARING_PROBE=1 setsid "$AB" up --config ~/gates.toml --state-root ~/st
 # session itself: one completed reconcile, then a canary edit that actually
 # lands on beta. The first cycle over 505k entries scans both sides, walks
 # the whole tree, and writes the initial ancestor, which takes minutes.
-for _ in $(seq 1 600); do
-  grep -q '\[sharing\]' ~/gates.log && break
+# A completed cycle announces itself; the sharing probe this used to wait
+# on was removed once it had answered its question.
+for _ in $(seq 1 900); do
+  grep -q 'synchronized' ~/gates.log && break
   pgrep -x autobahn >/dev/null || { echo "autobahn died:"; tail -5 ~/gates.log; exit 1; }
   sleep 2
 done
-grep -q '\[sharing\]' ~/gates.log || { echo "no cycle in 20 minutes"; tail -5 ~/gates.log; exit 1; }
-echo "first cycle done after $(grep -c '\[sharing\]' ~/gates.log) reconcile(s)"
+grep -q 'synchronized' ~/gates.log || { echo "no cycle in 30 minutes"; tail -5 ~/gates.log; exit 1; }
+echo "first cycle done"
 
 date +%s.%N > "$SRC/probe/canary"
 for _ in $(seq 1 300); do
@@ -92,7 +94,7 @@ for i in $(seq 1 "$N"); do
 done
 sleep 10
 kill $poller 2>/dev/null
-ssh -n dest 'pkill -f poll.sh' 2>/dev/null
+ssh -n dest 'pkill -f "[p]oll\.sh"' 2>/dev/null
 pkill -x autobahn 2>/dev/null
 
 stat() {

@@ -7,7 +7,7 @@
 # Usage: soak.sh <hours> [corpus]
 set -u
 HOURS=${1:-6}
-CORPUS=${2:-sub40k-a}
+CORPUS=${2:-sub50k}
 BM=~/bench/benchmark
 OUT=~/soak
 mkdir -p "$OUT"; rm -f "$OUT"/*.log "$OUT"/*.jsonl
@@ -15,7 +15,15 @@ mkdir -p "$OUT"; rm -f "$OUT"/*.log "$OUT"/*.jsonl
 rm -rf ~/.autobahn ~/.autobahn-dev
 ssh -n dest "rm -rf ~/dest/$CORPUS && mkdir -p ~/dest/$CORPUS"
 # The observer lives on the destination, watching the tree it receives.
-ssh -n dest "pkill -f 'benchmark [o]bserver' 2>/dev/null; setsid nohup ~/bench/benchmark observer 9911 > ~/observer.log 2>&1 < /dev/null &"
+# Two calls, and matched by process name rather than command line: a
+# -f pattern for "benchmark observer" also matches the very command that
+# starts one, so a single line would kill its own shell before the
+# observer existed. Nothing else on the destination runs as `benchmark`.
+ssh -n dest "pkill -x benchmark 2>/dev/null; true"
+ssh -n dest "setsid nohup ~/bench/benchmark observer 9911 > ~/observer.log 2>&1 < /dev/null &"
+sleep 2
+ssh -n dest "pgrep -x benchmark > /dev/null" \
+  || { echo "the observer did not start on the destination"; exit 1; }
 sleep 2
 cat > "$OUT/ab.toml" <<TOML
 [groups.soak]
@@ -35,11 +43,14 @@ sleep 60   # let the first synchronization finish
     [ -z "$pid" ] && { echo "$(date +%s) AUTOBAHN_GONE"; sleep 30; continue; }
     rss=$(awk '/VmRSS/{print $2}' /proc/$pid/status 2>/dev/null)
     fds=$(ls /proc/$pid/fd 2>/dev/null | wc -l)
-    watches=$(find /proc/$pid/fd -lname anon_inode:inotify 2>/dev/null | wc -l)
+    # Watch descriptors, not inotify instances. The instance count is
+    # always one and says nothing; the watch count is one per directory
+    # and is the number that would reveal a leak.
+    watches=$(cat /proc/$pid/fdinfo/* 2>/dev/null | grep -c '^inotify wd:')
     stag=$(find ~/.autobahn -type d -name 'staging*' 2>/dev/null | head -1)
     sfiles=$( [ -n "$stag" ] && find "$stag" -type f 2>/dev/null | wc -l || echo 0)
     skb=$( [ -n "$stag" ] && du -sk "$stag" 2>/dev/null | cut -f1 || echo 0)
-    dfiles=$(find ~/dest/$CORPUS -type f 2>/dev/null | wc -l)
+    dfiles=$(ssh -n -o ConnectTimeout=5 dest "find ~/dest/$CORPUS -type f 2>/dev/null | wc -l" 2>/dev/null || echo 0)
     echo "$(date +%s) ${rss:-0} $fds $watches $sfiles $skb $dfiles"
     sleep 30
   done

@@ -163,8 +163,7 @@ Still open, in order:
       residual, and power-loss modelling for the ancestor store (the
       enumeration proves process-crash truncation only; header fields sit
       outside the record digests).
-- [ ] **Known-and-retained**: single-huge-file mounts can evade the
-      emptied guard (count is the trigger; byte thresholds would halt
-      routine large-file deletions for the same on-disk signature);
-      pathname TOCTOU outside Linux creations; the dirfd traversal
-      refactor.
+- [x] **Known-and-retained** residuals are documented with their
+      reasoning, reopening conditions, and would-be fixes in
+      `RETAINED.md`; the five open risks have their execution plan in
+      `NEXT.md`.

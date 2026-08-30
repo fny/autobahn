@@ -2693,8 +2693,12 @@ mod tests {
     }
 
     /// A creation must refuse to replace content that appeared after its
-    /// absence check — RENAME_NOREPLACE closes the window atomically on
-    /// Linux, and this pins the helper's two behaviors.
+    /// absence check, on every platform that can express that atomically:
+    /// `RENAME_NOREPLACE` on Linux, `renamex_np(RENAME_EXCL)` on macOS.
+    /// Platforms with neither — FreeBSD among them — keep the plain
+    /// rename and therefore the documented check-then-rename window
+    /// (RETAINED.md section 2); this pins which behavior each gets rather
+    /// than assuming the atomic one everywhere.
     #[test]
     fn a_creation_rename_refuses_to_replace() {
         let keep = tempdir().expect("temporary directory");
@@ -2703,7 +2707,15 @@ mod tests {
         fs::write(&source, b"staged").expect("writes");
         fs::write(&target, b"an editor's save").expect("writes");
 
+        let atomic_no_replace = cfg!(any(target_os = "linux", target_os = "macos"));
         let refused = publish_rename(&source, &target, false);
+        if !atomic_no_replace {
+            // The residual, pinned as a residual: the rename lands, and
+            // the platform is one this project documents as windowed.
+            assert!(refused.is_ok(), "the fallback rename must still work");
+            assert_eq!(fs::read(&target).expect("reads"), b"staged");
+            return;
+        }
         assert!(refused.is_err(), "a creation replaced existing content");
         assert_eq!(
             fs::read(&target).expect("reads"),

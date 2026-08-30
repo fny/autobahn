@@ -189,8 +189,11 @@ lifecycle harness of I5.
 
 **Boundary.** Check and use are separated by a pathname re-resolution
 window for *replacements and removals on every platform*, and for
-creations outside Linux — RETAINED.md §2 (findings I4-A and I4-C
-sharpened its scope). Lease validation compares metadata, not content:
+creations on platforms with no atomic no-replace rename — Linux
+(`RENAME_NOREPLACE`) and macOS (`renamex_np`) have one, FreeBSD and the
+other BSDs do not — RETAINED.md §2 (findings I4-A and I4-C sharpened
+its scope; `a_creation_rename_refuses_to_replace` pins which behavior
+each platform gets). Lease validation compares metadata, not content:
 a same-length rewrite with restored metadata passes it — RETAINED.md
 §5 (finding I4-B).
 

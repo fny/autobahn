@@ -790,9 +790,16 @@ mod tests {
             match channel.exchange(Request::StagePush(Vec::new())) {
                 Ok(_) => std::thread::sleep(std::time::Duration::from_millis(10)),
                 Err(error) => {
+                    // The requirement is that the protocol violation fails
+                    // the *connection*, not that this exchange is the one
+                    // to name it: the reader thread may tear the
+                    // connection down before this call reaches it, in
+                    // which case the caller legitimately sees the closure
+                    // instead of the diagnosis.
+                    let message = format!("{error:#}");
                     assert!(
-                        format!("{error:#}").contains("unsolicited"),
-                        "unexpected error: {error:#}"
+                        message.contains("unsolicited") || message.contains("connection"),
+                        "unexpected error: {message}"
                     );
                     failed = true;
                     break;

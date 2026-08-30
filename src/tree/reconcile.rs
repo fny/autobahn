@@ -143,6 +143,26 @@ impl Reconciler {
             return;
         }
 
+        // The other signature of mass disappearance: the directory node
+        // itself vanished on exactly one side — a removed mountpoint, or
+        // rm -rf of the directory — while the ancestor records a
+        // substantial tree beneath it. The existing-but-empty form is
+        // guarded on the descend path below; this form never reaches that
+        // branch, because absent-versus-directory is a disagreement.
+        if !path.is_empty() && self.result.emptied_subtree.is_none() {
+            let vanished = |node: Option<&Node>| node.is_none();
+            let populated = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Directory(_)));
+            if ((vanished(alpha) && populated(beta)) || (vanished(beta) && populated(alpha)))
+                && ancestor.is_some_and(|node| {
+                    matches!(node.content, Content::Directory(_))
+                        && entries_below(node) >= EMPTIED_SUBTREE_MINIMUM
+                })
+            {
+                self.result.emptied_subtree = Some(path.to_owned());
+                return;
+            }
+        }
+
         // If alpha and beta agree (shallowly) at this path, then recurse.
         if shallow_equal(alpha, beta) {
             // The emptied-subtree guard, at the only place it can trigger:

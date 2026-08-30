@@ -107,6 +107,10 @@ pub struct Session {
     /// When set, the next cycle's scans re-read every file's content —
     /// the verify verb's request.
     verify_next: bool,
+    /// Whether either endpoint's tree lives on another machine, which is
+    /// what makes intent records worth a sync on every mutating cycle
+    /// (see [`ancestor::AncestorStore::intend`]).
+    remote_involved: bool,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
     /// Whether the last cycle finished with the two sides synchronized and
@@ -251,11 +255,13 @@ impl Session {
                 ancestor = tainted;
             }
         }
+        let remote_involved = alpha.is_remote() || beta.is_remote();
         Ok(Session {
             held: Vec::new(),
             #[cfg(test)]
             fail_before_record: false,
             verify_next: false,
+            remote_involved,
             alpha,
             beta,
             mode,
@@ -490,7 +496,8 @@ impl Session {
                 &reconciliation.beta_transitions,
             )?;
             if !intent_recorded {
-                self.ancestor_store.intend(&intended)?;
+                self.ancestor_store
+                    .intend(&intended, self.remote_involved)?;
                 intent_recorded = true;
             }
             Some(
@@ -508,7 +515,8 @@ impl Session {
                 &reconciliation.alpha_transitions,
             )?;
             if !intent_recorded {
-                self.ancestor_store.intend(&intended)?;
+                self.ancestor_store
+                    .intend(&intended, self.remote_involved)?;
                 intent_recorded = true;
             }
             Some(
@@ -985,12 +993,27 @@ mod tests {
         );
         assert_eq!(result.emptied_subtree.as_deref(), Some("data"));
 
-        // Deleting the directory itself is an ordinary deletion.
+        // A subtree whose directory node vanished entirely — a removed
+        // mountpoint, or rm -rf of the directory — is the same mass
+        // disappearance with a different on-disk signature, and it halts
+        // the same way.
         let mount_deleted = Node::directory("", vec![file("readme", 9)]);
         let result = crate::tree::reconcile(
             Some(&with_mount),
             Some(&mount_deleted),
             Some(&with_mount),
+            SyncMode::TwoWaySafe,
+        );
+        assert_eq!(result.emptied_subtree.as_deref(), Some("data"));
+
+        // A small directory's outright deletion still propagates without
+        // ceremony.
+        let with_small_data = Node::directory("", vec![file("readme", 9), big_data(3)]);
+        let small_deleted = Node::directory("", vec![file("readme", 9)]);
+        let result = crate::tree::reconcile(
+            Some(&with_small_data),
+            Some(&small_deleted),
+            Some(&with_small_data),
             SyncMode::TwoWaySafe,
         );
         assert!(result.emptied_subtree.is_none());
@@ -1837,5 +1860,66 @@ mod tests {
         let report = cycle_to_quiescence(&mut session);
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         assert_eq!(read_or_absent(&beta_root, "payload.bin"), Some(content));
+    }
+
+    /// A session with a remote endpoint asks for durable intents: the
+    /// peer's machine persists transitions independently of this
+    /// machine's page cache, so an unsynced intent is no ordering at all.
+    #[test]
+    fn a_remote_endpoint_makes_the_intent_durable() {
+        struct RemoteFlagged(ScriptedEndpoint);
+        impl Endpoint for RemoteFlagged {
+            fn is_remote(&self) -> bool {
+                true
+            }
+            fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+                self.0.scan()
+            }
+            fn stage_begin(
+                &mut self,
+                files: Vec<FileRequest>,
+            ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+                self.0.stage_begin(files)
+            }
+            fn supply_open(&mut self, needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+                self.0.supply_open(needs)
+            }
+            fn supply_pull(
+                &mut self,
+                max_frames: usize,
+            ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+                self.0.supply_pull(max_frames)
+            }
+            fn stage_push(&mut self, frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+                self.0.stage_push(frames)
+            }
+            fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+                self.0.transition(transitions)
+            }
+        }
+
+        let cycle_syncs = |remote: bool| {
+            let keep = tempfile::tempdir().unwrap();
+            let state = keep.path().join("state");
+            std::fs::create_dir_all(&state).unwrap();
+            let content = || Node::directory("", vec![file("target", 1)]);
+            let alpha = ScriptedEndpoint::new(vec![scripted(content())]);
+            let beta: Box<dyn Endpoint + Send> = if remote {
+                Box::new(RemoteFlagged(ScriptedEndpoint::new(vec![scripted(
+                    Node::directory("", vec![]),
+                )])))
+            } else {
+                Box::new(ScriptedEndpoint::new(vec![scripted(Node::directory(
+                    "",
+                    vec![],
+                ))]))
+            };
+            let mut session =
+                Session::new(Box::new(alpha), beta, SyncMode::TwoWaySafe, state).unwrap();
+            session.run_cycle().expect("the cycle runs");
+            session.ancestor_store.append_syncs
+        };
+        assert_eq!(cycle_syncs(true), 1, "a remote session syncs its intent");
+        assert_eq!(cycle_syncs(false), 0, "a local session does not");
     }
 }

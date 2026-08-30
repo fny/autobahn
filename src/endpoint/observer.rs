@@ -145,6 +145,11 @@ pub struct RootObserver {
     /// exists to protect.
     #[cfg(test)]
     pub(crate) after_walk: Mutex<Option<Box<dyn Fn() + Send>>>,
+    /// A test seam that keeps the watcher from ever starting, modelling
+    /// the polling fallback: the worst case for the generation protocol,
+    /// because no kernel event ever arrives to stamp a stale publication.
+    #[cfg(test)]
+    pub(crate) suppress_watching: std::sync::atomic::AtomicBool,
 }
 
 impl RootObserver {
@@ -187,6 +192,13 @@ impl RootObserver {
     /// watch walks the whole root, and the usual cause of failure is a host
     /// already at its watch limit.
     fn ensure_watching(&self) {
+        #[cfg(test)]
+        if self
+            .suppress_watching
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.watcher.is_some() {
             return;
@@ -419,9 +431,10 @@ impl RootObserver {
     /// refused: adopting it would roll the baseline back past a change
     /// whose dirty marks a scan has already consumed, and the next scan
     /// would adopt the rolled-back record for paths nothing tells it to
-    /// re-read. The offerer's own writes stay safe under refusal — their
-    /// paths were marked when the transition invalidated them, and the
-    /// watcher's events re-mark whatever lands late.
+    /// re-read. The offerer's own writes stay safe under refusal — the
+    /// transition announces its paths again after its last write, so even
+    /// a scan that consumed the pre-write marks is outdated by the time
+    /// the offer could be refused.
     pub fn offer_baseline(&self, folded: Snapshot, based_on: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if based_on < state.baseline_generation {
@@ -534,6 +547,8 @@ pub fn observer_for(
         writer: crate::persist::StateWriter::new(),
         #[cfg(test)]
         after_walk: Mutex::new(None),
+        #[cfg(test)]
+        suppress_watching: std::sync::atomic::AtomicBool::new(false),
     });
     // A cold start seeds the baseline from the persisted cache, so the first
     // scan of a process re-digests only what changed since the last one.

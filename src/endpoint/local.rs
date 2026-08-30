@@ -129,6 +129,11 @@ pub struct LocalEndpoint {
     /// cache, however many sessions synchronize it. See
     /// [`observer`](crate::endpoint::observer) for why.
     observer: Arc<crate::endpoint::observer::RootObserver>,
+    /// A test seam between the transition's announcement and its writes —
+    /// the window in which a sharing session's scan can consume the
+    /// announced dirty marks and still read the old bytes.
+    #[cfg(test)]
+    pub(crate) between_announce_and_writes: Option<Box<dyn Fn() + Send>>,
     /// The generation this endpoint's last scan reflects, so it waits only
     /// for changes it has not already seen.
     seen_generation: u64,
@@ -377,6 +382,8 @@ impl LocalEndpoint {
                 observer_ignores,
                 cache_path,
             ),
+            #[cfg(test)]
+            between_announce_and_writes: None,
             seen_generation: 0,
             last_snapshot: None,
             supply: None,
@@ -983,6 +990,10 @@ impl Endpoint for LocalEndpoint {
         // other session sharing this root would then reconcile against.
         self.observer
             .invalidate(transitions.iter().map(|change| change.path.as_str()));
+        #[cfg(test)]
+        if let Some(hook) = &self.between_announce_and_writes {
+            hook();
+        }
 
         let mut transitioner = Transitioner {
             root: &self.root,
@@ -1031,6 +1042,17 @@ impl Endpoint for LocalEndpoint {
             missing_staged_files: transitioner.missing_staged_files,
             missing_staged: transitioner.missing_staged,
         };
+
+        // The paths are announced *again* now that the writes are done.
+        // The pre-write announcement keeps a racing scan from adopting its
+        // baseline; but such a scan consumes the announced dirty marks and
+        // can still read the old bytes before they change, publishing them
+        // at the announced generation. Only this post-write announcement
+        // deterministically outdates that publication — the kernel's own
+        // events do the same job, but they arrive on their own schedule
+        // and never arrive at all under the polling fallback.
+        self.observer
+            .invalidate(transitions.iter().map(|change| change.path.as_str()));
 
         // A problem means the filesystem disagreed with the snapshot the
         // transition was validated against, so the snapshot is known to be
@@ -1590,15 +1612,26 @@ impl Transitioner<'_> {
         // Folded into the ancestor and the baseline, that pair made the
         // editor's content invisible to every later scan and let a
         // validated transition overwrite it.
+        // The move is taken only for a staged entry that is still a
+        // regular file whose bytes still match the digest. Receive
+        // verified those bytes once, but the digest-named path is
+        // addressable between then and now, and a rename would promote
+        // whatever sits there into the tree *as* the verified content —
+        // with the achieved record then pairing the requested digest with
+        // the impostor's own metadata, hiding it from every later scan.
+        // Anything doubtful falls through to the copy path, which digests
+        // what it moves and turns a mismatch into a retransfer.
         let mut published: Option<FileMetadata> = None;
         let moved = last_use
             && fs::set_permissions(&staged, Permissions::from_mode(mode)).is_ok()
             && {
                 published = fs::symlink_metadata(&staged)
                     .ok()
+                    .filter(|metadata| metadata.file_type().is_file())
                     .map(|metadata| file_metadata(&metadata));
                 published.is_some()
             }
+            && staged_content_matches(&staged, digest)
             && publish_rename(&staged, target, replace).is_ok();
         if !moved {
             let temporary = parent.join(temporary_name("apply"));
@@ -3827,5 +3860,164 @@ mod tests {
         assert!(validate_path("a/../b").is_err());
         assert!(validate_path("a//b").is_err());
         assert!(validate_path("a/./b").is_err());
+    }
+
+    /// Finding I1-A: a sharing session's scan that lands between a
+    /// transition's announcement and its writes reads the old bytes at the
+    /// announced generation. The transition's completion must outdate that
+    /// publication — under the polling fallback, where no kernel event
+    /// will ever do it instead.
+    #[test]
+    fn a_scan_racing_a_transition_cannot_outlive_the_writes() {
+        use std::sync::atomic::Ordering;
+        let mut fixture = Fixture::new();
+        fixture
+            .beta
+            .observer
+            .suppress_watching
+            .store(true, Ordering::SeqCst);
+
+        // Converge on the old content first.
+        write(&fixture.alpha_root, "file.txt", "the old contents");
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        fixture
+            .beta
+            .transition(transitions)
+            .expect("the converge transition applies");
+
+        // The change the racing scan will straddle.
+        write(&fixture.alpha_root, "file.txt", "the new contents!!");
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+
+        // The sharing session scans inside the announce window: after the
+        // paths are invalidated, before any byte is written.
+        let observer = std::sync::Arc::clone(&fixture.beta.observer);
+        let racing = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let stash = std::sync::Arc::clone(&racing);
+        fixture.beta.between_announce_and_writes = Some(Box::new(move || {
+            *stash.lock().unwrap() = Some(observer.scan(None).expect("the racing scan runs"));
+        }));
+        fixture
+            .beta
+            .transition(transitions)
+            .expect("the raced transition applies");
+        fixture.beta.between_announce_and_writes = None;
+
+        let (stale_snapshot, stale_generation) =
+            racing.lock().unwrap().take().expect("the seam fired");
+        let digest_of = |snapshot: &Snapshot| match &snapshot
+            .root
+            .as_ref()
+            .and_then(|root| root.child("file.txt"))
+            .expect("file.txt is recorded")
+            .content
+        {
+            Content::File { digest, .. } => *digest,
+            other => panic!("file.txt is {other:?}"),
+        };
+        // The racing scan legitimately read the old bytes...
+        assert_eq!(
+            digest_of(&stale_snapshot),
+            *blake3::hash(b"the old contents").as_bytes()
+        );
+        // ...but the completed transition must have outdated its
+        // publication: nothing else ever will in the polling fallback.
+        assert!(
+            stale_generation < fixture.beta.observer.generation(),
+            "the stale racing scan still claims the current generation"
+        );
+        // And a scan now sees what is actually on disk.
+        let fresh = fixture.beta.scan().expect("the follow-up scan runs");
+        assert_eq!(
+            digest_of(&fresh),
+            *blake3::hash(b"the new contents!!").as_bytes()
+        );
+    }
+
+    /// Finding I3-A: the last-use publish path renames staged content
+    /// straight into the tree. Content tampered with after its receive
+    /// verification must not ride that rename under the original digest —
+    /// the record would then suppress every later scan's detection and
+    /// propagate the tampered bytes as verified.
+    #[test]
+    fn tampered_staged_content_is_never_published_by_the_move_path() {
+        let mut fixture = Fixture::new();
+        let genuine: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 249) as u8).collect();
+        let tampered: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 247) as u8).collect();
+        let root = fixture.alpha_root.join("payload.bin");
+        fs::write(&root, &genuine).expect("alpha content is writable");
+
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        // The tamper: same length, wrong bytes, at the digest-named path.
+        let digest = *blake3::hash(&genuine).as_bytes();
+        let staged = staged_path(&fixture.beta.staging_root, &digest);
+        fs::write(&staged, &tampered).expect("the staged file is writable");
+
+        let outcome = fixture
+            .beta
+            .transition(transitions)
+            .expect("the transition itself runs");
+        let landed = fs::read(fixture.beta_root.join("payload.bin")).ok();
+        assert_ne!(
+            landed.as_deref(),
+            Some(tampered.as_slice()),
+            "tampered bytes were published under the genuine digest"
+        );
+        assert!(
+            outcome.missing_staged_files,
+            "the tamper must schedule a retransfer"
+        );
+
+        // The retransfer converges on the genuine bytes.
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        fixture
+            .beta
+            .transition(transitions)
+            .expect("the follow-up transition runs");
+        assert_eq!(
+            fs::read(fixture.beta_root.join("payload.bin"))
+                .ok()
+                .as_deref(),
+            Some(genuine.as_slice())
+        );
+    }
+
+    /// The symlink variant of the same finding: a staged entry swapped for
+    /// a symlink — even one pointing at content with the right bytes —
+    /// must never be renamed into the tree as if it were the verified
+    /// regular file.
+    #[test]
+    fn a_staged_symlink_is_never_published_by_the_move_path() {
+        let mut fixture = Fixture::new();
+        let genuine: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 233) as u8).collect();
+        fs::write(fixture.alpha_root.join("payload.bin"), &genuine)
+            .expect("alpha content is writable");
+
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        let digest = *blake3::hash(&genuine).as_bytes();
+        let staged = staged_path(&fixture.beta.staging_root, &digest);
+        let decoy = fixture.beta.staging_root.join("decoy");
+        fs::write(&decoy, &genuine).expect("the decoy is writable");
+        fs::remove_file(&staged).expect("the staged file is removable");
+        std::os::unix::fs::symlink(&decoy, &staged).expect("the swap succeeds");
+
+        let _ = fixture
+            .beta
+            .transition(transitions)
+            .expect("the transition itself runs");
+        let target = fixture.beta_root.join("payload.bin");
+        if let Ok(metadata) = fs::symlink_metadata(&target) {
+            // Not landing at all is safe; landing as anything but the
+            // verified regular file is not.
+            assert!(
+                metadata.file_type().is_file(),
+                "a symlink was published as a verified regular file"
+            );
+        }
     }
 }

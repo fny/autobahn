@@ -76,6 +76,14 @@ pub(crate) struct AncestorStore {
     journal_bytes: u64,
     /// Whether appends sync before acknowledging (power-loss durability).
     sync_appends: bool,
+    /// How many appends actually synced, so a test can hold the durability
+    /// contract without a way to cut the power.
+    #[cfg(test)]
+    pub(crate) append_syncs: u64,
+    /// Simulates a checkpoint directory sync failure, so a test can hold
+    /// the compaction ordering on filesystems where it cannot really fail.
+    #[cfg(test)]
+    pub(crate) fail_directory_sync: bool,
     /// The journal, held open across appends. An intent and an achieved
     /// record per cycle would otherwise cost two opens per cycle, which
     /// measured as two to four milliseconds of p50 on the edit path. The
@@ -187,6 +195,10 @@ impl AncestorStore {
                 checkpoint_bytes,
                 journal_bytes,
                 sync_appends: false,
+                #[cfg(test)]
+                append_syncs: 0,
+                #[cfg(test)]
+                fail_directory_sync: false,
                 journal: None,
             },
             ancestor,
@@ -205,12 +217,27 @@ impl AncestorStore {
     /// Records the paths the current cycle is about to mutate, before any
     /// endpoint transition runs. Does not advance the generation: an
     /// intent is a marker, not a state.
-    pub(crate) fn intend(&mut self, paths: &[String]) -> Result<()> {
+    ///
+    /// `durable` forces the append onto stable storage whatever the
+    /// configured durability. The session sets it whenever a remote
+    /// endpoint participates: the peer's machine persists the transition
+    /// independently of this machine's page cache, so no writeback
+    /// reordering is even needed for a power loss to drop the intent
+    /// while the mutation survives — and the stale ancestor then reads a
+    /// revert made while the tool was down as "unchanged". One sync per
+    /// mutating cycle, issued before any transition and invisible next
+    /// to a network round trip, is the entire cost. A local-local
+    /// session keeps the configured durability: losing the intent there
+    /// requires the storage stack to reorder two writes to the same disk
+    /// (the same residual class the module documents for the journal
+    /// tail), and `durability = "power"` closes it for those who need
+    /// that closed.
+    pub(crate) fn intend(&mut self, paths: &[String], durable: bool) -> Result<()> {
         if paths.is_empty() {
             return Ok(());
         }
         let record = self.encode(&JournalEntry::Intent(paths.to_vec()))?;
-        self.append(&record)
+        self.append(&record, durable || self.sync_appends)
     }
 
     /// Discards the stored ancestor entirely, so the next cycle reconciles
@@ -258,7 +285,7 @@ impl AncestorStore {
             return Ok(());
         }
 
-        self.append(&record)?;
+        self.append(&record, self.sync_appends)?;
         self.generation += 1;
 
         if self.journal_bytes > self.compaction_threshold() {
@@ -279,8 +306,10 @@ impl AncestorStore {
     }
 
     /// Appends one encoded record, rolling back a partial write.
-    fn append(&mut self, record: &[u8]) -> Result<()> {
+    fn append(&mut self, record: &[u8], sync: bool) -> Result<()> {
+        let mut created = false;
         if self.journal.is_none() {
+            created = !self.journal_path.exists();
             self.journal = Some(
                 OpenOptions::new()
                     .create(true)
@@ -300,10 +329,28 @@ impl AncestorStore {
             let _ = journal.set_len(self.journal_bytes);
             return Err(error).context("unable to append to the ancestor journal");
         }
-        if self.sync_appends {
+        if sync {
             journal
                 .sync_data()
                 .context("unable to sync the ancestor journal")?;
+            // A synced record in a journal file this very append created is
+            // still not durable: the file's directory entry needs its own
+            // sync, or the whole file — record included — can vanish with
+            // the power. Failure to confirm that is failure, not a shrug:
+            // the caller is about to act on the record's durability.
+            if created {
+                let parent = self
+                    .journal_path
+                    .parent()
+                    .context("the ancestor journal has no parent directory")?;
+                File::open(parent)
+                    .and_then(|directory| directory.sync_all())
+                    .context("unable to sync the ancestor journal's directory")?;
+            }
+            #[cfg(test)]
+            {
+                self.append_syncs += 1;
+            }
         }
         self.journal_bytes += record.len() as u64;
         Ok(())
@@ -352,11 +399,25 @@ impl AncestorStore {
         }
         fs::rename(&temporary, &self.checkpoint_path)
             .context("unable to publish the ancestor checkpoint")?;
-        if let Some(parent) = self.checkpoint_path.parent() {
-            if let Ok(directory) = File::open(parent) {
-                let _ = directory.sync_all();
-            }
+        // The rename's durability must be *confirmed* before the journal —
+        // the only other copy of these generations — is cleared. A failed
+        // directory sync is therefore an error, not a shrug: leaving the
+        // journal untouched is already safe (replay skips spent records,
+        // and the next open's normalization retires them), while clearing
+        // it after an unconfirmed rename lets a power loss persist the
+        // truncation, drop the rename, and silently roll the ancestor back
+        // to the previous checkpoint.
+        let parent = self
+            .checkpoint_path
+            .parent()
+            .context("the ancestor checkpoint has no parent directory")?;
+        #[cfg(test)]
+        if self.fail_directory_sync {
+            anyhow::bail!("test seam: the checkpoint directory sync failed");
         }
+        File::open(parent)
+            .and_then(|directory| directory.sync_all())
+            .context("unable to sync the ancestor checkpoint's directory")?;
 
         // Truncation rather than removal: an empty journal and a missing one
         // mean the same thing to replay, and truncating cannot race a reader
@@ -1009,7 +1070,7 @@ mod tests {
                     // boundaries, which is exactly what makes them worth
                     // weaving into the enumeration.
                     store
-                        .intend(&[format!("p{operation}")])
+                        .intend(&[format!("p{operation}")], false)
                         .expect("intends");
                     continue;
                 }
@@ -1150,7 +1211,9 @@ mod tests {
             .expect("records");
 
         // The cycle announces, then crashes before achieving.
-        store.intend(&["b".into(), "c".into()]).expect("intends");
+        store
+            .intend(&["b".into(), "c".into()], false)
+            .expect("intends");
         let (mut store, loaded, unresolved) = AncestorStore::open(&path).expect("reopens");
         assert!(same(&loaded, &first), "the intent must not change state");
         assert_eq!(unresolved, vec!["b".to_string(), "c".to_string()]);
@@ -1179,7 +1242,7 @@ mod tests {
         store
             .record(&[change("", first.clone())], first.as_ref())
             .expect("records");
-        store.intend(&["b".into()]).expect("intends");
+        store.intend(&["b".into()], false).expect("intends");
 
         // Damage the tail so the next open normalizes.
         let journal = journal_path(&path);
@@ -1241,5 +1304,117 @@ mod tests {
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("corrupt"), "{error:#}");
+    }
+
+    /// Finding I2-B: an intent orders nothing unless it is on stable
+    /// storage before the transitions it announces. A durable intent —
+    /// requested by any session with a remote endpoint — syncs whatever
+    /// the configured durability; achieved records still sync only under
+    /// durability = "power".
+    #[test]
+    fn a_durable_intent_syncs_whatever_the_configured_durability() {
+        let keep = tempfile::tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+        assert_eq!(store.append_syncs, 0);
+
+        store
+            .intend(&["p".to_owned()], true)
+            .expect("the intent appends");
+        assert_eq!(store.append_syncs, 1, "a durable intent must sync");
+
+        let tree = Some(Node::directory("", vec![file("a", 1)]));
+        store
+            .record(&[change("", tree.clone())], tree.as_ref())
+            .expect("the record appends");
+        store
+            .intend(&["p".to_owned()], false)
+            .expect("the intent appends");
+        assert_eq!(
+            store.append_syncs, 1,
+            "default durability syncs neither achieved records nor \
+             local-session intents"
+        );
+
+        store.set_power_durability(true);
+        store
+            .intend(&["p".to_owned()], false)
+            .expect("the intent appends");
+        store
+            .record(&[change("b", Some(file("b", 2)))], tree.as_ref())
+            .expect("the record appends");
+        assert_eq!(
+            store.append_syncs, 3,
+            "power durability syncs both record kinds"
+        );
+    }
+
+    /// Finding I10-B: compaction must not clear the journal — the only
+    /// other copy of the acknowledged generations — until the checkpoint
+    /// rename's durability is confirmed. A failed directory sync is an
+    /// error that leaves the journal intact, and everything acknowledged
+    /// must survive a reopen.
+    #[test]
+    fn an_unconfirmed_checkpoint_never_clears_the_journal() {
+        let keep = tempfile::tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+
+        // The first record carries the whole tree and checkpoints cleanly.
+        let mut children = vec![file("seed", 0)];
+        let tree = |children: &Vec<Node>| Some(Node::directory("", children.clone()));
+        let first = tree(&children);
+        store
+            .record(&[change("", first.clone())], first.as_ref())
+            .expect("the seed record lands");
+
+        // Journal records accumulate until compaction fires — into a
+        // directory sync that "fails". The checkpoint bytes are saved
+        // first: after the failure, the power loss the ordering guards
+        // against is simulated by putting them back, dropping the
+        // unconfirmed rename while keeping whatever happened to the
+        // journal — which must therefore still hold the records.
+        let saved_checkpoint = std::fs::read(&path).ok();
+        store.fail_directory_sync = true;
+        let mut acknowledged = first;
+        let mut failed = false;
+        for index in 1..10_000u32 {
+            let name = format!("f{index}");
+            children.push(file(&name, (index % 250) as u8));
+            let next = tree(&children);
+            match store.record(
+                &[change(&name, Some(file(&name, (index % 250) as u8)))],
+                next.as_ref(),
+            ) {
+                Ok(()) => acknowledged = next,
+                Err(error) => {
+                    assert!(format!("{error:#}").contains("test seam"), "{error:#}");
+                    failed = true;
+                    break;
+                }
+            }
+        }
+        assert!(failed, "compaction never triggered the seam");
+        drop(store);
+
+        // The simulated power loss: the unconfirmed checkpoint rename is
+        // dropped; the journal's state stays as the crash left it.
+        match saved_checkpoint {
+            Some(bytes) => std::fs::write(&path, bytes).unwrap(),
+            None => std::fs::remove_file(&path).unwrap(),
+        }
+
+        // Everything acknowledged survives the failed compaction.
+        let (_, node, unresolved) = AncestorStore::open(&path).expect("the store reopens");
+        assert!(unresolved.is_empty());
+        let expected = acknowledged.expect("the acknowledged tree exists");
+        let reopened = node.expect("the reopened ancestor exists");
+        for child in expected.children() {
+            assert!(
+                reopened.child(&child.name).is_some(),
+                "acknowledged {} vanished with the failed compaction",
+                child.name
+            );
+        }
     }
 }

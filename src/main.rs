@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use autobahn::config::Config;
@@ -376,17 +376,30 @@ fn run_sync(
     // resolved to their physical identity, so a session created here shares
     // its identity (and therefore its state lock) with any supervisor
     // session over the same roots, even when the two spell them differently.
-    let identity_of = |spec: &str, agent: &Option<String>| -> String {
+    //
+    // The resolution is performed exactly once per side and *frozen*: the
+    // same PathBuf serves the identity string, the pair lock, and the
+    // endpoint root. A second canonicalization at endpoint construction —
+    // as this once did — reopens the window in which a retargeted symlink
+    // binds a different tree than the state and lock identify, letting a
+    // stale ancestor authorize writes into the wrong tree.
+    let frozen_of = |spec: &str, agent: &Option<String>| -> Option<PathBuf> {
         if agent.is_some() || parse_remote(spec).is_some() {
-            spec.to_owned()
+            None
         } else {
-            paths::resolve_for_identity(&PathBuf::from(spec))
-                .to_string_lossy()
-                .into_owned()
+            Some(paths::resolve_for_identity(&PathBuf::from(spec)))
         }
     };
-    let alpha_identity = identity_of(&alpha, &alpha_agent);
-    let beta_identity = identity_of(&beta, &beta_agent);
+    let alpha_frozen = frozen_of(&alpha, &alpha_agent);
+    let beta_frozen = frozen_of(&beta, &beta_agent);
+    let identity_from = |spec: &str, frozen: &Option<PathBuf>| -> String {
+        match frozen {
+            Some(path) => path.to_string_lossy().into_owned(),
+            None => spec.to_owned(),
+        }
+    };
+    let alpha_identity = identity_from(&alpha, &alpha_frozen);
+    let beta_identity = identity_from(&beta, &beta_frozen);
     let identifier = session_identifier(&alpha_identity, &beta_identity);
     let state_directory = match state_dir {
         Some(directory) => directory,
@@ -423,48 +436,50 @@ fn run_sync(
         default_owner: None,
         default_group: None,
     };
-    let endpoint =
-        |spec: &str, agent: Option<String>, side: &str| -> Result<Box<dyn Endpoint + Send>> {
-            if let Some(command) = agent {
-                let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
-                if argv.is_empty() {
-                    bail!("empty {side} agent command");
-                }
-                let connection = Connection::spawn(&argv)?;
-                return Ok(Box::new(RemoteEndpoint::connect(
-                    connection,
-                    initialize(spec.to_owned(), side),
-                )?));
+    let endpoint = |spec: &str,
+                    agent: Option<String>,
+                    frozen: Option<&PathBuf>,
+                    side: &str|
+     -> Result<Box<dyn Endpoint + Send>> {
+        if let Some(command) = agent {
+            let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
+            if argv.is_empty() {
+                bail!("empty {side} agent command");
             }
-            if let Some((host, path)) = parse_remote(spec) {
-                return Ok(Box::new(autobahn::endpoint::remote::connect_ssh(
-                    host,
-                    initialize(path.to_owned(), side),
-                )?));
-            }
-            // A missing *beta* root is a legitimate state (the transition
-            // creates it); a missing alpha stays an error, since a mistyped
-            // source combined with a mirroring mode would otherwise empty
-            // the destination.
-            let lexical = PathBuf::from(spec);
-            let root = match lexical.canonicalize() {
-                Ok(root) => root,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound && side != "alpha" => {
-                    lexical
-                }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("unable to resolve {side} root {spec}"));
-                }
-            };
-            Ok(Box::new(LocalEndpoint::new(
-                root,
-                state_directory.join(format!("staging-{side}")),
-                options()?,
-            )?))
-        };
-    let alpha_endpoint = endpoint(&alpha, alpha_agent, "alpha")?;
-    let beta_endpoint = endpoint(&beta, beta_agent, "beta")?;
+            let connection = Connection::spawn(&argv)?;
+            return Ok(Box::new(RemoteEndpoint::connect(
+                connection,
+                initialize(spec.to_owned(), side),
+            )?));
+        }
+        if let Some((host, path)) = parse_remote(spec) {
+            return Ok(Box::new(autobahn::endpoint::remote::connect_ssh(
+                host,
+                initialize(path.to_owned(), side),
+            )?));
+        }
+        // The frozen resolution computed for the session identity above —
+        // never a second canonicalization of the original spelling, and
+        // never the raw lexical path, either of which would reopen the
+        // retarget window the freeze closes. A missing *beta* root is a
+        // legitimate state (the transition creates it, under the frozen
+        // resolved parent); a missing alpha stays an error, since a
+        // mistyped source combined with a mirroring mode would otherwise
+        // empty the destination.
+        let root = frozen
+            .expect("local endpoints carry a frozen resolution")
+            .clone();
+        if side == "alpha" && std::fs::symlink_metadata(&root).is_err() {
+            bail!("unable to resolve {side} root {spec}");
+        }
+        Ok(Box::new(LocalEndpoint::new(
+            root,
+            state_directory.join(format!("staging-{side}")),
+            options()?,
+        )?))
+    };
+    let alpha_endpoint = endpoint(&alpha, alpha_agent, alpha_frozen.as_ref(), "alpha")?;
+    let beta_endpoint = endpoint(&beta, beta_agent, beta_frozen.as_ref(), "beta")?;
 
     // Create the session and run.
     let mut session = Session::new(alpha_endpoint, beta_endpoint, mode.into(), state_directory)?;

@@ -174,6 +174,10 @@ pub fn connect_pooled(
 }
 
 impl Endpoint for RemoteEndpoint {
+    fn is_remote(&self) -> bool {
+        true
+    }
+
     fn scan(&mut self) -> Result<Snapshot> {
         match self.exchange(Request::Scan)? {
             Response::Scan(snapshot) => {

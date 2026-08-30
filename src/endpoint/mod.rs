@@ -154,6 +154,14 @@ pub fn fold_transition(
 /// Endpoints are `Send` so the controller can drive the two sides of that
 /// pump from separate threads.
 pub trait Endpoint: Send {
+    /// Whether this endpoint's tree lives on another machine. A remote
+    /// tree's mutations persist independently of this machine's page
+    /// cache, which changes what must be synced before acting (see the
+    /// session's intent handling).
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     /// Performs a filesystem scan, returning the current snapshot. Endpoints
     /// accelerate rescans internally (via node-resident metadata from prior
     /// snapshots); callers just get a fresh, consistent snapshot.

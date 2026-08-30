@@ -3892,10 +3892,12 @@ mod tests {
         let mut fixture = Fixture::new();
         // A quiet root waits out the timeout. Watch startup can replay the
         // fixture's own creation on some platforms (FSEvents most of all),
-        // so quiet is asserted once the dust settles rather than on the
-        // very first wait.
+        // and await_change reports change relative to the last *scan* — so
+        // settling means scanning to consume whatever dust arrived, then
+        // waiting, until one full window passes quietly.
         let mut quiet = false;
         for _ in 0..20 {
+            fixture.alpha.scan().expect("the settling scan runs");
             if !fixture
                 .alpha
                 .await_change(Duration::from_millis(50))
@@ -3957,9 +3959,19 @@ mod tests {
             .transition(transitions)
             .expect("the converge transition applies");
 
-        // The change the racing scan will straddle.
+        // The change the racing scan will straddle. The write is announced
+        // to alpha's observer the way any writer in the tool would: without
+        // the announcement, this scan can legitimately serve alpha's
+        // published snapshot while the kernel's event is still in flight,
+        // the diff comes back empty, and the test races itself instead of
+        // the transition.
         write(&fixture.alpha_root, "file.txt", "the new contents!!");
+        fixture.alpha.observer.invalidate(["file.txt"]);
         let transitions = fixture.beta_transitions();
+        assert!(
+            !transitions.is_empty(),
+            "the announced change must be visible to reconciliation"
+        );
         fixture.stage(&transitions);
 
         // The sharing session scans inside the announce window: after the
@@ -3970,11 +3982,21 @@ mod tests {
         fixture.beta.between_announce_and_writes = Some(Box::new(move || {
             *stash.lock().unwrap() = Some(observer.scan(None).expect("the racing scan runs"));
         }));
-        fixture
+        let outcome = fixture
             .beta
             .transition(transitions)
             .expect("the raced transition applies");
         fixture.beta.between_announce_and_writes = None;
+        assert!(
+            outcome.problems.is_empty(),
+            "the raced transition refused: {:?}",
+            outcome.problems
+        );
+        assert!(
+            !outcome.missing_staged_files,
+            "the raced transition lost its staged content: {:?}",
+            outcome.missing_staged
+        );
 
         let (stale_snapshot, stale_generation) =
             racing.lock().unwrap().take().expect("the seam fired");

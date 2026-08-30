@@ -707,14 +707,18 @@ mod tests {
             stale_generation < observer.generation(),
             "the stale walk must not claim the current generation"
         );
-        // The gate: the next scan must NOT serve the stale snapshot.
+        // The gate: the next scan must NOT serve the stale snapshot. (Its
+        // generation is not asserted equal to the observer's current one:
+        // a live watcher — FSEvents especially — may deliver more dust
+        // between the scan and the comparison, and quietness of the
+        // scheduler is not the property under test.)
         let (fresh, fresh_generation) = observer.scan(None).expect("scans");
         assert_ne!(
             digest_of(&fresh, "file.txt"),
             before,
             "the mid-scan change was never observed"
         );
-        assert_eq!(fresh_generation, observer.generation());
+        assert!(fresh_generation > stale_generation);
     }
 
     /// A stale fold offered as the baseline is a hint, never an oracle: a

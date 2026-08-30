@@ -622,6 +622,26 @@ mod tests {
         let mut channel_a = connection.open(initialize(&root_a)).expect("open a");
         let mut channel_b = connection.open(initialize(&root_b)).expect("open b");
 
+        // Channel B's root has just been created, and a watcher can report
+        // that creation as change (FSEvents replays startup dust). The
+        // channel is settled first — scan, then short waits until one
+        // passes quietly — so the long wait below measures blocking rather
+        // than the watcher's opinion of its own startup.
+        channel_b
+            .exchange(Request::Scan)
+            .expect("the settling scan exchanges");
+        for _ in 0..20 {
+            let response = channel_b
+                .exchange(Request::AwaitChanges(100))
+                .expect("the settling wait exchanges");
+            if matches!(response, Response::AwaitChanges(false)) {
+                break;
+            }
+            channel_b
+                .exchange(Request::Scan)
+                .expect("the settling scan exchanges");
+        }
+
         // Channel B blocks in a long change wait; channel A's scan must
         // complete while B is still waiting — the proof that channels are
         // served concurrently.

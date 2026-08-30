@@ -1037,9 +1037,19 @@ fn agents_install_automatically_over_ssh() {
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
     fs::set_permissions(&script, permissions).expect("script should be executable");
 
-    // The agent bundle holds this platform's binary under bundle naming.
+    // The agent bundle holds this platform's binary under bundle naming —
+    // the fake remote is this very machine, so the installer's uname probe
+    // reports whatever platform the test runs on.
     let agents = world.directory("agents");
-    fs::copy(agent_binary(), agents.join("autobahn-linux-x86_64")).expect("bundle copy");
+    let platform = format!(
+        "autobahn-{}-{}",
+        match std::env::consts::OS {
+            "macos" => "darwin",
+            other => other,
+        },
+        std::env::consts::ARCH
+    );
+    fs::copy(agent_binary(), agents.join(platform)).expect("bundle copy");
 
     // These variables are consulted only by the SSH connection path, which
     // only this test exercises (every other test connects via

@@ -514,3 +514,329 @@ fn interleaved_bidirectional_activity_converges() {
     );
     assert!(!harness.beta.join("dir1/nested/beta-new.txt").exists());
 }
+
+// ── the reconnect harness: cutting the wire at every frame boundary ──
+//
+// A byte-cutting proxy rides between the controller and a real agent
+// process: it forwards the stdio byte stream while parsing the frame
+// structure, and dies at a configured point — at the boundary after the
+// Nth frame, or two bytes into the frame after it. The sweep advances the
+// cut through the entire canonical exchange in both directions. After
+// every cut, a fresh session over the same state must recover to a safe
+// tree: cleanly converged, or conflicted only on the cut cycle's own
+// paths with both sides holding legitimate content. Each cycle builds a
+// fresh connection, so no response from a dead connection can satisfy a
+// new request — the cut connection object dies with its session.
+
+/// An incremental parser for the wire's length-prefixed frame structure,
+/// fed the bytes that pass through a cut stream.
+struct FrameParser {
+    prefix: [u8; 4],
+    prefix_got: usize,
+    payload_left: u64,
+    complete: usize,
+}
+
+impl FrameParser {
+    fn new() -> FrameParser {
+        FrameParser {
+            prefix: [0; 4],
+            prefix_got: 0,
+            payload_left: 0,
+            complete: 0,
+        }
+    }
+
+    /// Bytes until the next parsing milestone; never spans a boundary.
+    fn next_chunk(&self) -> u64 {
+        if self.payload_left > 0 {
+            self.payload_left
+        } else {
+            (4 - self.prefix_got) as u64
+        }
+    }
+
+    fn advance(&mut self, bytes: &[u8]) {
+        let mut index = 0;
+        while index < bytes.len() {
+            if self.payload_left == 0 {
+                let take = (4 - self.prefix_got).min(bytes.len() - index);
+                self.prefix[self.prefix_got..self.prefix_got + take]
+                    .copy_from_slice(&bytes[index..index + take]);
+                self.prefix_got += take;
+                index += take;
+                if self.prefix_got == 4 {
+                    self.payload_left = u32::from_le_bytes(self.prefix) as u64;
+                    if self.payload_left == 0 {
+                        self.prefix_got = 0;
+                        self.complete += 1;
+                    }
+                }
+            } else {
+                let take = self.payload_left.min((bytes.len() - index) as u64) as usize;
+                self.payload_left -= take as u64;
+                index += take;
+                if self.payload_left == 0 {
+                    self.prefix_got = 0;
+                    self.complete += 1;
+                }
+            }
+        }
+    }
+}
+
+/// Which half of the exchange the cut severs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CutDirection {
+    /// The agent's responses stop arriving.
+    FromAgent,
+    /// The controller's requests stop getting through.
+    ToAgent,
+}
+
+/// A stream that forwards until its cut point, then dies.
+struct CutStream<T> {
+    inner: T,
+    parser: FrameParser,
+    frames: usize,
+    extra: u64,
+    fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<T> CutStream<T> {
+    fn new(
+        inner: T,
+        frames: usize,
+        extra: u64,
+        fired: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> CutStream<T> {
+        CutStream {
+            inner,
+            parser: FrameParser::new(),
+            frames,
+            extra,
+            fired,
+        }
+    }
+
+    /// How many more bytes may pass, `0` meaning the cut fires now.
+    fn budget(&self) -> u64 {
+        if self.parser.complete < self.frames {
+            self.parser.next_chunk()
+        } else {
+            self.extra
+        }
+    }
+
+    fn account(&mut self, bytes: &[u8]) {
+        if self.parser.complete < self.frames {
+            self.parser.advance(bytes);
+        } else {
+            self.extra -= bytes.len() as u64;
+        }
+    }
+
+    fn fire(&self) {
+        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for CutStream<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let budget = self.budget();
+        if budget == 0 {
+            self.fire();
+            return Ok(0);
+        }
+        let cap = buf.len().min(budget as usize);
+        let got = self.inner.read(&mut buf[..cap])?;
+        self.account(&buf[..got]);
+        Ok(got)
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for CutStream<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let budget = self.budget();
+        if budget == 0 {
+            self.fire();
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "cut: the connection died here",
+            ));
+        }
+        let cap = buf.len().min(budget as usize);
+        let wrote = self.inner.write(&buf[..cap])?;
+        self.account(&buf[..wrote]);
+        Ok(wrote)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl Harness {
+    /// One cycle over an agent whose connection dies at the configured
+    /// point. Returns the cycle's outcome and whether the cut engaged.
+    fn agent_cycle_with_cut(
+        &mut self,
+        direction: CutDirection,
+        frames: usize,
+        extra: u64,
+    ) -> (anyhow::Result<CycleReport>, bool) {
+        use std::io::{Read, Write};
+        let binary = env!("CARGO_BIN_EXE_autobahn");
+        let mut child = std::process::Command::new(binary)
+            .arg("agent")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn agent");
+        let stdin = child.stdin.take().expect("agent stdin");
+        let stdout = child.stdout.take().expect("agent stdout");
+        let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (reader, writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) = match direction {
+            CutDirection::FromAgent => (
+                Box::new(CutStream::new(stdout, frames, extra, fired.clone())),
+                Box::new(stdin),
+            ),
+            CutDirection::ToAgent => (
+                Box::new(stdout),
+                Box::new(CutStream::new(stdin, frames, extra, fired.clone())),
+            ),
+        };
+        let connection = Connection::from_streams(reader, writer);
+        let result = (|| -> anyhow::Result<CycleReport> {
+            let beta: Box<dyn Endpoint + Send> = Box::new(RemoteEndpoint::connect(
+                connection,
+                Initialize {
+                    root: self.beta.to_string_lossy().into_owned(),
+                    session: format!(
+                        "e2e-{}-{}",
+                        self.state.to_string_lossy().len(),
+                        blake3::hash(self.state.to_string_lossy().as_bytes()).to_hex()
+                    ),
+                    ignores: self.ignores.clone(),
+                    symlink_mode: SymlinkMode::Raw,
+                    file_mode: None,
+                    directory_mode: None,
+                    side: "beta".into(),
+                    staging: Default::default(),
+                    max_file_size: None,
+                    max_entry_count: None,
+                    default_owner: None,
+                    default_group: None,
+                },
+            )?);
+            let alpha: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
+                self.alpha.clone(),
+                self.state.join("staging-alpha"),
+                EndpointOptions {
+                    ignores: IgnoreSet::new(&self.ignores)?,
+                    ..EndpointOptions::default()
+                },
+            )?);
+            let mut session = Session::new(alpha, beta, self.mode, self.state.clone())?;
+            session.run_cycle()
+        })();
+        let _ = child.kill();
+        let _ = child.wait();
+        (result, fired.load(std::sync::atomic::Ordering::SeqCst))
+    }
+}
+
+/// The sweep: for both directions, cut at the boundary after every frame
+/// of the canonical exchange (and two bytes into the frame after it),
+/// recover, and hold the safety line every time. The sweep is self-
+/// terminating — it ends when a cut point lies beyond the whole exchange.
+#[test]
+fn every_cut_connection_recovers_to_a_safe_tree() {
+    let old_bytes: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let new_bytes: Vec<u8> = (0..80 * 1024u32).map(|i| (i % 241) as u8).collect();
+    let created: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 239) as u8).collect();
+
+    for direction in [CutDirection::FromAgent, CutDirection::ToAgent] {
+        let mut cut_points = 0usize;
+        let mut conflicted_points = 0usize;
+        'sweep: for frames in 0.. {
+            for extra in [0u64, 2] {
+                let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
+                fs::write(harness.alpha.join("stable.txt"), b"stable").unwrap();
+                fs::write(harness.alpha.join("modify.txt"), &old_bytes).unwrap();
+                harness.cycle_ok();
+                harness.cycle_ok();
+                harness.assert_trees_equal("pre-cut convergence");
+
+                // The change the cut cycle carries.
+                fs::write(harness.alpha.join("modify.txt"), &new_bytes).unwrap();
+                fs::write(harness.alpha.join("created.bin"), &created).unwrap();
+
+                let (result, fired) = harness.agent_cycle_with_cut(direction, frames, extra);
+                if !fired {
+                    // The cut point lies beyond the whole exchange: the
+                    // cycle must have completed untouched, and the sweep
+                    // is done for this direction.
+                    result.expect("an uncut exchange completes");
+                    if extra == 0 {
+                        break 'sweep;
+                    }
+                    continue;
+                }
+                cut_points += 1;
+
+                // Recovery: ordinary sessions over the same state.
+                let mut last: Option<CycleReport> = None;
+                for _ in 0..6 {
+                    let report = harness.cycle().expect("recovery cycles run");
+                    let settled = report.alpha_transitions == 0
+                        && report.beta_transitions == 0
+                        && !report.missing_staged_files;
+                    last = Some(report);
+                    if settled {
+                        break;
+                    }
+                }
+                let report = last.expect("at least one recovery cycle");
+
+                // The safety line: nothing torn, conflicts only on the cut
+                // cycle's paths, and full agreement without them.
+                let candidate = |root: &Path, name: &str, allowed: &[Option<&[u8]>]| {
+                    let actual = fs::read(root.join(name)).ok();
+                    assert!(
+                        allowed.contains(&actual.as_deref()),
+                        "{direction:?} frames={frames} extra={extra}: {name} holds \
+                         none of its legitimate versions ({:?} bytes)",
+                        actual.map(|bytes| bytes.len())
+                    );
+                };
+                for root in [&harness.alpha, &harness.beta] {
+                    candidate(root, "stable.txt", &[Some(b"stable")]);
+                    candidate(root, "modify.txt", &[Some(&old_bytes), Some(&new_bytes)]);
+                    candidate(root, "created.bin", &[None, Some(&created)]);
+                }
+                if report.conflicts.is_empty() {
+                    harness.assert_trees_equal(&format!(
+                        "{direction:?} frames={frames} extra={extra}: recovery"
+                    ));
+                } else {
+                    conflicted_points += 1;
+                    for conflict in &report.conflicts {
+                        assert!(
+                            ["modify.txt", "created.bin"].contains(&conflict.root.as_str()),
+                            "{direction:?} frames={frames} extra={extra}: conflict off \
+                             the cut cycle's paths: {}",
+                            conflict.root
+                        );
+                    }
+                }
+            }
+        }
+        eprintln!(
+            "cut sweep {direction:?}: {cut_points} cut points, \
+             {conflicted_points} recovered with conflicts"
+        );
+        assert!(cut_points > 0, "the sweep never engaged a cut");
+    }
+}

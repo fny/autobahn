@@ -226,6 +226,28 @@ impl ChangeWatcher {
         })
     }
 
+    /// Records paths this process is about to change, exactly as the
+    /// backend's own callback would. The operating system's events for
+    /// these writes arrive on their own schedule; a scan racing that
+    /// delivery must still find the paths dirty, or it adopts its baseline
+    /// for a file that no longer matches the disk — and publishes the
+    /// result as current.
+    pub(crate) fn mark_pending(&self, paths: impl IntoIterator<Item = PathBuf>) {
+        let mut pending = self
+            .pending
+            .lock()
+            .expect("the pending lock is never poisoned");
+        for path in paths {
+            if pending.paths.len() >= MAXIMUM_PENDING_PATHS {
+                pending.give_up();
+                return;
+            }
+            if !pending.incomplete {
+                pending.paths.push(path);
+            }
+        }
+    }
+
     /// Takes the changes recorded since the last call, as paths to re-read.
     ///
     /// Returns `None` when the record cannot be trusted — a kernel queue
@@ -953,12 +975,14 @@ impl Endpoint for LocalEndpoint {
             }
         }
         // The observation is about to stop describing the tree, so it is
-        // invalidated *before* the first write rather than after the last.
-        // The watcher's own events for these writes may arrive late, and a
-        // scan published in that gap would describe a tree that no longer
-        // exists — which every other session sharing this root would then
-        // reconcile against.
-        self.observer.invalidate();
+        // invalidated *before* the first write rather than after the last,
+        // and the paths about to change ride along: the watcher's own
+        // events for these writes may arrive late, and a scan racing that
+        // delivery would otherwise take its incremental path, find nothing
+        // dirty, and publish a tree that no longer exists — which every
+        // other session sharing this root would then reconcile against.
+        self.observer
+            .invalidate(transitions.iter().map(|change| change.path.as_str()));
 
         let mut transitioner = Transitioner {
             root: &self.root,
@@ -1037,7 +1061,8 @@ impl Endpoint for LocalEndpoint {
                     // starts from a tree that already knows about this
                     // write instead of re-digesting what was just
                     // published.
-                    self.observer.offer_baseline(folded.clone());
+                    self.observer
+                        .offer_baseline(folded.clone(), self.seen_generation);
                     self.last_snapshot = Some(folded);
                 }
                 // A graft failure (which real transition results shouldn't

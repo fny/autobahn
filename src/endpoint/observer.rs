@@ -114,6 +114,10 @@ struct State {
     /// The tree a scan starts from, which is what makes it incremental.
     /// Advanced by a scan, and by a transition folding what it achieved.
     baseline: Option<Snapshot>,
+    /// The generation the baseline reflects, so an offer based on older
+    /// observations cannot roll the baseline back past a change whose
+    /// dirty marks a scan already consumed.
+    baseline_generation: u64,
     /// When the last *full* walk completed.
     last_full_scan: Option<Instant>,
     /// Set while a scan is running, so concurrent callers wait for it
@@ -135,6 +139,12 @@ pub struct RootObserver {
     cache_path: PathBuf,
     /// The background writer for that cache.
     writer: crate::persist::StateWriter,
+    /// A test seam invoked between the walk and its publication, so the
+    /// generation gate — a snapshot must never be served as current across
+    /// a change it did not observe — can be exercised at the one moment it
+    /// exists to protect.
+    #[cfg(test)]
+    pub(crate) after_walk: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl RootObserver {
@@ -276,6 +286,15 @@ impl RootObserver {
             // Outside the lock: a large tree takes seconds to walk, and a
             // watcher callback must never wait behind one.
             let result = self.walk(baseline.as_ref(), &behavior, want_full, rehash);
+            #[cfg(test)]
+            if let Some(hook) = self
+                .after_walk
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+            {
+                hook();
+            }
 
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.scanning = false;
@@ -313,6 +332,7 @@ impl RootObserver {
             }
 
             state.baseline = Some(snapshot.clone());
+            state.baseline_generation = taken_at;
             state.published = Some((taken_at, snapshot.clone()));
             return Ok((snapshot, taken_at));
         }
@@ -365,12 +385,24 @@ impl RootObserver {
         Ok((snapshot, taken_at, dirty.is_none()))
     }
 
-    /// Declares that this root is about to be written to.
+    /// Declares that the given root-relative paths are about to be written.
     ///
-    /// Called *before* the write, not after: the watcher's own event for it
-    /// may arrive late, and a scan published in that gap would describe a
-    /// tree that no longer exists.
-    pub fn invalidate(&self) {
+    /// Called *before* the writes, not after: the watcher's own events for
+    /// them may arrive late, and a scan published in that gap would
+    /// describe a tree that no longer exists. The paths are recorded in the
+    /// watcher's pending set before the generation advances — the same
+    /// order the watcher's own callback uses — so any walk old enough to
+    /// miss them in its dirty set is also old enough for its publication to
+    /// be refused as current.
+    pub fn invalidate<'a>(&self, paths: impl IntoIterator<Item = &'a str>) {
+        {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(watcher) = state.watcher.as_ref() {
+                // Joined under the observer's canonical root, so the
+                // consuming strip_prefix is exact.
+                watcher.mark_pending(paths.into_iter().map(|path| self.key.root.join(path)));
+            }
+        }
         self.signal.advance();
     }
 
@@ -381,9 +413,22 @@ impl RootObserver {
     /// *baseline* but not the published generation: the next scan still
     /// runs, it simply starts from a tree that already knows about the
     /// write instead of re-digesting everything just published.
-    pub fn offer_baseline(&self, folded: Snapshot) {
+    ///
+    /// `based_on` is the generation of the lease the fold was built from.
+    /// An offer based on an older generation than the standing baseline is
+    /// refused: adopting it would roll the baseline back past a change
+    /// whose dirty marks a scan has already consumed, and the next scan
+    /// would adopt the rolled-back record for paths nothing tells it to
+    /// re-read. The offerer's own writes stay safe under refusal — their
+    /// paths were marked when the transition invalidated them, and the
+    /// watcher's events re-mark whatever lands late.
+    pub fn offer_baseline(&self, folded: Snapshot, based_on: u64) {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if based_on < state.baseline_generation {
+            return;
+        }
         state.baseline = Some(folded);
+        state.baseline_generation = based_on;
         state.published = None;
     }
 
@@ -480,12 +525,15 @@ pub fn observer_for(
             watch_retry_after: None,
             published: None,
             baseline: None,
+            baseline_generation: 0,
             last_full_scan: None,
             scanning: false,
         }),
         scanned: Condvar::new(),
         cache_path,
         writer: crate::persist::StateWriter::new(),
+        #[cfg(test)]
+        after_walk: Mutex::new(None),
     });
     // A cold start seeds the baseline from the persisted cache, so the first
     // scan of a process re-digests only what changed since the last one.
@@ -569,5 +617,185 @@ mod tests {
         let link = directory.path().join("alias");
         std::os::unix::fs::symlink(&base, &link).expect("symlink");
         assert_eq!(canonical_root(&link.join("missing").join("deeper")), two);
+    }
+
+    // ── the generation protocol, under enumerated interleavings ──────
+    //
+    // The observer's one hard promise: a snapshot is never served as
+    // current across a change it did not observe. Example tests are weak
+    // evidence for a protocol like this, so the promise is checked under
+    // directed interleavings — including the mid-scan one, which is the
+    // exact moment the generation gate exists for — and a randomized
+    // sweep of operation sequences.
+
+    fn harness_observer(root: &std::path::Path) -> Arc<RootObserver> {
+        let cache = root.parent().expect("parent").join(format!(
+            "cache-{}-{}",
+            std::process::id(),
+            root.file_name().and_then(|n| n.to_str()).unwrap_or("root")
+        ));
+        observer_for(
+            ObserverKey {
+                root: canonical_root(root),
+                ignores: String::new(),
+                symlink_mode: crate::scan::SymlinkMode::default(),
+                max_file_size: None,
+            },
+            IgnoreSet::new(&[]).expect("ignores"),
+            cache,
+        )
+    }
+
+    fn digest_of(snapshot: &Snapshot, name: &str) -> crate::tree::Digest {
+        match &snapshot
+            .root
+            .as_ref()
+            .and_then(|root| root.child(name))
+            .unwrap_or_else(|| panic!("{name} missing"))
+            .content
+        {
+            crate::tree::Content::File { digest, .. } => *digest,
+            _ => panic!("{name} is not a file"),
+        }
+    }
+
+    /// A write that lands *during* a scan — after the walk, before
+    /// publication — must leave the published snapshot unserved: its
+    /// generation predates the change, and the next scan must re-read.
+    #[test]
+    fn a_mid_scan_change_is_never_served_as_current() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+
+        let (first, _) = observer.scan(None).expect("scans");
+        let before = digest_of(&first, "file.txt");
+
+        // Arm the seam: the write and its invalidation land between the
+        // walk and the publish.
+        let seam_root = root.clone();
+        let seam_observer = Arc::clone(&observer);
+        *observer.after_walk.lock().unwrap() = Some(Box::new(move || {
+            std::fs::write(seam_root.join("file.txt"), b"after!").expect("writes");
+            seam_observer.invalidate(["file.txt"]);
+        }));
+        observer.invalidate(std::iter::empty::<&str>()); // force the next scan to walk
+        let (stale, stale_generation) = observer.scan(None).expect("scans");
+        *observer.after_walk.lock().unwrap() = None;
+
+        // The walk predates the seam's write, so its snapshot is stale —
+        // and its generation says so.
+        assert_eq!(digest_of(&stale, "file.txt"), before);
+        assert!(
+            stale_generation < observer.generation(),
+            "the stale walk must not claim the current generation"
+        );
+        // The gate: the next scan must NOT serve the stale snapshot.
+        let (fresh, fresh_generation) = observer.scan(None).expect("scans");
+        assert_ne!(
+            digest_of(&fresh, "file.txt"),
+            before,
+            "the mid-scan change was never observed"
+        );
+        assert_eq!(fresh_generation, observer.generation());
+    }
+
+    /// A stale fold offered as the baseline is a hint, never an oracle: a
+    /// change invalidated after the offer must still be seen.
+    #[test]
+    fn an_offered_baseline_cannot_hide_an_invalidated_change() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        let (first, _) = observer.scan(None).expect("scans");
+
+        // A transition-shaped sequence, interleaved badly on purpose: the
+        // offer arrives, then the disk changes under it.
+        observer.offer_baseline(first.clone(), 0);
+        std::fs::write(root.join("file.txt"), b"after!").expect("writes");
+        observer.invalidate(["file.txt"]);
+
+        let (fresh, _) = observer.scan(None).expect("scans");
+        assert_ne!(
+            digest_of(&fresh, "file.txt"),
+            digest_of(&first, "file.txt"),
+            "an offered baseline hid an invalidated change"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig {
+            cases: 48, ..Default::default()
+        })]
+
+        /// Random interleavings of the operations two sessions actually
+        /// perform. After every operation, the reference model knows the
+        /// disk's true content; whenever any session scans, the snapshot
+        /// must agree with the model — regardless of what offers,
+        /// distrusts, cache hits, or stale baselines came before.
+        #[test]
+        fn every_interleaving_scans_the_truth(
+            operations in proptest::collection::vec(0u8..8, 1..12)
+        ) {
+            let keep = tempfile::tempdir().expect("tempdir");
+            let root = keep.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::write(root.join("file.txt"), b"v-000").expect("writes");
+            let observer = harness_observer(&root);
+            let mut truth = 0u32;
+            let mut folds: Vec<(Snapshot, u64)> = Vec::new();
+
+            for (step, operation) in operations.into_iter().enumerate() {
+                match operation {
+                    // A write, correctly announced — the transition path.
+                    0..=1 => {
+                        truth += 1;
+                        std::fs::write(
+                            root.join("file.txt"),
+                            format!("v-{truth:03}"),
+                        )
+                        .expect("writes");
+                        observer.invalidate(["file.txt"]);
+                    }
+                    // A scan by either of two sessions.
+                    2..=4 => {
+                        let (snapshot, generation) = observer.scan(None).expect("scans");
+                        let expected =
+                            *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
+                        proptest::prop_assert_eq!(
+                            digest_of(&snapshot, "file.txt"),
+                            expected,
+                            "step {}: a scan disagreed with the disk",
+                            step
+                        );
+                        folds.push((snapshot, generation));
+                    }
+                    // A stale fold offered as the next baseline.
+                    5 => {
+                        if let Some((fold, generation)) = folds.first().cloned() {
+                            observer.offer_baseline(fold, generation);
+                        }
+                    }
+                    // A transition problem: every session distrusts.
+                    6 => observer.distrust_baseline(),
+                    // A verified scan must agree with the disk too.
+                    _ => {
+                        let (snapshot, _) = observer.scan_rehash(None).expect("scans");
+                        let expected =
+                            *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
+                        proptest::prop_assert_eq!(
+                            digest_of(&snapshot, "file.txt"),
+                            expected,
+                            "step {}: a verified scan disagreed with the disk",
+                            step
+                        );
+                    }
+                }
+            }
+        }
     }
 }

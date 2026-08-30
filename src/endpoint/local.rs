@@ -2114,10 +2114,48 @@ fn temporary_name(purpose: &str) -> String {
 
 /// Warns when a synchronization root lives on a filesystem whose caching
 /// and event semantics undermine local-filesystem assumptions. Detection is
-/// best-effort and Linux-only; the probe walks up to the deepest existing
-/// ancestor so a missing root is still classified by the volume it will be
-/// created on.
+/// best-effort (Linux and macOS); the probe walks up to the deepest
+/// existing ancestor so a missing root is still classified by the volume
+/// it will be created on.
 fn warn_if_network_filesystem(root: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut probe = root.to_path_buf();
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent.to_path_buf(),
+                None => return,
+            }
+        }
+        let Ok(path) = std::ffi::CString::new(probe.as_os_str().as_bytes()) else {
+            return;
+        };
+        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut stats) } != 0 {
+            return;
+        }
+        // macOS names the filesystem instead of numbering it.
+        let name = unsafe { std::ffi::CStr::from_ptr(stats.f_fstypename.as_ptr()) };
+        let Ok(name) = name.to_str() else { return };
+        let lowered = name.to_ascii_lowercase();
+        let kind = match lowered.as_str() {
+            "nfs" => "NFS",
+            "smbfs" => "SMB",
+            "cifs" => "CIFS",
+            "webdav" => "WebDAV",
+            "afpfs" => "AFP",
+            _ if lowered.contains("fuse") => "FUSE",
+            _ => return,
+        };
+        eprintln!(
+            "warning: {} is on {kind}; synchronization of network filesystems is \
+             best-effort and assumes this client is the only writer — attribute \
+             caching can hide another client's changes from both scanning and \
+             the checks that guard destructive operations",
+            root.display()
+        );
+    }
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::ffi::OsStrExt;
@@ -2151,7 +2189,7 @@ fn warn_if_network_filesystem(root: &Path) {
             root.display()
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = root;
 }
 
@@ -2181,9 +2219,31 @@ fn staged_content_matches(path: &Path, digest: &Digest) -> bool {
 /// carries no expectation about existing content, so a file that appeared
 /// between the absence check and this rename — an editor's save, most
 /// plainly — belongs to someone else. Linux enforces that atomically with
-/// `RENAME_NOREPLACE`; elsewhere the check-then-rename window remains and
-/// is documented as residual.
+/// `RENAME_NOREPLACE` and macOS with `renamex_np(RENAME_EXCL)`; elsewhere
+/// the check-then-rename window remains and is documented as residual.
 fn publish_rename(source: &Path, target: &Path, replace: bool) -> io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if !replace {
+        use std::os::unix::ffi::OsStrExt;
+        let source_c = std::ffi::CString::new(source.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
+        let target_c = std::ffi::CString::new(target.as_os_str().as_bytes())
+            .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
+        let result =
+            unsafe { libc::renamex_np(source_c.as_ptr(), target_c.as_ptr(), libc::RENAME_EXCL) };
+        if result == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        // Filesystems without RENAME_EXCL support (some network and FUSE
+        // volumes) report ENOTSUP or EINVAL; falling back to the plain
+        // rename there keeps the old (windowed) behavior rather than
+        // failing every creation.
+        if error.raw_os_error() != Some(libc::ENOTSUP) && error.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(error);
+        }
+    }
     #[cfg(target_os = "linux")]
     if !replace {
         use std::os::unix::ffi::OsStrExt;

@@ -33,6 +33,13 @@ watcher event was delivered, or a writer announced the change through
   `ChangeWatcher::mark_pending` in the same record-then-advance order —
   so any walk old enough to miss a path in its dirty set is also old
   enough for its publication to be refused as current.
+- A transition announces its paths *twice*: before its first write (so a
+  racing scan cannot adopt its baseline) and again after its last (so a
+  racing scan that consumed the first announcement's marks and read the
+  old bytes is deterministically outdated — the kernel's own events do
+  the same job, but on their own schedule, and never at all under the
+  polling fallback). The independent review's finding I1-A showed the
+  single pre-write announcement insufficient.
 - `offer_baseline` refuses an offer based on an older generation than
   the standing baseline, so a stale fold can never roll the baseline
   back past a change whose dirty marks a scan already consumed.
@@ -41,12 +48,16 @@ watcher event was delivered, or a writer announced the change through
   (`ChangeWatcher::take_dirty` returning `None`), never narrows it.
 
 **Checked by**: `a_mid_scan_change_is_never_served_as_current`,
-`an_offered_baseline_cannot_hide_an_invalidated_change`, and the
+`an_offered_baseline_cannot_hide_an_invalidated_change`, the
 randomized interleaving sweep `every_interleaving_scans_the_truth`
-(all in `src/endpoint/observer.rs`). All three protocol properties are
-mutation-checked: disabling the path recording, the offer refusal, or
-the serve gate turns the sweep red. The sweep found two real holes on
-its first runs — both fixed before it first passed.
+(all in `src/endpoint/observer.rs`), and
+`a_scan_racing_a_transition_cannot_outlive_the_writes`
+(`src/endpoint/local.rs`), which pauses a real transition between its
+announcement and its writes under the suppressed-watcher seam. The
+protocol properties are mutation-checked: disabling the path recording,
+the offer refusal, the serve gate, or the post-write announcement turns
+a test red. The sweep found two real holes on its first runs, and the
+independent review found a third (I1-A) — all fixed.
 
 **Boundary.** An *unannounced* external write is visible only when the
 operating system delivers its event; scans in that delivery window are
@@ -67,10 +78,20 @@ and removed provenance surfaces as a conflict, never as an overwrite.
   normalizable record.
 - Before the first transition of a cycle — but after staging, which
   mutates neither tree — `intend` appends the union of both sides'
-  transition paths. An intent left unresolved at open drops those
-  paths from the in-memory ancestor and persists the drop immediately
+  transition paths. Whenever a *remote* endpoint participates (or
+  `durability = "power"` is set), that append syncs before any
+  transition runs: the peer's machine persists its transition
+  independently of this machine's page cache, so an unsynced intent
+  there is no ordering at all — no writeback reordering is even needed
+  to lose it (finding I2-B). A local-local session under default
+  durability keeps the residual: losing the intent requires the
+  storage stack to reorder two writes to the same disk, the same class
+  as I10's journal-tail boundary, and `durability = "power"` closes
+  it. An intent left unresolved at open drops those paths from the
+  in-memory ancestor and persists the drop immediately
   (`Session::with_lock`), so provenance is honestly "unknown" after a
-  crash inside the transition window.
+  crash — process or, where the sync applies, power — inside the
+  transition window.
 - Journal normalization is temp-file + fsync + rename, preserves a
   trailing unresolved intent, and a stray normalization temp is removed
   at open.
@@ -87,15 +108,28 @@ every byte and must reopen to an acknowledged state),
 `an_interrupted_normalization_cannot_lose_acknowledgments`,
 `a_torn_final_record_is_discarded`,
 `an_interrupted_reset_cannot_fabricate_an_ancestor`,
-`corrupt_ancestor_is_an_error_not_a_reset`, and — end to end —
+`corrupt_ancestor_is_an_error_not_a_reset`,
+`a_durable_intent_syncs_whatever_the_configured_durability`,
+`a_remote_endpoint_makes_the_intent_durable`,
+`an_unconfirmed_checkpoint_never_clears_the_journal`, and — end to
+end —
 `a_crash_between_transition_and_record_ends_in_conflict_not_overwrite`
 (mutation-checked: with `intend` disabled, the recovered session
 silently overwrites the revert and the test goes red).
 
 **Boundary.** The acknowledged cost of intent taint: a crash inside the
 transition window can turn a clean propagation into a surfaced
-conflict, and a crashed deletion can recover as resurrection. Noise,
-never loss.
+conflict, and a crashed deletion can recover as *resurrection* — the
+absent-versus-present shape reconciles as a creation, not a conflict,
+so the earlier "surfaces as a conflict" reads as the general promise
+and resurrection as its deletion-shaped exception (finding I2-C).
+Under default durability a power loss can still drop an unsynced
+*achieved* record's tail; with the intent durable ahead of it, that
+recovers as taint noise, never as stale provenance. "Acknowledged" for
+a remote endpoint means a decoded response from the authenticated
+agent, not proof of remote disk state — a hostile agent is outside
+this invariant's model (finding I2-A; see the threat-model note at the
+end).
 
 ## I3. A digest names exactly its bytes
 
@@ -110,6 +144,10 @@ staging store, and corrupted transfer content cannot reach a tree.
   digest-named staged path only on a match. A mismatch discards.
 - Staged survivors from interrupted cycles are re-verified by content
   (`staged_content_matches`) before being trusted.
+- The last-use publish path re-verifies at the moment of use: the
+  staged entry must still be a regular file whose bytes match the
+  digest, or the publish falls through to the copy path, which digests
+  what it moves (finding I3-A closed the unverified rename).
 - Supply re-verifies alternates sharing a digest before serving them.
 
 **Checked by**: `corrupted_frames_are_discarded_never_published`
@@ -118,7 +156,9 @@ corruption and turns the torn-bytes assertion red),
 `a_corrupt_staged_survivor_is_retransferred_not_trusted`,
 `a_truncated_staging_transfer_recovers_cleanly`,
 `supply_recovers_from_an_alternate_path_sharing_the_digest`,
-`published_content_moves_out_of_staging_on_its_last_use`.
+`published_content_moves_out_of_staging_on_its_last_use`,
+`tampered_staged_content_is_never_published_by_the_move_path`,
+`a_staged_symlink_is_never_published_by_the_move_path`.
 
 **Boundary.** A digest *recorded in a snapshot* is reused when metadata
 matches; content rewritten with deliberately restored metadata evades
@@ -147,17 +187,26 @@ concurrent arrival.
 `transition_folds_achieved_results_into_the_snapshot`, and the
 lifecycle harness of I5.
 
-**Boundary.** Outside Linux creations, check and use are separated by a
-pathname re-resolution window — RETAINED.md §2.
+**Boundary.** Check and use are separated by a pathname re-resolution
+window for *replacements and removals on every platform*, and for
+creations outside Linux — RETAINED.md §2 (findings I4-A and I4-C
+sharpened its scope). Lease validation compares metadata, not content:
+a same-length rewrite with restored metadata passes it — RETAINED.md
+§5 (finding I4-B).
 
 ## I5. No crash leaves torn bytes
 
 **Statement.** At every boundary of the staging and transition
-lifecycle — and at every byte of the remote wire exchange — a crash
-leaves every file on both trees bytewise equal to one of its legitimate
-versions. Recovery from any such crash reaches quiescence, its
-conflicts confined to the crashed cycle's own paths, with full
-agreement on everything else.
+lifecycle — and at every frame boundary of the remote wire exchange —
+a *process* crash leaves every file on both trees bytewise equal to
+one of its legitimate versions. Recovery from any such crash, with the
+triggering fault gone, reaches quiescence, its conflicts confined to
+the crashed cycle's own paths, with full agreement on everything else.
+This is a process-crash invariant: publication paths do not sync file
+data, so a *power loss* can expose unsynced bytes under a renamed name
+(finding I5-A) — the durable-ancestor guarantees of I2 and I10 are the
+power-loss story, and content re-verification plus re-transfer restore
+the trees on the cycles that follow.
 
 **Enforced by**: the composition of I2 (intent records), I3 (staged
 content verification), and I4 (lease validation, rename publication) —
@@ -181,11 +230,15 @@ the cuts inside the remote transition-to-record window.
 
 ## I6. One writer per tree region
 
-**Statement.** Within one configuration load, no two sessions may write
-overlapping local roots; across processes, an identical endpoint pair
-is excluded by lock, and a state root admits one supervisor and one
-session at a time. Endpoint identity is resolved once and the resolved
-identity is carried through validation, locking, and construction.
+**Statement.** Within one configuration load, no two sessions may hold
+*nested* writable local roots (an exactly-equal shared root warns and
+is a pinned-legal topology — fan-out, star, relay); across processes
+on one controller under one state root, an identical endpoint pair is
+excluded by lock, and a state root admits one supervisor and one
+session at a time. Endpoint identity is resolved once — on the
+supervisor path *and* the manual `sync` path (finding I6-C closed the
+latter's second resolution) — and the frozen resolution is carried
+through validation, locking, and construction.
 
 **Enforced by**: `src/config.rs` (canonical containment refusal for
 nested writable endpoints), `src/supervisor/mod.rs` (frozen endpoint
@@ -201,7 +254,12 @@ resolution), `src/session/mod.rs` (`EndpointPairLock`,
 `a_retargeted_root_is_refused_rather_than_bound_to_stale_state`.
 
 **Boundary.** Different-but-overlapping configurations in separate
-processes — RETAINED.md §4.
+processes — RETAINED.md §4. The pair lock is controller-local (one
+machine, one user, one state root); two controllers, two users, or two
+lock roots are outside it (finding I6-B), as are physical aliases that
+pathname canonicalization cannot see, such as bind mounts (finding
+I6-D). Equal-root sharing relies on the observer's generation protocol
+and lease validation, not on mutual exclusion.
 
 ## I7. Reconciliation never destroys silently
 
@@ -210,8 +268,10 @@ when the ancestor proves the other side already had it; two-sided
 divergence is a conflict, left unresolved; a proposed deletion and a
 proposed modification of the same path re-propagates the content. Mass
 disappearance is halted, not propagated: a root or large subtree
-(eight or more ancestor entries) empty on exactly one side halts the
-session rather than deleting the other side.
+(eight or more ancestor entries) that is empty — or absent entirely,
+a removed mountpoint's signature (finding I7-A closed that form) — on
+exactly one side halts the session rather than deleting the other
+side.
 
 **Enforced by**: `src/tree/reconcile.rs` (the safe-mode rules;
 `Reconciliation::emptied_subtree` riding the descend path;
@@ -231,15 +291,19 @@ session rather than deleting the other side.
 `emptied_subtree_detection_rides_reconciliation`.
 
 **Boundary.** A vanished mount holding fewer than eight entries — one
-huge file — evades the count guard: RETAINED.md §1.
+huge file — evades the count guard: RETAINED.md §1. The guard also
+presumes trustworthy provenance; a fabricated ancestor (I2's hostile-
+agent boundary) makes safe-mode arithmetic destructive (finding I7-B).
 
 ## I8. Both ends speak the same safety semantics
 
-**Statement.** A controller and an agent synchronize only if they share
-the compatibility epoch; the epoch rides the version string
-(`src/protocol.rs`, `COMPATIBILITY_EPOCH`), so any safety-semantics
-change fails the handshake with both versions named rather than
-producing subtly mixed behavior.
+**Statement.** A controller and an agent synchronize only if their
+version strings — package version plus compatibility epoch
+(`src/protocol.rs`, `COMPATIBILITY_EPOCH`) — match exactly, with both
+versions named on mismatch. The epoch is a *maintained convention*,
+not a mechanical property: it catches safety-semantics changes exactly
+when a change bumps it (finding I8-A), which is why bumping it is a
+standing release-gate rule rather than an optimization.
 
 **Checked by**: `a_stale_epoch_fails_the_handshake`,
 `a_failed_handshake_reaps_the_spawned_process`.
@@ -247,9 +311,14 @@ producing subtly mixed behavior.
 ## I9. The wire is hostile until proven otherwise
 
 **Statement.** No length, flag, or compressed size received from a
-connection is trusted before validation: oversized frames are refused
-on both send and receive before allocation, decompression bombs are
-refused, and unknown flags are errors.
+connection is trusted before validation: oversized incoming frames are
+refused *before allocation*, decompression bombs are refused, and
+unknown flags are errors. Outgoing oversized frames are refused before
+the write but *after* serialization — the sender allocates its own
+frame first (finding I9-A); the cap protects the peer and the wire,
+not the sender's memory. Structural depth of decoded messages is
+bounded only by bincode's input length, not by an explicit depth gate
+(finding I9-B) — a hostile peer is the threat-model note's territory.
 
 **Enforced by**: `src/transport/mod.rs` (`read_frame` validates length
 and decompressed size against `MAXIMUM_FRAME_SIZE` before allocating).
@@ -267,19 +336,70 @@ is replaced atomically; a crash during any write leaves the previous
 complete state or a detectable partial, never a silently mixed one.
 
 **Enforced by**: `src/session/ancestor.rs` (checkpoint and
-normalization write-fsync-rename; the journal-first reset order),
+normalization write-fsync-rename; a compaction whose checkpoint-rename
+durability cannot be *confirmed* — the parent-directory sync fails —
+is an error that leaves the journal untouched, never a truncation over
+an unconfirmed rename (finding I10-B closed that ordering); intent
+appends sync unconditionally, and one that creates the journal file
+also syncs its directory entry; the journal-first reset order),
 `src/persist.rs` (`StateWriter`).
 
 **Checked by**: `a_partially_written_state_is_never_published`,
 `an_interrupted_normalization_cannot_lose_acknowledgments`,
 `an_interrupted_reset_cannot_fabricate_an_ancestor`,
 `a_reset_leaves_nothing_to_replay`,
-`a_state_superseded_within_the_window_is_never_encoded`.
+`a_state_superseded_within_the_window_is_never_encoded`,
+`an_unconfirmed_checkpoint_never_clears_the_journal`
+(mutation-checked: truncating before the confirmed sync rolls
+acknowledged generations back and turns the test red),
+`a_durable_intent_syncs_whatever_the_configured_durability`
+(mutation-checked).
 
-**Boundary.** Journal *appends* are buffered by the OS unless
+**Boundary.** Journal *achieved* appends are buffered by the OS unless
 `durability = "power"` syncs each one; the default trades the tail of
 the journal under power loss for latency, never its integrity — replay
-discards a torn tail record (`a_torn_final_record_is_discarded`).
+discards a torn tail record (`a_torn_final_record_is_discarded`), and
+the durable intent ahead of the lost tail downgrades the loss to taint
+noise. `reset` orders its removals by program order only; under
+power-loss reordering the surviving outcomes are the previous complete
+state or a fail-closed replay error, with silent resurrection confined
+to a legacy-checkpoint corner (finding I10-A, verified PARTIAL). The
+observer cache and status files are atomically *replaced* but their
+contents carry no integrity check against torn-sector corruption
+(finding I10-C) — the cache is a performance hint whose worst
+corruption case is equivalent to the forged-metadata boundary of
+RETAINED.md §5, and the verify verb re-reads past it.
+
+## The threat-model note
+
+Several invariants say "acknowledged", "authenticated", or "verified"
+about the remote agent. The agent is trusted at the level SSH
+authenticates it: a *hostile* agent binary — one that fabricates scan
+results or transition outcomes while speaking the protocol correctly —
+can manufacture ancestor provenance and thereby steer safe-mode
+reconciliation into overwriting the controller's own tree (findings
+I2-A, I7-B), and can send structurally deep messages that exhaust the
+decoder (finding I9-B). Defending the controller against the machine
+it synchronizes with is a different product than defending it against
+crashes, races, and power loss; it would need result validation
+against independent rescans, semantic caps on decoded structures, and
+an explicit trust boundary in the docs. Until that is built, the
+honest statement is: every guarantee in this document assumes both
+endpoints run genuine binaries.
+
+## The review of record
+
+This document was independently attacked (2026-08-30, an external
+model lineage, 22 findings), and each top finding was then verified or
+refuted by separate fresh verifiers. Six confirmed findings were fixed
+— I1-A, I2-B, I3-A, I7-A, I10-B, I6-C, each with a harness or contract
+test added first and the fix mutation-checked where the failure is
+constructible — and the statement-precision findings were folded into
+the invariant texts above, so the document now says what the code
+does. The remaining open items are deliberate boundaries: the
+hostile-agent model (above), cross-process and cross-machine writer
+exclusion (RETAINED.md §4), power-loss publication of tree *content*
+(I5), and the sub-threshold emptied-mount shape (RETAINED.md §1).
 
 ## How to attack this document
 

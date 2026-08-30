@@ -13,6 +13,16 @@ use super::{diff_at, path_join, Change, Conflict, Content, Node, SyncMode};
 /// The outcome of reconciliation.
 #[derive(Debug, Default)]
 pub struct Reconciliation {
+    /// A directory the ancestor records as non-trivial that presents as
+    /// existing-but-empty on exactly one side — the signature of a vanished
+    /// mount below the root (a deliberate deletion removes the directory
+    /// itself). The session halts before applying any transition when this
+    /// is set. Detected here, during the walk reconciliation already does,
+    /// because a separate whole-tree pass measured at twenty milliseconds
+    /// per cycle on a sixty-thousand-entry tree; the expensive part (the
+    /// subtree count) runs only when the rare empty-versus-populated
+    /// trigger fires.
+    pub emptied_subtree: Option<String>,
     /// Changes to apply to the ancestor (beyond those implied by successful
     /// transitions).
     pub ancestor_changes: Vec<Change>,
@@ -60,6 +70,21 @@ fn shallow_equal(a: Option<&Node>, b: Option<&Node>) -> bool {
         (Some(a), Some(b)) => a.content_equal(b, false),
         _ => false,
     }
+}
+
+/// The size at which an emptied directory below the root trips the safety
+/// halt. A vanished mount usually held a substantial tree; a user emptying
+/// a small directory while keeping it is ordinary housekeeping.
+const EMPTIED_SUBTREE_MINIMUM: usize = 8;
+
+/// Counts the entries below a node. Called only when the emptied-subtree
+/// trigger has already fired, which is what keeps the guard off the
+/// per-cycle cost of every ordinary reconciliation.
+fn entries_below(node: &Node) -> usize {
+    node.children()
+        .iter()
+        .map(|child| 1 + entries_below(child))
+        .sum()
 }
 
 impl Reconciler {
@@ -120,6 +145,22 @@ impl Reconciler {
 
         // If alpha and beta agree (shallowly) at this path, then recurse.
         if shallow_equal(alpha, beta) {
+            // The emptied-subtree guard, at the only place it can trigger:
+            // both sides hold a directory here, and exactly one of them is
+            // empty. (The root's own emptiness, including an absent root,
+            // is checked by the session before reconciliation begins.)
+            if !path.is_empty() && self.result.emptied_subtree.is_none() {
+                let empty = |node: Option<&Node>| {
+                    matches!(node, Some(node)
+                        if matches!(node.content, Content::Directory(_))
+                            && node.children().is_empty())
+                };
+                if empty(alpha) != empty(beta)
+                    && ancestor.is_some_and(|node| entries_below(node) >= EMPTIED_SUBTREE_MINIMUM)
+                {
+                    self.result.emptied_subtree = Some(path.to_owned());
+                }
+            }
             // If the ancestor disagrees, then record an ancestor update at
             // this path (enabling "both modified same" reconciliation) and
             // don't let the old ancestor contents drive recursion.

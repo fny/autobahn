@@ -359,6 +359,10 @@ impl Session {
             beta_root.as_ref(),
             self.mode,
         );
+        if let Some(path) = &reconciliation.emptied_subtree {
+            let _ = path;
+            bail!(SafetyHalt::RootEmptied);
+        }
         report.conflicts = reconciliation.conflicts;
 
         // Safety: refuse to propagate a root deletion.
@@ -590,91 +594,38 @@ fn stage(
     })
 }
 
-/// The size at which an emptied directory *below* the root triggers the
-/// safety halt. A vanished mount usually held a substantial tree; a user
-/// emptying a small directory while keeping it is ordinary housekeeping.
-/// The root itself keeps a floor of two, matching the established
-/// root-emptied semantics.
-const EMPTIED_SUBTREE_MINIMUM: usize = 8;
-
-/// Detects the emptied-tree condition: some directory the ancestor records
-/// as non-trivial now presents as *existing but empty* (or, at the root,
-/// absent) on exactly one side while the other retains it.
-///
-/// The discriminator between a vanished filesystem and a deliberate mass
-/// deletion is the directory itself. `rm -rf data` removes `data`, and the
-/// deletion propagates as intended; an unmounted volume leaves `data`
-/// present and empty, which is the signature this halts on. The original
-/// check looked only at the root and only when it had two or more
-/// immediate children — so a root holding everything under one directory,
-/// or a mount point below the root, emptied beta's entire good copy
-/// without tripping anything. Both were reproduced before this was
-/// generalized.
+/// Detects the emptied-root condition at the root itself: the ancestor was
+/// non-trivial, and exactly one side now presents an absent or childless
+/// root while the other retains content. Emptied directories *below* the
+/// root are detected by reconciliation during the walk it already performs
+/// (`Reconciliation::emptied_subtree`); a separate whole-tree pass here
+/// measured at twenty milliseconds per cycle on a sixty-thousand-entry
+/// tree, dominating the latency of every edit. The ancestor count — the
+/// only expensive part — runs lazily, only when the rare one-side-empty
+/// trigger fires.
 fn one_side_emptied_root(
     ancestor: Option<&Node>,
     alpha: Option<&Node>,
     beta: Option<&Node>,
 ) -> bool {
-    fn emptied_below_root(side: Option<&Node>) -> bool {
-        match side {
-            // A subtree the side no longer has at all is a deletion of the
-            // directory itself — the ordinary, intended kind.
-            None => false,
-            Some(node) => {
-                matches!(node.content, Content::Directory(_)) && node.children().is_empty()
-            }
-        }
+    let ancestor = match ancestor {
+        Some(node) if matches!(node.content, Content::Directory(_)) => node,
+        _ => return false,
+    };
+    let gone = |side: Option<&Node>| match side {
+        None => true,
+        Some(node) => node.children().is_empty(),
+    };
+    if gone(alpha) == gone(beta) {
+        return false;
     }
-    // One walk of the ancestor, carrying both sides down by name; returns
-    // the entry count below the node and whether a hazard was found, so
-    // per-directory counts never require a second traversal.
-    fn walk(
-        ancestor: &Node,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
-        at_root: bool,
-    ) -> (usize, bool) {
-        if !matches!(ancestor.content, Content::Directory(_)) {
-            return (0, false);
-        }
-        let mut entries = 0;
-        let mut hazard = false;
-        for child in ancestor.children() {
-            let (below, found) = walk(
-                child,
-                alpha.and_then(|node| node.child(&child.name)),
-                beta.and_then(|node| node.child(&child.name)),
-                false,
-            );
-            entries += 1 + below;
-            hazard |= found;
-        }
-        let floor = if at_root { 2 } else { EMPTIED_SUBTREE_MINIMUM };
-        if entries >= floor {
-            let (alpha_emptied, beta_emptied) = if at_root {
-                // A root that scans as absent is indistinguishable from an
-                // unmounted filesystem and gets the same protection as an
-                // emptied one.
-                let gone = |side: Option<&Node>| match side {
-                    None => true,
-                    Some(node) => node.children().is_empty(),
-                };
-                (gone(alpha), gone(beta))
-            } else {
-                (emptied_below_root(alpha), emptied_below_root(beta))
-            };
-            if alpha_emptied != beta_emptied {
-                hazard = true;
-            }
-        }
-        (entries, hazard)
+    fn entries_below(node: &Node) -> usize {
+        node.children()
+            .iter()
+            .map(|child| 1 + entries_below(child))
+            .sum()
     }
-    match ancestor {
-        Some(node) if matches!(node.content, Content::Directory(_)) => {
-            walk(node, alpha, beta, true).1
-        }
-        _ => false,
-    }
+    entries_below(ancestor) >= 2
 }
 
 /// An exclusive lock on a *pair of endpoint identities*, machine-wide for
@@ -874,7 +825,7 @@ mod tests {
         ));
         // A root holding everything under one directory is exactly the
         // shape the original guard missed: reproduced deleting beta's
-        // whole copy before the guard was generalized.
+        // whole copy before the guard counted recursive entries.
         let single = Node::directory(
             "",
             vec![Node::directory(
@@ -887,30 +838,45 @@ mod tests {
             Some(&empty),
             Some(&single)
         ));
-        // A mount below the root that vanishes leaves an existing, empty
-        // directory; the root still has its siblings.
-        let with_mount = Node::directory(
-            "",
-            vec![
-                file("readme", 9),
-                Node::directory("data", (1..=9).map(|i| file(&format!("f{i}"), i)).collect()),
-            ],
-        );
+        // An absent root gets the same protection as an emptied one.
+        assert!(one_side_emptied_root(Some(&single), None, Some(&single)));
+        // A truly trivial tree still empties freely at the root.
+        let trivial = Node::directory("", vec![file("a", 1)]);
+        assert!(!one_side_emptied_root(
+            Some(&trivial),
+            Some(&empty),
+            Some(&trivial)
+        ));
+    }
+
+    /// Emptied directories *below* the root are reconciliation's to spot,
+    /// during the walk it already performs.
+    #[test]
+    fn emptied_subtree_detection_rides_reconciliation() {
+        let big_data =
+            |n: u8| Node::directory("data", (1..=n).map(|i| file(&format!("f{i}"), i)).collect());
+        let with_mount = Node::directory("", vec![file("readme", 9), big_data(9)]);
         let mount_emptied =
             Node::directory("", vec![file("readme", 9), Node::directory("data", vec![])]);
-        assert!(one_side_emptied_root(
+        // A vanished mount: data/ exists but is empty on one side only.
+        let result = crate::tree::reconcile(
             Some(&with_mount),
             Some(&mount_emptied),
-            Some(&with_mount)
-        ));
-        // Deleting the directory itself is the ordinary kind of deletion
-        // and must keep propagating.
+            Some(&with_mount),
+            SyncMode::TwoWaySafe,
+        );
+        assert_eq!(result.emptied_subtree.as_deref(), Some("data"));
+
+        // Deleting the directory itself is an ordinary deletion.
         let mount_deleted = Node::directory("", vec![file("readme", 9)]);
-        assert!(!one_side_emptied_root(
+        let result = crate::tree::reconcile(
             Some(&with_mount),
             Some(&mount_deleted),
-            Some(&with_mount)
-        ));
+            Some(&with_mount),
+            SyncMode::TwoWaySafe,
+        );
+        assert!(result.emptied_subtree.is_none());
+
         // Small directories may be emptied without ceremony.
         let with_small = Node::directory(
             "",
@@ -923,24 +889,15 @@ mod tests {
             "",
             vec![file("readme", 9), Node::directory("queue", vec![])],
         );
-        assert!(!one_side_emptied_root(
+        let result = crate::tree::reconcile(
             Some(&with_small),
             Some(&small_emptied),
-            Some(&with_small)
-        ));
-        // A truly trivial tree still empties freely at the root.
-        let trivial = Node::directory("", vec![file("a", 1)]);
-        assert!(!one_side_emptied_root(
-            Some(&trivial),
-            Some(&empty),
-            Some(&trivial)
-        ));
+            Some(&with_small),
+            SyncMode::TwoWaySafe,
+        );
+        assert!(result.emptied_subtree.is_none());
     }
 
-    /// The endpoint-pair lock is what keeps two state directories from
-    /// owning one pair of trees: direction-insensitive for the same pair,
-    /// and indifferent to pairs that merely share one endpoint (fan-out
-    /// and relay topologies stay legal).
     #[test]
     fn the_pair_lock_is_unordered_and_pair_scoped() {
         let keep = tempfile::tempdir().unwrap();

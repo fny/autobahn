@@ -36,3 +36,33 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --release
+
+  # Linux on ARM: the deployment target for Graviton instances. The code
+  # needs no platform-specific anything here — this job exists to keep that
+  # true rather than to assume it.
+  linux-arm:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Tests
+        run: cargo test --release
+
+  # FreeBSD has no hosted runner, so the suite runs inside a FreeBSD VM on
+  # the Linux runner. (A container cannot do this: containers share the
+  # host kernel, and FreeBSD's kqueue watcher needs a FreeBSD kernel.)
+  freebsd:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tests in a FreeBSD VM
+        uses: vmactions/freebsd-vm@v1
+        with:
+          usesh: true
+          prepare: |
+            pkg install -y rust
+          run: |
+            cargo test --release

@@ -201,6 +201,18 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Re-read every file's content on the sessions' next cycle, making
+    /// content that changed without its metadata moving (restored
+    /// timestamps, reproducible-build rewrites) visible and synchronized.
+    Verify {
+        /// Filter to a group (defaults to every session).
+        group: Option<String>,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Run as a synchronization agent on standard input/output (invoked on
     /// remote hosts by the sync command; not intended for interactive use).
     Agent,
@@ -247,6 +259,15 @@ fn main() {
             ControlRequest::Resume(Selector { group, host }),
             state_root,
             "resumed",
+        ),
+        Command::Verify {
+            group,
+            host,
+            state_root,
+        } => run_control(
+            ControlRequest::Verify(Selector { group, host }),
+            state_root,
+            "verifying",
         ),
         Command::Reset {
             group,

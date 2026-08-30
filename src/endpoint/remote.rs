@@ -192,6 +192,16 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
+    fn scan_verified(&mut self) -> Result<Snapshot> {
+        match self.exchange(Request::ScanVerified)? {
+            Response::Scan(snapshot) => {
+                self.last_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+            response => Err(unexpected_response(&response, "verified scan")),
+        }
+    }
+
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {
         match self.exchange(Request::StageBegin(files))? {
             Response::StageBegin(needs) => Ok(needs),

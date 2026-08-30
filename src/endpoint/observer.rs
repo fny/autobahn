@@ -220,6 +220,18 @@ impl RootObserver {
     /// during the walk leaves the result immediately stale, which is the
     /// safe direction — at worst one extra cycle, never a missed change.
     pub fn scan(&self, max_entry_count: Option<u64>) -> Result<(Snapshot, u64)> {
+        self.scan_inner(max_entry_count, false)
+    }
+
+    /// Scans with digest reuse disabled: every file is re-read, so content
+    /// changed without its metadata moving becomes visible — and, being
+    /// published like any other scan, the verified snapshot becomes every
+    /// sharing session's baseline.
+    pub fn scan_rehash(&self, max_entry_count: Option<u64>) -> Result<(Snapshot, u64)> {
+        self.scan_inner(max_entry_count, true)
+    }
+
+    fn scan_inner(&self, max_entry_count: Option<u64>, rehash: bool) -> Result<(Snapshot, u64)> {
         self.ensure_watching();
 
         loop {
@@ -229,9 +241,13 @@ impl RootObserver {
                 // Serve the published scan while its generation still
                 // stands: nothing has happened to the tree since it was
                 // taken, so a fresh walk could only reproduce it.
-                if let Some((taken_at, snapshot)) = &state.published {
-                    if *taken_at == self.signal.current() && !self.full_scan_due(&state) {
-                        return Ok((snapshot.clone(), *taken_at));
+                // A verifying scan never serves the cache: the re-read is
+                // the entire point.
+                if !rehash {
+                    if let Some((taken_at, snapshot)) = &state.published {
+                        if *taken_at == self.signal.current() && !self.full_scan_due(&state) {
+                            return Ok((snapshot.clone(), *taken_at));
+                        }
                     }
                 }
 
@@ -249,7 +265,7 @@ impl RootObserver {
                     state.behavior = Some(scan::probe(&self.key.root));
                 }
                 state.scanning = true;
-                let want_full = self.full_scan_due(&state);
+                let want_full = rehash || self.full_scan_due(&state);
                 (
                     state.baseline.clone(),
                     state.behavior.unwrap_or_default(),
@@ -259,7 +275,7 @@ impl RootObserver {
 
             // Outside the lock: a large tree takes seconds to walk, and a
             // watcher callback must never wait behind one.
-            let result = self.walk(baseline.as_ref(), &behavior, want_full);
+            let result = self.walk(baseline.as_ref(), &behavior, want_full, rehash);
 
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             state.scanning = false;
@@ -316,6 +332,7 @@ impl RootObserver {
         baseline: Option<&Snapshot>,
         behavior: &FilesystemBehavior,
         want_full: bool,
+        rehash: bool,
     ) -> Result<(Snapshot, u64, bool)> {
         // The generation is read *before* the walk: an event arriving during
         // it leaves the published snapshot immediately stale, which is the
@@ -342,6 +359,7 @@ impl RootObserver {
             self.key.symlink_mode,
             self.key.max_file_size,
             dirty.as_ref(),
+            rehash,
         )
         .with_context(|| format!("unable to scan {}", self.key.root.display()))?;
         Ok((snapshot, taken_at, dirty.is_none()))

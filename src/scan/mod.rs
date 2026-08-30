@@ -187,6 +187,7 @@ pub fn validate_portable_target(path: &str, target: &str) -> Result<(), String> 
 /// Ignored entries and unsupported filesystem types appear as untracked
 /// content; unreadable entries appear as problematic content. A missing root
 /// yields a snapshot with no content.
+#[allow(clippy::too_many_arguments)] // a scan is configured, not builder-shaped
 pub fn scan(
     root: &Path,
     baseline: Option<&Snapshot>,
@@ -195,6 +196,7 @@ pub fn scan(
     symlink_mode: SymlinkMode,
     max_file_size: Option<u64>,
     dirty: Option<&DirtyPaths>,
+    rehash: bool,
 ) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
@@ -236,6 +238,7 @@ pub fn scan(
         max_file_size,
         dirty.is_some(),
         baseline.map(|snapshot| snapshot.scanned_at_seconds),
+        rehash,
     );
     let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
     let mut snapshot = Snapshot {
@@ -306,6 +309,10 @@ struct Scanner<'a> {
     incremental: bool,
     /// When the baseline's scan started, for the racy-timestamp rule.
     baseline_scanned_at: Option<i64>,
+    /// Whether this scan re-reads every file regardless of metadata — the
+    /// verify verb's mode, which makes content changed without its
+    /// metadata moving visible.
+    rehash: bool,
     /// The digest streaming buffer, allocated once per scan.
     buffer: Vec<u8>,
     /// The number of synchronizable directories scanned.
@@ -327,6 +334,7 @@ impl<'a> Scanner<'a> {
         max_file_size: Option<u64>,
         incremental: bool,
         baseline_scanned_at: Option<i64>,
+        rehash: bool,
     ) -> Scanner<'a> {
         Scanner {
             ignores,
@@ -335,6 +343,7 @@ impl<'a> Scanner<'a> {
             max_file_size,
             incremental,
             baseline_scanned_at,
+            rehash,
             buffer: vec![0u8; DIGEST_BUFFER_SIZE],
             directories: 0,
             files: 0,
@@ -607,7 +616,12 @@ impl<'a> Scanner<'a> {
         // The digest is only recomputed when the metadata that would have
         // accompanied it has changed. This is the difference between a scan
         // that reads the whole hierarchy and one that reads only what moved.
-        let digest = match reusable_digest(baseline, &recorded, self.baseline_scanned_at) {
+        let reusable = if self.rehash {
+            None
+        } else {
+            reusable_digest(baseline, &recorded, self.baseline_scanned_at)
+        };
+        let digest = match reusable {
             Some(digest) => digest,
             None => {
                 let (digest, read) = match self.digest_file(disk_path) {
@@ -625,6 +639,32 @@ impl<'a> Scanner<'a> {
                 // the wrong digest survived every future scan, full scans
                 // included, and was persisted into the cache.
                 let _ = read;
+                // Under a verifying scan, a recomputed digest that differs
+                // while the metadata matches the baseline exactly is the
+                // precise class the metadata gate cannot see — content
+                // rewritten with its timestamps restored. Each instance is
+                // evidence and is reported loudly.
+                if self.rehash {
+                    if let Some(Content::File {
+                        digest: recorded_digest,
+                        metadata: recorded_metadata,
+                        ..
+                    }) = baseline.map(|node| &node.content)
+                    {
+                        let metadata_matches = recorded_metadata.mtime_seconds
+                            == recorded.mtime_seconds
+                            && recorded_metadata.mtime_nanos == recorded.mtime_nanos
+                            && recorded_metadata.size == recorded.size
+                            && recorded_metadata.inode == recorded.inode;
+                        if metadata_matches && *recorded_digest != digest {
+                            eprintln!(
+                                "verify: {} changed content without its metadata \
+                                 moving — invisible to ordinary scans until now",
+                                disk_path.display()
+                            );
+                        }
+                    }
+                }
                 digest
             }
         };
@@ -968,6 +1008,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed")
     }
@@ -989,6 +1030,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("full scan should succeed");
         let incremental = scan(
@@ -999,6 +1041,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             Some(&dirty),
+            false,
         )
         .expect("incremental scan should succeed");
         assert!(
@@ -1102,6 +1145,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             Some(&dirty),
+            false,
         )
         .expect("incremental scan should succeed");
         assert!(incremental.content_equal(&baseline));
@@ -1135,6 +1179,7 @@ mod tests {
                 mode,
                 None,
                 None,
+                false,
             )
             .expect("scan should succeed")
         };
@@ -1200,6 +1245,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -1215,6 +1261,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -1232,6 +1279,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("a missing root is not an error");
         assert!(snapshot.root.is_none());
@@ -1254,6 +1302,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .is_err());
     }
@@ -1441,6 +1490,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1475,6 +1525,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1510,6 +1561,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1537,6 +1589,7 @@ mod tests {
             SymlinkMode::default(),
             None,
             None,
+            false,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");

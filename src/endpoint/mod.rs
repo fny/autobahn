@@ -159,6 +159,13 @@ pub trait Endpoint: Send {
     /// snapshots); callers just get a fresh, consistent snapshot.
     fn scan(&mut self) -> Result<Snapshot>;
 
+    /// Scans with digest reuse disabled: every file is re-read, making
+    /// content that changed without its metadata moving visible. The
+    /// default cannot do better than an ordinary scan.
+    fn scan_verified(&mut self) -> Result<Snapshot> {
+        self.scan()
+    }
+
     /// Begins staging on this (destination) endpoint for the requested
     /// files, returning the subset that actually needs transfer along with
     /// base signatures. Requests satisfiable locally (already-staged content

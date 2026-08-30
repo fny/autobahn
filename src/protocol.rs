@@ -73,6 +73,10 @@ pub struct Initialize {
 pub enum Request {
     /// Perform a scan.
     Scan,
+    /// Perform a scan with digest reuse disabled: every file's content is
+    /// re-read, so content changed without its metadata moving becomes
+    /// visible. The verify verb's scan.
+    ScanVerified,
     /// Begin staging for the specified files.
     StageBegin(Vec<FileRequest>),
     /// Open a supply stream for the specified needs.

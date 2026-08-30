@@ -759,6 +759,13 @@ impl Endpoint for LocalEndpoint {
         Ok(snapshot)
     }
 
+    fn scan_verified(&mut self) -> Result<Snapshot> {
+        let (snapshot, generation) = self.observer.scan_rehash(self.max_entry_count)?;
+        self.seen_generation = generation;
+        self.last_snapshot = Some(snapshot.clone());
+        Ok(snapshot)
+    }
+
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {
         fs::create_dir_all(&self.staging_root).with_context(|| {
             format!(
@@ -2497,6 +2504,74 @@ mod tests {
             fs::symlink_metadata(beta_root.join("dir/file.txt")).expect("file should exist");
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.gid(), gid);
+    }
+
+    /// The verify escape hatch: content rewritten with its metadata
+    /// restored — same length, same mtime, same inode — is invisible to
+    /// every ordinary scan by design (the founding trade of scan-based
+    /// synchronization). A verified scan re-reads everything and sees it.
+    #[test]
+    fn a_verified_scan_sees_what_metadata_hides() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let staging = keep.path().join("staging");
+        fs::create_dir_all(&root).expect("root");
+        let path = root.join("forged.txt");
+        fs::write(&path, b"first version").expect("writes");
+        // Old enough that the racy-timestamp rule trusts the digest.
+        let moment = std::time::SystemTime::now() - std::time::Duration::from_secs(120);
+        let set_mtime = || {
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .expect("opens")
+                .set_modified(moment)
+                .expect("mtime");
+        };
+        set_mtime();
+
+        let mut endpoint = LocalEndpoint::new(root.clone(), staging, EndpointOptions::default())
+            .expect("endpoint");
+        let first = endpoint.scan().expect("scans");
+        let digest_of = |snapshot: &Snapshot| match &snapshot
+            .root
+            .as_ref()
+            .and_then(|root| root.child("forged.txt"))
+            .expect("present")
+            .content
+        {
+            Content::File { digest, .. } => *digest,
+            _ => panic!("expected a file"),
+        };
+        let original = digest_of(&first);
+
+        // The forgery: same length, restored mtime, same inode.
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .expect("opens")
+            .write_all(b"forgd version")
+            .expect("writes");
+        set_mtime();
+
+        let ordinary = endpoint.scan().expect("scans");
+        assert_eq!(
+            digest_of(&ordinary),
+            original,
+            "an ordinary scan must miss the forgery — that miss is the \
+             documented design trade this verb exists to answer"
+        );
+
+        let verified = endpoint.scan_verified().expect("verifies");
+        assert_ne!(
+            digest_of(&verified),
+            original,
+            "the verified scan must see the true content"
+        );
+        // And having seen it once, ordinary scans stay correct: the
+        // verified snapshot is the published baseline now.
+        let after = endpoint.scan().expect("scans");
+        assert_eq!(digest_of(&after), digest_of(&verified));
     }
 
     /// A creation must refuse to replace content that appeared after its

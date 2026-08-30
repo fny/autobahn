@@ -104,6 +104,9 @@ pub struct Session {
     /// Simulates a crash between the transitions and the achieved record.
     #[cfg(test)]
     pub(crate) fail_before_record: bool,
+    /// When set, the next cycle's scans re-read every file's content —
+    /// the verify verb's request.
+    verify_next: bool,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
     /// Whether the last cycle finished with the two sides synchronized and
@@ -175,6 +178,15 @@ impl Session {
         self.ancestor_store.set_power_durability(enabled);
     }
 
+    /// Requests that the next cycle re-read every file's content instead
+    /// of trusting recorded digests, making content changed without its
+    /// metadata moving visible.
+    pub fn request_verify(&mut self) {
+        self.verify_next = true;
+        // The quiesced shortcut would skip the very walk being requested.
+        self.quiesced = false;
+    }
+
     /// Creates a session between the provided endpoints under an
     /// already-held state lock. This exists so that callers with expensive
     /// endpoint construction (spawning SSH, handshaking with an agent) can
@@ -243,6 +255,7 @@ impl Session {
             held: Vec::new(),
             #[cfg(test)]
             fail_before_record: false,
+            verify_next: false,
             alpha,
             beta,
             mode,
@@ -338,12 +351,23 @@ impl Session {
         let mut report = CycleReport::default();
 
         // Scan both endpoints in parallel.
+        let verify = std::mem::take(&mut self.verify_next);
         let (alpha_snapshot, beta_snapshot) = {
             let alpha = &mut self.alpha;
             let beta = &mut self.beta;
             std::thread::scope(|scope| {
-                let alpha_scan = scope.spawn(move || alpha.scan());
-                let beta_result = beta.scan();
+                let alpha_scan = scope.spawn(move || {
+                    if verify {
+                        alpha.scan_verified()
+                    } else {
+                        alpha.scan()
+                    }
+                });
+                let beta_result = if verify {
+                    beta.scan_verified()
+                } else {
+                    beta.scan()
+                };
                 let alpha_result = alpha_scan.join().expect("scan thread panicked");
                 (alpha_result, beta_result)
             })

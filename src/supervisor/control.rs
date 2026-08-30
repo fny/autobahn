@@ -31,6 +31,9 @@ pub enum ControlRequest {
     /// Discard the selected sessions' ancestors (their next cycles merge
     /// both sides additively, resurrecting deletions) and cycle.
     Reset(Selector),
+    /// Re-read every file's content on the selected sessions' next cycle,
+    /// making content changed without its metadata moving visible.
+    Verify(Selector),
 }
 
 /// Selects sessions by group and destination.
@@ -73,6 +76,8 @@ pub(crate) struct WorkerControl {
     pub paused: AtomicBool,
     /// Discard the ancestor before the next cycle.
     pub reset: AtomicBool,
+    /// Re-read every file's content on the next cycle.
+    pub verify: AtomicBool,
 }
 
 /// The registry mapping sessions to their control flags, shared between the
@@ -99,6 +104,10 @@ impl Registry {
             }),
             ControlRequest::Reset(selector) => (selector, |control| {
                 control.reset.store(true, Ordering::Relaxed);
+                control.wake.store(true, Ordering::Relaxed);
+            }),
+            ControlRequest::Verify(selector) => (selector, |control| {
+                control.verify.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
             }),
         };

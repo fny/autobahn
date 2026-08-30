@@ -261,6 +261,9 @@ impl Supervisor {
                         if flags.reset.swap(false, Ordering::Relaxed) {
                             worker.reset();
                         }
+                        if flags.verify.swap(false, Ordering::Relaxed) {
+                            worker.verify_pending = true;
+                        }
                         let result = worker.attempt();
                         let failed = result.is_err();
                         if let Err(error) = worker.conclude(&result) {
@@ -301,6 +304,8 @@ struct Worker<'a> {
     session: Option<Session>,
     /// The number of cycles completed since this worker started.
     cycles: u64,
+    /// A verify request awaiting the next cycle (survives reconnection).
+    verify_pending: bool,
 }
 
 impl<'a> Worker<'a> {
@@ -318,6 +323,7 @@ impl<'a> Worker<'a> {
             verbose,
             session: None,
             cycles: 0,
+            verify_pending: false,
         }
     }
 
@@ -334,7 +340,11 @@ impl<'a> Worker<'a> {
             if self.session.is_none() {
                 self.session = Some(connect(self.plan, self.state_root, self.pool)?);
             }
-            run_cycles(self.session.as_mut().expect("the session was just created"))
+            let session = self.session.as_mut().expect("the session was just created");
+            if std::mem::take(&mut self.verify_pending) {
+                session.request_verify();
+            }
+            run_cycles(session)
         })();
         if let Ok((digest, _)) = &result {
             self.cycles += digest.cycles;

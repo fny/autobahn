@@ -429,6 +429,12 @@ fn serve_channel<W: Write>(
                     Response::Scan(snapshot)
                 }
             }),
+            Request::ScanVerified => endpoint.scan_verified().map(|snapshot| {
+                // Never elided: the entire point is a full re-read whose
+                // result the controller sees in full.
+                anchor = Anchor::To(Some(snapshot.clone()));
+                Response::Scan(snapshot)
+            }),
             Request::StageBegin(files) => endpoint.stage_begin(files).map(Response::StageBegin),
             Request::SupplyOpen(needs) => {
                 endpoint.supply_open(needs).map(|()| Response::SupplyOpened)

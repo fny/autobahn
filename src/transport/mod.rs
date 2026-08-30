@@ -1003,6 +1003,40 @@ pub(crate) mod tests {
     /// mistake there would shift the layout while both ends still agreed
     /// with each other — invisible to a round-trip test, fatal against a
     /// peer built from other code. This asserts the exact prefix instead.
+    /// A stale agent built from the same package version but an older
+    /// compatibility epoch must fail the handshake: safety-relevant
+    /// behavior can change without a wire-format change, and "the agent
+    /// runs and decodes frames" must not be read as "the agent has the
+    /// fixes". The epoch rides in the version string, so the installed
+    /// agent's filename changes with it too — the installer never invokes
+    /// a stale same-semver binary.
+    #[test]
+    fn a_stale_epoch_fails_the_handshake() {
+        let current = local_handshake();
+        verify_handshake(&current).expect("the current version verifies");
+
+        let stale = Handshake {
+            magic: protocol::MAGIC,
+            version: format!(
+                "{}+e{}",
+                env!("CARGO_PKG_VERSION"),
+                protocol::COMPATIBILITY_EPOCH + 1
+            ),
+        };
+        let error = verify_handshake(&stale).expect_err("a different epoch must fail");
+        assert!(
+            format!("{error:#}").contains("version mismatch"),
+            "{error:#}"
+        );
+
+        // And the epoch reaches the installed agent's path.
+        assert!(
+            crate::transport::install::versioned_remote_command()
+                .contains(&format!("+e{}", protocol::COMPATIBILITY_EPOCH)),
+            "the install path must carry the epoch"
+        );
+    }
+
     #[test]
     fn frame_layout_is_a_length_then_a_flag_then_the_body() {
         // Small frames travel uncompressed: [len(4)][flag=0][bincode].

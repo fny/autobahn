@@ -630,47 +630,48 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
     // would bind whatever tree the path reaches *today* to the ancestor of
     // the tree it reached *then* — provenance for the wrong root, which is
     // how a deliberate revert gets silently overwritten. Refuse instead.
-    for (target, planned, side) in [
+    // The verified resolution is also the path the endpoint will use, so a
+    // symlink retargeted after this check cannot redirect the endpoint: the
+    // check and the use are one resolution, not two.
+    let mut frozen: [Option<PathBuf>; 2] = [None, None];
+    for (index, (target, planned, side)) in [
         (&plan.alpha, &plan.alpha_identity, "alpha"),
         (&plan.beta, &plan.beta_identity, "beta"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         if let EndpointTarget::Local(path) = target {
-            let resolved = crate::paths::resolve_for_identity(path)
-                .to_string_lossy()
-                .into_owned();
-            if &resolved != planned {
+            let resolved = crate::paths::resolve_for_identity(path);
+            if resolved.to_string_lossy() != planned.as_str() {
                 anyhow::bail!(
                     "the {side} root {} no longer resolves to the tree it was planned \
                      against ({planned} became {resolved}); refusing to attach its \
                      session state to a different tree — restart to replan",
-                    path.display()
+                    path.display(),
+                    resolved = resolved.display()
                 );
             }
+            // A missing alpha stays an error: combined with a mirroring
+            // mode, a mistyped source path would otherwise read as "the
+            // source is empty" and empty the destination. A missing beta is
+            // a legitimate state a transition resolves by creating it.
+            if side == "alpha" && !resolved.exists() {
+                anyhow::bail!("alpha root {} does not exist", resolved.display());
+            }
+            frozen[index] = Some(resolved);
         }
     }
 
     let endpoint = |target: &EndpointTarget, side: &str| -> Result<Box<dyn Endpoint + Send>> {
         match target {
             EndpointTarget::Local(path) => {
-                // A missing *beta* root is a legitimate synchronization
-                // state (one a transition resolves by creating it), so it
-                // passes through lexically. A missing alpha stays an error:
-                // combined with a mirroring mode, a mistyped source path
-                // would otherwise read as "the source is empty" and empty
-                // the destination.
-                let root = match path.canonicalize() {
-                    Ok(root) => root,
-                    Err(error)
-                        if error.kind() == std::io::ErrorKind::NotFound && side != "alpha" =>
-                    {
-                        path.clone()
-                    }
-                    Err(error) => {
-                        return Err(error).with_context(|| {
-                            format!("unable to resolve {side} root {}", path.display())
-                        });
-                    }
-                };
+                // The frozen resolution from the identity check above —
+                // never a second canonicalization of the original spelling,
+                // which would reopen the window the check just closed.
+                let root = frozen[if side == "alpha" { 0 } else { 1 }]
+                    .clone()
+                    .unwrap_or_else(|| path.clone());
                 let staging = crate::endpoint::local::staging_root_for(
                     plan.staging,
                     &root,

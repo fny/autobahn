@@ -328,6 +328,14 @@ impl LocalEndpoint {
         let cache_path = staging_root.with_extension("scancache");
         let observer_root = root.clone();
         let observer_ignores = options.ignores.clone();
+        // A network filesystem answers stats from a client cache, delivers
+        // no (or partial) change events, and gives advisory locks whatever
+        // semantics the server chooses — which quietly voids the
+        // assumptions scanning, destructive validation, and locking are
+        // built on. Synchronizing one is best-effort, single-writer
+        // territory, and the person configuring it should know that.
+        warn_if_network_filesystem(&root);
+
         Ok(LocalEndpoint {
             root,
             staging_root,
@@ -2037,6 +2045,49 @@ fn temporary_name(purpose: &str) -> String {
         "{TEMPORARY_PREFIX}-{purpose}-{}-{count}",
         std::process::id()
     )
+}
+
+/// Warns when a synchronization root lives on a filesystem whose caching
+/// and event semantics undermine local-filesystem assumptions. Detection is
+/// best-effort and Linux-only; the probe walks up to the deepest existing
+/// ancestor so a missing root is still classified by the volume it will be
+/// created on.
+fn warn_if_network_filesystem(root: &Path) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let mut probe = root.to_path_buf();
+        while !probe.exists() {
+            match probe.parent() {
+                Some(parent) => probe = parent.to_path_buf(),
+                None => return,
+            }
+        }
+        let Ok(path) = std::ffi::CString::new(probe.as_os_str().as_bytes()) else {
+            return;
+        };
+        let mut stats: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut stats) } != 0 {
+            return;
+        }
+        let kind = match stats.f_type {
+            0x6969 => "NFS",
+            0x517b => "SMB",
+            0xff53_4d42 => "CIFS",
+            0xfe53_4d42 => "SMB2",
+            0x6573_5546 => "FUSE",
+            _ => return,
+        };
+        eprintln!(
+            "warning: {} is on {kind}; synchronization of network filesystems is \
+             best-effort and assumes this client is the only writer — attribute \
+             caching can hide another client's changes from both scanning and \
+             the checks that guard destructive operations",
+            root.display()
+        );
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = root;
 }
 
 /// Whether a staged file's bytes hash to the digest its name claims. Used

@@ -165,7 +165,19 @@ pub struct MuxResponse {
     pub response: Response,
 }
 
-/// Returns the version string used for handshake validation.
+/// The compatibility epoch: bumped whenever safety-relevant behavior
+/// changes without a wire-format change — a hardened transition path, a
+/// stricter validation rule — so that a stale agent built from the same
+/// package version cannot pass the handshake and silently run without the
+/// fix. The epoch rides inside the version string, which means the
+/// handshake comparison, the installed agent's filename, and the mismatch
+/// diagnostic all enforce it with no protocol change at all: a mismatched
+/// agent fails the handshake, and the installer places the new agent at a
+/// path the old one never occupied.
+pub const COMPATIBILITY_EPOCH: u32 = 1;
+
+/// Returns the version string used for handshake validation and agent
+/// installation: the package version qualified by the compatibility epoch.
 pub fn version() -> String {
-    env!("CARGO_PKG_VERSION").to_owned()
+    format!("{}+e{}", env!("CARGO_PKG_VERSION"), COMPATIBILITY_EPOCH)
 }

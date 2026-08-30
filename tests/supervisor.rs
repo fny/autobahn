@@ -638,7 +638,55 @@ fn a_missing_alpha_is_a_session_error_not_a_crash() {
         .result
         .as_ref()
         .expect_err("the session should fail");
-    assert!(error.contains("unable to resolve alpha root"), "{error}");
+    assert!(
+        error.contains("alpha root") && error.contains("does not exist"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_retargeted_root_is_refused_rather_than_bound_to_stale_state() {
+    // Session identity resolves through symlinks at plan time. If the link
+    // is retargeted before the worker connects, the path now reaches a
+    // different tree — and binding that tree to the planned tree's ancestor
+    // hands reconciliation the wrong provenance. The worker must refuse.
+    let world = World::new();
+    let tree_a = world.directory("tree-a");
+    let tree_b = world.directory("tree-b");
+    let beta = world.directory("beta");
+    write(&tree_a, "file.txt", "a's content");
+    write(&tree_b, "file.txt", "b's content");
+    let link = world.path("entry");
+    std::os::unix::fs::symlink(&tree_a, &link).expect("symlink should be creatable");
+
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{link}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        link = link.display(),
+        beta = beta.display(),
+    ));
+
+    // The retarget lands between planning and connecting.
+    std::fs::remove_file(&link).expect("link should be removable");
+    std::os::unix::fs::symlink(&tree_b, &link).expect("symlink should be recreatable");
+
+    let outcomes = world.run_once(plans);
+    let error = outcomes[0]
+        .result
+        .as_ref()
+        .expect_err("the session must refuse the retargeted root");
+    assert!(
+        error.contains("no longer resolves"),
+        "expected the retarget refusal, got: {error}"
+    );
+    assert!(
+        !beta.join("file.txt").exists(),
+        "nothing may be synchronized from the wrong tree"
+    );
 }
 
 #[test]

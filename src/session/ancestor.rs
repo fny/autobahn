@@ -86,6 +86,10 @@ impl AncestorStore {
     /// because starting from nothing would resurrect deletions.
     pub(crate) fn open(path: &Path) -> Result<(AncestorStore, Option<Node>)> {
         let journal_path = journal_path(path);
+        // A temporary left by an interrupted normalization holds nothing
+        // authoritative — the rename is the commit point — so it is
+        // discarded before the journal is read.
+        let _ = fs::remove_file(normalization_path(&journal_path));
         let (mut generation, mut ancestor, checkpoint_bytes) = read_checkpoint(path)?;
 
         let (records, physical_bytes) = read_journal(&journal_path)?;
@@ -113,12 +117,35 @@ impl AncestorStore {
         let applied_bytes: usize = applied.iter().map(Vec::len).sum();
         let journal_bytes = applied_bytes as u64;
         if applied_bytes as u64 != physical_bytes {
+            // Normalization must never be able to destroy what it is
+            // healing. Rewriting the live journal in place could be cut by
+            // a crash — or fail partway on the very full disk that tore the
+            // journal in the first place — leaving fewer acknowledged
+            // records than it found. The rewrite therefore goes to a
+            // sibling temporary, synced, and renames over the journal; the
+            // journal stays authoritative and untouched until the rename
+            // commits, and a failure at any point leaves it exactly as it
+            // was for the next attempt.
             let mut normalized = Vec::with_capacity(applied_bytes);
             for raw in &applied {
                 normalized.extend_from_slice(raw);
             }
-            fs::write(&journal_path, &normalized)
-                .context("unable to normalize the ancestor journal")?;
+            let temporary = normalization_path(&journal_path);
+            {
+                let mut file =
+                    File::create(&temporary).context("unable to normalize the ancestor journal")?;
+                file.write_all(&normalized)
+                    .context("unable to normalize the ancestor journal")?;
+                file.sync_all()
+                    .context("unable to sync the normalized ancestor journal")?;
+            }
+            fs::rename(&temporary, &journal_path)
+                .context("unable to publish the normalized ancestor journal")?;
+            if let Some(parent) = journal_path.parent() {
+                if let Ok(directory) = File::open(parent) {
+                    let _ = directory.sync_all();
+                }
+            }
         }
 
         if let Some(root) = &ancestor {
@@ -286,6 +313,15 @@ struct Record {
     /// The record's exact on-disk bytes, header included, so the journal
     /// can be rewritten as precisely the records that were applied.
     raw: Vec<u8>,
+}
+
+/// The sibling temporary a journal normalization writes before renaming
+/// over the journal. Distinct from every other temporary name the store
+/// uses.
+fn normalization_path(journal: &Path) -> PathBuf {
+    let mut name = journal.file_name().unwrap_or_default().to_os_string();
+    name.push(".norm-tmp");
+    journal.with_file_name(name)
 }
 
 fn journal_path(path: &Path) -> PathBuf {
@@ -942,6 +978,60 @@ mod tests {
                     "cut {cut}: an acknowledgment made after recovery was lost"
                 );
             }
+        }
+    }
+
+    /// Normalization must be unable to destroy what it heals: every crash
+    /// state its temp-then-rename sequence can leave — a partial temporary,
+    /// a complete unsynced temporary, a complete temporary before the
+    /// rename — must reopen to the same acknowledged state and stay
+    /// appendable. The first implementation rewrote the live journal in
+    /// place, and a cut (or a still-full disk) during that write silently
+    /// rolled acknowledged provenance back.
+    #[test]
+    fn an_interrupted_normalization_cannot_lose_acknowledgments() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let first = Some(directory(vec![file("a", 1)]));
+        store
+            .record(&[change("", first.clone())], first.as_ref())
+            .expect("records");
+        let second = Some(directory(vec![file("a", 1), file("b", 2)]));
+        store
+            .record(&[change("b", Some(file("b", 2)))], second.as_ref())
+            .expect("records");
+
+        // Damage the journal with a torn tail so the next open normalizes.
+        let journal = journal_path(&path);
+        let mut bytes = fs::read(&journal).expect("reads");
+        let intact = bytes.clone();
+        bytes.extend_from_slice(&9u64.to_le_bytes());
+        bytes.extend_from_slice(&4096u64.to_le_bytes());
+        fs::write(&journal, &bytes).expect("writes");
+
+        // Crash states of the normalization sequence, each rebuilt from the
+        // damaged journal: (a) a partial temporary beside it, (b) a complete
+        // temporary before the rename. In both, the journal itself is still
+        // authoritative and both records must survive, and a record made
+        // after recovery must survive its own reopen.
+        let temp = normalization_path(&journal);
+        for (label, temp_bytes) in [
+            ("partial temporary", &intact[..intact.len() / 2]),
+            ("complete temporary", &intact[..]),
+        ] {
+            fs::write(&journal, &bytes).expect("restores damage");
+            fs::write(&temp, temp_bytes).expect("plants the crash state");
+            let (mut reopened, loaded) =
+                AncestorStore::open(&path).unwrap_or_else(|error| panic!("{label}: {error:#}"));
+            assert!(same(&loaded, &second), "{label}: acknowledged state lost");
+            assert!(!temp.exists(), "{label}: stray temporary not cleared");
+            let third = Some(directory(vec![file("a", 1), file("b", 2), file("c", 3)]));
+            reopened
+                .record(&[change("c", Some(file("c", 3)))], third.as_ref())
+                .expect("records after recovery");
+            let (_, after) = AncestorStore::open(&path).expect("reopens");
+            assert!(same(&after, &third), "{label}: post-recovery record lost");
         }
     }
 }

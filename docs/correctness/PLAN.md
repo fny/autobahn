@@ -114,3 +114,57 @@ is), with verification infrastructure built *before* the fixes it checks.
 - **F2.6** watcher case-fold marking (bounded by the 120s full scan).
 - **C2.4-manual** `sync --state-dir` remains an escape hatch; Phase 5's
   endpoint lock closes the dangerous overlap.
+
+## Open risks (added after a fifth review round; the list above is history, not a claim of completeness)
+
+The seven phases above are complete, but "complete" means those items
+landed — not that the codebase is settled. A risk discussion over the
+finished work (reviews archived as `review-*.md`, risk list in the same
+round) produced the following, in priority order. Items marked done were
+fixed in the same round.
+
+- [x] **Journal normalization made crash-atomic.** The healing rewrite
+      went to the live journal with `fs::write`; a crash or a still-full
+      disk during recovery could destroy the acknowledged records being
+      healed. Now temp + fsync + rename, with the crash states
+      fault-injected.
+- [x] **Endpoint resolution frozen.** connect() verified the plan-time
+      identity and then canonicalized the original path a second time; a
+      symlink retargeted between the two still bound the wrong tree. One
+      resolution now serves the check, the pair lock, and the endpoint,
+      and a retarget-refusal test pins it.
+- [x] **Nested writable endpoints across sessions refused** (containment,
+      canonically compared). Equal shared endpoints — fan-out, star,
+      relay — warn instead of failing: they are pinned-legal topologies.
+      Cross-process sharing is documented as unsupported rather than
+      detected.
+- [x] **Network filesystems detected and the support boundary written
+      down** (README): NFS/SMB/CIFS/FUSE roots warn; single-writer,
+      best-effort.
+- [x] **Compatibility epoch.** The handshake version now carries an epoch
+      bumped when safety semantics change without a wire change, so a
+      stale same-semver agent fails the handshake and the installer
+      places the fixed agent at a fresh path. Version bumped to 0.4.0.
+
+Still open, in order:
+
+- [ ] **Intent records** before transitions (first item of the next
+      session): the last architectural window in which a crash between a
+      transition and its ancestor record lets a later deliberate revert
+      be overwritten.
+- [ ] **Enumeration-style harnesses** for the observer generation
+      protocol, the staging/transition lifecycle, and remote reconnect
+      behavior — the three state machines that still have only
+      example-based tests.
+- [ ] **An independent review** organized around invariants rather than
+      the existing defect lists; everything so far shares one
+      implementation lineage and two model reviewers.
+- [ ] **A `--checksum` re-verification pass** for the forged-timestamp
+      residual, and power-loss modelling for the ancestor store (the
+      enumeration proves process-crash truncation only; header fields sit
+      outside the record digests).
+- [ ] **Known-and-retained**: single-huge-file mounts can evade the
+      emptied guard (count is the trigger; byte thresholds would halt
+      routine large-file deletions for the same on-disk signature);
+      pathname TOCTOU outside Linux creations; the dirfd traversal
+      refactor.

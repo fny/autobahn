@@ -259,3 +259,24 @@ convention and adversarial review to keep safe in Go, the borrow checker
 and `Arc::make_mut` enforce structurally here.
 
 [Mutagen]: https://github.com/mutagen-io/mutagen
+
+## Support boundaries
+
+- **Local filesystems.** Synchronization roots are expected to live on
+  local filesystems (ext4, XFS, APFS, and the like). Network mounts —
+  NFS, SMB/CIFS, FUSE — are best-effort: client-side attribute caching
+  can hide another client's writes from both scanning and the checks
+  that guard destructive operations, change notification is absent or
+  incomplete, and lock semantics depend on the server. If a root must
+  live on a network mount, treat this client as the only writer.
+  autobahn prints a warning when it detects such a root.
+- **One owner per pair of trees.** Two sessions synchronizing the same
+  pair of roots are excluded machine-wide per user, even across
+  different `--state-root`/`--state-dir` settings. Running sessions over
+  the same trees from *different machines* (or different Unix users) is
+  not supported and can silently undo deliberate changes.
+- **Timestamp-preserving rewrites.** A tool that rewrites a file with
+  identical length while restoring its modification time (reproducible
+  builds, `touch -r`) defeats metadata-based change detection, as it
+  does in every synchronizer of this design. A content re-verification
+  escape hatch is planned.

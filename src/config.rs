@@ -600,6 +600,71 @@ impl Config {
             }
         }
 
+        // Across sessions, a writable endpoint nested inside another
+        // session's endpoint means two sessions mutate one tree region from
+        // independent ancestors: each can read the other's writes as user
+        // edits and propagate them back, and a check/use window lets a
+        // losing write travel. Containment is refused when either endpoint
+        // involved is writable. *Equality* is different: identical shared
+        // endpoints are the fan-out, star, and relay topologies — pinned
+        // legal by tests and in ordinary use — so a shared writable
+        // endpoint that is exactly equal warns instead of failing. Two
+        // configurations in separate processes are outside what this can
+        // see; the endpoint-pair lock covers the identical pair there, and
+        // anything else is documented as unsupported.
+        let writable = |plan: &SessionPlan, alpha: bool| -> bool {
+            if alpha {
+                matches!(plan.mode, SyncMode::TwoWaySafe | SyncMode::TwoWayResolved)
+            } else {
+                true
+            }
+        };
+        let mut endpoints: Vec<(String, bool, String)> = Vec::new();
+        for plan in &plans {
+            endpoints.push((
+                plan.alpha_identity.clone(),
+                writable(plan, true),
+                plan.display(),
+            ));
+            endpoints.push((
+                plan.beta_identity.clone(),
+                writable(plan, false),
+                plan.display(),
+            ));
+        }
+        for (index, (identity, writes, owner)) in endpoints.iter().enumerate() {
+            for (other_identity, other_writes, other_owner) in endpoints.iter().skip(index + 1) {
+                if owner == other_owner {
+                    continue; // within-session overlap is checked above
+                }
+                if identity == other_identity {
+                    if (*writes || *other_writes) && owner != other_owner {
+                        eprintln!(
+                            "warning: sessions '{owner}' and '{other_owner}' share the \
+                             writable endpoint {identity}; concurrent edits there can \
+                             conflict across sessions"
+                        );
+                    }
+                    continue;
+                }
+                let contains = |outer: &str, inner: &str| {
+                    inner
+                        .strip_prefix(outer)
+                        .is_some_and(|rest| rest.starts_with('/'))
+                };
+                let nested =
+                    contains(identity, other_identity) || contains(other_identity, identity);
+                if nested && (*writes || *other_writes) {
+                    errors.push(format!(
+                        "sessions '{owner}' and '{other_owner}': endpoint {other_identity} \
+                         is nested inside {identity} and at least one of them is written; \
+                         two sessions cannot safely write one tree region from independent \
+                         ancestors"
+                    ));
+                }
+            }
+        }
+
         if !errors.is_empty() {
             bail!("invalid configuration:\n  {}", errors.join("\n  "));
         }
@@ -1159,6 +1224,62 @@ mod tests {
             alpha = "/srv/hub"
             mode = "one-way-safe"
             betas = ["/srv/final"]
+            "#,
+        );
+        assert_eq!(config.plans().expect("plans should build").len(), 2);
+    }
+
+    #[test]
+    fn nested_writable_endpoints_across_sessions_are_rejected() {
+        // Two sessions writing one tree region from independent ancestors
+        // can each read the other's writes as user edits; nesting is
+        // refused when either endpoint is written.
+        let config = parse(
+            r#"
+            [groups.whole]
+            alpha = "/srv/project"
+            mode = "two-way-safe"
+            betas = ["/backup/project"]
+
+            [groups.part]
+            alpha = "/srv/project/docs"
+            mode = "two-way-safe"
+            betas = ["/laptop/docs"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(error.contains("nested inside"), "{error}");
+
+        // Read-only nesting — two one-way sessions reading overlapping
+        // sources — stays legal: nothing writes the shared region.
+        let config = parse(
+            r#"
+            [groups.whole]
+            alpha = "/srv/project"
+            mode = "one-way-safe"
+            betas = ["/backup/project"]
+
+            [groups.part]
+            alpha = "/srv/project/docs"
+            mode = "one-way-safe"
+            betas = ["/laptop/docs"]
+            "#,
+        );
+        assert_eq!(config.plans().expect("plans should build").len(), 2);
+
+        // Equal shared endpoints (fan-out, star, relay) stay legal too —
+        // they warn rather than fail.
+        let config = parse(
+            r#"
+            [groups.star-one]
+            alpha = "/hub"
+            mode = "two-way-safe"
+            betas = ["/spoke-one"]
+
+            [groups.star-two]
+            alpha = "/hub"
+            mode = "two-way-safe"
+            betas = ["/spoke-two"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);

@@ -125,3 +125,14 @@ deliberately last: phases A–C change what the invariants document says.
 
 Each phase ends the standard gate: full suite, clippy, fmt, crash
 scripts, smoke, and — for A — the latency A/B.
+
+## Status
+
+All phases are complete. A and B landed as the intent-record and
+verify-verb commits; C1's interleaving sweep found two generation-
+protocol holes (fixed and mutation-checked before it first passed);
+C2 moved the intent window off the staging phase so mid-transfer
+crashes recover conflict-free; C3 measured the remote intent window at
+3 of 29 frame-boundary cuts. D produced `INVARIANTS.md`. Hot-path
+changes were A/B measured flat (p50 51.9/52.0 before, 52.2/50.7
+after).

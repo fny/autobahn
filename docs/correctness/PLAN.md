@@ -146,24 +146,25 @@ fixed in the same round.
       stale same-semver agent fails the handshake and the installer
       places the fixed agent at a fresh path. Version bumped to 0.4.0.
 
-Still open, in order:
+All five were then executed as NEXT.md phases A through D:
 
-- [ ] **Intent records** before transitions (first item of the next
-      session): the last architectural window in which a crash between a
-      transition and its ancestor record lets a later deliberate revert
-      be overwritten.
-- [ ] **Enumeration-style harnesses** for the observer generation
-      protocol, the staging/transition lifecycle, and remote reconnect
-      behavior — the three state machines that still have only
-      example-based tests.
-- [ ] **An independent review** organized around invariants rather than
-      the existing defect lists; everything so far shares one
-      implementation lineage and two model reviewers.
-- [ ] **A `--checksum` re-verification pass** for the forged-timestamp
-      residual, and power-loss modelling for the ancestor store (the
-      enumeration proves process-crash truncation only; header fields sit
-      outside the record digests).
+- [x] **Intent records** before transitions (phase A): the crash window
+      is closed, the journal entry is typed, record digests cover the
+      generation, and `durability = "power"` makes appends syncable.
+- [x] **Enumeration-style harnesses** (phase C): the observer
+      interleaving sweep (which found and forced the fix of two real
+      generation-protocol holes), the staging/transition fault harness
+      (which moved the intent window off the staging phase), and the
+      reconnect frame-cutting sweep (which measured the remote intent
+      window at 3 of 29 cut points).
+- [x] **A `--checksum` re-verification pass** (phase B): the
+      `autobahn verify` verb re-reads every byte on demand and logs
+      each metadata-invisible divergence.
+- [x] **The invariants document** (phase D): `INVARIANTS.md` states
+      every claimed invariant with its enforcing code and checking
+      tests, as the input for an independent review. The review itself
+      remains external — everything here still shares one
+      implementation lineage.
 - [x] **Known-and-retained** residuals are documented with their
       reasoning, reopening conditions, and would-be fixes in
-      `RETAINED.md`; the five open risks have their execution plan in
-      `NEXT.md`.
+      `RETAINED.md`.

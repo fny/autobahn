@@ -461,18 +461,23 @@ impl Session {
             bail!(SafetyHalt::RootDeletion);
         }
 
-        // Announce what this cycle is about to touch before touching any
-        // of it. If the process dies between here and the achieved record,
-        // the next run finds the intent unresolved and drops these paths'
+        // What this cycle is about to touch, announced in the journal
+        // *after* staging but before the first transition. If the process
+        // dies between the announcement and the achieved record, the next
+        // run finds the intent unresolved and drops these paths'
         // provenance — a crash mid-cycle costs surfaced conflicts, never a
         // silent overwrite of a revert made while the tool was down.
+        // Staging is deliberately outside the announced window: it mutates
+        // neither tree, it is the longest phase of a large cycle, and a
+        // crash there must recover as the clean propagation it still is
+        // rather than as conflict noise.
         let intended: Vec<String> = reconciliation
             .alpha_transitions
             .iter()
             .chain(reconciliation.beta_transitions.iter())
             .map(|change| change.path.clone())
             .collect();
-        self.ancestor_store.intend(&intended)?;
+        let mut intent_recorded = false;
 
         // Stage and transition each side. Content flowing to beta is
         // supplied by alpha and vice versa.
@@ -484,6 +489,10 @@ impl Session {
                 self.beta.as_mut(),
                 &reconciliation.beta_transitions,
             )?;
+            if !intent_recorded {
+                self.ancestor_store.intend(&intended)?;
+                intent_recorded = true;
+            }
             Some(
                 self.beta
                     .transition(reconciliation.beta_transitions.clone())
@@ -498,12 +507,17 @@ impl Session {
                 self.alpha.as_mut(),
                 &reconciliation.alpha_transitions,
             )?;
+            if !intent_recorded {
+                self.ancestor_store.intend(&intended)?;
+                intent_recorded = true;
+            }
             Some(
                 self.alpha
                     .transition(reconciliation.alpha_transitions.clone())
                     .context("alpha transition failed")?,
             )
         };
+        let _ = intent_recorded;
 
         #[cfg(test)]
         if self.fail_before_record {
@@ -1426,5 +1440,402 @@ mod tests {
         drop(held);
         Session::new(endpoint("a3"), endpoint("b3"), SyncMode::TwoWaySafe, state)
             .expect("the lock should be free again");
+    }
+
+    // ── the staging and transition lifecycle, under injected faults ──
+    //
+    // Real endpoints over real trees, with a crash injected at each
+    // boundary of the staging and transition lifecycle. After every crash
+    // the same things must hold: nothing on either disk is ever torn (every
+    // file is bytewise one of its legitimate versions), a fresh session
+    // over the same state recovers to quiescence, conflicts surface only on
+    // the crashed cycle's own paths, and everything unconflicted agrees.
+
+    /// The boundaries a cycle can die at.
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Fault {
+        /// Before staging begins on the destination.
+        StageBegin,
+        /// Mid-receive: half of a frame batch lands, then the crash.
+        StagePushTruncate,
+        /// Mid-supply on the source.
+        SupplyPull,
+        /// At the transition, before anything is applied.
+        TransitionBefore,
+        /// Mid-transition: half of the changes land, then the crash.
+        TransitionPartial,
+        /// After the whole transition, before the cycle records it.
+        TransitionAfter,
+        /// Not a crash: every literal byte in every frame is silently
+        /// corrupted. The digest gate on the receiving side must discard
+        /// the content, and the session must still converge with the
+        /// correct bytes — this is the end-to-end proof that nothing
+        /// unverified can reach the staging store.
+        CorruptFrames,
+    }
+
+    /// A local endpoint that dies once, at its armed boundary.
+    struct FaultEndpoint {
+        inner: crate::endpoint::local::LocalEndpoint,
+        fault: Option<Fault>,
+        pulls: usize,
+    }
+
+    impl FaultEndpoint {
+        fn fires(&mut self, at: Fault) -> bool {
+            if self.fault == Some(at) {
+                self.fault = None;
+                return true;
+            }
+            false
+        }
+    }
+
+    impl Endpoint for FaultEndpoint {
+        fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+            self.inner.scan()
+        }
+        fn stage_begin(
+            &mut self,
+            files: Vec<FileRequest>,
+        ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+            if self.fires(Fault::StageBegin) {
+                anyhow::bail!("injected fault: stage_begin");
+            }
+            self.inner.stage_begin(files)
+        }
+        fn supply_open(&mut self, needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+            self.inner.supply_open(needs)
+        }
+        fn supply_pull(
+            &mut self,
+            max_frames: usize,
+        ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+            self.pulls += 1;
+            if self.pulls > 1 && self.fires(Fault::SupplyPull) {
+                anyhow::bail!("injected fault: supply_pull");
+            }
+            self.inner.supply_pull(max_frames)
+        }
+        fn stage_push(&mut self, frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+            self.stage_push_nowait(frames)
+        }
+        fn stage_push_nowait(
+            &mut self,
+            mut frames: Vec<crate::endpoint::TransferFrame>,
+        ) -> Result<()> {
+            if self.fires(Fault::StagePushTruncate) {
+                frames.truncate(frames.len() / 2);
+                let _ = self.inner.stage_push_nowait(frames);
+                anyhow::bail!("injected fault: stage_push");
+            }
+            if self.fault == Some(Fault::CorruptFrames) {
+                // Not one-shot: every batch of the cycle is corrupted.
+                for frame in &mut frames {
+                    if let crate::endpoint::TransferFrame::Op(crate::rsync::Op::Data(data)) = frame
+                    {
+                        for byte in data.iter_mut() {
+                            *byte ^= 0x55;
+                        }
+                    }
+                }
+            }
+            self.inner.stage_push_nowait(frames)
+        }
+        fn stage_finish(&mut self) -> Result<()> {
+            self.inner.stage_finish()
+        }
+        fn transition(&mut self, mut transitions: Vec<Change>) -> Result<TransitionOutcome> {
+            if self.fires(Fault::TransitionBefore) {
+                anyhow::bail!("injected fault: transition (nothing applied)");
+            }
+            if self.fires(Fault::TransitionPartial) {
+                transitions.truncate(transitions.len().div_ceil(2));
+                let _ = self.inner.transition(transitions);
+                anyhow::bail!("injected fault: transition (partially applied)");
+            }
+            if self.fault == Some(Fault::TransitionAfter) {
+                self.fault = None;
+                let _ = self.inner.transition(transitions);
+                anyhow::bail!("injected fault: transition (fully applied)");
+            }
+            self.inner.transition(transitions)
+        }
+    }
+
+    fn lifecycle_endpoint(
+        root: &std::path::Path,
+        staging: &std::path::Path,
+        fault: Option<Fault>,
+    ) -> Box<dyn Endpoint + Send> {
+        let inner = crate::endpoint::local::LocalEndpoint::new(
+            root.to_path_buf(),
+            staging.to_path_buf(),
+            crate::endpoint::local::EndpointOptions::default(),
+        )
+        .expect("endpoints open");
+        Box::new(FaultEndpoint {
+            inner,
+            fault,
+            pulls: 0,
+        })
+    }
+
+    /// Deterministic content large enough to span several transfer frames.
+    fn bytes(seed: u8, length: usize) -> Vec<u8> {
+        (0..length)
+            .map(|index| (index as u64).wrapping_mul(31).wrapping_add(seed as u64) as u8)
+            .collect()
+    }
+
+    fn read_or_absent(root: &std::path::Path, name: &str) -> Option<Vec<u8>> {
+        std::fs::read(root.join(name)).ok()
+    }
+
+    /// The torn-bytes check: whatever is on disk at this path is byte-for-
+    /// byte one of its legitimate versions — never a truncated transfer,
+    /// never staged garbage published early.
+    fn assert_untorn(root: &std::path::Path, name: &str, candidates: &[Option<Vec<u8>>]) {
+        let actual = read_or_absent(root, name);
+        assert!(
+            candidates.contains(&actual),
+            "{name} in {} holds none of its legitimate versions \
+             (found {:?} bytes)",
+            root.display(),
+            actual.map(|bytes| bytes.len())
+        );
+    }
+
+    fn cycle_to_quiescence(session: &mut Session) -> CycleReport {
+        let mut last = None;
+        for _ in 0..6 {
+            let report = session.run_cycle().expect("recovery cycles run");
+            let settled = report.alpha_transitions == 0
+                && report.beta_transitions == 0
+                && !report.missing_staged_files;
+            last = Some(report);
+            if settled {
+                return last.unwrap();
+            }
+        }
+        panic!("the session did not quiesce: {last:?}");
+    }
+
+    /// The full lifecycle: converge, diverge, crash at the armed boundary,
+    /// verify nothing is torn, recover, verify the recovered state.
+    fn a_crash_at(alpha_fault: Option<Fault>, beta_fault: Option<Fault>) {
+        let keep = tempfile::tempdir().unwrap();
+        let alpha_root = keep.path().join("alpha");
+        let beta_root = keep.path().join("beta");
+        let alpha_staging = keep.path().join("staging-alpha");
+        let beta_staging = keep.path().join("staging-beta");
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&alpha_root).unwrap();
+        std::fs::create_dir_all(&beta_root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+
+        let old_modify = bytes(1, 96 * 1024);
+        let new_modify = bytes(2, 120 * 1024);
+        let old_delete = bytes(3, 48 * 1024);
+        let created = bytes(4, 160 * 1024);
+        let own = bytes(5, 24 * 1024);
+
+        // Converge on the initial content.
+        std::fs::write(alpha_root.join("modify.txt"), &old_modify).unwrap();
+        std::fs::write(alpha_root.join("delete.txt"), &old_delete).unwrap();
+        std::fs::write(alpha_root.join("keep.txt"), b"keep").unwrap();
+        {
+            let mut session = Session::new(
+                lifecycle_endpoint(&alpha_root, &alpha_staging, None),
+                lifecycle_endpoint(&beta_root, &beta_staging, None),
+                SyncMode::TwoWaySafe,
+                state.clone(),
+            )
+            .unwrap();
+            let report = cycle_to_quiescence(&mut session);
+            assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        }
+        assert_eq!(
+            read_or_absent(&beta_root, "keep.txt").as_deref(),
+            Some(&b"keep"[..])
+        );
+
+        // The divergence the crashed cycle will be propagating.
+        std::fs::write(alpha_root.join("modify.txt"), &new_modify).unwrap();
+        std::fs::write(alpha_root.join("created.bin"), &created).unwrap();
+        std::fs::remove_file(alpha_root.join("delete.txt")).unwrap();
+        std::fs::write(beta_root.join("beta_own.txt"), &own).unwrap();
+
+        // The crash.
+        {
+            let mut session = Session::new(
+                lifecycle_endpoint(&alpha_root, &alpha_staging, alpha_fault),
+                lifecycle_endpoint(&beta_root, &beta_staging, beta_fault),
+                SyncMode::TwoWaySafe,
+                state.clone(),
+            )
+            .unwrap();
+            let error = session.run_cycle().expect_err("the injected fault fires");
+            assert!(format!("{error:#}").contains("injected fault"), "{error:#}");
+        }
+
+        // Nothing is torn while the tool is down.
+        let untorn = |root: &std::path::Path| {
+            assert_untorn(
+                root,
+                "modify.txt",
+                &[Some(old_modify.clone()), Some(new_modify.clone())],
+            );
+            assert_untorn(root, "created.bin", &[None, Some(created.clone())]);
+            assert_untorn(root, "delete.txt", &[None, Some(old_delete.clone())]);
+            assert_untorn(root, "keep.txt", &[Some(b"keep".to_vec())]);
+            assert_untorn(root, "beta_own.txt", &[None, Some(own.clone())]);
+        };
+        untorn(&alpha_root);
+        untorn(&beta_root);
+
+        // Recovery: a fresh session over the same state, no faults.
+        let report = {
+            let mut session = Session::new(
+                lifecycle_endpoint(&alpha_root, &alpha_staging, None),
+                lifecycle_endpoint(&beta_root, &beta_staging, None),
+                SyncMode::TwoWaySafe,
+                state,
+            )
+            .unwrap();
+            cycle_to_quiescence(&mut session)
+        };
+
+        // Still nothing torn, crash noise stays on the crashed cycle's own
+        // paths, and every unconflicted path agrees between the sides.
+        untorn(&alpha_root);
+        untorn(&beta_root);
+        let conflicted: Vec<&str> = report
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.root.as_str())
+            .collect();
+        for path in &conflicted {
+            assert!(
+                ["modify.txt", "created.bin", "delete.txt", "beta_own.txt"].contains(path),
+                "a conflict appeared off the crashed cycle's paths: {path}"
+            );
+        }
+        for path in [
+            "modify.txt",
+            "created.bin",
+            "delete.txt",
+            "keep.txt",
+            "beta_own.txt",
+        ] {
+            if !conflicted.contains(&path) {
+                assert_eq!(
+                    read_or_absent(&alpha_root, path),
+                    read_or_absent(&beta_root, path),
+                    "{path} is unconflicted but the sides disagree"
+                );
+            }
+        }
+        // The edit made on beta while the crash was in flight is never lost.
+        assert_eq!(read_or_absent(&beta_root, "beta_own.txt"), Some(own));
+
+        // Faults during staging precede the intent record, so recovery owes
+        // full convergence with no conflict noise at all.
+        let staging_fault = matches!(
+            alpha_fault.or(beta_fault),
+            Some(Fault::StageBegin | Fault::StagePushTruncate | Fault::SupplyPull)
+        );
+        if staging_fault {
+            assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+            assert_eq!(
+                read_or_absent(&alpha_root, "modify.txt"),
+                Some(new_modify.clone())
+            );
+            assert_eq!(read_or_absent(&beta_root, "modify.txt"), Some(new_modify));
+            assert_eq!(read_or_absent(&beta_root, "created.bin"), Some(created));
+            assert_eq!(read_or_absent(&beta_root, "delete.txt"), None);
+        }
+    }
+
+    #[test]
+    fn a_crash_before_staging_recovers_cleanly() {
+        a_crash_at(None, Some(Fault::StageBegin));
+    }
+
+    #[test]
+    fn a_truncated_staging_transfer_recovers_cleanly() {
+        a_crash_at(None, Some(Fault::StagePushTruncate));
+    }
+
+    #[test]
+    fn a_source_that_dies_mid_supply_recovers_cleanly() {
+        a_crash_at(Some(Fault::SupplyPull), None);
+    }
+
+    #[test]
+    fn a_crash_before_any_transition_recovers_safely() {
+        a_crash_at(None, Some(Fault::TransitionBefore));
+    }
+
+    #[test]
+    fn a_partially_applied_transition_recovers_safely() {
+        a_crash_at(None, Some(Fault::TransitionPartial));
+    }
+
+    #[test]
+    fn a_crash_after_transition_before_record_recovers_safely() {
+        a_crash_at(None, Some(Fault::TransitionAfter));
+    }
+
+    /// Corrupted transfer content never reaches either tree: the receive
+    /// digest gate discards it, and once the frames flow clean again the
+    /// session converges on the correct bytes.
+    #[test]
+    fn corrupted_frames_are_discarded_never_published() {
+        let keep = tempfile::tempdir().unwrap();
+        let alpha_root = keep.path().join("alpha");
+        let beta_root = keep.path().join("beta");
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&alpha_root).unwrap();
+        std::fs::create_dir_all(&beta_root).unwrap();
+        std::fs::create_dir_all(&state).unwrap();
+        let content = bytes(9, 200 * 1024);
+        std::fs::write(alpha_root.join("payload.bin"), &content).unwrap();
+
+        let mut session = Session::new(
+            lifecycle_endpoint(&alpha_root, &keep.path().join("staging-alpha"), None),
+            lifecycle_endpoint(
+                &beta_root,
+                &keep.path().join("staging-beta"),
+                Some(Fault::CorruptFrames),
+            ),
+            SyncMode::TwoWaySafe,
+            state,
+        )
+        .unwrap();
+
+        // The corrupted cycle: staging discards the mismatched content, so
+        // the transition reports it missing and nothing lands on beta —
+        // wrong bytes above all.
+        let report = session.run_cycle().expect("a corrupted cycle still runs");
+        assert_untorn(&beta_root, "payload.bin", &[None, Some(content.clone())]);
+        assert!(
+            report.missing_staged_files || read_or_absent(&beta_root, "payload.bin").is_some(),
+            "the corrupted transfer neither landed nor was reported missing"
+        );
+
+        // The corruption stops (the armed fault is consumed by replacing
+        // the endpoint), and the next session converges on correct bytes.
+        drop(session);
+        let mut session = Session::new(
+            lifecycle_endpoint(&alpha_root, &keep.path().join("staging-alpha"), None),
+            lifecycle_endpoint(&beta_root, &keep.path().join("staging-beta"), None),
+            SyncMode::TwoWaySafe,
+            keep.path().join("state"),
+        )
+        .unwrap();
+        let report = cycle_to_quiescence(&mut session);
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(read_or_absent(&beta_root, "payload.bin"), Some(content));
     }
 }

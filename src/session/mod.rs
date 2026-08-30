@@ -101,6 +101,9 @@ pub struct Session {
     /// Exclusivity locks held for this session's lifetime (the endpoint
     /// pair lock, when the caller acquired one).
     held: Vec<EndpointPairLock>,
+    /// Simulates a crash between the transitions and the achieved record.
+    #[cfg(test)]
+    pub(crate) fail_before_record: bool,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
     /// Whether the last cycle finished with the two sides synchronized and
@@ -166,6 +169,12 @@ impl Session {
         self.held.push(lock);
     }
 
+    /// Opts the ancestor store into power-loss durability: every journal
+    /// append syncs before the cycle is acknowledged.
+    pub fn set_power_durability(&mut self, enabled: bool) {
+        self.ancestor_store.set_power_durability(enabled);
+    }
+
     /// Creates a session between the provided endpoints under an
     /// already-held state lock. This exists so that callers with expensive
     /// endpoint construction (spawning SSH, handshaking with an agent) can
@@ -178,9 +187,62 @@ impl Session {
         lock: SessionLock,
     ) -> Result<Session> {
         let ancestor_path = lock.state_directory().join("ancestor");
-        let (ancestor_store, ancestor) = ancestor::AncestorStore::open(&ancestor_path)?;
+        let (mut ancestor_store, mut ancestor, unresolved) =
+            ancestor::AncestorStore::open(&ancestor_path)?;
+        if !unresolved.is_empty() {
+            // A previous run crashed between announcing transitions and
+            // recording what they achieved, so provenance at these paths is
+            // unknown: the writes may or may not have landed. The honest
+            // resolution is to *drop* the ancestor there and persist that
+            // drop immediately — with no ancestor, a difference between the
+            // sides surfaces as a conflict instead of one side silently
+            // overwriting what might be a deliberate revert, and agreement
+            // simply re-records itself. Persisting first keeps the
+            // in-memory ancestor and the store's replay identical, and
+            // consumes the intent so a later restart does not re-taint.
+            let mut drops: Vec<Change> = Vec::new();
+            let mut seen = std::collections::HashSet::new();
+            for path in unresolved {
+                if !seen.insert(path.clone()) {
+                    continue;
+                }
+                let exists = match &ancestor {
+                    Some(root) if path.is_empty() => {
+                        let _ = root;
+                        true
+                    }
+                    Some(root) => {
+                        let mut node = Some(root);
+                        for part in path.split('/') {
+                            node = node.and_then(|n| n.child(part));
+                        }
+                        node.is_some()
+                    }
+                    None => false,
+                };
+                if exists {
+                    drops.push(Change {
+                        path,
+                        old: None,
+                        new: None,
+                    });
+                }
+            }
+            if drops.is_empty() {
+                // Nothing to drop, but the intent must still be consumed.
+                ancestor_store.record(&[], ancestor.as_ref())?;
+            } else {
+                let tainted = apply(ancestor.as_ref(), &drops).map_err(|message| {
+                    anyhow::anyhow!("unable to taint the ancestor: {message}")
+                })?;
+                ancestor_store.record(&drops, tainted.as_ref())?;
+                ancestor = tainted;
+            }
+        }
         Ok(Session {
             held: Vec::new(),
+            #[cfg(test)]
+            fail_before_record: false,
             alpha,
             beta,
             mode,
@@ -375,6 +437,19 @@ impl Session {
             bail!(SafetyHalt::RootDeletion);
         }
 
+        // Announce what this cycle is about to touch before touching any
+        // of it. If the process dies between here and the achieved record,
+        // the next run finds the intent unresolved and drops these paths'
+        // provenance — a crash mid-cycle costs surfaced conflicts, never a
+        // silent overwrite of a revert made while the tool was down.
+        let intended: Vec<String> = reconciliation
+            .alpha_transitions
+            .iter()
+            .chain(reconciliation.beta_transitions.iter())
+            .map(|change| change.path.clone())
+            .collect();
+        self.ancestor_store.intend(&intended)?;
+
         // Stage and transition each side. Content flowing to beta is
         // supplied by alpha and vice versa.
         let beta_outcome = if reconciliation.beta_transitions.is_empty() {
@@ -405,6 +480,11 @@ impl Session {
                     .context("alpha transition failed")?,
             )
         };
+
+        #[cfg(test)]
+        if self.fail_before_record {
+            bail!("test seam: crashed after transitions, before the achieved record");
+        }
 
         // Fold transition results into ancestor changes: each transition's
         // achieved content becomes the ancestor's new content at that path.
@@ -923,7 +1003,7 @@ mod tests {
         let path = directory.path().join("ancestor");
         let ancestor = Node::directory("", vec![file("a", 1)]);
 
-        let (mut store, empty) = ancestor::AncestorStore::open(&path).unwrap();
+        let (mut store, empty, _) = ancestor::AncestorStore::open(&path).unwrap();
         assert!(empty.is_none());
         let change = Change {
             path: String::new(),
@@ -932,7 +1012,7 @@ mod tests {
         };
         store.record(&[change], Some(&ancestor)).unwrap();
 
-        let (mut store, loaded) = ancestor::AncestorStore::open(&path).unwrap();
+        let (mut store, loaded, _) = ancestor::AncestorStore::open(&path).unwrap();
         assert!(loaded.unwrap().content_equal(&ancestor, true));
 
         let deletion = Change {
@@ -941,7 +1021,7 @@ mod tests {
             new: None,
         };
         store.record(&[deletion], None).unwrap();
-        let (_, loaded) = ancestor::AncestorStore::open(&path).unwrap();
+        let (_, loaded, _) = ancestor::AncestorStore::open(&path).unwrap();
         assert!(loaded.is_none());
     }
 
@@ -1048,6 +1128,62 @@ mod tests {
 
     /// Builds a snapshot around a root, sharing the root's storage across
     /// clones — which is what an unchanged rescan produces.
+    /// The intent record's whole purpose: a crash between the transitions
+    /// and the achieved record must never let the stale ancestor authorize
+    /// overwriting a revert made while the tool was down. The recovered
+    /// session drops provenance for the intended paths, so the difference
+    /// surfaces as a conflict and neither side is touched.
+    #[test]
+    fn a_crash_between_transition_and_record_ends_in_conflict_not_overwrite() {
+        let keep = tempfile::tempdir().unwrap();
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let old_content = || Node::directory("", vec![file("target", 1)]);
+        let new_content = || Node::directory("", vec![file("target", 2)]);
+
+        // Cycle one converges on the old content; cycle two propagates the
+        // new content to beta and then "crashes" at the seam.
+        {
+            let alpha =
+                ScriptedEndpoint::new(vec![scripted(old_content()), scripted(new_content())]);
+            let beta = ScriptedEndpoint::new(vec![scripted(old_content())]);
+            let mut session = Session::new(
+                Box::new(alpha),
+                Box::new(beta),
+                SyncMode::TwoWaySafe,
+                state.clone(),
+            )
+            .unwrap();
+            session.run_cycle().expect("first cycle converges");
+            session.fail_before_record = true;
+            let error = session.run_cycle().expect_err("the seam must fire");
+            assert!(format!("{error:#}").contains("test seam"), "{error:#}");
+        }
+
+        // While the tool was down, the user deliberately reverted alpha.
+        // Beta holds the propagated new content (the transition landed).
+        let transitions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let alpha = CountingEndpoint {
+            inner: ScriptedEndpoint::new(vec![scripted(old_content())]),
+            transitions: std::sync::Arc::clone(&transitions),
+        };
+        let beta = ScriptedEndpoint::new(vec![scripted(new_content())]);
+        let mut session =
+            Session::new(Box::new(alpha), Box::new(beta), SyncMode::TwoWaySafe, state).unwrap();
+        let report = session.run_cycle().expect("the recovery cycle runs");
+        assert!(
+            !report.conflicts.is_empty(),
+            "unknown provenance must surface as a conflict"
+        );
+        assert_eq!(
+            transitions.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the revert must not be overwritten: without the intent record, \
+             the stale ancestor read alpha as unchanged and beta as modified \
+             and pushed the new content back over the revert"
+        );
+    }
+
     fn scripted(root: Node) -> crate::tree::Snapshot {
         crate::tree::Snapshot {
             root: Some(root),

@@ -77,6 +77,9 @@ pub struct Defaults {
     pub ignores: Vec<String>,
     /// The default interval, in seconds, between synchronization cycles.
     pub interval: Option<u64>,
+    /// The default durability class for the ancestor journal: "process"
+    /// (the default) or "power", which syncs every record.
+    pub durability: Option<String>,
     /// The default symbolic link treatment (`ignore`, `portable`, or `raw`).
     pub symlink_mode: Option<String>,
     /// The default permission bits (octal) for created files.
@@ -128,6 +131,9 @@ pub struct Group {
     pub ignores: Vec<String>,
     /// The interval, in seconds, between cycles (falls back to the defaults).
     pub interval: Option<u64>,
+    /// The durability class for the ancestor journal (falls back to the
+    /// defaults): "process" or "power".
+    pub durability: Option<String>,
     /// The symbolic link treatment (`ignore`, `portable`, or `raw`; falls
     /// back to the defaults).
     pub symlink_mode: Option<String>,
@@ -191,6 +197,9 @@ pub struct SessionPlan {
     pub ignores: Vec<String>,
     /// The interval between synchronization cycles.
     pub interval: Duration,
+    /// Whether the ancestor journal syncs every record before
+    /// acknowledging it (power-loss durability).
+    pub power_durability: bool,
     /// The symbolic link treatment.
     pub symlink_mode: SymlinkMode,
     /// The permission bits for created files (`None` for the endpoint
@@ -332,6 +341,22 @@ impl Config {
                         "group '{name}' has no mode and the defaults specify none"
                     ));
                     None
+                }
+            };
+            let power_durability = match group
+                .durability
+                .as_deref()
+                .or(self.defaults.durability.as_deref())
+                .unwrap_or("process")
+            {
+                "process" => false,
+                "power" => true,
+                other => {
+                    errors.push(format!(
+                        "group '{name}': unknown durability '{other}' \
+                         (expected 'process' or 'power')"
+                    ));
+                    false
                 }
             };
             if group.alpha.is_empty() {
@@ -547,6 +572,7 @@ impl Config {
                     mode,
                     ignores: ignores.clone(),
                     interval,
+                    power_durability,
                     symlink_mode,
                     file_mode,
                     directory_mode,

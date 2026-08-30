@@ -74,6 +74,15 @@ pub(crate) struct AncestorStore {
     /// threshold at which appending stops being cheaper than rewriting.
     checkpoint_bytes: u64,
     journal_bytes: u64,
+    /// Whether appends sync before acknowledging (power-loss durability).
+    sync_appends: bool,
+    /// The journal, held open across appends. An intent and an achieved
+    /// record per cycle would otherwise cost two opens per cycle, which
+    /// measured as two to four milliseconds of p50 on the edit path. The
+    /// handle survives checkpoint truncation (same inode, and O_APPEND
+    /// always writes at the current end); normalization replaces the inode
+    /// but only ever runs inside open(), before any handle exists.
+    journal: Option<File>,
 }
 
 impl AncestorStore {
@@ -84,7 +93,7 @@ impl AncestorStore {
     /// session that has never completed a cycle. Corruption *is* an error:
     /// an ancestor that cannot be read must never be silently discarded,
     /// because starting from nothing would resurrect deletions.
-    pub(crate) fn open(path: &Path) -> Result<(AncestorStore, Option<Node>)> {
+    pub(crate) fn open(path: &Path) -> Result<(AncestorStore, Option<Node>, Vec<String>)> {
         let journal_path = journal_path(path);
         // A temporary left by an interrupted normalization holds nothing
         // authoritative — the rename is the commit point — so it is
@@ -100,15 +109,32 @@ impl AncestorStore {
         // Skipping — rather than stopping at the first mismatch — is what
         // lets an acknowledged record behind a spent prefix survive.
         let mut applied = Vec::new();
+        let mut unresolved: Vec<String> = Vec::new();
         for record in records {
             if record.base_generation != generation {
                 continue;
             }
-            ancestor = apply(ancestor.as_ref(), &record.changes).map_err(|message| {
-                anyhow::anyhow!("unable to replay ancestor journal: {message}")
-            })?;
-            generation += 1;
-            applied.push(record.raw);
+            match record.entry {
+                JournalEntry::Achieved(changes) => {
+                    ancestor = apply(ancestor.as_ref(), &changes).map_err(|message| {
+                        anyhow::anyhow!("unable to replay ancestor journal: {message}")
+                    })?;
+                    generation += 1;
+                    // An achieved record at this generation resolves every
+                    // intent written at it: the cycle that wrote the intent
+                    // (or the recovery that inherited its taint) completed
+                    // and recorded what actually happened.
+                    unresolved.clear();
+                    applied.push(record.raw);
+                }
+                JournalEntry::Intent(paths) => {
+                    unresolved.extend(paths);
+                    // An unresolved intent is information, not debris: it
+                    // must survive normalization so a second crash before
+                    // the taint is recorded still surfaces it.
+                    applied.push(record.raw);
+                }
+            }
         }
         // The journal is normalized to exactly the applied records, so dead
         // bytes — spent prefixes, torn tails, partial headers — can never
@@ -160,9 +186,31 @@ impl AncestorStore {
                 generation,
                 checkpoint_bytes,
                 journal_bytes,
+                sync_appends: false,
+                journal: None,
             },
             ancestor,
+            unresolved,
         ))
+    }
+
+    /// Opts every future append into power-loss durability: each record is
+    /// synced before it is acknowledged. Off by default — the default
+    /// class is process-crash safety, matching the design's economy — and
+    /// the choice is the configuration's, not the code's.
+    pub(crate) fn set_power_durability(&mut self, enabled: bool) {
+        self.sync_appends = enabled;
+    }
+
+    /// Records the paths the current cycle is about to mutate, before any
+    /// endpoint transition runs. Does not advance the generation: an
+    /// intent is a marker, not a state.
+    pub(crate) fn intend(&mut self, paths: &[String]) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let record = self.encode(&JournalEntry::Intent(paths.to_vec()))?;
+        self.append(&record)
     }
 
     /// Discards the stored ancestor entirely, so the next cycle reconciles
@@ -197,12 +245,7 @@ impl AncestorStore {
     /// The caller must not install `ancestor` in memory before this returns:
     /// the ordering is the whole guarantee.
     pub(crate) fn record(&mut self, changes: &[Change], ancestor: Option<&Node>) -> Result<()> {
-        let payload = bincode::serialize(changes).context("unable to encode ancestor changes")?;
-        let mut record = Vec::with_capacity(payload.len() + RECORD_HEADER_SIZE);
-        record.extend_from_slice(&self.generation.to_le_bytes());
-        record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        record.extend_from_slice(&digest(&payload));
-        record.extend_from_slice(&payload);
+        let record = self.encode(&JournalEntry::Achieved(changes.to_vec()))?;
 
         // A record approaching the size of a full rewrite is not worth
         // journalling: appending it would trip compaction immediately and
@@ -215,12 +258,39 @@ impl AncestorStore {
             return Ok(());
         }
 
-        let mut journal = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.journal_path)
-            .context("unable to open the ancestor journal")?;
-        if let Err(error) = journal.write_all(&record) {
+        self.append(&record)?;
+        self.generation += 1;
+
+        if self.journal_bytes > self.compaction_threshold() {
+            self.checkpoint(self.generation, ancestor)?;
+        }
+        Ok(())
+    }
+
+    /// Encodes one journal record at the current generation.
+    fn encode(&self, entry: &JournalEntry) -> Result<Vec<u8>> {
+        let payload = bincode::serialize(entry).context("unable to encode a journal record")?;
+        let mut record = Vec::with_capacity(payload.len() + RECORD_HEADER_SIZE);
+        record.extend_from_slice(&self.generation.to_le_bytes());
+        record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        record.extend_from_slice(&digest(self.generation, &payload));
+        record.extend_from_slice(&payload);
+        Ok(record)
+    }
+
+    /// Appends one encoded record, rolling back a partial write.
+    fn append(&mut self, record: &[u8]) -> Result<()> {
+        if self.journal.is_none() {
+            self.journal = Some(
+                OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&self.journal_path)
+                    .context("unable to open the ancestor journal")?,
+            );
+        }
+        let journal = self.journal.as_mut().expect("just opened");
+        if let Err(error) = journal.write_all(record) {
             // A partial append — a full disk is the ordinary cause — must
             // not persist: bytes left at the tail would sit in front of the
             // next successful append and swallow it on the next load. Roll
@@ -230,13 +300,12 @@ impl AncestorStore {
             let _ = journal.set_len(self.journal_bytes);
             return Err(error).context("unable to append to the ancestor journal");
         }
-
-        self.generation += 1;
-        self.journal_bytes += record.len() as u64;
-
-        if self.journal_bytes > self.compaction_threshold() {
-            self.checkpoint(self.generation, ancestor)?;
+        if self.sync_appends {
+            journal
+                .sync_data()
+                .context("unable to sync the ancestor journal")?;
         }
+        self.journal_bytes += record.len() as u64;
         Ok(())
     }
 
@@ -269,7 +338,7 @@ impl AncestorStore {
         // forty percent of a checkpoint's bytes are content digests, where
         // a flipped bit stays structurally valid bincode and directly
         // misclassifies a file during reconciliation.
-        data.extend_from_slice(&digest(&payload));
+        data.extend_from_slice(&digest(generation, &payload));
         data.extend_from_slice(&payload);
 
         let temporary = self.checkpoint_path.with_extension("tmp");
@@ -307,9 +376,25 @@ const RECORD_HEADER_SIZE: usize = 8 + 8 + 8;
 /// length can make the loader allocate.
 const MAXIMUM_RECORD_SIZE: u64 = 1 << 30;
 
+/// What one journal record carries.
+#[derive(serde::Serialize, serde::Deserialize)]
+enum JournalEntry {
+    /// The changes a completed cycle achieved — the record that advances
+    /// the ancestor by one generation.
+    Achieved(Vec<Change>),
+    /// The paths a cycle was *about* to mutate, written before the first
+    /// endpoint transition. An intent still unresolved at open — one with
+    /// no achieved record following at its generation — marks those paths
+    /// as having unknown provenance: the transition may or may not have
+    /// landed before the crash, and the ancestor must not be allowed to
+    /// arbitrate "changed versus unchanged" there. The session converts
+    /// the taint into surfaced conflicts rather than silent overwrites.
+    Intent(Vec<String>),
+}
+
 struct Record {
     base_generation: u64,
-    changes: Vec<Change>,
+    entry: JournalEntry,
     /// The record's exact on-disk bytes, header included, so the journal
     /// can be rewritten as precisely the records that were applied.
     raw: Vec<u8>,
@@ -330,10 +415,16 @@ fn journal_path(path: &Path) -> PathBuf {
     path.with_file_name(name)
 }
 
-/// Eight bytes of BLAKE3 over the payload — enough to catch the truncation
-/// and tearing this is guarding against, without another dependency.
-fn digest(payload: &[u8]) -> [u8; 8] {
-    let hash = blake3::hash(payload);
+/// Eight bytes of BLAKE3 over the generation *and* the payload. The
+/// generation must be inside the digest: it decides whether a record is
+/// applied or skipped, so a flipped bit there used to make a valid record
+/// silently skippable — and normalization would then retire it — where a
+/// payload flip was always caught.
+fn digest(generation: u64, payload: &[u8]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(payload);
+    let hash = hasher.finalize();
     let mut digest = [0u8; 8];
     digest.copy_from_slice(&hash.as_bytes()[..8]);
     digest
@@ -361,7 +452,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64)> {
     }
     let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
     let payload = &body[16..];
-    if digest(payload) != body[8..16] {
+    if digest(generation, payload) != body[8..16] {
         bail!("the ancestor checkpoint is corrupt");
     }
     let ancestor: Option<Node> =
@@ -404,14 +495,14 @@ fn read_journal(path: &Path) -> Result<(Vec<Record>, u64)> {
             break;
         }
         let payload = &data[start..end];
-        if digest(payload) != header[16..24] {
+        if digest(base_generation, payload) != header[16..24] {
             bail!("the ancestor journal is corrupt at offset {offset}");
         }
-        let changes: Vec<Change> = bincode::deserialize(payload)
+        let entry: JournalEntry = bincode::deserialize(payload)
             .context("unable to decode a record of the ancestor journal")?;
         records.push(Record {
             base_generation,
-            changes,
+            entry,
             raw: data[offset..end].to_vec(),
         });
         offset = end;
@@ -472,7 +563,7 @@ mod tests {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
 
-        let (mut store, ancestor) = AncestorStore::open(&path).expect("opens");
+        let (mut store, ancestor, _) = AncestorStore::open(&path).expect("opens");
         assert!(ancestor.is_none(), "a fresh session has no ancestor");
 
         let first = Some(directory(vec![file("a", 1)]));
@@ -484,7 +575,7 @@ mod tests {
             .record(&[change("b", Some(file("b", 2)))], second.as_ref())
             .expect("records");
 
-        let (_, reloaded) = AncestorStore::open(&path).expect("reopens");
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
         assert!(
             same(&reloaded, &second),
             "the reloaded ancestor must match what was recorded"
@@ -499,7 +590,7 @@ mod tests {
         let legacy = Some(directory(vec![file("a", 1)]));
         fs::write(&path, bincode::serialize(&legacy).expect("encodes")).expect("writes");
 
-        let (mut store, ancestor) = AncestorStore::open(&path).expect("opens");
+        let (mut store, ancestor, _) = AncestorStore::open(&path).expect("opens");
         assert!(same(&ancestor, &legacy));
         assert_eq!(store.generation, 0);
 
@@ -508,7 +599,7 @@ mod tests {
         store
             .record(&[change("b", Some(file("b", 2)))], next.as_ref())
             .expect("records");
-        let (_, reloaded) = AncestorStore::open(&path).expect("reopens");
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
         assert!(same(&reloaded, &next));
     }
 
@@ -518,7 +609,7 @@ mod tests {
     fn a_torn_final_record_is_discarded() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
         let first = Some(directory(vec![file("a", 1)]));
         store
             .record(&[change("", first.clone())], first.as_ref())
@@ -532,7 +623,7 @@ mod tests {
         data.extend_from_slice(b"partial");
         fs::write(&journal, &data).expect("writes");
 
-        let (_, reloaded) = AncestorStore::open(&path).expect("opens despite the torn tail");
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("opens despite the torn tail");
         assert!(
             same(&reloaded, &first),
             "the intact record must still apply"
@@ -546,7 +637,7 @@ mod tests {
     fn a_corrupt_record_fails_the_load() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
         let first = Some(directory(vec![file("a", 1)]));
         store
             .record(&[change("", first.clone())], first.as_ref())
@@ -574,7 +665,7 @@ mod tests {
     fn compaction_retires_the_records_it_absorbed() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
 
         let mut children = Vec::new();
         let mut ancestor = None;
@@ -589,7 +680,7 @@ mod tests {
         }
         assert!(store.generation > 0);
 
-        let (_, reloaded) = AncestorStore::open(&path).expect("reopens");
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
         assert!(
             same(&reloaded, &ancestor),
             "the ancestor must survive compaction unchanged"
@@ -603,7 +694,7 @@ mod tests {
             .checkpoint(store.generation, ancestor.as_ref())
             .expect("checkpoints");
         fs::write(&journal, &stale).expect("restores the stale journal");
-        let (_, after) = AncestorStore::open(&path).expect("reopens");
+        let (_, after, _) = AncestorStore::open(&path).expect("reopens");
         assert!(
             same(&after, &ancestor),
             "records already folded into the checkpoint must not reapply"
@@ -617,14 +708,14 @@ mod tests {
     fn a_reset_leaves_nothing_to_replay() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
         let recorded = Some(directory(vec![file("a", 1)]));
         store
             .record(&[change("", recorded.clone())], recorded.as_ref())
             .expect("records");
 
         AncestorStore::reset(&path).expect("resets");
-        let (_, after) = AncestorStore::open(&path).expect("reopens");
+        let (_, after, _) = AncestorStore::open(&path).expect("reopens");
         assert!(after.is_none(), "a reset ancestor must stay reset");
     }
 
@@ -636,7 +727,7 @@ mod tests {
     fn one_changed_file_does_not_rewrite_the_hierarchy() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
 
         // A hierarchy large enough that rewriting it would be conspicuous.
         let mut children: Vec<Node> = (0..30_000).map(|i| file(&format!("f{i:06}"), 1)).collect();
@@ -675,7 +766,7 @@ mod tests {
             "one edit wrote {growth} bytes against a {hierarchy_bytes}-byte hierarchy"
         );
 
-        let (_, reloaded) = AncestorStore::open(&path).expect("reopens");
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
         assert!(same(&reloaded, &next), "and the edit must survive");
     }
 
@@ -686,7 +777,7 @@ mod tests {
         checkpoint: &Path,
         journal_bytes: &[u8],
         length: usize,
-    ) -> Result<(AncestorStore, Option<Node>)> {
+    ) -> Result<(AncestorStore, Option<Node>, Vec<String>)> {
         let keep = tempdir().expect("temporary directory");
         let target = keep.path().join("ancestor");
         if checkpoint.exists() {
@@ -709,7 +800,7 @@ mod tests {
     fn every_journal_cut_reopens_and_stays_appendable() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
 
         // Acknowledged history: after each record, the state and the journal
         // byte length it was acknowledged at.
@@ -745,12 +836,13 @@ mod tests {
                 .expect("a boundary")
                 .1
                 .clone();
-            let (mut reopened, loaded) = open_cut(&path, &journal, cut).unwrap_or_else(|error| {
-                panic!(
-                    "cut at {cut} of {} failed to open: {error:#}",
-                    journal.len()
-                )
-            });
+            let (mut reopened, loaded, _) =
+                open_cut(&path, &journal, cut).unwrap_or_else(|error| {
+                    panic!(
+                        "cut at {cut} of {} failed to open: {error:#}",
+                        journal.len()
+                    )
+                });
             assert!(
                 same(&loaded, &expected),
                 "cut at {cut}: reloaded state is not the acknowledged one"
@@ -776,7 +868,7 @@ mod tests {
             reopened
                 .record(&[fresh_change], with_fresh.as_ref())
                 .expect("recovered store accepts a record");
-            let (_, after) =
+            let (_, after, _) =
                 AncestorStore::open(&reopened.checkpoint_path).expect("reopens after append");
             assert!(
                 same(&after, &with_fresh),
@@ -792,7 +884,7 @@ mod tests {
     fn a_spent_prefix_never_masks_later_acknowledgments() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
         let first = Some(directory(vec![file("a", 1)]));
         store
             .record(&[change("", first.clone())], first.as_ref())
@@ -806,13 +898,13 @@ mod tests {
             .expect("checkpoints");
         fs::write(journal_path(&path), &stale).expect("restores the spent journal");
 
-        let (mut reopened, loaded) = AncestorStore::open(&path).expect("opens");
+        let (mut reopened, loaded, _) = AncestorStore::open(&path).expect("opens");
         assert!(same(&loaded, &first));
         let second = Some(directory(vec![file("a", 1), file("b", 2)]));
         reopened
             .record(&[change("b", Some(file("b", 2)))], second.as_ref())
             .expect("records after recovery");
-        let (_, after) = AncestorStore::open(&path).expect("reopens");
+        let (_, after, _) = AncestorStore::open(&path).expect("reopens");
         assert!(
             same(&after, &second),
             "the acknowledgment behind the spent prefix was lost"
@@ -832,7 +924,7 @@ mod tests {
         // a delta journalled on top: the exact shape codex flagged.
         let base = Some(directory(vec![file("a", 1), file("b", 2)]));
         fs::write(&path, bincode::serialize(&base).expect("encodes")).expect("writes");
-        let (mut store, loaded) = AncestorStore::open(&path).expect("opens");
+        let (mut store, loaded, _) = AncestorStore::open(&path).expect("opens");
         assert!(same(&loaded, &base));
         let full = Some(directory(vec![file("a", 1), file("b", 2), file("c", 3)]));
         store
@@ -856,7 +948,7 @@ mod tests {
             // Rebuild the pre-reset state each round.
             fs::write(&path, bincode::serialize(&base).expect("encodes")).expect("writes");
             let _ = fs::remove_file(journal_path(&path));
-            let (mut store, _) = AncestorStore::open(&path).expect("opens");
+            let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
             store
                 .record(&[change("c", Some(file("c", 3)))], full.as_ref())
                 .expect("records");
@@ -868,7 +960,7 @@ mod tests {
             remove_first();
             let outcome = AncestorStore::open(&path);
             match outcome {
-                Ok((_, state)) => {
+                Ok((_, state, _)) => {
                     let acknowledged =
                         same(&state, &full) || same(&state, &base) || state.is_none();
                     assert!(
@@ -902,16 +994,25 @@ mod tests {
         /// its own reopen.
         #[test]
         fn random_histories_survive_every_cut(
-            operations in proptest::collection::vec(0u8..12, 1..9)
+            operations in proptest::collection::vec(0u8..15, 1..9)
         ) {
             let keep = tempdir().expect("temporary directory");
             let path = keep.path().join("ancestor");
-            let (mut store, _) = AncestorStore::open(&path).expect("opens");
+            let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
 
             let mut state: Option<Node> = None;
             let mut boundaries: Vec<(u64, Option<Node>)> = vec![(0, None)];
             let mut counter = 0u8;
             for operation in operations {
+                if operation >= 12 {
+                    // Intents carry no state; they only add bytes between
+                    // boundaries, which is exactly what makes them worth
+                    // weaving into the enumeration.
+                    store
+                        .intend(&[format!("p{operation}")])
+                        .expect("intends");
+                    continue;
+                }
                 if operation >= 9 {
                     // A checkpoint absorbs the journal; the boundary map
                     // starts over from the checkpointed state.
@@ -951,7 +1052,7 @@ mod tests {
                     .expect("a boundary")
                     .1
                     .clone();
-                let (mut reopened, loaded) = open_cut(&path, &journal, cut)
+                let (mut reopened, loaded, _) = open_cut(&path, &journal, cut)
                     .unwrap_or_else(|error| panic!("cut {cut}: {error:#}"));
                 proptest::prop_assert!(
                     same(&loaded, &expected),
@@ -971,7 +1072,7 @@ mod tests {
                 reopened
                     .record(&[advance], with_fresh.as_ref())
                     .expect("recovered store accepts a record");
-                let (_, after) =
+                let (_, after, _) =
                     AncestorStore::open(&reopened.checkpoint_path).expect("reopens");
                 proptest::prop_assert!(
                     same(&after, &with_fresh),
@@ -992,7 +1093,7 @@ mod tests {
     fn an_interrupted_normalization_cannot_lose_acknowledgments() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
-        let (mut store, _) = AncestorStore::open(&path).expect("opens");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
         let first = Some(directory(vec![file("a", 1)]));
         store
             .record(&[change("", first.clone())], first.as_ref())
@@ -1022,7 +1123,7 @@ mod tests {
         ] {
             fs::write(&journal, &bytes).expect("restores damage");
             fs::write(&temp, temp_bytes).expect("plants the crash state");
-            let (mut reopened, loaded) =
+            let (mut reopened, loaded, _) =
                 AncestorStore::open(&path).unwrap_or_else(|error| panic!("{label}: {error:#}"));
             assert!(same(&loaded, &second), "{label}: acknowledged state lost");
             assert!(!temp.exists(), "{label}: stray temporary not cleared");
@@ -1030,8 +1131,115 @@ mod tests {
             reopened
                 .record(&[change("c", Some(file("c", 3)))], third.as_ref())
                 .expect("records after recovery");
-            let (_, after) = AncestorStore::open(&path).expect("reopens");
+            let (_, after, _) = AncestorStore::open(&path).expect("reopens");
             assert!(same(&after, &third), "{label}: post-recovery record lost");
         }
+    }
+
+    /// An intent with no achieved record following it surfaces its paths;
+    /// one followed by an achieved record at its generation is consumed.
+    #[test]
+    fn intents_surface_until_a_cycle_completes() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _, unresolved) = AncestorStore::open(&path).expect("opens");
+        assert!(unresolved.is_empty());
+        let first = Some(directory(vec![file("a", 1)]));
+        store
+            .record(&[change("", first.clone())], first.as_ref())
+            .expect("records");
+
+        // The cycle announces, then crashes before achieving.
+        store.intend(&["b".into(), "c".into()]).expect("intends");
+        let (mut store, loaded, unresolved) = AncestorStore::open(&path).expect("reopens");
+        assert!(same(&loaded, &first), "the intent must not change state");
+        assert_eq!(unresolved, vec!["b".to_string(), "c".to_string()]);
+
+        // A completed cycle consumes it.
+        let second = Some(directory(vec![file("a", 1), file("b", 2)]));
+        store
+            .record(&[change("b", Some(file("b", 2)))], second.as_ref())
+            .expect("records");
+        let (_, loaded, unresolved) = AncestorStore::open(&path).expect("reopens");
+        assert!(same(&loaded, &second));
+        assert!(
+            unresolved.is_empty(),
+            "a completed cycle consumes the intent"
+        );
+    }
+
+    /// An unresolved intent survives normalization: it is information the
+    /// next open needs, not debris to retire.
+    #[test]
+    fn an_unresolved_intent_survives_normalization() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+        let first = Some(directory(vec![file("a", 1)]));
+        store
+            .record(&[change("", first.clone())], first.as_ref())
+            .expect("records");
+        store.intend(&["b".into()]).expect("intends");
+
+        // Damage the tail so the next open normalizes.
+        let journal = journal_path(&path);
+        let mut bytes = fs::read(&journal).expect("reads");
+        bytes.extend_from_slice(&7u64.to_le_bytes());
+        fs::write(&journal, &bytes).expect("writes");
+
+        let (_, _, unresolved) = AncestorStore::open(&path).expect("opens");
+        assert_eq!(unresolved, vec!["b".to_string()]);
+        // And again, from the normalized file.
+        let (_, _, unresolved) = AncestorStore::open(&path).expect("reopens");
+        assert_eq!(unresolved, vec!["b".to_string()]);
+    }
+
+    /// The record digest covers the generation. A flipped bit there used
+    /// to make a valid record silently skippable — replay treated it as
+    /// spent — and normalization then retired it for good.
+    #[test]
+    fn a_flipped_generation_is_corruption_not_a_skip() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+        let first = Some(directory(vec![file("a", 1)]));
+        store
+            .record(&[change("", first.clone())], first.as_ref())
+            .expect("records");
+
+        let journal = journal_path(&path);
+        let mut bytes = fs::read(&journal).expect("reads");
+        bytes[0] ^= 0x01; // the base generation's low byte
+        fs::write(&journal, &bytes).expect("writes");
+        let error = match AncestorStore::open(&path) {
+            Ok(_) => panic!("a flipped generation must not load"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("corrupt"), "{error:#}");
+    }
+
+    /// The checkpoint digest covers its generation for the same reason: a
+    /// flip there used to silently disown every journal record.
+    #[test]
+    fn a_flipped_checkpoint_generation_is_corruption() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+        let state = Some(directory(vec![file("a", 1)]));
+        store
+            .record(&[change("", state.clone())], state.as_ref())
+            .expect("records");
+        store
+            .checkpoint(store.generation, state.as_ref())
+            .expect("checkpoints");
+
+        let mut bytes = fs::read(&path).expect("reads");
+        bytes[CHECKPOINT_MAGIC.len()] ^= 0x01;
+        fs::write(&path, &bytes).expect("writes");
+        let error = match AncestorStore::open(&path) {
+            Ok(_) => panic!("a flipped checkpoint generation must not load"),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("corrupt"), "{error:#}");
     }
 }

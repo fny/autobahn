@@ -741,6 +741,7 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
     let beta = endpoint(&plan.beta, "beta")?;
     let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
     session.hold(pair_lock);
+    session.set_power_durability(plan.power_durability);
     Ok(session)
 }
 

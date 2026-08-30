@@ -1,0 +1,1 @@
+[{"run": "bench-1787979551", "repeat": 2, "job": "coldsync-chromium-r2", "cell": {"name": "coldsync-chromium", "corpora": ["chromium"], "agents": 0, "bidirectional": false, "betas": 1, "mode": "replace", "pre_seeded": false}, "tools": ["mutagen", "autobahn"], "pair": "pair-0"}]

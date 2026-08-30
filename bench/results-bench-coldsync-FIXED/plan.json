@@ -1,0 +1,241 @@
+{
+  "run": "bench-1787979551",
+  "seed": false,
+  "ami": "ami-0a0f8c5fc0ba17009",
+  "chromium_commit": "6cb9c06e0412026a35dff678e98f49057a1ca53d",
+  "groups": [
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ]
+  ],
+  "repeats": 3,
+  "cells": [
+    "coldsync-5k",
+    "coldsync-50k",
+    "coldsync-chromium"
+  ],
+  "jobs": [
+    {
+      "run": "bench-1787979551",
+      "repeat": 1,
+      "job": "coldsync-50k-r1",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-3"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 2,
+      "job": "coldsync-chromium-r2",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-0"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 0,
+      "job": "coldsync-chromium-r0",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-1"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 2,
+      "job": "coldsync-5k-r2",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 1,
+      "job": "coldsync-chromium-r1",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-2"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 1,
+      "job": "coldsync-5k-r1",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 0,
+      "job": "coldsync-5k-r0",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 2,
+      "job": "coldsync-50k-r2",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-4"
+    },
+    {
+      "run": "bench-1787979551",
+      "repeat": 0,
+      "job": "coldsync-50k-r0",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-5"
+    }
+  ]
+}

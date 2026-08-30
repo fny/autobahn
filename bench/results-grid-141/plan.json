@@ -1,0 +1,3337 @@
+{
+  "run": "bench-1788018793",
+  "seed": false,
+  "ami": "ami-0a0f8c5fc0ba17009",
+  "chromium_commit": "6cb9c06e0412026a35dff678e98f49057a1ca53d",
+  "groups": [
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      2,
+      "c6i.4xlarge"
+    ],
+    [
+      11,
+      "c6i.2xlarge"
+    ],
+    [
+      11,
+      "c6i.2xlarge"
+    ],
+    [
+      11,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      2,
+      "c6i.2xlarge"
+    ],
+    [
+      11,
+      "c6i.xlarge"
+    ],
+    [
+      11,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ]
+  ],
+  "repeats": 5,
+  "cells": [
+    "chromium-1",
+    "chromium-10",
+    "chromium-100",
+    "chromium-1-bidir",
+    "chromium-10-bidir",
+    "chromium-100-bidir",
+    "50k-1",
+    "50k-10",
+    "50k-100",
+    "two50k-1",
+    "two50k-10",
+    "two50k-100",
+    "5k-1",
+    "5k-10",
+    "5k-100",
+    "5k-10-fan",
+    "50k-10-fan",
+    "two50k-10-fan",
+    "chromium-10-fan",
+    "50k-1-patch",
+    "50k-10-patch",
+    "chromium-1-patch",
+    "chromium-10-patch",
+    "chromium-10-fan-patch",
+    "coldsync-5k",
+    "coldsync-50k",
+    "coldsync-chromium",
+    "coldsync-5k-fan",
+    "coldsync-50k-fan",
+    "coldsync-chromium-fan"
+  ],
+  "jobs": [
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "coldsync-50k-fan-r2",
+      "cell": {
+        "name": "coldsync-50k-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "two50k-100-r4",
+      "cell": {
+        "name": "two50k-100",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "5k-1-r3",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "coldsync-5k-fan-r2",
+      "cell": {
+        "name": "coldsync-5k-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-26"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "50k-1-r2",
+      "cell": {
+        "name": "50k-1",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "two50k-1-r1",
+      "cell": {
+        "name": "two50k-1",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-10-patch-r1",
+      "cell": {
+        "name": "chromium-10-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "two50k-10-fan-r2",
+      "cell": {
+        "name": "two50k-10-fan",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-10-patch-r0",
+      "cell": {
+        "name": "chromium-10-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "two50k-1-r2",
+      "cell": {
+        "name": "two50k-1",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "coldsync-chromium-fan-r1",
+      "cell": {
+        "name": "coldsync-chromium-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-0"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-1-r0",
+      "cell": {
+        "name": "chromium-1",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-10-r0",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-9"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "coldsync-5k-r4",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "50k-10-fan-r1",
+      "cell": {
+        "name": "50k-10-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "5k-100-r0",
+      "cell": {
+        "name": "5k-100",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-1-bidir-r0",
+      "cell": {
+        "name": "chromium-1-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-13"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-10-fan-patch-r4",
+      "cell": {
+        "name": "chromium-10-fan-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-1-r2",
+      "cell": {
+        "name": "chromium-1",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-10"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "two50k-100-r0",
+      "cell": {
+        "name": "two50k-100",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "50k-100-r4",
+      "cell": {
+        "name": "50k-100",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "5k-1-r1",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-30"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "coldsync-50k-fan-r0",
+      "cell": {
+        "name": "coldsync-50k-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-1-patch-r2",
+      "cell": {
+        "name": "chromium-1-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-11"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-10-r2",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-12"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "coldsync-chromium-fan-r0",
+      "cell": {
+        "name": "coldsync-chromium-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-1"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "5k-10-fan-r1",
+      "cell": {
+        "name": "5k-10-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-27"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-100-bidir-r4",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-14"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-10-fan-patch-r2",
+      "cell": {
+        "name": "chromium-10-fan-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "two50k-10-fan-r1",
+      "cell": {
+        "name": "two50k-10-fan",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "coldsync-chromium-r4",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "coldsync-5k-fan-r4",
+      "cell": {
+        "name": "coldsync-5k-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-27"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-10-bidir-r3",
+      "cell": {
+        "name": "chromium-10-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-15"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "50k-10-patch-r3",
+      "cell": {
+        "name": "50k-10-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "two50k-1-r0",
+      "cell": {
+        "name": "two50k-1",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "50k-100-r3",
+      "cell": {
+        "name": "50k-100",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-10-bidir-r4",
+      "cell": {
+        "name": "chromium-10-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-16"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "5k-10-r3",
+      "cell": {
+        "name": "5k-10",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-100-bidir-r3",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-17"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "coldsync-5k-r2",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "50k-1-r0",
+      "cell": {
+        "name": "50k-1",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-100-bidir-r1",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-18"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-1-bidir-r3",
+      "cell": {
+        "name": "chromium-1-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "50k-10-r2",
+      "cell": {
+        "name": "50k-10",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-10-r1",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-13"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "two50k-10-r3",
+      "cell": {
+        "name": "two50k-10",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-1-patch-r4",
+      "cell": {
+        "name": "chromium-1-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-14"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "5k-10-fan-r4",
+      "cell": {
+        "name": "5k-10-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-27"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "coldsync-50k-r4",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "50k-10-patch-r1",
+      "cell": {
+        "name": "50k-10-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "coldsync-chromium-r1",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-9"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-10-fan-patch-r0",
+      "cell": {
+        "name": "chromium-10-fan-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "50k-10-fan-r0",
+      "cell": {
+        "name": "50k-10-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-10-fan-patch-r1",
+      "cell": {
+        "name": "chromium-10-fan-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "50k-1-patch-r4",
+      "cell": {
+        "name": "50k-1-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "50k-100-r1",
+      "cell": {
+        "name": "50k-100",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-10-r3",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-15"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "5k-100-r2",
+      "cell": {
+        "name": "5k-100",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-100-r3",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-16"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "50k-1-r3",
+      "cell": {
+        "name": "50k-1",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "coldsync-chromium-fan-r4",
+      "cell": {
+        "name": "coldsync-chromium-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-2"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "coldsync-5k-fan-r3",
+      "cell": {
+        "name": "coldsync-5k-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-26"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-10-patch-r4",
+      "cell": {
+        "name": "chromium-10-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-17"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "coldsync-chromium-r3",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-10"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "50k-10-patch-r2",
+      "cell": {
+        "name": "50k-10-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "two50k-10-r0",
+      "cell": {
+        "name": "two50k-10",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-100-bidir-r0",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-13"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "50k-100-r0",
+      "cell": {
+        "name": "50k-100",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-1-r1",
+      "cell": {
+        "name": "chromium-1",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-18"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "50k-1-r4",
+      "cell": {
+        "name": "50k-1",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-100-r2",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "50k-100-r2",
+      "cell": {
+        "name": "50k-100",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "coldsync-chromium-fan-r3",
+      "cell": {
+        "name": "coldsync-chromium-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-3"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "two50k-10-r2",
+      "cell": {
+        "name": "two50k-10",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "two50k-10-fan-r3",
+      "cell": {
+        "name": "two50k-10-fan",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-10-r4",
+      "cell": {
+        "name": "chromium-10",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-9"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-10-bidir-r1",
+      "cell": {
+        "name": "chromium-10-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-14"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-1-r4",
+      "cell": {
+        "name": "chromium-1",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-10"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-10-fan-r4",
+      "cell": {
+        "name": "chromium-10-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "5k-10-r1",
+      "cell": {
+        "name": "5k-10",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-30"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "two50k-10-fan-r0",
+      "cell": {
+        "name": "two50k-10-fan",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "coldsync-50k-fan-r3",
+      "cell": {
+        "name": "coldsync-50k-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "coldsync-chromium-fan-r2",
+      "cell": {
+        "name": "coldsync-chromium-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-4"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "two50k-10-r4",
+      "cell": {
+        "name": "two50k-10",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "50k-10-patch-r0",
+      "cell": {
+        "name": "50k-10-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-10-fan-patch-r3",
+      "cell": {
+        "name": "chromium-10-fan-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "50k-1-r1",
+      "cell": {
+        "name": "50k-1",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-1-patch-r1",
+      "cell": {
+        "name": "chromium-1-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-11"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "50k-10-fan-r4",
+      "cell": {
+        "name": "50k-10-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "two50k-100-r1",
+      "cell": {
+        "name": "two50k-100",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "50k-10-r4",
+      "cell": {
+        "name": "50k-10",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "50k-10-r3",
+      "cell": {
+        "name": "50k-10",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "two50k-1-r4",
+      "cell": {
+        "name": "two50k-1",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "50k-10-r1",
+      "cell": {
+        "name": "50k-10",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "50k-1-patch-r1",
+      "cell": {
+        "name": "50k-1-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "coldsync-50k-r2",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "5k-10-r0",
+      "cell": {
+        "name": "5k-10",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-1-bidir-r2",
+      "cell": {
+        "name": "chromium-1-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-15"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "coldsync-5k-r0",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-30"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-100-r4",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-12"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "coldsync-50k-r1",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "coldsync-chromium-r2",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-11"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "5k-10-r2",
+      "cell": {
+        "name": "5k-10",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "coldsync-chromium-r0",
+      "cell": {
+        "name": "coldsync-chromium",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-12"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "two50k-10-fan-r4",
+      "cell": {
+        "name": "two50k-10-fan",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "5k-100-r1",
+      "cell": {
+        "name": "5k-100",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-30"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "coldsync-50k-r0",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-10-fan-r1",
+      "cell": {
+        "name": "chromium-10-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "chromium-1-bidir-r4",
+      "cell": {
+        "name": "chromium-1-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-16"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-100-bidir-r2",
+      "cell": {
+        "name": "chromium-100-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-17"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "5k-10-r4",
+      "cell": {
+        "name": "5k-10",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-1-r3",
+      "cell": {
+        "name": "chromium-1",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-13"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "two50k-1-r3",
+      "cell": {
+        "name": "two50k-1",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "coldsync-5k-r3",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-1-patch-r3",
+      "cell": {
+        "name": "chromium-1-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-14"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "5k-10-fan-r3",
+      "cell": {
+        "name": "5k-10-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-27"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-1-patch-r0",
+      "cell": {
+        "name": "chromium-1-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-15"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "coldsync-50k-fan-r1",
+      "cell": {
+        "name": "coldsync-50k-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "5k-1-r2",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "coldsync-50k-fan-r4",
+      "cell": {
+        "name": "coldsync-50k-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "coldsync-5k-fan-r0",
+      "cell": {
+        "name": "coldsync-5k-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-27"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "5k-100-r3",
+      "cell": {
+        "name": "5k-100",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-30"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "5k-10-fan-r2",
+      "cell": {
+        "name": "5k-10-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-26"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-10-bidir-r0",
+      "cell": {
+        "name": "chromium-10-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-18"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-10-fan-r3",
+      "cell": {
+        "name": "chromium-10-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "chromium-10-patch-r3",
+      "cell": {
+        "name": "chromium-10-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-16"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "two50k-100-r2",
+      "cell": {
+        "name": "two50k-100",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-100-r0",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-17"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-1-bidir-r1",
+      "cell": {
+        "name": "chromium-1-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 1,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-10-bidir-r2",
+      "cell": {
+        "name": "chromium-10-bidir",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": true,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-5"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "50k-10-fan-r3",
+      "cell": {
+        "name": "50k-10-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-21"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "two50k-10-r1",
+      "cell": {
+        "name": "two50k-10",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "50k-10-patch-r4",
+      "cell": {
+        "name": "50k-10-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-24"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "50k-1-patch-r2",
+      "cell": {
+        "name": "50k-1-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-25"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "50k-1-patch-r0",
+      "cell": {
+        "name": "50k-1-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "chromium-10-fan-r0",
+      "cell": {
+        "name": "chromium-10-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-6"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-10-fan-r2",
+      "cell": {
+        "name": "chromium-10-fan",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-7"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "5k-1-r0",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-28"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "coldsync-5k-r1",
+      "cell": {
+        "name": "coldsync-5k",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "chromium-100-r1",
+      "cell": {
+        "name": "chromium-100",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-18"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "50k-10-fan-r2",
+      "cell": {
+        "name": "50k-10-fan",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-19"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "5k-10-fan-r0",
+      "cell": {
+        "name": "5k-10-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-27"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "50k-1-patch-r3",
+      "cell": {
+        "name": "50k-1-patch",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-20"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 2,
+      "job": "chromium-10-patch-r2",
+      "cell": {
+        "name": "chromium-10-patch",
+        "corpora": [
+          "chromium"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "patch",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-8"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "two50k-100-r3",
+      "cell": {
+        "name": "two50k-100",
+        "corpora": [
+          "sub50k",
+          "sub50k-b"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 0,
+      "job": "50k-10-r0",
+      "cell": {
+        "name": "50k-10",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 10,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-23"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "5k-100-r4",
+      "cell": {
+        "name": "5k-100",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 100,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-29"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 1,
+      "job": "coldsync-5k-fan-r1",
+      "cell": {
+        "name": "coldsync-5k-fan",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 10,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-26"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 3,
+      "job": "coldsync-50k-r3",
+      "cell": {
+        "name": "coldsync-50k",
+        "corpora": [
+          "sub50k"
+        ],
+        "agents": 0,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": false
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-22"
+    },
+    {
+      "run": "bench-1788018793",
+      "repeat": 4,
+      "job": "5k-1-r4",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-30"
+    }
+  ]
+}

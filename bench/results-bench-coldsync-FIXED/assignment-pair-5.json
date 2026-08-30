@@ -1,0 +1,1 @@
+[{"run": "bench-1787979551", "repeat": 0, "job": "coldsync-50k-r0", "cell": {"name": "coldsync-50k", "corpora": ["sub50k"], "agents": 0, "bidirectional": false, "betas": 1, "mode": "replace", "pre_seeded": false}, "tools": ["mutagen", "autobahn"], "pair": "pair-5"}]

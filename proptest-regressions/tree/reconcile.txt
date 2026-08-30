@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc ad5db2f0ba1514db2606f7aec97e5b7d9c6ae2e99fdb2306c5130a13a110d4fb # shrinks to ancestor_spec = [1, 0, 0, 19], alpha_spec = [9, 40, 26, 19], beta_spec = [1, 5, 5, 0]

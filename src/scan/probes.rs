@@ -183,11 +183,21 @@ mod tests {
     fn probing_reports_unix_semantics_and_leaves_nothing_behind() {
         let root = tempfile::tempdir().expect("temporary directory should be creatable");
         let behavior = probe(root.path());
-        // The test suite runs on a byte-preserving, case-sensitive Unix
-        // filesystem.
+        // Executability and byte-preserving names hold on every filesystem
+        // the suite runs on (ext4, tmpfs, APFS); only HFS+ decomposed.
         assert!(behavior.preserves_executability);
         assert!(!behavior.decomposes_unicode);
-        assert!(!behavior.case_insensitive);
+        // Case sensitivity genuinely differs (ext4 yes, default APFS no),
+        // so the probe is checked against the volume's actual behavior
+        // rather than an assumed one.
+        let expect_insensitive = {
+            let lower = root.path().join("case-probe-check");
+            std::fs::write(&lower, b"x").expect("probe file should be writable");
+            let folded = root.path().join("CASE-PROBE-CHECK").exists();
+            std::fs::remove_file(&lower).expect("probe file should be removable");
+            folded
+        };
+        assert_eq!(behavior.case_insensitive, expect_insensitive);
         // Every probe file was cleaned up.
         let leftovers: Vec<_> = std::fs::read_dir(root.path())
             .expect("root should list")

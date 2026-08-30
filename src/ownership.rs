@@ -106,7 +106,13 @@ mod tests {
     #[test]
     fn the_root_user_resolves_by_name() {
         assert_eq!(resolve_user("root").unwrap(), 0);
-        assert_eq!(resolve_group("root").unwrap(), 0);
+        // Group zero is "root" on Linux and "wheel" on macOS and the BSDs.
+        let group_zero = if cfg!(any(target_os = "macos", target_os = "freebsd")) {
+            "wheel"
+        } else {
+            "root"
+        };
+        assert_eq!(resolve_group(group_zero).unwrap(), 0);
     }
 
     #[test]

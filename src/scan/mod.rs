@@ -1513,7 +1513,12 @@ mod tests {
         // name, plus an ordinary file for company.
         for raw in [b"\xff\xfe".as_slice(), b"\xfe\xff".as_slice()] {
             let name = std::ffi::OsStr::from_bytes(raw);
-            fs::write(root_path.join(name), "bytes").expect("file should be writable");
+            if let Err(error) = fs::write(root_path.join(name), "bytes") {
+                // APFS refuses invalid UTF-8 names outright, so the
+                // condition this test guards against cannot exist there.
+                eprintln!("skipping: this filesystem refuses invalid UTF-8 names ({error})");
+                return;
+            }
         }
         write(root_path, "plain.txt", "plain");
 

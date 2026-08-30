@@ -3890,11 +3890,22 @@ mod tests {
         use std::time::{Duration, Instant};
 
         let mut fixture = Fixture::new();
-        // A quiet root waits out the timeout.
-        assert!(!fixture
-            .alpha
-            .await_change(Duration::from_millis(50))
-            .expect("await should succeed"));
+        // A quiet root waits out the timeout. Watch startup can replay the
+        // fixture's own creation on some platforms (FSEvents most of all),
+        // so quiet is asserted once the dust settles rather than on the
+        // very first wait.
+        let mut quiet = false;
+        for _ in 0..20 {
+            if !fixture
+                .alpha
+                .await_change(Duration::from_millis(50))
+                .expect("await should succeed")
+            {
+                quiet = true;
+                break;
+            }
+        }
+        assert!(quiet, "the root never went quiet");
 
         // A write arriving mid-wait is observed well before the timeout.
         let root = fixture.alpha_root.clone();

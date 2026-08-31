@@ -1,5 +1,11 @@
 # Benchmark: autobahn vs mutagen
 
+> **These numbers describe autobahn 0.3.0.** The current version is
+> 0.4.0, and two of its changes move measured quantities. Neither
+> alters a conclusion here, but the specific figures below are no
+> longer what the current binary produces — see
+> [Currency](#currency-what-changed-since-these-numbers) at the end.
+
 autobahn 0.3.0 against mutagen 0.19.0-dev, on matched pairs of
 `c6i.4xlarge` instances in one AWS availability zone. Four corpus sizes,
 three concurrency levels, ten repeats of each of fifteen cells: **150 jobs,
@@ -180,3 +186,46 @@ stuck session from a merely busy one.
   10-second default.
 
 Raw JSONL for every job is in `bench/results-bench-1787811723/`.
+
+## Currency: what changed since these numbers
+
+The measurements above were taken at 0.3.0. Since then the correctness
+work described in `docs/correctness/` landed, and every change touching
+a hot path was A/B measured on a 63,000-file local corpus before it
+shipped. Most measured flat. Two did not, and both make autobahn
+slower:
+
+**Steady-state latency: about +6 ms of p50, remote sessions only.** An
+intent record is now written to the ancestor journal before the first
+transition of a mutating cycle, and it is synced to stable storage
+whenever a *remote* endpoint takes part — without that ordering, a
+power loss on the controller can drop the record while the peer's
+machine keeps the write it announced, and a revert made while the tool
+was down is then silently overwritten. The A/B that priced it (Linux,
+EBS, `fdatasync` ≈ 2.9 ms idle):
+
+| Build | p50 across runs |
+|---|---|
+| before the change | 52.1, 53.4, 51.3, 53.2 ms |
+| syncing every cycle | 59.5, 58.1 ms |
+| syncing only for remote sessions (shipped) | 50.9, 52.8, 52.4 ms |
+
+Every cell in this benchmark is a remote pairing, so the sync applies
+throughout it. The headline 52 ms for 40k files at 10 agents should be
+read as roughly **58 ms** until a re-run says otherwise — about 32×
+mutagen's 1,854 ms rather than 35×.
+
+**Cold sync: about +1 s per 63,000 files.** Content published on its
+last use is now re-hashed immediately before the rename that puts it in
+place, so a staged file altered between its receive verification and
+its publication cannot enter the tree under the digest it no longer
+matches. On the A/B corpus that moved cold sync from 7.4 s to 8.4 s.
+Against the 423 s Chromium cold sync in this document the proportion is
+small, but it is not zero.
+
+**What this section is not.** These deltas come from a different corpus
+(63k files, not 40k or 505k), a different topology (one machine, not a
+pair), and a different workload than the benchmark. They are an honest
+adjustment, not a substitute measurement. Only a re-run on matched
+instance pairs produces citable 0.4.0 figures; the raw A/B reports
+behind the table above are kept alongside the benchmark aggregates.

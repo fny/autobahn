@@ -1,5 +1,14 @@
 # Benchmark matrix: autobahn 0.3.0 vs mutagen 0.19.0-dev
 
+> **Every figure here is autobahn 0.3.0.** At 0.4.0 the latency cells
+> should be read about 6 ms higher (an intent record is synced before
+> each mutating cycle of a remote session) and the first-synchronization
+> cells slightly higher (published content is re-hashed at the moment of
+> publication). The reasoning and the measurements are in
+> [BENCHMARK.md](BENCHMARK.md#currency-what-changed-since-these-numbers).
+> Both changes buy correctness properties, and neither changes a
+> conclusion in these tables.
+
 Every cell, every percentile. The summary and the interpretation are in
 [BENCHMARK.md](BENCHMARK.md). The method is in
 [bench/README.md](bench/README.md).

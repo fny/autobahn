@@ -18,6 +18,10 @@ betas = [
 ]
 ```
 
+```sh
+autobahn up
+```
+
 
 ## Motivation
 

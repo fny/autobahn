@@ -215,13 +215,22 @@ throughout it. The headline 52 ms for 40k files at 10 agents should be
 read as roughly **58 ms** until a re-run says otherwise — about 32×
 mutagen's 1,854 ms rather than 35×.
 
-**Cold sync: about +1 s per 63,000 files.** Content published on its
-last use is now re-hashed immediately before the rename that puts it in
-place, so a staged file altered between its receive verification and
-its publication cannot enter the tree under the digest it no longer
-matches. On the A/B corpus that moved cold sync from 7.4 s to 8.4 s.
-Against the 423 s Chromium cold sync in this document the proportion is
-small, but it is not zero.
+**Cold sync: about +1.2 s per 63,000 files, roughly 16%.** Content
+published on its last use is now re-hashed immediately before the
+rename that puts it in place, so a staged file altered between its
+receive verification and its publication cannot enter the tree under a
+digest it no longer matches. Measured across five interleaved pairs on
+the A/B corpus, median cold sync moved from **7.6 s to 8.8 s**.
+Proportionally that would be a couple of seconds on this document's
+423 s Chromium cold sync — small, but not zero.
+
+**Everything else held.** The same five pairs, re-run against current
+HEAD after all the correctness work landed, show no steady-state drift
+at all: median p50 **52.9 ms before, 53.5 ms after**, with the
+per-run spread (52.5–55.2 against 52.0–53.6) larger than the
+difference between them. Intent records, the doubled write
+announcement, generation gating, and the mass-disappearance guard cost
+nothing measurable on the local path.
 
 **What this section is not.** These deltas come from a different corpus
 (63k files, not 40k or 505k), a different topology (one machine, not a

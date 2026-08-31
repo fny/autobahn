@@ -13,8 +13,8 @@ alpha = "~/golfwagen"
 betas = [
   "audi.de",
   "mercedes-benz.de",
-  "porsche.de"
-  "man.eu"
+  "porsche.de",
+  "man.eu",
 ]
 ```
 
@@ -127,7 +127,13 @@ autobahn pause project     # suspend a group (drops its connections)
 autobahn resume project
 autobahn reset project     # forget the baseline; next cycle merges both
                            # sides additively (resurrects deletions)
+autobahn verify project    # next cycle re-reads every byte, catching
+                           # content whose metadata never moved
 ```
+
+`scripts/mi` runs a guided tour of all of this against throwaway
+directories — every command, and every state a session can report,
+printed as the binary actually produces them.
 
 Each (alpha, beta) pair becomes its own session, and sessions are
 independent: a host being down just means its session retries with backoff
@@ -152,6 +158,7 @@ sessions to drift out of date: what the file says is what runs.
 | `max_entry_count` | both | If a scan finds more entries than this, the cycle fails — a guard against pointing a session at the wrong directory. |
 | `staging` | both | Where in-flight content lives: `state` (default), `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
 | `default_owner` / `default_group` | both | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights. |
+| `durability` | both | `process` (default) or `power`. The default survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
 | `agent_command` | group | Advanced: reach remote endpoints through this command instead of SSH. |
 | `disabled` | top level | Host names to skip everywhere. A disabled beta host drops that beta; a disabled alpha host drops its whole group. |
 
@@ -237,18 +244,34 @@ automatically, on first contact.
 
 ## Scope
 
-Unix only: Linux today; macOS behaviors (Unicode normalization, case
-handling, executability propagation) are implemented and release binaries
-build for Darwin. Transport is SSH (or any stdio subprocess) — no Docker,
-no daemon, no port forwarding.
+Unix only. The full test suite runs green on **Linux (x86-64 and
+arm64), macOS (Apple Silicon), and FreeBSD**; CI covers all four on
+demand. macOS is a first-class target, not a build target: its Unicode
+normalization, case-folding, and atomic-creation behaviors are
+implemented against the platform's own primitives and exercised on real
+APFS volumes. Windows would be a port rather than a build target.
+
+Transport is SSH (or any stdio subprocess) — no Docker, no daemon, no
+port forwarding.
 
 ## Development
 
 ```sh
 cargo test                    # unit + end-to-end suites (e2e spawns real agents)
 cargo clippy --all-targets
+scripts/mi                    # a guided tour of every command and state
 scripts/build-agents.sh       # cross-build the agents bundle
+gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
 ```
+
+CI is manual rather than push-triggered: the repository is private, and
+macOS runner minutes bill at ten times the Linux rate.
+
+The correctness work — the invariants the design claims, the code that
+enforces each one, the tests that check it, and the residuals
+deliberately left open — is written down in `docs/correctness/`.
+`INVARIANTS.md` is the entry point, and was itself the subject of an
+independent adversarial review whose confirmed findings are fixed.
 
 Autobahn is a from-scratch Rust distillation of the architecture that
 emerged from a deep memory/performance overhaul of [Mutagen]'s
@@ -271,12 +294,27 @@ and `Arc::make_mut` enforce structurally here.
   live on a network mount, treat this client as the only writer.
   autobahn prints a warning when it detects such a root.
 - **One owner per pair of trees.** Two sessions synchronizing the same
-  pair of roots are excluded machine-wide per user, even across
-  different `--state-root`/`--state-dir` settings. Running sessions over
-  the same trees from *different machines* (or different Unix users) is
-  not supported and can silently undo deliberate changes.
+  pair of roots are excluded per user on one machine, even across
+  different `--state-root`/`--state-dir` settings. *Sharing* one root
+  across sessions is fine and pinned by tests — fan-out, star and relay
+  topologies all work, because those sessions share one watcher and one
+  scan of that root. What is not supported is the same pair of trees
+  driven from *different machines*, different Unix users, or different
+  state roots: the exclusion lock is local to one of those, so nothing
+  detects the overlap and deliberate changes can be silently undone.
 - **Timestamp-preserving rewrites.** A tool that rewrites a file with
   identical length while restoring its modification time (reproducible
   builds, `touch -r`) defeats metadata-based change detection, as it
-  does in every synchronizer of this design. A content re-verification
-  escape hatch is planned.
+  does in every synchronizer of this design. `autobahn verify` is the
+  escape hatch: the next cycle re-reads every byte, so such content
+  becomes visible and is synchronized normally.
+- **Live databases and other multi-file formats.** A SQLite database is
+  three interdependent files changing many times per second, and a
+  synchronizer captures them file by file. Syncing one *in one
+  direction* works — the copy lags while writes are in flight and
+  catches up within a cycle or two of them stopping — but a database
+  written on **both** sides produces a conflict that nothing can merge,
+  because two diverged databases cannot be reconciled as bytes. Keep
+  such files on one side (ignore them, or use a one-way mode), or
+  synchronize a snapshot (`sqlite3 app.db ".backup snap.db"`) rather
+  than the live file.

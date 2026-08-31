@@ -259,11 +259,16 @@ no chunking, so the failure at scale is abrupt rather than graceful.
 event and the path is never touched again, the periodic full scan is what
 finds it. That is the price of not trusting events.
 
-**Unix only.** The code uses `std::os::unix` and `libc` without gating. The
-single platform conditional is peer-credential retrieval
-(`src/supervisor/control.rs:211`), which already has a `getpeereid` branch,
-so macOS works and the BSDs likely need little beyond a build target.
-Windows would be a port, not a build target.
+**Unix only.** The code uses `std::os::unix` and `libc` throughout. Six
+places branch on the platform, each with a working fallback:
+peer-credential retrieval (`peer_is_same_user`, which uses `SO_PEERCRED`
+on Linux and `getpeereid` elsewhere), atomic no-replace creation
+(`publish_rename`: `renameat2` on Linux, `renamex_np` on macOS, a plain
+rename with a check-then-use window everywhere else), and
+network-filesystem detection (`warn_if_network_filesystem`, reading
+`statfs` magic numbers on Linux and `f_fstypename` on macOS). The suite
+runs green on Linux (x86-64 and arm64), macOS, and FreeBSD. Windows
+would be a port, not a build target.
 
 **One sharp edge in ignore rules.** A negation cannot recover content below
 an ignored *directory*, because a scan never descends into one
@@ -272,10 +277,14 @@ rather than `node_modules` with a negation.
 
 ## Where to start reading
 
+Named by symbol rather than by line, because line numbers drift and
+these pointers should not.
+
 | To understand | Read |
 |---|---|
 | The tree and its sharing | `src/tree/mod.rs` |
-| How a scan reuses work | `src/scan/mod.rs:293` |
-| The cycle | `src/session/mod.rs:260` |
-| Why writes are safe | `src/endpoint/local.rs:1261` |
-| What crosses the wire | `src/protocol.rs`, `src/transport/mod.rs:400` |
+| How a scan reuses work | `reusable_digest` in `src/scan/mod.rs` |
+| The cycle | `Session::run_cycle` in `src/session/mod.rs` |
+| Why writes are safe | `Transitioner` in `src/endpoint/local.rs` |
+| What crosses the wire | `src/protocol.rs`, `send_frame` in `src/transport/mod.rs` |
+| What the design promises | `docs/correctness/INVARIANTS.md` |

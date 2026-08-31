@@ -160,11 +160,15 @@ All five were then executed as NEXT.md phases A through D:
 - [x] **A `--checksum` re-verification pass** (phase B): the
       `autobahn verify` verb re-reads every byte on demand and logs
       each metadata-invisible divergence.
-- [x] **The invariants document** (phase D): `INVARIANTS.md` states
-      every claimed invariant with its enforcing code and checking
-      tests, as the input for an independent review. The review itself
-      remains external — everything here still shares one
-      implementation lineage.
+- [x] **The invariants document and the review it was written for**
+      (phase D): `INVARIANTS.md` states every claimed invariant with its
+      enforcing code and checking tests. It was then attacked by an
+      outside lineage, which produced 22 findings; each top finding was
+      re-derived from the code by separate verifiers, and the six
+      confirmed ones are fixed (see the review-of-record section of
+      `INVARIANTS.md`). The statement-precision findings were folded
+      into the invariant texts, so the document now says what the code
+      does rather than what it was hoped to do.
 - [x] **Known-and-retained** residuals are documented with their
       reasoning, reopening conditions, and would-be fixes in
       `RETAINED.md`.

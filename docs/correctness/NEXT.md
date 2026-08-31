@@ -136,3 +136,8 @@ crashes recover conflict-free; C3 measured the remote intent window at
 3 of 29 frame-boundary cuts. D produced `INVARIANTS.md`. Hot-path
 changes were A/B measured flat (p50 51.9/52.0 before, 52.2/50.7
 after).
+
+The plan is closed. What followed it — the independent attack on
+`INVARIANTS.md`, the verification of its findings, and the six fixes —
+is recorded in `INVARIANTS.md` itself rather than here, because those
+were never this plan's phases.

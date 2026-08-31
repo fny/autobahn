@@ -1,0 +1,197 @@
+#!/bin/bash
+#
+# mi — a guided tour of every autobahn command and every state it can
+# report, run against real directories on this machine.
+#
+# Nothing here is simulated: each section drives the actual binary over
+# actual files and prints what it actually said. The tour builds its own
+# scratch tree, and removes it (and the supervisor it starts) on the way
+# out, however it exits.
+#
+# Usage:  scripts/mi [path-to-autobahn-binary]
+#
+set -u
+
+BINARY="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/autobahn}"
+if [ ! -x "$BINARY" ]; then
+    echo "no autobahn binary at $BINARY (build with: cargo build --release)" >&2
+    exit 1
+fi
+
+# Deliberately /tmp rather than $TMPDIR: on macOS the latter is a long
+# per-user path that would dominate every line autobahn prints.
+WORK="$(mktemp -d "/tmp/autobahn-mi.XXXXXX")"
+SUPERVISOR=""
+
+cleanup() {
+    [ -n "$SUPERVISOR" ] && kill "$SUPERVISOR" 2>/dev/null
+    wait "$SUPERVISOR" 2>/dev/null
+    rm -rf "$WORK"
+}
+trap cleanup EXIT INT TERM
+
+# ── presentation ────────────────────────────────────────────────────
+# Colour only when a terminal is watching, so piping the tour into a
+# file or a pager yields plain text.
+if [ -t 1 ]; then
+    BOLD=$'\033[1m'; DIM=$'\033[2m'; CYAN=$'\033[36m'; OFF=$'\033[0m'
+else
+    BOLD=""; DIM=""; CYAN=""; OFF=""
+fi
+
+chapter() {
+    printf '\n%s━━ %s %s\n' "$BOLD" "$1" "$OFF"
+    [ $# -gt 1 ] && printf '%s%s%s\n' "$DIM" "$2" "$OFF"
+    return 0
+}
+
+# Echoes a command, then runs it — so the reader always sees what
+# produced the output beneath it.
+show() {
+    # The binary's own path is long and uninteresting; on screen it is
+    # simply the command a reader would type.
+    printf '\n%s$ %s%s\n' "$CYAN" "${*/$BINARY/autobahn}" "$OFF"
+    "$@"
+}
+
+# The same, for shell-level demonstrations (redirections, pipelines).
+narrate() {
+    printf '\n%s$ %s%s\n' "$CYAN" "$1" "$OFF"
+}
+
+pause_briefly() { sleep "${1:-3}"; }
+
+# The tour runs *inside* the scratch tree and refers to everything
+# relatively, so the commands on screen are the commands a reader would
+# type rather than a wall of temporary-directory noise.
+mkdir -p "$WORK/alpha/lib" "$WORK/beta" "$WORK/state"
+cd "$WORK" || exit 1
+ALPHA="alpha"
+BETA="beta"
+STATE="state"
+CONFIG="autobahn.toml"
+
+# ── the tour ────────────────────────────────────────────────────────
+
+chapter "the tree we start from" \
+        "An ordinary little project on alpha; beta is empty."
+echo "shared notes"          > "$ALPHA/notes.txt"
+echo "# readme"              > "$ALPHA/README.md"
+echo "fn main() {}"          > "$ALPHA/lib/main.rs"
+show find "$ALPHA" -type f
+
+chapter "the configuration" \
+        "One group, one destination, cycling every two seconds."
+cat > "$CONFIG" <<TOML
+[groups.demo]
+alpha = "$WORK/alpha"
+mode = "two-way-safe"
+interval = 2
+betas = ["$WORK/beta"]
+TOML
+show cat "$CONFIG"
+
+chapter "autobahn up" \
+        "Starts the supervisor: every session in the configuration, watched continuously."
+narrate "autobahn up --config $CONFIG --state-root $STATE &"
+"$BINARY" up --config "$CONFIG" --state-root "$STATE" > up.log 2>&1 &
+SUPERVISOR=$!
+pause_briefly 5
+show tail -2 up.log
+
+chapter "the first sync landed" ""
+show find "$BETA" -type f
+
+chapter "autobahn status" \
+        "The recorded state of every session, grouped."
+show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
+
+chapter "autobahn pause" \
+        "Cycling stops; the sessions stay configured."
+show "$BINARY" pause --state-root "$STATE"
+pause_briefly 2
+show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
+
+chapter "a genuine conflict" \
+        "While paused, the same file is edited differently on each side."
+narrate "echo \"alpha's line\" > alpha/notes.txt"
+echo "alpha's line" > "$ALPHA/notes.txt"
+narrate "echo \"beta's different line\" > beta/notes.txt"
+echo "beta's different line" > "$BETA/notes.txt"
+narrate "echo only-on-alpha > alpha/unrelated.txt   # no conflict here"
+echo "only-on-alpha" > "$ALPHA/unrelated.txt"
+
+show "$BINARY" resume --state-root "$STATE"
+pause_briefly 6
+show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
+
+chapter "neither side was touched" \
+        "A conflict is reported, never resolved by guessing."
+narrate "cat alpha/notes.txt beta/notes.txt"
+echo "  alpha: $(cat "$ALPHA/notes.txt")"
+echo "  beta:  $(cat "$BETA/notes.txt")"
+narrate "# and the unrelated file propagated anyway:"
+echo "  beta/unrelated.txt: $(cat "$BETA/unrelated.txt" 2>/dev/null || echo '(missing)')"
+
+chapter "resolving it" \
+        "Make the two sides agree; the next cycle records the agreement."
+narrate "cp alpha/notes.txt beta/notes.txt"
+cp "$ALPHA/notes.txt" "$BETA/notes.txt"
+pause_briefly 5
+show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
+
+chapter "autobahn flush" \
+        "Wakes the sessions now rather than at the next interval."
+narrate "echo 'urgent edit' > alpha/notes.txt"
+echo "urgent edit" > "$ALPHA/notes.txt"
+show "$BINARY" flush --state-root "$STATE"
+sleep 1
+echo "  beta/notes.txt: $(cat "$BETA/notes.txt")"
+
+chapter "autobahn verify" \
+        "The next cycle re-reads every byte, so content that changed without its metadata moving becomes visible."
+show "$BINARY" verify --state-root "$STATE"
+pause_briefly 3
+
+chapter "filtering" \
+        "Every reporting command takes an optional group, then an optional destination."
+show "$BINARY" status demo --config "$CONFIG" --state-root "$STATE"
+
+chapter "autobahn reset" \
+        "Discards the synchronization baselines. Deliberate by construction: the group is required."
+narrate "autobahn reset --state-root $STATE     # no group named"
+"$BINARY" reset --state-root "$STATE" 2>&1 | head -4
+show "$BINARY" reset demo --state-root "$STATE"
+pause_briefly 4
+show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
+
+chapter "the safety halt" \
+        "A destination that loses a populated tree is not mirrored away — the session halts and says so."
+narrate "rm -rf beta/*    # as if a mount vanished"
+rm -rf "${BETA:?}"/*
+pause_briefly 6
+show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
+narrate "# alpha is untouched:"
+show find "$ALPHA" -type f
+
+kill "$SUPERVISOR" 2>/dev/null; wait "$SUPERVISOR" 2>/dev/null; SUPERVISOR=""
+
+chapter "autobahn sync" \
+        "One pass over two roots, no supervisor and no configuration file."
+ONCE_A="once-a"; ONCE_B="once-b"
+mkdir -p "$ONCE_A" "$ONCE_B"
+echo "one-shot content" > "$ONCE_A/file.txt"
+show "$BINARY" sync "$ONCE_A" "$ONCE_B"
+echo "  once-b/file.txt: $(cat "$ONCE_B/file.txt")"
+
+chapter "remote roots" \
+        "The same command, with a destination on another host. (Shown, not run — it needs a real host.)"
+narrate "autobahn sync ./project user@host:/srv/project"
+narrate "# or, in a configuration: betas = [\"user@host:/srv/project\"]"
+echo "  The agent is copied to the host on first use and speaks over ssh."
+
+chapter "the rest of the surface" ""
+show "$BINARY" --help
+
+printf '\n%s━━ the tour is over %s\n' "$BOLD" "$OFF"
+printf '%sScratch tree removed: %s%s\n\n' "$DIM" "$WORK" "$OFF"

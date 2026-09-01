@@ -19,7 +19,7 @@ betas = [
 ```
 
 ```sh
-autobahn up
+autobahn watch
 ```
 
 

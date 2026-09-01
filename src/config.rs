@@ -658,40 +658,23 @@ impl Config {
                 plan.display(),
             ));
         }
-        // Shared writable endpoints are reported once per *endpoint*, naming
-        // every session that writes it. Reported per pair, as this once did,
-        // a five-destination fan-out produces ten near-identical lines that
-        // bury everything else the launch has to say.
-        let mut shared: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        for (identity, writes, owner) in &endpoints {
-            if !*writes {
-                continue;
-            }
-            let sessions = shared.entry(identity.as_str()).or_default();
-            if !sessions.contains(&owner.as_str()) {
-                sessions.push(owner.as_str());
-            }
-        }
-        for (identity, sessions) in shared {
-            if sessions.len() < 2 {
-                continue;
-            }
-            eprintln!(
-                "warning: {} sessions write {identity} ({}); concurrent edits \
-                 there can conflict across sessions",
-                sessions.len(),
-                sessions.join(", ")
-            );
-        }
-
         for (index, (identity, writes, owner)) in endpoints.iter().enumerate() {
             for (other_identity, other_writes, other_owner) in endpoints.iter().skip(index + 1) {
                 if owner == other_owner {
                     continue; // within-session overlap is checked above
                 }
-                let _ = (writes, other_writes);
                 if identity == other_identity {
-                    continue; // reported above, once per endpoint
+                    // Sessions sharing an endpoint *exactly* are the
+                    // fan-out, star and relay topologies. They are not
+                    // remarked on: they share one observer and one scan of
+                    // that root, every write is validated against the scan
+                    // it was reconciled from, and a collision reaches the
+                    // user as an ordinary conflict — the same one that a
+                    // single session produces when both its sides change a
+                    // file, which is likewise not warned about. What the
+                    // *mode* does with that collision is a property of the
+                    // mode, documented with the modes.
+                    continue;
                 }
                 let contains = |outer: &str, inner: &str| {
                     inner

@@ -145,6 +145,9 @@ Working with a running (or stopped) supervisor:
 autobahn up --once         # one pass over everything, then exit
 autobahn status            # what every session last did
 autobahn status project    # ...filtered to one group
+autobahn status .          # ...to whatever syncs the working directory
+autobahn status ~/project  # ...or any folder inside a synchronized root
+autobahn status --conflicts   # list every conflicting path, not a count
 
 # Poke a running supervisor:
 autobahn flush             # sync everything right now

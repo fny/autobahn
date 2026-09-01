@@ -161,11 +161,17 @@ enum Command {
         /// Override the state root (defaults to ~/.autobahn).
         #[arg(long)]
         state_root: Option<PathBuf>,
-        /// Filter to a group.
+        /// Filter to a group, by its name or by its folder — an absolute
+        /// path, a `~` path, or `.` for the working directory. A folder
+        /// inside a synchronized root selects the group that covers it,
+        /// so `autobahn status .` answers "what syncs where I am?".
         group: Option<String>,
         /// Filter to a destination host (or local beta path) within the
         /// group.
         host: Option<String>,
+        /// List every conflicting path rather than a count and an example.
+        #[arg(long)]
+        conflicts: bool,
     },
     /// Wake configured sessions in a running supervisor for an immediate
     /// synchronization cycle.
@@ -242,7 +248,8 @@ fn main() {
             state_root,
             group,
             host,
-        } => run_status(config, state_root, group, host),
+            conflicts,
+        } => run_status(config, state_root, group, host, conflicts),
         Command::Flush {
             group,
             host,
@@ -623,19 +630,51 @@ fn run_status(
     state_root: Option<PathBuf>,
     group: Option<String>,
     host: Option<String>,
+    expand_conflicts: bool,
 ) -> Result<()> {
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
 
+    // The selector is a group name or a folder. A folder is resolved to its
+    // physical identity and matched against each group's alpha — by
+    // containment, not equality, so the selector can be a directory *inside*
+    // a synchronized root. That is what makes `autobahn status .` useful
+    // from anywhere in a project rather than only at its top.
+    let folder = group.as_deref().and_then(|selector| {
+        let looks_like_path = selector.starts_with('.')
+            || selector.starts_with('/')
+            || selector.starts_with('~')
+            || std::path::Path::new(selector).is_dir();
+        if !looks_like_path {
+            return None;
+        }
+        let expanded = paths::expand_tilde(selector).ok()?;
+        Some(paths::resolve_for_identity(&expanded))
+    });
+    let covers = |plan: &autobahn::config::SessionPlan, folder: &std::path::Path| -> bool {
+        let alpha = std::path::Path::new(&plan.alpha_identity);
+        folder == alpha || folder.starts_with(alpha)
+    };
+
     let selected: Vec<_> = plans
         .iter()
-        .filter(|plan| group.as_deref().is_none_or(|group| plan.group == group))
+        .filter(|plan| match (&folder, group.as_deref()) {
+            (Some(folder), _) => covers(plan, folder),
+            (None, Some(group)) => plan.group == group,
+            (None, None) => true,
+        })
         .filter(|plan| host.as_deref().is_none_or(|host| plan.host == host))
         .collect();
     if selected.is_empty() {
-        match (&group, &host) {
-            (Some(group), Some(host)) => bail!("no configured session matches {group}@{host}"),
-            (Some(group), None) => bail!("no configured group named '{group}'"),
+        match (&folder, &group, &host) {
+            (Some(folder), _, _) => bail!(
+                "no configured group synchronizes {} (or anything containing it)",
+                folder.display()
+            ),
+            (None, Some(group), Some(host)) => {
+                bail!("no configured session matches {group}@{host}")
+            }
+            (None, Some(group), None) => bail!("no configured group named '{group}'"),
             _ => bail!("the configuration describes no sessions"),
         }
     }
@@ -691,6 +730,7 @@ fn run_status(
                 &plan.beta_spec(),
                 autobahn::config::mode_name(plan.mode),
                 status.as_ref(),
+                expand_conflicts,
             );
         }
         index = end;
@@ -704,7 +744,12 @@ fn run_status(
 /// entry in its block, so blocks with different destinations line their
 /// values up at different offsets and the page reads as jagged. A label
 /// carries its own meaning and needs no alignment to be found.
-fn print_status_entry(destination: &str, mode: &str, status: Option<&SessionStatus>) {
+fn print_status_entry(
+    destination: &str,
+    mode: &str,
+    status: Option<&SessionStatus>,
+    expand_conflicts: bool,
+) {
     // Only the folder is emphasised. Indentation already separates the
     // destinations from it, and bolding both levels leaves neither leading.
     println!("  {destination}");
@@ -747,10 +792,16 @@ fn print_status_entry(destination: &str, mode: &str, status: Option<&SessionStat
     // painted has no emphasis left to spend: the reader scans the status
     // words to find what needs attention, then reads the plain lines under
     // whichever one they stopped at.
-    match status.conflicts.len() {
-        0 => {}
-        1 => println!("    conflicts: 1, {}", status.conflicts[0]),
-        count => println!("    conflicts: {count}, first {}", status.conflicts[0]),
+    match (status.conflicts.len(), expand_conflicts) {
+        (0, _) => {}
+        (1, _) => println!("    conflicts: 1, {}", status.conflicts[0]),
+        (count, false) => println!("    conflicts: {count}, first {}", status.conflicts[0]),
+        (count, true) => {
+            println!("    conflicts: {count}");
+            for root in &status.conflicts {
+                println!("      {root}");
+            }
+        }
     }
     match status.problems.len() {
         0 => {}

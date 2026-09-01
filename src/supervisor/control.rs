@@ -260,14 +260,20 @@ fn peer_is_same_user(stream: &UnixStream) -> Result<bool> {
 /// Handles one control connection: a single request/response exchange, with
 /// timeouts so a stalled client can never wedge the control service.
 fn handle(stream: UnixStream, registry: &Registry) -> Result<()> {
-    stream
-        .set_nonblocking(false)
-        .context("unable to configure the control connection")?;
-    let timeout = Some(std::time::Duration::from_secs(2));
-    stream
-        .set_read_timeout(timeout)
-        .and_then(|()| stream.set_write_timeout(timeout))
-        .context("unable to configure control timeouts")?;
+    // A peer that connected and left without a word — `status` probing
+    // whether anyone is listening does exactly this, twice a second under
+    // `watch` — is not a failed request; it made none. macOS reports the
+    // vanished peer as EINVAL from the very first setsockopt, so a failure
+    // to configure the connection is read as that, and answered with
+    // silence rather than a complaint on every probe.
+    let configured = stream.set_nonblocking(false).and_then(|()| {
+        let timeout = Some(std::time::Duration::from_secs(2));
+        stream.set_read_timeout(timeout)?;
+        stream.set_write_timeout(timeout)
+    });
+    if configured.is_err() {
+        return Ok(());
+    }
     if !peer_is_same_user(&stream)? {
         anyhow::bail!("rejecting a control request from another user");
     }

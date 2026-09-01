@@ -718,21 +718,34 @@ fn run_watch(
         if let Err(error) = supervisor.run_watch(&stop) {
             // Leave the display and say why, since the loop below would
             // otherwise keep repainting a supervisor that no longer exists.
-            print!("\x1b[2J\x1b[H");
+            leave_display();
             eprintln!("autobahn: {error:#}");
             std::process::exit(1);
         }
     });
 
+    // The display lives on the alternate screen, like a pager: it takes
+    // the terminal over while it runs and gives it back — scrollback and
+    // all — on exit, including an interrupt. Both signals set a flag the
+    // loop checks, so the screen is restored on the loop's own terms
+    // rather than by a handler racing a half-painted frame.
+    static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    extern "C" fn interrupt(_: libc::c_int) {
+        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    unsafe {
+        libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, interrupt as libc::sighandler_t);
+    }
+    enter_display();
+
     let mut previous = String::new();
-    loop {
+    while !INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
         let mut frame = String::new();
         let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
         render_status(&selected, &display_root, expand_conflicts, &mut frame);
-        frame.push_str("\n\x1b[2mwatching · Ctrl-C to stop\x1b[0m\n");
+        let frame = fit_to_terminal(frame);
         if frame != previous {
-            // Home, then paint, then clear whatever the previous frame left
-            // below — one write, so the screen never shows a half frame.
             use std::io::Write;
             let mut out = std::io::stdout().lock();
             let _ = write!(out, "\x1b[H{frame}\x1b[J");
@@ -741,6 +754,102 @@ fn run_watch(
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
+    leave_display();
+    Ok(())
+}
+
+/// Switches to the alternate screen and hides the cursor.
+fn enter_display() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J");
+    let _ = out.flush();
+}
+
+/// Restores the main screen and the cursor.
+fn leave_display() {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = write!(out, "\x1b[?25h\x1b[?1049l");
+    let _ = out.flush();
+}
+
+/// The terminal's size in (rows, columns), when it can be determined.
+fn terminal_size() -> Option<(usize, usize)> {
+    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return None;
+    }
+    if size.ws_row == 0 || size.ws_col == 0 {
+        return None;
+    }
+    Some((size.ws_row as usize, size.ws_col as usize))
+}
+
+/// Trims a frame to what the terminal can show, so a configuration longer
+/// than the screen does not scroll the top away on every repaint. What is
+/// hidden is counted in the footer rather than silently lost.
+fn fit_to_terminal(frame: String) -> String {
+    let Some((rows, columns)) = terminal_size() else {
+        return frame + "\n\x1b[2mwatching · Ctrl-C to stop\x1b[0m\n";
+    };
+    // A line wider than the terminal wraps and eats a second row; counting
+    // that keeps the footer on screen.
+    let visual_rows = |line: &str| {
+        let width = strip_escapes(line).chars().count();
+        if width == 0 {
+            1
+        } else {
+            width.div_ceil(columns)
+        }
+    };
+    let lines: Vec<&str> = frame.lines().collect();
+    let total: usize = lines.iter().map(|line| visual_rows(line)).sum();
+    let budget = rows.saturating_sub(2); // the footer and a margin
+    let mut out = String::new();
+    if total <= budget {
+        for line in &lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.push_str("\n\x1b[2mwatching · Ctrl-C to stop\x1b[0m\n");
+        return out;
+    }
+    let mut used = 0;
+    let mut shown = 0;
+    for line in &lines {
+        let needed = visual_rows(line);
+        if used + needed > budget.saturating_sub(1) {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+        used += needed;
+        shown += 1;
+    }
+    out.push_str(&format!(
+        "\x1b[2m… {} more lines — enlarge the terminal, or `autobahn status` · Ctrl-C to stop\x1b[0m\n",
+        lines.len() - shown
+    ));
+    out
+}
+
+/// Removes ANSI escape sequences, for measuring visible width.
+fn strip_escapes(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Removes state belonging to sessions the configuration no longer

@@ -200,6 +200,50 @@ a local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
 | `one-way-safe` | Alpha → beta only; beta's own changes are never overwritten. | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
 | `one-way-replica` | Beta is an exact mirror of alpha. | Backups, artifact distribution — beta should be *identical*. |
 
+The modes differ only in six situations. Everything else — an
+unchanged file, a new file on alpha, a rename — behaves identically in
+all four. This is what each mode actually does, case by case:
+
+| | `two-way-safe` | `two-way-resolved` | `one-way-safe` | `one-way-replica` |
+|---|---|---|---|---|
+| Alpha edits a file | → beta | → beta | → beta | → beta |
+| Beta edits a file | → alpha | → alpha | stays on beta, **reported as a conflict** | **overwritten** from alpha |
+| Both edit the same file | **conflict**; both sides keep their own | alpha's version wins, silently | **conflict**; both sides keep their own | alpha's version wins, silently |
+| Alpha deletes a file | → beta | → beta | → beta | → beta |
+| Beta creates a new file | kept | kept | kept | **deleted** |
+| Beta deletes a file | → alpha | → alpha | restored from alpha | restored from alpha |
+
+Three things in that table surprise people:
+
+**`one-way-safe` is not "ignore beta".** It refuses to overwrite
+anything beta changed, and *tells you* — a file edited on beta is
+reported as a conflict every cycle until you resolve it. That is the
+mode's whole point: alpha pushes outward, but never destroys work that
+appeared on the far side. If you want beta's edits silently discarded,
+you want `one-way-replica`.
+
+**`one-way-replica` deletes files it has never seen.** Beta is made
+*identical* to alpha, so logs, caches, and anything else generated on
+beta are removed. Never point it at a directory the far side also
+writes to.
+
+**Deletions propagate in every mode**, including the one-way ones —
+deleting on alpha deletes on beta. What varies is only the reverse
+direction. (A deletion large enough to look like a vanished disk halts
+the session instead; see the safety rules.)
+
+#### Modes and fan-out
+
+When one alpha fans out to several betas, each destination is its own
+session, and the mode decides what happens when two betas change the
+same file at once. Under `two-way-safe`, whichever lands first reaches
+alpha and the other session reports a conflict — both edits survive,
+one needs a human. Under `two-way-resolved`, the second edit
+overwrites the first everywhere, silently, because "alpha wins" and
+alpha is now whatever arrived most recently. Neither is wrong, but the
+second only suits a fan-out you push *from* rather than edit at both
+ends.
+
 ## One-off syncs and scripting
 
 Underneath the supervisor sits a single-session command, useful for

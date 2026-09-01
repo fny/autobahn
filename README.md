@@ -247,6 +247,62 @@ alpha is now whatever arrived most recently. Neither is wrong, but the
 second only suits a fan-out you push *from* rather than edit at both
 ends.
 
+### Overlapping and nested roots
+
+Several sessions may share a root exactly. That is the fan-out, star,
+and relay shape above, and it is ordinary: those sessions share one
+watcher and one scan of the root, and each write is validated against
+the scan it was reconciled from.
+
+*Nesting* is different, and is refused when either endpoint is written:
+
+```
+sessions 'dist@/web/dist' and 'project@/backup/project': endpoint
+/srv/project/dist is nested inside /srv/project and at least one of
+them is written; two sessions cannot safely write one tree region from
+independent ancestors. Add it to the outer group's `ignores` if the
+outer session should leave that subtree alone
+```
+
+The reason is the ancestor. Two sessions writing one region each keep
+their own record of what was last agreed, so each reads the other's
+writes as user edits and propagates them back — indefinitely, with
+neither able to notice. Sharing a root exactly avoids this because the
+sessions share one observation of it; nesting gives them genuinely
+separate views, so it cannot.
+
+"Written" is the test, not the mode. An alpha is written only in the
+two-way modes; a beta is written in every mode. So two one-way sources
+reading overlapping trees are legal — nothing writes the shared region
+— while any nesting involving a destination, or a two-way source, is
+not.
+
+**Unless the outer session ignores the inner root.** Then they do not
+overlap at all: the outer never scans, writes, or records anything
+beneath that path. This is how you synchronize a project and ship its
+build output somewhere else:
+
+```toml
+[groups.project]
+alpha = "~/project"
+mode = "two-way-safe"
+ignores = ["dist"]          # the outer session leaves it alone
+betas = ["build.example.com"]
+
+[groups.dist]
+alpha = "~/project/dist"    # nested, but excluded above
+mode = "one-way-replica"
+betas = ["web.example.com:/srv/www"]
+```
+
+Both run side by side: the first destination receives the project
+without `dist`, the second receives `dist`. Remove the `ignores` line
+and the configuration is refused again.
+
+The check sees only one configuration load. Two autobahn processes with
+separate config files can still nest their endpoints, because neither
+can see the other — see the support boundaries.
+
 ## One-off syncs and scripting
 
 Underneath the supervisor sits a single-session command, useful for

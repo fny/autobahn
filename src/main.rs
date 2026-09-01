@@ -19,9 +19,19 @@ use autobahn::supervisor::{read_status, SessionStatus, Supervisor};
 use autobahn::transport::{serve_agent, Connection};
 use autobahn::tree::SyncMode;
 
+/// The help styling: clap's defaults, minus the underline it puts on
+/// section headings. Bold alone separates them, and underlines render
+/// inconsistently across terminals — some draw them through descenders,
+/// some ignore them, some use them for links.
+const HELP_STYLES: clap::builder::Styles = clap::builder::Styles::styled()
+    .header(clap::builder::styling::Style::new().bold())
+    .usage(clap::builder::styling::Style::new().bold())
+    .literal(clap::builder::styling::Style::new().bold())
+    .placeholder(clap::builder::styling::Style::new());
+
 /// Fast, safe, SSH-focused bidirectional file synchronization.
 #[derive(Parser)]
-#[command(name = "autobahn", version, about)]
+#[command(name = "autobahn", version, about, styles = HELP_STYLES)]
 struct Cli {
     #[command(subcommand)]
     command: Command,

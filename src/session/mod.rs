@@ -780,14 +780,11 @@ impl EndpointPairLock {
         EndpointPairLock::acquire_in(&root, alpha_identity, beta_identity)
     }
 
-    /// Acquires the pair lock under an explicit lock root (the seam tests
-    /// use so the mechanism can be exercised without touching the user's
-    /// real home directory).
-    fn acquire_in(
-        root: &Path,
-        alpha_identity: &str,
-        beta_identity: &str,
-    ) -> Result<EndpointPairLock> {
+    /// The lock directory name for a pair of endpoint identities, in either
+    /// order. Exposed so `clean` can tell which lock directories belong to a
+    /// configured pair and which are left over from pairs that no longer
+    /// exist.
+    pub fn key(alpha_identity: &str, beta_identity: &str) -> String {
         let (first, second) = if alpha_identity <= beta_identity {
             (alpha_identity, beta_identity)
         } else {
@@ -802,7 +799,23 @@ impl EndpointPairLock {
         for byte in &digest.as_bytes()[..16] {
             key.push_str(&format!("{byte:02x}"));
         }
-        let directory = root.join(key);
+        key
+    }
+
+    /// Acquires the pair lock under an explicit lock root (the seam tests
+    /// use so the mechanism can be exercised without touching the user's
+    /// real home directory).
+    fn acquire_in(
+        root: &Path,
+        alpha_identity: &str,
+        beta_identity: &str,
+    ) -> Result<EndpointPairLock> {
+        let (first, second) = if alpha_identity <= beta_identity {
+            (alpha_identity, beta_identity)
+        } else {
+            (beta_identity, alpha_identity)
+        };
+        let directory = root.join(EndpointPairLock::key(alpha_identity, beta_identity));
         let lock = SessionLock::acquire(directory).map_err(|error| {
             anyhow::anyhow!(
                 "another session is already synchronizing these roots \
@@ -1037,6 +1050,22 @@ mod tests {
             SyncMode::TwoWaySafe,
         );
         assert!(result.emptied_subtree.is_none());
+    }
+
+    /// `clean` decides which lock directories are live by recomputing their
+    /// names from the configuration, so the name `acquire` uses and the name
+    /// `key` reports must be the same function of the same inputs — in
+    /// either order, since a pair has no direction.
+    #[test]
+    fn the_pair_lock_key_names_the_directory_acquire_uses() {
+        let root = tempfile::tempdir().unwrap();
+        let _held = EndpointPairLock::acquire_in(root.path(), "/x", "/y").unwrap();
+        let expected = root.path().join(EndpointPairLock::key("/y", "/x"));
+        assert!(expected.is_dir(), "acquire and key disagree on the name");
+        assert_eq!(
+            EndpointPairLock::key("/x", "/y"),
+            EndpointPairLock::key("/y", "/x")
+        );
     }
 
     #[test]

@@ -157,7 +157,17 @@ autobahn reset project     # forget the baseline; next cycle merges both
                            # sides additively (resurrects deletions)
 autobahn verify project    # next cycle re-reads every byte, catching
                            # content whose metadata never moved
+autobahn clean --dry-run   # what state belongs to sessions no longer
+autobahn clean             # in the config; then remove it
 ```
+
+Removing a group from the config stops its sessions but keeps their
+state, so that adding the group back later resumes from memory rather
+than re-merging two drifted trees. `clean` is how that state is
+eventually let go: it removes ancestors, status records, staged content,
+and endpoint locks for any session the config no longer describes.
+Anything a running session holds is skipped, and the files in the
+synchronized trees are never touched.
 
 `scripts/mi` runs a guided tour of all of this against throwaway
 directories — every command, and every state a session can report,

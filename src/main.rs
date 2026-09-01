@@ -1,9 +1,9 @@
 //! The autobahn command line interface.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 use autobahn::config::Config;
@@ -217,6 +217,28 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Remove state left behind by sessions the configuration no longer
+    /// describes: their ancestors, status records, staged content, and
+    /// endpoint locks. State for a running session is never touched, and
+    /// the files in the synchronized trees are never touched by anything.
+    Clean {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// Show what would be removed without removing it.
+        #[arg(long)]
+        dry_run: bool,
+        /// Also remove staged content this machine holds *as an agent* for
+        /// sessions driven from other machines, when it has not been
+        /// touched for this many days. Such content is a transfer cache
+        /// whose owner cannot be identified from here, so it is left alone
+        /// unless asked.
+        #[arg(long, value_name = "DAYS")]
+        agent_staging_older_than: Option<u64>,
+    },
     /// Re-read every file's content on the sessions' next cycle, making
     /// content that changed without its metadata moving (restored
     /// timestamps, reproducible-build rewrites) visible and synchronized.
@@ -298,6 +320,12 @@ fn main() {
             state_root,
             "reset",
         ),
+        Command::Clean {
+            config,
+            state_root,
+            dry_run,
+            agent_staging_older_than,
+        } => run_clean(config, state_root, dry_run, agent_staging_older_than),
         Command::Sync {
             alpha,
             beta,
@@ -622,6 +650,212 @@ fn run_up(config: Option<PathBuf>, once: bool, state_root: Option<PathBuf>) -> R
     // when their connection streams close, so no explicit cleanup is needed.
     let stop = std::sync::atomic::AtomicBool::new(false);
     supervisor.run_watch(&stop)
+}
+
+/// Removes state belonging to sessions the configuration no longer
+/// describes.
+///
+/// "Stale" is decided against the configuration, never against age: a
+/// session that is configured but has not run in a year is not stale, and
+/// one removed from the configuration this morning is. Everything a session
+/// owns is keyed by its identifier — its directory under `sessions/`, its
+/// status record, and (on this machine as an agent) its staging — so the
+/// live set is the set of identifiers the configuration produces. Endpoint
+/// locks are keyed by the pair of endpoint identities instead, and the
+/// live set of those is computed the same way.
+///
+/// A session that is *running* holds its lock, and a lock that cannot be
+/// acquired means the state behind it is in use; such state is skipped and
+/// reported rather than removed from under a live process.
+fn run_clean(
+    config: Option<PathBuf>,
+    state_root: Option<PathBuf>,
+    dry_run: bool,
+    agent_staging_older_than: Option<u64>,
+) -> Result<()> {
+    use autobahn::session::{EndpointPairLock, SessionLock};
+    use std::collections::HashSet;
+
+    let plans = load_config(config)?.plans()?;
+    let state_root = resolve_state_root(state_root)?;
+    let live_sessions: HashSet<String> = plans.iter().map(|plan| plan.identifier()).collect();
+    let live_locks: HashSet<String> = plans
+        .iter()
+        .map(|plan| EndpointPairLock::key(&plan.alpha_identity, &plan.beta_identity))
+        .collect();
+
+    let verb = if dry_run { "would remove" } else { "removed" };
+    let mut removed = 0usize;
+    let mut bytes = 0u64;
+    let mut in_use = 0usize;
+
+    let mut remove = |path: &Path, what: &str| -> Result<()> {
+        let size = directory_size(path);
+        println!("{verb} {what} {} ({})", path.display(), format_size(size));
+        if !dry_run {
+            if path.is_dir() {
+                std::fs::remove_dir_all(path)
+            } else {
+                std::fs::remove_file(path)
+            }
+            .with_context(|| format!("unable to remove {}", path.display()))?;
+        }
+        removed += 1;
+        bytes += size;
+        Ok(())
+    };
+
+    // Sessions: the ancestor, the controller-side staging, and the lock.
+    // The lock is taken first — and held while the directory is removed —
+    // so a session that starts in the meantime cannot open state that is
+    // half gone.
+    let sessions = state_root.join("sessions");
+    let mut retired: HashSet<String> = HashSet::new();
+    for entry in list_directory(&sessions)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if live_sessions.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        match SessionLock::acquire(path.clone()) {
+            Ok(_lock) => {
+                remove(&path, "session")?;
+                retired.insert(name);
+            }
+            Err(_) => {
+                println!("skipped session {} (in use)", path.display());
+                in_use += 1;
+            }
+        }
+    }
+
+    // Status records are written by the supervisor for the sessions it
+    // runs; one without a configured session describes nothing.
+    for entry in list_directory(&state_root.join("status"))? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(identifier) = name.strip_suffix(".json") else {
+            continue;
+        };
+        if !live_sessions.contains(identifier) {
+            remove(&entry.path(), "status record")?;
+        }
+    }
+
+    // Endpoint locks live in the *default* state root regardless of any
+    // override, because their job is to catch sessions that disagree about
+    // the state root. A held lock belongs to a running session somewhere
+    // and is left alone.
+    let locks = paths::default_state_root()?.join("endpoint-locks");
+    for entry in list_directory(&locks)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if live_locks.contains(&name) {
+            continue;
+        }
+        let path = entry.path();
+        match SessionLock::acquire(path.clone()) {
+            Ok(_lock) => remove(&path, "endpoint lock")?,
+            Err(_) => {
+                println!("skipped endpoint lock {} (in use)", path.display());
+                in_use += 1;
+            }
+        }
+    }
+
+    // Agent-side staging: `<session>-<side>` directories and their scan
+    // caches, written when this machine serves as the agent for a session
+    // driven from *some* controller. When the session is one this
+    // configuration describes and it is stale, the staging is certainly
+    // stale too. Otherwise the owner is another machine and cannot be
+    // consulted, so age is the only available test and it is opt-in.
+    let staging = paths::default_state_root()?.join("staging");
+    for entry in list_directory(&staging)? {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stem = name.trim_end_matches(".scancache");
+        let Some((identifier, _side)) = stem.rsplit_once('-') else {
+            continue;
+        };
+        if live_sessions.contains(identifier) {
+            continue;
+        }
+        let path = entry.path();
+        // Staging for a session retired above is certainly stale. Anything
+        // else here belongs to a controller elsewhere.
+        let known_stale = retired.contains(identifier);
+        let old_enough = agent_staging_older_than.is_some_and(|days| {
+            entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age.as_secs() >= days * 86_400)
+        });
+        if known_stale || old_enough {
+            remove(&path, "staged content")?;
+        }
+    }
+
+    if removed == 0 && in_use == 0 {
+        println!("nothing to clean");
+    } else {
+        println!(
+            "{verb} {removed} item(s), {}{}",
+            format_size(bytes),
+            if in_use > 0 {
+                format!("; {in_use} in use and left alone")
+            } else {
+                String::new()
+            }
+        );
+    }
+    Ok(())
+}
+
+/// Lists a directory's entries, treating a missing directory as empty.
+fn list_directory(path: &Path) -> Result<Vec<std::fs::DirEntry>> {
+    match std::fs::read_dir(path) {
+        Ok(entries) => entries
+            .collect::<std::io::Result<Vec<_>>>()
+            .with_context(|| format!("unable to list {}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("unable to list {}", path.display())),
+    }
+}
+
+/// The total size of a file or directory tree, best-effort.
+fn directory_size(path: &Path) -> u64 {
+    fn walk(path: &Path, total: &mut u64) {
+        let Ok(metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if metadata.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(path) {
+                for entry in entries.flatten() {
+                    walk(&entry.path(), total);
+                }
+            }
+        } else {
+            *total += metadata.len();
+        }
+    }
+    let mut total = 0;
+    walk(path, &mut total);
+    total
+}
+
+/// Formats a byte count for display.
+fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
 }
 
 /// Shows the recorded status of the configured sessions.

@@ -80,8 +80,18 @@ fn platform_name(system: &str, machine: &str) -> String {
 }
 
 /// Returns the local platform in bundle naming form.
+///
+/// Rust names the operating system after the vendor ("macos") where
+/// `uname -s` names the kernel ("Darwin"), so the constant is translated
+/// rather than used directly. Without this the two namings never match on
+/// a Mac, and a Mac controller cannot serve as its own agent for another
+/// Mac — the case that is supposed to need no bundle at all.
 fn local_platform() -> String {
-    format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+    let system = match std::env::consts::OS {
+        "macos" => "darwin",
+        other => other,
+    };
+    format!("{system}-{}", std::env::consts::ARCH)
 }
 
 /// Locates the agent binary for a platform, searching in order: the bundle
@@ -206,6 +216,28 @@ mod tests {
         }
 
         assert_eq!(found.as_deref(), Some(planted.as_path()));
+    }
+
+    /// The probe's naming and the local constant's naming must agree, or
+    /// the running executable is never recognized as an agent for its own
+    /// platform — which is exactly the case that needs no bundle.
+    #[test]
+    fn the_local_platform_matches_what_probing_this_machine_would_report() {
+        let probed = platform_name(
+            if cfg!(target_os = "macos") {
+                "Darwin"
+            } else if cfg!(target_os = "linux") {
+                "Linux"
+            } else {
+                "FreeBSD"
+            },
+            if cfg!(target_arch = "aarch64") {
+                "arm64"
+            } else {
+                "x86_64"
+            },
+        );
+        assert_eq!(local_platform(), probed);
     }
 
     #[test]

@@ -2251,8 +2251,13 @@ fn publish_rename(source: &Path, target: &Path, replace: bool) -> io::Result<()>
             .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
         let target_c = std::ffi::CString::new(target.as_os_str().as_bytes())
             .map_err(|_| io::Error::from(ErrorKind::InvalidInput))?;
+        // Invoked as a raw syscall rather than through libc's wrapper:
+        // musl did not export `renameat2` until 1.2.5, so linking the
+        // wrapper fails outright on the static musl targets the Linux
+        // agents are built for. The syscall number is stable.
         let result = unsafe {
-            libc::renameat2(
+            libc::syscall(
+                libc::SYS_renameat2,
                 libc::AT_FDCWD,
                 source_c.as_ptr(),
                 libc::AT_FDCWD,
@@ -2264,10 +2269,16 @@ fn publish_rename(source: &Path, target: &Path, replace: bool) -> io::Result<()>
             return Ok(());
         }
         let error = io::Error::last_os_error();
-        // Filesystems without RENAME_NOREPLACE support report EINVAL;
-        // falling back to the plain rename there keeps the old (windowed)
-        // behavior rather than failing every creation.
-        if error.raw_os_error() != Some(libc::EINVAL) {
+        // A filesystem without RENAME_NOREPLACE support reports EINVAL, and
+        // a kernel older than 3.15 has no such call at all (ENOSYS); some
+        // stacks answer EOPNOTSUPP. Falling back to the plain rename in
+        // those cases keeps the documented check-then-rename window rather
+        // than failing every creation — the residual RETAINED.md section 2
+        // describes.
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::EOPNOTSUPP)
+        ) {
             return Err(error);
         }
     }

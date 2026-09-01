@@ -724,27 +724,26 @@ fn print_status_entry(destination: &str, status: Option<&SessionStatus>) {
 
     // Conflicts collapse to a count and an example: a session with forty of
     // them is one fact ("this pair disagrees"), not forty.
+    //
+    // Only the state carries colour. A page where every detail line is
+    // painted has no emphasis left to spend: the reader scans the status
+    // words to find what needs attention, then reads the plain lines under
+    // whichever one they stopped at.
     match status.conflicts.len() {
         0 => {}
-        1 => println!("    conflicts: \x1b[33m1, {}\x1b[0m", status.conflicts[0]),
-        count => println!(
-            "    conflicts: \x1b[33m{count}, first {}\x1b[0m",
-            status.conflicts[0]
-        ),
+        1 => println!("    conflicts: 1, {}", status.conflicts[0]),
+        count => println!("    conflicts: {count}, first {}", status.conflicts[0]),
     }
     match status.problems.len() {
         0 => {}
-        1 => println!("    problems: \x1b[33m1, {}\x1b[0m", status.problems[0]),
-        count => println!(
-            "    problems: \x1b[33m{count}, first {}\x1b[0m",
-            status.problems[0]
-        ),
+        1 => println!("    problems: 1, {}", status.problems[0]),
+        count => println!("    problems: {count}, first {}", status.problems[0]),
     }
     if let Some(error) = &status.error {
         // The innermost cause is the diagnosis; the wrapping context repeats
         // the destination this block already names.
         let detail = error.rsplit(": ").next().unwrap_or(error);
-        println!("    error: \x1b[31m{detail}\x1b[0m");
+        println!("    error: {detail}");
     }
 }
 

@@ -132,9 +132,19 @@ fn establish_ssh(destination: &str) -> Result<AgentConnection> {
     use anyhow::Context;
     let remote_command = transport::install::versioned_remote_command();
     let argv = Connection::ssh_argv(destination, Some(&remote_command));
-    let attempt =
-        || -> Result<AgentConnection> { AgentConnection::connect(Connection::spawn(&argv)?) };
-    let initial = match attempt() {
+    let attempt = |quiet: bool| -> Result<AgentConnection> {
+        let connection = if quiet {
+            Connection::spawn_quiet(&argv)?
+        } else {
+            Connection::spawn(&argv)?
+        };
+        AgentConnection::connect(connection)
+    };
+    // The first attempt is speculative — on a host that has never been
+    // synchronized, or one whose agent predates an upgrade, it is *expected*
+    // to fail — so its noise is suppressed. The retry after installation is
+    // not speculative, and is allowed to speak.
+    let initial = match attempt(true) {
         Ok(connection) => return Ok(connection),
         Err(error) => error,
     };
@@ -142,10 +152,15 @@ fn establish_ssh(destination: &str) -> Result<AgentConnection> {
     // once. (If the failure was something else — authentication, an
     // unreachable host — installation fails the same way and both failures
     // surface together.)
-    transport::install::ensure_agent(destination).with_context(|| {
-        format!("unable to connect to {destination} ({initial:#}), and agent installation failed")
-    })?;
-    attempt().with_context(|| {
+    // When installation fails, *its* error is the diagnosis — the host is
+    // unreachable, or authentication failed, and the installer's probe
+    // carries ssh's own words. The speculative connection's failure says
+    // only "connection closed", which is what a missing agent always looks
+    // like, so it is kept for the case where installation succeeds and the
+    // retry still fails.
+    transport::install::ensure_agent(destination)
+        .with_context(|| format!("unable to synchronize with {destination}"))?;
+    attempt(false).with_context(|| {
         format!(
             "unable to connect to {destination} even after installing the agent \
              (initial failure: {initial:#})"

@@ -103,6 +103,23 @@ impl Connection {
     /// directly in the user's terminal instead of being swallowed. The child
     /// is retained so that [`close`](Connection::close) can reap it.
     pub fn spawn(argv: &[String]) -> Result<Connection> {
+        Connection::spawn_inner(argv, Stdio::inherit())
+    }
+
+    /// Spawns as [`spawn`](Connection::spawn) does, but discards the child's
+    /// standard error.
+    ///
+    /// For the *speculative* first connection to a host, whose failure is
+    /// the ordinary way a missing agent is discovered: the remote shell's
+    /// "no such file or directory" is expected, is followed by an install
+    /// and a retry, and printing it makes routine bootstrapping look like a
+    /// fault. A failure that is not routine still surfaces, through the
+    /// installer's own diagnostics.
+    pub fn spawn_quiet(argv: &[String]) -> Result<Connection> {
+        Connection::spawn_inner(argv, Stdio::null())
+    }
+
+    fn spawn_inner(argv: &[String], stderr: Stdio) -> Result<Connection> {
         let (command, arguments) = argv
             .split_first()
             .ok_or_else(|| anyhow!("unable to spawn agent: empty command"))?;
@@ -110,7 +127,7 @@ impl Connection {
             .args(arguments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(stderr)
             .spawn()
             .with_context(|| format!("unable to start {command}"))?;
         let writer = child

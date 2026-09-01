@@ -56,10 +56,19 @@ fn probe_platform(destination: &str) -> Result<String> {
         .output()
         .context("unable to run ssh")?;
     if !output.status.success() {
-        bail!(
-            "unable to probe the platform of {destination}: ssh exited with {}",
-            output.status
-        );
+        // ssh's own message is the diagnosis — "Permission denied
+        // (publickey)", "Could not resolve hostname", "Connection refused" —
+        // and the exit status alone is not. It is folded in here because the
+        // speculative first connection no longer prints it.
+        let complaint = String::from_utf8_lossy(&output.stderr);
+        let complaint = complaint.trim();
+        if complaint.is_empty() {
+            bail!(
+                "unable to reach {destination}: ssh exited with {}",
+                output.status
+            );
+        }
+        bail!("unable to reach {destination}: {complaint}");
     }
     let report = String::from_utf8_lossy(&output.stdout);
     let mut parts = report.split_whitespace();
@@ -160,6 +169,7 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
         .stdin(Stdio::piped())
         .spawn()
         .context("unable to run ssh")?;
+    let complaint = child.stderr.take();
     let mut stdin = child
         .stdin
         .take()
@@ -169,7 +179,18 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
     let status = child.wait().context("unable to wait for ssh")?;
     write.context("unable to stream the agent binary")?;
     if !status.success() {
-        bail!("the installation command exited with {status}");
+        let detail = complaint
+            .map(|mut stderr| {
+                use std::io::Read;
+                let mut text = String::new();
+                let _ = stderr.read_to_string(&mut text);
+                text.trim().to_owned()
+            })
+            .filter(|text| !text.is_empty());
+        match detail {
+            Some(detail) => bail!("the installation command failed: {detail}"),
+            None => bail!("the installation command exited with {status}"),
+        }
     }
     Ok(())
 }
@@ -184,7 +205,11 @@ fn ssh_command(destination: &str, script: &str) -> Command {
     command.arg(destination);
     command.arg(script);
     command.stdout(Stdio::piped());
-    command.stderr(Stdio::inherit());
+    // Captured rather than inherited: ssh's complaint is folded into the
+    // error the caller returns, where it is attributed to a session and a
+    // host. Inherited, it arrives as an unattributed line in the middle of
+    // a supervisor's output, which for a fan-out is unreadable.
+    command.stderr(Stdio::piped());
     command
 }
 

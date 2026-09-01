@@ -51,7 +51,7 @@ done
 say() { printf '%s\n' "$*"; }
 die() { printf 'install: %s\n' "$*" >&2; exit 1; }
 
-# ── the tools this script needs ─────────────────────────────────────
+# the tools this script needs
 have() { command -v "$1" >/dev/null 2>&1; }
 
 if have curl; then
@@ -88,7 +88,7 @@ else
     die "neither sha256sum nor shasum is available"
 fi
 
-# ── which build ─────────────────────────────────────────────────────
+# which build
 # The same mapping the controller uses when it probes a remote host, so
 # the name resolved here is the name the release publishes.
 system="$(uname -s | tr '[:upper:]' '[:lower:]')"
@@ -127,7 +127,7 @@ If $REPO is private, install the GitHub CLI and run 'gh auth login' —
 private release assets are not served over plain download URLs."
 fi
 
-# ── verify before installing ────────────────────────────────────────
+# verify before installing
 # A checksum file is only evidence if it came from the release; it is
 # fetched separately and the binary is compared against its entry. If the
 # release publishes no checksums, say so rather than pretending.
@@ -146,7 +146,7 @@ else
     say "  warning: the release publishes no SHA256SUMS; installing unverified"
 fi
 
-# ── the command ─────────────────────────────────────────────────────
+# the command
 mkdir -p "$PREFIX"
 chmod 755 "$WORK/autobahn"
 # Written to a temporary alongside the target and renamed, so a running
@@ -155,7 +155,7 @@ mv "$WORK/autobahn" "$PREFIX/.autobahn.install.$$"
 mv "$PREFIX/.autobahn.install.$$" "$PREFIX/autobahn"
 say "  installed $PREFIX/autobahn"
 
-# ── the agents ──────────────────────────────────────────────────────
+# the agents
 if [ "$WITH_AGENTS" -eq 1 ]; then
     if fetch "autobahn-agents.tar.gz" "$WORK/agents.tar.gz" 2>/dev/null; then
         mkdir -p "$STATE_HOME"
@@ -180,7 +180,7 @@ else
     say "  skipped the agent bundle (--no-agents)"
 fi
 
-# ── is it reachable? ────────────────────────────────────────────────
+# is it reachable?
 case ":$PATH:" in
     *":$PREFIX:"*) ;;
     *)

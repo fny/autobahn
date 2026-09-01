@@ -640,51 +640,148 @@ fn run_status(
         }
     }
 
-    let mut current_group: Option<&str> = None;
+    // Gathered before printing, because the destination column's width is
+    // the widest destination *in each group* — a column that changed width
+    // partway down its own block would be worse than no column at all.
+    let mut rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = Vec::new();
     for plan in selected {
-        if current_group != Some(plan.group.as_str()) {
-            if current_group.is_some() {
-                println!();
-            }
-            current_group = Some(plan.group.as_str());
-            println!("\x1b[1m{}\x1b[0m  {}", plan.group, plan.alpha_spec);
+        let status = read_status(&state_root, &plan.identifier())?;
+        rows.push((plan, status));
+    }
+
+    let mut current_group: Option<&str> = None;
+    let mut index = 0;
+    while index < rows.len() {
+        let group = rows[index].0.group.as_str();
+        let end = rows[index..]
+            .iter()
+            .position(|(plan, _)| plan.group != group)
+            .map(|offset| index + offset)
+            .unwrap_or(rows.len());
+        let block = &rows[index..end];
+
+        if current_group.is_some() {
+            println!();
         }
-        match read_status(&state_root, &plan.identifier())? {
-            Some(status) => print_status_entry(plan.host.as_str(), &status),
-            None => println!("  \x1b[2m{}  never run\x1b[0m", plan.host),
+        current_group = Some(group);
+        let plan = block[0].0;
+        // The folder leads, because that is what the reader is thinking
+        // about; the group name follows because that is what pause, resume
+        // and reset take as an argument; the mode last, because it belongs
+        // to the group rather than to any one destination.
+        println!(
+            "\x1b[1m{}\x1b[0m  \x1b[2m{} · {}\x1b[0m",
+            plan.alpha_spec,
+            plan.group,
+            autobahn::config::mode_name(plan.mode)
+        );
+
+        let destination = |plan: &autobahn::config::SessionPlan| -> String { plan.beta_spec() };
+        let width = block
+            .iter()
+            .map(|(plan, _)| destination(plan).chars().count())
+            .max()
+            .unwrap_or(0);
+        // The cycle count is right-aligned on its digits so the counts stack,
+        // while the word after it starts at a fixed column.
+        let digits = block
+            .iter()
+            .map(|(_, status)| match status {
+                Some(status) => status.cycles.to_string().chars().count(),
+                None => 0,
+            })
+            .max()
+            .unwrap_or(1)
+            .max(1);
+        for (plan, status) in block {
+            print_status_entry(&destination(plan), width, digits, status.as_ref());
         }
+        index = end;
     }
     Ok(())
 }
 
-/// Prints one session's status line (and any conflict, problem, or error
-/// detail beneath it).
-fn print_status_entry(host: &str, status: &SessionStatus) {
-    let age = format_age(status.updated_at);
-    let state = match status.state.as_str() {
-        "synchronized" => status.state.clone(),
-        "error" => format!("\x1b[31m{}\x1b[0m", status.state),
-        _ => format!("\x1b[33m{}\x1b[0m", status.state),
+/// Prints one destination's line, and any detail it owes beneath it.
+///
+/// A healthy destination costs exactly one line; only a destination with
+/// something to report costs more, and every such line is indented under
+/// the destination it belongs to — never left to float at the end of a
+/// block, where it would appear to belong to whichever destination
+/// happened to be printed last.
+fn print_status_entry(
+    destination: &str,
+    width: usize,
+    digits: usize,
+    status: Option<&SessionStatus>,
+) {
+    let Some(status) = status else {
+        println!("  {destination:width$}   \x1b[2mnever run\x1b[0m");
+        return;
+    };
+
+    // A connection failure is its own state: "why is this not running" is
+    // answered by the word, not by reading a paragraph of error text.
+    let unreachable = status
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("unable to synchronize with"));
+    let (label, colour) = match status.state.as_str() {
+        _ if unreachable => ("unreachable", "\x1b[31m"),
+        "synchronized" => ("synchronized", ""),
+        "error" => ("error", "\x1b[31m"),
+        other => (other, "\x1b[33m"),
+    };
+    let reset = if colour.is_empty() { "" } else { "\x1b[0m" };
+    let state = format!("{colour}{label}{reset}");
+    // Padding is computed on the label rather than the coloured string,
+    // whose escape sequences occupy no columns.
+    let padding = " ".repeat(12usize.saturating_sub(label.chars().count()));
+
+    // The count is right-aligned on its digits so the numbers stack, and the
+    // word after it starts at a fixed column. A session that has never
+    // completed a cycle says so in words, occupying the same field.
+    let field = digits + 7;
+    let cycles = if status.cycles == 0 {
+        format!("{:<field$}", "never run")
+    } else {
+        format!(
+            "{:>digits$} {:<6}",
+            status.cycles,
+            if status.cycles == 1 {
+                "cycle"
+            } else {
+                "cycles"
+            }
+        )
     };
     println!(
-        "  \x1b[1m{host}\x1b[0m  {state}  {} cycle(s)  ({age})",
-        status.cycles
+        "  {destination:width$}   {state}{padding} {cycles}   {:>7}",
+        format_age(status.updated_at)
     );
-    // For a local beta the destination is the host label itself, so a
-    // detail line would just repeat it.
-    if status.beta != host {
-        println!("    {} [{}]", status.beta, status.mode);
-    } else {
-        println!("    [{}]", status.mode);
+
+    // Conflicts collapse to a count and an example: a session with forty of
+    // them is one fact ("this pair disagrees"), not forty.
+    match status.conflicts.len() {
+        0 => {}
+        1 => println!("      \x1b[33m1 conflict, {}\x1b[0m", status.conflicts[0]),
+        count => println!(
+            "      \x1b[33m{count} conflicts, first {}\x1b[0m",
+            status.conflicts[0]
+        ),
     }
-    for root in &status.conflicts {
-        println!("    conflict at {root:?}");
-    }
-    for problem in &status.problems {
-        println!("    problem: {problem}");
+    match status.problems.len() {
+        0 => {}
+        1 => println!("      \x1b[33m1 problem, {}\x1b[0m", status.problems[0]),
+        count => println!(
+            "      \x1b[33m{count} problems, first {}\x1b[0m",
+            status.problems[0]
+        ),
     }
     if let Some(error) = &status.error {
-        println!("    {error}");
+        // The innermost cause is the diagnosis; the wrapping context repeats
+        // the destination this line already names.
+        let detail = error.rsplit(": ").next().unwrap_or(error);
+        println!("      \x1b[31m{detail}\x1b[0m");
     }
 }
 

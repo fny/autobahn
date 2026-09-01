@@ -91,9 +91,9 @@ betas = ["$WORK/beta"]
 TOML
 show cat "$CONFIG"
 
-chapter "autobahn up" \
+chapter "autobahn watch" \
         "Starts the supervisor: every session in the configuration, watched continuously."
-narrate "autobahn up --config $CONFIG --state-root $STATE &"
+narrate "autobahn watch --config $CONFIG --state-root $STATE &"
 "$BINARY" up --config "$CONFIG" --state-root "$STATE" > up.log 2>&1 &
 SUPERVISOR=$!
 pause_briefly 5
@@ -106,14 +106,15 @@ chapter "autobahn status" \
         "The recorded state of every session, grouped."
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
-chapter "autobahn pause" \
-        "Cycling stops; the sessions stay configured."
-show "$BINARY" pause --state-root "$STATE"
-pause_briefly 2
+chapter "the supervisor stops" \
+        "Status still answers from what was last recorded — and says so."
+narrate "kill \$SUPERVISOR"
+kill "$SUPERVISOR" 2>/dev/null; wait "$SUPERVISOR" 2>/dev/null; SUPERVISOR=""
+pause_briefly 1
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
 chapter "a genuine conflict" \
-        "While paused, the same file is edited differently on each side."
+        "While nothing is running, the same file is edited differently on each side."
 narrate "echo \"alpha's line\" > alpha/notes.txt"
 echo "alpha's line" > "$ALPHA/notes.txt"
 narrate "echo \"beta's different line\" > beta/notes.txt"
@@ -121,7 +122,9 @@ echo "beta's different line" > "$BETA/notes.txt"
 narrate "echo only-on-alpha > alpha/unrelated.txt   # no conflict here"
 echo "only-on-alpha" > "$ALPHA/unrelated.txt"
 
-show "$BINARY" resume --state-root "$STATE"
+narrate "autobahn watch --config $CONFIG --state-root $STATE &"
+"$BINARY" watch --config "$CONFIG" --state-root "$STATE" >> up.log 2>&1 &
+SUPERVISOR=$!
 pause_briefly 6
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 

@@ -27,6 +27,7 @@ pub mod persist;
 pub mod protocol;
 pub mod rsync;
 pub mod scan;
+pub mod service;
 pub mod session;
 pub mod supervisor;
 pub mod transport;

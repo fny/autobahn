@@ -91,9 +91,19 @@ enum Command {
     /// agent on the remote host on first contact).
     Sync {
         /// The alpha synchronization root (a local path or [user@]host:path).
-        alpha: String,
+        /// With no roots at all, every session in the configuration is
+        /// synchronized once instead.
+        alpha: Option<String>,
         /// The beta synchronization root (a local path or [user@]host:path).
-        beta: String,
+        beta: Option<String>,
+        /// The configuration file, for the no-roots form (defaults to
+        /// ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root, for the no-roots form (defaults to
+        /// ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
         /// The synchronization mode.
         #[arg(long, value_enum, default_value = "two-way-safe")]
         mode: ModeArgument,
@@ -130,26 +140,30 @@ enum Command {
         #[arg(long)]
         alpha_agent: Option<String>,
     },
-    /// Run every session the groups configuration describes, supervising
-    /// them continuously (or once with --once).
+    /// Run every configured session here, in this terminal, until
+    /// interrupted. On a terminal the display is a live `autobahn status`;
+    /// when the output is a file or a pipe, one line is logged per event.
     ///
     /// The configuration fans groups of one local alpha directory out to
     /// any number of local or remote betas; see the documentation for the
     /// format. Sessions run in parallel, and a session whose destination is
     /// unreachable backs off and heals automatically — it never blocks the
-    /// others.
-    Up {
-        /// The configuration file (defaults to
-        /// ~/.autobahn/config.toml).
+    /// others. To keep this running when no terminal is, see `install`.
+    Watch {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Run a single pass over every session and exit (non-zero if any
-        /// session failed) instead of supervising continuously.
-        #[arg(long)]
-        once: bool,
         /// Override the state root (defaults to ~/.autobahn).
         #[arg(long)]
         state_root: Option<PathBuf>,
+        /// In the live display, list every conflicting path rather than a
+        /// count and an example.
+        #[arg(long)]
+        conflicts: bool,
+        /// Log one line per event even on a terminal, instead of the live
+        /// display.
+        #[arg(long)]
+        log: bool,
     },
     /// Show the recorded status of every configured session, grouped by
     /// group (optionally filtered by group and host).
@@ -184,26 +198,6 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Suspend cycling for configured sessions in a running supervisor.
-    Pause {
-        /// Filter to a group.
-        group: Option<String>,
-        /// Filter to a destination within the group.
-        host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Resume cycling for paused sessions in a running supervisor.
-    Resume {
-        /// Filter to a group.
-        group: Option<String>,
-        /// Filter to a destination within the group.
-        host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
     /// Reset sessions in a running supervisor: their synchronization
     /// baselines are discarded, so the next cycle merges both sides
     /// additively (resurrecting deletions). The group is required — a
@@ -217,6 +211,30 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Register the supervisor as a login service — launchd on macOS, a
+    /// systemd user unit on Linux — and start it now. It then runs across
+    /// logouts and reboots, restarting if it exits, logging to
+    /// ~/.autobahn/service.log.
+    Install {
+        /// Bake this configuration file into the service (defaults to
+        /// ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Bake this state root into the service (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Stop the login service and unregister it.
+    Uninstall,
+    /// Start the installed login service. With none installed, this
+    /// refuses and points at `install` (or `watch`, to run here instead).
+    Start,
+    /// Stop the login service. It stays registered and returns at the next
+    /// login; `uninstall` makes it stay gone.
+    Stop,
+    /// Stop and start the login service — after a configuration edit, or an
+    /// upgrade.
+    Restart,
     /// Remove state left behind by sessions the configuration no longer
     /// describes: their ancestors, status records, staged content, and
     /// endpoint locks. State for a running session is never touched, and
@@ -260,11 +278,32 @@ fn main() {
     let cli = Cli::parse();
     let result = match cli.command {
         Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
-        Command::Up {
+        Command::Watch {
             config,
-            once,
             state_root,
-        } => run_up(config, once, state_root),
+            conflicts,
+            log,
+        } => run_watch(config, state_root, conflicts, log),
+        Command::Install { config, state_root } => {
+            autobahn::service::install(config.as_deref(), state_root.as_deref()).map(|()| {
+                println!("installed and started the login service");
+            })
+        }
+        Command::Uninstall => autobahn::service::uninstall().map(|()| {
+            println!("stopped and unregistered the login service");
+        }),
+        Command::Start => autobahn::service::start().map(|()| {
+            println!("started the login service");
+        }),
+        Command::Stop => autobahn::service::stop().map(|()| {
+            println!(
+                "stopped the login service (it returns at the next login; `uninstall` \
+                 removes it)"
+            );
+        }),
+        Command::Restart => autobahn::service::restart().map(|()| {
+            println!("restarted the login service");
+        }),
         Command::Status {
             config,
             state_root,
@@ -280,24 +319,6 @@ fn main() {
             ControlRequest::Flush(Selector { group, host }),
             state_root,
             "flushed",
-        ),
-        Command::Pause {
-            group,
-            host,
-            state_root,
-        } => run_control(
-            ControlRequest::Pause(Selector { group, host }),
-            state_root,
-            "paused",
-        ),
-        Command::Resume {
-            group,
-            host,
-            state_root,
-        } => run_control(
-            ControlRequest::Resume(Selector { group, host }),
-            state_root,
-            "resumed",
         ),
         Command::Verify {
             group,
@@ -327,8 +348,22 @@ fn main() {
             agent_staging_older_than,
         } => run_clean(config, state_root, dry_run, agent_staging_older_than),
         Command::Sync {
-            alpha,
-            beta,
+            alpha: None,
+            beta: None,
+            config,
+            state_root,
+            ..
+        } => run_sync_config(config, state_root),
+        Command::Sync { alpha: None, .. } | Command::Sync { beta: None, .. } => {
+            Err(anyhow::anyhow!(
+                "sync takes two roots, or none to synchronize every configured session once"
+            ))
+        }
+        Command::Sync {
+            alpha: Some(alpha),
+            beta: Some(beta),
+            config: _,
+            state_root: _,
             mode,
             ignores,
             symlink_mode,
@@ -603,53 +638,109 @@ fn resolve_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Runs the supervisor over the configured sessions.
-fn run_up(config: Option<PathBuf>, once: bool, state_root: Option<PathBuf>) -> Result<()> {
+/// One pass over every configured session, then exit — non-zero if any
+/// session failed.
+fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> {
     let plans = load_config(config)?.plans()?;
     if plans.is_empty() {
         bail!("the configuration describes no sessions");
     }
     let state_root = resolve_state_root(state_root)?;
-
-    if once {
-        let supervisor = Supervisor::new(plans, state_root, false);
-        let outcomes = supervisor.run_once();
-        let mut failures = 0usize;
-        for outcome in &outcomes {
-            match &outcome.result {
-                Ok(digest) => {
-                    let mut summary = format!(
-                        "{} change(s) to alpha, {} change(s) to beta",
-                        digest.alpha_transitions, digest.beta_transitions
-                    );
-                    if digest.conflicts > 0 {
-                        summary.push_str(&format!(", {} conflict(s)", digest.conflicts));
-                    }
-                    if digest.problems > 0 {
-                        summary.push_str(&format!(", {} problem(s)", digest.problems));
-                    }
-                    println!("[{}] synchronized: {summary}", outcome.display);
+    let supervisor = Supervisor::new(plans, state_root, false);
+    let outcomes = supervisor.run_once();
+    let mut failures = 0usize;
+    for outcome in &outcomes {
+        match &outcome.result {
+            Ok(digest) => {
+                let mut summary = format!(
+                    "{} change(s) to alpha, {} change(s) to beta",
+                    digest.alpha_transitions, digest.beta_transitions
+                );
+                if digest.conflicts > 0 {
+                    summary.push_str(&format!(", {} conflict(s)", digest.conflicts));
                 }
-                Err(error) => {
-                    failures += 1;
-                    eprintln!("[{}] failed: {error}", outcome.display);
+                if digest.problems > 0 {
+                    summary.push_str(&format!(", {} problem(s)", digest.problems));
                 }
+                println!("[{}] synchronized: {summary}", outcome.display);
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("[{}] failed: {error}", outcome.display);
             }
         }
-        if failures > 0 {
-            bail!("{failures} session(s) failed");
-        }
-        return Ok(());
+    }
+    if failures > 0 {
+        bail!("{failures} session(s) failed");
+    }
+    Ok(())
+}
+
+/// Runs every configured session in the foreground until interrupted.
+///
+/// On a terminal, the supervisor is silent and the screen is a live
+/// `autobahn status`, redrawn as sessions report. Off a terminal — a log
+/// file under the login service, a pipe — the supervisor logs one line
+/// per event instead, which is what a log wants.
+fn run_watch(
+    config: Option<PathBuf>,
+    state_root: Option<PathBuf>,
+    expand_conflicts: bool,
+    log: bool,
+) -> Result<()> {
+    let plans = load_config(config)?.plans()?;
+    if plans.is_empty() {
+        bail!("the configuration describes no sessions");
+    }
+    let state_root = resolve_state_root(state_root)?;
+    let live_display = !log && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+
+    if !live_display {
+        println!(
+            "supervising {} session(s); status is available via `autobahn status`",
+            plans.len()
+        );
+        let supervisor = Supervisor::new(plans, state_root, true);
+        // Runs until the process is terminated: agent processes exit when
+        // their connection streams close, so no explicit cleanup is needed.
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        return supervisor.run_watch(&stop);
     }
 
-    println!(
-        "supervising {} session(s); status is available via `autobahn status`",
-        plans.len()
-    );
-    let supervisor = Supervisor::new(plans, state_root, true);
-    // Watch mode runs until the process is terminated: agent processes exit
-    // when their connection streams close, so no explicit cleanup is needed.
-    let stop = std::sync::atomic::AtomicBool::new(false);
-    supervisor.run_watch(&stop)
+    // The supervisor runs on its own thread and writes status records as
+    // it goes; this thread reads them back and repaints. The records are
+    // the same ones `autobahn status` reads, so the two never disagree.
+    let display_plans = plans.clone();
+    let display_root = state_root.clone();
+    std::thread::spawn(move || {
+        let supervisor = Supervisor::new(plans, state_root, false);
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        if let Err(error) = supervisor.run_watch(&stop) {
+            // Leave the display and say why, since the loop below would
+            // otherwise keep repainting a supervisor that no longer exists.
+            print!("\x1b[2J\x1b[H");
+            eprintln!("autobahn: {error:#}");
+            std::process::exit(1);
+        }
+    });
+
+    let mut previous = String::new();
+    loop {
+        let mut frame = String::new();
+        let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
+        render_status(&selected, &display_root, expand_conflicts, &mut frame);
+        frame.push_str("\n\x1b[2mwatching · Ctrl-C to stop\x1b[0m\n");
+        if frame != previous {
+            // Home, then paint, then clear whatever the previous frame left
+            // below — one write, so the screen never shows a half frame.
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            let _ = write!(out, "\x1b[H{frame}\x1b[J");
+            let _ = out.flush();
+            previous = frame;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// Removes state belonging to sessions the configuration no longer
@@ -913,25 +1004,55 @@ fn run_status(
         }
     }
 
-    // Gathered before printing, because the destination column's width is
-    // the widest destination *in each group* — a column that changed width
-    // partway down its own block would be worse than no column at all.
-    let mut rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = Vec::new();
-    for plan in selected {
-        let status = read_status(&state_root, &plan.identifier())?;
-        rows.push((plan, status));
-    }
+    let mut out = String::new();
+    render_status(&selected, &state_root, expand_conflicts, &mut out);
+    print!("{out}");
+    Ok(())
+}
+
+/// Renders the status of the selected sessions, as `status` prints it and
+/// `watch` repaints it.
+fn render_status(
+    selected: &[&autobahn::config::SessionPlan],
+    state_root: &Path,
+    expand_conflicts: bool,
+    out: &mut String,
+) {
+    use std::fmt::Write;
+
+    let rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = selected
+        .iter()
+        .map(|plan| {
+            (
+                *plan,
+                read_status(state_root, &plan.identifier()).ok().flatten(),
+            )
+        })
+        .collect();
 
     // Everything below is *recorded* state, read from disk. Without saying
     // whether a supervisor is running, a session whose supervisor exited an
     // hour ago still reads as "synchronized" — the command's most
     // misleading possible output, since nothing is synchronizing at all.
-    if !autobahn::supervisor::control::supervisor_is_running(&state_root) {
-        println!(
+    // The service's state says what to do about it.
+    if !autobahn::supervisor::control::supervisor_is_running(state_root) {
+        let remedy = match autobahn::service::state() {
+            Ok(autobahn::service::ServiceState::NotInstalled) => {
+                "run `autobahn watch` here, or `autobahn install` for a login service"
+            }
+            Ok(autobahn::service::ServiceState::Stopped) => {
+                "the login service is installed but stopped; run `autobahn start`"
+            }
+            Ok(autobahn::service::ServiceState::Running) => {
+                "the login service reports running, but is not answering"
+            }
+            Err(_) => "run `autobahn watch`",
+        };
+        let _ = writeln!(
+            out,
             "\x1b[33mno supervisor is running\x1b[0m; what follows is the state \
-             last recorded, not what is happening now"
+             last recorded, not what is happening now\n{remedy}\n"
         );
-        println!();
     }
 
     let mut current_group: Option<&str> = None;
@@ -946,50 +1067,52 @@ fn run_status(
         let block = &rows[index..end];
 
         if current_group.is_some() {
-            println!();
+            out.push('\n');
         }
         current_group = Some(group);
         let plan = block[0].0;
         // The folder leads, because that is what the reader is thinking
-        // about; the group name follows because that is what pause, resume
-        // and reset take as an argument; the mode last, because it belongs
-        // to the group rather than to any one destination.
-        println!(
+        // about; the group name follows because that is what reset and
+        // status take as an argument.
+        let _ = writeln!(
+            out,
             "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
             plan.alpha_spec, plan.group
         );
 
         for (plan, status) in block {
-            print_status_entry(
+            render_status_entry(
                 &plan.beta_spec(),
                 autobahn::config::mode_name(plan.mode),
                 status.as_ref(),
                 expand_conflicts,
+                out,
             );
         }
         index = end;
     }
-    Ok(())
 }
 
-/// Prints one destination and the labelled facts about it.
+/// Renders one destination and the labelled facts about it.
 ///
 /// Labelled rather than columnar: a column's width is set by the widest
 /// entry in its block, so blocks with different destinations line their
 /// values up at different offsets and the page reads as jagged. A label
 /// carries its own meaning and needs no alignment to be found.
-fn print_status_entry(
+fn render_status_entry(
     destination: &str,
     mode: &str,
     status: Option<&SessionStatus>,
     expand_conflicts: bool,
+    out: &mut String,
 ) {
+    use std::fmt::Write;
     // Only the folder is emphasised. Indentation already separates the
     // destinations from it, and bolding both levels leaves neither leading.
-    println!("  {destination}");
+    let _ = writeln!(out, "  {destination}");
     let Some(status) = status else {
-        println!("    status: \x1b[2mnever run\x1b[0m");
-        println!("    mode: {mode}");
+        let _ = writeln!(out, "    status: \x1b[2mnever run\x1b[0m");
+        let _ = writeln!(out, "    mode: {mode}");
         return;
     };
 
@@ -1013,11 +1136,12 @@ fn print_status_entry(
     } else {
         format!("{} cycles", status.cycles)
     };
-    println!(
+    let _ = writeln!(
+        out,
         "    status: {colour}{label}{reset}, {progress}, {}",
         format_age(status.updated_at)
     );
-    println!("    mode: {mode}");
+    let _ = writeln!(out, "    mode: {mode}");
 
     // Conflicts collapse to a count and an example: a session with forty of
     // them is one fact ("this pair disagrees"), not forty.
@@ -1028,25 +1152,33 @@ fn print_status_entry(
     // whichever one they stopped at.
     match (status.conflicts.len(), expand_conflicts) {
         (0, _) => {}
-        (1, _) => println!("    conflicts: 1, {}", status.conflicts[0]),
-        (count, false) => println!("    conflicts: {count}, first {}", status.conflicts[0]),
+        (1, _) => {
+            let _ = writeln!(out, "    conflicts: 1, {}", status.conflicts[0]);
+        }
+        (count, false) => {
+            let _ = writeln!(out, "    conflicts: {count}, first {}", status.conflicts[0]);
+        }
         (count, true) => {
-            println!("    conflicts: {count}");
+            let _ = writeln!(out, "    conflicts: {count}");
             for root in &status.conflicts {
-                println!("      {root}");
+                let _ = writeln!(out, "      {root}");
             }
         }
     }
     match status.problems.len() {
         0 => {}
-        1 => println!("    problems: 1, {}", status.problems[0]),
-        count => println!("    problems: {count}, first {}", status.problems[0]),
+        1 => {
+            let _ = writeln!(out, "    problems: 1, {}", status.problems[0]);
+        }
+        count => {
+            let _ = writeln!(out, "    problems: {count}, first {}", status.problems[0]);
+        }
     }
     if let Some(error) = &status.error {
         // The innermost cause is the diagnosis; the wrapping context repeats
         // the destination this block already names.
         let detail = error.rsplit(": ").next().unwrap_or(error);
-        println!("    error: {detail}");
+        let _ = writeln!(out, "    error: {detail}");
     }
 }
 

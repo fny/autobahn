@@ -128,8 +128,26 @@ betas = ["build.example.com"]
 Then run it:
 
 ```sh
-autobahn up                 # run every configured session, forever
+autobahn watch              # every configured session, here, until Ctrl-C
 ```
+
+On a terminal, `watch` is a live `autobahn status` that repaints as
+sessions report; piped to a file it logs one line per event instead.
+To keep syncing when no terminal is:
+
+```sh
+autobahn install            # register a login service, and start it
+autobahn stop               # stop it (it returns at the next login)
+autobahn start
+autobahn restart            # after editing the config, or upgrading
+autobahn uninstall          # stop it, and unregister it
+```
+
+The service is launchd on macOS and a systemd user unit on Linux —
+inspect it with `launchctl` or `systemctl --user` like any other — and
+it logs to `~/.autobahn/service.log`. There is no daemon of autobahn's
+own and nothing backgrounds itself: `start` with no service installed
+says so and points at `install` or `watch`.
 
 That's the whole setup. Both sides watch their filesystems natively
 (inotify/FSEvents), so edits on either end propagate within a fraction of
@@ -139,20 +157,17 @@ key-based SSH auth, and *either* side of a group may be remote — you can
 pull from a build server, or relay between two remote hosts through your
 machine.
 
-Working with a running (or stopped) supervisor:
+Asking a running supervisor things, whether it is `watch` or the service:
 
 ```sh
-autobahn up --once         # one pass over everything, then exit
 autobahn status            # what every session last did
 autobahn status project    # ...filtered to one group
 autobahn status .          # ...to whatever syncs the working directory
 autobahn status ~/project  # ...or any folder inside a synchronized root
 autobahn status --conflicts   # list every conflicting path, not a count
 
-# Poke a running supervisor:
+autobahn sync              # one pass over every session, then exit
 autobahn flush             # sync everything right now
-autobahn pause project     # suspend a group (drops its connections)
-autobahn resume project
 autobahn reset project     # forget the baseline; next cycle merges both
                            # sides additively (resurrects deletions)
 autobahn verify project    # next cycle re-reads every byte, catching
@@ -161,6 +176,10 @@ autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
 ```
 
+`scripts/mi` runs a guided tour of all of this against throwaway
+directories — every command, and every state a session can report,
+printed as the binary actually produces them.
+
 Removing a group from the config stops its sessions but keeps their
 state, so that adding the group back later resumes from memory rather
 than re-merging two drifted trees. `clean` is how that state is
@@ -168,10 +187,6 @@ eventually let go: it removes ancestors, status records, staged content,
 and endpoint locks for any session the config no longer describes.
 Anything a running session holds is skipped, and the files in the
 synchronized trees are never touched.
-
-`scripts/mi` runs a guided tour of all of this against throwaway
-directories — every command, and every state a session can report,
-printed as the binary actually produces them.
 
 Each (alpha, beta) pair becomes its own session, and sessions are
 independent: a host being down just means its session retries with backoff
@@ -326,7 +341,7 @@ autobahn sync ~/project /mnt/backup/project
 # Local ↔ remote over SSH:
 autobahn sync ~/project user@host:/srv/project
 
-# Keep watching, like a one-group supervisor:
+# Keep watching, like a one-group `watch`:
 autobahn sync ~/project user@host:/srv/project --watch
 
 # Mirror exactly, ignoring build artifacts:

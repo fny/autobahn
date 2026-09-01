@@ -286,7 +286,7 @@ pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlRespon
     let path = socket_path(state_root);
     let stream = UnixStream::connect(&path).with_context(|| {
         format!(
-            "unable to reach a running supervisor at {} (is `autobahn up` running?)",
+            "unable to reach a running supervisor at {} (is `autobahn watch` running?)",
             path.display()
         )
     })?;

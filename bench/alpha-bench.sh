@@ -63,7 +63,7 @@ for width in $WIDTHS; do
     printf ']\n'
   } > "$WORK/ab.toml"
 
-  setsid "$AB" up --config "$WORK/ab.toml" --state-root "$WORK/state" \
+  setsid "$AB" watch --config "$WORK/ab.toml" --state-root "$WORK/state" \
     > "$WORK/ab-$width.log" 2>&1 &
   sleep "$SETTLE"
 

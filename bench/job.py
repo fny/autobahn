@@ -68,7 +68,7 @@ TOOLS = {
     # single pattern is one wrong guess away from silently sampling
     # nothing at all.
     "autobahn": {
-        "local_pattern": f"{HOME}/autobahn up,autobahn up",
+        "local_pattern": f"{HOME}/autobahn watch,autobahn watch",
         "remote_pattern": ".autobahn/bin/autobahn-,autobahn-linux",
         "local_comms": ["autobahn"],
         "remote_comms": ["autobahn-.*"],
@@ -558,7 +558,7 @@ def start_tool(tool, corpora):
         # used to leave nothing to diagnose: chromium-1-bidir collapsed on
         # one repeat in four, and by the time it was noticed the next job
         # on that pair had overwritten the only log that could explain it.
-        run(f"setsid nohup {HOME}/autobahn up --config {HOME}/ab.toml "
+        run(f"setsid nohup {HOME}/autobahn watch --config {HOME}/ab.toml "
             f"> {HOME}/logs/{job_label()}-autobahn.log 2>&1 < /dev/null &")
     elif tool == "mutagen":
         run(f"{HOME}/mutagen daemon start", check=True)

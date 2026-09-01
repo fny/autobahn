@@ -659,7 +659,9 @@ impl Config {
             ));
         }
         for (index, (identity, writes, owner)) in endpoints.iter().enumerate() {
-            for (other_identity, other_writes, other_owner) in endpoints.iter().skip(index + 1) {
+            for (offset, (other_identity, other_writes, other_owner)) in
+                endpoints.iter().enumerate().skip(index + 1)
+            {
                 if owner == other_owner {
                     continue; // within-session overlap is checked above
                 }
@@ -681,16 +683,46 @@ impl Config {
                         .strip_prefix(outer)
                         .is_some_and(|rest| rest.starts_with('/'))
                 };
-                let nested =
-                    contains(identity, other_identity) || contains(other_identity, identity);
-                if nested && (*writes || *other_writes) {
-                    errors.push(format!(
-                        "sessions '{owner}' and '{other_owner}': endpoint {other_identity} \
-                         is nested inside {identity} and at least one of them is written; \
-                         two sessions cannot safely write one tree region from independent \
-                         ancestors"
-                    ));
+                // Which one contains which decides both the message and,
+                // below, whose ignore patterns are consulted.
+                let (outer, inner, outer_index) = if contains(identity, other_identity) {
+                    (identity, other_identity, index)
+                } else if contains(other_identity, identity) {
+                    (other_identity, identity, offset)
+                } else {
+                    continue;
+                };
+                if !*writes && !*other_writes {
+                    continue; // two read-only sources cannot disagree
                 }
+                // A nested endpoint the outer session *ignores* is not
+                // shared with it at all: the outer never scans, never
+                // writes, and never records a thing beneath that path. The
+                // check compares roots, so without consulting the ignores
+                // it refuses configurations that do not actually overlap —
+                // "synchronize this project, and ship its build output
+                // somewhere else" being the ordinary one.
+                // Endpoints are pushed two per plan, alpha then beta, so an
+                // endpoint at index i belongs to plan i / 2.
+                let outer_plan = &plans[outer_index / 2];
+                let excluded = std::path::Path::new(inner)
+                    .strip_prefix(outer)
+                    .ok()
+                    .and_then(|relative| relative.to_str())
+                    .is_some_and(|relative| {
+                        IgnoreSet::new(&outer_plan.ignores)
+                            .is_ok_and(|ignores| ignores.ignored(relative, true))
+                    });
+                if excluded {
+                    continue;
+                }
+                errors.push(format!(
+                    "sessions '{owner}' and '{other_owner}': endpoint {inner} is nested \
+                     inside {outer} and at least one of them is written; two sessions \
+                     cannot safely write one tree region from independent ancestors. \
+                     Add it to the outer group's `ignores` if the outer session should \
+                     leave that subtree alone"
+                ));
             }
         }
 
@@ -1256,6 +1288,55 @@ mod tests {
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);
+    }
+
+    /// A nested endpoint the outer session ignores is not shared with it:
+    /// the outer never scans, writes, or records anything beneath that
+    /// path, so the two sessions do not actually overlap. Refusing these
+    /// made "synchronize this project, and ship its build output
+    /// elsewhere" impossible to express at all.
+    #[test]
+    fn an_ignored_nested_endpoint_is_not_an_overlap() {
+        let config = parse(
+            r#"
+            [groups.project]
+            alpha = "/srv/project"
+            mode = "two-way-safe"
+            ignores = ["dist"]
+            betas = ["/backup/project"]
+
+            [groups.dist]
+            alpha = "/srv/project/dist"
+            mode = "one-way-replica"
+            betas = ["/web/dist"]
+            "#,
+        );
+        let plans = config
+            .plans()
+            .expect("the ignored nesting is not an overlap");
+        assert_eq!(plans.len(), 2);
+
+        // Without the ignore the same pair is refused, and the message
+        // names the containment in the right direction and the remedy.
+        let config = parse(
+            r#"
+            [groups.project]
+            alpha = "/srv/project"
+            mode = "two-way-safe"
+            betas = ["/backup/project"]
+
+            [groups.dist]
+            alpha = "/srv/project/dist"
+            mode = "one-way-replica"
+            betas = ["/web/dist"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(
+            error.contains("/srv/project/dist is nested inside /srv/project"),
+            "{error}"
+        );
+        assert!(error.contains("ignores"), "{error}");
     }
 
     #[test]

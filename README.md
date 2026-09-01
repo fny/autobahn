@@ -65,6 +65,9 @@ chooses where the command goes, `--no-agents` skips the bundle, and
 script needs the GitHub CLI: private release assets are not served over
 plain download URLs.)
 
+`AUTOBAHN_PREFIX` and `AUTOBAHN_HOME` set the same two destinations
+from the environment, for a non-interactive install.
+
 To do it by hand instead, grab a binary from [Releases](../../releases):
 each release ships
 `autobahn-<os>-<arch>` binaries (Linux binaries are static — they run on

@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# Installs bahn — the autobahn command — and the agent bundle it uses to
-# bootstrap remote hosts.
+# Installs autobahn and the agent bundle it uses to bootstrap remote
+# hosts.
 #
 #   curl -fsSL https://raw.githubusercontent.com/fny/autobahn/master/scripts/install.sh | sh
 #
@@ -19,8 +19,8 @@
 set -eu
 
 REPO="fny/autobahn"
-PREFIX="${BAHN_PREFIX:-$HOME/.local/bin}"
-STATE_HOME="${BAHN_HOME:-$HOME/.autobahn}"
+PREFIX="${AUTOBAHN_PREFIX:-$HOME/.local/bin}"
+STATE_HOME="${AUTOBAHN_HOME:-$HOME/.autobahn}"
 VERSION="latest"
 WITH_AGENTS=1
 
@@ -29,7 +29,7 @@ usage() {
 Usage: install.sh [options]
 
   --prefix DIR    Install the command here (default: ~/.local/bin,
-                  or $BAHN_PREFIX)
+                  or $AUTOBAHN_PREFIX)
   --version TAG   Install this release rather than the latest one
   --no-agents     Skip the agent bundle. Only safe when every host you
                   synchronize with shares this machine's platform; the
@@ -115,19 +115,9 @@ fi
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT INT TERM
 
-say "Installing bahn ($VERSION) for $PLATFORM"
+say "Installing autobahn ($VERSION) for $PLATFORM"
 
-# Releases published before the command was renamed carry the old asset
-# names; try the current ones first and fall back, so this script works
-# across the rename in both directions.
-NAME=""
-for candidate in bahn autobahn; do
-    if fetch "$candidate-$PLATFORM" "$WORK/bahn" 2>/dev/null; then
-        NAME="$candidate"
-        break
-    fi
-done
-if [ -z "$NAME" ]; then
+if ! fetch "autobahn-$PLATFORM" "$WORK/autobahn" 2>/dev/null; then
     if have gh; then
         die "unable to download the $PLATFORM build for $REPO ($VERSION).
 Check that the release exists and that 'gh auth status' succeeds."
@@ -142,12 +132,12 @@ fi
 # fetched separately and the binary is compared against its entry. If the
 # release publishes no checksums, say so rather than pretending.
 if fetch "SHA256SUMS" "$WORK/SHA256SUMS" 2>/dev/null; then
-    expected="$(grep " \{1,2\}$NAME-$PLATFORM\$" "$WORK/SHA256SUMS" | cut -d' ' -f1 || true)"
+    expected="$(grep " \{1,2\}autobahn-$PLATFORM\$" "$WORK/SHA256SUMS" | cut -d' ' -f1 || true)"
     if [ -z "$expected" ]; then
-        die "SHA256SUMS has no entry for $NAME-$PLATFORM"
+        die "SHA256SUMS has no entry for autobahn-$PLATFORM"
     fi
-    actual="$(checksum "$WORK/bahn")"
-    [ "$expected" = "$actual" ] || die "checksum mismatch for $NAME-$PLATFORM
+    actual="$(checksum "$WORK/autobahn")"
+    [ "$expected" = "$actual" ] || die "checksum mismatch for autobahn-$PLATFORM
   expected $expected
   actual   $actual
 Refusing to install. Retry, or report this."
@@ -158,16 +148,16 @@ fi
 
 # ── the command ─────────────────────────────────────────────────────
 mkdir -p "$PREFIX"
-chmod 755 "$WORK/bahn"
+chmod 755 "$WORK/autobahn"
 # Written to a temporary alongside the target and renamed, so a running
-# bahn is never a half-written file.
-mv "$WORK/bahn" "$PREFIX/.bahn.install.$$"
-mv "$PREFIX/.bahn.install.$$" "$PREFIX/bahn"
-say "  installed $PREFIX/bahn"
+# autobahn is never a half-written file.
+mv "$WORK/autobahn" "$PREFIX/.autobahn.install.$$"
+mv "$PREFIX/.autobahn.install.$$" "$PREFIX/autobahn"
+say "  installed $PREFIX/autobahn"
 
 # ── the agents ──────────────────────────────────────────────────────
 if [ "$WITH_AGENTS" -eq 1 ]; then
-    if fetch "$NAME-agents.tar.gz" "$WORK/agents.tar.gz" 2>/dev/null; then
+    if fetch "autobahn-agents.tar.gz" "$WORK/agents.tar.gz" 2>/dev/null; then
         mkdir -p "$STATE_HOME"
         # The archive carries a top-level agents/ directory, so this lands
         # at $STATE_HOME/agents. Extracted to a temporary first and swapped
@@ -205,8 +195,8 @@ esac
 say ""
 say "Done. Next:"
 say ""
-say "    bahn sync ~/project user@host:/srv/project     # try a pairing"
-say "    bahn --help                                    # everything else"
+say "    autobahn sync ~/project user@host:/srv/project     # try a pairing"
+say "    autobahn --help                                    # everything else"
 say ""
 say "For continuous synchronization, describe your groups in"
-say "$STATE_HOME/config.toml and run 'bahn up'."
+say "$STATE_HOME/config.toml and run 'autobahn up'."

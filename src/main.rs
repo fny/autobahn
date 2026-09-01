@@ -670,52 +670,30 @@ fn run_status(
         // and reset take as an argument; the mode last, because it belongs
         // to the group rather than to any one destination.
         println!(
-            "\x1b[1m{}\x1b[0m  \x1b[2m{} · {}\x1b[0m",
+            "\x1b[1m{}\x1b[0m \x1b[2m{} · {}\x1b[0m",
             plan.alpha_spec,
             plan.group,
             autobahn::config::mode_name(plan.mode)
         );
 
-        let destination = |plan: &autobahn::config::SessionPlan| -> String { plan.beta_spec() };
-        let width = block
-            .iter()
-            .map(|(plan, _)| destination(plan).chars().count())
-            .max()
-            .unwrap_or(0);
-        // The cycle count is right-aligned on its digits so the counts stack,
-        // while the word after it starts at a fixed column.
-        let digits = block
-            .iter()
-            .map(|(_, status)| match status {
-                Some(status) => status.cycles.to_string().chars().count(),
-                None => 0,
-            })
-            .max()
-            .unwrap_or(1)
-            .max(1);
         for (plan, status) in block {
-            print_status_entry(&destination(plan), width, digits, status.as_ref());
+            print_status_entry(&plan.beta_spec(), status.as_ref());
         }
         index = end;
     }
     Ok(())
 }
 
-/// Prints one destination's line, and any detail it owes beneath it.
+/// Prints one destination and the labelled facts about it.
 ///
-/// A healthy destination costs exactly one line; only a destination with
-/// something to report costs more, and every such line is indented under
-/// the destination it belongs to — never left to float at the end of a
-/// block, where it would appear to belong to whichever destination
-/// happened to be printed last.
-fn print_status_entry(
-    destination: &str,
-    width: usize,
-    digits: usize,
-    status: Option<&SessionStatus>,
-) {
+/// Labelled rather than columnar: a column's width is set by the widest
+/// entry in its block, so blocks with different destinations line their
+/// values up at different offsets and the page reads as jagged. A label
+/// carries its own meaning and needs no alignment to be found.
+fn print_status_entry(destination: &str, status: Option<&SessionStatus>) {
+    println!("  \x1b[1m{destination}\x1b[0m");
     let Some(status) = status else {
-        println!("  {destination:width$}   \x1b[2mnever run\x1b[0m");
+        println!("    status: \x1b[2mnever run\x1b[0m");
         return;
     };
 
@@ -732,30 +710,15 @@ fn print_status_entry(
         other => (other, "\x1b[33m"),
     };
     let reset = if colour.is_empty() { "" } else { "\x1b[0m" };
-    let state = format!("{colour}{label}{reset}");
-    // Padding is computed on the label rather than the coloured string,
-    // whose escape sequences occupy no columns.
-    let padding = " ".repeat(12usize.saturating_sub(label.chars().count()));
-
-    // The count is right-aligned on its digits so the numbers stack, and the
-    // word after it starts at a fixed column. A session that has never
-    // completed a cycle says so in words, occupying the same field.
-    let field = digits + 7;
-    let cycles = if status.cycles == 0 {
-        format!("{:<field$}", "never run")
+    let progress = if status.cycles == 0 {
+        "never run".to_owned()
+    } else if status.cycles == 1 {
+        "1 cycle".to_owned()
     } else {
-        format!(
-            "{:>digits$} {:<6}",
-            status.cycles,
-            if status.cycles == 1 {
-                "cycle"
-            } else {
-                "cycles"
-            }
-        )
+        format!("{} cycles", status.cycles)
     };
     println!(
-        "  {destination:width$}   {state}{padding} {cycles}   {:>7}",
+        "    status: {colour}{label}{reset}, {progress}, {}",
         format_age(status.updated_at)
     );
 
@@ -763,25 +726,25 @@ fn print_status_entry(
     // them is one fact ("this pair disagrees"), not forty.
     match status.conflicts.len() {
         0 => {}
-        1 => println!("      \x1b[33m1 conflict, {}\x1b[0m", status.conflicts[0]),
+        1 => println!("    conflicts: \x1b[33m1, {}\x1b[0m", status.conflicts[0]),
         count => println!(
-            "      \x1b[33m{count} conflicts, first {}\x1b[0m",
+            "    conflicts: \x1b[33m{count}, first {}\x1b[0m",
             status.conflicts[0]
         ),
     }
     match status.problems.len() {
         0 => {}
-        1 => println!("      \x1b[33m1 problem, {}\x1b[0m", status.problems[0]),
+        1 => println!("    problems: \x1b[33m1, {}\x1b[0m", status.problems[0]),
         count => println!(
-            "      \x1b[33m{count} problems, first {}\x1b[0m",
+            "    problems: \x1b[33m{count}, first {}\x1b[0m",
             status.problems[0]
         ),
     }
     if let Some(error) = &status.error {
         // The innermost cause is the diagnosis; the wrapping context repeats
-        // the destination this line already names.
+        // the destination this block already names.
         let detail = error.rsplit(": ").next().unwrap_or(error);
-        println!("      \x1b[31m{detail}\x1b[0m");
+        println!("    error: \x1b[31m{detail}\x1b[0m");
     }
 }
 

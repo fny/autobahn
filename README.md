@@ -53,7 +53,20 @@ Enter [Mutagen](https://github.com/mutagen-io/mutagen) which promised snappy fil
 
 ## Installing
 
-Grab a binary from [Releases](../../releases): each release ships
+```sh
+curl -fsSL https://raw.githubusercontent.com/fny/autobahn/master/scripts/install.sh | sh
+```
+
+That installs the command onto your `PATH` and the agent bundle into
+`~/.autobahn/agents`, which is where the controller looks when it needs
+to bootstrap a host whose platform differs from your own. `--prefix`
+chooses where the command goes, `--no-agents` skips the bundle, and
+`--version` pins a release. (While this repository is private, the
+script needs the GitHub CLI: private release assets are not served over
+plain download URLs.)
+
+To do it by hand instead, grab a binary from [Releases](../../releases):
+each release ships
 `autobahn-<os>-<arch>` binaries (Linux binaries are static — they run on
 any distribution), an `autobahn-agents.tar.gz` bundle, and `SHA256SUMS`.
 
@@ -65,12 +78,17 @@ install -m 755 autobahn-linux-x86_64 ~/.local/bin/autobahn
 If the machines you sync with share your platform, that's everything: the
 running binary doubles as the agent it installs remotely. If your fleet
 spans platforms (say, a Mac syncing to Linux servers), also unpack the
-agents bundle next to the binary — autobahn picks the right agent for each
-host automatically:
+agents bundle, and autobahn picks the right agent for each host
+automatically:
 
 ```sh
-tar xzf autobahn-agents.tar.gz -C ~/.local/bin   # creates ~/.local/bin/agents/
+mkdir -p ~/.autobahn
+tar xzf autobahn-agents.tar.gz -C ~/.autobahn    # creates ~/.autobahn/agents/
 ```
+
+The bundle is looked for in `AUTOBAHN_AGENTS_DIR`, then
+`~/.autobahn/agents`, then an `agents` directory beside the binary — so
+a bundle that travels with a relocatable binary keeps working.
 
 Or build from source with `cargo build --release` (Rust stable, Unix only).
 

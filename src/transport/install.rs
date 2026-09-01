@@ -11,10 +11,11 @@
 //!
 //! The binary to install is located by probing the remote platform
 //! (`uname -sm`) and searching, in order: the `AUTOBAHN_AGENTS_DIR`
-//! environment variable, an `agents` directory beside the running
-//! executable, and — when the remote platform matches the local one — the
-//! running executable itself (the common single-platform-fleet case, which
-//! needs no bundle at all).
+//! environment variable, `~/.autobahn/agents` (where the installer places
+//! the bundle), an `agents` directory beside the running executable, and —
+//! when the remote platform matches the local one — the running executable
+//! itself (the common single-platform-fleet case, which needs no bundle at
+//! all).
 
 use std::fs;
 use std::io::Write;
@@ -38,8 +39,9 @@ pub fn ensure_agent(destination: &str) -> Result<()> {
     let platform = probe_platform(destination)?;
     let binary = locate_agent_binary(&platform).ok_or_else(|| {
         anyhow!(
-            "no agent binary for {platform} is available (set AUTOBAHN_AGENTS_DIR or place an \
-             `agents/autobahn-{platform}` directory beside the executable)"
+            "no agent binary for {platform} is available (install the agent bundle into \
+             ~/.autobahn/agents, set AUTOBAHN_AGENTS_DIR, or place an `agents` directory \
+             containing autobahn-{platform} beside the executable)"
         )
     })?;
     upload_agent(destination, &binary)
@@ -82,13 +84,23 @@ fn local_platform() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-/// Locates the agent binary for a platform: the bundle directory named by
-/// `AUTOBAHN_AGENTS_DIR`, an `agents` directory beside the executable, or —
-/// for the local platform — the running executable itself.
+/// Locates the agent binary for a platform, searching in order: the bundle
+/// directory named by `AUTOBAHN_AGENTS_DIR`, the `agents` directory in the
+/// state root (where the installer puts it, and where everything else
+/// autobahn owns already lives), an `agents` directory beside the
+/// executable (which keeps a bundle travelling with a relocatable binary),
+/// and — for the local platform — the running executable itself, since it
+/// *is* an agent for its own platform.
 fn locate_agent_binary(platform: &str) -> Option<PathBuf> {
     let name = format!("autobahn-{platform}");
     if let Ok(directory) = std::env::var("AUTOBAHN_AGENTS_DIR") {
         let candidate = PathBuf::from(directory).join(&name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    if let Ok(state_root) = crate::paths::default_state_root() {
+        let candidate = state_root.join("agents").join(&name);
         if candidate.is_file() {
             return Some(candidate);
         }
@@ -169,6 +181,32 @@ fn ssh_command(destination: &str, script: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The installer places the bundle in the state root, so that is where
+    /// a bundle must be found — the alternative is an installer whose work
+    /// the controller ignores.
+    #[test]
+    fn a_bundle_in_the_state_root_is_found() {
+        // HOME is process-global, so this test owns it for its duration and
+        // restores it, rather than running beside another that reads it.
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let agents = keep.path().join(".autobahn").join("agents");
+        std::fs::create_dir_all(&agents).expect("directories");
+        // A platform this machine certainly is not, so the local-executable
+        // fallback cannot satisfy the lookup and mask the failure.
+        let planted = agents.join("autobahn-linux-mips64");
+        std::fs::write(&planted, b"an agent").expect("writes");
+
+        let previous = std::env::var("HOME").ok();
+        std::env::set_var("HOME", keep.path());
+        let found = locate_agent_binary("linux-mips64");
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        assert_eq!(found.as_deref(), Some(planted.as_path()));
+    }
 
     #[test]
     fn platform_names_normalize_uname_variants() {

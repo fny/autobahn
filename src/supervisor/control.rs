@@ -126,6 +126,17 @@ impl Registry {
     }
 }
 
+/// Whether a supervisor is listening for control requests on this state
+/// root.
+///
+/// Connecting is the only honest test. The socket *file* outlives the
+/// process that made it — a supervisor killed with SIGKILL leaves one
+/// behind — so its presence proves nothing, while a refused connection
+/// proves nobody is listening.
+pub fn supervisor_is_running(state_root: &Path) -> bool {
+    UnixStream::connect(socket_path(state_root)).is_ok()
+}
+
 /// Returns the control socket path for a state root.
 ///
 /// Unix socket paths are limited to roughly 108 bytes (`sockaddr_un`), so a

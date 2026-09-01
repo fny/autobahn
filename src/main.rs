@@ -649,6 +649,18 @@ fn run_status(
         rows.push((plan, status));
     }
 
+    // Everything below is *recorded* state, read from disk. Without saying
+    // whether a supervisor is running, a session whose supervisor exited an
+    // hour ago still reads as "synchronized" — the command's most
+    // misleading possible output, since nothing is synchronizing at all.
+    if !autobahn::supervisor::control::supervisor_is_running(&state_root) {
+        println!(
+            "\x1b[33mno supervisor is running\x1b[0m; what follows is the state \
+             last recorded, not what is happening now"
+        );
+        println!();
+    }
+
     let mut current_group: Option<&str> = None;
     let mut index = 0;
     while index < rows.len() {
@@ -670,14 +682,16 @@ fn run_status(
         // and reset take as an argument; the mode last, because it belongs
         // to the group rather than to any one destination.
         println!(
-            "\x1b[1m{}\x1b[0m \x1b[2m{} · {}\x1b[0m",
-            plan.alpha_spec,
-            plan.group,
-            autobahn::config::mode_name(plan.mode)
+            "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
+            plan.alpha_spec, plan.group
         );
 
         for (plan, status) in block {
-            print_status_entry(&plan.beta_spec(), status.as_ref());
+            print_status_entry(
+                &plan.beta_spec(),
+                autobahn::config::mode_name(plan.mode),
+                status.as_ref(),
+            );
         }
         index = end;
     }
@@ -690,10 +704,13 @@ fn run_status(
 /// entry in its block, so blocks with different destinations line their
 /// values up at different offsets and the page reads as jagged. A label
 /// carries its own meaning and needs no alignment to be found.
-fn print_status_entry(destination: &str, status: Option<&SessionStatus>) {
-    println!("  \x1b[1m{destination}\x1b[0m");
+fn print_status_entry(destination: &str, mode: &str, status: Option<&SessionStatus>) {
+    // Only the folder is emphasised. Indentation already separates the
+    // destinations from it, and bolding both levels leaves neither leading.
+    println!("  {destination}");
     let Some(status) = status else {
         println!("    status: \x1b[2mnever run\x1b[0m");
+        println!("    mode: {mode}");
         return;
     };
 
@@ -721,6 +738,7 @@ fn print_status_entry(destination: &str, status: Option<&SessionStatus>) {
         "    status: {colour}{label}{reset}, {progress}, {}",
         format_age(status.updated_at)
     );
+    println!("    mode: {mode}");
 
     // Conflicts collapse to a count and an example: a session with forty of
     // them is one fact ("this pair disagrees"), not forty.

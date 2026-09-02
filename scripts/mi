@@ -85,7 +85,7 @@ chapter "the configuration" \
 cat > "$CONFIG" <<TOML
 [groups.demo]
 alpha = "$WORK/alpha"
-mode = "two-way-safe"
+mode = "two-way-conflict"
 interval = 2
 betas = ["$WORK/beta"]
 TOML

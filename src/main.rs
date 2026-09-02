@@ -40,13 +40,21 @@ struct Cli {
 /// The synchronization mode, as expressed on the command line.
 #[derive(Clone, Copy, ValueEnum)]
 enum ModeArgument {
-    /// Bidirectional; conflicts are reported, not resolved.
+    /// Both directions; a file changed on both sides is a conflict,
+    /// reported and left alone.
+    #[value(name = "two-way-conflict", alias = "two-way-safe")]
     TwoWaySafe,
-    /// Bidirectional; conflicts resolve in alpha's favor.
+    /// Both directions; a file changed on both sides takes alpha's
+    /// version, silently.
+    #[value(name = "two-way-alpha", alias = "two-way-resolved")]
     TwoWayResolved,
-    /// Alpha to beta; beta-side changes are preserved.
+    /// Alpha to beta; a change beta made itself is kept and reported as a
+    /// conflict.
+    #[value(name = "one-way-conflict", alias = "one-way-safe")]
     OneWaySafe,
-    /// Alpha to beta; beta exactly mirrors alpha.
+    /// Alpha to beta; beta becomes an exact copy, its own changes
+    /// discarded.
+    #[value(name = "one-way-alpha", aliases = ["one-way-replica", "mirror"])]
     OneWayReplica,
 }
 
@@ -105,7 +113,7 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
         /// The synchronization mode.
-        #[arg(long, value_enum, default_value = "two-way-safe")]
+        #[arg(long, value_enum, default_value = "two-way-conflict")]
         mode: ModeArgument,
         /// Ignore patterns (gitignore-style; repeatable).
         #[arg(long = "ignore")]

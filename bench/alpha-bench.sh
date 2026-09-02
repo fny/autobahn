@@ -52,7 +52,7 @@ for width in $WIDTHS; do
   {
     echo "[groups.fan]"
     echo "alpha = \"$WORK/src\""
-    echo 'mode = "two-way-safe"'
+    echo 'mode = "two-way-conflict"'
     echo "interval = 5"
     printf 'betas = ['
     for b in $(seq 1 "$width"); do

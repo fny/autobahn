@@ -545,7 +545,7 @@ def start_tool(tool, corpora):
             lines += [
                 f"[groups.{corpus}]",
                 f'alpha = "{CORPUS}/{corpus}"',
-                'mode = "two-way-safe"',
+                'mode = "two-way-conflict"',
                 "interval = 5",
                 'ignores = ["/.git", "/out"]',
                 "betas = [" + ", ".join(
@@ -568,7 +568,7 @@ def start_tool(tool, corpora):
             # expands to internally, so the comparison stays fair.
             for index, host in enumerate(destinations()):
                 name = corpus if len(destinations()) == 1 else f"{corpus}-{index}"
-                run(f"{HOME}/mutagen sync create --name={name} --sync-mode=two-way-safe "
+                run(f"{HOME}/mutagen sync create --name={name} --sync-mode=two-way-conflict "
                     f"--ignore=/.git --ignore=/out --watch-polling-interval=5 "
                     f"{CORPUS}/{corpus} {host}:{DEST}/{corpus}", check=True)
     elif tool == "toysync":

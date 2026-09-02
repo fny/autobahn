@@ -105,7 +105,7 @@ destinations (the *betas*):
 # ~/.autobahn/config.toml
 
 [defaults]                  # inherited by every group; any key can be
-mode = "two-way-safe"       # overridden per group
+mode = "two-way-conflict"       # overridden per group
 ignores = [".git"]
 interval = 5                # heartbeat seconds between cycles
 
@@ -121,7 +121,7 @@ ignores = ["target"]        # appended to the defaults' ignores
 
 [groups.dotfiles]
 alpha = "~/.config/shell"
-mode = "one-way-replica"
+mode = "one-way-alpha"
 betas = ["build.example.com"]
 ```
 
@@ -221,18 +221,28 @@ a local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
 
 ### Which mode do I want?
 
-| Mode | Behavior | Reach for it when… |
+A mode is a direction and a policy. The direction is whether changes
+flow both ways or only from alpha to beta. The policy is what happens
+when the two sides disagree about a file: it is reported as a
+**conflict** and left alone, or **alpha** wins.
+
+| | conflict | alpha wins |
 |---|---|---|
-| `two-way-safe` (default) | Changes flow both ways; conflicts are reported and left alone. | You edit on both sides and want nothing lost, ever. |
-| `two-way-resolved` | Both ways; conflicts resolve in alpha's favor. | You edit on both sides but alpha is the truth when they collide. |
-| `one-way-safe` | Alpha → beta only; beta's own changes are never overwritten. | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
-| `one-way-replica` | Beta is an exact mirror of alpha. | Backups, artifact distribution — beta should be *identical*. |
+| **two-way** | `two-way-conflict` (default) | `two-way-alpha` |
+| **one-way** | `one-way-conflict` | `one-way-alpha` |
+
+| Mode | Reach for it when… |
+|---|---|
+| `two-way-conflict` | You edit on both sides and want nothing lost, ever. |
+| `two-way-alpha` | You edit on both sides but alpha is the truth when they collide. |
+| `one-way-conflict` | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
+| `one-way-alpha` | Backups, artifact distribution — beta should be *identical*. Also spelled `mirror`. |
 
 The modes differ only in six situations. Everything else — an
 unchanged file, a new file on alpha, a rename — behaves identically in
 all four. This is what each mode actually does, case by case:
 
-| | `two-way-safe` | `two-way-resolved` | `one-way-safe` | `one-way-replica` |
+| | `two-way-conflict` | `two-way-alpha` | `one-way-conflict` | `one-way-alpha` |
 |---|---|---|---|---|
 | Alpha edits a file | → beta | → beta | → beta | → beta |
 | Beta edits a file | → alpha | → alpha | stays on beta, **reported as a conflict** | **overwritten** from alpha |
@@ -243,14 +253,14 @@ all four. This is what each mode actually does, case by case:
 
 Three things in that table surprise people:
 
-**`one-way-safe` is not "ignore beta".** It refuses to overwrite
+**`one-way-conflict` is not "ignore beta".** It refuses to overwrite
 anything beta changed, and *tells you* — a file edited on beta is
 reported as a conflict every cycle until you resolve it. That is the
 mode's whole point: alpha pushes outward, but never destroys work that
 appeared on the far side. If you want beta's edits silently discarded,
-you want `one-way-replica`.
+you want `one-way-alpha`.
 
-**`one-way-replica` deletes files it has never seen.** Beta is made
+**`one-way-alpha` deletes files it has never seen.** Beta is made
 *identical* to alpha, so logs, caches, and anything else generated on
 beta are removed. Never point it at a directory the far side also
 writes to.
@@ -260,13 +270,17 @@ deleting on alpha deletes on beta. What varies is only the reverse
 direction. (A deletion large enough to look like a vanished disk halts
 the session instead; see the safety rules.)
 
+The earlier spellings — `two-way-safe`, `two-way-resolved`,
+`one-way-safe`, `one-way-replica` — are still accepted, so existing
+configurations keep working.
+
 #### Modes and fan-out
 
 When one alpha fans out to several betas, each destination is its own
 session, and the mode decides what happens when two betas change the
-same file at once. Under `two-way-safe`, whichever lands first reaches
+same file at once. Under `two-way-conflict`, whichever lands first reaches
 alpha and the other session reports a conflict — both edits survive,
-one needs a human. Under `two-way-resolved`, the second edit
+one needs a human. Under `two-way-alpha`, the second edit
 overwrites the first everywhere, silently, because "alpha wins" and
 alpha is now whatever arrived most recently. Neither is wrong, but the
 second only suits a fan-out you push *from* rather than edit at both
@@ -310,13 +324,13 @@ build output somewhere else:
 ```toml
 [groups.project]
 alpha = "~/project"
-mode = "two-way-safe"
+mode = "two-way-conflict"
 ignores = ["dist"]          # the outer session leaves it alone
 betas = ["build.example.com"]
 
 [groups.dist]
 alpha = "~/project/dist"    # nested, but excluded above
-mode = "one-way-replica"
+mode = "one-way-alpha"
 betas = ["web.example.com:/srv/www"]
 ```
 
@@ -346,7 +360,7 @@ autobahn sync ~/project user@host:/srv/project --watch
 
 # Mirror exactly, ignoring build artifacts:
 autobahn sync ~/project host:/srv/project \
-    --watch --mode one-way-replica --ignore target --ignore '*.log'
+    --watch --mode one-way-alpha --ignore target --ignore '*.log'
 ```
 
 One-shots share session state with the supervisor (same roots → same

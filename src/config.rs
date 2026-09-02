@@ -814,14 +814,21 @@ pub fn parse_size(spec: &SizeSpec) -> Result<u64, String> {
 
 /// Parses a synchronization mode name.
 pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
+    // The names are a grid: direction, then what happens when the two
+    // sides disagree about a file — it is reported as a conflict, or alpha
+    // wins. The older names (safe, resolved, replica) described the same
+    // four modes without exposing that structure; they stay accepted so
+    // existing configurations keep working.
     match mode {
-        "two-way-safe" => Ok(SyncMode::TwoWaySafe),
-        "two-way-resolved" => Ok(SyncMode::TwoWayResolved),
-        "one-way-safe" => Ok(SyncMode::OneWaySafe),
-        "one-way-replica" => Ok(SyncMode::OneWayReplica),
+        "two-way-conflict" | "two-way-safe" => Ok(SyncMode::TwoWaySafe),
+        "two-way-alpha" | "two-way-resolved" => Ok(SyncMode::TwoWayResolved),
+        "one-way-conflict" | "one-way-safe" => Ok(SyncMode::OneWaySafe),
+        // "mirror" is what everyone calls this shape (rsync --delete), so
+        // it is accepted too.
+        "one-way-alpha" | "one-way-replica" | "mirror" => Ok(SyncMode::OneWayReplica),
         other => Err(format!(
-            "unknown mode '{other}' (expected one of: one-way-replica, one-way-safe, \
-             two-way-resolved, two-way-safe)"
+            "unknown mode '{other}' (expected one of: two-way-conflict, two-way-alpha, \
+             one-way-conflict, one-way-alpha)"
         )),
     }
 }
@@ -829,10 +836,10 @@ pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
 /// Returns the canonical name of a synchronization mode.
 pub fn mode_name(mode: SyncMode) -> &'static str {
     match mode {
-        SyncMode::TwoWaySafe => "two-way-safe",
-        SyncMode::TwoWayResolved => "two-way-resolved",
-        SyncMode::OneWaySafe => "one-way-safe",
-        SyncMode::OneWayReplica => "one-way-replica",
+        SyncMode::TwoWaySafe => "two-way-conflict",
+        SyncMode::TwoWayResolved => "two-way-alpha",
+        SyncMode::OneWaySafe => "one-way-conflict",
+        SyncMode::OneWayReplica => "one-way-alpha",
     }
 }
 
@@ -1621,6 +1628,19 @@ mod tests {
         ] {
             assert_eq!(parse_mode(mode_name(mode)).unwrap(), mode);
         }
+        // The older spellings, and the colloquial one, are still accepted
+        // — existing configurations must not break on a rename.
+        assert_eq!(parse_mode("two-way-safe").unwrap(), SyncMode::TwoWaySafe);
+        assert_eq!(
+            parse_mode("two-way-resolved").unwrap(),
+            SyncMode::TwoWayResolved
+        );
+        assert_eq!(parse_mode("one-way-safe").unwrap(), SyncMode::OneWaySafe);
+        assert_eq!(
+            parse_mode("one-way-replica").unwrap(),
+            SyncMode::OneWayReplica
+        );
+        assert_eq!(parse_mode("mirror").unwrap(), SyncMode::OneWayReplica);
         assert!(parse_mode("bidirectional").is_err());
     }
 }

@@ -200,9 +200,15 @@ the whole run rather than restarted at each step.
 To watch it happen rather than sample it, `autobahn status --live`
 repaints twice a second and shows every phase however brief. It is a
 read-only window onto whatever supervisor is already running — the login
-service, or a `watch` in another terminal — and Ctrl-C leaves it with the
-scrollback intact. (`watch` is the same display, but it also does the
-synchronizing.)
+service, or a `watch` in another terminal. (`watch` is the same display,
+but it also does the synchronizing.)
+
+Both scroll, with the keys a pager has trained everyone to try: arrows
+and `j`/`k` by the line, PgUp/PgDn and space/`b` by the screen, `g`/`G`
+or Home/End for the ends, `q` to leave. A footer says where you are in
+the list. The content keeps refreshing underneath while you move around
+in it, and leaving — by `q` or Ctrl-C — gives the terminal back with the
+scrollback intact.
 
 A session between cycles is described by how its last cycle ended, as
 before; so is a paused one, and one backing off from an error, both of

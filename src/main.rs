@@ -1,10 +1,13 @@
 //! The autobahn command line interface.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+
+mod pager;
 
 use autobahn::config::Config;
 use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
@@ -870,23 +873,37 @@ fn run_watch(
     // the same ones `autobahn status` reads, so the two never disagree.
     let display_plans = plans.clone();
     let display_root = state_root.clone();
+    // A supervisor that fails has nothing left to display, so it asks the
+    // display to leave and hands its failure back here to be reported —
+    // after the terminal has been restored, and by the thread that owns
+    // the exit status.
+    let failure: Arc<Mutex<Option<String>>> = Arc::default();
+    let reported = failure.clone();
     std::thread::spawn(move || {
         let supervisor = Supervisor::new(plans, state_root, false);
         let stop = std::sync::atomic::AtomicBool::new(false);
         if let Err(error) = supervisor.run_watch(&stop) {
-            // Leave the display and say why, since the loop below would
-            // otherwise keep repainting a supervisor that no longer exists.
-            leave_display();
-            eprintln!("autobahn: {error:#}");
-            std::process::exit(1);
+            *reported.lock().unwrap_or_else(|error| error.into_inner()) =
+                Some(format!("{error:#}"));
+            pager::leave();
         }
     });
 
     let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
-    run_live_display(&selected, &display_root, expand_conflicts)
+    run_live_display(&selected, &display_root, expand_conflicts, "watching")?;
+    // Taken into a binding of its own, so the lock is released before the
+    // match rather than held across it.
+    let failure = failure
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .take();
+    match failure {
+        Some(error) => bail!(error),
+        None => Ok(()),
+    }
 }
 
-/// Repaints the status of the selected sessions until interrupted.
+/// Repaints the status of the selected sessions until the reader leaves.
 ///
 /// This is the display half of `watch`, which also supervises; on its own
 /// it is `status --live`, a read-only window onto whatever supervisor is
@@ -897,132 +914,13 @@ fn run_live_display(
     selected: &[&autobahn::config::SessionPlan],
     state_root: &Path,
     expand_conflicts: bool,
+    label: &str,
 ) -> Result<()> {
-    // The display lives on the alternate screen, like a pager: it takes
-    // the terminal over while it runs and gives it back — scrollback and
-    // all — on exit, including an interrupt. Both signals set a flag the
-    // loop checks, so the screen is restored on the loop's own terms
-    // rather than by a handler racing a half-painted frame.
-    static INTERRUPTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    extern "C" fn interrupt(_: libc::c_int) {
-        INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
-    }
-    unsafe {
-        libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, interrupt as libc::sighandler_t);
-    }
-    enter_display();
-
-    let mut previous = String::new();
-    while !INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
+    pager::display(label, || {
         let mut frame = String::new();
         render_status(selected, state_root, expand_conflicts, true, &mut frame);
-        let frame = fit_to_terminal(frame);
-        if frame != previous {
-            use std::io::Write;
-            let mut out = std::io::stdout().lock();
-            let _ = write!(out, "\x1b[H{frame}\x1b[J");
-            let _ = out.flush();
-            previous = frame;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(500));
-    }
-    leave_display();
-    Ok(())
-}
-
-/// Switches to the alternate screen and hides the cursor.
-fn enter_display() {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "\x1b[?1049h\x1b[?25l\x1b[H\x1b[2J");
-    let _ = out.flush();
-}
-
-/// Restores the main screen and the cursor.
-fn leave_display() {
-    use std::io::Write;
-    let mut out = std::io::stdout().lock();
-    let _ = write!(out, "\x1b[?25h\x1b[?1049l");
-    let _ = out.flush();
-}
-
-/// The terminal's size in (rows, columns), when it can be determined.
-fn terminal_size() -> Option<(usize, usize)> {
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut size) } != 0 {
-        return None;
-    }
-    if size.ws_row == 0 || size.ws_col == 0 {
-        return None;
-    }
-    Some((size.ws_row as usize, size.ws_col as usize))
-}
-
-/// Trims a frame to what the terminal can show, so a configuration longer
-/// than the screen does not scroll the top away on every repaint. What is
-/// hidden is counted in the footer rather than silently lost.
-fn fit_to_terminal(frame: String) -> String {
-    let Some((rows, columns)) = terminal_size() else {
-        return frame + "\n\x1b[2mwatching · Ctrl-C to stop\x1b[0m\n";
-    };
-    // A line wider than the terminal wraps and eats a second row; counting
-    // that keeps the footer on screen.
-    let visual_rows = |line: &str| {
-        let width = strip_escapes(line).chars().count();
-        if width == 0 {
-            1
-        } else {
-            width.div_ceil(columns)
-        }
-    };
-    let lines: Vec<&str> = frame.lines().collect();
-    let total: usize = lines.iter().map(|line| visual_rows(line)).sum();
-    let budget = rows.saturating_sub(2); // the footer and a margin
-    let mut out = String::new();
-    if total <= budget {
-        for line in &lines {
-            out.push_str(line);
-            out.push('\n');
-        }
-        out.push_str("\n\x1b[2mwatching · Ctrl-C to stop\x1b[0m\n");
-        return out;
-    }
-    let mut used = 0;
-    let mut shown = 0;
-    for line in &lines {
-        let needed = visual_rows(line);
-        if used + needed > budget.saturating_sub(1) {
-            break;
-        }
-        out.push_str(line);
-        out.push('\n');
-        used += needed;
-        shown += 1;
-    }
-    out.push_str(&format!(
-        "\x1b[2m… {} more lines — enlarge the terminal, or `autobahn status` · Ctrl-C to stop\x1b[0m\n",
-        lines.len() - shown
-    ));
-    out
-}
-
-/// Removes ANSI escape sequences, for measuring visible width.
-fn strip_escapes(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+        frame
+    })
 }
 
 /// What a selector picked out: the sessions, and — when the selector was a
@@ -1814,7 +1712,7 @@ fn run_status(
                  run `autobahn status` on a timer instead"
             );
         }
-        return run_live_display(&selected, &state_root, expand_conflicts);
+        return run_live_display(&selected, &state_root, expand_conflicts, "live");
     }
     if json {
         let report = autobahn::supervisor::status_report(&selected, &state_root);

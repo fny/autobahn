@@ -195,6 +195,11 @@ enum Command {
         /// List every conflicting path rather than a count and an example.
         #[arg(long)]
         conflicts: bool,
+        /// Show what each session is doing even when it is quick about
+        /// it. Ordinarily a phase is reported only once it has run long
+        /// enough to be worth waiting on; `watch` always reports one.
+        #[arg(long)]
+        live: bool,
         /// Print the report as JSON — the same document every user
         /// interface reads.
         #[arg(long)]
@@ -423,8 +428,9 @@ fn main() {
             group,
             host,
             conflicts,
+            live,
             json,
-        } => run_status(config, state_root, group, host, conflicts, json),
+        } => run_status(config, state_root, group, host, conflicts, live, json),
         Command::Flush {
             group,
             host,
@@ -894,7 +900,7 @@ fn run_watch(
     while !INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
         let mut frame = String::new();
         let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
-        render_status(&selected, &display_root, expand_conflicts, &mut frame);
+        render_status(&selected, &display_root, expand_conflicts, true, &mut frame);
         let frame = fit_to_terminal(frame);
         if frame != previous {
             use std::io::Write;
@@ -1767,12 +1773,14 @@ fn format_size(bytes: u64) -> String {
 }
 
 /// Shows the recorded status of the configured sessions.
+#[allow(clippy::too_many_arguments)]
 fn run_status(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
     group: Option<String>,
     host: Option<String>,
     expand_conflicts: bool,
+    live: bool,
     json: bool,
 ) -> Result<()> {
     let plans = load_config(config)?.plans()?;
@@ -1787,7 +1795,7 @@ fn run_status(
     }
 
     let mut out = String::new();
-    render_status(&selected, &state_root, expand_conflicts, &mut out);
+    render_status(&selected, &state_root, expand_conflicts, live, &mut out);
     print!("{out}");
     Ok(())
 }
@@ -1798,6 +1806,7 @@ fn render_status(
     selected: &[&autobahn::config::SessionPlan],
     state_root: &Path,
     expand_conflicts: bool,
+    live: bool,
     out: &mut String,
 ) {
     use std::fmt::Write;
@@ -1806,7 +1815,7 @@ fn render_status(
     // session doing"; the recorded status on disk answers "how did the last
     // cycle end". A session is described by the first when it is working
     // and by the second when it is not.
-    let live = autobahn::supervisor::control::query_progress(state_root);
+    let reported = autobahn::supervisor::control::query_progress(state_root);
     let rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = selected
         .iter()
         .map(|plan| {
@@ -1822,7 +1831,7 @@ fn render_status(
     // hour ago still reads as "synchronized" — the command's most
     // misleading possible output, since nothing is synchronizing at all.
     // The service's state says what to do about it.
-    if live.is_none() {
+    if reported.is_none() {
         let remedy = match autobahn::service::state() {
             Ok(autobahn::service::ServiceState::NotInstalled) => {
                 "run `autobahn watch` here, or `autobahn install` for a login service"
@@ -1868,7 +1877,7 @@ fn render_status(
         );
 
         for (plan, status) in block {
-            let progress = live.as_ref().and_then(|sessions| {
+            let progress = reported.as_ref().and_then(|sessions| {
                 sessions
                     .iter()
                     .find(|session| session.group == plan.group && session.host == plan.host)
@@ -1879,6 +1888,7 @@ fn render_status(
                 autobahn::config::mode_name(plan.mode),
                 status.as_ref(),
                 progress,
+                live,
                 expand_conflicts,
                 out,
             );
@@ -1898,6 +1908,7 @@ fn render_status_entry(
     mode: &str,
     status: Option<&SessionStatus>,
     progress: Option<&ProgressSnapshot>,
+    live: bool,
     expand_conflicts: bool,
     out: &mut String,
 ) {
@@ -1906,11 +1917,17 @@ fn render_status_entry(
     // destinations from it, and bolding both levels leaves neither leading.
     let _ = writeln!(out, "  {destination}");
 
-    // A session that is working is described by what it is doing. The
-    // recorded status describes the last cycle, which for the cycle that
-    // takes longest — the first scan of a large tree — is whatever
-    // preceded it, under an age that only grows. That reads as stuck.
-    let working = progress.filter(|progress| progress.phase.is_working());
+    // A session that is working is described by what it is doing — but
+    // only once it has been working long enough for that to be the more
+    // useful answer. Routine cycles finish in well under a second, and a
+    // status that flickers into "scanning" every few seconds reports
+    // nothing while hiding what the reader came for. The phase earns the
+    // line by taking long enough that its absence would look like death,
+    // which is the case it was added for: the cold sync of a large tree.
+    // `--live`, and `watch`, want every phase however brief.
+    let working = progress.filter(|progress| {
+        progress.phase.is_working() && (live || progress.working_seconds >= SLOW_PHASE_SECONDS)
+    });
     let Some(status) = status else {
         match working {
             Some(progress) => render_working(progress, out),
@@ -1997,6 +2014,12 @@ fn render_status_entry(
     }
 }
 
+/// How long a phase must have been running before `status` reports it in
+/// place of the last cycle's outcome. Comfortably longer than a routine
+/// cycle, comfortably shorter than the wait that prompts someone to ask
+/// whether anything is happening at all.
+const SLOW_PHASE_SECONDS: u64 = 5;
+
 /// Renders what a session is doing right now: the phase, how long it has
 /// been in it, an estimate when one can honestly be made, and the counts
 /// behind it.
@@ -2009,7 +2032,9 @@ fn render_working(progress: &ProgressSnapshot, out: &mut String) {
         progress.phase.label(),
         format_duration(progress.seconds)
     );
-    if let Some(remaining) = progress.remaining_seconds {
+    // An estimate that has rounded to nothing says "any moment now",
+    // which the moving counts already say better.
+    if let Some(remaining) = progress.remaining_seconds.filter(|left| *left > 0) {
         let _ = write!(headline, ", about {} left", format_duration(remaining));
     }
     let _ = writeln!(out, "{headline}");
@@ -2049,7 +2074,7 @@ fn render_working(progress: &ProgressSnapshot, out: &mut String) {
                         );
                     }
                 }
-                if let Some(remaining) = side.remaining_seconds {
+                if let Some(remaining) = side.remaining_seconds.filter(|left| *left > 0) {
                     let _ = write!(line, ", about {} left", format_duration(remaining));
                 }
                 let _ = writeln!(out, "{line}");
@@ -2176,7 +2201,7 @@ fn print_report(report: &CycleReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{conflict_filter, parse_remote, roll_up};
+    use super::{conflict_filter, parse_remote, render_status_entry, roll_up};
 
     #[test]
     fn remote_specification_parsing() {
@@ -2250,5 +2275,67 @@ mod tests {
 
         // A malformed pattern is reported, not silently matched.
         assert!(conflict_filter("[").is_err());
+    }
+
+    /// A routine cycle must not displace the answer the reader came for.
+    ///
+    /// Cycles run every few seconds and finish in well under one. If every
+    /// one of them turned the status line into "scanning, 0s elapsed", the
+    /// line would report nothing while hiding what the last cycle actually
+    /// did — the opposite of the problem the phase was added to solve.
+    #[test]
+    fn a_phase_earns_the_status_line_by_taking_long_enough_to_look_stuck() {
+        use autobahn::progress::{Phase, ProgressSnapshot};
+
+        let snapshot = |phase: Phase, seconds: u64| ProgressSnapshot {
+            phase,
+            seconds,
+            working_seconds: seconds,
+            alpha: side(),
+            beta: side(),
+            staged: 0,
+            staged_total: 0,
+            staged_bytes: 0,
+            staged_bytes_total: 0,
+            applied: 0,
+            applied_total: 0,
+            remaining_seconds: None,
+        };
+        let shows = |progress: &ProgressSnapshot, live: bool| {
+            let mut out = String::new();
+            render_status_entry(
+                "beta",
+                "two-way-conflict",
+                None,
+                Some(progress),
+                live,
+                false,
+                &mut out,
+            );
+            out.contains("scanning")
+        };
+
+        // A cycle that is quick about it says nothing.
+        assert!(!shows(&snapshot(Phase::Scanning, 0), false));
+        assert!(!shows(&snapshot(Phase::Scanning, 4), false));
+        // One that has been going long enough to look dead says so.
+        assert!(shows(&snapshot(Phase::Scanning, 5), false));
+        assert!(shows(&snapshot(Phase::Scanning, 600), false));
+        // A live view — `--live`, and `watch` — wants every phase.
+        assert!(shows(&snapshot(Phase::Scanning, 0), true));
+        // Waiting is never a phase to report: a session between cycles is
+        // described by how the last one ended.
+        assert!(!shows(&snapshot(Phase::Waiting, 600), true));
+    }
+
+    fn side() -> autobahn::progress::SideSnapshot {
+        autobahn::progress::SideSnapshot {
+            active: true,
+            entries: 0,
+            bytes: 0,
+            expected: None,
+            seconds: 0,
+            remaining_seconds: None,
+        }
     }
 }

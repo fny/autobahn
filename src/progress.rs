@@ -63,11 +63,15 @@ impl Phase {
     }
 
     /// Whether this phase is a session actively working, as opposed to
-    /// waiting between cycles. Only working phases displace the recorded
-    /// status: a session sitting in `Waiting` is described by how its last
-    /// cycle ended, which is exactly right.
+    /// resting between cycles. Only working phases displace the recorded
+    /// status.
+    ///
+    /// Waiting, paused and retrying are all rest, and all three are
+    /// already in the recorded status — a paused session records
+    /// "paused", and a retrying one records the error it is backing off
+    /// from, which says more than the word "retrying" would.
     pub fn is_working(self) -> bool {
-        !matches!(self, Phase::Waiting)
+        !matches!(self, Phase::Waiting | Phase::Paused | Phase::Retrying)
     }
 
     fn as_u8(self) -> u8 {
@@ -223,6 +227,10 @@ pub struct Progress {
     phase: AtomicU8,
     /// When the current phase began, in milliseconds since the epoch.
     phase_since: AtomicU64,
+    /// When the session last stopped resting, in milliseconds since the
+    /// epoch. A cycle moves through several phases, and to whoever is
+    /// waiting on it they are one continuous stretch of work.
+    working_since: AtomicU64,
     /// The alpha side's scan progress.
     pub alpha: Arc<SideProgress>,
     /// The beta side's scan progress.
@@ -243,6 +251,7 @@ impl Default for Progress {
         Progress {
             phase: AtomicU8::new(Phase::Waiting.as_u8()),
             phase_since: AtomicU64::new(now_millis()),
+            working_since: AtomicU64::new(now_millis()),
             alpha: Arc::default(),
             beta: Arc::default(),
             staged: AtomicU64::new(0),
@@ -260,9 +269,18 @@ impl Progress {
     /// current leaves the clock alone, so a repeated announcement doesn't
     /// reset how long the phase has been running.
     pub fn enter(&self, phase: Phase) {
-        let previous = self.phase.swap(phase.as_u8(), Ordering::Relaxed);
-        if previous != phase.as_u8() {
-            self.phase_since.store(now_millis(), Ordering::Relaxed);
+        let previous = Phase::from_u8(self.phase.swap(phase.as_u8(), Ordering::Relaxed));
+        if previous == phase {
+            return;
+        }
+        let now = now_millis();
+        self.phase_since.store(now, Ordering::Relaxed);
+        // Entering work from rest starts the run. Moving between working
+        // phases does not: a cold sync scans, then transfers, then
+        // applies, and restarting the clock at each step would make a
+        // ten-minute wait look like three short ones.
+        if phase.is_working() && !previous.is_working() {
+            self.working_since.store(now, Ordering::Relaxed);
         }
     }
 
@@ -361,6 +379,10 @@ impl Progress {
         ProgressSnapshot {
             phase,
             seconds: elapsed.as_secs(),
+            working_seconds: match phase.is_working() {
+                true => elapsed_since(self.working_since.load(Ordering::Relaxed)).as_secs(),
+                false => 0,
+            },
             alpha,
             beta,
             staged,
@@ -379,8 +401,13 @@ impl Progress {
 pub struct ProgressSnapshot {
     /// What the session is doing.
     pub phase: Phase,
-    /// How long it has been doing it.
+    /// How long it has been doing it — this phase alone.
     pub seconds: u64,
+    /// How long the session has been working without a rest, across
+    /// however many phases. Zero when it is resting. This is the measure
+    /// of "has this been going long enough to look stuck", because the
+    /// person waiting is waiting on the cycle, not on one of its steps.
+    pub working_seconds: u64,
     /// The alpha side's scan.
     pub alpha: SideSnapshot,
     /// The beta side's scan.
@@ -553,6 +580,52 @@ mod tests {
             .store(now_millis().saturating_sub(10_000), Ordering::Relaxed);
         progress.alpha.advance(1_000, 0);
         assert!(progress.snapshot().alpha.remaining_seconds.is_some());
+    }
+
+    #[test]
+    fn a_run_of_work_is_timed_across_its_phases_not_within_them() {
+        let progress = Progress::default();
+        progress.enter(Phase::Scanning);
+        progress
+            .working_since
+            .store(now_millis().saturating_sub(30_000), Ordering::Relaxed);
+        progress
+            .phase_since
+            .store(now_millis().saturating_sub(30_000), Ordering::Relaxed);
+
+        // Moving on to the next phase restarts that phase's clock but not
+        // the run's: a cold sync that scans, transfers and applies is one
+        // wait to whoever is watching it, not three short ones.
+        progress.enter(Phase::Staging);
+        let snapshot = progress.snapshot();
+        assert!(snapshot.seconds < 5, "the phase is new");
+        assert!(snapshot.working_seconds >= 30, "the run is not");
+
+        // Resting ends the run, and the next one starts from zero.
+        progress.rest(Phase::Waiting);
+        assert_eq!(progress.snapshot().working_seconds, 0);
+        progress.enter(Phase::Scanning);
+        assert!(progress.snapshot().working_seconds < 5);
+    }
+
+    #[test]
+    fn rest_is_never_reported_as_work() {
+        // All three are already in the recorded status, which says more:
+        // a paused session records "paused", and a retrying one records
+        // the error it is backing off from.
+        for phase in [Phase::Waiting, Phase::Paused, Phase::Retrying] {
+            assert!(!phase.is_working(), "{phase:?}");
+        }
+        for phase in [
+            Phase::Connecting,
+            Phase::Scanning,
+            Phase::Reconciling,
+            Phase::Staging,
+            Phase::Applying,
+            Phase::Saving,
+        ] {
+            assert!(phase.is_working(), "{phase:?}");
+        }
     }
 
     #[test]

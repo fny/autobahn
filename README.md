@@ -176,9 +176,10 @@ autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
 ```
 
-While a session is working, `status` says so — the phase it is in, how
-long it has been there, and, where the numbers allow an honest one, an
-estimate:
+When a session has been working long enough that its silence would look
+like death — a cold sync, a first scan, an unreachable host — `status`
+says what it is doing, how long it has been at it, and, where the numbers
+allow an honest one, an estimate:
 
 ```
 ~/Workspace/Voltai voltai
@@ -189,8 +190,17 @@ estimate:
     mode: two-way-conflict
 ```
 
+Routine cycles say nothing. They finish in well under a second, and a
+line that flickered into "scanning" every few seconds would report
+nothing while hiding what the reader came for — so a phase earns the line
+only after the session has been working for five seconds, counted across
+the whole run rather than restarted at each step. `autobahn status
+--live` shows every phase however brief, and `watch`, being a live
+display, always does.
+
 A session between cycles is described by how its last cycle ended, as
-before. The estimate is withheld unless the phase has been running long
+before; so is a paused one, and one backing off from an error, both of
+which the recorded status already names. The estimate is withheld unless the phase has been running long
 enough to have a rate and has a total to measure against — a first scan
 of a tree nothing has ever counted reports its progress and its elapsed
 time, and no estimate. A remote scan happens inside one request on the

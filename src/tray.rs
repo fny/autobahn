@@ -391,11 +391,9 @@ impl App {
                 // described by how its last cycle ended. The same rule the
                 // command line follows, for the same reason: an age that
                 // only grows over a stale state reads as stuck.
-                let line = match session
-                    .progress
-                    .as_ref()
-                    .filter(|progress| progress.phase.is_working())
-                {
+                let line = match session.progress.as_ref().filter(|progress| {
+                    progress.phase.is_working() && progress.working_seconds >= SLOW_PHASE_SECONDS
+                }) {
                     Some(progress) => {
                         let mut line = format!(
                             "{}  —  {}, {}",
@@ -403,7 +401,8 @@ impl App {
                             progress.phase.label(),
                             format_elapsed(progress.seconds)
                         );
-                        if let Some(remaining) = progress.remaining_seconds {
+                        if let Some(remaining) = progress.remaining_seconds.filter(|left| *left > 0)
+                        {
                             use std::fmt::Write;
                             let _ = write!(line, ", about {} left", format_elapsed(remaining));
                         }
@@ -794,6 +793,12 @@ fn icon(health: Health) -> Icon {
     }
     Icon::from_rgba(rgba, SIZE, SIZE).expect("a valid icon")
 }
+
+/// How long a phase must have run before the menu reports it in place of
+/// the last cycle's outcome. The menu is glanced at, not watched, and a
+/// line that flickers into "scanning" between polls says less than the one
+/// it replaces. Matches the command line's threshold.
+const SLOW_PHASE_SECONDS: u64 = 5;
 
 /// Formats an elapsed or remaining duration, at two significant units.
 fn format_elapsed(seconds: u64) -> String {

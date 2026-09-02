@@ -21,6 +21,15 @@ thiserror = "1"
 toml = "0.8"
 unicode-normalization = "0.1"
 
+# The menu bar app, behind a feature so the agent build stays lean.
+tray-icon = { version = "0.24", optional = true }
+muda = { version = "0.19", optional = true }
+winit = { version = "0.30", optional = true }
+notify-rust = { version = "4", optional = true }
+
+[features]
+tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust"]
+
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"

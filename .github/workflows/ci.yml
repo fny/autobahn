@@ -36,6 +36,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Tests
         run: cargo test --release
+      # The menu bar app cannot be exercised on a runner, but it can be
+      # kept compiling.
+      - name: Build with the tray
+        run: cargo build --release --features tray
 
   # Linux on ARM: the deployment target for Graviton instances. The code
   # needs no platform-specific anything here — this job exists to keep that

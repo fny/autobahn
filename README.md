@@ -200,6 +200,29 @@ destinations whose own conflict was with a *third* version. Resolution
 makes the sides agree; the next cycle records the agreement and the
 conflict is gone. Nothing here touches the ancestor.
 
+`autobahn status --json` and `autobahn conflicts --json` print all of
+this as one versioned document, for scripts and user interfaces.
+
+### The menu bar app
+
+```sh
+cargo build --release --features tray
+autobahn tray &
+```
+
+An icon whose colour is the state of every session — green when all
+are synchronized, yellow when any is in conflict, red when any is halted
+or unreachable, grey when nothing is running — and a menu with the
+detail: each group, each destination with its state, and under each
+conflict the ways to settle it (show the diff; keep alpha's, keep that
+destination's, keep both), which run the same `resolve` a terminal
+would. A session entering conflict, halting, or going unreachable
+raises a desktop notification, as does its recovery. The menu also
+starts, stops, and restarts the login service and opens its log.
+
+It is a view over `status --json`, polled every few seconds, and holds
+no state of its own. macOS and Linux (with a system tray).
+
 `scripts/mi` runs a guided tour of all of this against throwaway
 directories — every command, and every state a session can report,
 printed as the binary actually produces them.

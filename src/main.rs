@@ -325,6 +325,18 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Run the menu bar app: an icon whose colour is the state of every
+    /// session, a menu with the detail, and the ways to settle each
+    /// conflict. Built with the `tray` feature.
+    #[cfg(feature = "tray")]
+    Tray {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Remove state left behind by sessions the configuration no longer
     /// describes: their ancestors, status records, staged content, and
     /// endpoint locks. State for a running session is never touched, and
@@ -456,6 +468,10 @@ fn main() {
             config,
             state_root,
         } => run_resolve(config, state_root, selector, path, keep, all, yes, host),
+        #[cfg(feature = "tray")]
+        Command::Tray { config, state_root } => {
+            resolve_state_root(state_root).and_then(|root| autobahn::tray::run(config, root))
+        }
         Command::Clean {
             config,
             state_root,

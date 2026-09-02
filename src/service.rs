@@ -99,8 +99,7 @@ pub fn restart() -> Result<()> {
              or `autobahn watch` to run in this terminal"
         );
     }
-    platform::stop().ok();
-    platform::start()
+    platform::restart()
 }
 
 /// The service's current state.
@@ -201,7 +200,7 @@ mod platform {
         // A previous registration (an earlier install, or a stale one) is
         // replaced rather than layered.
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{}/{LABEL}", domain())])
+            .args(["bootout", &target()])
             .output();
         let mut command = Command::new("launchctl");
         command.args(["bootstrap", &domain(), &plist.to_string_lossy()]);
@@ -211,7 +210,7 @@ mod platform {
     pub fn uninstall() -> Result<()> {
         let plist = plist_path()?;
         let _ = Command::new("launchctl")
-            .args(["bootout", &format!("{}/{LABEL}", domain())])
+            .args(["bootout", &target()])
             .output();
         match std::fs::remove_file(&plist) {
             Ok(()) => Ok(()),
@@ -222,26 +221,78 @@ mod platform {
         }
     }
 
-    pub fn start() -> Result<()> {
-        // Bootstrapping loads the plist and, with RunAtLoad, starts it. A
-        // service that is already loaded answers "already bootstrapped"
-        // (exit 37), which is success for our purposes; a kickstart then
-        // covers the loaded-but-exited case.
+    fn target() -> String {
+        format!("{}/{LABEL}", domain())
+    }
+
+    /// Whether launchd has the service loaded, running or not.
+    fn loaded() -> bool {
+        Command::new("launchctl")
+            .args(["print", &target()])
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
+
+    /// Loads the plist, which with RunAtLoad also starts it.
+    ///
+    /// launchd tears a booted-out service down asynchronously, and while
+    /// that is in progress — longer with KeepAlive — a bootstrap of the
+    /// same label fails with "Input/output error" (exit 5). A stop
+    /// followed at once by a start is exactly that, so the bootstrap is
+    /// retried across the teardown rather than reported on first refusal.
+    fn bootstrap() -> Result<()> {
         let plist = plist_path()?;
-        let _ = Command::new("launchctl")
-            .args(["bootstrap", &domain(), &plist.to_string_lossy()])
-            .output();
-        let mut command = Command::new("launchctl");
-        command.args(["kickstart", &format!("{}/{LABEL}", domain())]);
-        run(command)
+        let mut last = None;
+        for _ in 0..20 {
+            let mut command = Command::new("launchctl");
+            command.args(["bootstrap", &domain(), &plist.to_string_lossy()]);
+            match run(command) {
+                Ok(()) => return Ok(()),
+                Err(error) => last = Some(error),
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Err(last.unwrap()).context("unable to load the service into launchd")
+    }
+
+    pub fn start() -> Result<()> {
+        if loaded() {
+            // Loaded but possibly exited: a kickstart starts it if it is
+            // not running and is harmless if it is.
+            let mut command = Command::new("launchctl");
+            command.args(["kickstart", &target()]);
+            return run(command);
+        }
+        bootstrap()
     }
 
     pub fn stop() -> Result<()> {
         // Unloading is the only stop that KeepAlive does not immediately
         // undo. The plist stays on disk, so the next login loads it again.
         let mut command = Command::new("launchctl");
-        command.args(["bootout", &format!("{}/{LABEL}", domain())]);
-        run(command)
+        command.args(["bootout", &target()]);
+        run(command)?;
+        // The unload is asynchronous; waiting for it here means a start
+        // that follows at once finds the label free.
+        for _ in 0..20 {
+            if !loaded() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+        }
+        Ok(())
+    }
+
+    pub fn restart() -> Result<()> {
+        if loaded() {
+            // launchd's own restart: kills the process and starts it
+            // again without unloading, so there is no teardown to race.
+            let mut command = Command::new("launchctl");
+            command.args(["kickstart", "-k", &target()]);
+            return run(command);
+        }
+        bootstrap()
     }
 
     pub fn state() -> Result<ServiceState> {
@@ -249,7 +300,7 @@ mod platform {
             return Ok(ServiceState::NotInstalled);
         }
         let output = Command::new("launchctl")
-            .args(["print", &format!("{}/{LABEL}", domain())])
+            .args(["print", &target()])
             .output()
             .context("unable to run launchctl")?;
         if !output.status.success() {
@@ -354,6 +405,10 @@ mod platform {
         run(systemctl(&["stop", &unit_name()]))
     }
 
+    pub fn restart() -> Result<()> {
+        run(systemctl(&["restart", &unit_name()]))
+    }
+
     pub fn state() -> Result<ServiceState> {
         if !unit_path()?.exists() {
             return Ok(ServiceState::NotInstalled);
@@ -385,6 +440,9 @@ mod platform {
         bail!("login services are supported on macOS (launchd) and Linux (systemd) only")
     }
     pub fn stop() -> Result<()> {
+        bail!("login services are supported on macOS (launchd) and Linux (systemd) only")
+    }
+    pub fn restart() -> Result<()> {
         bail!("login services are supported on macOS (launchd) and Linux (systemd) only")
     }
     pub fn state() -> Result<ServiceState> {

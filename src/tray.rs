@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use muda::{Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
+use muda::{IsMenuItem, Menu, MenuEvent, MenuItem, MenuItemKind, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 
@@ -57,6 +57,45 @@ enum Action {
     ServiceRestart,
     Refresh,
     Quit,
+}
+
+/// The menu, kept as live handles so it can be edited in place.
+///
+/// The menu is never replaced once built. Replacing it dismisses it if it
+/// is open — a menu that vanishes under the pointer at the moment
+/// something changes is the worst possible time — whereas AppKit updates
+/// an open menu's items live. So the summary and every session line are
+/// handles whose text is set, conflict submenus are added and removed
+/// within their session's submenu, and the service items are fixed
+/// entries that are enabled or disabled. Only a change to the *shape* of
+/// the configuration — a group or destination added or removed — rebuilds
+/// it, and that is rare and never mid-glance.
+struct MenuModel {
+    menu: Menu,
+    summary: MenuItem,
+    /// Present only while there is an error to show; a blank item would
+    /// be an empty row.
+    error: Option<MenuItem>,
+    groups: Vec<GroupItems>,
+    service_start: MenuItem,
+    service_stop: MenuItem,
+    service_restart: MenuItem,
+    /// The shape the model was built for: group names and their
+    /// destinations. A report with a different shape needs a rebuild.
+    shape: Vec<(String, Vec<String>)>,
+}
+
+struct GroupItems {
+    submenu: Submenu,
+    sessions: Vec<SessionItems>,
+}
+
+struct SessionItems {
+    line: MenuItem,
+    /// The session's error, present only while it has one.
+    detail: Option<MenuItem>,
+    /// Conflict submenus by path, in menu order.
+    conflicts: Vec<(String, Submenu)>,
 }
 
 /// The icon's overall colour.
@@ -112,6 +151,7 @@ fn run_loop(
         health: Health::Idle,
         report: None,
         last_error: None,
+        model: None,
     };
     event_loop
         .run_app(&mut app)
@@ -133,6 +173,8 @@ struct App {
     /// The last action's failure, shown at the top of the menu until an
     /// action succeeds — a notification can be missed.
     last_error: Option<String>,
+    /// The live menu.
+    model: Option<MenuModel>,
 }
 
 impl winit::application::ApplicationHandler<Wake> for App {
@@ -205,7 +247,15 @@ impl App {
             }
             self.health = health;
         }
-        self.set_menu(&report);
+        let shape = shape_of(&report);
+        let rebuild = match &self.model {
+            Some(model) => model.shape != shape,
+            None => true,
+        };
+        if rebuild {
+            self.build_menu(&report, shape);
+        }
+        self.update_menu(&report);
         self.report = Some(report);
     }
 
@@ -220,6 +270,9 @@ impl App {
     }
 
     fn set_menu_error(&mut self, message: &str) {
+        // With no report there is no model; a bare menu carries the
+        // message and a way out.
+        self.model = None;
         let menu = Menu::new();
         let _ = menu.append(&MenuItem::new(format!("autobahn: {message}"), false, None));
         let _ = menu.append(&PredefinedMenuItem::separator());
@@ -232,20 +285,74 @@ impl App {
         }
     }
 
-    fn set_menu(&mut self, report: &StatusReport) {
+    /// Builds the menu for a configuration shape. Called once, and again
+    /// only when the shape changes.
+    fn build_menu(&mut self, report: &StatusReport, shape: Vec<(String, Vec<String>)>) {
         self.actions.clear();
         let menu = Menu::new();
+        let summary = MenuItem::new("", false, None);
+        let _ = menu.append(&summary);
+        let _ = menu.append(&PredefinedMenuItem::separator());
 
-        // The summary line: what the icon colour means, in words.
+        let mut groups = Vec::new();
+        for group in &report.groups {
+            let submenu = Submenu::new(format!("{}  ({})", group.alpha, group.name), true);
+            let mut sessions = Vec::new();
+            for _ in &group.sessions {
+                let line = MenuItem::new("", false, None);
+                let _ = submenu.append(&line);
+                sessions.push(SessionItems {
+                    line,
+                    detail: None,
+                    conflicts: Vec::new(),
+                });
+            }
+            let _ = menu.append(&submenu);
+            groups.push(GroupItems { submenu, sessions });
+        }
+        let _ = menu.append(&PredefinedMenuItem::separator());
+
+        let mut fixed = |label: &str, action: Action| -> MenuItem {
+            let item = MenuItem::new(label, true, None);
+            self.actions.insert(item.id().clone(), action);
+            let _ = menu.append(&item);
+            item
+        };
+        let service_start = fixed("Start service", Action::ServiceStart);
+        let service_stop = fixed("Stop service", Action::ServiceStop);
+        let service_restart = fixed("Restart service", Action::ServiceRestart);
+        fixed("Open log", Action::OpenLog);
+        fixed("Refresh", Action::Refresh);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        fixed("Quit", Action::Quit);
+
+        if let Some(tray) = &self.tray {
+            tray.set_menu(Some(Box::new(menu.clone())));
+        }
+        self.model = Some(MenuModel {
+            menu,
+            summary,
+            error: None,
+            groups,
+            service_start,
+            service_stop,
+            service_restart,
+            shape,
+        });
+    }
+
+    /// Brings the menu's text and conflict entries up to date, in place.
+    fn update_menu(&mut self, report: &StatusReport) {
+        let Some(model) = self.model.as_mut() else {
+            return;
+        };
+
         let sessions: Vec<_> = report
             .groups
             .iter()
             .flat_map(|group| group.sessions.iter())
             .collect();
         let count = |state: &str| sessions.iter().filter(|s| s.state == state).count();
-        // The counts are what was last recorded, and are worth showing
-        // whether or not anything is running now — a conflict recorded an
-        // hour ago is still a conflict. What is running is said first.
         let mut parts = Vec::new();
         if !report.supervisor_running {
             parts.push(
@@ -271,36 +378,52 @@ impl App {
             }
         }
         let summary = parts.join(", ");
-        if std::env::var_os("AUTOBAHN_TRAY_DEBUG").is_some() {
-            eprintln!("menu: {summary}");
+        model.summary.set_text(&summary);
+        let error_text = self.last_error.as_deref().map(|e| format!("⚠ {e}"));
+        set_optional(&model.menu, &model.summary, &mut model.error, error_text);
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
         }
-        let _ = menu.append(&MenuItem::new(&summary, false, None));
-        if let Some(error) = &self.last_error {
-            let _ = menu.append(&MenuItem::new(format!("⚠ {error}"), false, None));
-        }
-        let _ = menu.append(&PredefinedMenuItem::separator());
 
-        // One submenu per group; one line per destination; one submenu per
-        // conflict, holding the ways to settle it.
-        for group in &report.groups {
-            let submenu = Submenu::new(format!("{}  ({})", group.alpha, group.name), true);
-            for session in &group.sessions {
+        for (group, items) in report.groups.iter().zip(model.groups.iter_mut()) {
+            for (session, entry) in group.sessions.iter().zip(items.sessions.iter_mut()) {
                 let age = session
                     .age_seconds
                     .map(format_age)
                     .unwrap_or_else(|| "never run".to_owned());
-                let line = format!("{}  —  {}, {}", session.host, session.state, age);
-                let _ = submenu.append(&MenuItem::new(line, false, None));
-                if let Some(error) = &session.error {
-                    let detail = error.rsplit(": ").next().unwrap_or(error);
-                    let _ = submenu.append(&MenuItem::new(format!("      {detail}"), false, None));
-                }
+                entry
+                    .line
+                    .set_text(format!("{}  —  {}, {}", session.host, session.state, age));
+                let detail_text = session
+                    .error
+                    .as_deref()
+                    .map(|error| format!("      {}", error.rsplit(": ").next().unwrap_or(error)));
+                set_optional(&items.submenu, &entry.line, &mut entry.detail, detail_text);
+
+                // Conflicts: remove the ones that are gone, add the ones
+                // that are new, leave the rest untouched.
+                let wanted: Vec<&str> = session.conflicts.iter().map(|c| c.path.as_str()).collect();
+                entry.conflicts.retain(|(path, submenu)| {
+                    if wanted.contains(&path.as_str()) {
+                        true
+                    } else {
+                        let _ = items.submenu.remove(submenu);
+                        false
+                    }
+                });
                 for conflict in &session.conflicts {
+                    if entry
+                        .conflicts
+                        .iter()
+                        .any(|(path, _)| path == &conflict.path)
+                    {
+                        continue;
+                    }
                     let item = Submenu::new(format!("      ⚠ {}", conflict.path), true);
                     let mut add = |label: String, action: Action| {
-                        let entry = MenuItem::new(label, true, None);
-                        self.actions.insert(entry.id().clone(), action);
-                        let _ = item.append(&entry);
+                        let choice = MenuItem::new(label, true, None);
+                        self.actions.insert(choice.id().clone(), action);
+                        let _ = item.append(&choice);
                     };
                     add(
                         "Show diff".into(),
@@ -328,40 +451,32 @@ impl App {
                             },
                         );
                     }
-                    let _ = submenu.append(&item);
+                    // Placed after this session's line, its detail if
+                    // any, and the conflicts it already has — before the
+                    // next session.
+                    let position = items
+                        .submenu
+                        .items()
+                        .iter()
+                        .position(|k| k.id() == entry.line.id())
+                        .map(|p| {
+                            p + 1 + usize::from(entry.detail.is_some()) + entry.conflicts.len()
+                        })
+                        .unwrap_or(0);
+                    let _ = items.submenu.insert(&item, position);
+                    entry.conflicts.push((conflict.path.clone(), item));
                 }
             }
-            let _ = menu.append(&submenu);
         }
-        let _ = menu.append(&PredefinedMenuItem::separator());
 
-        // The service, and the app.
-        let mut add = |label: &str, action: Action, enabled: bool| {
-            let entry = MenuItem::new(label, enabled, None);
-            self.actions.insert(entry.id().clone(), action);
-            let _ = menu.append(&entry);
+        let (start, stop, restart) = match report.service.as_str() {
+            "running" => (false, true, true),
+            "stopped" => (true, false, false),
+            _ => (false, false, false),
         };
-        match report.service.as_str() {
-            "running" => {
-                add("Restart service", Action::ServiceRestart, true);
-                add("Stop service", Action::ServiceStop, true);
-            }
-            "stopped" => add("Start service", Action::ServiceStart, true),
-            _ => add(
-                "Install a service with `autobahn install`",
-                Action::Refresh,
-                false,
-            ),
-        }
-        add("Open log", Action::OpenLog, true);
-        add("Refresh", Action::Refresh, true);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        add("Quit", Action::Quit, true);
-
-        if let Some(tray) = &self.tray {
-            tray.set_menu(Some(Box::new(menu)));
-            let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
-        }
+        model.service_start.set_enabled(start);
+        model.service_stop.set_enabled(stop);
+        model.service_restart.set_enabled(restart);
     }
 
     /// Raises a desktop notification for each session whose state changed
@@ -533,6 +648,82 @@ fn open_path(path: &std::path::Path) -> Result<()> {
         .status()
         .with_context(|| format!("unable to open {}", path.display()))?;
     Ok(())
+}
+
+/// What `Menu` and `Submenu` have in common as containers of items —
+/// muda gives them the same methods but no shared trait.
+trait Container {
+    fn items(&self) -> Vec<MenuItemKind>;
+    fn insert(&self, item: &dyn IsMenuItem, position: usize) -> muda::Result<()>;
+    fn remove(&self, item: &dyn IsMenuItem) -> muda::Result<()>;
+}
+
+impl Container for Menu {
+    fn items(&self) -> Vec<MenuItemKind> {
+        Menu::items(self)
+    }
+    fn insert(&self, item: &dyn IsMenuItem, position: usize) -> muda::Result<()> {
+        Menu::insert(self, item, position)
+    }
+    fn remove(&self, item: &dyn IsMenuItem) -> muda::Result<()> {
+        Menu::remove(self, item)
+    }
+}
+
+impl Container for Submenu {
+    fn items(&self) -> Vec<MenuItemKind> {
+        Submenu::items(self)
+    }
+    fn insert(&self, item: &dyn IsMenuItem, position: usize) -> muda::Result<()> {
+        Submenu::insert(self, item, position)
+    }
+    fn remove(&self, item: &dyn IsMenuItem) -> muda::Result<()> {
+        Submenu::remove(self, item)
+    }
+}
+
+/// Keeps an optional item — one that exists only while it has text —
+/// in step with `text`, directly after `anchor`, editing the text in
+/// place when the item already exists.
+fn set_optional<M: Container>(
+    parent: &M,
+    anchor: &MenuItem,
+    slot: &mut Option<MenuItem>,
+    text: Option<String>,
+) {
+    match (slot.as_ref(), text) {
+        (Some(item), Some(text)) => item.set_text(text),
+        (Some(item), None) => {
+            let _ = parent.remove(item);
+            *slot = None;
+        }
+        (None, Some(text)) => {
+            let item = MenuItem::new(text, false, None);
+            let position = parent
+                .items()
+                .iter()
+                .position(|k| k.id() == anchor.id())
+                .map(|p| p + 1)
+                .unwrap_or(0);
+            let _ = parent.insert(&item, position);
+            *slot = Some(item);
+        }
+        (None, None) => {}
+    }
+}
+
+/// The configuration's shape: group names and their destinations.
+fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
+    report
+        .groups
+        .iter()
+        .map(|group| {
+            (
+                group.name.clone(),
+                group.sessions.iter().map(|s| s.host.clone()).collect(),
+            )
+        })
+        .collect()
 }
 
 fn health_of(report: &StatusReport) -> Health {

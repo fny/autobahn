@@ -19,7 +19,7 @@ pub mod control;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
@@ -88,8 +88,8 @@ pub struct SessionStatus {
     pub beta: String,
     /// The synchronization mode name.
     pub mode: String,
-    /// The session state: `synchronized`, `conflicts`, `problems`,
-    /// `paused`, or `error`.
+    /// The session state: `synchronized`, `conflicts`, `blocked`,
+    /// `paused`, `halted`, `unreachable`, or `errored`.
     pub state: String,
     /// The number of cycles completed since the supervisor started this
     /// session.
@@ -105,9 +105,14 @@ pub struct SessionStatus {
     /// them. Absent in records written before this field existed.
     #[serde(default)]
     pub conflict_details: Vec<ConflictDetail>,
-    /// Any problems reported by the most recent cycle, as `side path:
-    /// message` strings.
-    pub problems: Vec<String>,
+    /// Paths the most recent cycle could not read or write, as `side path:
+    /// message` strings. The cycle itself succeeded; these are what it
+    /// could not carry.
+    ///
+    /// Written as `problems` before it had a name that said what it was;
+    /// the alias keeps existing status files readable.
+    #[serde(alias = "problems")]
+    pub blocked: Vec<String>,
     /// The failure that ended the most recent attempt, if it failed.
     pub error: Option<String>,
     /// When this status was recorded, in seconds since the Unix epoch.
@@ -158,6 +163,9 @@ pub struct Supervisor {
     /// The agent connection pool: sessions on the same host share one
     /// connection, each as its own channel.
     pool: AgentPool,
+    /// What to run when sessions need attention. Nothing is observed or
+    /// timed when nothing is configured to run.
+    alerts: crate::alerts::AlertPlan,
 }
 
 impl Supervisor {
@@ -169,7 +177,15 @@ impl Supervisor {
             state_root,
             verbose,
             pool: AgentPool::default(),
+            alerts: crate::alerts::AlertPlan::default(),
         }
+    }
+
+    /// Adopts an alert plan, so that sessions needing attention are
+    /// announced rather than merely recorded.
+    pub fn with_alerts(mut self, alerts: crate::alerts::AlertPlan) -> Supervisor {
+        self.alerts = alerts;
+        self
     }
 
     /// Runs one attempt of every session in parallel and returns their
@@ -294,14 +310,28 @@ impl Supervisor {
             }
         };
 
+        // The alerter watches what the workers publish. It lives outside
+        // the thread scope because both it and the workers borrow this.
+        let published: Vec<Arc<Mutex<Option<SessionStatus>>>> =
+            self.plans.iter().map(|_| Arc::default()).collect();
+
         std::thread::scope(|scope| {
             if let Some(listener) = listener {
                 let registry = &registry;
                 scope.spawn(move || control::serve(listener, registry, stop));
             }
+            if self.alerts.is_configured() {
+                let plans = &self.plans;
+                let published = &published;
+                let state_root = self.state_root.as_path();
+                let alerts = self.alerts.clone();
+                scope.spawn(move || watch_alerts(plans, published, state_root, alerts, stop));
+            }
+
             for (index, plan) in self.plans.iter().enumerate() {
                 let flags = controls[index].clone();
                 let progress = progresses[index].clone();
+                let published = published[index].clone();
                 scope.spawn(move || {
                     // Stagger the first attempts so a large fan-out doesn't
                     // open every connection in the same instant (bounded, so
@@ -315,6 +345,7 @@ impl Supervisor {
 
                     let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
                     worker.progress = progress;
+                    worker.published = Some(published);
                     let identifier = plan.identifier();
                     let mut failures = 0u32;
                     while !stop.load(Ordering::Relaxed) {
@@ -376,6 +407,9 @@ struct Worker<'a> {
     /// worker that nobody is watching — a single pass, or a test — still
     /// has one; it is simply never read.
     progress: Arc<crate::progress::Progress>,
+    /// Where the last recorded status is shared with the alerter. Absent
+    /// when nothing is alerting, so a single pass costs nothing.
+    published: Option<Arc<Mutex<Option<SessionStatus>>>>,
 }
 
 impl<'a> Worker<'a> {
@@ -395,6 +429,7 @@ impl<'a> Worker<'a> {
             cycles: 0,
             verify_pending: false,
             progress: Arc::default(),
+            published: None,
         }
     }
 
@@ -556,12 +591,13 @@ impl<'a> Worker<'a> {
             last_beta_transitions: 0,
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
-            problems: Vec::new(),
+            blocked: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
             alpha_entries: self.progress.alpha.expected_total(),
             beta_entries: self.progress.beta.expected_total(),
         };
+        self.publish(&status);
         if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
             eprintln!(
                 "[{}] unable to record status: {error:#}",
@@ -601,7 +637,7 @@ impl<'a> Worker<'a> {
             last_beta_transitions: 0,
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
-            problems: Vec::new(),
+            blocked: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
             alpha_entries: self.progress.alpha.expected_total(),
@@ -617,11 +653,15 @@ impl<'a> Worker<'a> {
                     .map(|conflict| conflict.root.clone())
                     .collect();
                 status.conflict_details = report.conflicts.iter().map(conflict_detail).collect();
-                status.problems = problem_lines(report);
+                status.blocked = blocked_paths(report);
+                // The headline word, for a reader who wants one. It is
+                // lossy by construction — a session can be in conflict
+                // *and* have blocked paths — so the counts themselves are
+                // what `status` prints and what alerts are drawn from.
                 status.state = if !status.conflicts.is_empty() {
                     "conflicts".into()
-                } else if !status.problems.is_empty() {
-                    "problems".into()
+                } else if !status.blocked.is_empty() {
+                    "blocked".into()
                 } else {
                     "synchronized".into()
                 };
@@ -635,20 +675,41 @@ impl<'a> Worker<'a> {
                     for root in &status.conflicts {
                         eprintln!("[{display}] conflict at {root:?} (left unresolved)");
                     }
-                    for problem in &status.problems {
+                    for problem in &status.blocked {
                         eprintln!("[{display}] problem: {problem}");
                     }
                 }
             }
             Err(error) => {
-                status.state = "error".into();
+                // Decided from the error's *type*, once, here — not by
+                // searching its prose at display time, where rewording a
+                // message silently reclassified a session.
+                status.state = if error.downcast_ref::<crate::session::SafetyHalt>().is_some() {
+                    "halted"
+                } else if error
+                    .downcast_ref::<crate::endpoint::remote::Unreachable>()
+                    .is_some()
+                {
+                    "unreachable"
+                } else {
+                    "errored"
+                }
+                .into();
                 status.error = Some(format!("{error:#}"));
                 if self.verbose {
                     eprintln!("[{display}] error: {error:#}");
                 }
             }
         }
+        self.publish(&status);
         write_status(self.state_root, &self.plan.identifier(), &status)
+    }
+
+    /// Shares a status with the alerter.
+    fn publish(&self, status: &SessionStatus) {
+        if let Some(published) = &self.published {
+            *published.lock().unwrap_or_else(|error| error.into_inner()) = Some(status.clone());
+        }
     }
 }
 
@@ -666,7 +727,7 @@ fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
         digest.alpha_transitions += report.alpha_transitions;
         digest.beta_transitions += report.beta_transitions;
         digest.conflicts = report.conflicts.len();
-        digest.problems = problem_lines(&report).len();
+        digest.problems = blocked_paths(&report).len();
         if !report.missing_staged_files {
             return Ok((digest, report));
         }
@@ -893,14 +954,16 @@ pub struct SessionReport {
     /// The full destination specification.
     pub beta: String,
     pub mode: String,
-    /// "never-run", "synchronized", "conflicts", "problems", "unreachable",
-    /// "halted", or "error".
+    /// "never-run", "synchronized", "conflicts", "blocked", "unreachable",
+    /// "halted", or "errored".
     pub state: String,
     pub cycles: u64,
     /// Seconds since the status was recorded, or null when never run.
     pub age_seconds: Option<u64>,
     pub conflicts: Vec<ConflictDetail>,
-    pub problems: Vec<String>,
+    /// Paths the cycle could not read or write.
+    #[serde(rename = "blocked")]
+    pub blocked: Vec<String>,
     pub error: Option<String>,
     /// What the session is doing right now, when a supervisor is running
     /// and reports it. Everything else in this record is what the last
@@ -935,7 +998,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 cycles: 0,
                 age_seconds: None,
                 conflicts: Vec::new(),
-                problems: Vec::new(),
+                blocked: Vec::new(),
                 error: None,
                 progress: progress.clone(),
             },
@@ -947,7 +1010,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 cycles: status.cycles,
                 age_seconds: Some(now.saturating_sub(status.updated_at)),
                 conflicts: status.conflict_details.clone(),
-                problems: status.problems.clone(),
+                blocked: status.blocked.clone(),
                 error: status.error.clone(),
                 progress: progress.clone(),
             },
@@ -979,14 +1042,65 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
 /// deserve their own word — a host that cannot be reached, and a session
 /// that halted for safety — told apart from the rest.
 pub fn classify_state(status: &SessionStatus) -> String {
+    // Records written now carry the classification already. Ones written
+    // before they did say only "error", and are read the old way — by the
+    // message — so that a status file surviving an upgrade still reads
+    // correctly. New records never take this path.
+    if status.state != "error" {
+        return status.state.clone();
+    }
     let error = status.error.as_deref().unwrap_or("");
     if error.contains("unable to synchronize with") {
         "unreachable".into()
     } else if error.contains("halted") {
         "halted".into()
     } else {
-        status.state.clone()
+        "errored".into()
     }
+}
+
+/// Every condition a session is currently in that warrants telling
+/// someone.
+///
+/// A set rather than a word, because they genuinely co-occur: a session can
+/// hold hundreds of conflicts *and* a handful of paths it cannot write, and
+/// the single state word has to pick one and hide the other.
+pub fn alerts_for(status: &SessionStatus) -> Vec<crate::alerts::Alert> {
+    use crate::alerts::Alert;
+    let mut alerts = Vec::new();
+    match classify_state(status).as_str() {
+        "halted" => alerts.push(Alert::Halted),
+        "unreachable" => alerts.push(Alert::Unreachable),
+        "errored" => alerts.push(Alert::Errored),
+        // A cycle that ran leaves its exceptions behind; a cycle that
+        // failed leaves last time's, which are not news about now.
+        _ => {
+            if !status.conflicts.is_empty() {
+                alerts.push(Alert::Conflicts);
+            }
+            if !status.blocked.is_empty() {
+                alerts.push(Alert::Blocked);
+            }
+        }
+    }
+    alerts
+}
+
+/// How to describe a session's conditions in one line.
+pub fn alert_summary(status: &SessionStatus) -> String {
+    let mut parts = Vec::new();
+    match classify_state(status).as_str() {
+        state @ ("halted" | "unreachable" | "errored") => parts.push(state.to_owned()),
+        _ => {
+            if !status.conflicts.is_empty() {
+                parts.push(format!("{} conflicts", status.conflicts.len()));
+            }
+            if !status.blocked.is_empty() {
+                parts.push(format!("{} blocked", status.blocked.len()));
+            }
+        }
+    }
+    parts.join(", ")
 }
 
 /// Describes a conflict's sides from the changes reconciliation recorded
@@ -1038,7 +1152,7 @@ fn conflict_detail(conflict: &crate::tree::Conflict) -> ConflictDetail {
 }
 
 /// Flattens a cycle report's problems into labeled lines.
-fn problem_lines(report: &CycleReport) -> Vec<String> {
+fn blocked_paths(report: &CycleReport) -> Vec<String> {
     let mut lines = Vec::new();
     for (side, problems) in [
         ("alpha", &report.alpha_scan_problems),
@@ -1052,6 +1166,99 @@ fn problem_lines(report: &CycleReport) -> Vec<String> {
     }
     lines
 }
+
+/// Watches what the workers publish and runs the alert hooks.
+///
+/// On its own thread, and deliberately so: a hook is someone else's
+/// program. It may be slow, it may hang, and it must never be on the path
+/// of a synchronization cycle. The worst a wedged hook can do from here is
+/// delay the *next* hook, which the dispatcher already declines to launch.
+fn watch_alerts(
+    plans: &[SessionPlan],
+    published: &[Arc<Mutex<Option<SessionStatus>>>],
+    state_root: &Path,
+    plan: crate::alerts::AlertPlan,
+    stop: &AtomicBool,
+) {
+    use crate::alerts::{Alerter, Dispatcher, Fire, SessionAlerts};
+
+    let timeout = plan.timeout;
+    let mut alerter = Alerter::new(plan);
+    let dispatcher = Dispatcher::default();
+    while !stop.load(Ordering::Relaxed) {
+        let sessions: Vec<SessionAlerts> = plans
+            .iter()
+            .zip(published)
+            .map(|(plan, published)| {
+                let status = published
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone();
+                // A session that has not run yet is not in trouble; it has
+                // simply not started. Alerting on it would fire on every
+                // supervisor start.
+                let (alerts, summary) = match &status {
+                    Some(status) => (alerts_for(status), alert_summary(status)),
+                    None => (Vec::new(), String::new()),
+                };
+                SessionAlerts {
+                    group: plan.group.clone(),
+                    host: plan.host.clone(),
+                    alerts,
+                    summary,
+                }
+            })
+            .collect();
+
+        if let Some(fire) = alerter.observe(&sessions, std::time::Instant::now()) {
+            let commands = alerter.commands(&fire);
+            let (summary, count, states) = match &fire {
+                Fire::Alert {
+                    summary,
+                    alerts,
+                    sessions,
+                    ..
+                } => (
+                    summary.clone(),
+                    *sessions,
+                    alerts
+                        .iter()
+                        .map(|alert| alert.name())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ),
+                Fire::Recovered => ("all clear".to_owned(), 0, String::new()),
+            };
+            let environment = vec![
+                ("AUTOBAHN_SUMMARY".to_owned(), summary),
+                ("AUTOBAHN_ALERT_COUNT".to_owned(), count.to_string()),
+                ("AUTOBAHN_STATES".to_owned(), states),
+                (
+                    "AUTOBAHN_EVENT".to_owned(),
+                    match fire {
+                        Fire::Recovered => "recovered".to_owned(),
+                        Fire::Alert { repeat: true, .. } => "repeat".to_owned(),
+                        Fire::Alert { .. } => "alert".to_owned(),
+                    },
+                ),
+            ];
+            // The same document `status --json` prints, so a hook that
+            // wants more than the summary reads the seam that already
+            // exists rather than a second one invented for it.
+            let selected: Vec<&SessionPlan> = plans.iter().collect();
+            let document =
+                serde_json::to_string(&status_report(&selected, state_root)).unwrap_or_default();
+            dispatcher.dispatch(commands, environment, document, timeout);
+        }
+
+        sleep_interruptible(ALERT_POLL_INTERVAL, stop);
+    }
+}
+
+/// How often the alerter looks at what the workers have published. The
+/// confirmation period is what governs timeliness; this only has to be
+/// finer than that.
+const ALERT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Computes the delay before a failing session's next attempt: its interval
 /// doubled per consecutive failure, capped at [`MAXIMUM_BACKOFF`], plus a
@@ -1429,7 +1636,7 @@ mod tests {
             last_beta_transitions: 2,
             conflicts: vec!["path/to/conflict".into()],
             conflict_details: Vec::new(),
-            problems: vec!["beta x: denied".into()],
+            blocked: vec!["beta x: denied".into()],
             error: None,
             updated_at: 12345,
             alpha_entries: 1_000,

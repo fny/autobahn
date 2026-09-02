@@ -19,6 +19,7 @@
 //! - Remote endpoints run the same binary in agent mode over an SSH (or any
 //!   subprocess) byte stream, speaking a framed, version-checked protocol.
 
+pub mod alerts;
 pub mod config;
 pub mod endpoint;
 pub mod ownership;

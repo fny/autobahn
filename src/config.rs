@@ -37,7 +37,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
 
 use crate::endpoint::StagingMode;
@@ -45,6 +45,16 @@ use crate::paths::{expand_tilde, resolve_for_identity};
 use crate::scan::{IgnoreSet, SymlinkMode};
 use crate::session::session_identifier;
 use crate::tree::SyncMode;
+
+/// How long a condition holds before it alerts, unless the configuration
+/// says otherwise. Long enough that a dropped connection or a passing
+/// permission error is never mentioned; short enough to be timely for the
+/// conditions that persist.
+const DEFAULT_ALERT_AFTER: Duration = Duration::from_secs(30);
+
+/// How long an alert hook may run before it is killed. Generous for a
+/// notification, short enough that a wedged hook is noticed.
+const DEFAULT_ALERT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The synchronization interval used when neither a group nor the defaults
 /// specify one.
@@ -64,6 +74,52 @@ pub struct Config {
     /// The synchronization groups, keyed by name.
     #[serde(default)]
     pub groups: BTreeMap<String, Group>,
+    /// What to run when a session needs attention.
+    #[serde(default)]
+    pub alerts: Alerts,
+}
+
+/// The `[alerts]` section: commands the supervisor runs when sessions need
+/// someone, and how long a condition must hold before it counts.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Alerts {
+    /// Run for any alert. The catchall over every state below.
+    pub on_alert: Option<String>,
+    /// Run when the last alert clears.
+    pub on_recovered: Option<String>,
+    /// Run when both sides changed the same path.
+    pub on_conflicts: Option<String>,
+    /// Run when paths could not be read or written.
+    pub on_blocked: Option<String>,
+    /// Run on a safety halt.
+    pub on_halted: Option<String>,
+    /// Run when a destination cannot be reached.
+    pub on_unreachable: Option<String>,
+    /// Run when a cycle failed for some other reason.
+    pub on_errored: Option<String>,
+    /// How long a condition must hold before it counts. Short enough to be
+    /// timely, long enough that a blip is never mentioned.
+    pub alert_after: Option<DurationSpec>,
+    /// How often to fire again while the alerting set is unchanged. Absent
+    /// or zero never repeats.
+    pub repeat_after: Option<DurationSpec>,
+    /// How long a hook may run before it is killed.
+    pub timeout: Option<DurationSpec>,
+    /// Per-state overrides of `alert_after`, keyed by state name.
+    #[serde(default)]
+    pub after: BTreeMap<String, DurationSpec>,
+}
+
+/// A duration as written in the configuration: a plain number of seconds,
+/// or a suffixed string.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+pub enum DurationSpec {
+    /// A plain number of seconds, matching how `interval` is written.
+    Seconds(u64),
+    /// A suffixed string ("30s", "5m", "2h").
+    Text(String),
 }
 
 /// Settings inherited by every group (each overridable per group).
@@ -314,6 +370,65 @@ impl Config {
     /// Derives the session plans this configuration describes, excluding
     /// disabled hosts. Every problem in the configuration is reported, not
     /// just the first.
+    /// Resolves the `[alerts]` section into the plan the supervisor
+    /// follows.
+    ///
+    /// Validated here rather than at the moment something goes wrong: a
+    /// misspelled state name or an unreadable duration must be a
+    /// configuration error at startup, not a silent no-op discovered on the
+    /// night the alert was supposed to fire.
+    pub fn alert_plan(&self) -> Result<crate::alerts::AlertPlan> {
+        use crate::alerts::Alert;
+
+        let alerts = &self.alerts;
+        let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
+            None => Ok(fallback),
+            Some(spec) => parse_duration(spec)
+                .map_err(|message| anyhow!("invalid configuration:\n  alerts.{what}: {message}")),
+        };
+
+        let mut on_each = BTreeMap::new();
+        for (alert, command) in [
+            (Alert::Conflicts, &alerts.on_conflicts),
+            (Alert::Blocked, &alerts.on_blocked),
+            (Alert::Halted, &alerts.on_halted),
+            (Alert::Unreachable, &alerts.on_unreachable),
+            (Alert::Errored, &alerts.on_errored),
+        ] {
+            if let Some(command) = command {
+                on_each.insert(alert, command.clone());
+            }
+        }
+
+        let mut after = BTreeMap::new();
+        for (name, spec) in &alerts.after {
+            let Some(alert) = Alert::parse(name) else {
+                let known: Vec<&str> = Alert::all().iter().map(|alert| alert.name()).collect();
+                bail!(
+                    "invalid configuration:\n  alerts.after.{name}: unknown state \
+                     (expected one of: {})",
+                    known.join(", ")
+                );
+            };
+            after.insert(
+                alert,
+                parse_duration(spec).map_err(|message| {
+                    anyhow!("invalid configuration:\n  alerts.after.{name}: {message}")
+                })?,
+            );
+        }
+
+        Ok(crate::alerts::AlertPlan {
+            on_alert: alerts.on_alert.clone(),
+            on_recovered: alerts.on_recovered.clone(),
+            on_each,
+            after,
+            default_after: duration(&alerts.alert_after, "alert_after", DEFAULT_ALERT_AFTER)?,
+            repeat_after: duration(&alerts.repeat_after, "repeat_after", Duration::ZERO)?,
+            timeout: duration(&alerts.timeout, "timeout", DEFAULT_ALERT_TIMEOUT)?,
+        })
+    }
+
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
         let mut errors = Vec::new();
         let mut plans = Vec::new();
@@ -810,6 +925,33 @@ pub fn parse_size(spec: &SizeSpec) -> Result<u64, String> {
     value
         .checked_mul(multiplier)
         .ok_or_else(|| format!("size '{text}' overflows"))
+}
+
+/// Parses a duration: a plain number of seconds, or an integer with an
+/// `s`, `m`, `h`, or `d` suffix. Matching is case-insensitive.
+pub fn parse_duration(spec: &DurationSpec) -> Result<Duration, String> {
+    let text = match spec {
+        DurationSpec::Seconds(seconds) => return Ok(Duration::from_secs(*seconds)),
+        DurationSpec::Text(text) => text.trim(),
+    };
+    let split = text
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(text.len());
+    let (digits, suffix) = text.split_at(split);
+    let value: u64 = digits
+        .parse()
+        .map_err(|_| format!("invalid duration '{text}'"))?;
+    let multiplier: u64 = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "s" | "sec" | "secs" => 1,
+        "m" | "min" | "mins" => 60,
+        "h" | "hr" | "hrs" => 3600,
+        "d" => 86_400,
+        other => return Err(format!("invalid duration suffix '{other}' in '{text}'")),
+    };
+    value
+        .checked_mul(multiplier)
+        .map(Duration::from_secs)
+        .ok_or_else(|| format!("duration '{text}' overflows"))
 }
 
 /// Parses a synchronization mode name.

@@ -465,7 +465,12 @@ fn an_unreachable_destination_does_not_block_other_sessions() {
     let status = world
         .status(doomed_plan)
         .expect("status should be recorded");
-    assert_eq!(status.state, "error");
+    // A destination whose agent command cannot be spawned is a permanent
+    // misconfiguration, not a host that happens to be down — so it is
+    // `errored`. `unreachable`, which alerting treats with patience
+    // because it usually clears itself, is reserved for a host that is
+    // genuinely not answering.
+    assert_eq!(status.state, "errored");
     assert!(status.error.is_some());
     assert_eq!(status.cycles, 0);
 }
@@ -823,7 +828,7 @@ fn watch_mode_heals_after_a_destination_recovers() {
             wait_until(Duration::from_secs(15), || {
                 world
                     .status(&plan)
-                    .is_some_and(|status| status.state == "error")
+                    .is_some_and(|status| status.state == "errored")
             }),
             "the failure should be recorded"
         );
@@ -1483,6 +1488,101 @@ fn a_supervised_session_reports_what_it_is_doing() {
         let status = world.status(&plan).expect("a status is recorded");
         assert_eq!(status.alpha_entries, alpha_entries);
         assert_eq!(status.beta_entries, beta_entries);
+
+        stop.store(true, Ordering::Relaxed);
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
+    });
+}
+
+/// A supervisor running unattended tells someone when a session needs them.
+///
+/// The end-to-end path: a session goes into conflict, the condition holds
+/// for its confirmation period, and the configured command runs with the
+/// summary in its environment and the status document on its input. And —
+/// the property that makes the feature usable rather than infuriating — a
+/// healthy supervisor runs nothing at all.
+#[test]
+fn a_session_needing_attention_runs_the_configured_hook() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let evidence = world.directory("evidence");
+    let fired = evidence.join("fired");
+
+    let configuration = format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-conflict"
+        interval = 1
+        betas = ["{beta}"]
+
+        [alerts]
+        on_alert = "cat > {fired}.stdin; printf '%s' \"$AUTOBAHN_SUMMARY|$AUTOBAHN_STATES|$AUTOBAHN_EVENT\" > {fired}"
+        alert_after = "1s"
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+        fired = fired.display(),
+    );
+    let plans = world.plans(&configuration);
+    let alerts = toml::from_str::<Config>(&configuration)
+        .expect("the configuration parses")
+        .alert_plan()
+        .expect("the alert plan resolves");
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans, world.state_root(), false).with_alerts(alerts);
+        let stop_ref = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
+        let _guard = StopGuard(stop_ref);
+
+        // Healthy: the hook must not run. Silence is the normal state, and
+        // a tool that announces its own good health is one people mute.
+        write(&alpha, "shared.txt", "from alpha");
+        assert!(
+            wait_until(Duration::from_secs(20), || beta.join("shared.txt").exists()),
+            "the initial content should synchronize"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        assert!(
+            !fired.exists(),
+            "a healthy supervisor must run nothing at all"
+        );
+
+        // Now make the two sides disagree about the same file.
+        write(&alpha, "shared.txt", "alpha's version");
+        write(&beta, "shared.txt", "beta's version");
+
+        assert!(
+            wait_until(Duration::from_secs(30), || fired.exists()),
+            "a session in conflict should run the hook"
+        );
+        // Give the hook's writes a moment to land in full.
+        std::thread::sleep(Duration::from_millis(500));
+
+        let reported = fs::read_to_string(&fired).expect("the hook wrote its environment");
+        let fields: Vec<&str> = reported.split('|').collect();
+        assert!(
+            fields[0].contains("work@") && fields[0].contains("conflicts"),
+            "the summary names the session and what is wrong: {reported}"
+        );
+        assert_eq!(fields[1], "conflicts", "the states are listed: {reported}");
+        assert_eq!(fields[2], "alert", "the event is an alert: {reported}");
+
+        // The full report arrives on standard input — the same document
+        // `status --json` prints, rather than a second one invented for
+        // hooks.
+        let document =
+            fs::read_to_string(fired.with_extension("stdin")).expect("the hook read its input");
+        let report: serde_json::Value =
+            serde_json::from_str(&document).expect("the document is the JSON report");
+        assert!(report["version"].is_number());
+        assert_eq!(report["groups"][0]["name"], "work");
 
         stop.store(true, Ordering::Relaxed);
         watcher

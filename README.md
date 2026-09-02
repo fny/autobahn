@@ -219,6 +219,60 @@ time, and no estimate. A remote scan happens inside one request on the
 far side, so it reports that it is running and for how long, without
 counts.
 
+### What a session's state means
+
+Two questions, not one word list. **Did the cycle run?** If it did not:
+`unreachable` (the host is not answering — usually clears itself),
+`halted` (a safety refusal — retrying will *never* clear it), or `errored`
+(it failed for some other reason; the message is the evidence). If it did
+run, the tree is in sync except for what the cycle could not carry:
+`conflicts` (both sides changed a path — you pick a winner) and `blocked`
+(a path could not be read or written — you fix the filesystem).
+
+Conflicts and blocked paths co-occur, so both counts are reported rather
+than one hiding the other.
+
+### Being told
+
+A supervisor running as a login service is invisible by design, which
+means a conflict or a permission that stopped working sits there with
+nobody told. `[alerts]` runs a command when that happens:
+
+```toml
+[alerts]
+on_alert     = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
+on_recovered = "terminal-notifier -title autobahn -message 'all clear'"
+alert_after  = "30s"
+
+[alerts.after]
+unreachable = "5m"    # a sleeping laptop deserves patience
+halted      = "0s"    # a safety halt does not
+```
+
+`on_alert` is the catchall over every state above; `on_conflicts`,
+`on_blocked`, `on_halted`, `on_unreachable` and `on_errored` name one each
+and fire in addition to it. Three rules make it usable rather than
+maddening:
+
+- **Nothing runs while everything is healthy.** Silence is the normal
+  state.
+- **A condition must hold for `alert_after` before it counts.** A wifi
+  handover that takes every session unreachable for eight seconds is never
+  mentioned — it fixed itself — and a sleeping laptop produces one
+  notification rather than fifteen.
+- **An alert fires when the set of sessions in trouble changes**, never on
+  repetition. `repeat_after` opts into a nag; it is off by default.
+
+Hooks get `$AUTOBAHN_SUMMARY` (one line naming the sessions and what is
+wrong), `$AUTOBAHN_ALERT_COUNT`, `$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`,
+and the full `status --json` document on standard input. They run off the
+cycle and cannot affect or delay synchronization: a hook is killed if it
+outstays `timeout`, and is skipped while a previous one is still running.
+
+The service runs under launchd or systemd with a sparse environment, so
+give commands absolute paths — and on Linux, `notify-send` needs
+`DBUS_SESSION_BUS_ADDRESS`.
+
 When two sides disagree about a file, `status` names it and these three
 settle it:
 

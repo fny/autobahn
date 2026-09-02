@@ -369,8 +369,8 @@ impl App {
             ("conflicts", "in conflict"),
             ("halted", "halted"),
             ("unreachable", "unreachable"),
-            ("error", "failing"),
-            ("problems", "with problems"),
+            ("errored", "failing"),
+            ("blocked", "blocked"),
         ] {
             let n = count(state);
             if n > 0 {
@@ -517,8 +517,9 @@ impl App {
                 if previous == session.state {
                     continue;
                 }
-                let attention =
-                    |state: &str| matches!(state, "conflicts" | "halted" | "unreachable" | "error");
+                let attention = |state: &str| {
+                    matches!(state, "conflicts" | "halted" | "unreachable" | "errored")
+                };
                 let (title, body) = if attention(&session.state) {
                     (
                         format!("{} — {}", group.alpha, session.state),
@@ -760,8 +761,8 @@ fn health_of(report: &StatusReport) -> Health {
     let mut health = Health::Good;
     for state in states {
         match state {
-            "halted" | "unreachable" | "error" => return Health::Bad,
-            "conflicts" | "problems" => health = Health::Attention,
+            "halted" | "unreachable" | "errored" => return Health::Bad,
+            "conflicts" | "blocked" => health = Health::Attention,
             _ => {}
         }
     }

@@ -821,7 +821,7 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
                     summary.push_str(&format!(", {} conflict(s)", digest.conflicts));
                 }
                 if digest.problems > 0 {
-                    summary.push_str(&format!(", {} problem(s)", digest.problems));
+                    summary.push_str(&format!(", {} blocked", digest.problems));
                 }
                 println!("[{}] synchronized: {summary}", outcome.display);
             }
@@ -849,10 +849,15 @@ fn run_watch(
     expand_conflicts: bool,
     log: bool,
 ) -> Result<()> {
-    let plans = load_config(config)?.plans()?;
+    let configuration = load_config(config)?;
+    let plans = configuration.plans()?;
     if plans.is_empty() {
         bail!("the configuration describes no sessions");
     }
+    // Validated here so a misspelled state or an unreadable duration is a
+    // startup failure, not a silent no-op discovered on the night the
+    // alert was meant to fire.
+    let alerts = configuration.alert_plan()?;
     let state_root = resolve_state_root(state_root)?;
     let live_display = !log && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
 
@@ -861,7 +866,7 @@ fn run_watch(
             "supervising {} session(s); status is available via `autobahn status`",
             plans.len()
         );
-        let supervisor = Supervisor::new(plans, state_root, true);
+        let supervisor = Supervisor::new(plans, state_root, true).with_alerts(alerts);
         // Runs until the process is terminated: agent processes exit when
         // their connection streams close, so no explicit cleanup is needed.
         let stop = std::sync::atomic::AtomicBool::new(false);
@@ -880,7 +885,7 @@ fn run_watch(
     let failure: Arc<Mutex<Option<String>>> = Arc::default();
     let reported = failure.clone();
     std::thread::spawn(move || {
-        let supervisor = Supervisor::new(plans, state_root, false);
+        let supervisor = Supervisor::new(plans, state_root, false).with_alerts(alerts);
         let stop = std::sync::atomic::AtomicBool::new(false);
         if let Err(error) = supervisor.run_watch(&stop) {
             *reported.lock().unwrap_or_else(|error| error.into_inner()) =
@@ -1867,10 +1872,34 @@ fn render_status_entry(
 
     // The state word comes from the same classifier the JSON report uses,
     // so the two views cannot disagree about what a session is doing.
-    let label = autobahn::supervisor::classify_state(status);
-    let colour = match label.as_str() {
-        "synchronized" => "",
-        "error" | "unreachable" | "halted" => "\x1b[31m",
+    //
+    // One word cannot say everything: a cycle that ran can leave both
+    // conflicts and blocked paths, and the word has to pick. So where the
+    // cycle *ran*, the counts are the headline and the word is dropped;
+    // where it did not run, the word is the whole story.
+    let state = autobahn::supervisor::classify_state(status);
+    let failed = matches!(state.as_str(), "errored" | "unreachable" | "halted");
+    let label = if failed || status.conflicts.is_empty() && status.blocked.is_empty() {
+        state.clone()
+    } else {
+        let mut parts = Vec::new();
+        if !status.conflicts.is_empty() {
+            parts.push(format!(
+                "{} conflicts",
+                thousands(status.conflicts.len() as u64)
+            ));
+        }
+        if !status.blocked.is_empty() {
+            parts.push(format!(
+                "{} blocked",
+                thousands(status.blocked.len() as u64)
+            ));
+        }
+        parts.join(", ")
+    };
+    let colour = match (failed, label.as_str()) {
+        (_, "synchronized") => "",
+        (true, _) => "\x1b[31m",
         _ => "\x1b[33m",
     };
     let reset = if colour.is_empty() { "" } else { "\x1b[0m" };
@@ -1915,13 +1944,13 @@ fn render_status_entry(
             }
         }
     }
-    match status.problems.len() {
+    match status.blocked.len() {
         0 => {}
         1 => {
-            let _ = writeln!(out, "    problems: 1, {}", status.problems[0]);
+            let _ = writeln!(out, "    blocked: 1, {}", status.blocked[0]);
         }
         count => {
-            let _ = writeln!(out, "    problems: {count}, first {}", status.problems[0]);
+            let _ = writeln!(out, "    blocked: {count}, first {}", status.blocked[0]);
         }
     }
     if let Some(error) = &status.error {

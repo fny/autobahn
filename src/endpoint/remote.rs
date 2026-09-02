@@ -19,6 +19,19 @@ use crate::transport::mux::{AgentChannel, AgentConnection, AgentPool};
 use crate::transport::{self, Connection};
 use crate::tree::{Change, Snapshot};
 
+/// The failure raised when a destination cannot be reached at all: the
+/// host is down, asleep, or refusing the connection.
+///
+/// Its own error type because it is the one failure that reliably clears
+/// itself, and both the status vocabulary and the alerter treat it
+/// differently for that reason.
+#[derive(Debug, thiserror::Error)]
+#[error("unable to synchronize with {destination}")]
+pub struct Unreachable {
+    /// The destination that could not be reached.
+    pub destination: String,
+}
+
 /// A remote endpoint backed by one channel of an agent connection.
 ///
 /// Dropping the endpoint closes its channel; when that channel was the
@@ -338,8 +351,16 @@ fn establish_ssh(destination: &str) -> Result<AgentConnection> {
     // only "connection closed", which is what a missing agent always looks
     // like, so it is kept for the case where installation succeeds and the
     // retry still fails.
-    transport::install::ensure_agent(destination)
-        .with_context(|| format!("unable to synchronize with {destination}"))?;
+    // Typed, not merely worded: `status` and the alerter both need to know
+    // that this failure is "the host is not there" rather than "something
+    // went wrong", and deciding that by searching the message for a phrase
+    // means any rewording of the message silently reclassifies the session.
+    transport::install::ensure_agent(destination).map_err(|error| {
+        anyhow::Error::new(Unreachable {
+            destination: destination.to_owned(),
+        })
+        .context(format!("{error:#}"))
+    })?;
     attempt(false).with_context(|| {
         format!(
             "unable to connect to {destination} even after installing the agent \

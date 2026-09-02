@@ -397,3 +397,26 @@ loudly, so the harness now prefers to fail loudly.
 | `smoke.sh` | Local end-to-end test of the harness itself. Run after any change. |
 | `report/` | The published report. |
 | `results-*/` | Raw JSONL per run, plus the plan and per-pair driver logs. |
+
+## The local gate: `bench/ab.sh`
+
+The matrix above is the benchmark of record and needs a pair of EC2
+hosts. The gate that every hot-path change passes before it ships is
+smaller, runs on one machine in about ten minutes, and lives here too:
+
+    bench/ab.sh target/release/autobahn-before target/release/autobahn-after
+
+It runs the two binaries in interleaved legs over a generated 40,000-file
+corpus (`bench/corpus.py`), each leg a cold sync and then a window of
+simulated editing agents, and reports p50/p90/p99 side by side with a
+verdict against the run-to-run spread. Interleaving is what makes it
+honest on a shared machine. The raw reports of every gate run that
+shaped a decision are in `bench/ab-reports/`.
+
+Three lessons are built into the script rather than left to be
+relearned: processes are tracked by PID, because a variant binary with a
+different name once survived every cleanup and contaminated the next
+leg; the harness is rebuilt if the one present cannot execute, because a
+build tree synchronized from another platform leaves one that cannot;
+and one leg each yields no verdict, because it measures nothing about
+the machine's own variance.

@@ -165,6 +165,7 @@ autobahn status project    # ...filtered to one group
 autobahn status .          # ...to whatever syncs the working directory
 autobahn status ~/project  # ...or any folder inside a synchronized root
 autobahn status --conflicts   # list every conflicting path, not a count
+autobahn status --live     # ...repainting, as it happens (Ctrl-C leaves)
 
 autobahn sync              # one pass over every session, then exit
 autobahn flush             # sync everything right now
@@ -194,9 +195,14 @@ Routine cycles say nothing. They finish in well under a second, and a
 line that flickered into "scanning" every few seconds would report
 nothing while hiding what the reader came for — so a phase earns the line
 only after the session has been working for five seconds, counted across
-the whole run rather than restarted at each step. `autobahn status
---live` shows every phase however brief, and `watch`, being a live
-display, always does.
+the whole run rather than restarted at each step.
+
+To watch it happen rather than sample it, `autobahn status --live`
+repaints twice a second and shows every phase however brief. It is a
+read-only window onto whatever supervisor is already running — the login
+service, or a `watch` in another terminal — and Ctrl-C leaves it with the
+scrollback intact. (`watch` is the same display, but it also does the
+synchronizing.)
 
 A session between cycles is described by how its last cycle ended, as
 before; so is a paused one, and one backing off from an error, both of

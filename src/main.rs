@@ -195,9 +195,10 @@ enum Command {
         /// List every conflicting path rather than a count and an example.
         #[arg(long)]
         conflicts: bool,
-        /// Show what each session is doing even when it is quick about
-        /// it. Ordinarily a phase is reported only once it has run long
-        /// enough to be worth waiting on; `watch` always reports one.
+        /// Repaint continuously instead of printing once, showing every
+        /// session's phase as it happens. A read-only window onto the
+        /// running supervisor; `watch` is the same display, but it also
+        /// does the synchronizing. Ctrl-C leaves.
         #[arg(long)]
         live: bool,
         /// Print the report as JSON — the same document every user
@@ -881,6 +882,22 @@ fn run_watch(
         }
     });
 
+    let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
+    run_live_display(&selected, &display_root, expand_conflicts)
+}
+
+/// Repaints the status of the selected sessions until interrupted.
+///
+/// This is the display half of `watch`, which also supervises; on its own
+/// it is `status --live`, a read-only window onto whatever supervisor is
+/// already running — the login service, or a `watch` in another terminal.
+/// Every phase is shown however brief: the reader is looking at it, and
+/// movement is the point.
+fn run_live_display(
+    selected: &[&autobahn::config::SessionPlan],
+    state_root: &Path,
+    expand_conflicts: bool,
+) -> Result<()> {
     // The display lives on the alternate screen, like a pager: it takes
     // the terminal over while it runs and gives it back — scrollback and
     // all — on exit, including an interrupt. Both signals set a flag the
@@ -899,8 +916,7 @@ fn run_watch(
     let mut previous = String::new();
     while !INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst) {
         let mut frame = String::new();
-        let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
-        render_status(&selected, &display_root, expand_conflicts, true, &mut frame);
+        render_status(selected, state_root, expand_conflicts, true, &mut frame);
         let frame = fit_to_terminal(frame);
         if frame != previous {
             use std::io::Write;
@@ -1788,6 +1804,18 @@ fn run_status(
 
     let selection = select(&plans, group.as_deref(), host.as_deref())?;
     let selected: Vec<_> = selection.plans;
+    if live {
+        if json {
+            bail!("--live repaints a display; --json prints one document. Pick one");
+        }
+        if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+            bail!(
+                "--live repaints a terminal display, and this output is not a terminal; \
+                 run `autobahn status` on a timer instead"
+            );
+        }
+        return run_live_display(&selected, &state_root, expand_conflicts);
+    }
     if json {
         let report = autobahn::supervisor::status_report(&selected, &state_root);
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -2035,7 +2063,7 @@ fn render_working(progress: &ProgressSnapshot, out: &mut String) {
     // An estimate that has rounded to nothing says "any moment now",
     // which the moving counts already say better.
     if let Some(remaining) = progress.remaining_seconds.filter(|left| *left > 0) {
-        let _ = write!(headline, ", about {} left", format_duration(remaining));
+        let _ = write!(headline, ", about {} left", format_estimate(remaining));
     }
     let _ = writeln!(out, "{headline}");
 
@@ -2075,7 +2103,7 @@ fn render_working(progress: &ProgressSnapshot, out: &mut String) {
                     }
                 }
                 if let Some(remaining) = side.remaining_seconds.filter(|left| *left > 0) {
-                    let _ = write!(line, ", about {} left", format_duration(remaining));
+                    let _ = write!(line, ", about {} left", format_estimate(remaining));
                 }
                 let _ = writeln!(out, "{line}");
             }
@@ -2106,6 +2134,23 @@ fn render_working(progress: &ProgressSnapshot, out: &mut String) {
         }
         _ => {}
     }
+}
+
+/// Formats an estimate, rounded to a precision it can actually support.
+///
+/// The rate is sampled from work in flight and genuinely varies, so a
+/// linear extrapolation moves — twenty seconds out it will disagree with
+/// itself by several seconds between one repaint and the next. Reporting
+/// that to the second makes the number look unstable rather than
+/// approximate. Rounding to a step that grows with the estimate keeps it
+/// steady and says what it means: this is an estimate.
+fn format_estimate(seconds: u64) -> String {
+    let step = match seconds {
+        0..=29 => 5,
+        30..=299 => 15,
+        _ => 60,
+    };
+    format_duration(seconds.div_ceil(step) * step)
 }
 
 /// Formats a duration for display, at two significant units.
@@ -2201,7 +2246,7 @@ fn print_report(report: &CycleReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{conflict_filter, parse_remote, render_status_entry, roll_up};
+    use super::{conflict_filter, format_estimate, parse_remote, render_status_entry, roll_up};
 
     #[test]
     fn remote_specification_parsing() {
@@ -2337,5 +2382,24 @@ mod tests {
             seconds: 0,
             remaining_seconds: None,
         }
+    }
+
+    /// An estimate is rounded to a precision it can support, so that a
+    /// number which genuinely moves between repaints does not look broken.
+    #[test]
+    fn an_estimate_is_rounded_to_the_precision_it_can_support() {
+        // Close in, five-second steps: the two readings that made "about
+        // 20s" and "about 14s" out of the same transfer now agree.
+        assert_eq!(format_estimate(14), "15s");
+        assert_eq!(format_estimate(20), "20s");
+        assert_eq!(format_estimate(1), "5s");
+        // Further out, coarser: quarter-minutes, then minutes.
+        assert_eq!(format_estimate(100), "1m45s");
+        assert_eq!(format_estimate(700), "12m");
+        assert_eq!(format_estimate(3_500), "59m");
+        assert_eq!(format_estimate(3_600), "1h");
+        // Rounding is always up: an estimate that lands early is a
+        // pleasant surprise, one that overruns is a broken promise.
+        assert_eq!(format_estimate(31), "45s");
     }
 }

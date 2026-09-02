@@ -194,6 +194,10 @@ enum Command {
         /// List every conflicting path rather than a count and an example.
         #[arg(long)]
         conflicts: bool,
+        /// Print the report as JSON — the same document every user
+        /// interface reads.
+        #[arg(long)]
+        json: bool,
     },
     /// Wake configured sessions in a running supervisor for an immediate
     /// synchronization cycle.
@@ -250,6 +254,10 @@ enum Command {
         selector: Option<String>,
         /// Filter to a destination within the group.
         host: Option<String>,
+        /// Print as JSON: the status report, restricted to sessions in
+        /// conflict.
+        #[arg(long)]
+        json: bool,
         /// The configuration file (defaults to ~/.autobahn/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
@@ -392,7 +400,8 @@ fn main() {
             group,
             host,
             conflicts,
-        } => run_status(config, state_root, group, host, conflicts),
+            json,
+        } => run_status(config, state_root, group, host, conflicts, json),
         Command::Flush {
             group,
             host,
@@ -426,9 +435,10 @@ fn main() {
         Command::Conflicts {
             selector,
             host,
+            json,
             config,
             state_root,
-        } => run_conflicts(config, state_root, selector, host),
+        } => run_conflicts(config, state_root, selector, host, json),
         Command::Diff {
             selector,
             path,
@@ -1086,10 +1096,22 @@ fn run_conflicts(
     state_root: Option<PathBuf>,
     selector: Option<String>,
     host: Option<String>,
+    json: bool,
 ) -> Result<()> {
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
     let selection = select(&plans, selector.as_deref(), host.as_deref())?;
+    if json {
+        let mut report = autobahn::supervisor::status_report(&selection.plans, &state_root);
+        for group in &mut report.groups {
+            group
+                .sessions
+                .retain(|session| !session.conflicts.is_empty());
+        }
+        report.groups.retain(|group| !group.sessions.is_empty());
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     let mut total = 0;
     let mut current_group: Option<&str> = None;
@@ -1619,12 +1641,18 @@ fn run_status(
     group: Option<String>,
     host: Option<String>,
     expand_conflicts: bool,
+    json: bool,
 ) -> Result<()> {
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
 
     let selection = select(&plans, group.as_deref(), host.as_deref())?;
     let selected: Vec<_> = selection.plans;
+    if json {
+        let report = autobahn::supervisor::status_report(&selected, &state_root);
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
 
     let mut out = String::new();
     render_status(&selected, &state_root, expand_conflicts, &mut out);
@@ -1738,17 +1766,13 @@ fn render_status_entry(
         return;
     };
 
-    // A connection failure is its own state: "why is this not running" is
-    // answered by the word, not by reading a paragraph of error text.
-    let unreachable = status
-        .error
-        .as_deref()
-        .is_some_and(|error| error.contains("unable to synchronize with"));
-    let (label, colour) = match status.state.as_str() {
-        _ if unreachable => ("unreachable", "\x1b[31m"),
-        "synchronized" => ("synchronized", ""),
-        "error" => ("error", "\x1b[31m"),
-        other => (other, "\x1b[33m"),
+    // The state word comes from the same classifier the JSON report uses,
+    // so the two views cannot disagree about what a session is doing.
+    let label = autobahn::supervisor::classify_state(status);
+    let colour = match label.as_str() {
+        "synchronized" => "",
+        "error" | "unreachable" | "halted" => "\x1b[31m",
+        _ => "\x1b[33m",
     };
     let reset = if colour.is_empty() { "" } else { "\x1b[0m" };
     let progress = if status.cycles == 0 {

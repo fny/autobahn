@@ -806,6 +806,120 @@ pub fn open_endpoints(
     Ok((alpha, beta))
 }
 
+/// Everything `status` knows, as one document — the seam any user
+/// interface builds on. `status --json` prints it; `autobahn tray` reads
+/// it directly. The `version` field moves when the shape does.
+#[derive(Clone, Debug, Serialize)]
+pub struct StatusReport {
+    /// The schema version of this document.
+    pub version: u32,
+    /// Whether a supervisor is answering on the control socket.
+    pub supervisor_running: bool,
+    /// The login service: "not-installed", "stopped", "running", or
+    /// "unknown".
+    pub service: String,
+    /// The configured groups, in configuration order.
+    pub groups: Vec<GroupReport>,
+}
+
+/// One group's report.
+#[derive(Clone, Debug, Serialize)]
+pub struct GroupReport {
+    pub name: String,
+    /// The alpha root as written in the configuration.
+    pub alpha: String,
+    pub sessions: Vec<SessionReport>,
+}
+
+/// One session's report: its plan, and its recorded status if any.
+#[derive(Clone, Debug, Serialize)]
+pub struct SessionReport {
+    /// The destination label status prints (a host, or a local path).
+    pub host: String,
+    /// The full destination specification.
+    pub beta: String,
+    pub mode: String,
+    /// "never-run", "synchronized", "conflicts", "problems", "unreachable",
+    /// "halted", or "error".
+    pub state: String,
+    pub cycles: u64,
+    /// Seconds since the status was recorded, or null when never run.
+    pub age_seconds: Option<u64>,
+    pub conflicts: Vec<ConflictDetail>,
+    pub problems: Vec<String>,
+    pub error: Option<String>,
+}
+
+/// Builds the report for a set of plans.
+pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let mut groups: Vec<GroupReport> = Vec::new();
+    for plan in plans {
+        let status = read_status(state_root, &plan.identifier()).ok().flatten();
+        let session = match status {
+            None => SessionReport {
+                host: plan.host.clone(),
+                beta: plan.beta_spec(),
+                mode: crate::config::mode_name(plan.mode).to_owned(),
+                state: "never-run".into(),
+                cycles: 0,
+                age_seconds: None,
+                conflicts: Vec::new(),
+                problems: Vec::new(),
+                error: None,
+            },
+            Some(status) => SessionReport {
+                host: plan.host.clone(),
+                beta: plan.beta_spec(),
+                mode: crate::config::mode_name(plan.mode).to_owned(),
+                state: classify_state(&status),
+                cycles: status.cycles,
+                age_seconds: Some(now.saturating_sub(status.updated_at)),
+                conflicts: status.conflict_details.clone(),
+                problems: status.problems.clone(),
+                error: status.error.clone(),
+            },
+        };
+        match groups.last_mut() {
+            Some(group) if group.name == plan.group => group.sessions.push(session),
+            _ => groups.push(GroupReport {
+                name: plan.group.clone(),
+                alpha: plan.alpha_spec.clone(),
+                sessions: vec![session],
+            }),
+        }
+    }
+    StatusReport {
+        version: 1,
+        supervisor_running: control::supervisor_is_running(state_root),
+        service: match crate::service::state() {
+            Ok(crate::service::ServiceState::NotInstalled) => "not-installed",
+            Ok(crate::service::ServiceState::Stopped) => "stopped",
+            Ok(crate::service::ServiceState::Running) => "running",
+            Err(_) => "unknown",
+        }
+        .to_owned(),
+        groups,
+    }
+}
+
+/// The state word for a recorded status, with the two error shapes that
+/// deserve their own word — a host that cannot be reached, and a session
+/// that halted for safety — told apart from the rest.
+pub fn classify_state(status: &SessionStatus) -> String {
+    let error = status.error.as_deref().unwrap_or("");
+    if error.contains("unable to synchronize with") {
+        "unreachable".into()
+    } else if error.contains("halted") {
+        "halted".into()
+    } else {
+        status.state.clone()
+    }
+}
+
 /// Describes a conflict's sides from the changes reconciliation recorded
 /// for it: the newest node each side's changes carry at the conflict's
 /// root, or absence.

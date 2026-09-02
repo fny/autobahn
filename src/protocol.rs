@@ -97,6 +97,15 @@ pub enum Request {
     /// byte of the encoded snapshot as data operations. The controller's
     /// recovery when it cannot reproduce the baseline a `ScanDelta` named.
     ScanFull,
+    /// Read one file's content, by root-relative path. `resolve` and `diff`
+    /// use this to look at a conflict's sides; it is not a synchronization
+    /// primitive, and reads nothing but a regular file.
+    ReadFile(String),
+    /// Replace one file's content, by root-relative path (`None` removes
+    /// it). Written to a temporary beside the target and renamed into
+    /// place, so a reader never sees a partial file. `resolve` uses this
+    /// to make the sides of a conflict agree.
+    WriteFile(String, Option<Vec<u8>>),
 }
 
 /// The header of a snapshot sent as a delta.
@@ -162,6 +171,10 @@ pub enum Response {
     ScanDelta(ScanDelta),
     /// A batch of snapshot delta operations; empty when the stream is done.
     ScanOps(Vec<crate::rsync::Op>),
+    /// A file's content (`None` when there is no regular file at the path).
+    File(Option<Vec<u8>>),
+    /// Acknowledgement of WriteFile.
+    Written,
 }
 
 /// A controller-to-agent frame on a multiplexed connection.
@@ -214,7 +227,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 4;
+pub const COMPATIBILITY_EPOCH: u32 = 5;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

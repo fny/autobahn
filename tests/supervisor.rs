@@ -1225,3 +1225,174 @@ fn remote_home_relative_roots_resolve_against_the_agent_home() {
     // `~/mirror` resolved against the agent's home, not the controller's.
     assert_eq!(read(&remote_home, "mirror/file.txt"), "content");
 }
+
+// ── conflicts, diff, resolve ─────────────────────────────────────────
+
+/// Runs the CLI against a world's configuration file and state root.
+fn cli(world: &World, config: &Path, args: &[&str]) -> (bool, String) {
+    let output = std::process::Command::new(agent_binary())
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .arg("--state-root")
+        .arg(world.state_root())
+        .output()
+        .expect("the CLI runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.success(), text)
+}
+
+/// A fan-out in conflict three ways: one file edited differently on alpha
+/// and on each of two destinations.
+fn three_way_conflict(world: &World) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    let alpha = world.directory("alpha");
+    let b1 = world.directory("b1");
+    let b2 = world.directory("b2");
+    write(&alpha, "notes.txt", "original");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.r]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
+            alpha.display(),
+            b1.display(),
+            b2.display()
+        ),
+    )
+    .unwrap();
+    assert!(cli(world, &config, &["sync"]).0, "the first sync converges");
+    write(&alpha, "notes.txt", "v-alpha");
+    write(&b1, "notes.txt", "v-b1");
+    write(&b2, "notes.txt", "v-b2");
+    cli(world, &config, &["sync"]);
+    (config, alpha, b1, b2)
+}
+
+#[test]
+fn conflicts_lists_every_side_with_what_it_holds() {
+    let world = World::new();
+    let (config, _, b1, b2) = three_way_conflict(&world);
+    let (ok, text) = cli(&world, &config, &["conflicts"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("notes.txt"), "{text}");
+    assert!(text.contains(&b1.to_string_lossy().to_string()), "{text}");
+    assert!(text.contains(&b2.to_string_lossy().to_string()), "{text}");
+    // Both sides are described — the size is the proof the details
+    // recorded at conflict time reached the listing.
+    assert!(text.contains("alpha  7 B"), "{text}");
+    assert!(text.contains("--keep alpha|"), "{text}");
+}
+
+#[test]
+fn diff_shows_the_two_sides_by_group_or_by_file_path() {
+    let world = World::new();
+    let (config, alpha, _, b2) = three_way_conflict(&world);
+    let b2_spec = b2.to_string_lossy().to_string();
+
+    let (_, by_group) = cli(
+        &world,
+        &config,
+        &["diff", "r", "notes.txt", "--host", &b2_spec],
+    );
+    assert!(
+        by_group.contains("-v-alpha") && by_group.contains("+v-b2"),
+        "{by_group}"
+    );
+
+    // Addressed by the file itself, from anywhere.
+    let file = alpha.join("notes.txt").to_string_lossy().to_string();
+    let (_, by_path) = cli(&world, &config, &["diff", &file, "--host", &b2_spec]);
+    assert!(
+        by_path.contains("-v-alpha") && by_path.contains("+v-b2"),
+        "{by_path}"
+    );
+}
+
+#[test]
+fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
+    let world = World::new();
+    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    let b1_spec = b1.to_string_lossy().to_string();
+    // Addressed by a path inside the root, and keeping b1's version: it
+    // must reach alpha *and* b2, whose own conflict is settled by it.
+    let file = alpha.join("notes.txt").to_string_lossy().to_string();
+    let (ok, text) = cli(&world, &config, &["resolve", &file, "--keep", &b1_spec]);
+    assert!(ok, "{text}");
+    for root in [&alpha, &b1, &b2] {
+        assert_eq!(read(root, "notes.txt"), "v-b1");
+    }
+    cli(&world, &config, &["sync"]);
+    let (_, after) = cli(&world, &config, &["conflicts"]);
+    assert!(after.contains("no conflicts"), "{after}");
+}
+
+#[test]
+fn resolve_keeping_both_renames_the_loser_aside() {
+    let world = World::new();
+    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "notes.txt", "--keep", "both"],
+    );
+    assert!(ok, "{text}");
+    assert_eq!(read(&alpha, "notes.txt"), "v-alpha");
+    assert_eq!(read(&b1, "notes.txt"), "v-alpha");
+    assert_eq!(read(&b1, "notes.txt.b1"), "v-b1");
+    assert_eq!(read(&b2, "notes.txt.b2"), "v-b2");
+}
+
+#[test]
+fn resolve_all_requires_a_winner_and_asks_first() {
+    let world = World::new();
+    let (config, alpha, b1, _) = three_way_conflict(&world);
+    write(&alpha, "more.txt", "a");
+    write(&b1, "more.txt", "b");
+    cli(&world, &config, &["sync"]);
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "--all", "--keep", "both"],
+    );
+    assert!(!ok && text.contains("choose whose version wins"), "{text}");
+    // Without --yes and with no terminal to answer, it declines.
+    let (_, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "--all", "--keep", "alpha"],
+    );
+    assert!(text.contains("nothing done"), "{text}");
+    assert_eq!(read(&b1, "more.txt"), "b");
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "--all", "--keep", "alpha", "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert_eq!(read(&b1, "more.txt"), "a");
+    assert_eq!(read(&b1, "notes.txt"), "v-alpha");
+}
+
+#[test]
+fn a_group_name_wins_over_a_directory_of_the_same_name() {
+    // The selector is a group name unless it carries a path marker; a bare
+    // word that happens to also name a directory in the working directory
+    // must still select the group.
+    let world = World::new();
+    let (config, _, _, _) = three_way_conflict(&world);
+    let decoy = world.directory("r");
+    let output = std::process::Command::new(agent_binary())
+        .current_dir(decoy.parent().unwrap())
+        .args(["conflicts", "r", "--config"])
+        .arg(&config)
+        .arg("--state-root")
+        .arg(world.state_root())
+        .output()
+        .expect("runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("notes.txt"), "{text}");
+}

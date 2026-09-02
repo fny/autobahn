@@ -314,6 +314,23 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
+    fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        match self.exchange(Request::ReadFile(path.to_owned()))? {
+            Response::File(content) => Ok(content),
+            response => Err(unexpected_response(&response, "read file")),
+        }
+    }
+
+    fn write_file(&mut self, path: &str, content: Option<&[u8]>) -> Result<()> {
+        match self.exchange(Request::WriteFile(
+            path.to_owned(),
+            content.map(|c| c.to_vec()),
+        ))? {
+            Response::Written => Ok(()),
+            response => Err(unexpected_response(&response, "write file")),
+        }
+    }
+
     fn scan_verified(&mut self) -> Result<Snapshot> {
         match self.exchange(Request::ScanVerified)? {
             Response::Scan(snapshot) => {
@@ -434,6 +451,8 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Error(_) => "error",
         Response::ScanDelta(_) => "scan delta",
         Response::ScanOps(_) => "scan operations",
+        Response::File(_) => "file",
+        Response::Written => "written",
     }
 }
 

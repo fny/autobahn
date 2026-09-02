@@ -966,6 +966,60 @@ impl Endpoint for LocalEndpoint {
         self.observer.activity()
     }
 
+    fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
+        let full = resolve_relative(&self.root, path)?;
+        match fs::symlink_metadata(&full) {
+            Ok(metadata) if metadata.file_type().is_file() => fs::read(&full)
+                .map(Some)
+                .with_context(|| format!("unable to read {}", full.display())),
+            Ok(_) => Ok(None),
+            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error).with_context(|| format!("unable to read {}", full.display())),
+        }
+    }
+
+    fn write_file(&mut self, path: &str, content: Option<&[u8]>) -> Result<()> {
+        let full = resolve_relative(&self.root, path)?;
+        // Announced before the write, exactly as a transition's writes are:
+        // a scan racing this must not publish the old bytes as current.
+        self.observer.invalidate([path]);
+        let result = match content {
+            None => match fs::remove_file(&full) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                Err(error) => {
+                    Err(error).with_context(|| format!("unable to remove {}", full.display()))
+                }
+            },
+            Some(bytes) => {
+                let parent = full
+                    .parent()
+                    .ok_or_else(|| anyhow::anyhow!("{path} has no parent directory"))?;
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("unable to create {}", parent.display()))?;
+                // Temporary beside the target, then rename: a reader sees
+                // the old file or the new one, never a partial one.
+                let temporary = parent.join(temporary_name("resolve"));
+                let written = fs::write(&temporary, bytes)
+                    .and_then(|()| {
+                        // The mode is preserved from whatever was there, so a
+                        // resolved script stays executable.
+                        if let Ok(existing) = fs::metadata(&full) {
+                            fs::set_permissions(&temporary, existing.permissions())?;
+                        }
+                        fs::rename(&temporary, &full)
+                    })
+                    .with_context(|| format!("unable to write {}", full.display()));
+                if written.is_err() {
+                    let _ = fs::remove_file(&temporary);
+                }
+                written
+            }
+        };
+        self.observer.invalidate([path]);
+        result
+    }
+
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
         // Validation is performed against the last scan, which the
         // controller's cycle guarantees is the very scan these transitions
@@ -2191,6 +2245,22 @@ fn warn_if_network_filesystem(root: &Path) {
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = root;
+}
+
+/// Joins a root-relative path onto the root, refusing anything that would
+/// leave it: an absolute path, or a `..` component. These paths come from a
+/// controller, which is trusted — but a request that could not possibly be
+/// legitimate is refused rather than obeyed.
+fn resolve_relative(root: &Path, path: &str) -> Result<PathBuf> {
+    let relative = Path::new(path);
+    if relative.is_absolute()
+        || relative
+            .components()
+            .any(|component| !matches!(component, std::path::Component::Normal(_)))
+    {
+        bail!("{path:?} is not a plain root-relative path");
+    }
+    Ok(root.join(relative))
 }
 
 /// Whether a staged file's bytes hash to the digest its name claims. Used

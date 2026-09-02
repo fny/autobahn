@@ -136,10 +136,17 @@ echo "  beta:  $(cat "$BETA/notes.txt")"
 narrate "# and the unrelated file propagated anyway:"
 echo "  beta/unrelated.txt: $(cat "$BETA/unrelated.txt" 2>/dev/null || echo '(missing)')"
 
-chapter "resolving it" \
-        "Make the two sides agree; the next cycle records the agreement."
-narrate "cp alpha/notes.txt beta/notes.txt"
-cp "$ALPHA/notes.txt" "$BETA/notes.txt"
+chapter "autobahn conflicts" \
+        "Every conflict, with what each side holds."
+show "$BINARY" conflicts --config "$CONFIG" --state-root "$STATE"
+
+chapter "autobahn diff" \
+        "The two sides of the file — addressed by its path, from anywhere."
+show "$BINARY" diff "$ALPHA/notes.txt" --config "$CONFIG" --state-root "$STATE"
+
+chapter "autobahn resolve" \
+        "Choose a winner; its version is put on every side, and the next cycle records the agreement."
+show "$BINARY" resolve "$ALPHA/notes.txt" --keep alpha --config "$CONFIG" --state-root "$STATE"
 pause_briefly 5
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 

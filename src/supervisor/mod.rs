@@ -52,6 +52,30 @@ const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 /// The recorded state of one supervised session, as persisted to its status
 /// file after every attempt.
+/// One side of a conflict, as of the cycle that reported it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConflictSide {
+    /// Whether anything exists at the path on this side.
+    pub present: bool,
+    /// The kind of entry: "file", "directory", "symlink", or "" when absent.
+    pub kind: String,
+    /// The file's size in bytes, for a file.
+    pub size: u64,
+    /// The file's modification time in seconds since the epoch, for a file.
+    pub mtime_seconds: i64,
+}
+
+/// A conflict, with what each side held.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ConflictDetail {
+    /// The root-relative path.
+    pub path: String,
+    /// Alpha's side.
+    pub alpha: ConflictSide,
+    /// Beta's side.
+    pub beta: ConflictSide,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SessionStatus {
     /// The group the session belongs to.
@@ -76,6 +100,11 @@ pub struct SessionStatus {
     pub last_beta_transitions: usize,
     /// The root paths of any conflicts reported by the most recent cycle.
     pub conflicts: Vec<String>,
+    /// What each side held at each conflict, as of the cycle that reported
+    /// it — so `conflicts` can describe the sides without connecting to
+    /// them. Absent in records written before this field existed.
+    #[serde(default)]
+    pub conflict_details: Vec<ConflictDetail>,
     /// Any problems reported by the most recent cycle, as `side path:
     /// message` strings.
     pub problems: Vec<String>,
@@ -476,6 +505,7 @@ impl<'a> Worker<'a> {
             last_alpha_transitions: 0,
             last_beta_transitions: 0,
             conflicts: Vec::new(),
+            conflict_details: Vec::new(),
             problems: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
@@ -518,6 +548,7 @@ impl<'a> Worker<'a> {
             last_alpha_transitions: 0,
             last_beta_transitions: 0,
             conflicts: Vec::new(),
+            conflict_details: Vec::new(),
             problems: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
@@ -531,6 +562,7 @@ impl<'a> Worker<'a> {
                     .iter()
                     .map(|conflict| conflict.root.clone())
                     .collect();
+                status.conflict_details = report.conflicts.iter().map(conflict_detail).collect();
                 status.problems = problem_lines(report);
                 status.state = if !status.conflicts.is_empty() {
                     "conflicts".into()
@@ -634,6 +666,28 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
     // pointed at different state directories cannot own the same trees.
     let pair_lock =
         crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
+    let (alpha, beta) = open_endpoints(plan, state_root, pool)?;
+    let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
+    session.hold(pair_lock);
+    session.set_power_durability(plan.power_durability);
+    Ok(session)
+}
+
+/// Opens a plan's two endpoints without taking its session lock.
+///
+/// The supervisor takes the lock first and then calls this; `resolve` and
+/// `diff` call it alone, because they operate *beside* a running session —
+/// reading and writing individual files through the same endpoints, in the
+/// way any other program writing to the tree would — rather than owning
+/// the pair. The identity check is the same: a root that no longer
+/// resolves to the tree it was planned against is refused.
+pub fn open_endpoints(
+    plan: &SessionPlan,
+    state_root: &Path,
+    pool: &AgentPool,
+) -> Result<(Box<dyn Endpoint + Send>, Box<dyn Endpoint + Send>)> {
+    let identifier = plan.identifier();
+    let state_directory = state_root.join("sessions").join(&identifier);
 
     // The identity was resolved when the plan was built; between then and
     // now a symlink along the path can have been retargeted, and connecting
@@ -749,10 +803,55 @@ fn connect(plan: &SessionPlan, state_root: &Path, pool: &AgentPool) -> Result<Se
 
     let alpha = endpoint(&plan.alpha, "alpha")?;
     let beta = endpoint(&plan.beta, "beta")?;
-    let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
-    session.hold(pair_lock);
-    session.set_power_durability(plan.power_durability);
-    Ok(session)
+    Ok((alpha, beta))
+}
+
+/// Describes a conflict's sides from the changes reconciliation recorded
+/// for it: the newest node each side's changes carry at the conflict's
+/// root, or absence.
+fn conflict_detail(conflict: &crate::tree::Conflict) -> ConflictDetail {
+    use crate::tree::{Change, Content};
+    let side = |changes: &[Change]| -> ConflictSide {
+        // The change at the conflict root itself describes the side; a
+        // conflict rooted at a directory carries changes beneath it, and
+        // the root's own entry is what the reader wants to see.
+        let node = changes
+            .iter()
+            .find(|change| change.path == conflict.root)
+            .or_else(|| changes.first())
+            .and_then(|change| change.new.as_ref());
+        match node {
+            None => ConflictSide::default(),
+            Some(node) => match &node.content {
+                Content::File { metadata, .. } => ConflictSide {
+                    present: true,
+                    kind: "file".into(),
+                    size: metadata.size,
+                    mtime_seconds: metadata.mtime_seconds,
+                },
+                Content::Directory(_) => ConflictSide {
+                    present: true,
+                    kind: "directory".into(),
+                    ..Default::default()
+                },
+                Content::Symlink { .. } => ConflictSide {
+                    present: true,
+                    kind: "symlink".into(),
+                    ..Default::default()
+                },
+                _ => ConflictSide {
+                    present: true,
+                    kind: "other".into(),
+                    ..Default::default()
+                },
+            },
+        }
+    };
+    ConflictDetail {
+        path: conflict.root.clone(),
+        alpha: side(&conflict.alpha_changes),
+        beta: side(&conflict.beta_changes),
+    }
 }
 
 /// Flattens a cycle report's problems into labeled lines.
@@ -1146,6 +1245,7 @@ mod tests {
             last_alpha_transitions: 1,
             last_beta_transitions: 2,
             conflicts: vec!["path/to/conflict".into()],
+            conflict_details: Vec::new(),
             problems: vec!["beta x: denied".into()],
             error: None,
             updated_at: 12345,

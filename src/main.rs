@@ -243,6 +243,80 @@ enum Command {
     /// Stop and start the login service — after a configuration edit, or an
     /// upgrade.
     Restart,
+    /// List every conflict, with what each side holds and how to resolve it.
+    Conflicts {
+        /// A group name, or a folder (`.`, an absolute path, a `~` path)
+        /// inside a synchronized root. Omit for every group.
+        selector: Option<String>,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Show how the two sides of a file differ.
+    ///
+    /// The file may be named by a filesystem path inside a synchronized
+    /// root (`autobahn diff ./src/main.rs`), or by group and root-relative
+    /// path (`autobahn diff project src/main.rs`). With several
+    /// destinations, name one with --host; otherwise each is shown.
+    Diff {
+        /// A group name, or a path — to the file itself, or to a folder
+        /// inside a synchronized root.
+        selector: String,
+        /// The root-relative path, when the selector was a group or folder.
+        path: Option<String>,
+        /// The destination to compare against (defaults to every one).
+        #[arg(long)]
+        host: Option<String>,
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Resolve conflicts by choosing which side's version wins.
+    ///
+    /// The winner is named by what `status` calls it: `alpha`, or a
+    /// destination's host (or local path). Its content is put on alpha and
+    /// every other destination, so one command settles a conflict across
+    /// a whole fan-out. `both` keeps the winner in place and renames the
+    /// other side's version aside as `<name>.<side>` before propagating.
+    ///
+    /// Resolution makes the sides agree; the next cycle records the
+    /// agreement and the conflict is gone. Nothing here touches the
+    /// ancestor.
+    Resolve {
+        /// A group name, or a path — to the conflicting file itself, or to a
+        /// folder inside a synchronized root.
+        selector: String,
+        /// The root-relative path, when the selector was a group or folder.
+        path: Option<String>,
+        /// Whose version wins: `alpha`, a destination host or path, or
+        /// `both`.
+        #[arg(long)]
+        keep: String,
+        /// Resolve every conflict in the selected sessions the same way.
+        /// Shows the list and asks first, unless --yes.
+        #[arg(long)]
+        all: bool,
+        /// With --all, do not ask.
+        #[arg(long)]
+        yes: bool,
+        /// Filter to a destination within the group.
+        #[arg(long)]
+        host: Option<String>,
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Remove state left behind by sessions the configuration no longer
     /// describes: their ancestors, status records, staged content, and
     /// endpoint locks. State for a running session is never touched, and
@@ -349,6 +423,29 @@ fn main() {
             state_root,
             "reset",
         ),
+        Command::Conflicts {
+            selector,
+            host,
+            config,
+            state_root,
+        } => run_conflicts(config, state_root, selector, host),
+        Command::Diff {
+            selector,
+            path,
+            host,
+            config,
+            state_root,
+        } => run_diff(config, state_root, selector, path, host),
+        Command::Resolve {
+            selector,
+            path,
+            keep,
+            all,
+            yes,
+            host,
+            config,
+            state_root,
+        } => run_resolve(config, state_root, selector, path, keep, all, yes, host),
         Command::Clean {
             config,
             state_root,
@@ -860,6 +957,455 @@ fn strip_escapes(text: &str) -> String {
     out
 }
 
+/// What a selector picked out: the sessions, and — when the selector was a
+/// path *inside* a synchronized root — the root-relative remainder.
+struct Selection<'a> {
+    plans: Vec<&'a autobahn::config::SessionPlan>,
+    /// The path's remainder below the alpha root, when the selector was a
+    /// path deeper than the root itself. `Some("")` never occurs; the root
+    /// itself yields `None`.
+    relative: Option<String>,
+}
+
+/// Selects sessions by group name or by folder.
+///
+/// A selector that looks like a path — starting with `.`, `/`, or `~`, or
+/// naming something that exists — is resolved to its physical identity and
+/// matched against each group's alpha by *containment*, so a folder or
+/// file inside a synchronized root selects the group covering it. That is
+/// what lets every command that takes a selector answer from wherever the
+/// caller happens to be standing, and what lets `diff` and `resolve` be
+/// pointed at a file directly. Anything else is a group name.
+fn select<'a>(
+    plans: &'a [autobahn::config::SessionPlan],
+    selector: Option<&str>,
+    host: Option<&str>,
+) -> Result<Selection<'a>> {
+    let folder = selector.and_then(|selector| {
+        // An explicit path marker always means a path. A bare word is a
+        // group name if one matches — a group called `rr` must stay
+        // addressable from a directory that also contains an `rr` — and is
+        // tried as a path only when no group has that name.
+        let explicit =
+            selector.starts_with('.') || selector.starts_with('/') || selector.starts_with('~');
+        let is_group = plans.iter().any(|plan| plan.group == selector);
+        let looks_like_path = explicit || (!is_group && std::path::Path::new(selector).exists());
+        if !looks_like_path {
+            return None;
+        }
+        let expanded = paths::expand_tilde(selector).ok()?;
+        Some(paths::resolve_for_identity(&expanded))
+    });
+    let mut relative = None;
+    let selected: Vec<&autobahn::config::SessionPlan> = plans
+        .iter()
+        .filter(|plan| match (&folder, selector) {
+            (Some(folder), _) => {
+                let alpha = std::path::Path::new(&plan.alpha_identity);
+                if folder == alpha {
+                    true
+                } else if let Ok(rest) = folder.strip_prefix(alpha) {
+                    relative = Some(rest.to_string_lossy().into_owned());
+                    true
+                } else {
+                    false
+                }
+            }
+            (None, Some(group)) => plan.group == group,
+            (None, None) => true,
+        })
+        .collect();
+    let before_host = selected.len();
+    // A destination is named as status prints it: a host name, or for a
+    // local beta its path — which may be spelled with ~ or relatively, so
+    // a path-looking name is compared by identity rather than text.
+    let host_identity = host.and_then(|host| {
+        let looks_like_path =
+            host.starts_with('.') || host.starts_with('/') || host.starts_with('~');
+        if !looks_like_path {
+            return None;
+        }
+        let expanded = paths::expand_tilde(host).ok()?;
+        Some(
+            paths::resolve_for_identity(&expanded)
+                .to_string_lossy()
+                .into_owned(),
+        )
+    });
+    let selected: Vec<&autobahn::config::SessionPlan> = selected
+        .into_iter()
+        .filter(|plan| {
+            host.is_none_or(|host| {
+                plan.host == host
+                    || plan.beta_spec() == host
+                    || host_identity.as_deref() == Some(plan.beta_identity.as_str())
+            })
+        })
+        .collect();
+    if selected.is_empty() {
+        match (&folder, selector, host) {
+            (_, _, Some(host)) if before_host > 0 => bail!(
+                "no destination named {host:?} in the selected group (destinations are named \
+                 as `autobahn status` shows them)"
+            ),
+            (Some(folder), _, _) => bail!(
+                "no configured group synchronizes {} (or anything containing it)",
+                folder.display()
+            ),
+            (None, Some(group), Some(host)) => {
+                bail!("no configured session matches {group}@{host}")
+            }
+            (None, Some(group), None) => bail!("no configured group named '{group}'"),
+            _ => bail!("the configuration describes no sessions"),
+        }
+    }
+    Ok(Selection {
+        plans: selected,
+        relative,
+    })
+}
+
+/// The root-relative path a command was given: explicitly, or as the
+/// remainder of a path selector.
+fn relative_path(selection: &Selection, explicit: Option<String>) -> Result<String> {
+    match (explicit, &selection.relative) {
+        (Some(path), _) => Ok(path
+            .trim_start_matches("./")
+            .trim_end_matches('/')
+            .to_owned()),
+        (None, Some(rest)) => Ok(rest.clone()),
+        (None, None) => bail!(
+            "name the file: a root-relative path after the group, or a path to the file itself"
+        ),
+    }
+}
+
+/// Lists every conflict with what each side holds.
+fn run_conflicts(
+    config: Option<PathBuf>,
+    state_root: Option<PathBuf>,
+    selector: Option<String>,
+    host: Option<String>,
+) -> Result<()> {
+    let plans = load_config(config)?.plans()?;
+    let state_root = resolve_state_root(state_root)?;
+    let selection = select(&plans, selector.as_deref(), host.as_deref())?;
+
+    let mut total = 0;
+    let mut current_group: Option<&str> = None;
+    for plan in &selection.plans {
+        let Some(status) = read_status(&state_root, &plan.identifier())? else {
+            continue;
+        };
+        if status.conflicts.is_empty() {
+            continue;
+        }
+        if current_group != Some(plan.group.as_str()) {
+            if current_group.is_some() {
+                println!();
+            }
+            current_group = Some(plan.group.as_str());
+            println!(
+                "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
+                plan.alpha_spec, plan.group
+            );
+        }
+        println!("  {}", plan.beta_spec());
+        for path in &status.conflicts {
+            total += 1;
+            let detail = status
+                .conflict_details
+                .iter()
+                .find(|detail| &detail.path == path);
+            println!("    {path}");
+            if let Some(detail) = detail {
+                let describe = |side: &autobahn::supervisor::ConflictSide| -> String {
+                    if !side.present {
+                        return "absent".to_owned();
+                    }
+                    match side.kind.as_str() {
+                        "file" => format!(
+                            "{}, modified {}",
+                            format_size(side.size),
+                            format_age(side.mtime_seconds.max(0) as u64)
+                        ),
+                        kind => kind.to_owned(),
+                    }
+                };
+                println!("      alpha  {}", describe(&detail.alpha));
+                println!("      {:<6} {}", plan.host, describe(&detail.beta));
+            }
+        }
+        println!(
+            "    → autobahn resolve {} <path> --keep alpha|{}|both",
+            plan.group, plan.host
+        );
+    }
+    if total == 0 {
+        println!("no conflicts");
+    }
+    Ok(())
+}
+
+/// Shows how the two sides of one file differ, with the system's diff.
+fn run_diff(
+    config: Option<PathBuf>,
+    state_root: Option<PathBuf>,
+    selector: String,
+    path: Option<String>,
+    host: Option<String>,
+) -> Result<()> {
+    let plans = load_config(config)?.plans()?;
+    let state_root = resolve_state_root(state_root)?;
+    let selection = select(&plans, Some(&selector), host.as_deref())?;
+    let path = relative_path(&selection, path)?;
+    let pool = autobahn::transport::mux::AgentPool::default();
+
+    // A scratch directory of our own, removed on exit; the dev-dependency
+    // on tempfile is not available to the binary.
+    let scratch = std::env::temp_dir().join(format!("autobahn-diff-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).context("unable to create a scratch directory")?;
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let scratch = Scratch(scratch);
+    let mut shown = 0;
+    for plan in &selection.plans {
+        let (mut alpha, mut beta) = autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
+        let a = alpha.read_file(&path)?;
+        let b = beta.read_file(&path)?;
+        if a == b {
+            println!("{}: identical on alpha and {}", path, plan.host);
+            continue;
+        }
+        shown += 1;
+        let write = |name: &str, content: &Option<Vec<u8>>| -> Result<PathBuf> {
+            let file = scratch.0.join(name);
+            std::fs::write(&file, content.as_deref().unwrap_or(b""))
+                .with_context(|| format!("unable to write {}", file.display()))?;
+            Ok(file)
+        };
+        let left = write("alpha", &a)?;
+        let right = write(&plan.host.replace('/', "_"), &b)?;
+        // The labels name the sides, not the scratch files.
+        let status = std::process::Command::new("diff")
+            .args(["-u", "--label", &format!("alpha/{path}"), "--label"])
+            .arg(format!("{}/{path}", plan.host))
+            .arg(&left)
+            .arg(&right)
+            .status()
+            .context("unable to run diff")?;
+        // diff exits 1 when the files differ, which is the expected case;
+        // 2 is a real failure.
+        if status.code() == Some(2) {
+            bail!("diff failed for {path}");
+        }
+        if a.is_none() || b.is_none() {
+            println!(
+                "({} on {})",
+                if a.is_none() { "absent" } else { "present" },
+                if a.is_none() { "alpha" } else { &plan.host }
+            );
+        }
+    }
+    let _ = shown;
+    Ok(())
+}
+
+/// Resolves conflicts by putting the winner's version on every other side.
+#[allow(clippy::too_many_arguments)]
+fn run_resolve(
+    config: Option<PathBuf>,
+    state_root: Option<PathBuf>,
+    selector: String,
+    path: Option<String>,
+    keep: String,
+    all: bool,
+    yes: bool,
+    host: Option<String>,
+) -> Result<()> {
+    let plans = load_config(config)?.plans()?;
+    let state_root = resolve_state_root(state_root)?;
+    let selection = select(&plans, Some(&selector), host.as_deref())?;
+    let group = selection.plans[0].group.clone();
+    if selection.plans.iter().any(|plan| plan.group != group) {
+        bail!("resolve works within one group; the selector matched several");
+    }
+
+    // The winner: alpha, both, or one of this group's destinations by the
+    // name status prints for it.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Winner {
+        Alpha,
+        Both,
+        Beta(usize),
+    }
+    let winner = match keep.as_str() {
+        "alpha" => Winner::Alpha,
+        "both" => Winner::Both,
+        other => {
+            let all_in_group: Vec<&autobahn::config::SessionPlan> =
+                plans.iter().filter(|plan| plan.group == group).collect();
+            let matches: Vec<usize> = all_in_group
+                .iter()
+                .enumerate()
+                .filter(|(_, plan)| plan.host == other || plan.beta_spec() == other)
+                .map(|(index, _)| index)
+                .collect();
+            match matches.as_slice() {
+                [index] => Winner::Beta(*index),
+                [] => bail!(
+                    "--keep {other:?} names no destination of group '{group}'; expected \
+                     alpha, both, or one of: {}",
+                    all_in_group
+                        .iter()
+                        .map(|plan| plan.host.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+                _ => bail!("--keep {other:?} is ambiguous; name the destination as host:path"),
+            }
+        }
+    };
+
+    // Which paths, in which sessions.
+    let mut targets: Vec<(&autobahn::config::SessionPlan, Vec<String>)> = Vec::new();
+    if all {
+        for plan in &selection.plans {
+            if let Some(status) = read_status(&state_root, &plan.identifier())? {
+                if !status.conflicts.is_empty() {
+                    targets.push((plan, status.conflicts.clone()));
+                }
+            }
+        }
+        if targets.is_empty() {
+            println!("no conflicts to resolve");
+            return Ok(());
+        }
+        if winner == Winner::Both {
+            bail!("--all cannot keep both: choose whose version wins");
+        }
+        println!("about to resolve, keeping {keep}:");
+        for (plan, conflicts) in &targets {
+            for path in conflicts {
+                println!("  {}  {path}", plan.display());
+            }
+        }
+        if !yes {
+            print!("proceed? [y/N] ");
+            use std::io::Write;
+            std::io::stdout().flush().ok();
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer).ok();
+            if !matches!(answer.trim(), "y" | "Y" | "yes") {
+                println!("nothing done");
+                return Ok(());
+            }
+        }
+    } else {
+        let path = relative_path(&selection, path)?;
+        targets = selection
+            .plans
+            .iter()
+            .map(|plan| (*plan, vec![path.clone()]))
+            .collect();
+    }
+
+    // Every session in the group is opened, because the winner's content
+    // must reach every destination — including sessions the selector did
+    // not name, when the winner is one destination and the path conflicts
+    // on another.
+    let pool = autobahn::transport::mux::AgentPool::default();
+    let group_plans: Vec<&autobahn::config::SessionPlan> =
+        plans.iter().filter(|plan| plan.group == group).collect();
+    let mut endpoints = Vec::new();
+    for plan in &group_plans {
+        endpoints.push(autobahn::supervisor::open_endpoints(
+            plan,
+            &state_root,
+            &pool,
+        )?);
+    }
+
+    let paths: std::collections::BTreeSet<String> = targets
+        .iter()
+        .flat_map(|(_, paths)| paths.iter().cloned())
+        .collect();
+    for path in &paths {
+        // Read the winner.
+        let content = match winner {
+            Winner::Alpha | Winner::Both => endpoints[0].0.read_file(path)?,
+            Winner::Beta(index) => endpoints[index].1.read_file(path)?,
+        };
+        let winner_name = match winner {
+            Winner::Alpha | Winner::Both => "alpha".to_owned(),
+            Winner::Beta(index) => group_plans[index].host.clone(),
+        };
+        // Write it everywhere else, keeping the loser aside when asked. Alpha
+        // is written first, so a session that cycles between writes sees
+        // alpha already agreeing with the winner.
+        if !matches!(winner, Winner::Alpha | Winner::Both) {
+            endpoints[0].0.write_file(path, content.as_deref())?;
+        }
+        for (index, plan) in group_plans.iter().enumerate() {
+            if matches!(winner, Winner::Beta(w) if w == index) {
+                continue;
+            }
+            // Only sessions where this path actually conflicts are touched;
+            // a destination that already agrees with alpha is left alone.
+            let conflicts_here = targets.iter().any(|(target, paths)| {
+                target.identifier() == plan.identifier() && paths.contains(path)
+            });
+            if !conflicts_here && winner != Winner::Both {
+                continue;
+            }
+            if winner == Winner::Both {
+                if let Some(losing) = endpoints[index].1.read_file(path)? {
+                    if Some(&losing) != content.as_ref() {
+                        // The suffix names the side in the shortest form
+                        // that still identifies it: a host name as is, a
+                        // local path by its last component.
+                        let suffix = std::path::Path::new(&plan.host)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| plan.host.clone());
+                        let aside = format!("{path}.{suffix}");
+                        endpoints[index].1.write_file(&aside, Some(&losing))?;
+                        println!("  {}: kept {} as {aside}", plan.host, path);
+                    }
+                }
+            }
+            endpoints[index].1.write_file(path, content.as_deref())?;
+        }
+        println!(
+            "resolved {path}: {} version {}",
+            winner_name,
+            if content.is_some() {
+                "put on every side"
+            } else {
+                "removed from every side"
+            }
+        );
+    }
+
+    // A running supervisor picks the writes up through its watchers; a
+    // flush makes the agreement get recorded now rather than at the next
+    // heartbeat.
+    if autobahn::supervisor::control::supervisor_is_running(&state_root) {
+        let _ = autobahn::supervisor::control::send(
+            &state_root,
+            &ControlRequest::Flush(Selector {
+                group: Some(group),
+                host: None,
+            }),
+        );
+    }
+    Ok(())
+}
+
 /// Removes state belonging to sessions the configuration no longer
 /// describes.
 ///
@@ -1077,49 +1623,8 @@ fn run_status(
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
 
-    // The selector is a group name or a folder. A folder is resolved to its
-    // physical identity and matched against each group's alpha — by
-    // containment, not equality, so the selector can be a directory *inside*
-    // a synchronized root. That is what makes `autobahn status .` useful
-    // from anywhere in a project rather than only at its top.
-    let folder = group.as_deref().and_then(|selector| {
-        let looks_like_path = selector.starts_with('.')
-            || selector.starts_with('/')
-            || selector.starts_with('~')
-            || std::path::Path::new(selector).is_dir();
-        if !looks_like_path {
-            return None;
-        }
-        let expanded = paths::expand_tilde(selector).ok()?;
-        Some(paths::resolve_for_identity(&expanded))
-    });
-    let covers = |plan: &autobahn::config::SessionPlan, folder: &std::path::Path| -> bool {
-        let alpha = std::path::Path::new(&plan.alpha_identity);
-        folder == alpha || folder.starts_with(alpha)
-    };
-
-    let selected: Vec<_> = plans
-        .iter()
-        .filter(|plan| match (&folder, group.as_deref()) {
-            (Some(folder), _) => covers(plan, folder),
-            (None, Some(group)) => plan.group == group,
-            (None, None) => true,
-        })
-        .filter(|plan| host.as_deref().is_none_or(|host| plan.host == host))
-        .collect();
-    if selected.is_empty() {
-        match (&folder, &group, &host) {
-            (Some(folder), _, _) => bail!(
-                "no configured group synchronizes {} (or anything containing it)",
-                folder.display()
-            ),
-            (None, Some(group), Some(host)) => {
-                bail!("no configured session matches {group}@{host}")
-            }
-            (None, Some(group), None) => bail!("no configured group named '{group}'"),
-            _ => bail!("the configuration describes no sessions"),
-        }
-    }
+    let selection = select(&plans, group.as_deref(), host.as_deref())?;
+    let selected: Vec<_> = selection.plans;
 
     let mut out = String::new();
     render_status(&selected, &state_root, expand_conflicts, &mut out);

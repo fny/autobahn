@@ -176,6 +176,30 @@ autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
 ```
 
+When two sides disagree about a file, `status` names it and these three
+settle it:
+
+```sh
+autobahn conflicts                  # every conflict, with what each side holds
+autobahn conflicts ~/project        # ...for whatever group syncs that folder
+autobahn diff ./src/main.rs         # the two sides of a file, as a unified diff
+autobahn diff project src/main.rs   # same file, by group and root-relative path
+
+autobahn resolve ./src/main.rs --keep alpha       # my version wins, everywhere
+autobahn resolve project src/main.rs --keep boite # boite's version wins, everywhere
+autobahn resolve project src/main.rs --keep both  # keep alpha's; the loser is
+                                                  # renamed aside as main.rs.boite
+autobahn resolve ~/project --all --keep boite     # every conflict in the group,
+                                                  # after showing the list and asking
+```
+
+A winner is named as `status` names it: `alpha`, or a destination's host
+(or path). Its version is put on alpha and on every other destination,
+so one command settles a conflict across a whole fan-out — including
+destinations whose own conflict was with a *third* version. Resolution
+makes the sides agree; the next cycle records the agreement and the
+conflict is gone. Nothing here touches the ancestor.
+
 `scripts/mi` runs a guided tour of all of this against throwaway
 directories — every command, and every state a session can report,
 printed as the binary actually produces them.

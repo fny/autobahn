@@ -867,4 +867,80 @@ mod tests {
         drop(pool);
         assert_clean_exit(&finished);
     }
+
+    /// The agent reads and writes single files on request — atomically
+    /// for readers, and never outside its root.
+    #[test]
+    fn an_agent_reads_and_writes_single_files_within_its_root() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).expect("root should be creatable");
+        std::fs::write(root.join("sub/a.txt"), b"before").expect("writes");
+        let outside = keep.path().join("outside.txt");
+        std::fs::write(&outside, b"secret").expect("writes");
+
+        let (client, finished) = spawned_agent();
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        let mut channel = connection.open(initialize(&root)).expect("open");
+
+        match channel
+            .exchange(Request::ReadFile("sub/a.txt".into()))
+            .expect("read")
+        {
+            Response::File(Some(bytes)) => assert_eq!(bytes, b"before"),
+            other => panic!("unexpected {other:?}"),
+        }
+        match channel
+            .exchange(Request::ReadFile("missing.txt".into()))
+            .expect("read")
+        {
+            Response::File(None) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        match channel
+            .exchange(Request::WriteFile(
+                "sub/a.txt".into(),
+                Some(b"after".to_vec()),
+            ))
+            .expect("write")
+        {
+            Response::Written => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(std::fs::read(root.join("sub/a.txt")).unwrap(), b"after");
+        match channel
+            .exchange(Request::WriteFile("sub/a.txt".into(), None))
+            .expect("remove")
+        {
+            Response::Written => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!root.join("sub/a.txt").exists());
+
+        // Escaping the root is refused, both ways.
+        for path in ["../outside.txt", "/etc/passwd"] {
+            match channel
+                .exchange(Request::ReadFile(path.into()))
+                .expect("exchange")
+            {
+                Response::Error(message) => assert!(message.contains("root-relative"), "{message}"),
+                other => panic!("{path}: unexpected {other:?}"),
+            }
+        }
+        match channel
+            .exchange(Request::WriteFile(
+                "../outside.txt".into(),
+                Some(b"x".to_vec()),
+            ))
+            .expect("exchange")
+        {
+            Response::Error(_) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
+
+        drop(channel);
+        drop(connection);
+        assert_clean_exit(&finished);
+    }
 }

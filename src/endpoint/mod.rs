@@ -231,6 +231,20 @@ pub trait Endpoint: Send {
         Ok(false)
     }
 
+    /// Reads one regular file's content by root-relative path, `None` when
+    /// there is no regular file there. For looking at a conflict's sides;
+    /// not a synchronization primitive.
+    fn read_file(&mut self, _path: &str) -> Result<Option<Vec<u8>>> {
+        anyhow::bail!("this endpoint cannot read individual files")
+    }
+
+    /// Replaces one file's content by root-relative path (`None` removes
+    /// it), atomically with respect to readers. For making a conflict's
+    /// sides agree; not a synchronization primitive.
+    fn write_file(&mut self, _path: &str, _content: Option<&[u8]>) -> Result<()> {
+        anyhow::bail!("this endpoint cannot write individual files")
+    }
+
     /// A monotone measure of how much change this endpoint has recorded but
     /// not yet had consumed by a scan, used to tell a burst of writes from a
     /// single one. Two samples that agree mean nothing arrived in between.

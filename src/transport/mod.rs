@@ -705,6 +705,25 @@ const FRAME_UNCOMPRESSED: u8 = 0;
 /// decompressed length).
 const FRAME_COMPRESSED: u8 = 1;
 
+/// The flag bit marking a frame as one piece of a larger message, with
+/// more pieces to follow. A message whose encoding exceeds
+/// [`FRAME_CHUNK_SIZE`] is sent as a sequence of frames carrying this bit,
+/// ending with one that does not; the reader concatenates the bodies.
+///
+/// The per-frame cap therefore bounds a *frame* — its job, defending
+/// against a corrupt or hostile length prefix — while [`MAXIMUM_MESSAGE_SIZE`]
+/// bounds what a sequence may reassemble to. Before this, the frame cap
+/// was also a ceiling on message size, which made it a ceiling on tree
+/// size: a staging request or a transition over a large tree is one list,
+/// and a large enough list could not be sent at all.
+const FRAME_MORE: u8 = 2;
+
+/// The encoded size above which a message is split into frames.
+const FRAME_CHUNK_SIZE: usize = 16 * 1024 * 1024;
+
+/// The largest message a sequence of frames may reassemble to.
+const MAXIMUM_MESSAGE_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
 /// The encoded size below which compression isn't attempted: tiny frames
 /// (bare requests, acknowledgements) can't compress meaningfully and would
 /// only pay the header.
@@ -758,14 +777,47 @@ fn assemble_and_write<W: Write, T: Serialize>(
 ) -> Result<()> {
     scratch.encoded.clear();
     bincode::serialize_into(&mut scratch.encoded, message).context("unable to encode frame")?;
-    let encoded = &scratch.encoded;
-    if encoded.len() > protocol::MAXIMUM_FRAME_SIZE as usize {
+    if scratch.encoded.len() > MAXIMUM_MESSAGE_SIZE {
         bail!(
-            "outgoing frame of {} bytes exceeds the maximum frame size of {} bytes",
-            encoded.len(),
-            protocol::MAXIMUM_FRAME_SIZE
+            "outgoing message of {} bytes exceeds the maximum message size of {} bytes",
+            scratch.encoded.len(),
+            MAXIMUM_MESSAGE_SIZE
         );
     }
+    // A message larger than one chunk goes as several frames, each marked
+    // "more follows" except the last. The scratch buffers are split
+    // temporarily so a chunk can be compressed into `compressed` while the
+    // encoding is read from `encoded`.
+    let encoded = std::mem::take(&mut scratch.encoded);
+    let mut result = Ok(());
+    let chunks = if encoded.is_empty() {
+        1
+    } else {
+        encoded.len().div_ceil(FRAME_CHUNK_SIZE)
+    };
+    for (index, chunk) in encoded.chunks(FRAME_CHUNK_SIZE.max(1)).enumerate() {
+        let more = index + 1 < chunks;
+        result = write_chunk(writer, chunk, more, scratch);
+        if result.is_err() {
+            break;
+        }
+    }
+    if encoded.is_empty() {
+        result = write_chunk(writer, &[], false, scratch);
+    }
+    scratch.encoded = encoded;
+    result
+}
+
+/// Writes one frame carrying `encoded` (a whole message, or a chunk of
+/// one when `more` is set).
+fn write_chunk<W: Write>(
+    writer: &mut W,
+    encoded: &[u8],
+    more: bool,
+    scratch: &mut FrameScratch,
+) -> Result<()> {
+    let more_bit = if more { FRAME_MORE } else { 0 };
 
     // Compress when it actually helps: the payload carries a flag byte
     // declaring which form it took, so the reader never guesses (and a
@@ -780,7 +832,7 @@ fn assemble_and_write<W: Write, T: Serialize>(
     // framed cannot drift apart. Each returns the body to write beside it.
     let uncompressed = |header: &mut [u8; 9]| -> usize {
         header[..4].copy_from_slice(&((encoded.len() + 1) as u32).to_le_bytes());
-        header[4] = FRAME_UNCOMPRESSED;
+        header[4] = FRAME_UNCOMPRESSED | more_bit;
         5
     };
     let (header_len, body): (usize, &[u8]) = if encoded.len() >= COMPRESSION_THRESHOLD {
@@ -795,7 +847,7 @@ fn assemble_and_write<W: Write, T: Serialize>(
             .context("unable to compress frame")?;
         if size + COMPRESSED_HEADER_SIZE < encoded.len() {
             header[..4].copy_from_slice(&((size + COMPRESSED_HEADER_SIZE) as u32).to_le_bytes());
-            header[4] = FRAME_COMPRESSED;
+            header[4] = FRAME_COMPRESSED | more_bit;
             header[5..9].copy_from_slice(&(encoded.len() as u32).to_le_bytes());
             (9, &scratch.compressed[..size])
         } else {
@@ -827,6 +879,30 @@ fn receive_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T> {
 /// validated against the frame cap *before* any allocation, so a hostile
 /// header can't induce one.
 fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
+    let Some((mut message, mut more)) = read_chunk(reader)? else {
+        return Ok(None);
+    };
+    while more {
+        // End-of-stream inside a sequence is a truncated message, not a
+        // clean close.
+        let Some((chunk, further)) = read_chunk(reader)? else {
+            bail!("connection closed in the middle of a message");
+        };
+        if message.len() + chunk.len() > MAXIMUM_MESSAGE_SIZE {
+            bail!(
+                "incoming message exceeds the maximum message size of {} bytes",
+                MAXIMUM_MESSAGE_SIZE
+            );
+        }
+        message.extend_from_slice(&chunk);
+        more = further;
+    }
+    Ok(Some(message))
+}
+
+/// Reads one frame, returning its body and whether more frames of the same
+/// message follow.
+fn read_chunk<R: Read>(reader: &mut R) -> Result<Option<(Vec<u8>, bool)>> {
     let mut prefix = [0u8; 4];
     match reader.read_exact(&mut prefix) {
         Ok(()) => {}
@@ -850,8 +926,13 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
         Err(error) => return Err(error).context("unable to read frame payload"),
     }
 
-    match payload.split_first() {
-        Some((&FRAME_UNCOMPRESSED, body)) => {
+    let Some((&flag, _)) = payload.split_first() else {
+        bail!("empty frame");
+    };
+    let more = flag & FRAME_MORE != 0;
+    let flag = flag & !FRAME_MORE;
+    match payload.split_first().map(|(_, body)| (flag, body)) {
+        Some((FRAME_UNCOMPRESSED, body)) => {
             // The outer length admits the compressed header's overhead; an
             // uncompressed body must still respect the frame cap itself.
             if body.len() > protocol::MAXIMUM_FRAME_SIZE as usize {
@@ -861,9 +942,9 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
                     protocol::MAXIMUM_FRAME_SIZE
                 );
             }
-            Ok(Some(body.to_vec()))
+            Ok(Some((body.to_vec(), more)))
         }
-        Some((&FRAME_COMPRESSED, rest)) => {
+        Some((FRAME_COMPRESSED, rest)) => {
             if rest.len() < 4 {
                 bail!("compressed frame is missing its length header");
             }
@@ -880,7 +961,7 @@ fn read_frame<R: Read>(reader: &mut R) -> Result<Option<Vec<u8>>> {
             }
             let decompressed = lz4_flex::block::decompress(body, raw_length as usize)
                 .context("unable to decompress frame")?;
-            Ok(Some(decompressed))
+            Ok(Some((decompressed, more)))
         }
         Some((flag, _)) => bail!("invalid frame flag {flag}"),
         None => bail!("empty frame"),
@@ -1292,25 +1373,72 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn oversized_frames_are_rejected_on_send() {
-        let (mut first, mut second) = connected_pair();
+    fn a_message_larger_than_a_frame_is_split_and_reassembled() {
+        // A message past the frame cap used to be refused outright, which
+        // made the cap a ceiling on tree size: a staging request or a
+        // transition over a large tree is one list. It now crosses as a
+        // sequence of frames, each under the cap, that the reader
+        // concatenates.
+        let (reader, mut writer) = pipe();
+        let (_sink_reader, sink_writer) = pipe();
+        let mut receiver = Connection::from_streams(Box::new(reader), Box::new(sink_writer));
 
-        // A payload exactly at the cap still carries a bincode length prefix,
-        // putting the encoded frame over it. (A string keeps the encoding a
-        // single bulk copy rather than a per-byte sequence.)
-        let oversized = "a".repeat(protocol::MAXIMUM_FRAME_SIZE as usize);
-        let error = first.send(&oversized).expect_err("expected a rejection");
+        // Varied content, so compression cannot hide the size.
+        let large: Vec<u8> = (0..(protocol::MAXIMUM_FRAME_SIZE as usize + 12_345))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let expected = large.clone();
+        let sender = std::thread::spawn(move || {
+            send_frame(&mut writer, &large).expect("a large message sends");
+        });
+        let received: Vec<u8> = receiver.receive().expect("a large message is received");
+        sender.join().expect("sender");
+        assert_eq!(received.len(), expected.len());
+        assert!(received == expected, "the reassembled message differs");
+    }
+
+    #[test]
+    fn every_frame_of_a_split_message_respects_the_cap() {
+        // Capture the raw bytes and walk the frames: none may exceed the
+        // per-frame cap, all but the last carry the more-follows bit, and
+        // the last does not.
+        let large: Vec<u8> = (0..(3 * FRAME_CHUNK_SIZE + 7))
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .collect();
+        let mut wire = Vec::new();
+        send_frame(&mut wire, &large).expect("sends");
+        let mut offset = 0;
+        let mut frames = Vec::new();
+        while offset < wire.len() {
+            let length = u32::from_le_bytes(wire[offset..offset + 4].try_into().unwrap()) as usize;
+            assert!(length <= protocol::MAXIMUM_FRAME_SIZE as usize + COMPRESSED_HEADER_SIZE);
+            let flag = wire[offset + 4];
+            frames.push(flag & FRAME_MORE != 0);
+            offset += 4 + length;
+        }
         assert!(
-            format!("{error:#}").contains("maximum frame size"),
+            frames.len() >= 4,
+            "expected several frames, got {}",
+            frames.len()
+        );
+        assert!(frames[..frames.len() - 1].iter().all(|more| *more));
+        assert!(!frames[frames.len() - 1]);
+    }
+
+    #[test]
+    fn a_message_truncated_between_frames_is_an_error_not_a_message() {
+        let large: Vec<u8> = vec![7u8; 2 * FRAME_CHUNK_SIZE + 1];
+        let mut wire = Vec::new();
+        send_frame(&mut wire, &large).expect("sends");
+        // Cut after the first frame.
+        let first_length = u32::from_le_bytes(wire[..4].try_into().unwrap()) as usize;
+        let cut = wire[..4 + first_length].to_vec();
+        let mut reader = std::io::Cursor::new(cut);
+        let error = read_frame(&mut reader).expect_err("a truncated sequence must fail");
+        assert!(
+            format!("{error:#}").contains("middle of a message"),
             "unexpected error: {error:#}"
         );
-
-        // Nothing was written, so the connection remains usable.
-        first.send(&Request::Scan).expect("unable to send");
-        assert!(matches!(
-            second.receive::<Request>().expect("unable to receive"),
-            Request::Scan
-        ));
     }
 
     #[test]

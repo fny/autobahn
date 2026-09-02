@@ -38,7 +38,10 @@ fn main() -> anyhow::Result<()> {
 
         let mut roots: Vec<Option<autobahn::tree::Node>> = Vec::new();
         for (side, endpoint) in [
-            ("alpha", &mut alpha as &mut Box<dyn autobahn::endpoint::Endpoint + Send>),
+            (
+                "alpha",
+                &mut alpha as &mut Box<dyn autobahn::endpoint::Endpoint + Send>,
+            ),
             ("beta", &mut beta),
         ] {
             let snapshot = endpoint.scan()?;
@@ -100,7 +103,8 @@ fn compare(
             None => Vec::new(),
         }
     };
-    let directory = |node: Option<&Node>| matches!(node, Some(n) if matches!(n.content, Content::Directory(_)));
+    let directory =
+        |node: Option<&Node>| matches!(node, Some(n) if matches!(n.content, Content::Directory(_)));
     let empty_or_absent =
         |node: Option<&Node>| !directory(node) || node.is_some_and(|n| n.children().is_empty());
 
@@ -108,7 +112,11 @@ fn compare(
         || (!path.is_empty() && empty_or_absent(alpha) != empty_or_absent(beta))
     {
         let populated = if empty_or_absent(alpha) { beta } else { alpha };
-        let side = if empty_or_absent(alpha) { "beta" } else { "alpha" };
+        let side = if empty_or_absent(alpha) {
+            "beta"
+        } else {
+            "alpha"
+        };
         let count = populated.map(entries_below).unwrap_or(0);
         if count >= 8 {
             *found += 1;

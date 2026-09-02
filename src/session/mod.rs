@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{bail, Context, Result};
 
 use crate::endpoint::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
-pub(crate) mod ancestor;
+pub mod ancestor;
 
 use crate::tree::{
     apply, path_join, propagate_executability, reconcile, Change, Conflict, Content, Digest, Node,

@@ -54,6 +54,29 @@ use crate::tree::{apply, Change, Node};
 /// was written before journalling existed and is generation zero.
 const CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNANC";
 
+/// Marks a checkpoint that states its own format. Two little-endian
+/// version bytes follow the marker, then the generation, digest and
+/// payload as before.
+///
+/// Formats used to be told apart by the presence of a marker alone, which
+/// works exactly once. A stated version lets a build read what older ones
+/// wrote and write what it prefers, so changing the encoding becomes a
+/// decision rather than an outage: the alternative is that every session
+/// stops at the upgrade, because an ancestor that cannot be read is never
+/// discarded silently.
+const VERSIONED_CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNAN2";
+
+/// The format this build writes.
+const CHECKPOINT_VERSION: u16 = 2;
+
+/// The oldest format this build reads.
+///
+/// Formats 0 (a bare hierarchy, before journalling) and 1 (a generation
+/// and digest, before versions were stated) both still read. Raising this
+/// drops support for what it passes, and the message that refuses them
+/// names the command that recovers.
+const OLDEST_READABLE_CHECKPOINT: u16 = 0;
+
 /// The smallest journal worth compacting. Below this the full write costs
 /// more than the reading it would save.
 const MINIMUM_COMPACTION_SIZE: u64 = 1 << 20;
@@ -107,7 +130,7 @@ impl AncestorStore {
         // authoritative — the rename is the commit point — so it is
         // discarded before the journal is read.
         let _ = fs::remove_file(normalization_path(&journal_path));
-        let (mut generation, mut ancestor, checkpoint_bytes) = read_checkpoint(path)?;
+        let (mut generation, mut ancestor, checkpoint_bytes, version) = read_checkpoint(path)?;
 
         let (records, physical_bytes) = read_journal(&journal_path)?;
         // Replay applies every record that continues the lineage in hand and
@@ -187,23 +210,38 @@ impl AncestorStore {
                 .map_err(|message| anyhow::anyhow!("persisted ancestor is invalid: {message}"))?;
         }
 
-        Ok((
-            AncestorStore {
-                checkpoint_path: path.to_path_buf(),
-                journal_path,
-                generation,
-                checkpoint_bytes,
-                journal_bytes,
-                sync_appends: false,
-                #[cfg(test)]
-                append_syncs: 0,
-                #[cfg(test)]
-                fail_directory_sync: false,
-                journal: None,
-            },
-            ancestor,
-            unresolved,
-        ))
+        let mut store = AncestorStore {
+            checkpoint_path: path.to_path_buf(),
+            journal_path,
+            generation,
+            checkpoint_bytes,
+            journal_bytes,
+            sync_appends: false,
+            #[cfg(test)]
+            append_syncs: 0,
+            #[cfg(test)]
+            fail_directory_sync: false,
+            journal: None,
+        };
+
+        // Read the old format, write the current one. The conversion
+        // happens once, here, on the first open after an upgrade — so a
+        // format change costs one checkpoint rewrite per session and
+        // nothing else. Waiting for the next compaction instead would
+        // leave old formats alive indefinitely on quiet sessions, and
+        // every future decoder would have to keep supporting them.
+        //
+        // The rewrite carries the replayed hierarchy, so it also retires
+        // the journal, whose records were decoded by the same build that
+        // just read them. A failure here is not fatal: the old checkpoint
+        // is still readable, and the next open tries again.
+        if version != CHECKPOINT_VERSION {
+            if let Err(error) = store.checkpoint(generation, ancestor.as_ref()) {
+                eprintln!("unable to rewrite the ancestor in the current format: {error:#}");
+            }
+        }
+
+        Ok((store, ancestor, unresolved))
     }
 
     /// Opts every future append into power-loss durability: each record is
@@ -378,14 +416,15 @@ impl AncestorStore {
     fn checkpoint(&mut self, generation: u64, ancestor: Option<&Node>) -> Result<()> {
         let payload =
             bincode::serialize(&ancestor).context("unable to encode the ancestor checkpoint")?;
-        let mut data = Vec::with_capacity(payload.len() + 24);
-        data.extend_from_slice(&CHECKPOINT_MAGIC);
+        let mut data = Vec::with_capacity(payload.len() + 26);
+        data.extend_from_slice(&VERSIONED_CHECKPOINT_MAGIC);
+        data.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
         data.extend_from_slice(&generation.to_le_bytes());
         // The same truncated digest the journal's records carry: roughly
         // forty percent of a checkpoint's bytes are content digests, where
         // a flipped bit stays structurally valid bincode and directly
         // misclassifies a file during reconciliation.
-        data.extend_from_slice(&digest(generation, &payload));
+        data.extend_from_slice(&checkpoint_digest(CHECKPOINT_VERSION, generation, &payload));
         data.extend_from_slice(&payload);
 
         let temporary = self.checkpoint_path.with_extension("tmp");
@@ -491,34 +530,127 @@ fn digest(generation: u64, payload: &[u8]) -> [u8; 8] {
     digest
 }
 
-/// Reads the checkpoint, returning its generation, hierarchy, and size.
-fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64)> {
+/// The digest of a versioned checkpoint. The version joins the generation
+/// inside it: a flipped version byte would otherwise send the reader to
+/// the wrong decoder, which is the one failure a digest exists to prevent.
+fn checkpoint_digest(version: u16, generation: u64, payload: &[u8]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&version.to_le_bytes());
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(payload);
+    let hash = hasher.finalize();
+    let mut digest = [0u8; 8];
+    digest.copy_from_slice(&hash.as_bytes()[..8]);
+    digest
+}
+
+/// The format a checkpoint's bytes declare.
+fn checkpoint_version(data: &[u8]) -> u16 {
+    if data.starts_with(&VERSIONED_CHECKPOINT_MAGIC)
+        && data.len() >= VERSIONED_CHECKPOINT_MAGIC.len() + 2
+    {
+        let start = VERSIONED_CHECKPOINT_MAGIC.len();
+        u16::from_le_bytes(data[start..start + 2].try_into().expect("two bytes"))
+    } else if data.starts_with(&CHECKPOINT_MAGIC) {
+        1
+    } else {
+        0
+    }
+}
+
+/// The failure for a checkpoint this build cannot decode.
+///
+/// It names the formats, the command, and what the command does. A message
+/// that says only "unable to decode ancestor" leaves the reader with a
+/// stopped session and nothing to do about it, and `reset` is not a safe
+/// thing to suggest without saying that it brings deletions back.
+fn unreadable_checkpoint(found: u16) -> anyhow::Error {
+    anyhow::anyhow!(
+        "the ancestor is format {found}, and this build reads formats \
+         {OLDEST_READABLE_CHECKPOINT} to {CHECKPOINT_VERSION}. Run \
+         `autobahn reset <group>` for this session to rebuild it. That merges \
+         both sides and brings back files deleted while the other version ran"
+    )
+}
+
+/// Reads the checkpoint, returning its generation, hierarchy, size, and the
+/// format it was written in.
+fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
     let data = match fs::read(path) {
         Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, None, 0)),
+        // No checkpoint at all is a session that has never completed a
+        // cycle. It is already in the current format, having none.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((0, None, 0, CHECKPOINT_VERSION))
+        }
         Err(error) => return Err(error).context("unable to read ancestor"),
     };
     let size = data.len() as u64;
-    // A checkpoint from a build that predates journalling is the bare
-    // hierarchy. It reads as generation zero, and the first compaction
-    // rewrites it in the current form.
-    if !data.starts_with(&CHECKPOINT_MAGIC) {
-        let ancestor: Option<Node> =
-            bincode::deserialize(&data).context("unable to decode ancestor")?;
-        return Ok((0, ancestor, size));
+    let version = checkpoint_version(&data);
+    if version > CHECKPOINT_VERSION || version < OLDEST_READABLE_CHECKPOINT {
+        return Err(unreadable_checkpoint(version));
     }
-    let body = &data[CHECKPOINT_MAGIC.len()..];
-    if body.len() < 16 {
-        bail!("the ancestor checkpoint is truncated");
+    match version {
+        // A checkpoint from a build that predates journalling is the bare
+        // hierarchy. It reads as generation zero.
+        0 => {
+            let ancestor: Option<Node> =
+                bincode::deserialize(&data).context("unable to decode ancestor")?;
+            Ok((0, ancestor, size, 0))
+        }
+        // Format 1 states no version: a marker, a generation, a digest.
+        1 => {
+            let body = &data[CHECKPOINT_MAGIC.len()..];
+            if body.len() < 16 {
+                bail!("the ancestor checkpoint is truncated");
+            }
+            let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
+            let payload = &body[16..];
+            if digest(generation, payload) != body[8..16] {
+                bail!("the ancestor checkpoint is corrupt");
+            }
+            let ancestor: Option<Node> =
+                bincode::deserialize(payload).context("unable to decode ancestor")?;
+            Ok((generation, ancestor, size, 1))
+        }
+        // Format 2 states its version, and the digest covers it.
+        _ => {
+            let body = &data[VERSIONED_CHECKPOINT_MAGIC.len() + 2..];
+            if body.len() < 16 {
+                bail!("the ancestor checkpoint is truncated");
+            }
+            let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
+            let payload = &body[16..];
+            if checkpoint_digest(version, generation, payload) != body[8..16] {
+                bail!("the ancestor checkpoint is corrupt");
+            }
+            let ancestor: Option<Node> =
+                bincode::deserialize(payload).context("unable to decode ancestor")?;
+            Ok((generation, ancestor, size, version))
+        }
     }
-    let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
-    let payload = &body[16..];
-    if digest(generation, payload) != body[8..16] {
-        bail!("the ancestor checkpoint is corrupt");
+}
+
+/// Reports whether the checkpoint at `path` is one this build can read,
+/// without decoding it.
+///
+/// Only the header is read, so this costs one short read per session and
+/// can run before any cycle does. A session that would stop hours later on
+/// a timer is better reported while someone is still watching.
+pub fn readable(path: &Path) -> Result<()> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        // No checkpoint is a session that has never completed a cycle.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error).context("unable to read ancestor"),
+    };
+    let mut header = [0u8; 16];
+    let read = file.read(&mut header).context("unable to read ancestor")?;
+    let version = checkpoint_version(&header[..read]);
+    if version > CHECKPOINT_VERSION || version < OLDEST_READABLE_CHECKPOINT {
+        return Err(unreadable_checkpoint(version));
     }
-    let ancestor: Option<Node> =
-        bincode::deserialize(payload).context("unable to decode ancestor")?;
-    Ok((generation, ancestor, size))
+    Ok(())
 }
 
 /// Reads every intact record from the journal, in order, and reports how
@@ -636,7 +768,10 @@ mod tests {
             .record(&[change("b", Some(file("b", 2)))], second.as_ref())
             .expect("records");
 
-        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
+        let (_, reloaded, _) = match AncestorStore::open(&path) {
+            Ok(opened) => opened,
+            Err(error) => panic!("the rewritten checkpoint must reopen: {error:#}"),
+        };
         assert!(
             same(&reloaded, &second),
             "the reloaded ancestor must match what was recorded"
@@ -1009,7 +1144,10 @@ mod tests {
             // Rebuild the pre-reset state each round.
             fs::write(&path, bincode::serialize(&base).expect("encodes")).expect("writes");
             let _ = fs::remove_file(journal_path(&path));
-            let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+            let (mut store, _, _) = match AncestorStore::open(&path) {
+                Ok(opened) => opened,
+                Err(error) => panic!("a new store must open: {error:#}"),
+            };
             store
                 .record(&[change("c", Some(file("c", 3)))], full.as_ref())
                 .expect("records");
@@ -1296,14 +1434,122 @@ mod tests {
             .checkpoint(store.generation, state.as_ref())
             .expect("checkpoints");
 
+        // The generation follows the marker and the version.
         let mut bytes = fs::read(&path).expect("reads");
-        bytes[CHECKPOINT_MAGIC.len()] ^= 0x01;
+        bytes[VERSIONED_CHECKPOINT_MAGIC.len() + 2] ^= 0x01;
         fs::write(&path, &bytes).expect("writes");
         let error = match AncestorStore::open(&path) {
             Ok(_) => panic!("a flipped checkpoint generation must not load"),
             Err(error) => error,
         };
         assert!(format!("{error:#}").contains("corrupt"), "{error:#}");
+    }
+
+    /// A checkpoint states its format, and a build that cannot read that
+    /// format says so with the command that recovers.
+    ///
+    /// The message is the whole point of the mechanism. An ancestor is
+    /// never discarded silently, so a format nobody can read stops the
+    /// session — and a stopped session with no stated remedy is how a
+    /// planned change becomes an outage.
+    #[test]
+    fn a_checkpoint_states_its_format_and_an_unknown_one_names_the_remedy() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let state = Some(directory(vec![file("a", 1)]));
+        {
+            let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+            store
+                .checkpoint(store.generation, state.as_ref())
+                .expect("checkpoints");
+        }
+        // What this build writes, it states.
+        let bytes = fs::read(&path).expect("reads");
+        assert_eq!(checkpoint_version(&bytes), CHECKPOINT_VERSION);
+
+        // A format from the future is refused, and the refusal carries the
+        // versions, the command, and what the command costs.
+        let mut future = bytes.clone();
+        let start = VERSIONED_CHECKPOINT_MAGIC.len();
+        future[start..start + 2].copy_from_slice(&(CHECKPOINT_VERSION + 1).to_le_bytes());
+        fs::write(&path, &future).expect("writes");
+        let error = match AncestorStore::open(&path) {
+            Ok(_) => panic!("an unknown format must not load"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(
+            error.contains(&format!("format {}", CHECKPOINT_VERSION + 1)),
+            "{error}"
+        );
+        assert!(error.contains("autobahn reset"), "{error}");
+        assert!(error.contains("brings back files"), "{error}");
+
+        // The cheap check reaches the same conclusion without decoding.
+        assert!(readable(&path).is_err());
+    }
+
+    /// A checkpoint written by an older build is read, then rewritten in
+    /// the current format. The conversion happens once, on first open.
+    #[test]
+    fn an_older_checkpoint_is_read_and_then_rewritten_in_the_current_format() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let state = Some(directory(vec![file("a", 1), file("b", 2)]));
+
+        // Format 0: the bare hierarchy, as builds before journalling wrote.
+        let bare = bincode::serialize(&state).expect("encodes");
+        fs::write(&path, &bare).expect("writes");
+        assert_eq!(checkpoint_version(&bare), 0);
+
+        let (store, loaded, _) = match AncestorStore::open(&path) {
+            Ok(opened) => opened,
+            Err(error) => panic!("an old format must still open: {error:#}"),
+        };
+        assert!(
+            same(&loaded, &state),
+            "the hierarchy survives the conversion"
+        );
+        assert_eq!(store.generation, 0);
+        drop(store);
+
+        // And the file on disk is now the current format.
+        let rewritten = fs::read(&path).expect("reads");
+        assert_eq!(checkpoint_version(&rewritten), CHECKPOINT_VERSION);
+
+        // Which the next open reads without converting again.
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
+        assert!(same(&reloaded, &state));
+    }
+
+    /// Format 1 — a marker, a generation and a digest, with no stated
+    /// version — is read and converted the same way.
+    #[test]
+    fn the_unversioned_format_is_read_and_converted() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let state = Some(directory(vec![file("a", 1)]));
+
+        let payload = bincode::serialize(&state).expect("encodes");
+        let generation = 7u64;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&CHECKPOINT_MAGIC);
+        bytes.extend_from_slice(&generation.to_le_bytes());
+        bytes.extend_from_slice(&digest(generation, &payload));
+        bytes.extend_from_slice(&payload);
+        fs::write(&path, &bytes).expect("writes");
+        assert_eq!(checkpoint_version(&bytes), 1);
+
+        let (store, loaded, _) = match AncestorStore::open(&path) {
+            Ok(opened) => opened,
+            Err(error) => panic!("format 1 must open: {error:#}"),
+        };
+        assert!(same(&loaded, &state));
+        assert_eq!(store.generation, generation, "the generation carries over");
+        drop(store);
+        assert_eq!(
+            checkpoint_version(&fs::read(&path).expect("reads")),
+            CHECKPOINT_VERSION
+        );
     }
 
     /// Finding I2-B: an intent orders nothing unless it is on stable

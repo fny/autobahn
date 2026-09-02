@@ -971,6 +971,28 @@ pub struct SessionReport {
     pub progress: Option<crate::progress::ProgressSnapshot>,
 }
 
+/// Reports every session whose ancestor this build cannot read.
+///
+/// Only each checkpoint's header is read, so this costs one short read per
+/// session and runs before any cycle does. An ancestor is never discarded
+/// silently, so a format this build does not know stops the session that
+/// owns it — and a session that stops hours later, on a timer, is found by
+/// nobody. Reported at startup, it is found while someone is watching.
+pub fn unreadable_ancestors(plans: &[SessionPlan], state_root: &Path) -> Vec<(String, String)> {
+    plans
+        .iter()
+        .filter_map(|plan| {
+            let checkpoint = state_root
+                .join("sessions")
+                .join(plan.identifier())
+                .join("ancestor");
+            crate::session::ancestor::readable(&checkpoint)
+                .err()
+                .map(|error| (plan.display(), format!("{error:#}")))
+        })
+        .collect()
+}
+
 /// Builds the report for a set of plans.
 pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport {
     // One round trip serves both questions: a supervisor that answers is

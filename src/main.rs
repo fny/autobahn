@@ -859,6 +859,13 @@ fn run_watch(
     // alert was meant to fire.
     let alerts = configuration.alert_plan()?;
     let state_root = resolve_state_root(state_root)?;
+
+    // Said before the first cycle, while someone is still looking at the
+    // terminal. These sessions will stop on their own anyway; the point is
+    // that the reader learns it now rather than from a status page later.
+    for (session, problem) in autobahn::supervisor::unreadable_ancestors(&plans, &state_root) {
+        eprintln!("[{session}] {problem}");
+    }
     let live_display = !log && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
 
     if !live_display {

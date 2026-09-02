@@ -29,7 +29,18 @@ committed.
 - [x] **The emptied-subtree halt lies and withholds the path.** Done: the
   absent-directory form (I7-A) is gone, so deliberate deletions propagate;
   the remaining halt names the path, the side, and the entry count.
-  Superseded parts of the original note kept below for context.
+
+- [ ] **`one_file_system = true`, and probably first.** Do not walk into a
+  directory that sits on a different filesystem. `rsync -x`,
+  `tar --one-file-system`, `find -xdev` and `du -x` all do this. It uses
+  the same device number as the item that follows, but needs it only
+  during the walk. It never has to remember one, so it needs no new field,
+  no ancestor change, no carry-forward, and no epoch bump. It also removes
+  the problem in both directions: a mount that appears copies nothing, and
+  a mount that goes away deletes nothing. The mount guard is then only
+  needed for people who turn this off. Decide the default. `true` matches
+  every other tool. The agent needs the option too, so it goes in
+  `Initialize`.
 
 - [ ] **Record mount boundaries by device number.** The proper fix for the
   hole reopened by dropping I7-A: a mountpoint removed on eject (macOS
@@ -43,18 +54,6 @@ committed.
   the compatibility epoch bumps and every agent reinstalls; the mount list
   must survive incremental scans (which adopt subtrees without visiting
   them) or it silently empties; A/B the scan hot path before commit.
-
-- [ ] ~~The old note:~~ **The emptied-subtree halt lies and withholds the path.**
-  `src/session/mod.rs:471` — two distinct conditions raise the same
-  `SafetyHalt::RootEmptied`, and the subtree one discards the path it was
-  handed (`let _ = path;`) then reports that the *root* was emptied. The
-  root is fine. Three parts:
-  1. `SafetyHalt::SubtreeEmptied { path }` as its own variant, naming the
-     directory.
-  2. Name the side too — "gone on beta, 4,150 entries on alpha". Neither
-     current message says which side.
-  3. Report all of them, not the first only: reconciliation stops at the
-     first, so you fix one and halt again on the next. Twelve, for vibe.
 
 - [ ] **`conflicts` says "no conflicts" for a halted session.** Structural:
   the cycle bails before `report.conflicts` is assigned, so a halted
@@ -70,6 +69,32 @@ committed.
   empty/absent on the other. It answered a question the product could not
   answer about itself, which is the argument for shipping it. Delete the
   example when it lands.
+
+## Ancestor format (started 2026-09-02)
+
+- [x] **Version the ancestor checkpoint.** Done. Format 2 states its own
+  version, the digest covers it, and formats 0 and 1 still read and are
+  rewritten in the current form on first open. An unknown format is
+  refused with the versions, the command, and what the command costs. A
+  header-only check runs at startup, before any cycle.
+
+- [ ] **Rebuild an ancestor that cannot be read, when it is safe.** Now
+  justified by corruption alone — versioning covers planned changes. Scan
+  both sides. If they hold identical content, adopt it and carry on:
+  nothing can be resurrected when the two sides already agree, so the fix
+  is provably a no-op. If they differ, do not act. Halt and name
+  `autobahn reset`, because rebuilding then resurrects deletions. Make it
+  loud either way, and refuse a second rebuild on the same session — a
+  disk that corrupts one ancestor will corrupt another, and a silent
+  retry turns a hardware fault into a mystery.
+
+- [ ] **Version the journal records too.** The checkpoint states its
+  format; journal records do not. Today it does not matter, because an
+  older checkpoint is converted at open and the journal is retired with
+  it, so records never outlive the build that wrote them. A change that
+  lands without a checkpoint rewrite would break that. Either state the
+  version per record, or write down why the conversion at open is
+  sufficient.
 
 ## Carried over (not yet asked for, noted so they aren't lost)
 

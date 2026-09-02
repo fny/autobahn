@@ -328,7 +328,6 @@ enum Command {
     /// Run the menu bar app: an icon whose colour is the state of every
     /// session, a menu with the detail, and the ways to settle each
     /// conflict. Built with the `tray` feature.
-    #[cfg(feature = "tray")]
     Tray {
         /// The configuration file (defaults to ~/.autobahn/config.toml).
         #[arg(long)]
@@ -472,6 +471,10 @@ fn main() {
         Command::Tray { config, state_root } => {
             resolve_state_root(state_root).and_then(|root| autobahn::tray::run(config, root))
         }
+        #[cfg(not(feature = "tray"))]
+        Command::Tray { .. } => Err(anyhow::anyhow!(
+            "this build has no menu bar app; build one with `cargo build --release --features tray`"
+        )),
         Command::Clean {
             config,
             state_root,

@@ -9,10 +9,10 @@
 //! correspond to the request is a protocol error. Channels on the same
 //! connection interleave freely — see [`crate::transport::mux`].
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
-use crate::protocol::{Initialize, Request, Response};
+use crate::protocol::{Initialize, Request, Response, ScanDelta};
 use crate::transport::mux::{AgentChannel, AgentConnection, AgentPool};
 use crate::transport::{self, Connection};
 use crate::tree::{Change, Snapshot};
@@ -42,6 +42,108 @@ pub struct RemoteEndpoint {
 }
 
 impl RemoteEndpoint {
+    /// Reassembles a snapshot sent as a delta, retrying in full when the
+    /// baseline the agent named cannot be reproduced here.
+    fn receive_snapshot(&mut self, header: ScanDelta, what: &str) -> Result<Snapshot> {
+        match self.reassemble(&header) {
+            Ok(snapshot) => {
+                self.last_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+            Err(error) if header.baseline.is_some() => {
+                // The baseline disagreement is a performance event, not a
+                // protocol failure: the delta stream is drained already (or
+                // was never valid), and the agent re-sends against nothing.
+                eprintln!(
+                    "note: the agent's snapshot baseline could not be reproduced \
+                     ({error:#}); requesting it in full"
+                );
+                let header = match self.exchange(Request::ScanFull)? {
+                    Response::ScanDelta(header) => header,
+                    response => return Err(unexpected_response(&response, what)),
+                };
+                if header.baseline.is_some() {
+                    bail!("the agent answered a full-scan request with a delta");
+                }
+                let snapshot = self.reassemble(&header)?;
+                self.last_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Pulls a delta's operations and applies them to the baseline this
+    /// endpoint holds, verifying the result against the header's digest.
+    fn reassemble(&mut self, header: &ScanDelta) -> Result<Snapshot> {
+        use std::io::Cursor;
+
+        // The base is the encoding of the snapshot this endpoint last
+        // received — re-encoded now, so nothing is held between scans. Its
+        // digest must be the one the agent computed the delta against.
+        let (base, signature) = match header.baseline {
+            Some(expected) => {
+                let last = self
+                    .last_snapshot
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("no previous snapshot to serve as the baseline"))?;
+                let base = crate::transport::encode_snapshot(last)?;
+                let actual = *blake3::hash(&base).as_bytes();
+                if actual != expected {
+                    // The stream must still be drained, or the next request
+                    // on this channel would be answered with its leftovers.
+                    self.drain_delta()?;
+                    bail!("the baseline encoding here differs from the agent's");
+                }
+                let signature = crate::rsync::signature(Cursor::new(&base), header.block_size)
+                    .context("unable to sign the baseline snapshot")?;
+                (base, signature)
+            }
+            None => (Vec::new(), crate::rsync::Signature::default()),
+        };
+
+        let mut output = Vec::with_capacity(header.length as usize);
+        let mut base = Cursor::new(base);
+        loop {
+            let ops = match self.exchange(Request::ScanPull)? {
+                Response::ScanOps(ops) => ops,
+                response => return Err(unexpected_response(&response, "scan pull")),
+            };
+            if ops.is_empty() {
+                break;
+            }
+            for op in &ops {
+                crate::rsync::patch(&mut base, &signature, op, &mut output)
+                    .context("unable to apply a snapshot delta operation")?;
+            }
+            if output.len() as u64 > header.length {
+                bail!("the snapshot delta reassembled to more than its declared length");
+            }
+        }
+        if *blake3::hash(&output).as_bytes() != header.digest {
+            bail!("the reassembled snapshot does not match the agent's digest");
+        }
+        let snapshot: Snapshot =
+            bincode::deserialize(&output).context("unable to decode the reassembled snapshot")?;
+        if let Some(root) = snapshot.root.as_ref() {
+            root.validate(false).map_err(|message| {
+                anyhow!("the reassembled snapshot is not a valid hierarchy: {message}")
+            })?;
+        }
+        Ok(snapshot)
+    }
+
+    /// Discards the rest of a delta stream.
+    fn drain_delta(&mut self) -> Result<()> {
+        loop {
+            match self.exchange(Request::ScanPull)? {
+                Response::ScanOps(ops) if ops.is_empty() => return Ok(()),
+                Response::ScanOps(_) => continue,
+                response => return Err(unexpected_response(&response, "scan pull")),
+            }
+        }
+    }
+
     /// Establishes a remote endpoint as the sole session over a dedicated
     /// connection: exchanges handshakes (enforcing version equality) and
     /// opens one channel with the session's root and policy.
@@ -199,6 +301,7 @@ impl Endpoint for RemoteEndpoint {
                 self.last_snapshot = Some(snapshot.clone());
                 Ok(snapshot)
             }
+            Response::ScanDelta(header) => self.receive_snapshot(header, "scan"),
             // The agent reports "unchanged" only against a snapshot it has
             // actually sent, so having nothing to reproduce means the two
             // sides disagree about what was transmitted. That is a protocol
@@ -217,6 +320,7 @@ impl Endpoint for RemoteEndpoint {
                 self.last_snapshot = Some(snapshot.clone());
                 Ok(snapshot)
             }
+            Response::ScanDelta(header) => self.receive_snapshot(header, "verified scan"),
             response => Err(unexpected_response(&response, "verified scan")),
         }
     }
@@ -328,6 +432,8 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Transition(_) => "transition",
         Response::AwaitChanges(_) => "await changes",
         Response::Error(_) => "error",
+        Response::ScanDelta(_) => "scan delta",
+        Response::ScanOps(_) => "scan operations",
     }
 }
 

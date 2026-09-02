@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
-use crate::tree::{Change, Snapshot};
+use crate::tree::{Change, Digest, Snapshot};
 
 /// The protocol magic, checked during the handshake.
 pub const MAGIC: u32 = 0x4142_4E31; // "ABN1"
@@ -90,6 +90,37 @@ pub enum Request {
     /// Block until content may have changed or the specified number of
     /// milliseconds elapses.
     AwaitChanges(u64),
+    /// Pull the next batch of snapshot delta operations, after a
+    /// `ScanDelta` response. An empty batch ends the stream.
+    ScanPull,
+    /// Repeat the last scan's result as a delta against *nothing*: every
+    /// byte of the encoded snapshot as data operations. The controller's
+    /// recovery when it cannot reproduce the baseline a `ScanDelta` named.
+    ScanFull,
+}
+
+/// The header of a snapshot sent as a delta.
+///
+/// A snapshot is never sent as one frame. The agent encodes it, runs the
+/// rsync engine over those bytes against the encoding it last sent on this
+/// channel, and streams the resulting operations in bounded batches; the
+/// controller reassembles the new encoding from the old one. That removes
+/// the ceiling a single frame's size cap put on tree size, and makes a
+/// rescan of a large tree that changed a little cost a little.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanDelta {
+    /// The digest of the encoded snapshot the delta was computed against,
+    /// or `None` when it was computed against nothing (a full stream).
+    pub baseline: Option<Digest>,
+    /// The digest of the encoded snapshot the stream reassembles to. The
+    /// controller checks its reassembly against this, so a baseline the two
+    /// sides disagree about is detected rather than decoded.
+    pub digest: Digest,
+    /// The length of that encoding, in bytes.
+    pub length: u64,
+    /// The block size the baseline's signature used, which the controller
+    /// needs to build the matching signature over its own copy.
+    pub block_size: u32,
 }
 
 /// A response from the agent to the controller. Every response variant
@@ -126,6 +157,11 @@ pub enum Response {
     AwaitChanges(bool),
     /// A request-level failure.
     Error(String),
+    /// A scan result, sent as a delta: this header, then `ScanOps` batches
+    /// in answer to `ScanPull` until an empty one.
+    ScanDelta(ScanDelta),
+    /// A batch of snapshot delta operations; empty when the stream is done.
+    ScanOps(Vec<crate::rsync::Op>),
 }
 
 /// A controller-to-agent frame on a multiplexed connection.
@@ -178,7 +214,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 2;
+pub const COMPATIBILITY_EPOCH: u32 = 3;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

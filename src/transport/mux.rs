@@ -661,10 +661,21 @@ mod tests {
                 .exchange(Request::Scan)
                 .expect("scan should exchange");
             let scan_elapsed = started.elapsed();
-            let Response::Scan(snapshot) = response else {
-                panic!("expected a scan response");
+            // A scan arrives as a delta header now; the test only needs to
+            // know that the exchange completed on its own channel, and the
+            // header's declared length is evidence the snapshot was built.
+            let Response::ScanDelta(header) = response else {
+                panic!("expected a scan delta response, got {response:?}");
             };
-            assert_eq!(snapshot.files, 1);
+            assert!(header.length > 0);
+            // Drain the stream so the channel is clean for shutdown.
+            loop {
+                match channel_a.exchange(Request::ScanPull).expect("pull") {
+                    Response::ScanOps(ops) if ops.is_empty() => break,
+                    Response::ScanOps(_) => {}
+                    other => panic!("unexpected {other:?}"),
+                }
+            }
             assert!(
                 scan_elapsed < std::time::Duration::from_millis(1_000),
                 "the scan waited on the other channel: {scan_elapsed:?}"

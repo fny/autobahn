@@ -422,6 +422,8 @@ fn serve_channel<W: Write>(
     // because transitions fold their achieved results into the latter —
     // leaving the endpoint holding a tree the controller has never seen.
     let mut last_sent: Option<Snapshot> = None;
+    // The operations of a snapshot delta in flight, drained by ScanPull.
+    let mut pending: std::collections::VecDeque<crate::rsync::Op> = Default::default();
     while let Ok(request) = requests.recv() {
         // What becomes of the record of what this channel has transmitted,
         // *if* this response reaches the controller. It is applied only
@@ -431,7 +433,7 @@ fn serve_channel<W: Write>(
         // next rescan report "unchanged" against a tree it never received.
         let mut anchor = Anchor::Keep;
         let result = match request {
-            Request::Scan => endpoint.scan().map(|snapshot| {
+            Request::Scan => endpoint.scan().and_then(|snapshot| {
                 // Root identity settles the whole snapshot: its statistics
                 // are derived from the hierarchy, leaving only the probed
                 // executability behavior to compare alongside it.
@@ -440,18 +442,29 @@ fn serve_channel<W: Write>(
                         && sent.preserves_executability == snapshot.preserves_executability
                 });
                 if unchanged {
-                    Response::ScanUnchanged
-                } else {
-                    anchor = Anchor::To(Some(snapshot.clone()));
-                    Response::Scan(snapshot)
+                    return Ok(Response::ScanUnchanged);
                 }
+                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending)?;
+                anchor = Anchor::To(Some(snapshot));
+                Ok(Response::ScanDelta(header))
             }),
-            Request::ScanVerified => endpoint.scan_verified().map(|snapshot| {
+            Request::ScanVerified => endpoint.scan_verified().and_then(|snapshot| {
                 // Never elided: the entire point is a full re-read whose
                 // result the controller sees in full.
-                anchor = Anchor::To(Some(snapshot.clone()));
-                Response::Scan(snapshot)
+                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending)?;
+                anchor = Anchor::To(Some(snapshot));
+                Ok(Response::ScanDelta(header))
             }),
+            Request::ScanFull => match last_sent.as_ref() {
+                // The controller could not reproduce the baseline the last
+                // delta named. The snapshot it wants is the one this channel
+                // just anchored; it goes again against nothing.
+                Some(snapshot) => {
+                    snapshot_delta(snapshot, None, &mut pending).map(Response::ScanDelta)
+                }
+                None => Err(anyhow!("a full scan was requested before any scan")),
+            },
+            Request::ScanPull => Ok(Response::ScanOps(next_scan_batch(&mut pending))),
             Request::StageBegin(files) => endpoint.stage_begin(files).map(Response::StageBegin),
             Request::SupplyOpen(needs) => {
                 endpoint.supply_open(needs).map(|()| Response::SupplyOpened)
@@ -507,6 +520,81 @@ fn serve_channel<W: Write>(
             }
         }
     }
+}
+
+/// Encodes a snapshot the way both ends of a channel must: the bare
+/// hierarchy, so that the controller can re-encode the copy it holds and
+/// obtain the exact bytes a delta was computed against.
+pub fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
+    bincode::serialize(snapshot).context("unable to encode the snapshot")
+}
+
+/// Prepares a snapshot for transmission as a delta against `baseline` (the
+/// snapshot this channel last sent, or `None` for a full stream), leaving
+/// the operations queued for `ScanPull` and returning the header.
+///
+/// The baseline is never held as bytes between scans: it is re-encoded
+/// here when needed, which costs one serialization on a changed scan and
+/// no memory in between. The header carries the digest of the *new*
+/// encoding, so if the controller's re-encoding of its copy of the
+/// baseline were ever to differ from this one, the reassembly would fail
+/// to verify and be redone in full — determinism of the encoding is a
+/// performance assumption, not a correctness one.
+fn snapshot_delta(
+    snapshot: &Snapshot,
+    baseline: Option<&Snapshot>,
+    pending: &mut std::collections::VecDeque<crate::rsync::Op>,
+) -> Result<protocol::ScanDelta> {
+    let target = encode_snapshot(snapshot)?;
+    let digest = *blake3::hash(&target).as_bytes();
+    let (baseline_digest, signature) = match baseline {
+        Some(baseline) => {
+            let base = encode_snapshot(baseline)?;
+            let block_size = crate::rsync::optimal_block_size(base.len() as u64);
+            let signature = crate::rsync::signature(std::io::Cursor::new(&base), block_size)
+                .context("unable to sign the baseline snapshot")?;
+            (Some(*blake3::hash(&base).as_bytes()), signature)
+        }
+        None => (None, crate::rsync::Signature::default()),
+    };
+    pending.clear();
+    crate::rsync::deltify(std::io::Cursor::new(&target), &signature, &mut |op| {
+        pending.push_back(op);
+        Ok(())
+    })
+    .context("unable to compute the snapshot delta")?;
+    Ok(protocol::ScanDelta {
+        baseline: baseline_digest,
+        digest,
+        length: target.len() as u64,
+        block_size: signature.block_size,
+    })
+}
+
+/// The content bound on one batch of snapshot delta operations. Batches
+/// are bounded by content, not count: a data operation carries up to
+/// 64 KiB, a block operation almost nothing, and the frame cap is on bytes.
+const SCAN_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
+/// Takes the next batch of queued delta operations, empty when the stream
+/// is exhausted.
+fn next_scan_batch(
+    pending: &mut std::collections::VecDeque<crate::rsync::Op>,
+) -> Vec<crate::rsync::Op> {
+    let mut batch = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(op) = pending.front() {
+        let size = match op {
+            crate::rsync::Op::Data(data) => data.len(),
+            crate::rsync::Op::Blocks { .. } => 16,
+        };
+        if !batch.is_empty() && bytes + size > SCAN_BATCH_BYTES {
+            break;
+        }
+        bytes += size;
+        batch.push(pending.pop_front().expect("front was Some"));
+    }
+    batch
 }
 
 /// Sends one channel-tagged response frame through the shared writer.
@@ -1380,5 +1468,106 @@ pub(crate) mod tests {
         // refers to a process (or zombie) of ours.
         let alive = unsafe { libc::kill(pid, 0) };
         assert_eq!(alive, -1, "the child should be gone after the drop");
+    }
+
+    /// A snapshot too large for one frame crosses the wire as a delta
+    /// stream whose every batch fits — the ceiling this transport used to
+    /// put on tree size no longer exists.
+    #[test]
+    fn a_snapshot_larger_than_a_frame_streams_as_a_delta() {
+        use crate::tree::{Content, FileMetadata, Node};
+        // Long names inflate the encoding without a large tree: a thousand
+        // files with 70 KiB names encode past the 64 MiB frame cap.
+        let name_length = 70 * 1024;
+        let file = |index: usize, digest_byte: u8| Node {
+            name: format!("{index:06}{}", "n".repeat(name_length)),
+            content: Content::File {
+                digest: [digest_byte; 32],
+                executable: false,
+                metadata: FileMetadata::default(),
+            },
+        };
+        let snapshot_with = |changed: u8| -> Snapshot {
+            let children: Vec<Node> = (0..1000)
+                .map(|index| file(index, if index == 500 { changed } else { 1 }))
+                .collect();
+            Snapshot {
+                root: Some(Node::directory("", children)),
+                files: 1000,
+                directories: 1,
+                symlinks: 0,
+                total_file_size: 0,
+                scanned_at_seconds: 0,
+                preserves_executability: true,
+            }
+        };
+        let first = snapshot_with(1);
+        let encoded = encode_snapshot(&first).expect("encodes");
+        assert!(
+            encoded.len() > protocol::MAXIMUM_FRAME_SIZE as usize,
+            "the fixture must exceed the frame cap ({} bytes)",
+            encoded.len()
+        );
+
+        // Full stream: against nothing.
+        let mut pending = std::collections::VecDeque::new();
+        let header = snapshot_delta(&first, None, &mut pending).expect("delta");
+        assert!(header.baseline.is_none());
+        let mut output = Vec::new();
+        let mut base = std::io::Cursor::new(Vec::new());
+        let signature = crate::rsync::Signature::default();
+        let mut batches = 0;
+        loop {
+            let batch = next_scan_batch(&mut pending);
+            if batch.is_empty() {
+                break;
+            }
+            batches += 1;
+            let encoded_batch = bincode::serialize(&Response::ScanOps(batch.clone())).unwrap();
+            assert!(
+                encoded_batch.len() < protocol::MAXIMUM_FRAME_SIZE as usize / 4,
+                "a batch must fit a frame with room to spare"
+            );
+            for op in &batch {
+                crate::rsync::patch(&mut base, &signature, op, &mut output).expect("patch");
+            }
+        }
+        assert!(batches > 1, "the stream should have needed several batches");
+        assert_eq!(output, encoded);
+        assert_eq!(*blake3::hash(&output).as_bytes(), header.digest);
+
+        // Delta: one file changed against the first as baseline. The
+        // stream must reproduce the second snapshot, and carry far less
+        // data than the encoding — that is the point of the delta.
+        let second = snapshot_with(2);
+        let header = snapshot_delta(&second, Some(&first), &mut pending).expect("delta");
+        assert_eq!(header.baseline, Some(*blake3::hash(&encoded).as_bytes()));
+        let signature =
+            crate::rsync::signature(std::io::Cursor::new(&encoded), header.block_size).unwrap();
+        let mut base = std::io::Cursor::new(encoded.clone());
+        let mut output = Vec::new();
+        let mut data_bytes = 0usize;
+        loop {
+            let batch = next_scan_batch(&mut pending);
+            if batch.is_empty() {
+                break;
+            }
+            for op in &batch {
+                if let crate::rsync::Op::Data(data) = op {
+                    data_bytes += data.len();
+                }
+                crate::rsync::patch(&mut base, &signature, op, &mut output).expect("patch");
+            }
+        }
+        assert_eq!(*blake3::hash(&output).as_bytes(), header.digest);
+        let decoded: Snapshot = bincode::deserialize(&output).expect("decodes");
+        match &decoded.root.unwrap().children()[500].content {
+            Content::File { digest, .. } => assert_eq!(*digest, [2u8; 32]),
+            other => panic!("expected a file, got {other:?}"),
+        }
+        assert!(
+            data_bytes < encoded.len() / 100,
+            "one changed file should cost a sliver of data, not {data_bytes} bytes"
+        );
     }
 }

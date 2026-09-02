@@ -22,7 +22,7 @@ pub struct Reconciliation {
     /// per cycle on a sixty-thousand-entry tree; the expensive part (the
     /// subtree count) runs only when the rare empty-versus-populated
     /// trigger fires.
-    pub emptied_subtree: Option<String>,
+    pub emptied_subtree: Option<EmptiedSubtree>,
     /// Changes to apply to the ancestor (beyond those implied by successful
     /// transitions).
     pub ancestor_changes: Vec<Change>,
@@ -70,6 +70,19 @@ fn shallow_equal(a: Option<&Node>, b: Option<&Node>) -> bool {
         (Some(a), Some(b)) => a.content_equal(b, false),
         _ => false,
     }
+}
+
+/// A directory that a filesystem appears to have vanished from underneath:
+/// present on both sides, empty on one, and recorded by the ancestor as
+/// holding a substantial tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmptiedSubtree {
+    /// The root-relative path of the directory.
+    pub path: String,
+    /// The side it is empty on.
+    pub side: &'static str,
+    /// How many entries the ancestor records beneath it.
+    pub entries: usize,
 }
 
 /// The size at which an emptied directory below the root trips the safety
@@ -143,32 +156,26 @@ impl Reconciler {
             return;
         }
 
-        // The other signature of mass disappearance: the directory node
-        // itself vanished on exactly one side — a removed mountpoint, or
-        // rm -rf of the directory — while the ancestor records a
-        // substantial tree beneath it. The existing-but-empty form is
-        // guarded on the descend path below; this form never reaches that
-        // branch, because absent-versus-directory is a disagreement.
-        if !path.is_empty() && self.result.emptied_subtree.is_none() {
-            let vanished = |node: Option<&Node>| node.is_none();
-            let populated = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Directory(_)));
-            if ((vanished(alpha) && populated(beta)) || (vanished(beta) && populated(alpha)))
-                && ancestor.is_some_and(|node| {
-                    matches!(node.content, Content::Directory(_))
-                        && entries_below(node) >= EMPTIED_SUBTREE_MINIMUM
-                })
-            {
-                self.result.emptied_subtree = Some(path.to_owned());
-                return;
-            }
-        }
-
         // If alpha and beta agree (shallowly) at this path, then recurse.
         if shallow_equal(alpha, beta) {
-            // The emptied-subtree guard, at the only place it can trigger:
-            // both sides hold a directory here, and exactly one of them is
-            // empty. (The root's own emptiness, including an absent root,
-            // is checked by the session before reconciliation begins.)
+            // The vanished-filesystem guard, at the only place it can
+            // trigger: both sides hold a directory here, and exactly one of
+            // them is empty.
+            //
+            // Only this shape is guarded, and the distinction is the whole
+            // point. A mountpoint is a directory belonging to the *parent*
+            // filesystem, so a filesystem that goes away — unplugged,
+            // dropped share, restarted container — leaves the directory
+            // behind and empty. A deliberate deletion removes the directory
+            // itself, and propagates like any other deletion.
+            //
+            // The guard once covered the absent shape too, on the grounds
+            // that some mountpoints are removed on eject (macOS `/Volumes`
+            // among them). That is true, and it cost every ordinary
+            // directory deletion a halt to catch it — a bad trade, since
+            // the two causes are indistinguishable from the tree alone.
+            // Telling them apart needs the device number recorded at scan
+            // time, which is the proper fix and is not this.
             if !path.is_empty() && self.result.emptied_subtree.is_none() {
                 let empty = |node: Option<&Node>| {
                     matches!(node, Some(node)
@@ -178,7 +185,11 @@ impl Reconciler {
                 if empty(alpha) != empty(beta)
                     && ancestor.is_some_and(|node| entries_below(node) >= EMPTIED_SUBTREE_MINIMUM)
                 {
-                    self.result.emptied_subtree = Some(path.to_owned());
+                    self.result.emptied_subtree = Some(EmptiedSubtree {
+                        path: path.to_owned(),
+                        side: if empty(alpha) { "alpha" } else { "beta" },
+                        entries: ancestor.map(entries_below).unwrap_or(0),
+                    });
                 }
             }
             // If the ancestor disagrees, then record an ancestor update at

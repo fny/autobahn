@@ -160,7 +160,7 @@ machine.
 Asking a running supervisor things, whether it is `watch` or the service:
 
 ```sh
-autobahn status            # what every session last did
+autobahn status            # what every session is doing, or last did
 autobahn status project    # ...filtered to one group
 autobahn status .          # ...to whatever syncs the working directory
 autobahn status ~/project  # ...or any folder inside a synchronized root
@@ -176,12 +176,36 @@ autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
 ```
 
+While a session is working, `status` says so — the phase it is in, how
+long it has been there, and, where the numbers allow an honest one, an
+estimate:
+
+```
+~/Workspace/Voltai voltai
+  ubuntu@fny.voltai.party:~/Workspace
+    status: scanning, 6m20s elapsed
+      alpha: 412,331 of ~1,470,000 entries (28%), about 14m left
+      beta: scanning for 6m20s
+    mode: two-way-conflict
+```
+
+A session between cycles is described by how its last cycle ended, as
+before. The estimate is withheld unless the phase has been running long
+enough to have a rate and has a total to measure against — a first scan
+of a tree nothing has ever counted reports its progress and its elapsed
+time, and no estimate. A remote scan happens inside one request on the
+far side, so it reports that it is running and for how long, without
+counts.
+
 When two sides disagree about a file, `status` names it and these three
 settle it:
 
 ```sh
 autobahn conflicts                  # every conflict, with what each side holds
 autobahn conflicts ~/project        # ...for whatever group syncs that folder
+autobahn conflicts --depth 1        # roll up: which top-level folders, and how many
+autobahn conflicts --filter vulns   # only paths containing "vulns"
+autobahn conflicts --filter '*.ts'  # ...or matching a glob, at any depth
 autobahn diff ./src/main.rs         # the two sides of a file, as a unified diff
 autobahn diff project src/main.rs   # same file, by group and root-relative path
 
@@ -200,8 +224,18 @@ destinations whose own conflict was with a *third* version. Resolution
 makes the sides agree; the next cycle records the agreement and the
 conflict is gone. Nothing here touches the ancestor.
 
+`--depth` turns a long list into a map of where the trouble is —
+seven hundred paths under one folder are one fact about that folder —
+and each level tells you how to look inside the next. `--filter` takes a
+plain word (matched anywhere in the path, ignoring case) or a glob:
+without a slash it matches at any depth, with one it is anchored to the
+root.
+
 `autobahn status --json` and `autobahn conflicts --json` print all of
-this as one versioned document, for scripts and user interfaces.
+this as one versioned document, for scripts and user interfaces. Each
+session carries a `progress` object while a supervisor is running —
+`--filter` applies to the JSON too, while `--depth`, being a way of
+reading a list, does not.
 
 ### The menu bar app
 

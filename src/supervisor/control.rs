@@ -34,6 +34,9 @@ pub enum ControlRequest {
     /// Re-read every file's content on the selected sessions' next cycle,
     /// making content changed without its metadata moving visible.
     Verify(Selector),
+    /// Report what every supervised session is doing right now. The one
+    /// request that reads rather than writes.
+    Progress,
 }
 
 /// Selects sessions by group and destination.
@@ -62,8 +65,22 @@ pub enum ControlResponse {
         /// The number of sessions affected.
         sessions: usize,
     },
+    /// The live progress of every supervised session, in supervision
+    /// order.
+    Progress(Vec<SessionProgress>),
     /// The request failed.
     Error(String),
+}
+
+/// One supervised session's live progress.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SessionProgress {
+    /// The session's group.
+    pub group: String,
+    /// The session's destination.
+    pub host: String,
+    /// What it is doing.
+    pub progress: crate::progress::ProgressSnapshot,
 }
 
 /// The control flags of one supervised session, flipped by the control
@@ -80,16 +97,43 @@ pub(crate) struct WorkerControl {
     pub verify: AtomicBool,
 }
 
+/// One registry entry: a session, its control flags, and its live
+/// progress.
+pub(crate) struct Entry {
+    /// The session's group.
+    pub group: String,
+    /// The session's destination.
+    pub host: String,
+    /// The flags the control socket flips and the worker consumes.
+    pub control: Arc<WorkerControl>,
+    /// What the session is doing, updated by the worker as it works.
+    pub progress: Arc<crate::progress::Progress>,
+}
+
 /// The registry mapping sessions to their control flags, shared between the
 /// socket thread and the workers.
 pub(crate) struct Registry {
-    /// One entry per supervised session: group, host, and flags.
-    pub entries: Vec<(String, String, Arc<WorkerControl>)>,
+    /// One entry per supervised session.
+    pub entries: Vec<Entry>,
 }
 
 impl Registry {
     /// Applies a control request, returning the number of affected sessions.
     fn apply(&self, request: &ControlRequest) -> ControlResponse {
+        // Progress reads rather than writes, and selects nothing: the
+        // caller wants the whole picture and matches it up itself.
+        if let ControlRequest::Progress = request {
+            return ControlResponse::Progress(
+                self.entries
+                    .iter()
+                    .map(|entry| SessionProgress {
+                        group: entry.group.clone(),
+                        host: entry.host.clone(),
+                        progress: entry.progress.snapshot(),
+                    })
+                    .collect(),
+            );
+        }
         let (selector, action): (&Selector, fn(&WorkerControl)) = match request {
             ControlRequest::Flush(selector) => (selector, |control| {
                 control.wake.store(true, Ordering::Relaxed);
@@ -110,11 +154,12 @@ impl Registry {
                 control.verify.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
             }),
+            ControlRequest::Progress => unreachable!("progress is answered above"),
         };
         let mut sessions = 0;
-        for (group, host, control) in &self.entries {
-            if selector.matches(group, host) {
-                action(control);
+        for entry in &self.entries {
+            if selector.matches(&entry.group, &entry.host) {
+                action(&entry.control);
                 sessions += 1;
             }
         }
@@ -304,16 +349,38 @@ pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlRespon
     crate::transport::receive_control_frame(&mut reader)
 }
 
+/// Asks the supervisor owning `state_root` what its sessions are doing.
+///
+/// Absent when no supervisor is running — which is the honest answer, since
+/// live progress is something only a running supervisor has. A supervisor
+/// from a different build may not understand the request; that is reported
+/// the same way, because the caller's remedy is identical.
+pub fn query_progress(state_root: &Path) -> Option<Vec<SessionProgress>> {
+    match send(state_root, &ControlRequest::Progress) {
+        Ok(ControlResponse::Progress(sessions)) => Some(sessions),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn entry(group: &str, host: &str) -> Entry {
+        Entry {
+            group: group.into(),
+            host: host.into(),
+            control: Arc::default(),
+            progress: Arc::default(),
+        }
+    }
+
     fn registry() -> Registry {
         Registry {
             entries: vec![
-                ("work".into(), "host1".into(), Arc::default()),
-                ("work".into(), "host2".into(), Arc::default()),
-                ("other".into(), "host1".into(), Arc::default()),
+                entry("work", "host1"),
+                entry("work", "host2"),
+                entry("other", "host1"),
             ],
         }
     }
@@ -345,15 +412,15 @@ mod tests {
             host: None,
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 2 }));
-        assert!(registry.entries[0].2.paused.load(Ordering::Relaxed));
-        assert!(!registry.entries[2].2.paused.load(Ordering::Relaxed));
+        assert!(registry.entries[0].control.paused.load(Ordering::Relaxed));
+        assert!(!registry.entries[2].control.paused.load(Ordering::Relaxed));
         // One session.
         let response = registry.apply(&ControlRequest::Reset(Selector {
             group: Some("other".into()),
             host: Some("host1".into()),
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
-        assert!(registry.entries[2].2.reset.load(Ordering::Relaxed));
+        assert!(registry.entries[2].control.reset.load(Ordering::Relaxed));
         // No match.
         let response = registry.apply(&ControlRequest::Flush(Selector {
             group: Some("absent".into()),

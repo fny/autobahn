@@ -241,19 +241,32 @@ impl RootObserver {
     /// records that generation, not the current one: an event arriving
     /// during the walk leaves the result immediately stale, which is the
     /// safe direction — at worst one extra cycle, never a missed change.
-    pub fn scan(&self, max_entry_count: Option<u64>) -> Result<(Snapshot, u64)> {
-        self.scan_inner(max_entry_count, false)
+    pub fn scan(
+        &self,
+        max_entry_count: Option<u64>,
+        progress: Option<&crate::progress::SideProgress>,
+    ) -> Result<(Snapshot, u64)> {
+        self.scan_inner(max_entry_count, false, progress)
     }
 
     /// Scans with digest reuse disabled: every file is re-read, so content
     /// changed without its metadata moving becomes visible — and, being
     /// published like any other scan, the verified snapshot becomes every
     /// sharing session's baseline.
-    pub fn scan_rehash(&self, max_entry_count: Option<u64>) -> Result<(Snapshot, u64)> {
-        self.scan_inner(max_entry_count, true)
+    pub fn scan_rehash(
+        &self,
+        max_entry_count: Option<u64>,
+        progress: Option<&crate::progress::SideProgress>,
+    ) -> Result<(Snapshot, u64)> {
+        self.scan_inner(max_entry_count, true, progress)
     }
 
-    fn scan_inner(&self, max_entry_count: Option<u64>, rehash: bool) -> Result<(Snapshot, u64)> {
+    fn scan_inner(
+        &self,
+        max_entry_count: Option<u64>,
+        rehash: bool,
+        progress: Option<&crate::progress::SideProgress>,
+    ) -> Result<(Snapshot, u64)> {
         self.ensure_watching();
 
         loop {
@@ -297,7 +310,7 @@ impl RootObserver {
 
             // Outside the lock: a large tree takes seconds to walk, and a
             // watcher callback must never wait behind one.
-            let result = self.walk(baseline.as_ref(), &behavior, want_full, rehash);
+            let result = self.walk(baseline.as_ref(), &behavior, want_full, rehash, progress);
             #[cfg(test)]
             if let Some(hook) = self
                 .after_walk
@@ -365,6 +378,7 @@ impl RootObserver {
         behavior: &FilesystemBehavior,
         want_full: bool,
         rehash: bool,
+        progress: Option<&crate::progress::SideProgress>,
     ) -> Result<(Snapshot, u64, bool)> {
         // The generation is read *before* the walk: an event arriving during
         // it leaves the published snapshot immediately stale, which is the
@@ -392,6 +406,7 @@ impl RootObserver {
             self.key.max_file_size,
             dirty.as_ref(),
             rehash,
+            progress,
         )
         .with_context(|| format!("unable to scan {}", self.key.root.display()))?;
         Ok((snapshot, taken_at, dirty.is_none()))
@@ -685,7 +700,7 @@ mod tests {
         std::fs::write(root.join("file.txt"), b"before").expect("writes");
         let observer = harness_observer(&root);
 
-        let (first, _) = observer.scan(None).expect("scans");
+        let (first, _) = observer.scan(None, None).expect("scans");
         let before = digest_of(&first, "file.txt");
 
         // Arm the seam: the write and its invalidation land between the
@@ -697,7 +712,7 @@ mod tests {
             seam_observer.invalidate(["file.txt"]);
         }));
         observer.invalidate(std::iter::empty::<&str>()); // force the next scan to walk
-        let (stale, stale_generation) = observer.scan(None).expect("scans");
+        let (stale, stale_generation) = observer.scan(None, None).expect("scans");
         *observer.after_walk.lock().unwrap() = None;
 
         // The walk predates the seam's write, so its snapshot is stale —
@@ -712,7 +727,7 @@ mod tests {
         // a live watcher — FSEvents especially — may deliver more dust
         // between the scan and the comparison, and quietness of the
         // scheduler is not the property under test.)
-        let (fresh, fresh_generation) = observer.scan(None).expect("scans");
+        let (fresh, fresh_generation) = observer.scan(None, None).expect("scans");
         assert_ne!(
             digest_of(&fresh, "file.txt"),
             before,
@@ -730,7 +745,7 @@ mod tests {
         std::fs::create_dir(&root).expect("root");
         std::fs::write(root.join("file.txt"), b"before").expect("writes");
         let observer = harness_observer(&root);
-        let (first, _) = observer.scan(None).expect("scans");
+        let (first, _) = observer.scan(None, None).expect("scans");
 
         // A transition-shaped sequence, interleaved badly on purpose: the
         // offer arrives, then the disk changes under it.
@@ -738,7 +753,7 @@ mod tests {
         std::fs::write(root.join("file.txt"), b"after!").expect("writes");
         observer.invalidate(["file.txt"]);
 
-        let (fresh, _) = observer.scan(None).expect("scans");
+        let (fresh, _) = observer.scan(None, None).expect("scans");
         assert_ne!(
             digest_of(&fresh, "file.txt"),
             digest_of(&first, "file.txt"),
@@ -782,7 +797,7 @@ mod tests {
                     }
                     // A scan by either of two sessions.
                     2..=4 => {
-                        let (snapshot, generation) = observer.scan(None).expect("scans");
+                        let (snapshot, generation) = observer.scan(None, None).expect("scans");
                         let expected =
                             *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
                         proptest::prop_assert_eq!(
@@ -803,7 +818,7 @@ mod tests {
                     6 => observer.distrust_baseline(),
                     // A verified scan must agree with the disk too.
                     _ => {
-                        let (snapshot, _) = observer.scan_rehash(None).expect("scans");
+                        let (snapshot, _) = observer.scan_rehash(None, None).expect("scans");
                         let expected =
                             *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
                         proptest::prop_assert_eq!(

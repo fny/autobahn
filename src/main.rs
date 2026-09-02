@@ -11,6 +11,7 @@ use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
 use autobahn::endpoint::remote::RemoteEndpoint;
 use autobahn::endpoint::Endpoint;
 use autobahn::paths;
+use autobahn::progress::ProgressSnapshot;
 use autobahn::protocol::Initialize;
 use autobahn::scan::{IgnoreSet, SymlinkMode};
 use autobahn::session::{session_identifier, CycleReport, Session};
@@ -254,6 +255,17 @@ enum Command {
         selector: Option<String>,
         /// Filter to a destination within the group.
         host: Option<String>,
+        /// Roll conflicts up to this many path segments and show a count
+        /// for each: `--depth 1` lists the top-level folders in conflict.
+        #[arg(long, value_name = "N")]
+        depth: Option<usize>,
+        /// Show only conflicts whose path matches. A pattern with no glob
+        /// characters matches anywhere in the path, case-insensitively
+        /// (`--filter arcturus`); one with them is a glob, anchored to the
+        /// root when it contains a slash and matched at any depth when it
+        /// does not (`--filter '*.ts'`, `--filter 'arcturus/**'`).
+        #[arg(long, value_name = "PATTERN")]
+        filter: Option<String>,
         /// Print as JSON: the status report, restricted to sessions in
         /// conflict.
         #[arg(long)]
@@ -446,10 +458,12 @@ fn main() {
         Command::Conflicts {
             selector,
             host,
+            depth,
+            filter,
             json,
             config,
             state_root,
-        } => run_conflicts(config, state_root, selector, host, json),
+        } => run_conflicts(config, state_root, selector, host, depth, filter, json),
         Command::Diff {
             selector,
             path,
@@ -751,6 +765,9 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
             Ok(())
         }
         ControlResponse::Error(message) => bail!(message),
+        // `run_control` sends only the verbs; progress is asked for by
+        // `status`, which reads the answer itself.
+        ControlResponse::Progress(_) => bail!("the supervisor answered with progress"),
     }
 }
 
@@ -1110,19 +1127,38 @@ fn relative_path(selection: &Selection, explicit: Option<String>) -> Result<Stri
 }
 
 /// Lists every conflict with what each side holds.
+#[allow(clippy::too_many_arguments)]
 fn run_conflicts(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
     selector: Option<String>,
     host: Option<String>,
+    depth: Option<usize>,
+    filter: Option<String>,
     json: bool,
 ) -> Result<()> {
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
     let selection = select(&plans, selector.as_deref(), host.as_deref())?;
+    let matches = filter.as_deref().map(conflict_filter).transpose()?;
+    if let Some(0) = depth {
+        bail!("--depth counts path segments, so it starts at 1");
+    }
     if json {
+        // Depth is a way of *reading* a long list, and a reader that wants
+        // JSON has its own. Rolling the records up here would hand it a
+        // different shape than it asked for, so it is refused rather than
+        // silently ignored.
+        if depth.is_some() {
+            bail!("--depth is a display option; with --json, group the paths yourself");
+        }
         let mut report = autobahn::supervisor::status_report(&selection.plans, &state_root);
         for group in &mut report.groups {
+            for session in &mut group.sessions {
+                if let Some(matches) = &matches {
+                    session.conflicts.retain(|conflict| matches(&conflict.path));
+                }
+            }
             group
                 .sessions
                 .retain(|session| !session.conflicts.is_empty());
@@ -1141,6 +1177,16 @@ fn run_conflicts(
         if status.conflicts.is_empty() {
             continue;
         }
+        let selected: Vec<&String> = status
+            .conflicts
+            .iter()
+            .filter(|path| matches.as_ref().is_none_or(|matches| matches(path)))
+            .collect();
+        if selected.is_empty() {
+            continue;
+        }
+        // The group's heading waits until something under it survived the
+        // filter: a heading over nothing reads as a group in trouble.
         if current_group != Some(plan.group.as_str()) {
             if current_group.is_some() {
                 println!();
@@ -1152,8 +1198,28 @@ fn run_conflicts(
             );
         }
         println!("  {}", plan.beta_spec());
-        for path in &status.conflicts {
-            total += 1;
+        total += selected.len();
+
+        // Rolled up, a conflict list becomes a map of where the trouble
+        // is: seven hundred paths under one folder are one fact about that
+        // folder, and the reader drills in from there.
+        if let Some(depth) = depth {
+            for (prefix, count) in roll_up(&selected, depth) {
+                match count {
+                    1 if selected.contains(&&prefix) => println!("    {prefix}"),
+                    1 => println!("    {prefix} — 1 conflict"),
+                    count => println!("    {prefix} — {count} conflicts"),
+                }
+            }
+            println!(
+                "    → autobahn conflicts {} --depth {} to look inside",
+                plan.group,
+                depth + 1
+            );
+            continue;
+        }
+
+        for path in selected {
             let detail = status
                 .conflict_details
                 .iter()
@@ -1183,9 +1249,56 @@ fn run_conflicts(
         );
     }
     if total == 0 {
-        println!("no conflicts");
+        match &filter {
+            Some(pattern) => println!("no conflicts match {pattern:?}"),
+            None => println!("no conflicts"),
+        }
     }
     Ok(())
+}
+
+/// Groups conflict paths by their first `depth` segments, keeping the order
+/// they were reported in and counting what falls under each.
+///
+/// A path shorter than the depth is its own group: there is nothing further
+/// to roll it up into.
+fn roll_up(paths: &[&String], depth: usize) -> Vec<(String, usize)> {
+    let mut grouped: Vec<(String, usize)> = Vec::new();
+    for path in paths {
+        let prefix = path.split('/').take(depth).collect::<Vec<_>>().join("/");
+        match grouped.iter_mut().find(|(existing, _)| *existing == prefix) {
+            Some((_, count)) => *count += 1,
+            None => grouped.push((prefix, 1)),
+        }
+    }
+    grouped
+}
+
+/// Builds the predicate behind `conflicts --filter`.
+///
+/// Two behaviours, chosen by what the pattern looks like, because a
+/// filter is typed in a hurry: a plain word is what someone means when
+/// they type `--filter arcturus`, and a glob is what they mean when they
+/// type `--filter '*.ts'`. A glob without a slash is matched at any depth,
+/// the way the same pattern behaves in an ignore file; one with a slash is
+/// anchored to the root, since that is what writing the separator asks
+/// for.
+fn conflict_filter(pattern: &str) -> Result<Box<dyn Fn(&str) -> bool>> {
+    if !pattern.contains(['*', '?', '[', '{']) {
+        let needle = pattern.to_lowercase();
+        return Ok(Box::new(move |path: &str| {
+            path.to_lowercase().contains(&needle)
+        }));
+    }
+    let anchored = if pattern.contains('/') {
+        pattern.to_owned()
+    } else {
+        format!("**/{pattern}")
+    };
+    let glob = globset::Glob::new(&anchored)
+        .with_context(|| format!("unable to read the filter {pattern:?} as a pattern"))?
+        .compile_matcher();
+    Ok(Box::new(move |path: &str| glob.is_match(path)))
 }
 
 /// Shows how the two sides of one file differ, with the system's diff.
@@ -1689,6 +1802,11 @@ fn render_status(
 ) {
     use std::fmt::Write;
 
+    // One round trip answers both "is anything running" and "what is each
+    // session doing"; the recorded status on disk answers "how did the last
+    // cycle end". A session is described by the first when it is working
+    // and by the second when it is not.
+    let live = autobahn::supervisor::control::query_progress(state_root);
     let rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = selected
         .iter()
         .map(|plan| {
@@ -1704,7 +1822,7 @@ fn render_status(
     // hour ago still reads as "synchronized" — the command's most
     // misleading possible output, since nothing is synchronizing at all.
     // The service's state says what to do about it.
-    if !autobahn::supervisor::control::supervisor_is_running(state_root) {
+    if live.is_none() {
         let remedy = match autobahn::service::state() {
             Ok(autobahn::service::ServiceState::NotInstalled) => {
                 "run `autobahn watch` here, or `autobahn install` for a login service"
@@ -1750,10 +1868,17 @@ fn render_status(
         );
 
         for (plan, status) in block {
+            let progress = live.as_ref().and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.group == plan.group && session.host == plan.host)
+                    .map(|session| &session.progress)
+            });
             render_status_entry(
                 &plan.beta_spec(),
                 autobahn::config::mode_name(plan.mode),
                 status.as_ref(),
+                progress,
                 expand_conflicts,
                 out,
             );
@@ -1772,6 +1897,7 @@ fn render_status_entry(
     destination: &str,
     mode: &str,
     status: Option<&SessionStatus>,
+    progress: Option<&ProgressSnapshot>,
     expand_conflicts: bool,
     out: &mut String,
 ) {
@@ -1779,8 +1905,19 @@ fn render_status_entry(
     // Only the folder is emphasised. Indentation already separates the
     // destinations from it, and bolding both levels leaves neither leading.
     let _ = writeln!(out, "  {destination}");
+
+    // A session that is working is described by what it is doing. The
+    // recorded status describes the last cycle, which for the cycle that
+    // takes longest — the first scan of a large tree — is whatever
+    // preceded it, under an age that only grows. That reads as stuck.
+    let working = progress.filter(|progress| progress.phase.is_working());
     let Some(status) = status else {
-        let _ = writeln!(out, "    status: \x1b[2mnever run\x1b[0m");
+        match working {
+            Some(progress) => render_working(progress, out),
+            None => {
+                let _ = writeln!(out, "    status: \x1b[2mnever run\x1b[0m");
+            }
+        }
         let _ = writeln!(out, "    mode: {mode}");
         return;
     };
@@ -1801,11 +1938,16 @@ fn render_status_entry(
     } else {
         format!("{} cycles", status.cycles)
     };
-    let _ = writeln!(
-        out,
-        "    status: {colour}{label}{reset}, {progress}, {}",
-        format_age(status.updated_at)
-    );
+    match working {
+        Some(working) => render_working(working, out),
+        None => {
+            let _ = writeln!(
+                out,
+                "    status: {colour}{label}{reset}, {progress}, {}",
+                format_age(status.updated_at)
+            );
+        }
+    }
     let _ = writeln!(out, "    mode: {mode}");
 
     // Conflicts collapse to a count and an example: a session with forty of
@@ -1843,8 +1985,150 @@ fn render_status_entry(
         // The innermost cause is the diagnosis; the wrapping context repeats
         // the destination this block already names.
         let detail = error.rsplit(": ").next().unwrap_or(error);
-        let _ = writeln!(out, "    error: {detail}");
+        // While the session is working, the recorded error is the *last*
+        // attempt's, not this one's. Saying so is the difference between a
+        // session that is retrying and one that has given up.
+        let label = if working.is_some() {
+            "last error"
+        } else {
+            "error"
+        };
+        let _ = writeln!(out, "    {label}: {detail}");
     }
+}
+
+/// Renders what a session is doing right now: the phase, how long it has
+/// been in it, an estimate when one can honestly be made, and the counts
+/// behind it.
+fn render_working(progress: &ProgressSnapshot, out: &mut String) {
+    use autobahn::progress::Phase;
+    use std::fmt::Write;
+
+    let mut headline = format!(
+        "    status: {}, {} elapsed",
+        progress.phase.label(),
+        format_duration(progress.seconds)
+    );
+    if let Some(remaining) = progress.remaining_seconds {
+        let _ = write!(headline, ", about {} left", format_duration(remaining));
+    }
+    let _ = writeln!(out, "{headline}");
+
+    match progress.phase {
+        Phase::Scanning => {
+            for (name, side) in [("alpha", &progress.alpha), ("beta", &progress.beta)] {
+                if !side.active {
+                    continue;
+                }
+                let mut line = format!("      {name}: ");
+                match (side.entries, side.expected) {
+                    // A side that reports nothing is one whose scan runs
+                    // out of reach — on the far side of an agent — so all
+                    // there is to say is that it is running, and for how
+                    // long. That alone is the difference between a slow
+                    // scan and a stuck session.
+                    (0, _) => {
+                        let _ = write!(line, "scanning for {}", format_duration(side.seconds));
+                    }
+                    // A count with nothing to measure it against still
+                    // moves, and a number that moves is the answer to "is
+                    // this doing anything".
+                    (entries, None) => {
+                        let _ = write!(line, "{} entries so far", thousands(entries));
+                    }
+                    // The total is what this side's last scan found, so it
+                    // is approximate — the tree has changed since — and is
+                    // written as one.
+                    (entries, Some(expected)) => {
+                        let _ = write!(
+                            line,
+                            "{} of ~{} entries ({}%)",
+                            thousands(entries),
+                            thousands(expected),
+                            (entries.saturating_mul(100) / expected.max(1)).min(99)
+                        );
+                    }
+                }
+                if let Some(remaining) = side.remaining_seconds {
+                    let _ = write!(line, ", about {} left", format_duration(remaining));
+                }
+                let _ = writeln!(out, "{line}");
+            }
+        }
+        Phase::Staging => {
+            let mut line = format!(
+                "      {} of {} files",
+                thousands(progress.staged),
+                thousands(progress.staged_total)
+            );
+            if progress.staged_bytes_total > 0 {
+                let _ = write!(
+                    line,
+                    ", {} of {}",
+                    format_bytes(progress.staged_bytes),
+                    format_bytes(progress.staged_bytes_total)
+                );
+            }
+            let _ = writeln!(out, "{line}");
+        }
+        Phase::Applying => {
+            let _ = writeln!(
+                out,
+                "      {} of {} changes",
+                thousands(progress.applied),
+                thousands(progress.applied_total)
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Formats a duration for display, at two significant units.
+fn format_duration(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => match (seconds / 60, seconds % 60) {
+            (minutes, 0) => format!("{minutes}m"),
+            (minutes, rest) => format!("{minutes}m{rest:02}s"),
+        },
+        _ => match (seconds / 3600, (seconds % 3600) / 60) {
+            (hours, 0) => format!("{hours}h"),
+            (hours, minutes) => format!("{hours}h{minutes:02}m"),
+        },
+    }
+}
+
+/// Formats a count with thousands separators, so six digits can be read at
+/// a glance rather than counted.
+fn thousands(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
+/// Formats a byte count at three significant figures.
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (1 << 30, "GB"),
+        (1 << 20, "MB"),
+        (1 << 10, "kB"),
+        (1, "bytes"),
+    ];
+    for (scale, unit) in UNITS {
+        if bytes >= scale {
+            if scale == 1 {
+                return format!("{bytes} {unit}");
+            }
+            return format!("{:.1} {unit}", bytes as f64 / scale as f64);
+        }
+    }
+    "0 bytes".to_owned()
 }
 
 /// Formats the age of a status timestamp for display.
@@ -1892,7 +2176,7 @@ fn print_report(report: &CycleReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_remote;
+    use super::{conflict_filter, parse_remote, roll_up};
 
     #[test]
     fn remote_specification_parsing() {
@@ -1904,5 +2188,67 @@ mod tests {
         assert_eq!(parse_remote("/local/path"), None);
         assert_eq!(parse_remote("relative/path:with-colon"), None);
         assert_eq!(parse_remote("plain"), None);
+    }
+
+    #[test]
+    fn rolling_up_groups_by_leading_segments_and_keeps_leaves_whole() {
+        let paths: Vec<String> = [
+            "vulns/backend/app.py",
+            "vulns/backend/db.py",
+            "vulns/README.md",
+            "autobahn/src/main.rs",
+            "Cargo.toml",
+        ]
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+        let borrowed: Vec<&String> = paths.iter().collect();
+
+        assert_eq!(
+            roll_up(&borrowed, 1),
+            vec![
+                ("vulns".to_owned(), 3),
+                ("autobahn".to_owned(), 1),
+                ("Cargo.toml".to_owned(), 1),
+            ],
+            "depth 1 groups by top-level folder, in the order reported"
+        );
+        assert_eq!(
+            roll_up(&borrowed, 2),
+            vec![
+                ("vulns/backend".to_owned(), 2),
+                ("vulns/README.md".to_owned(), 1),
+                ("autobahn/src".to_owned(), 1),
+                ("Cargo.toml".to_owned(), 1),
+            ]
+        );
+        // A depth past the deepest path leaves every path its own group,
+        // which is the unrolled listing.
+        assert_eq!(roll_up(&borrowed, 9).len(), paths.len());
+    }
+
+    #[test]
+    fn a_filter_is_a_substring_until_it_looks_like_a_glob() {
+        // A plain word matches anywhere, ignoring case: what someone means
+        // when they type a folder name in a hurry.
+        let plain = conflict_filter("arcturus").expect("a plain filter compiles");
+        assert!(plain("arcturus/frontend/app.ts"));
+        assert!(plain("vendor/ARCTURUS/x"));
+        assert!(!plain("vulns/backend/app.py"));
+
+        // A glob without a slash matches at any depth.
+        let extension = conflict_filter("*.ts").expect("a glob compiles");
+        assert!(extension("arcturus/frontend/app.ts"));
+        assert!(extension("app.ts"));
+        assert!(!extension("arcturus/frontend/app.tsx"));
+
+        // A glob with a slash is anchored to the root, because writing the
+        // separator is what asks for that.
+        let anchored = conflict_filter("vulns/**").expect("a glob compiles");
+        assert!(anchored("vulns/backend/app.py"));
+        assert!(!anchored("other/vulns/backend/app.py"));
+
+        // A malformed pattern is reported, not silently matched.
+        assert!(conflict_filter("[").is_err());
     }
 }

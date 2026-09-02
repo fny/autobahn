@@ -1396,3 +1396,98 @@ fn a_group_name_wins_over_a_directory_of_the_same_name() {
     let text = String::from_utf8_lossy(&output.stdout);
     assert!(text.contains("notes.txt"), "{text}");
 }
+
+/// A supervised session says what it is doing, and leaves behind the totals
+/// that let the next scan be estimated rather than merely timed.
+///
+/// This is the live half of status. Without it, a session in the middle of a
+/// long first scan is described entirely by what preceded that scan —
+/// commonly an error, under an age that only grows — and reads as stuck.
+#[test]
+fn a_supervised_session_reports_what_it_is_doing() {
+    use autobahn::progress::Phase;
+    use autobahn::supervisor::control;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    for index in 0..64 {
+        write(&alpha, &format!("file{index:02}.txt"), "content");
+    }
+
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        interval = 1
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+    let plan = plans[0].clone();
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans, world.state_root(), false);
+        let stop_ref = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
+        let _guard = StopGuard(stop_ref);
+
+        assert!(
+            wait_until(Duration::from_secs(20), || beta.join("file00.txt").exists()),
+            "the initial content should synchronize"
+        );
+
+        // Every supervised session is reported, whatever it is doing.
+        assert!(
+            wait_until(Duration::from_secs(10), || control::query_progress(
+                &world.state_root()
+            )
+            .is_some()),
+            "a running supervisor reports progress"
+        );
+        let live = control::query_progress(&world.state_root()).expect("progress is reported");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].group, "work");
+
+        // Once the pair settles, the session is waiting — and a waiting
+        // session is described by its recorded status, not by a phase.
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                control::query_progress(&world.state_root())
+                    .is_some_and(|live| live[0].progress.phase == Phase::Waiting)
+            }),
+            "a settled session waits"
+        );
+        assert!(!Phase::Waiting.is_working());
+
+        // Both sides have completed a scan, so both left a total behind.
+        // These are what a later scan is measured against; without them
+        // there is no honest estimate, only elapsed time.
+        let live = control::query_progress(&world.state_root()).expect("progress is reported");
+        let alpha_entries = live[0].progress.alpha.expected.expect("alpha has a total");
+        let beta_entries = live[0].progress.beta.expected.expect("beta has a total");
+        assert!(
+            alpha_entries >= 65,
+            "the total counts the tree: {alpha_entries}"
+        );
+        assert_eq!(
+            alpha_entries, beta_entries,
+            "synchronized trees hold the same number of entries"
+        );
+
+        // The totals are recorded alongside the status, so the next run's
+        // first scan starts with a yardstick rather than without one.
+        let status = world.status(&plan).expect("a status is recorded");
+        assert_eq!(status.alpha_entries, alpha_entries);
+        assert_eq!(status.beta_entries, beta_entries);
+
+        stop.store(true, Ordering::Relaxed);
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
+    });
+}

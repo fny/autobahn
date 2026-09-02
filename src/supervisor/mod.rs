@@ -112,6 +112,14 @@ pub struct SessionStatus {
     pub error: Option<String>,
     /// When this status was recorded, in seconds since the Unix epoch.
     pub updated_at: u64,
+    /// The entry count alpha's last completed scan reported, which is what
+    /// the next run's first scan is measured against for an estimate.
+    /// Absent in records written before this field existed.
+    #[serde(default)]
+    pub alpha_entries: u64,
+    /// The entry count beta's last completed scan reported.
+    #[serde(default)]
+    pub beta_entries: u64,
 }
 
 /// The outcome of one session's participation in a single-pass run.
@@ -244,12 +252,37 @@ impl Supervisor {
             .iter()
             .map(|_| Arc::<control::WorkerControl>::default())
             .collect();
+        // Every session also gets a progress record, seeded from what its
+        // last run recorded so that the first scan after a restart can be
+        // measured rather than merely timed.
+        let progresses: Vec<Arc<crate::progress::Progress>> = self
+            .plans
+            .iter()
+            .map(|plan| {
+                let progress = Arc::<crate::progress::Progress>::default();
+                if let Ok(Some(status)) = read_status(&self.state_root, &plan.identifier()) {
+                    if status.alpha_entries > 0 {
+                        progress.alpha.seed_expected(status.alpha_entries);
+                    }
+                    if status.beta_entries > 0 {
+                        progress.beta.seed_expected(status.beta_entries);
+                    }
+                }
+                progress
+            })
+            .collect();
         let registry = control::Registry {
             entries: self
                 .plans
                 .iter()
                 .zip(&controls)
-                .map(|(plan, flags)| (plan.group.clone(), plan.host.clone(), flags.clone()))
+                .zip(&progresses)
+                .map(|((plan, flags), progress)| control::Entry {
+                    group: plan.group.clone(),
+                    host: plan.host.clone(),
+                    control: flags.clone(),
+                    progress: progress.clone(),
+                })
                 .collect(),
         };
         let listener = match control::bind(&self.state_root) {
@@ -268,6 +301,7 @@ impl Supervisor {
             }
             for (index, plan) in self.plans.iter().enumerate() {
                 let flags = controls[index].clone();
+                let progress = progresses[index].clone();
                 scope.spawn(move || {
                     // Stagger the first attempts so a large fan-out doesn't
                     // open every connection in the same instant (bounded, so
@@ -280,6 +314,7 @@ impl Supervisor {
                     sleep_interruptible(stagger, stop);
 
                     let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
+                    worker.progress = progress;
                     let identifier = plan.identifier();
                     let mut failures = 0u32;
                     while !stop.load(Ordering::Relaxed) {
@@ -305,9 +340,11 @@ impl Supervisor {
                                 failures,
                                 jitter_percent(&identifier, failures),
                             );
+                            worker.progress.rest(crate::progress::Phase::Retrying);
                             sleep_flagged(delay, stop, &flags);
                         } else {
                             failures = 0;
+                            worker.progress.rest(crate::progress::Phase::Waiting);
                             worker.await_activity(plan.interval, stop, &flags);
                         }
                     }
@@ -335,6 +372,10 @@ struct Worker<'a> {
     cycles: u64,
     /// A verify request awaiting the next cycle (survives reconnection).
     verify_pending: bool,
+    /// What this session is doing, published to the control socket. A
+    /// worker that nobody is watching — a single pass, or a test — still
+    /// has one; it is simply never read.
+    progress: Arc<crate::progress::Progress>,
 }
 
 impl<'a> Worker<'a> {
@@ -353,6 +394,7 @@ impl<'a> Worker<'a> {
             session: None,
             cycles: 0,
             verify_pending: false,
+            progress: Arc::default(),
         }
     }
 
@@ -367,7 +409,14 @@ impl<'a> Worker<'a> {
     fn attempt(&mut self) -> Result<(CycleDigest, CycleReport)> {
         let result = (|| {
             if self.session.is_none() {
-                self.session = Some(connect(self.plan, self.state_root, self.pool)?);
+                // Connecting is its own phase because it is its own wait:
+                // the first connection to a host installs the agent there,
+                // and an unreachable one is where a session sits until it
+                // times out.
+                self.progress.enter(crate::progress::Phase::Connecting);
+                let mut session = connect(self.plan, self.state_root, self.pool)?;
+                session.set_progress(self.progress.clone());
+                self.session = Some(session);
             }
             let session = self.session.as_mut().expect("the session was just created");
             if std::mem::take(&mut self.verify_pending) {
@@ -445,6 +494,7 @@ impl<'a> Worker<'a> {
         // agent — a paused session holds no resources and doesn't block
         // other processes.
         self.session = None;
+        self.progress.rest(crate::progress::Phase::Paused);
         self.record_state("paused");
         if self.verbose {
             println!("[{}] paused", self.plan.display());
@@ -509,6 +559,8 @@ impl<'a> Worker<'a> {
             problems: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
+            alpha_entries: self.progress.alpha.expected_total(),
+            beta_entries: self.progress.beta.expected_total(),
         };
         if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
             eprintln!(
@@ -552,6 +604,8 @@ impl<'a> Worker<'a> {
             problems: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
+            alpha_entries: self.progress.alpha.expected_total(),
+            beta_entries: self.progress.beta.expected_total(),
         };
         match result {
             Ok((digest, report)) => {
@@ -848,10 +902,17 @@ pub struct SessionReport {
     pub conflicts: Vec<ConflictDetail>,
     pub problems: Vec<String>,
     pub error: Option<String>,
+    /// What the session is doing right now, when a supervisor is running
+    /// and reports it. Everything else in this record is what the last
+    /// cycle left behind; this is the only live field.
+    pub progress: Option<crate::progress::ProgressSnapshot>,
 }
 
 /// Builds the report for a set of plans.
 pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport {
+    // One round trip serves both questions: a supervisor that answers is
+    // running, and its answer is what every session is doing.
+    let live = control::query_progress(state_root);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -859,6 +920,12 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
     let mut groups: Vec<GroupReport> = Vec::new();
     for plan in plans {
         let status = read_status(state_root, &plan.identifier()).ok().flatten();
+        let progress = live.as_ref().and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.group == plan.group && session.host == plan.host)
+                .map(|session| session.progress.clone())
+        });
         let session = match status {
             None => SessionReport {
                 host: plan.host.clone(),
@@ -870,6 +937,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 conflicts: Vec::new(),
                 problems: Vec::new(),
                 error: None,
+                progress: progress.clone(),
             },
             Some(status) => SessionReport {
                 host: plan.host.clone(),
@@ -881,6 +949,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 conflicts: status.conflict_details.clone(),
                 problems: status.problems.clone(),
                 error: status.error.clone(),
+                progress: progress.clone(),
             },
         };
         match groups.last_mut() {
@@ -893,8 +962,8 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         }
     }
     StatusReport {
-        version: 1,
-        supervisor_running: control::supervisor_is_running(state_root),
+        version: 2,
+        supervisor_running: live.is_some(),
         service: match crate::service::state() {
             Ok(crate::service::ServiceState::NotInstalled) => "not-installed",
             Ok(crate::service::ServiceState::Stopped) => "stopped",
@@ -1363,6 +1432,8 @@ mod tests {
             problems: vec!["beta x: denied".into()],
             error: None,
             updated_at: 12345,
+            alpha_entries: 1_000,
+            beta_entries: 1_002,
         };
         write_status(directory.path(), "abc123", &status).expect("status should write");
         let loaded = read_status(directory.path(), "abc123")
@@ -1371,6 +1442,10 @@ mod tests {
         assert_eq!(loaded.group, "g");
         assert_eq!(loaded.state, "conflicts");
         assert_eq!(loaded.cycles, 3);
+        // The scan totals ride along so the next run's first scan can be
+        // measured against them rather than merely timed.
+        assert_eq!(loaded.alpha_entries, 1_000);
+        assert_eq!(loaded.beta_entries, 1_002);
         assert_eq!(loaded.conflicts, vec!["path/to/conflict".to_owned()]);
 
         assert!(read_status(directory.path(), "missing")

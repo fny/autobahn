@@ -10,15 +10,16 @@
 use std::fs::{self, File};
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::endpoint::{Endpoint, FileRequest, TransitionOutcome};
+use crate::endpoint::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
 pub(crate) mod ancestor;
 
 use crate::tree::{
-    apply, path_join, propagate_executability, reconcile, Change, Conflict, Content, Node, Problem,
-    SyncMode,
+    apply, path_join, propagate_executability, reconcile, Change, Conflict, Content, Digest, Node,
+    Problem, SyncMode,
 };
 
 /// The number of transfer frames pumped between endpoints per round trip
@@ -113,6 +114,10 @@ pub struct Session {
     remote_involved: bool,
     /// The current ancestor hierarchy.
     ancestor: Option<Node>,
+    /// Where this session announces what it is doing, when a supervisor is
+    /// watching. A session with no observer announces into a handle nobody
+    /// reads, which keeps the cycle free of conditionals.
+    progress: Arc<crate::progress::Progress>,
     /// Whether the last cycle finished with the two sides synchronized and
     /// nothing outstanding — the precondition for skipping a cycle whose
     /// scans reproduce [`settled_alpha`](Self::settled_alpha) and
@@ -267,11 +272,21 @@ impl Session {
             mode,
             ancestor_store,
             ancestor,
+            progress: Arc::default(),
             quiesced: false,
             settled_alpha: None,
             settled_beta: None,
             _lock: lock,
         })
+    }
+
+    /// Adopts the supervisor's progress record, so that what this session
+    /// is doing is visible while it does it. Each endpoint gets the handle
+    /// for its own side.
+    pub fn set_progress(&mut self, progress: Arc<crate::progress::Progress>) {
+        self.alpha.set_scan_progress(progress.alpha.clone());
+        self.beta.set_scan_progress(progress.beta.clone());
+        self.progress = progress;
     }
 
     /// Blocks until either endpoint signals that content may have changed,
@@ -357,6 +372,7 @@ impl Session {
         let mut report = CycleReport::default();
 
         // Scan both endpoints in parallel.
+        self.progress.enter(crate::progress::Phase::Scanning);
         let verify = std::mem::take(&mut self.verify_next);
         let (alpha_snapshot, beta_snapshot) = {
             let alpha = &mut self.alpha;
@@ -445,6 +461,7 @@ impl Session {
         }
 
         // Reconcile.
+        self.progress.enter(crate::progress::Phase::Reconciling);
         let reconciliation = reconcile(
             self.ancestor.as_ref(),
             alpha_root.as_ref(),
@@ -494,17 +511,22 @@ impl Session {
                 self.alpha.as_mut(),
                 self.beta.as_mut(),
                 &reconciliation.beta_transitions,
+                &self.progress,
             )?;
             if !intent_recorded {
                 self.ancestor_store
                     .intend(&intended, self.remote_involved)?;
                 intent_recorded = true;
             }
-            Some(
-                self.beta
-                    .transition(reconciliation.beta_transitions.clone())
-                    .context("beta transition failed")?,
-            )
+            self.progress
+                .begin_applying(reconciliation.beta_transitions.len() as u64);
+            let outcome = self
+                .beta
+                .transition(reconciliation.beta_transitions.clone())
+                .context("beta transition failed")?;
+            self.progress
+                .applied_reached(reconciliation.beta_transitions.len() as u64);
+            Some(outcome)
         };
         let alpha_outcome = if reconciliation.alpha_transitions.is_empty() {
             None
@@ -513,17 +535,22 @@ impl Session {
                 self.beta.as_mut(),
                 self.alpha.as_mut(),
                 &reconciliation.alpha_transitions,
+                &self.progress,
             )?;
             if !intent_recorded {
                 self.ancestor_store
                     .intend(&intended, self.remote_involved)?;
                 intent_recorded = true;
             }
-            Some(
-                self.alpha
-                    .transition(reconciliation.alpha_transitions.clone())
-                    .context("alpha transition failed")?,
-            )
+            self.progress
+                .begin_applying(reconciliation.alpha_transitions.len() as u64);
+            let outcome = self
+                .alpha
+                .transition(reconciliation.alpha_transitions.clone())
+                .context("alpha transition failed")?;
+            self.progress
+                .applied_reached(reconciliation.alpha_transitions.len() as u64);
+            Some(outcome)
         };
         let _ = intent_recorded;
 
@@ -561,6 +588,7 @@ impl Session {
         // only ever contain synchronizable content — this is the safety net
         // against reconciliation defects reaching disk), and persist it.
         if !ancestor_changes.is_empty() {
+            self.progress.enter(crate::progress::Phase::Saving);
             let new_ancestor = apply(self.ancestor.as_ref(), &ancestor_changes)
                 .map_err(|message| anyhow::anyhow!("ancestor update failed: {message}"))?;
             if let Some(root) = &new_ancestor {
@@ -659,10 +687,44 @@ pub fn transition_dependencies(transitions: &[Change]) -> Vec<FileRequest> {
 
 /// Stages the content needed by `transitions` onto the destination endpoint,
 /// supplying it from the source endpoint in streamed batches.
+/// The total size of the content a transfer is about to move.
+///
+/// A staging need names a path and a digest, not a length; the lengths are
+/// on the nodes the transitions carry, so they are collected from there and
+/// matched by digest — which is what a need is addressed by.
+fn staged_bytes(transitions: &[Change], needs: &[StagingNeed]) -> u64 {
+    fn collect(node: &Node, sizes: &mut std::collections::HashMap<Digest, u64>) {
+        match &node.content {
+            Content::File {
+                digest, metadata, ..
+            } => {
+                sizes.insert(*digest, metadata.size);
+            }
+            Content::Directory(children) => {
+                for child in children.iter() {
+                    collect(child, sizes);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut sizes = std::collections::HashMap::new();
+    for change in transitions {
+        if let Some(node) = &change.new {
+            collect(node, &mut sizes);
+        }
+    }
+    needs
+        .iter()
+        .map(|need| sizes.get(&need.request.digest).copied().unwrap_or(0))
+        .sum()
+}
+
 fn stage(
     source: &mut dyn Endpoint,
     destination: &mut dyn Endpoint,
     transitions: &[Change],
+    progress: &crate::progress::Progress,
 ) -> Result<()> {
     let requests = transition_dependencies(transitions);
     if requests.is_empty() {
@@ -674,6 +736,11 @@ fn stage(
     if needs.is_empty() {
         return Ok(());
     }
+    // What this transfer will move, announced before it starts so that its
+    // progress can be read as a fraction rather than as a total that only
+    // grows. The sizes come from the transitions themselves: a need names
+    // a path and a digest, not a length.
+    progress.begin_staging(needs.len() as u64, staged_bytes(transitions, &needs));
     source
         .supply_open(needs)
         .context("unable to open supply stream")?;
@@ -682,13 +749,32 @@ fn stage(
     // writes even when both endpoints share this process. (A remote
     // destination additionally keeps its own window of pushed batches in
     // flight, and stage_finish drains those acknowledgements.)
-    let (batches, staged) = std::sync::mpsc::sync_channel(1);
+    let (batches, staged) = std::sync::mpsc::sync_channel::<Vec<TransferFrame>>(1);
     std::thread::scope(|scope| {
         let pusher = scope.spawn(move || -> Result<()> {
             while let Ok(frames) = staged.recv() {
+                // Counted in this half rather than in the pulling one. The
+                // channel between them holds a single batch, so a pass
+                // over the frames before the send sits squarely between
+                // the source's read and the destination's write, with
+                // nothing to overlap it; here it runs while the puller is
+                // already fetching the next batch. (Measured: two passes
+                // before the send cost 2.5 ms of p50.)
+                let mut files = 0u64;
+                let mut bytes = 0u64;
+                for frame in frames.iter() {
+                    match frame {
+                        TransferFrame::EndOfFile { .. } => files += 1,
+                        TransferFrame::Op(crate::rsync::Op::Data(data)) => {
+                            bytes += data.len() as u64
+                        }
+                        TransferFrame::Op(_) => {}
+                    }
+                }
                 destination
                     .stage_push_nowait(frames)
                     .context("unable to push file content")?;
+                progress.staged(files, bytes);
             }
             destination
                 .stage_finish()

@@ -9,6 +9,8 @@
 //! correspond to the request is a protocol error. Channels on the same
 //! connection interleave freely — see [`crate::transport::mux`].
 
+use std::sync::Arc;
+
 use anyhow::{anyhow, bail, Context, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
@@ -39,9 +41,84 @@ pub struct RemoteEndpoint {
     /// same fold the agent applies. Retaining it is what lets an unchanged
     /// rescan cost nothing on the wire.
     last_snapshot: Option<Snapshot>,
+    /// Where this endpoint's scans report that they are running.
+    progress: Option<Arc<crate::progress::SideProgress>>,
+}
+
+/// Holds a side in its scanning state until the scan returns, however it
+/// returns: a scan that fails partway must not leave the side looking as
+/// though it is still running.
+struct ScanGuard {
+    progress: Option<Arc<crate::progress::SideProgress>>,
+}
+
+impl ScanGuard {
+    /// Ends the scan with the total it established.
+    fn finish(&mut self, total: u64) {
+        if let Some(progress) = self.progress.take() {
+            progress.end(Some(total));
+        }
+    }
+}
+
+impl Drop for ScanGuard {
+    fn drop(&mut self) {
+        // Still held means the scan did not reach `finish`: it failed. The
+        // side stops scanning, and the next one is measured against
+        // whatever the last *successful* scan established.
+        if let Some(progress) = self.progress.take() {
+            progress.end(None);
+        }
+    }
+}
+
+/// Ends a remote scan, leaving a successful snapshot's own total behind for
+/// the next scan to be measured against.
+fn finish_scan(guard: Option<ScanGuard>, snapshot: &Result<Snapshot>) {
+    if let (Some(mut guard), Ok(snapshot)) = (guard, snapshot) {
+        guard.finish(snapshot.directories + snapshot.files + snapshot.symlinks);
+    }
 }
 
 impl RemoteEndpoint {
+    /// Marks this side as scanning for as long as the returned guard
+    /// lives.
+    ///
+    /// A remote scan happens inside a single request on the far side, so
+    /// there is nothing to count while it runs: the guard reports that the
+    /// side is scanning and how long it has been, and the completed
+    /// snapshot's own total is left behind for the next scan to be
+    /// measured against. Live counts would need the agent to report them
+    /// mid-request, which the protocol does not carry.
+    fn scanning(&self) -> Option<ScanGuard> {
+        let progress = self.progress.clone()?;
+        progress.begin(false);
+        Some(ScanGuard {
+            progress: Some(progress),
+        })
+    }
+
+    /// Asks the agent for a scan and receives the snapshot, however it
+    /// chose to send it.
+    fn request_scan(&mut self, request: Request, what: &'static str) -> Result<Snapshot> {
+        match self.exchange(request)? {
+            Response::Scan(snapshot) => {
+                self.last_snapshot = Some(snapshot.clone());
+                Ok(snapshot)
+            }
+            Response::ScanDelta(header) => self.receive_snapshot(header, what),
+            // The agent reports "unchanged" only against a snapshot it has
+            // actually sent, so having nothing to reproduce means the two
+            // sides disagree about what was transmitted. That is a protocol
+            // defect, and silently rescanning would paper over it.
+            Response::ScanUnchanged => self
+                .last_snapshot
+                .clone()
+                .ok_or_else(|| anyhow!("the agent reported an unchanged scan before sending one")),
+            response => Err(unexpected_response(&response, what)),
+        }
+    }
+
     /// Reassembles a snapshot sent as a delta, retrying in full when the
     /// baseline the agent named cannot be reproduced here.
     fn receive_snapshot(&mut self, header: ScanDelta, what: &str) -> Result<Snapshot> {
@@ -159,6 +236,7 @@ impl RemoteEndpoint {
             channel,
             pending_pushes: 0,
             last_snapshot: None,
+            progress: None,
         }
     }
 
@@ -295,23 +373,15 @@ impl Endpoint for RemoteEndpoint {
         true
     }
 
+    fn set_scan_progress(&mut self, progress: Arc<crate::progress::SideProgress>) {
+        self.progress = Some(progress);
+    }
+
     fn scan(&mut self) -> Result<Snapshot> {
-        match self.exchange(Request::Scan)? {
-            Response::Scan(snapshot) => {
-                self.last_snapshot = Some(snapshot.clone());
-                Ok(snapshot)
-            }
-            Response::ScanDelta(header) => self.receive_snapshot(header, "scan"),
-            // The agent reports "unchanged" only against a snapshot it has
-            // actually sent, so having nothing to reproduce means the two
-            // sides disagree about what was transmitted. That is a protocol
-            // defect, and silently rescanning would paper over it.
-            Response::ScanUnchanged => self
-                .last_snapshot
-                .clone()
-                .ok_or_else(|| anyhow!("the agent reported an unchanged scan before sending one")),
-            response => Err(unexpected_response(&response, "scan")),
-        }
+        let scanning = self.scanning();
+        let snapshot = self.request_scan(Request::Scan, "scan");
+        finish_scan(scanning, &snapshot);
+        snapshot
     }
 
     fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
@@ -332,14 +402,10 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn scan_verified(&mut self) -> Result<Snapshot> {
-        match self.exchange(Request::ScanVerified)? {
-            Response::Scan(snapshot) => {
-                self.last_snapshot = Some(snapshot.clone());
-                Ok(snapshot)
-            }
-            Response::ScanDelta(header) => self.receive_snapshot(header, "verified scan"),
-            response => Err(unexpected_response(&response, "verified scan")),
-        }
+        let scanning = self.scanning();
+        let snapshot = self.request_scan(Request::ScanVerified, "verified scan");
+        finish_scan(scanning, &snapshot);
+        snapshot
     }
 
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {

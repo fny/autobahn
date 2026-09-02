@@ -13,6 +13,8 @@ pub mod local;
 pub mod observer;
 pub mod remote;
 
+use std::sync::Arc;
+
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -161,6 +163,12 @@ pub trait Endpoint: Send {
     fn is_remote(&self) -> bool {
         false
     }
+
+    /// Adopts a handle on which this endpoint's scans publish their
+    /// running counts. Endpoints that cannot report progress — a remote
+    /// one, whose scan happens inside a single request on the far side —
+    /// ignore it, and the session reports only that they are scanning.
+    fn set_scan_progress(&mut self, _progress: Arc<crate::progress::SideProgress>) {}
 
     /// Performs a filesystem scan, returning the current snapshot. Endpoints
     /// accelerate rescans internally (via node-resident metadata from prior

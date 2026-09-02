@@ -129,6 +129,11 @@ pub struct LocalEndpoint {
     /// cache, however many sessions synchronize it. See
     /// [`observer`](crate::endpoint::observer) for why.
     observer: Arc<crate::endpoint::observer::RootObserver>,
+    /// Where this endpoint's scans publish their running counts, when a
+    /// supervisor is watching. Shared with one side of one session: an
+    /// observer serving several sessions walks once, and the session that
+    /// performs the walk is the one that reports it.
+    progress: Option<Arc<crate::progress::SideProgress>>,
     /// A test seam between the transition's announcement and its writes —
     /// the window in which a sharing session's scan can consume the
     /// announced dirty marks and still read the old bytes.
@@ -382,6 +387,7 @@ impl LocalEndpoint {
                 observer_ignores,
                 cache_path,
             ),
+            progress: None,
             #[cfg(test)]
             between_announce_and_writes: None,
             seen_generation: 0,
@@ -775,6 +781,10 @@ impl LocalEndpoint {
 }
 
 impl Endpoint for LocalEndpoint {
+    fn set_scan_progress(&mut self, progress: Arc<crate::progress::SideProgress>) {
+        self.progress = Some(progress);
+    }
+
     fn scan(&mut self) -> Result<Snapshot> {
         // The observation is shared: one watcher, one walk and one cache
         // per root, however many sessions synchronize it. What this
@@ -782,14 +792,18 @@ impl Endpoint for LocalEndpoint {
         // returned — because transitions validate against the scan they
         // were reconciled from, not against whatever the observer has
         // published since.
-        let (snapshot, generation) = self.observer.scan(self.max_entry_count)?;
+        let (snapshot, generation) = self
+            .observer
+            .scan(self.max_entry_count, self.progress.as_deref())?;
         self.seen_generation = generation;
         self.last_snapshot = Some(snapshot.clone());
         Ok(snapshot)
     }
 
     fn scan_verified(&mut self) -> Result<Snapshot> {
-        let (snapshot, generation) = self.observer.scan_rehash(self.max_entry_count)?;
+        let (snapshot, generation) = self
+            .observer
+            .scan_rehash(self.max_entry_count, self.progress.as_deref())?;
         self.seen_generation = generation;
         self.last_snapshot = Some(snapshot.clone());
         Ok(snapshot)
@@ -1085,6 +1099,9 @@ impl Endpoint for LocalEndpoint {
             // Each change is applied independently: a refusal at one path
             // must never abort the rest of the transition.
             slots[index] = Some(transitioner.apply(&transitions[index]));
+            if let Some(progress) = &self.progress {
+                progress.change_applied();
+            }
         }
         let results: Vec<Option<Node>> = slots
             .into_iter()
@@ -4073,7 +4090,7 @@ mod tests {
         let racing = std::sync::Arc::new(std::sync::Mutex::new(None));
         let stash = std::sync::Arc::clone(&racing);
         fixture.beta.between_announce_and_writes = Some(Box::new(move || {
-            *stash.lock().unwrap() = Some(observer.scan(None).expect("the racing scan runs"));
+            *stash.lock().unwrap() = Some(observer.scan(None, None).expect("the racing scan runs"));
         }));
         let outcome = fixture
             .beta

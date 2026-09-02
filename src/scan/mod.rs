@@ -21,6 +21,11 @@ pub use probes::{probe, recompose, FilesystemBehavior};
 /// digester.
 const DIGEST_BUFFER_SIZE: usize = 64 * 1024;
 
+/// How many entries a scan counts before publishing them. Large enough
+/// that the atomic add disappears against the filesystem work, small
+/// enough that a reader watching a long scan sees a number that moves.
+const PROGRESS_BLOCK: u64 = 512;
+
 /// The file type mask within a raw mode value (`S_IFMT`).
 const MODE_TYPE_MASK: u32 = 0o170000;
 
@@ -188,6 +193,7 @@ pub fn validate_portable_target(path: &str, target: &str) -> Result<(), String> 
 /// content; unreadable entries appear as problematic content. A missing root
 /// yields a snapshot with no content.
 #[allow(clippy::too_many_arguments)] // a scan is configured, not builder-shaped
+#[allow(clippy::too_many_arguments)]
 pub fn scan(
     root: &Path,
     baseline: Option<&Snapshot>,
@@ -197,6 +203,7 @@ pub fn scan(
     max_file_size: Option<u64>,
     dirty: Option<&DirtyPaths>,
     rehash: bool,
+    progress: Option<&crate::progress::SideProgress>,
 ) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
@@ -231,6 +238,12 @@ pub fn scan(
     // one there is nothing to adopt, and everything must be read anyway.
     let baseline_root = baseline.and_then(|s| s.root.as_ref());
     let dirty = dirty.filter(|_| baseline_root.is_some());
+    // A scan with no marks to work from reads the whole tree, which is
+    // both the slow case and the only one whose running count can be
+    // measured against a whole-tree total.
+    if let Some(progress) = progress {
+        progress.begin(dirty.is_none());
+    }
     let mut scanner = Scanner::new(
         ignores,
         behavior,
@@ -239,8 +252,10 @@ pub fn scan(
         dirty.is_some(),
         baseline.map(|snapshot| snapshot.scanned_at_seconds),
         rehash,
+        progress,
     );
     let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
+    scanner.publish();
     let mut snapshot = Snapshot {
         root: Some(Node {
             name: String::new(),
@@ -258,6 +273,14 @@ pub fn scan(
     // filesystem access, over a tree that is mostly shared storage).
     if dirty.is_some() {
         recount(&mut snapshot);
+    }
+    // Every scan's statistics describe the whole tree — an incremental one
+    // recounts the assembled hierarchy above — so every scan leaves behind
+    // a total for the next full scan to be measured against.
+    if let Some(progress) = progress {
+        progress.end(Some(
+            snapshot.directories + snapshot.files + snapshot.symlinks,
+        ));
     }
     Ok(snapshot)
 }
@@ -323,6 +346,12 @@ struct Scanner<'a> {
     symlinks: u64,
     /// The total size of synchronizable file content.
     total_file_size: u64,
+    /// Where to publish the running counts, when someone is watching.
+    progress: Option<&'a crate::progress::SideProgress>,
+    /// Entries and bytes counted but not yet published. See
+    /// [`counted`](Scanner::counted).
+    pending_entries: u64,
+    pending_bytes: u64,
 }
 
 impl<'a> Scanner<'a> {
@@ -335,6 +364,7 @@ impl<'a> Scanner<'a> {
         incremental: bool,
         baseline_scanned_at: Option<i64>,
         rehash: bool,
+        progress: Option<&'a crate::progress::SideProgress>,
     ) -> Scanner<'a> {
         Scanner {
             ignores,
@@ -349,6 +379,35 @@ impl<'a> Scanner<'a> {
             files: 0,
             symlinks: 0,
             total_file_size: 0,
+            progress,
+            pending_entries: 0,
+            pending_bytes: 0,
+        }
+    }
+
+    /// Counts one visited entry, and any bytes read for it.
+    ///
+    /// The counts are accumulated in plain fields and published a block at
+    /// a time. An atomic add per entry sounds free and is not: this runs
+    /// once per filesystem entry, for a number nobody reads more than once
+    /// a second.
+    #[inline]
+    fn counted(&mut self, bytes: u64) {
+        self.pending_entries += 1;
+        self.pending_bytes += bytes;
+        if self.pending_entries >= PROGRESS_BLOCK {
+            self.publish();
+        }
+    }
+
+    /// Publishes the accumulated counts.
+    fn publish(&mut self) {
+        let (entries, bytes) = (
+            std::mem::take(&mut self.pending_entries),
+            std::mem::take(&mut self.pending_bytes),
+        );
+        if let Some(progress) = self.progress {
+            progress.advance(entries, bytes);
         }
     }
 
@@ -392,6 +451,7 @@ impl<'a> Scanner<'a> {
             let baseline = baseline.expect("a non-relisted directory has a baseline");
             let dirty = dirty.expect("a non-relisted directory is marked");
             self.directories += 1;
+            self.counted(0);
             let mut children = Vec::with_capacity(baseline.children().len());
             for baseline_child in baseline.children() {
                 let Some(child_dirty) = dirty.children.get(&baseline_child.name) else {
@@ -427,6 +487,7 @@ impl<'a> Scanner<'a> {
             Err(error) => return problematic(format!("unable to read directory: {error:#}")),
         };
         self.directories += 1;
+        self.counted(0);
 
         let mut children = Vec::with_capacity(entries.len());
         for (raw_name, entry_path) in entries {
@@ -621,6 +682,10 @@ impl<'a> Scanner<'a> {
         } else {
             reusable_digest(baseline, &recorded, self.baseline_scanned_at)
         };
+        // Bytes actually read for this file, which is what the scan's
+        // running byte count means: a file whose digest was reused cost
+        // nothing to read.
+        let mut bytes_read = 0;
         let digest = match reusable {
             Some(digest) => digest,
             None => {
@@ -638,7 +703,7 @@ impl<'a> Scanner<'a> {
                 // inside that window the pair validated itself forever —
                 // the wrong digest survived every future scan, full scans
                 // included, and was persisted into the cache.
-                let _ = read;
+                bytes_read = read;
                 // Under a verifying scan, a recomputed digest that differs
                 // while the metadata matches the baseline exactly is the
                 // precise class the metadata gate cannot see — content
@@ -670,6 +735,7 @@ impl<'a> Scanner<'a> {
         };
 
         self.files += 1;
+        self.counted(bytes_read);
         self.total_file_size += recorded.size;
         Content::File {
             digest,
@@ -724,6 +790,7 @@ impl<'a> Scanner<'a> {
             }
         }
         self.symlinks += 1;
+        self.counted(0);
         Content::Symlink {
             target: target.to_owned(),
         }
@@ -1009,6 +1076,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed")
     }
@@ -1031,6 +1099,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("full scan should succeed");
         let incremental = scan(
@@ -1042,6 +1111,7 @@ mod tests {
             None,
             Some(&dirty),
             false,
+            None,
         )
         .expect("incremental scan should succeed");
         assert!(
@@ -1146,6 +1216,7 @@ mod tests {
             None,
             Some(&dirty),
             false,
+            None,
         )
         .expect("incremental scan should succeed");
         assert!(incremental.content_equal(&baseline));
@@ -1180,6 +1251,7 @@ mod tests {
                 None,
                 None,
                 false,
+                None,
             )
             .expect("scan should succeed")
         };
@@ -1246,6 +1318,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -1262,6 +1335,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -1280,6 +1354,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("a missing root is not an error");
         assert!(snapshot.root.is_none());
@@ -1303,6 +1378,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .is_err());
     }
@@ -1491,6 +1567,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1531,6 +1608,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1567,6 +1645,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1595,6 +1674,7 @@ mod tests {
             None,
             None,
             false,
+            None,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");

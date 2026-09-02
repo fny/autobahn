@@ -387,13 +387,37 @@ impl App {
 
         for (group, items) in report.groups.iter().zip(model.groups.iter_mut()) {
             for (session, entry) in group.sessions.iter().zip(items.sessions.iter_mut()) {
-                let age = session
-                    .age_seconds
-                    .map(format_age)
-                    .unwrap_or_else(|| "never run".to_owned());
-                entry
-                    .line
-                    .set_text(format!("{}  —  {}, {}", session.host, session.state, age));
+                // A session that is working says so; one that is not is
+                // described by how its last cycle ended. The same rule the
+                // command line follows, for the same reason: an age that
+                // only grows over a stale state reads as stuck.
+                let line = match session
+                    .progress
+                    .as_ref()
+                    .filter(|progress| progress.phase.is_working())
+                {
+                    Some(progress) => {
+                        let mut line = format!(
+                            "{}  —  {}, {}",
+                            session.host,
+                            progress.phase.label(),
+                            format_elapsed(progress.seconds)
+                        );
+                        if let Some(remaining) = progress.remaining_seconds {
+                            use std::fmt::Write;
+                            let _ = write!(line, ", about {} left", format_elapsed(remaining));
+                        }
+                        line
+                    }
+                    None => {
+                        let age = session
+                            .age_seconds
+                            .map(format_age)
+                            .unwrap_or_else(|| "never run".to_owned());
+                        format!("{}  —  {}, {}", session.host, session.state, age)
+                    }
+                };
+                entry.line.set_text(line);
                 let detail_text = session
                     .error
                     .as_deref()
@@ -769,6 +793,21 @@ fn icon(health: Health) -> Icon {
         }
     }
     Icon::from_rgba(rgba, SIZE, SIZE).expect("a valid icon")
+}
+
+/// Formats an elapsed or remaining duration, at two significant units.
+fn format_elapsed(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => match (seconds / 60, seconds % 60) {
+            (minutes, 0) => format!("{minutes}m"),
+            (minutes, rest) => format!("{minutes}m{rest:02}s"),
+        },
+        _ => match (seconds / 3600, (seconds % 3600) / 60) {
+            (hours, 0) => format!("{hours}h"),
+            (hours, minutes) => format!("{hours}h{minutes:02}m"),
+        },
+    }
 }
 
 fn format_age(seconds: u64) -> String {

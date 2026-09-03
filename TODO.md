@@ -142,9 +142,11 @@ committed.
   bundle to state its version: a manifest beside it, or a marker string
   the installer can find in the bytes, checked before upload. Failing
   closed there turns a ten-minute outage into a refusal to start.
-  Related: there is no recorded way to build the Linux agent. This
-  machine has no cross toolchain, and the Sep 1 binary was built
-  somewhere else. Write the recipe down, and put it in the README.
+  Related: agent bundles are moving to GitHub Actions, which removes the
+  "built by hand somewhere, age unknown" problem at the source. The
+  version check is still worth having — a release artifact can be stale
+  in a workflow too — and CI is the natural place to stamp the bundle
+  with the version the check reads.
 
 - [ ] **A rebuilt agent never reaches a host that already has that
   version.** `remote.rs:341` installs only when the first connect fails,

@@ -1293,6 +1293,7 @@ fn run_shop(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> 
 fn confirmed(
     targets: &[(&autobahn::config::SessionPlan, Vec<String>)],
     keep: &str,
+    scope: Option<&str>,
     both: bool,
     yes: bool,
 ) -> Result<bool> {
@@ -1305,7 +1306,14 @@ fn confirmed(
         "both" => "both versions".to_owned(),
         host => format!("{host}'s version"),
     };
-    println!("about to resolve {paths} path(s), keeping {winner}:");
+    let what = match paths {
+        1 => "1 conflict".to_owned(),
+        many => format!("{many} conflicts"),
+    };
+    match scope {
+        Some(scope) => println!("about to resolve {what} under {scope}, keeping {winner}:"),
+        None => println!("about to resolve {what}, keeping {winner}:"),
+    }
     for (plan, paths) in targets {
         for path in paths {
             println!("  {}  {path}", plan.display());
@@ -1452,8 +1460,10 @@ fn run_resolve(
         }
     };
 
-    // Which paths, in which sessions.
+    // Which paths, in which sessions — and the folder they came from,
+    // when a folder was named.
     let mut targets: Vec<(&autobahn::config::SessionPlan, Vec<String>)> = Vec::new();
+    let mut scope: Option<String> = None;
     if all {
         for plan in &selection.plans {
             if let Some(status) = read_status(&state_root, &plan.identifier())? {
@@ -1470,12 +1480,37 @@ fn run_resolve(
             bail!("--all cannot keep both: choose whose version wins");
         }
     } else {
-        let path = relative_path(&selection, path)?;
-        targets = selection
-            .plans
-            .iter()
-            .map(|plan| (*plan, vec![path.clone()]))
-            .collect();
+        let named = relative_path(&selection, path)?;
+        // A named path may be a file or a folder. Take every recorded
+        // conflict at or under it, so naming a folder settles what is
+        // inside it — `conflicts` scopes the same way, and a folder
+        // resolved as if it were a file can only fail: its "content" reads
+        // as nothing, and writing nothing means removing it.
+        for plan in &selection.plans {
+            if let Some(status) = read_status(&state_root, &plan.identifier())? {
+                let under: Vec<String> = status
+                    .conflicts
+                    .iter()
+                    .filter(|path| *path == &named || path.starts_with(&format!("{named}/")))
+                    .cloned()
+                    .collect();
+                if !under.is_empty() {
+                    targets.push((plan, under));
+                }
+            }
+        }
+        // Nothing recorded there. The path is taken at its word, which is
+        // how a file is forced to match a side without a conflict being
+        // reported first.
+        if targets.is_empty() {
+            targets = selection
+                .plans
+                .iter()
+                .map(|plan| (*plan, vec![named.clone()]))
+                .collect();
+        } else {
+            scope = Some(named);
+        }
     }
 
     // One confirmation, whether the command names one path or every one.
@@ -1483,7 +1518,13 @@ fn run_resolve(
     // is what made it a conflict — and it does so on every destination in
     // the group, not only the one named. Both facts are worth reading
     // before they happen.
-    if !confirmed(&targets, &keep, winner == Winner::Both, yes)? {
+    if !confirmed(
+        &targets,
+        &keep,
+        scope.as_deref(),
+        winner == Winner::Both,
+        yes,
+    )? {
         println!("nothing done");
         return Ok(());
     }
@@ -2465,5 +2506,43 @@ mod tests {
         );
         // Counting from the root instead would say nothing at all.
         assert_eq!(roll_up(&scoped, 1), vec![("autobahn".to_owned(), 3)]);
+    }
+
+    /// Naming a folder resolves the conflicts inside it.
+    ///
+    /// `resolve` writes a file's bytes to every side. A folder read that
+    /// way has no content, so the write becomes a removal — which fails,
+    /// but only after saying it would "resolve 1 path". Expanding the
+    /// folder into the conflicts recorded under it is both what the
+    /// command can do and what `autobahn resolve voltai autobahn` plainly
+    /// means.
+    #[test]
+    fn a_named_folder_covers_the_conflicts_recorded_under_it() {
+        let recorded = [
+            "autobahn/src/main.rs",
+            "autobahn/Cargo.toml",
+            "autobahn",
+            "vulns/app.py",
+            "autobahn-notes.md",
+        ];
+        let under = |named: &str| -> Vec<&str> {
+            recorded
+                .iter()
+                .copied()
+                .filter(|path| *path == named || path.starts_with(&format!("{named}/")))
+                .collect()
+        };
+        assert_eq!(
+            under("autobahn"),
+            ["autobahn/src/main.rs", "autobahn/Cargo.toml", "autobahn"],
+            "the folder, and everything below it"
+        );
+        // A sibling whose name merely starts the same is not below it.
+        assert!(!under("autobahn").contains(&"autobahn-notes.md"));
+        // A file names only itself.
+        assert_eq!(under("vulns/app.py"), ["vulns/app.py"]);
+        // And a path with nothing recorded expands to nothing, which is
+        // what sends the command back to taking the path at its word.
+        assert!(under("bench").is_empty());
     }
 }

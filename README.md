@@ -290,8 +290,8 @@ autobahn resolve ./src/main.rs --keep alpha       # my version wins, everywhere
 autobahn resolve project src/main.rs --keep boite # boite's version wins, everywhere
 autobahn resolve project src/main.rs --keep both  # keep alpha's; the loser is
                                                   # renamed aside as main.rs.boite
-autobahn resolve ~/project --all --keep boite     # every conflict in the group,
-                                                  # after showing the list and asking
+autobahn resolve voltai autobahn --keep alpha     # every conflict under one folder
+autobahn resolve ~/project --all --keep boite     # every conflict in the group
 ```
 
 A winner is named as `status` names it: `alpha`, or a destination's host

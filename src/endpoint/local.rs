@@ -813,28 +813,36 @@ fn folded_name(name: &str, behavior: &crate::scan::probes::FilesystemBehavior) -
 /// different case — and the local filesystem files both under one entry.
 /// Saying so is the difference between a message someone can act on and
 /// one that sends them looking for a file that appears not to exist.
-fn folded_twin(
-    parent: &Path,
-    name: &str,
-    behavior: &crate::scan::probes::FilesystemBehavior,
-) -> Option<(String, &'static str)> {
-    if !folds_names(behavior) {
+///
+/// The decision rests on what the directory holds, not on the probed
+/// behaviour. The caller has already had a path resolve to something; if
+/// no entry is spelled exactly that way, this filesystem folded it into
+/// one that is, whatever the flags in hand happen to say. Those flags can
+/// be a default that claims names never fold — the observer probes when
+/// the root exists, and a session that started before it did carries the
+/// default forward.
+fn folded_twin(parent: &Path, name: &str) -> Option<(String, &'static str)> {
+    let names: Vec<String> = fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    // Spelled exactly this way, so nothing was folded.
+    if names.iter().any(|other| other == name) {
         return None;
     }
-    let key = folded_name(name, behavior);
-    fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
-        let other = entry.file_name().to_string_lossy().into_owned();
-        if other == name || folded_name(&other, behavior) != key {
-            return None;
-        }
+    let recomposed = recompose(name);
+    let folded = recompose(&caseless::default_case_fold_str(name));
+    names.into_iter().find_map(|other| {
         // Which rule folded them. Recomposition alone settling it means
         // the two spell one name; otherwise it took case folding.
-        let kind = if recompose(&other) == recompose(name) {
-            "unicode collision"
+        if recompose(&other) == recomposed {
+            Some((other, "unicode collision"))
+        } else if recompose(&caseless::default_case_fold_str(&other)) == folded {
+            Some((other, "casing collision"))
         } else {
-            "casing collision"
-        };
-        Some((other, kind))
+            None
+        }
     })
 }
 
@@ -1559,7 +1567,7 @@ impl Transitioner<'_> {
             // cause when these are grouped: twenty files that collided the
             // same way are one problem, and the name in front of it
             // differs for every one of them.
-            match folded_twin(&parent, name, &self.behavior) {
+            match folded_twin(&parent, name) {
                 Some((twin, kind)) => self.problem(
                     path,
                     format!("{twin:?} is already here under one entry: {kind}"),
@@ -4291,38 +4299,23 @@ mod tests {
         assert_ne!(decomposed, precomposed, "the two spellings differ in bytes");
         fs::write(directory.path().join(decomposed), b"same").expect("writes");
 
-        let folding = FilesystemBehavior {
-            normalization_insensitive: true,
-            ..FilesystemBehavior::default()
-        };
         assert_eq!(
-            folded_twin(directory.path(), precomposed, &folding),
+            folded_twin(directory.path(), precomposed),
             Some((decomposed.to_owned(), "unicode collision")),
             "the entry already there is named, and so is the rule that folded them"
         );
 
-        // A filesystem that tells them apart has no twin to report, and a
-        // name that is genuinely absent has none either.
-        let exact = FilesystemBehavior {
-            normalization_insensitive: false,
-            case_insensitive: false,
-            decomposes_unicode: false,
-            ..FilesystemBehavior::default()
-        };
-        assert_eq!(folded_twin(directory.path(), precomposed, &exact), None);
-        assert_eq!(
-            folded_twin(directory.path(), "unrelated.txt", &folding),
-            None
-        );
+        // Nothing to report for a name that is genuinely absent, or for
+        // one spelled exactly as it is stored.
+        assert_eq!(folded_twin(directory.path(), "unrelated.txt"), None);
+        assert_eq!(folded_twin(directory.path(), decomposed), None);
 
-        // Case folds the same way, on a volume that ignores case.
-        let insensitive = FilesystemBehavior {
-            case_insensitive: true,
-            ..FilesystemBehavior::default()
-        };
+        // Case folds the same way. The probed flags are not consulted at
+        // all: the observer can be holding a default that claims names
+        // never fold, and this decision rests on what the directory holds.
         fs::write(directory.path().join("Report.md"), b"x").expect("writes");
         assert_eq!(
-            folded_twin(directory.path(), "REPORT.MD", &insensitive),
+            folded_twin(directory.path(), "REPORT.MD"),
             Some(("Report.md".to_owned(), "casing collision"))
         );
     }

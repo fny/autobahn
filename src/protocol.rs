@@ -178,7 +178,7 @@ pub enum Response {
     ScanOps(Vec<crate::rsync::Op>),
     /// A file's content (`None` when there is no regular file at the path).
     File(Option<Vec<u8>>),
-    /// Acknowledgement of WriteFile.
+    /// Acknowledgement of Rename.
     Written,
 }
 

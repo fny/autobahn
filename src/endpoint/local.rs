@@ -780,6 +780,54 @@ impl LocalEndpoint {
     }
 }
 
+/// Whether this filesystem treats different names as the same entry.
+fn folds_names(behavior: &crate::scan::probes::FilesystemBehavior) -> bool {
+    behavior.case_insensitive || behavior.normalization_insensitive || behavior.decomposes_unicode
+}
+
+/// The key under which this filesystem files a name.
+///
+/// Two names with the same key denote one directory entry here, however
+/// different their bytes.
+fn folded_name(name: &str, behavior: &crate::scan::probes::FilesystemBehavior) -> String {
+    // Case-insensitive lookups use Unicode case *folding* (`Σ`, `σ`, and
+    // `ς` all collide), not mere lowercasing; folding can emit decomposed
+    // sequences, so recomposition follows it.
+    let mut key = if behavior.case_insensitive {
+        caseless::default_case_fold_str(name)
+    } else {
+        name.to_owned()
+    };
+    if folds_names(behavior) {
+        key = recompose(&key);
+    }
+    key
+}
+
+/// The entry already in `parent` that this filesystem cannot tell apart
+/// from `name`, when its bytes differ.
+///
+/// A creation refused because "something is already there" is usually
+/// exactly this: the destination holds a name spelled differently — a
+/// combining accent where the other side has a precomposed one, or a
+/// different case — and the local filesystem files both under one entry.
+/// Saying so is the difference between a message someone can act on and
+/// one that sends them looking for a file that appears not to exist.
+fn folded_twin(
+    parent: &Path,
+    name: &str,
+    behavior: &crate::scan::probes::FilesystemBehavior,
+) -> Option<String> {
+    if !folds_names(behavior) {
+        return None;
+    }
+    let key = folded_name(name, behavior);
+    fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
+        let other = entry.file_name().to_string_lossy().into_owned();
+        (other != name && folded_name(&other, behavior) == key).then_some(other)
+    })
+}
+
 impl Endpoint for LocalEndpoint {
     fn set_scan_progress(&mut self, progress: Arc<crate::progress::SideProgress>) {
         self.progress = Some(progress);
@@ -1497,7 +1545,17 @@ impl Transitioner<'_> {
         // asked to destroy: the change carries no expectation about what's
         // there, so there's nothing to validate it against.
         if fs::symlink_metadata(parent.join(name)).is_ok() {
-            self.problem(path, "refusing to create over existing content");
+            match folded_twin(&parent, name, &self.behavior) {
+                Some(twin) => self.problem(
+                    path,
+                    format!(
+                        "refusing to create over existing content: this filesystem files it \
+                         under the same entry as {twin:?}, which is already here — the two \
+                         names differ only in spelling"
+                    ),
+                ),
+                None => self.problem(path, "refusing to create over existing content"),
+            }
             return None;
         }
         self.create_node(path, &parent, name, new)
@@ -1596,26 +1654,8 @@ impl Transitioner<'_> {
         // together denote a single on-disk entry; creating the second would
         // silently replace the first, so it's refused up front.
         let behavior = self.behavior;
-        let folds_names = behavior.case_insensitive
-            || behavior.normalization_insensitive
-            || behavior.decomposes_unicode;
-        let fold = move |name: &str| {
-            // Case-insensitive lookups use Unicode case *folding* (`Σ`, `σ`,
-            // and `ς` all collide), not mere lowercasing; folding can emit
-            // decomposed sequences, so recomposition follows it.
-            let mut key = if behavior.case_insensitive {
-                caseless::default_case_fold_str(name)
-            } else {
-                name.to_owned()
-            };
-            if behavior.case_insensitive
-                || behavior.normalization_insensitive
-                || behavior.decomposes_unicode
-            {
-                key = recompose(&key);
-            }
-            key
-        };
+        let folds_names = folds_names(&behavior);
+        let fold = move |name: &str| folded_name(name, &behavior);
         let mut folded: HashMap<String, ()> = HashMap::new();
         for child in children {
             let child_path = path_join(path, &child.name);
@@ -4222,5 +4262,58 @@ mod tests {
                 "a symlink was published as a verified regular file"
             );
         }
+    }
+
+    /// A refused creation names the entry that is in the way.
+    ///
+    /// Found on a real configuration: a Linux destination held one PDF
+    /// under two spellings — one with a combining acute, one precomposed
+    /// — while the Mac held only the decomposed one. APFS files both under
+    /// a single entry, so creating the second was refused, correctly. The
+    /// message said only "refusing to create over existing content", which
+    /// sent the reader looking for a file that appears not to be there.
+    #[test]
+    fn a_refused_creation_names_the_entry_it_cannot_be_told_apart_from() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        // The same name twice: decomposed, then precomposed.
+        let decomposed = "Jorge Sua\u{301}rez resume.pdf";
+        let precomposed = "Jorge Su\u{e1}rez resume.pdf";
+        assert_ne!(decomposed, precomposed, "the two spellings differ in bytes");
+        fs::write(directory.path().join(decomposed), b"same").expect("writes");
+
+        let folding = FilesystemBehavior {
+            normalization_insensitive: true,
+            ..FilesystemBehavior::default()
+        };
+        assert_eq!(
+            folded_twin(directory.path(), precomposed, &folding).as_deref(),
+            Some(decomposed),
+            "the entry already there is named"
+        );
+
+        // A filesystem that tells them apart has no twin to report, and a
+        // name that is genuinely absent has none either.
+        let exact = FilesystemBehavior {
+            normalization_insensitive: false,
+            case_insensitive: false,
+            decomposes_unicode: false,
+            ..FilesystemBehavior::default()
+        };
+        assert_eq!(folded_twin(directory.path(), precomposed, &exact), None);
+        assert_eq!(
+            folded_twin(directory.path(), "unrelated.txt", &folding),
+            None
+        );
+
+        // Case folds the same way, on a volume that ignores case.
+        let insensitive = FilesystemBehavior {
+            case_insensitive: true,
+            ..FilesystemBehavior::default()
+        };
+        fs::write(directory.path().join("Report.md"), b"x").expect("writes");
+        assert_eq!(
+            folded_twin(directory.path(), "REPORT.MD", &insensitive).as_deref(),
+            Some("Report.md")
+        );
     }
 }

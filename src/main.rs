@@ -1196,9 +1196,23 @@ fn blocked_fix(
         if let Some(name) = prefix.split('/').rev().find(|name| name.starts_with('.')) {
             fixes.push(format!("or add \"{name}\" to the group's ignores"));
         }
+    } else if cause.contains("differ only in spelling") {
+        // The other side holds one file under two spellings, and this
+        // filesystem cannot keep both. Diffing was the old suggestion and
+        // it is useless here: the two are usually the same bytes, and one
+        // of them is often a PDF.
+        let elsewhere = if side == "beta" {
+            "alpha"
+        } else {
+            plan.host.as_str()
+        };
+        fixes.push(format!(
+            "{elsewhere} holds this name twice, spelled two ways. Delete one copy there"
+        ));
     } else if cause.contains("refusing to create over existing content") {
         fixes.push(format!(
-            "autobahn diff {} <path>, then remove or rename one side",
+            "something is already at that path that no scan saw. \
+             `autobahn issues {}` again after the next cycle; if it stays, look at both sides",
             plan.group
         ));
     }

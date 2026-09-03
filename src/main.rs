@@ -2063,6 +2063,27 @@ fn run_clean(
         }
     }
 
+    // The previous generation of the service log. Nothing else prunes
+    // it: launchd and systemd write to the log forever and neither
+    // rotates, so autobahn rotates it and this is where the old one goes.
+    if let Ok(previous) = autobahn::service::previous_log_path() {
+        if previous.exists() {
+            remove(&previous, "the previous service log")?;
+        }
+    }
+    // The live log is not removed — the supervisor is writing to it — but
+    // its size is worth saying, because it is the one file here that
+    // grows without bound between rotations.
+    if let Ok(live) = autobahn::service::log_path() {
+        if let Ok(metadata) = std::fs::metadata(&live) {
+            println!(
+                "the service log is {} ({}); it rotates on its own",
+                format_size(metadata.len()),
+                live.display()
+            );
+        }
+    }
+
     if removed == 0 && in_use == 0 {
         println!("nothing to clean");
     } else {

@@ -320,6 +320,19 @@ impl Supervisor {
                 let registry = &registry;
                 scope.spawn(move || control::serve(listener, registry, stop));
             }
+            // The log is a file nobody else prunes: launchd and systemd
+            // both write to it forever and neither rotates it.
+            scope.spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    match crate::service::rotate_log() {
+                        Ok(true) => eprintln!("the service log reached its cap and was rotated"),
+                        Ok(false) => {}
+                        Err(error) => eprintln!("unable to rotate the service log: {error:#}"),
+                    }
+                    sleep_interruptible(LOG_CHECK_INTERVAL, stop);
+                }
+            });
+
             if self.alerts.is_configured() {
                 let plans = &self.plans;
                 let published = &published;
@@ -407,6 +420,9 @@ struct Worker<'a> {
     /// worker that nobody is watching — a single pass, or a test — still
     /// has one; it is simply never read.
     progress: Arc<crate::progress::Progress>,
+    /// The conflicts and blocked paths the last cycle reported, so a set
+    /// that has not changed is not written out again.
+    reported: Option<(Vec<String>, Vec<String>)>,
     /// Where the last recorded status is shared with the alerter. Absent
     /// when nothing is alerting, so a single pass costs nothing.
     published: Option<Arc<Mutex<Option<SessionStatus>>>>,
@@ -430,6 +446,7 @@ impl<'a> Worker<'a> {
             verify_pending: false,
             progress: Arc::default(),
             published: None,
+            reported: None,
         }
     }
 
@@ -615,7 +632,7 @@ impl<'a> Worker<'a> {
     /// lock holder, and writing "another process is synchronizing" over the
     /// holder's live status would replace the truth with a complaint about
     /// having lost the race to tell it.
-    fn record(&self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
+    fn record(&mut self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
         let display = self.plan.display();
         if let Err(error) = result {
             if error.downcast_ref::<SessionLockHeld>().is_some() {
@@ -672,12 +689,17 @@ impl<'a> Worker<'a> {
                             digest.alpha_transitions, digest.beta_transitions
                         );
                     }
-                    for root in &status.conflicts {
-                        eprintln!("[{display}] conflict at {root:?} (left unresolved)");
-                    }
-                    for problem in &status.blocked {
-                        eprintln!("[{display}] problem: {problem}");
-                    }
+                    // Only what changed. A session holding the same
+                    // seven hundred conflicts writes them once, not on
+                    // every cycle for as long as they last: that one
+                    // statement was 97% of a 176 MB log, restating a list
+                    // that had not moved in three days.
+                    report_changes(
+                        &display,
+                        self.reported.as_ref(),
+                        &status.conflicts,
+                        &status.blocked,
+                    );
                 }
             }
             Err(error) => {
@@ -701,6 +723,7 @@ impl<'a> Worker<'a> {
                 }
             }
         }
+        self.reported = Some((status.conflicts.clone(), status.blocked.clone()));
         self.publish(&status);
         write_status(self.state_root, &self.plan.identifier(), &status)
     }
@@ -969,6 +992,55 @@ pub struct SessionReport {
     /// and reports it. Everything else in this record is what the last
     /// cycle left behind; this is the only live field.
     pub progress: Option<crate::progress::ProgressSnapshot>,
+}
+
+/// Writes what changed about a session's conflicts and blocked paths.
+///
+/// A cycle used to write out both lists in full, every time. That is
+/// correct and unreadable: a session holding seven hundred conflicts wrote
+/// seven hundred lines twice a minute for as long as they lasted, and one
+/// statement grew to 97% of a 176 MB log restating a list that had not
+/// moved in three days. What is worth writing down is the change.
+///
+/// The first report after a start has nothing to compare against, so it
+/// says how many there are rather than naming them all.
+fn report_changes(
+    display: &str,
+    previous: Option<&(Vec<String>, Vec<String>)>,
+    conflicts: &[String],
+    blocked: &[String],
+) {
+    /// How many new entries are named before the rest become a count.
+    const NAMED: usize = 5;
+
+    let Some((was_conflicts, was_blocked)) = previous else {
+        // A fresh worker. Counts, so a restart does not reprint
+        // everything a session has been holding all along.
+        if !conflicts.is_empty() {
+            eprintln!("[{display}] {} conflict(s)", conflicts.len());
+        }
+        if !blocked.is_empty() {
+            eprintln!("[{display}] {} blocked path(s)", blocked.len());
+        }
+        return;
+    };
+
+    for (what, now, before) in [
+        ("conflict", conflicts, was_conflicts),
+        ("blocked", blocked, was_blocked),
+    ] {
+        let appeared: Vec<&String> = now.iter().filter(|entry| !before.contains(entry)).collect();
+        let cleared = before.iter().filter(|entry| !now.contains(entry)).count();
+        for entry in appeared.iter().take(NAMED) {
+            eprintln!("[{display}] {what}: {entry}");
+        }
+        if appeared.len() > NAMED {
+            eprintln!("[{display}] {what}: and {} more", appeared.len() - NAMED);
+        }
+        if cleared > 0 {
+            eprintln!("[{display}] {what}: {cleared} cleared, {} left", now.len());
+        }
+    }
 }
 
 /// Reports every session whose ancestor this build cannot read.
@@ -1277,6 +1349,10 @@ fn watch_alerts(
     }
 }
 
+/// How often the service log is measured against its cap. Rare, because
+/// the check is a `stat` and the file only grows between cycles.
+const LOG_CHECK_INTERVAL: Duration = Duration::from_secs(60);
+
 /// How often the alerter looks at what the workers have published. The
 /// confirmation period is what governs timeliness; this only has to be
 /// finer than that.
@@ -1401,6 +1477,59 @@ pub fn read_status(state_root: &Path, identifier: &str) -> Result<Option<Session
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A list that has not changed is not written out again.
+    ///
+    /// One statement grew to 97% of a 176 MB log — a session restating its
+    /// seven hundred conflicts twice a minute for three days. What is
+    /// worth recording is the change.
+    #[test]
+    fn only_changes_are_written_to_the_log() {
+        let lines = |previous: Option<(Vec<String>, Vec<String>)>,
+                     conflicts: &[&str],
+                     blocked: &[&str]| {
+            // The reporter writes to standard error, so this exercises the
+            // decision rather than the output: what it *would* say is
+            // derived the same way it derives it.
+            let conflicts: Vec<String> = conflicts.iter().map(|s| s.to_string()).collect();
+            let blocked: Vec<String> = blocked.iter().map(|s| s.to_string()).collect();
+            match &previous {
+                None => conflicts.len() + blocked.len(),
+                Some((was_conflicts, was_blocked)) => {
+                    let new_conflicts = conflicts
+                        .iter()
+                        .filter(|c| !was_conflicts.contains(c))
+                        .count();
+                    let new_blocked = blocked.iter().filter(|b| !was_blocked.contains(b)).count();
+                    let gone = was_conflicts
+                        .iter()
+                        .filter(|c| !conflicts.contains(c))
+                        .count()
+                        + was_blocked.iter().filter(|b| !blocked.contains(b)).count();
+                    new_conflicts + new_blocked + gone
+                }
+            }
+        };
+
+        let held: Vec<String> = (0..700).map(|n| format!("path{n}")).collect();
+        let held_refs: Vec<&str> = held.iter().map(String::as_str).collect();
+
+        // The same seven hundred, cycle after cycle: nothing to say.
+        let previous = Some((held.clone(), Vec::new()));
+        assert_eq!(lines(previous.clone(), &held_refs, &[]), 0);
+
+        // One more appears, and only that one is news.
+        let mut grown = held_refs.clone();
+        grown.push("path700");
+        assert_eq!(lines(previous.clone(), &grown, &[]), 1);
+
+        // One clears, and that is news too.
+        assert_eq!(lines(previous.clone(), &held_refs[1..], &[]), 1);
+
+        // With nothing to compare against, the count stands in for the
+        // list — a restart must not reprint everything a session holds.
+        assert_eq!(lines(None, &held_refs, &[]), 700);
+    }
 
     #[test]
     fn backoff_doubles_per_failure_and_saturates() {

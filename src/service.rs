@@ -39,6 +39,54 @@ pub fn log_path() -> Result<PathBuf> {
     Ok(crate::paths::default_state_root()?.join("service.log"))
 }
 
+/// The size at which the service log is rotated.
+///
+/// Small, because the log is a record of changes and changes are rare. It
+/// grew to 176 MB once, and 97% of that was one statement restating a
+/// list that had not moved in three days.
+const MAXIMUM_LOG_SIZE: u64 = 16 << 20;
+
+/// The previous generation of the service log.
+pub fn previous_log_path() -> Result<PathBuf> {
+    Ok(crate::paths::default_state_root()?.join("service.log.1"))
+}
+
+/// Keeps the service log under its cap, returning whether it rotated.
+///
+/// The current file is copied aside and then truncated **in place**.
+/// Renaming it would not work: the service's output is an open descriptor
+/// held by launchd or systemd, and it follows the inode — so the writer
+/// would go on filling the file that was just moved out of the way, and
+/// the new one would stay empty forever. Truncating keeps the descriptor
+/// pointing at the same file, and because that descriptor is in append
+/// mode the next write lands at the start.
+pub fn rotate_log() -> Result<bool> {
+    let path = log_path()?;
+    let size = match std::fs::metadata(&path) {
+        Ok(metadata) => metadata.len(),
+        // No log is not a failure: `watch` in a terminal writes to the
+        // terminal, and there is nothing to rotate.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error).context("unable to measure the service log"),
+    };
+    if size < MAXIMUM_LOG_SIZE {
+        return Ok(false);
+    }
+    let previous = previous_log_path()?;
+    std::fs::copy(&path, &previous).with_context(|| {
+        format!(
+            "unable to keep the previous service log at {}",
+            previous.display()
+        )
+    })?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .with_context(|| format!("unable to truncate {}", path.display()))?;
+    Ok(true)
+}
+
 /// Registers the service to start at login, and starts it now.
 ///
 /// The service runs `autobahn watch`, which detects that its output is not

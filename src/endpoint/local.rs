@@ -817,14 +817,24 @@ fn folded_twin(
     parent: &Path,
     name: &str,
     behavior: &crate::scan::probes::FilesystemBehavior,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     if !folds_names(behavior) {
         return None;
     }
     let key = folded_name(name, behavior);
     fs::read_dir(parent).ok()?.flatten().find_map(|entry| {
         let other = entry.file_name().to_string_lossy().into_owned();
-        (other != name && folded_name(&other, behavior) == key).then_some(other)
+        if other == name || folded_name(&other, behavior) != key {
+            return None;
+        }
+        // Which rule folded them. Recomposition alone settling it means
+        // the two spell one name; otherwise it took case folding.
+        let kind = if recompose(&other) == recompose(name) {
+            "unicode collision"
+        } else {
+            "casing collision"
+        };
+        Some((other, kind))
     })
 }
 
@@ -1545,14 +1555,14 @@ impl Transitioner<'_> {
         // asked to destroy: the change carries no expectation about what's
         // there, so there's nothing to validate it against.
         if fs::symlink_metadata(parent.join(name)).is_ok() {
+            // The kind goes last, because that is the part read as the
+            // cause when these are grouped: twenty files that collided the
+            // same way are one problem, and the name in front of it
+            // differs for every one of them.
             match folded_twin(&parent, name, &self.behavior) {
-                Some(twin) => self.problem(
+                Some((twin, kind)) => self.problem(
                     path,
-                    format!(
-                        "refusing to create over existing content: this filesystem files it \
-                         under the same entry as {twin:?}, which is already here — the two \
-                         names differ only in spelling"
-                    ),
+                    format!("{twin:?} is already here under one entry: {kind}"),
                 ),
                 None => self.problem(path, "refusing to create over existing content"),
             }
@@ -4286,9 +4296,9 @@ mod tests {
             ..FilesystemBehavior::default()
         };
         assert_eq!(
-            folded_twin(directory.path(), precomposed, &folding).as_deref(),
-            Some(decomposed),
-            "the entry already there is named"
+            folded_twin(directory.path(), precomposed, &folding),
+            Some((decomposed.to_owned(), "unicode collision")),
+            "the entry already there is named, and so is the rule that folded them"
         );
 
         // A filesystem that tells them apart has no twin to report, and a
@@ -4312,8 +4322,8 @@ mod tests {
         };
         fs::write(directory.path().join("Report.md"), b"x").expect("writes");
         assert_eq!(
-            folded_twin(directory.path(), "REPORT.MD", &insensitive).as_deref(),
-            Some("Report.md")
+            folded_twin(directory.path(), "REPORT.MD", &insensitive),
+            Some(("Report.md".to_owned(), "casing collision"))
         );
     }
 }

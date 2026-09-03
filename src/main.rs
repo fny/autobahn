@@ -1196,23 +1196,28 @@ fn blocked_fix(
         if let Some(name) = prefix.split('/').rev().find(|name| name.starts_with('.')) {
             fixes.push(format!("or add \"{name}\" to the group's ignores"));
         }
-    } else if cause.contains("differ only in spelling") {
-        // The other side holds one file under two spellings, and this
-        // filesystem cannot keep both. Diffing was the old suggestion and
-        // it is useless here: the two are usually the same bytes, and one
-        // of them is often a PDF.
+    } else if cause == "unicode collision" || cause == "casing collision" {
+        // The other side holds one name twice, under spellings this
+        // filesystem files as a single entry. Diffing was the old
+        // suggestion and it is useless: the two copies are usually the
+        // same bytes, and one of them is often a PDF.
         let elsewhere = if side == "beta" {
-            "alpha"
+            "alpha".to_owned()
         } else {
-            plan.host.as_str()
+            plan.host.clone()
+        };
+        let how = if cause.starts_with("unicode") {
+            "spelled two ways"
+        } else {
+            "cased two ways"
         };
         fixes.push(format!(
-            "{elsewhere} holds this name twice, spelled two ways. Delete one copy there"
+            "{elsewhere} holds this name twice, {how}. Delete either copy there"
         ));
     } else if cause.contains("refusing to create over existing content") {
         fixes.push(format!(
-            "something is already at that path that no scan saw. \
-             `autobahn issues {}` again after the next cycle; if it stays, look at both sides",
+            "something no scan saw is at that path. Run `autobahn issues {}` \
+             after the next cycle; if it stays, look at both sides",
             plan.group
         ));
     }
@@ -2935,5 +2940,50 @@ mod tests {
             &plan,
         );
         assert_eq!(fixes.len(), 1, "{fixes:?}");
+    }
+
+    /// A collision is shown as what it is, not as the error that carried
+    /// it.
+    ///
+    /// The heading is the cause, and the cause is the last part of the
+    /// recorded message. So the kind goes at the end: the name in front of
+    /// it differs for every file, and twenty files that collided the same
+    /// way have to group as one problem.
+    #[test]
+    fn a_name_collision_reads_as_a_collision() {
+        let entry = "alpha recruiting/candidates/Jorge Suárez resume.pdf: \
+                     \"Jorge Sua\u{301}rez resume.pdf\" is already here under one entry: \
+                     unicode collision";
+        let (side, path, cause) = blocked_parts(entry);
+        assert_eq!(side, "alpha");
+        assert_eq!(path, "recruiting/candidates/Jorge Suárez resume.pdf");
+        assert_eq!(cause, "unicode collision", "the heading names the rule");
+
+        // Two files colliding the same way group together, however
+        // different the names in front of the cause.
+        let other = "alpha recruiting/candidates/Ana Muñoz cv.pdf: \
+                     \"Ana Mun\u{303}oz cv.pdf\" is already here under one entry: \
+                     unicode collision";
+        assert_eq!(blocked_parts(other).2, cause);
+
+        // And the fix names what to do about it rather than offering a
+        // diff, which for a PDF is no help at all.
+        let plan = toml::from_str::<autobahn::config::Config>(
+            "[groups.g]\nalpha = \"/tmp/a\"\nmode = \"two-way-conflict\"\nbetas = [\"u@h:/tmp/b\"]\n",
+        )
+        .expect("parses")
+        .plans()
+        .expect("plans")
+        .remove(0);
+        let fixes = blocked_fix("alpha", cause, "recruiting/candidates", &plan);
+        assert_eq!(fixes.len(), 1);
+        assert!(fixes[0].contains("holds this name twice"), "{fixes:?}");
+        assert!(fixes[0].contains("spelled two ways"), "{fixes:?}");
+        assert!(!fixes[0].contains("diff"), "{fixes:?}");
+
+        // Casing says casing.
+        let fixes = blocked_fix("beta", "casing collision", "docs", &plan);
+        assert!(fixes[0].starts_with("alpha holds"), "{fixes:?}");
+        assert!(fixes[0].contains("cased two ways"), "{fixes:?}");
     }
 }

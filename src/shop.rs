@@ -354,9 +354,9 @@ impl Shop<'_> {
     fn help(&self) -> &'static str {
         match self.counter {
             Some(_) => {
-                "↑↓ choose · a keep ours · t keep theirs · b keep both · esc back · q close up"
+                "↑↓ choose · a keep ours · t keep theirs · b keep both · esc back · q close the shop"
             }
-            None => "↑↓ choose · ⏎ counter · f rush · q close up",
+            None => "↑↓ choose · ⏎ counter · f rush · q close the shop",
         }
     }
 
@@ -372,7 +372,7 @@ impl Shop<'_> {
             _ => "autobahn watch",
         };
         out.push_str(&format!("  \x1b[2mnote on the glass:\x1b[0m  {note}\n"));
-        out.push_str("\n  \x1b[2mq close up\x1b[0m\n");
+        out.push_str("\n  \x1b[2mq close the shop\x1b[0m\n");
         out
     }
 

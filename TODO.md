@@ -245,11 +245,19 @@ Metadata walk of the `voltai` roots, cold, `find` excluding `target`:
   22.5s cycle, and ignoring that one directory bought 4.25x (4 cycles
   per 90s -> 17).
 
-- [ ] **Parallel scanning — still worth doing, for the agent.** The case
-  is not "make alpha faster", it is "make fny faster", and the agent runs
-  the same scanner. Before writing any of it: `bench/ab.sh` drives two
-  *local* roots, so it cannot see a remote-dominated cost and would
-  report nothing. Build the remote benchmark first.
+- [ ] **Find out which phase is slow on fny, before optimizing anything.**
+  Paused 2026-09-03 part way through. `examples/cycle_cost` now runs on
+  real roots (cf68e9d) and is built on fny; the next step is simply to run
+  it there against `~/Workspace/arcturus` and `~/Workspace/currents` and
+  read which column dominates — rescan, reconcile, validate, encode, or
+  write. Everything below depends on that answer and none of it should
+  start without it.
+
+- [ ] **Parallel scanning — worth doing only if `rescan` is the column.**
+  The case is not "make alpha faster", it is "make fny faster", and the
+  agent runs the same scanner. Note that `bench/ab.sh` drives two *local*
+  roots, so it cannot see a remote-dominated cost and would report
+  nothing — the instrument has to match the machine the cost is on.
 
 - [x] ~~Scale the full-scan interval with tree size.~~ Written, tested,
   measured, and dropped. The premise was that the flat 120s

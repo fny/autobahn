@@ -1292,7 +1292,8 @@ fn run_shop(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> 
 /// end-of-file, and both look like the tool having silently done nothing.
 fn confirmed(
     targets: &[(&autobahn::config::SessionPlan, Vec<String>)],
-    keep: &str,
+    kept: &str,
+    overwritten: &[String],
     scope: Option<&str>,
     both: bool,
     yes: bool,
@@ -1301,29 +1302,47 @@ fn confirmed(
         return Ok(true);
     }
     let paths: usize = targets.iter().map(|(_, paths)| paths.len()).sum();
-    let winner = match keep {
-        "alpha" => "alpha's version".to_owned(),
-        "both" => "both versions".to_owned(),
-        host => format!("{host}'s version"),
-    };
     let what = match paths {
         1 => "1 conflict".to_owned(),
         many => format!("{many} conflicts"),
     };
     match scope {
-        Some(scope) => println!("about to resolve {what} under {scope}, keeping {winner}:"),
-        None => println!("about to resolve {what}, keeping {winner}:"),
+        Some(scope) => println!("about to resolve {what} under {scope}:"),
+        None => println!("about to resolve {what}:"),
     }
-    for (plan, paths) in targets {
-        for path in paths {
-            println!("  {}  {path}", plan.display());
+
+    // The two sides by their roots. Naming them "alpha" and
+    // "group@destination" told the reader neither which machine nor which
+    // folder, and the second reads like an ssh target, which it is not.
+    println!();
+    if both {
+        println!("  keep       {kept}");
+        for loser in overwritten {
+            println!("  keep too   {loser}  (renamed aside)");
+        }
+    } else {
+        println!("  keep       {kept}");
+        for loser in overwritten {
+            println!("  overwrite  {loser}");
         }
     }
-    if both {
-        println!("the loser is renamed aside, not deleted.");
+    println!();
+
+    // The paths. One destination needs no repetition of its name; several
+    // do, because their conflicts differ.
+    if targets.len() == 1 {
+        for path in &targets[0].1 {
+            println!("  {path}");
+        }
     } else {
-        println!("this overwrites the other version on every destination in the group.");
+        for (plan, paths) in targets {
+            println!("  {}", plan.beta_spec());
+            for path in paths {
+                println!("    {path}");
+            }
+        }
     }
+    println!();
 
     if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
         bail!("nothing to answer the prompt; pass --yes to resolve without asking");
@@ -1508,10 +1527,52 @@ fn run_resolve(
                 .iter()
                 .map(|plan| (*plan, vec![named.clone()]))
                 .collect();
-        } else {
+        } else if targets
+            .iter()
+            .any(|(_, paths)| paths.iter().any(|path| path != &named))
+        {
+            // Only a folder that actually expanded is reported as one.
+            // Naming a file and being told its conflict is "under" it
+            // reads as though there were more inside.
             scope = Some(named);
         }
     }
+
+    let group_plans: Vec<&autobahn::config::SessionPlan> =
+        plans.iter().filter(|plan| plan.group == group).collect();
+
+    // Who keeps their version, and who gets overwritten — named by their
+    // actual roots. "alpha" is the word `--keep` takes, and on its own it
+    // says nothing about which machine or folder that is.
+    let alpha_spec = group_plans
+        .first()
+        .map(|plan| plan.alpha_spec.clone())
+        .unwrap_or_default();
+    let (kept, mut overwritten) = match winner {
+        Winner::Alpha | Winner::Both => (
+            format!("{alpha_spec}  (alpha)"),
+            targets
+                .iter()
+                .map(|(plan, _)| plan.beta_spec())
+                .collect::<Vec<_>>(),
+        ),
+        Winner::Beta(index) => (
+            format!(
+                "{}  ({})",
+                group_plans[index].beta_spec(),
+                group_plans[index].host
+            ),
+            std::iter::once(format!("{alpha_spec}  (alpha)"))
+                .chain(
+                    targets
+                        .iter()
+                        .filter(|(plan, _)| plan.identifier() != group_plans[index].identifier())
+                        .map(|(plan, _)| plan.beta_spec()),
+                )
+                .collect(),
+        ),
+    };
+    overwritten.dedup();
 
     // One confirmation, whether the command names one path or every one.
     // Resolution overwrites a file that someone deliberately edited — that
@@ -1520,7 +1581,8 @@ fn run_resolve(
     // before they happen.
     if !confirmed(
         &targets,
-        &keep,
+        &kept,
+        &overwritten,
         scope.as_deref(),
         winner == Winner::Both,
         yes,
@@ -1534,8 +1596,6 @@ fn run_resolve(
     // not name, when the winner is one destination and the path conflicts
     // on another.
     let pool = autobahn::transport::mux::AgentPool::default();
-    let group_plans: Vec<&autobahn::config::SessionPlan> =
-        plans.iter().filter(|plan| plan.group == group).collect();
     let mut endpoints = Vec::new();
     for plan in &group_plans {
         endpoints.push(autobahn::supervisor::open_endpoints(

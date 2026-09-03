@@ -227,6 +227,40 @@ committed.
   root is the definition of a safety halt. Deciding this changes which
   alert hook fires, so it is worth saying out loud before doing it.
 
+## Where scan time actually goes (measured 2026-09-03)
+
+Recorded because two plausible optimizations were aimed at the wrong
+machine, and the reasoning behind each looked sound right up to the
+measurement.
+
+Metadata walk of the `voltai` roots, cold, `find` excluding `target`:
+
+| | with `mutagen-bench` | without |
+|---|---|---|
+| Mac (alpha) | 3.4s | ~4s |
+| fny (beta)  | 27.9s | 9.2s |
+
+- **The cost is the remote side.** Alpha walks its whole tree in 3-4s.
+  fny took 27.9s, of which `mutagen-bench` was ~19s. That is the entire
+  22.5s cycle, and ignoring that one directory bought 4.25x (4 cycles
+  per 90s -> 17).
+
+- [ ] **Parallel scanning — still worth doing, for the agent.** The case
+  is not "make alpha faster", it is "make fny faster", and the agent runs
+  the same scanner. Before writing any of it: `bench/ab.sh` drives two
+  *local* roots, so it cannot see a remote-dominated cost and would
+  report nothing. Build the remote benchmark first.
+
+- [x] ~~Scale the full-scan interval with tree size.~~ Written, tested,
+  measured, and dropped. The premise was that the flat 120s
+  `FULL_SCAN_INTERVAL` was costing large roots a full walk every two
+  minutes. It is not: 606,001 entries, fixed schedule 57 cycles per 300s
+  versus 56 for a schedule that followed measured cost. No difference.
+  The number that started it — a 62s walk — came from a *cold one-shot
+  process*; inside a running supervisor the baseline is resident and
+  digest reuse means a full walk of 606k entries is sub-second. Do not
+  reach for this again without measuring a warm supervisor.
+
 ## Carried over (not yet asked for, noted so they aren't lost)
 
 - [ ] 21 blocked paths on `fny.voltai.party` — root-owned

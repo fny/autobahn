@@ -1703,6 +1703,26 @@ fn node_at<'a>(
     Some(node)
 }
 
+/// The first entry at or beneath `node` that synchronization cannot carry,
+/// as a root-relative path and the reason, or `None` when there is none.
+///
+/// A transition refuses to remove such an entry — content reconciliation
+/// never scanned is content nobody decided to delete — and refuses
+/// bottom-up, so asking anyway strips everything around it and leaves a
+/// half-deleted tree behind. Knowing in advance is what turns that into a
+/// refusal to start.
+fn unsynchronizable_within(node: &autobahn::tree::Node, path: &str) -> Option<(String, String)> {
+    use autobahn::tree::{path_join, Content};
+    match &node.content {
+        Content::Directory(children) => children
+            .iter()
+            .find_map(|child| unsynchronizable_within(child, &path_join(path, &child.name))),
+        Content::Problematic { message } => Some((path.to_owned(), message.clone())),
+        Content::Untracked => Some((path.to_owned(), "excluded from synchronization".to_owned())),
+        _ => None,
+    }
+}
+
 /// A free name beside `path` for a version being kept rather than
 /// discarded, suffixed by the side it came from.
 ///
@@ -1949,6 +1969,10 @@ fn run_resolve(
     // the engine here rather than call `remove_dir_all`.
     let mut settled = 0usize;
     let mut refused: Vec<(String, String)> = Vec::new();
+    // Paths that cannot be settled this way at all, as opposed to ones
+    // that lost a race. The two need different words: one says try again,
+    // the other says this will never work.
+    let mut blocked: Vec<(String, String, String, String)> = Vec::new();
     for (index, plan) in group_plans.iter().enumerate() {
         // Which side of this session loses. The winner keeps its version
         // untouched; every other copy in the group is retired, including
@@ -2034,6 +2058,18 @@ fn run_resolve(
                     settled += 1;
                     continue;
                 }
+                // Content synchronization never scanned cannot be removed
+                // by a transition — it refuses, by design, because nobody
+                // decided to delete what reconciliation never saw. Asking
+                // anyway does not fail cleanly: the removal runs
+                // bottom-up, takes away everything it *can* account for,
+                // and leaves the rest. That is the worst of both outcomes,
+                // a half-deleted tree and the conflict still open, so the
+                // check happens here rather than being discovered midway.
+                if let Some((example, reason)) = unsynchronizable_within(node, path) {
+                    blocked.push((path.clone(), side.clone(), example, reason));
+                    continue;
+                }
                 removals.push(autobahn::tree::Change {
                     path: path.clone(),
                     old: Some(node.clone()),
@@ -2062,13 +2098,28 @@ fn run_resolve(
                 .count();
         }
     }
-    if settled > 0 {
-        let kept_word = match winner {
-            Winner::Both => "both versions kept",
-            _ => "one version kept",
-        };
-        println!("settled {settled} of {} ({kept_word})", paths.len());
+    // Always said, including "settled 0". A command that reports nothing
+    // reads as a command that worked, and this one can legitimately settle
+    // none of what it was asked to.
+    let kept_word = match winner {
+        Winner::Both => "both versions kept",
+        _ => "one version kept",
+    };
+    println!("settled {settled} of {} ({kept_word})", paths.len());
+
+    // Blocked, and permanently: retiring this side would mean deleting
+    // content synchronization never scanned, which it will not do. Saying
+    // "try again" here would be a lie, so the ways out are named instead.
+    for (path, side, example, reason) in &blocked {
+        println!("  {path}: not settled — {side} holds {example} ({reason}),");
+        println!("    which cannot be deleted on your behalf. Either:");
+        println!("      · ignore {path} in this group, so it stops being compared, or");
+        println!("      · `--keep both`, which moves the version aside instead of deleting it, or");
+        println!("      · delete it on {side} by hand.");
     }
+
+    // Refused, and possibly transient: the entry moved between the scan
+    // and the removal, which is the race the validation exists to catch.
     for (path, error) in &refused {
         println!("  left alone: {path} — {error}");
     }

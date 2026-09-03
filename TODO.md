@@ -174,7 +174,20 @@ committed.
   `happy` and `voltagen` hold `node_modules` and `.git`, which the
   default ignores exclude.
 
-- [ ] **`resolve` cannot settle a conflict caused by excluded content,
+- [x] **`resolve` cannot settle a conflict caused by excluded content,
+  and did not say so.** Done, and it was destructive, not merely silent:
+  `--keep <the absent side>` ran the removal, which strips bottom-up,
+  took away every entry it could account for, and left the excluded one
+  — a half-deleted tree with the conflict still open. It then reported
+  "changed while this ran, run again", which is never true of this case.
+  It now checks before touching anything, settles nothing, and names the
+  three ways out. `--keep both` is the one that works, because a rename
+  moves ignored content along with the rest; verified end to end by
+  `resolve_will_not_half_delete_a_tree_holding_excluded_content`.
+  Still open: `issues` offers three winners for these conflicts when only
+  one can help, and should say which.
+
+- [ ] ~~superseded~~ **`resolve` cannot settle a conflict caused by excluded content,
   and does not say so.** `--keep <the side that holds it>` retires the
   *other* side, which is absent, so nothing happens and the conflict
   returns next cycle. Only `--keep alpha` "works", by deleting the tree.

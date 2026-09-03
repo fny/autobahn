@@ -1429,6 +1429,71 @@ fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
     }
 }
 
+/// Retiring a side means deleting it, and a transition will not delete
+/// content reconciliation never scanned. It refuses bottom-up, so asking
+/// anyway strips everything around the excluded entry and leaves the
+/// conflict open — a half-deleted tree, which is worse than either
+/// outcome. So the refusal happens before anything is touched.
+#[test]
+fn resolve_will_not_half_delete_a_tree_holding_excluded_content() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("b1");
+    write(&alpha, "seed", "seed");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[defaults]\nmode = \"two-way-conflict\"\nignores = [\".git\"]\n\
+             [groups.r]\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+    assert!(cli(&world, &config, &["sync"]).0);
+
+    // A project on beta holding an ignored `.git`, which reaches alpha
+    // without it — then alpha deletes the project. That is "deleted on
+    // ours" against a side that cannot be fully removed.
+    write(&beta, "project/.git/HEAD", "ref");
+    write(&beta, "project/src/main.rs", "fn main() {}");
+    cli(&world, &config, &["sync"]);
+    assert!(alpha.join("project/src/main.rs").exists(), "it propagated");
+    fs::remove_dir_all(alpha.join("project")).unwrap();
+    cli(&world, &config, &["sync"]);
+
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "project", "--keep", "alpha", "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("settled 0 of 1"), "it says so: {text}");
+    assert!(text.contains("not settled"), "{text}");
+    assert!(text.contains("--keep both"), "it names a way out: {text}");
+    // Nothing was taken, not even the part it could have taken.
+    assert!(beta.join("project/.git/HEAD").exists(), "{text}");
+    assert_eq!(read(&beta, "project/src/main.rs"), "fn main() {}");
+
+    // And the way out it names actually works: a rename moves the whole
+    // tree, ignored content included, so the conflict settles.
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "project", "--keep", "both", "--yes"],
+    );
+    assert!(ok, "{text}");
+    for _ in 0..3 {
+        cli(&world, &config, &["sync"]);
+    }
+    assert_eq!(read(&beta, "project.b1/src/main.rs"), "fn main() {}");
+    assert!(beta.join("project.b1/.git/HEAD").exists(), "git survives");
+    assert_eq!(read(&alpha, "project.b1/src/main.rs"), "fn main() {}");
+    let (_, after) = cli(&world, &config, &["conflicts"]);
+    assert!(after.contains("nothing needs you"), "{after}");
+}
+
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();

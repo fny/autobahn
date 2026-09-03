@@ -263,7 +263,11 @@ enum Command {
         /// A group name, or a folder (`.`, an absolute path, a `~` path)
         /// inside a synchronized root. Omit for every group.
         selector: Option<String>,
+        /// The root-relative path to look under, when the selector was a
+        /// group or a folder. Scopes the listing to that subtree.
+        path: Option<String>,
         /// Filter to a destination within the group.
+        #[arg(long)]
         host: Option<String>,
         /// Roll conflicts up to this many path segments and show a count
         /// for each: `--depth 1` lists the top-level folders in conflict.
@@ -341,11 +345,11 @@ enum Command {
         #[arg(long)]
         keep: String,
         /// Resolve every conflict in the selected sessions the same way.
-        /// Shows the list and asks first, unless --yes.
         #[arg(long)]
         all: bool,
-        /// With --all, do not ask.
-        #[arg(long)]
+        /// Do not ask. Resolution overwrites a file someone edited, on
+        /// every destination in the group, so it asks first by default.
+        #[arg(long, short = 'y')]
         yes: bool,
         /// Filter to a destination within the group.
         #[arg(long)]
@@ -478,13 +482,16 @@ fn main() {
         ),
         Command::Conflicts {
             selector,
+            path,
             host,
             depth,
             filter,
             json,
             config,
             state_root,
-        } => run_conflicts(config, state_root, selector, host, depth, filter, json),
+        } => run_conflicts(
+            config, state_root, selector, path, host, depth, filter, json,
+        ),
         Command::Mi { config, state_root } => run_shop(config, state_root),
         Command::Diff {
             selector,
@@ -1076,6 +1083,7 @@ fn run_conflicts(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
     selector: Option<String>,
+    path: Option<String>,
     host: Option<String>,
     depth: Option<usize>,
     filter: Option<String>,
@@ -1088,6 +1096,28 @@ fn run_conflicts(
     if let Some(0) = depth {
         bail!("--depth counts path segments, so it starts at 1");
     }
+    // Where to look. `resolve` and `diff` both take a path this way, and
+    // both accept it as the selector itself — `autobahn conflicts .`
+    // should mean the folder you are standing in, not the whole group.
+    let scope = match (&path, &selection.relative) {
+        (Some(path), _) => Some(
+            path.trim_start_matches("./")
+                .trim_end_matches('/')
+                .to_owned(),
+        ),
+        (None, Some(rest)) => Some(rest.clone()),
+        (None, None) => None,
+    };
+    let within = |path: &str| match &scope {
+        None => true,
+        Some(scope) => path == scope || path.starts_with(&format!("{scope}/")),
+    };
+    // Depth counts from the scope, not from the root. Rolling up from the
+    // root inside a scope would collapse everything into the scope itself.
+    let below = scope
+        .as_deref()
+        .map(|scope| scope.split('/').count())
+        .unwrap_or(0);
     if json {
         // Depth is a way of *reading* a long list, and a reader that wants
         // JSON has its own. Rolling the records up here would hand it a
@@ -1124,7 +1154,7 @@ fn run_conflicts(
         let selected: Vec<&String> = status
             .conflicts
             .iter()
-            .filter(|path| matches.as_ref().is_none_or(|matches| matches(path)))
+            .filter(|path| within(path) && matches.as_ref().is_none_or(|matches| matches(path)))
             .collect();
         if selected.is_empty() {
             continue;
@@ -1148,7 +1178,7 @@ fn run_conflicts(
         // is: seven hundred paths under one folder are one fact about that
         // folder, and the reader drills in from there.
         if let Some(depth) = depth {
-            for (prefix, count) in roll_up(&selected, depth) {
+            for (prefix, count) in roll_up(&selected, depth + below) {
                 match count {
                     1 if selected.contains(&&prefix) => println!("    {prefix}"),
                     1 => println!("    {prefix} — 1 conflict"),
@@ -1156,7 +1186,7 @@ fn run_conflicts(
                 }
             }
             println!(
-                "    → autobahn conflicts {} --depth {} to look inside",
+                "    → `autobahn conflicts {} --depth {}` opens the next level",
                 plan.group,
                 depth + 1
             );
@@ -1193,9 +1223,10 @@ fn run_conflicts(
         );
     }
     if total == 0 {
-        match &filter {
-            Some(pattern) => println!("no conflicts match {pattern:?}"),
-            None => println!("no conflicts"),
+        match (&scope, &filter) {
+            (Some(scope), _) => println!("no conflicts under {scope}"),
+            (None, Some(pattern)) => println!("no conflicts match {pattern:?}"),
+            (None, None) => println!("no conflicts"),
         }
     }
     Ok(())
@@ -1251,6 +1282,50 @@ fn run_shop(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> 
     let state_root = resolve_state_root(state_root)?;
     let selected: Vec<&autobahn::config::SessionPlan> = plans.iter().collect();
     shop::run(&selected, &state_root, config)
+}
+
+/// Asks before resolving, and says what resolution will do.
+///
+/// `--yes` answers in advance. Where standard input is not a terminal
+/// there is nobody to ask, so the command refuses rather than prompting
+/// into a pipe: a prompt nobody can answer either hangs or reads
+/// end-of-file, and both look like the tool having silently done nothing.
+fn confirmed(
+    targets: &[(&autobahn::config::SessionPlan, Vec<String>)],
+    keep: &str,
+    both: bool,
+    yes: bool,
+) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    let paths: usize = targets.iter().map(|(_, paths)| paths.len()).sum();
+    let winner = match keep {
+        "alpha" => "alpha's version".to_owned(),
+        "both" => "both versions".to_owned(),
+        host => format!("{host}'s version"),
+    };
+    println!("about to resolve {paths} path(s), keeping {winner}:");
+    for (plan, paths) in targets {
+        for path in paths {
+            println!("  {}  {path}", plan.display());
+        }
+    }
+    if both {
+        println!("the loser is renamed aside, not deleted.");
+    } else {
+        println!("this overwrites the other version on every destination in the group.");
+    }
+
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        bail!("nothing to answer the prompt; pass --yes to resolve without asking");
+    }
+    print!("proceed? [y/N] ");
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer).ok();
+    Ok(matches!(answer.trim(), "y" | "Y" | "yes"))
 }
 
 /// Shows how the two sides of one file differ, with the system's diff.
@@ -1394,23 +1469,6 @@ fn run_resolve(
         if winner == Winner::Both {
             bail!("--all cannot keep both: choose whose version wins");
         }
-        println!("about to resolve, keeping {keep}:");
-        for (plan, conflicts) in &targets {
-            for path in conflicts {
-                println!("  {}  {path}", plan.display());
-            }
-        }
-        if !yes {
-            print!("proceed? [y/N] ");
-            use std::io::Write;
-            std::io::stdout().flush().ok();
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer).ok();
-            if !matches!(answer.trim(), "y" | "Y" | "yes") {
-                println!("nothing done");
-                return Ok(());
-            }
-        }
     } else {
         let path = relative_path(&selection, path)?;
         targets = selection
@@ -1418,6 +1476,16 @@ fn run_resolve(
             .iter()
             .map(|plan| (*plan, vec![path.clone()]))
             .collect();
+    }
+
+    // One confirmation, whether the command names one path or every one.
+    // Resolution overwrites a file that someone deliberately edited — that
+    // is what made it a conflict — and it does so on every destination in
+    // the group, not only the one named. Both facts are worth reading
+    // before they happen.
+    if !confirmed(&targets, &keep, winner == Winner::Both, yes)? {
+        println!("nothing done");
+        return Ok(());
     }
 
     // Every session in the group is opened, because the winner's content
@@ -2355,5 +2423,47 @@ mod tests {
         // Rounding is always up: an estimate that lands early is a
         // pleasant surprise, one that overruns is a broken promise.
         assert_eq!(format_estimate(31), "45s");
+    }
+
+    /// `conflicts` takes a path where its siblings do, and counts depth
+    /// from that path rather than from the root.
+    ///
+    /// The second positional used to be the destination, so
+    /// `autobahn conflicts voltai autobahn` reported no such destination —
+    /// while `resolve` and `diff`, which take a path there, had taught the
+    /// opposite. Rolling up from the root inside a scope is the matching
+    /// mistake: every path already shares the scope, so depth 1 would
+    /// collapse the whole listing into the scope itself.
+    #[test]
+    fn a_scope_narrows_the_listing_and_moves_where_depth_counts_from() {
+        let paths: Vec<String> = [
+            "autobahn/src/main.rs",
+            "autobahn/src/shop.rs",
+            "autobahn/Cargo.toml",
+            "vulns/backend/app.py",
+        ]
+        .iter()
+        .map(|path| path.to_string())
+        .collect();
+
+        let within =
+            |scope: &str, path: &str| path == scope || path.starts_with(&format!("{scope}/"));
+        let scoped: Vec<&String> = paths
+            .iter()
+            .filter(|path| within("autobahn", path))
+            .collect();
+        assert_eq!(scoped.len(), 3, "vulns is outside the scope");
+
+        // Depth counts from the scope: one level below `autobahn`.
+        let below = "autobahn".split('/').count();
+        assert_eq!(
+            roll_up(&scoped, 1 + below),
+            vec![
+                ("autobahn/src".to_owned(), 2),
+                ("autobahn/Cargo.toml".to_owned(), 1),
+            ]
+        );
+        // Counting from the root instead would say nothing at all.
+        assert_eq!(roll_up(&scoped, 1), vec![("autobahn".to_owned(), 3)]);
     }
 }

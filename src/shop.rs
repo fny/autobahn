@@ -205,6 +205,10 @@ impl Shop<'_> {
                 path.clone(),
                 "--keep".into(),
                 keep,
+                // The counter is the confirmation: the winner was chosen
+                // by a keypress, and there is no terminal behind this to
+                // answer a prompt.
+                "--yes".into(),
             ],
             format!("settled {path}"),
             format!("could not settle {path}"),

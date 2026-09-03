@@ -279,6 +279,7 @@ settle it:
 ```sh
 autobahn conflicts                  # every conflict, with what each side holds
 autobahn conflicts ~/project        # ...for whatever group syncs that folder
+autobahn conflicts voltai autobahn  # ...to one folder inside the group
 autobahn conflicts --depth 1        # roll up: which top-level folders, and how many
 autobahn conflicts --filter vulns   # only paths containing "vulns"
 autobahn conflicts --filter '*.ts'  # ...or matching a glob, at any depth

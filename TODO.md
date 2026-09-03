@@ -5,7 +5,16 @@ committed.
 
 ## UX
 
-- [ ] **`conflicts --depth` drill-down hint: backticks and wording.**
+- [x] **`conflicts --depth` drill-down hint: backticks and wording.** Done
+  alongside the positional fix: the hint is now
+  `` `autobahn conflicts <group> --depth N` opens the next level ``.
+
+- [x] **`conflicts` took a host where its siblings take a path.** Done.
+  `autobahn conflicts voltai autobahn` scopes to that folder, `--host`
+  filters the destination, and a folder given as the selector scopes too.
+  Depth counts from the scope.
+
+- [ ] ~~superseded~~ **`conflicts --depth` drill-down hint.**
   `src/main.rs:1139` currently prints
   `    → autobahn conflicts voltai --depth 2 to look inside`.
   Put backticks around the command, and reword — "to look inside" is

@@ -575,7 +575,9 @@ impl App {
         common.push(self.state_root.clone().into());
         let outcome: Result<()> = match action {
             Action::Resolve { group, path, keep } => {
-                command.args(["resolve", &group, &path, "--keep", &keep]);
+                // The menu item is the confirmation, and nothing here
+                // could answer a prompt.
+                command.args(["resolve", &group, &path, "--keep", &keep, "--yes"]);
                 command.args(&common);
                 run_quiet(command)
             }

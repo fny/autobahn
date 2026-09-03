@@ -84,13 +84,21 @@ fn main() {
         // The two remaining per-cycle costs that walk the whole hierarchy:
         // the ancestor is validated and then serialized and written to disk
         // synchronously, every cycle that changes anything.
-        let started = Instant::now();
-        edited
+        // Validated the way a cycle validates: over the *synchronizable*
+        // subtree, which is what the ancestor actually holds. Asserting
+        // the raw tree is clean made this unrunnable on any real root —
+        // an unreadable file somewhere below is the normal condition, and
+        // a measurement that only works on synthetic trees measures the
+        // wrong machine.
+        let synchronizable = edited
             .root
             .as_ref()
             .expect("root")
-            .validate(true)
-            .expect("valid");
+            .synchronizable_subtree();
+        let started = Instant::now();
+        if let Some(node) = &synchronizable {
+            node.validate(true).expect("valid");
+        }
         let validate_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         // The same validation, against the hierarchy it was derived from.

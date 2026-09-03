@@ -1058,56 +1058,33 @@ impl Endpoint for LocalEndpoint {
         }
     }
 
-    fn write_file(&mut self, path: &str, content: Option<&[u8]>) -> Result<()> {
-        let full = resolve_relative(&self.root, path)?;
-        // Announced before the write, exactly as a transition's writes are:
-        // a scan racing this must not publish the old bytes as current.
-        self.observer.invalidate([path]);
-        let result = match content {
-            None => match fs::remove_file(&full) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
-                // A tree, not a file. `resolve` replaces one file's bytes
-                // with another's, and "no bytes" means removing it — which
-                // a directory refuses. Saying so beats the raw errno,
-                // which reads as a permission or a bug.
-                Err(error) if fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) => Err(error)
-                    .with_context(|| {
-                        format!(
-                            "{path} is a directory. Resolving replaces one file's content, \
-                             so it cannot settle a whole tree — make the two sides agree by hand"
-                        )
-                    }),
-                Err(error) => {
-                    Err(error).with_context(|| format!("unable to remove {}", full.display()))
-                }
-            },
-            Some(bytes) => {
-                let parent = full
-                    .parent()
-                    .ok_or_else(|| anyhow::anyhow!("{path} has no parent directory"))?;
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("unable to create {}", parent.display()))?;
-                // Temporary beside the target, then rename: a reader sees
-                // the old file or the new one, never a partial one.
-                let temporary = parent.join(temporary_name("resolve"));
-                let written = fs::write(&temporary, bytes)
-                    .and_then(|()| {
-                        // The mode is preserved from whatever was there, so a
-                        // resolved script stays executable.
-                        if let Ok(existing) = fs::metadata(&full) {
-                            fs::set_permissions(&temporary, existing.permissions())?;
-                        }
-                        fs::rename(&temporary, &full)
-                    })
-                    .with_context(|| format!("unable to write {}", full.display()));
-                if written.is_err() {
-                    let _ = fs::remove_file(&temporary);
-                }
-                written
-            }
-        };
-        self.observer.invalidate([path]);
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        let source = resolve_relative(&self.root, from)?;
+        let target = resolve_relative(&self.root, to)?;
+        // Refused rather than overwritten. The caller is preserving
+        // something, so a name that is already taken means the caller has
+        // guessed wrong about what is free — and `fs::rename` would
+        // replace the occupant without a word.
+        if fs::symlink_metadata(&target).is_ok() {
+            bail!("{to} already exists; move it out of the way first");
+        }
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("{to} has no parent directory"))?;
+        fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+        // Both paths are announced before and after, exactly as a
+        // transition's writes are: a scan racing this must not publish
+        // either name's old state as current.
+        self.observer.invalidate([from, to]);
+        let result = fs::rename(&source, &target).with_context(|| {
+            format!(
+                "unable to move {} to {}",
+                source.display(),
+                target.display()
+            )
+        });
+        self.observer.invalidate([from, to]);
         result
     }
 

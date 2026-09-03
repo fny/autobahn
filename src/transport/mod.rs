@@ -466,9 +466,7 @@ fn serve_channel<W: Write>(
             },
             Request::ScanPull => Ok(Response::ScanOps(next_scan_batch(&mut pending))),
             Request::ReadFile(path) => endpoint.read_file(&path).map(Response::File),
-            Request::WriteFile(path, content) => endpoint
-                .write_file(&path, content.as_deref())
-                .map(|()| Response::Written),
+            Request::Rename(from, to) => endpoint.rename(&from, &to).map(|()| Response::Written),
             Request::StageBegin(files) => endpoint.stage_begin(files).map(Response::StageBegin),
             Request::SupplyOpen(needs) => {
                 endpoint.supply_open(needs).map(|()| Response::SupplyOpened)

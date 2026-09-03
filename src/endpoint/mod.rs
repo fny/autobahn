@@ -246,11 +246,16 @@ pub trait Endpoint: Send {
         anyhow::bail!("this endpoint cannot read individual files")
     }
 
-    /// Replaces one file's content by root-relative path (`None` removes
-    /// it), atomically with respect to readers. For making a conflict's
-    /// sides agree; not a synchronization primitive.
-    fn write_file(&mut self, _path: &str, _content: Option<&[u8]>) -> Result<()> {
-        anyhow::bail!("this endpoint cannot write individual files")
+    /// Moves one entry aside, by root-relative path: whatever is at `from`
+    /// — a file, a symbolic link, or a whole tree — ends up at `to`, which
+    /// must not already exist.
+    ///
+    /// For keeping a conflict's losing version under another name. A
+    /// rename is the only way to do that for a directory without copying
+    /// its content, and the losing side is the only place that content
+    /// exists; not a synchronization primitive.
+    fn rename(&mut self, _from: &str, _to: &str) -> Result<()> {
+        anyhow::bail!("this endpoint cannot move entries")
     }
 
     /// A monotone measure of how much change this endpoint has recorded but

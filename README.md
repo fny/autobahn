@@ -295,15 +295,31 @@ autobahn resolve project src/main.rs --keep boite # boite's version wins, everyw
 autobahn resolve project src/main.rs --keep both  # keep alpha's; the loser is
                                                   # renamed aside as main.rs.boite
 autobahn resolve voltai autobahn --keep alpha     # every conflict under one folder
+autobahn resolve project a.rs b.rs c.rs --keep alpha  # several at once, one pass
 autobahn resolve ~/project --all --keep boite     # every conflict in the group
 ```
 
 A winner is named as `status` names it: `alpha`, or a destination's host
-(or path). Its version is put on alpha and on every other destination,
-so one command settles a conflict across a whole fan-out — including
-destinations whose own conflict was with a *third* version. Resolution
-makes the sides agree; the next cycle records the agreement and the
-conflict is gone. Nothing here touches the ancestor.
+(or path). Its version reaches alpha and every other destination, so one
+command settles a conflict across a whole fan-out — including
+destinations whose own conflict was with a *third* version.
+
+It asks before it acts, unless you pass `--yes` (`-y`).
+
+What it does is retire the *losing* version, not copy the winning one:
+the losing side's copy is removed, or moved aside for `--keep both`, and
+the next cycle carries the winner across. That is why it settles a
+conflict between a file and a whole directory, which no amount of
+copying bytes can do — reconciliation already propagates one side's
+content over the other's deletion, for a file, a symbolic link, or a
+tree alike.
+
+Two things follow. The removal goes through the same transition path a
+cycle uses, so an entry that changed since the command started is
+refused and reported rather than destroyed; run the command again to
+settle it. And the winner arrives on the next cycle, so the command
+flushes the supervisor before returning. Without a supervisor running,
+run `autobahn sync` once. Nothing here touches the ancestor.
 
 `--depth` turns a long list into a map of where the trouble is —
 seven hundred paths under one folder are one fact about that folder —

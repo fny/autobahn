@@ -371,21 +371,13 @@ impl Shop<'_> {
             1 => format!("settled {}", pending.paths[0]),
             many => format!("settled {many} paths"),
         };
-        let commands = pending
-            .paths
-            .iter()
-            .map(|path| {
-                vec![
-                    "resolve".to_owned(),
-                    group.clone(),
-                    path.clone(),
-                    "--keep".into(),
-                    keep.clone(),
-                    "--yes".into(),
-                ]
-            })
-            .collect();
-        self.spawn(commands, told, "could not settle".to_owned());
+        // One command for the whole row, not one per path. Resolution reads
+        // each losing side once for every path it is given, so a row of
+        // twenty conflicts costs one scan this way and twenty the other.
+        let mut command = vec!["resolve".to_owned(), group.clone()];
+        command.extend(pending.paths.iter().cloned());
+        command.extend(["--keep".to_owned(), keep, "--yes".to_owned()]);
+        self.spawn(vec![command], told, "could not settle".to_owned());
     }
 
     /// Puts the commands that would clear a blocked row on the clipboard.

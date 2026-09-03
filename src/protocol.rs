@@ -101,11 +101,16 @@ pub enum Request {
     /// use this to look at a conflict's sides; it is not a synchronization
     /// primitive, and reads nothing but a regular file.
     ReadFile(String),
-    /// Replace one file's content, by root-relative path (`None` removes
-    /// it). Written to a temporary beside the target and renamed into
-    /// place, so a reader never sees a partial file. `resolve` uses this
-    /// to make the sides of a conflict agree.
-    WriteFile(String, Option<Vec<u8>>),
+    /// Move one entry aside, by root-relative path. Whatever is at the
+    /// first path — a file, a symbolic link, or a whole tree — ends up at
+    /// the second, which must not already exist.
+    ///
+    /// `resolve --keep both` uses this to preserve the losing side's
+    /// version under another name before the winner's version arrives. A
+    /// rename is the only operation that can do that for a directory
+    /// without moving its content, and the losing side is the only place
+    /// that content exists.
+    Rename(String, String),
 }
 
 /// The header of a snapshot sent as a delta.
@@ -227,7 +232,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 5;
+pub const COMPATIBILITY_EPOCH: u32 = 6;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

@@ -1325,14 +1325,21 @@ fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
     // Addressed by a path inside the root, and keeping b1's version: it
     // must reach alpha *and* b2, whose own conflict is settled by it.
     let file = alpha.join("notes.txt").to_string_lossy().to_string();
-    let (ok, text) = cli(&world, &config, &["resolve", &file, "--keep", &b1_spec]);
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", &file, "--keep", &b1_spec, "--yes"],
+    );
     assert!(ok, "{text}");
+    // Resolution retires the losing versions; the cycle carries the winner.
+    // Two cycles, because b2's copy reaches it through alpha.
+    cli(&world, &config, &["sync"]);
+    cli(&world, &config, &["sync"]);
     for root in [&alpha, &b1, &b2] {
         assert_eq!(read(root, "notes.txt"), "v-b1");
     }
-    cli(&world, &config, &["sync"]);
     let (_, after) = cli(&world, &config, &["conflicts"]);
-    assert!(after.contains("no conflicts"), "{after}");
+    assert!(after.contains("nothing needs you"), "{after}");
 }
 
 #[test]
@@ -1342,13 +1349,84 @@ fn resolve_keeping_both_renames_the_loser_aside() {
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "notes.txt", "--keep", "both"],
+        &["resolve", "r", "notes.txt", "--keep", "both", "--yes"],
     );
     assert!(ok, "{text}");
-    assert_eq!(read(&alpha, "notes.txt"), "v-alpha");
-    assert_eq!(read(&b1, "notes.txt"), "v-alpha");
+    // The rename happens at once, because the losing content is only on
+    // the losing side and nothing has to be moved to preserve it.
     assert_eq!(read(&b1, "notes.txt.b1"), "v-b1");
     assert_eq!(read(&b2, "notes.txt.b2"), "v-b2");
+    // Everything else is ordinary propagation: alpha's version fills the
+    // names the renames vacated, and each aside reaches the other roots.
+    cli(&world, &config, &["sync"]);
+    cli(&world, &config, &["sync"]);
+    for root in [&alpha, &b1, &b2] {
+        assert_eq!(read(root, "notes.txt"), "v-alpha");
+        assert_eq!(read(root, "notes.txt.b1"), "v-b1");
+        assert_eq!(read(root, "notes.txt.b2"), "v-b2");
+    }
+}
+
+/// A conflict whose sides are not both files is the case that byte-copying
+/// resolution could never settle: a directory has no content to read, and
+/// "write no content" means removing it, which `remove_file` refuses. Every
+/// winner is exercised, because each retires a different side.
+#[test]
+fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
+    for keep in ["alpha", "b1", "both"] {
+        let world = World::new();
+        let (config, alpha, b1, _) = three_way_conflict(&world);
+        // `tree` is a populated directory on one side and a file on the
+        // other, both created since the ancestor: neither change is a
+        // deletion, so it is a genuine conflict rather than a propagation.
+        // Large enough that a mistake would trip the emptied-subtree halt.
+        let (directory, file) = match keep {
+            "b1" => (&alpha, &b1),
+            _ => (&b1, &alpha),
+        };
+        fs::create_dir_all(directory.join("tree/inner")).unwrap();
+        for n in 0..9 {
+            write(directory, &format!("tree/inner/f{n}"), "held");
+        }
+        write(file, "tree", "the file version");
+        cli(&world, &config, &["sync"]);
+        let (_, listed) = cli(&world, &config, &["conflicts"]);
+        assert!(listed.contains("tree"), "a conflict at `tree`: {listed}");
+
+        let winner = match keep {
+            "b1" => b1.to_string_lossy().to_string(),
+            other => other.to_owned(),
+        };
+        let (ok, text) = cli(
+            &world,
+            &config,
+            &["resolve", "r", "tree", "--keep", &winner, "--yes"],
+        );
+        assert!(ok, "keeping {keep}: {text}");
+        for _ in 0..3 {
+            cli(&world, &config, &["sync"]);
+        }
+
+        // `notes.txt` is still conflicted — the fixture leaves it that way
+        // — so the claim is about `tree` alone.
+        let (_, after) = cli(&world, &config, &["conflicts"]);
+        assert!(!after.contains("tree"), "keeping {keep}: {after}");
+        match keep {
+            // The file wins: the tree is gone from every root.
+            "alpha" | "b1" => {
+                assert_eq!(read(file, "tree"), "the file version");
+                assert_eq!(read(directory, "tree"), "the file version");
+                assert!(!directory.join("tree/inner").exists(), "the tree is gone");
+            }
+            // Both are kept: the loser's whole tree survives under a free
+            // name, which is the thing a rename can do and a copy cannot.
+            _ => {
+                assert_eq!(read(&alpha, "tree"), "the file version");
+                assert_eq!(read(&alpha, "tree.b1/inner/f0"), "held");
+                assert_eq!(read(&b1, "tree.b1/inner/f8"), "held");
+            }
+        }
+    }
 }
 
 #[test]
@@ -1364,13 +1442,15 @@ fn resolve_all_requires_a_winner_and_asks_first() {
         &["resolve", "r", "--all", "--keep", "both"],
     );
     assert!(!ok && text.contains("choose whose version wins"), "{text}");
-    // Without --yes and with no terminal to answer, it declines.
-    let (_, text) = cli(
+    // Without --yes and with no terminal to answer, it refuses rather than
+    // guessing: a resolution overwrites work someone did deliberately, so
+    // an unattended run must say what to pass, not quietly do nothing.
+    let (ok, text) = cli(
         &world,
         &config,
         &["resolve", "r", "--all", "--keep", "alpha"],
     );
-    assert!(text.contains("nothing done"), "{text}");
+    assert!(!ok && text.contains("pass --yes"), "{text}");
     assert_eq!(read(&b1, "more.txt"), "b");
     let (ok, text) = cli(
         &world,
@@ -1378,6 +1458,7 @@ fn resolve_all_requires_a_winner_and_asks_first() {
         &["resolve", "r", "--all", "--keep", "alpha", "--yes"],
     );
     assert!(ok, "{text}");
+    cli(&world, &config, &["sync"]);
     assert_eq!(read(&b1, "more.txt"), "a");
     assert_eq!(read(&b1, "notes.txt"), "v-alpha");
 }

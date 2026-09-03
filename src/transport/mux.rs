@@ -871,7 +871,7 @@ mod tests {
     /// The agent reads and writes single files on request — atomically
     /// for readers, and never outside its root.
     #[test]
-    fn an_agent_reads_and_writes_single_files_within_its_root() {
+    fn an_agent_reads_and_moves_single_entries_within_its_root() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let root = keep.path().join("root");
         std::fs::create_dir_all(root.join("sub")).expect("root should be creatable");
@@ -898,24 +898,26 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         match channel
-            .exchange(Request::WriteFile(
-                "sub/a.txt".into(),
-                Some(b"after".to_vec()),
-            ))
-            .expect("write")
-        {
-            Response::Written => {}
-            other => panic!("unexpected {other:?}"),
-        }
-        assert_eq!(std::fs::read(root.join("sub/a.txt")).unwrap(), b"after");
-        match channel
-            .exchange(Request::WriteFile("sub/a.txt".into(), None))
-            .expect("remove")
+            .exchange(Request::Rename("sub/a.txt".into(), "sub/b.txt".into()))
+            .expect("rename")
         {
             Response::Written => {}
             other => panic!("unexpected {other:?}"),
         }
         assert!(!root.join("sub/a.txt").exists());
+        assert_eq!(std::fs::read(root.join("sub/b.txt")).unwrap(), b"before");
+        // A name that is already taken is refused, not overwritten: the
+        // caller is preserving something, so a wrong guess must not
+        // destroy the occupant.
+        std::fs::write(root.join("sub/c.txt"), b"occupied").expect("writes");
+        match channel
+            .exchange(Request::Rename("sub/b.txt".into(), "sub/c.txt".into()))
+            .expect("exchange")
+        {
+            Response::Error(message) => assert!(message.contains("already exists"), "{message}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert_eq!(std::fs::read(root.join("sub/c.txt")).unwrap(), b"occupied");
 
         // Escaping the root is refused, both ways.
         for path in ["../outside.txt", "/etc/passwd"] {
@@ -928,10 +930,7 @@ mod tests {
             }
         }
         match channel
-            .exchange(Request::WriteFile(
-                "../outside.txt".into(),
-                Some(b"x".to_vec()),
-            ))
+            .exchange(Request::Rename("sub/b.txt".into(), "../outside.txt".into()))
             .expect("exchange")
         {
             Response::Error(_) => {}

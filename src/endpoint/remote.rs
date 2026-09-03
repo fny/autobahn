@@ -412,13 +412,10 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
-    fn write_file(&mut self, path: &str, content: Option<&[u8]>) -> Result<()> {
-        match self.exchange(Request::WriteFile(
-            path.to_owned(),
-            content.map(|c| c.to_vec()),
-        ))? {
+    fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        match self.exchange(Request::Rename(from.to_owned(), to.to_owned()))? {
             Response::Written => Ok(()),
-            response => Err(unexpected_response(&response, "write file")),
+            response => Err(unexpected_response(&response, "move entry")),
         }
     }
 

@@ -340,8 +340,10 @@ enum Command {
         /// A group name, or a path — to the conflicting file itself, or to a
         /// folder inside a synchronized root.
         selector: String,
-        /// The root-relative path, when the selector was a group or folder.
-        path: Option<String>,
+        /// The root-relative paths, when the selector was a group or
+        /// folder. Several may be given; each losing side is then read once
+        /// for all of them rather than once per path.
+        paths: Vec<String>,
         /// Whose version wins: `alpha`, a destination host or path, or
         /// `both`.
         #[arg(long)]
@@ -504,14 +506,14 @@ fn main() {
         } => run_diff(config, state_root, selector, path, host),
         Command::Resolve {
             selector,
-            path,
+            paths,
             keep,
             all,
             yes,
             host,
             config,
             state_root,
-        } => run_resolve(config, state_root, selector, path, keep, all, yes, host),
+        } => run_resolve(config, state_root, selector, paths, keep, all, yes, host),
         #[cfg(feature = "tray")]
         Command::Tray { config, state_root } => {
             resolve_state_root(state_root).and_then(|root| autobahn::tray::run(config, root))
@@ -1665,11 +1667,54 @@ fn run_diff(
 
 /// Resolves conflicts by putting the winner's version on every other side.
 #[allow(clippy::too_many_arguments)]
+/// The node a root-relative path names in a scanned tree, or `None` when
+/// nothing is there.
+fn node_at<'a>(
+    root: Option<&'a autobahn::tree::Node>,
+    path: &str,
+) -> Option<&'a autobahn::tree::Node> {
+    let mut node = root?;
+    if path.is_empty() {
+        return Some(node);
+    }
+    for name in path.split('/') {
+        node = node.child(name)?;
+    }
+    Some(node)
+}
+
+/// A free name beside `path` for a version being kept rather than
+/// discarded, suffixed by the side it came from.
+///
+/// Free is checked against the scan rather than assumed: a previous
+/// `--keep both` on the same path leaves the obvious name taken, and a
+/// rename onto an occupied name is refused (which would abandon the
+/// resolution half-done). The counter is a last resort, not a habit.
+fn free_name(root: Option<&autobahn::tree::Node>, path: &str, side: &str) -> String {
+    // The side named in the shortest form that still identifies it: a host
+    // name as is, a local path by its last component.
+    let suffix = std::path::Path::new(side)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| side.to_owned());
+    let candidate = format!("{path}.{suffix}");
+    if node_at(root, &candidate).is_none() {
+        return candidate;
+    }
+    for counter in 2.. {
+        let candidate = format!("{path}.{suffix}.{counter}");
+        if node_at(root, &candidate).is_none() {
+            return candidate;
+        }
+    }
+    unreachable!("the counter is unbounded")
+}
+
 fn run_resolve(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
     selector: String,
-    path: Option<String>,
+    named: Vec<String>,
     keep: String,
     all: bool,
     yes: bool,
@@ -1739,18 +1784,30 @@ fn run_resolve(
             bail!("--all cannot keep both: choose whose version wins");
         }
     } else {
-        let named = relative_path(&selection, path)?;
+        // Several paths may be named at once. Each losing side is read once
+        // for the whole command, so settling twenty conflicts costs one
+        // scan rather than twenty — which is what the shop does when it
+        // settles a row.
+        let named: Vec<String> = match named.is_empty() {
+            true => vec![relative_path(&selection, None)?],
+            false => named
+                .into_iter()
+                .map(|path| relative_path(&selection, Some(path)))
+                .collect::<Result<_>>()?,
+        };
         // A named path may be a file or a folder. Take every recorded
         // conflict at or under it, so naming a folder settles what is
-        // inside it — `conflicts` scopes the same way, and a folder
-        // resolved as if it were a file can only fail: its "content" reads
-        // as nothing, and writing nothing means removing it.
+        // inside it — `conflicts` scopes the same way.
         for plan in &selection.plans {
             if let Some(status) = read_status(&state_root, &plan.identifier())? {
                 let under: Vec<String> = status
                     .conflicts
                     .iter()
-                    .filter(|path| *path == &named || path.starts_with(&format!("{named}/")))
+                    .filter(|path| {
+                        named
+                            .iter()
+                            .any(|name| *path == name || path.starts_with(&format!("{name}/")))
+                    })
                     .cloned()
                     .collect();
                 if !under.is_empty() {
@@ -1758,23 +1815,23 @@ fn run_resolve(
                 }
             }
         }
-        // Nothing recorded there. The path is taken at its word, which is
-        // how a file is forced to match a side without a conflict being
+        // Nothing recorded there. The paths are taken at their word, which
+        // is how a file is forced to match a side without a conflict being
         // reported first.
         if targets.is_empty() {
             targets = selection
                 .plans
                 .iter()
-                .map(|plan| (*plan, vec![named.clone()]))
+                .map(|plan| (*plan, named.clone()))
                 .collect();
         } else if targets
             .iter()
-            .any(|(_, paths)| paths.iter().any(|path| path != &named))
+            .any(|(_, paths)| paths.iter().any(|path| !named.contains(path)))
         {
             // Only a folder that actually expanded is reported as one.
             // Naming a file and being told its conflict is "under" it
             // reads as though there were more inside.
-            scope = Some(named);
+            scope = Some(named.join(", "));
         }
     }
 
@@ -1849,66 +1906,164 @@ fn run_resolve(
         .iter()
         .flat_map(|(_, paths)| paths.iter().cloned())
         .collect();
-    for path in &paths {
-        // Read the winner.
-        let content = match winner {
-            Winner::Alpha | Winner::Both => endpoints[0].0.read_file(path)?,
-            Winner::Beta(index) => endpoints[index].1.read_file(path)?,
+
+    // Resolution retires the *losing* version and lets the ordinary cycle
+    // carry the winner's, rather than copying bytes across by hand.
+    //
+    // That is not a shortcut, it is the only approach that works for
+    // everything a filesystem holds. Copying bytes can settle a file and
+    // nothing else: a directory has no bytes to read, and "write no bytes"
+    // means removing it, which `remove_file` refuses. Reconciliation, on
+    // the other hand, already resolves this shape — when one side's change
+    // is purely a deletion, the other side's content propagates over it,
+    // for a file, a symbolic link, or a whole tree alike (see the comment
+    // at `tree/reconcile.rs:375`, which names manual conflict resolution as
+    // the reason). So the smallest honest edit is to make the losing side's
+    // change a pure deletion and let the engine do what it already does.
+    //
+    // The removal itself goes through `transition`, not through a raw
+    // recursive delete. A transition removes a directory bottom-up and
+    // refuses any entry that has moved since the scan it was planned from,
+    // so content that appeared while this command was running is never
+    // destroyed by it. That validation is the whole reason to route through
+    // the engine here rather than call `remove_dir_all`.
+    let mut settled = 0usize;
+    let mut refused: Vec<(String, String)> = Vec::new();
+    for (index, plan) in group_plans.iter().enumerate() {
+        // Which side of this session loses. The winner keeps its version
+        // untouched; every other copy in the group is retired, including
+        // alpha's when a destination wins, since alpha is how the winning
+        // content reaches the group's other destinations.
+        let losing: Vec<(&mut Box<dyn autobahn::endpoint::Endpoint + Send>, String)> = {
+            let (alpha, beta) = &mut endpoints[index];
+            match winner {
+                // Alpha wins (or both sides are kept, in which case alpha's
+                // copy stays put and beta's moves aside): only beta loses.
+                Winner::Alpha | Winner::Both => vec![(beta, plan.host.clone())],
+                // This destination wins, so alpha loses — and alpha is
+                // retired *here*, on the winning session, for two reasons.
+                // Every session opens its own handle on alpha, so the
+                // retirement has to happen through exactly one of them; and
+                // this is the session that will carry the winning content
+                // back to alpha, from which the group's other destinations
+                // then take it.
+                Winner::Beta(w) if w == index => vec![(alpha, "alpha".to_owned())],
+                // Another destination wins, so this one loses too. Its copy
+                // and alpha's both go; the pair reads as a deletion on both
+                // sides, which clears the ancestor entry, and the winner's
+                // content then arrives as ordinary new content.
+                Winner::Beta(_) => vec![(beta, plan.host.clone())],
+            }
         };
-        let winner_name = match winner {
-            Winner::Alpha | Winner::Both => "alpha".to_owned(),
-            Winner::Beta(index) => group_plans[index].host.clone(),
-        };
-        // Write it everywhere else, keeping the loser aside when asked. Alpha
-        // is written first, so a session that cycles between writes sees
-        // alpha already agreeing with the winner.
-        if !matches!(winner, Winner::Alpha | Winner::Both) {
-            endpoints[0].0.write_file(path, content.as_deref())?;
-        }
-        for (index, plan) in group_plans.iter().enumerate() {
-            if matches!(winner, Winner::Beta(w) if w == index) {
+
+        for (endpoint, side) in losing {
+            // Only paths that actually conflict on this session are
+            // touched; a destination that already agrees is left alone.
+            // Alpha is the exception: its copy must go for the winning
+            // content to reach it, whichever session reported the conflict.
+            let here: Vec<&String> = paths
+                .iter()
+                .filter(|path| {
+                    side == "alpha"
+                        || targets.iter().any(|(target, paths)| {
+                            target.identifier() == plan.identifier() && paths.contains(*path)
+                        })
+                })
+                .collect();
+            if here.is_empty() {
                 continue;
             }
-            // Only sessions where this path actually conflicts are touched;
-            // a destination that already agrees with alpha is left alone.
-            let conflicts_here = targets.iter().any(|(target, paths)| {
-                target.identifier() == plan.identifier() && paths.contains(path)
-            });
-            if !conflicts_here && winner != Winner::Both {
-                continue;
+
+            // One scan per losing side, not one per path — and it must be
+            // the scan the removals are validated against, so nothing runs
+            // between it and the transition.
+            //
+            // A scan of a large tree is the slow part of this command, so
+            // it says whose tree it is reading. On a terminal the line is
+            // erased afterwards; anywhere else it is never written, since a
+            // carriage return in a log file is noise.
+            let transient = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
+            if transient {
+                eprint!("  reading {side}\r");
             }
-            if winner == Winner::Both {
-                if let Some(losing) = endpoints[index].1.read_file(path)? {
-                    if Some(&losing) != content.as_ref() {
-                        // The suffix names the side in the shortest form
-                        // that still identifies it: a host name as is, a
-                        // local path by its last component.
-                        let suffix = std::path::Path::new(&plan.host)
-                            .file_name()
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| plan.host.clone());
-                        let aside = format!("{path}.{suffix}");
-                        endpoints[index].1.write_file(&aside, Some(&losing))?;
-                        println!("  {}: kept {} as {aside}", plan.host, path);
-                    }
+            let snapshot = endpoint
+                .scan()
+                .with_context(|| format!("unable to read {side}"))?;
+            if transient {
+                eprint!("\r\x1b[2K");
+            }
+
+            let mut removals = Vec::new();
+            for path in here {
+                let Some(node) = node_at(snapshot.root.as_ref(), path) else {
+                    // Already gone on this side. Nothing to retire, and the
+                    // cycle will carry the winner's version here anyway.
+                    continue;
+                };
+                if winner == Winner::Both {
+                    // Kept, not discarded: the losing version moves to a
+                    // free name, from which it propagates to every side as
+                    // ordinary new content. A rename does this for a whole
+                    // tree without moving any of it, which is why it is a
+                    // primitive rather than a read and a write.
+                    let aside = free_name(snapshot.root.as_ref(), path, &side);
+                    endpoint
+                        .rename(path, &aside)
+                        .with_context(|| format!("unable to keep {side}'s {path}"))?;
+                    println!("  {side}: kept {path} as {aside}");
+                    settled += 1;
+                    continue;
                 }
+                removals.push(autobahn::tree::Change {
+                    path: path.clone(),
+                    old: Some(node.clone()),
+                    new: None,
+                });
             }
-            endpoints[index].1.write_file(path, content.as_deref())?;
+
+            if removals.is_empty() {
+                continue;
+            }
+            let outcome = endpoint
+                .transition(removals)
+                .with_context(|| format!("unable to retire {side}'s version"))?;
+            // A refusal is not an error: the transition reports it and
+            // leaves the content alone. It means the path moved between the
+            // scan and the removal, which is exactly the case the
+            // validation exists to catch — so it is reported, by path, and
+            // the conflict stays.
+            for problem in &outcome.problems {
+                refused.push((problem.path.clone(), problem.message.clone()));
+            }
+            settled += outcome
+                .results
+                .iter()
+                .filter(|result| result.is_none())
+                .count();
         }
+    }
+    if settled > 0 {
+        let kept_word = match winner {
+            Winner::Both => "both versions kept",
+            _ => "one version kept",
+        };
+        println!("settled {settled} of {} ({kept_word})", paths.len());
+    }
+    for (path, error) in &refused {
+        println!("  left alone: {path} — {error}");
+    }
+    if !refused.is_empty() {
         println!(
-            "resolved {path}: {} version {}",
-            winner_name,
-            if content.is_some() {
-                "put on every side"
-            } else {
-                "removed from every side"
-            }
+            "{} path(s) changed while this ran and were not touched. \
+             Run the command again to settle them.",
+            refused.len()
         );
     }
 
-    // A running supervisor picks the writes up through its watchers; a
-    // flush makes the agreement get recorded now rather than at the next
-    // heartbeat.
+    // The winning version has not moved yet: this command only retired the
+    // losing one. The cycle carries the winner across, which is what makes
+    // a directory work at all — so the flush is part of the resolution
+    // here, not a courtesy to make `status` catch up sooner.
     if autobahn::supervisor::control::supervisor_is_running(&state_root) {
         let _ = autobahn::supervisor::control::send(
             &state_root,
@@ -1916,6 +2071,15 @@ fn run_resolve(
                 group: Some(group),
                 host: None,
             }),
+        );
+        if settled > 0 {
+            println!("copying the kept version across now");
+        }
+    } else if settled > 0 {
+        println!(
+            "the supervisor is not running, so the kept version has not \
+             moved yet. Start it with `autobahn start`, or run \
+             `autobahn sync` once."
         );
     }
     Ok(())

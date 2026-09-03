@@ -111,14 +111,36 @@ committed.
 
 ## Found while building the shop (2026-09-03)
 
-- [ ] **`resolve` cannot settle a directory conflict.** It replaces one
-  file's bytes, so "keep ours" on a deleted directory means removing a
-  tree, and `remove_file` refuses it. The failure now explains itself
-  rather than leaking `Is a directory (os error 21)`, but the conflict
-  still cannot be settled from either the CLI or the shop. Doing it
-  properly means resolution using stage and transition rather than
-  read_file/write_file — the machinery exists, `resolve` does not use it.
-  Until then the two sides must be made to agree by hand.
+- [x] **`resolve` cannot settle a directory conflict.** Done, and not by
+  teaching it to copy directories. It now retires the *losing* version
+  and lets the cycle carry the winner — which is what reconciliation
+  already does for one side's deletion, for a file, a symbolic link, or
+  a tree alike. The removal goes through `transition`, so an entry that
+  moved since the scan is refused rather than destroyed. `--keep both`
+  renames the loser aside, a new endpoint primitive (epoch 6). Covered
+  for all three winners by
+  `resolve_settles_a_conflict_between_a_directory_and_a_file`.
+
+- [ ] **Three integration tests were broken for a day.** `82976d3` (the
+  resolve confirmation) and the `issues` rename each broke assertions in
+  `tests/supervisor.rs`, and neither was caught, because after each
+  change I ran only `--bins`. The lesson is not "run everything every
+  time" — it is that a change to a command's *output or prompting* has
+  to run that command's integration tests, which are the only place the
+  wording is asserted. Worth a note in the contributing guide.
+
+- [ ] **A rebuilt agent never reaches a host that already has that
+  version.** `remote.rs:341` installs only when the first connect fails,
+  and the binary is named `autobahn-<version>`. A rebuild at the same
+  version runs the old agent forever. Found the hard way: the directory
+  message added in 82976d3 did not appear on `boite`, whose agent is from
+  Sep 2 02:15. It hid because the case I tested failed on alpha, which is
+  local. Fix: name the remote binary by a digest of its content
+  (`autobahn-<version>-<digest8>`), so a changed binary always deploys and
+  an unchanged one never re-uploads. Hashing 4 MB costs a few milliseconds
+  and only on connect. Prune old binaries in `clean`. Until then, remove
+  `~/.autobahn/bin/autobahn-<version>` on the remote by hand after any
+  agent-side change.
 
 - [ ] **A directory conflict is recorded as kind "other".**
   `conflict_detail` maps `Content::Directory` to "directory", but a real

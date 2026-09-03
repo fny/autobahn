@@ -587,7 +587,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
     };
     let size = data.len() as u64;
     let version = checkpoint_version(&data);
-    if version > CHECKPOINT_VERSION || version < OLDEST_READABLE_CHECKPOINT {
+    if !(OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION).contains(&version) {
         return Err(unreadable_checkpoint(version));
     }
     match version {
@@ -647,7 +647,7 @@ pub fn readable(path: &Path) -> Result<()> {
     let mut header = [0u8; 16];
     let read = file.read(&mut header).context("unable to read ancestor")?;
     let version = checkpoint_version(&header[..read]);
-    if version > CHECKPOINT_VERSION || version < OLDEST_READABLE_CHECKPOINT {
+    if !(OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION).contains(&version) {
         return Err(unreadable_checkpoint(version));
     }
     Ok(())

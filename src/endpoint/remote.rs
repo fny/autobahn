@@ -355,16 +355,28 @@ fn establish_ssh(destination: &str) -> Result<AgentConnection> {
     // that this failure is "the host is not there" rather than "something
     // went wrong", and deciding that by searching the message for a phrase
     // means any rewording of the message silently reclassifies the session.
-    transport::install::ensure_agent(destination).map_err(|error| {
+    let installed = transport::install::ensure_agent(destination).map_err(|error| {
         anyhow::Error::new(Unreachable {
             destination: destination.to_owned(),
         })
         .context(format!("{error:#}"))
     })?;
     attempt(false).with_context(|| {
+        // A version mismatch *here* is not a host that needs upgrading —
+        // the agent it is complaining about was installed seconds ago, by
+        // the line above. It means the bundle that agent was copied from
+        // holds an older build than this controller, and the name it was
+        // given (which carries the controller's version) says nothing
+        // about the code inside it. Nothing on this side can read the
+        // version out of a binary built for another platform, so the
+        // handshake is the first thing that can notice — and without this
+        // the message blames the remote for a file that is stale here.
         format!(
-            "unable to connect to {destination} even after installing the agent \
-             (initial failure: {initial:#})"
+            "the agent just installed on {destination} does not match this build. \
+             The {} bundle it was copied from is stale: {}. Rebuild it, or remove \
+             it so a matching one is used. (initial failure: {initial:#})",
+            installed.platform,
+            installed.provenance(),
         )
     })
 }

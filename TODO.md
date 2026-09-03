@@ -129,6 +129,23 @@ committed.
   to run that command's integration tests, which are the only place the
   wording is asserted. Worth a note in the contributing guide.
 
+- [ ] **The agent bundle has no version, and nothing checks it.** Found by
+  breaking every Linux session on 2026-09-03. The epoch went 5 -> 6, the
+  installer uploaded `agents/autobahn-linux-x86_64` — a cross-build from
+  Sep 1, holding epoch 5 — and named it `autobahn-0.4.0+e6`. The name
+  carries the controller's version; the *content* is whatever file sits
+  in `agents/`. macOS hosts were fine, because for the local platform the
+  installer sends the running executable, which is always current. The
+  handshake refused the mismatch, so nothing was corrupted and the
+  sessions only errored — but the message blamed the remote host.
+  The message now names the bundle and its age. The real fix is for the
+  bundle to state its version: a manifest beside it, or a marker string
+  the installer can find in the bytes, checked before upload. Failing
+  closed there turns a ten-minute outage into a refusal to start.
+  Related: there is no recorded way to build the Linux agent. This
+  machine has no cross toolchain, and the Sep 1 binary was built
+  somewhere else. Write the recipe down, and put it in the README.
+
 - [ ] **A rebuilt agent never reaches a host that already has that
   version.** `remote.rs:341` installs only when the first connect fails,
   and the binary is named `autobahn-<version>`. A rebuild at the same

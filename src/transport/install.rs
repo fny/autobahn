@@ -35,7 +35,17 @@ pub fn versioned_remote_command() -> String {
 /// Ensures this version's agent is installed on the remote host: probes the
 /// platform, locates a matching binary locally, and streams it into place
 /// over a single SSH connection.
-pub fn ensure_agent(destination: &str) -> Result<()> {
+///
+/// Returns what was installed, which the caller needs to diagnose the one
+/// failure this cannot detect for itself: a *stale bundle*. The uploaded
+/// file is named for the controller's version, but nothing here can read
+/// the version out of a binary built for another platform, so a bundle
+/// left over from an older build is published under the new name and the
+/// handshake is the first thing to notice. That is safe — the mismatch is
+/// refused — but the message says only that the remote is behind, which
+/// reads as a host that needs upgrading rather than a bundle that needs
+/// rebuilding.
+pub fn ensure_agent(destination: &str) -> Result<Installed> {
     let platform = probe_platform(destination)?;
     let binary = locate_agent_binary(&platform).ok_or_else(|| {
         anyhow!(
@@ -45,7 +55,51 @@ pub fn ensure_agent(destination: &str) -> Result<()> {
         )
     })?;
     upload_agent(destination, &binary)
-        .with_context(|| format!("unable to install the {platform} agent on {destination}"))
+        .with_context(|| format!("unable to install the {platform} agent on {destination}"))?;
+    Ok(Installed {
+        platform,
+        source: binary,
+    })
+}
+
+/// What an installation put on the remote host.
+pub struct Installed {
+    /// The remote platform, in bundle naming form.
+    pub platform: String,
+    /// The local file the agent was copied from.
+    pub source: PathBuf,
+}
+
+impl Installed {
+    /// How the source file should be described when the agent it produced
+    /// turns out to be the wrong version: the path, and how old it is.
+    ///
+    /// The age is the tell. A bundle built days before the controller is
+    /// the whole diagnosis, and it is the one fact a version mismatch
+    /// alone never shows.
+    pub fn provenance(&self) -> String {
+        let age = self
+            .source
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .map(|age| format!(", last built {}", describe_age(age)))
+            .unwrap_or_default();
+        format!("{}{age}", self.source.display())
+    }
+}
+
+/// A duration in the coarsest unit that still says something, for reporting
+/// how old a bundle is.
+fn describe_age(age: std::time::Duration) -> String {
+    let seconds = age.as_secs();
+    match seconds {
+        0..=90 => "moments ago".to_owned(),
+        91..=5_399 => format!("{} minutes ago", seconds / 60),
+        5_400..=172_799 => format!("{} hours ago", seconds / 3_600),
+        _ => format!("{} days ago", seconds / 86_400),
+    }
 }
 
 /// Probes the remote host's platform, returning it in bundle naming form

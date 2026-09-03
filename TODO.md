@@ -159,7 +159,28 @@ committed.
   `~/.autobahn/bin/autobahn-<version>` on the remote by hand after any
   agent-side change.
 
-- [ ] **A directory conflict is recorded as kind "other".**
+- [x] **A directory conflict is recorded as kind "other".** Done, and the
+  answer was not a mislabel. "other" is `Content::Untracked` or
+  `Content::Problematic` — content that exists but cannot be carried —
+  and it is the *reason* for the conflict, not a detail of it. It is
+  almost never at the conflict's root either: a tree is refused because
+  of one entry beneath it. `conflict_detail` now walks the whole side,
+  counts what cannot be carried, and names an example, preferring an
+  unreadable entry over an excluded one because the first is a fault to
+  fix and the second is policy. `issues` and the shop both show it.
+  Found the live cause of the two `vibe` -> `boite` conflicts this way:
+  `happy` and `voltagen` hold `node_modules` and `.git`, which the
+  default ignores exclude.
+
+- [ ] **`resolve` cannot settle a conflict caused by excluded content,
+  and does not say so.** `--keep <the side that holds it>` retires the
+  *other* side, which is absent, so nothing happens and the conflict
+  returns next cycle. Only `--keep alpha` "works", by deleting the tree.
+  Neither is what the reader wants: the fix is an ignore rule for the
+  whole path, or nothing. `issues` should say that instead of offering
+  three winners, two of which cannot help.
+
+- [ ] ~~superseded~~ **A directory conflict is recorded as kind "other".**
   `conflict_detail` maps `Content::Directory` to "directory", but a real
   one (`vibe` → `boite`, the `happy` and `voltagen` trees) comes back as
   "other" — so the change it inspects is not the directory node it

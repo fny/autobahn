@@ -644,13 +644,19 @@ fn sides(session: &SessionReport, path: &str) -> String {
 
 /// One side of a conflict, in a few characters.
 fn held(side: &autobahn::supervisor::ConflictSide) -> String {
+    // Content that cannot be synchronized is the reason for the stalemate,
+    // so it is what the row says, whatever kind the entry itself is.
+    if let Some(blocking) = &side.unsynchronizable {
+        return match blocking.entries {
+            1 => "1 entry it cannot carry".to_owned(),
+            many => format!("{many} entries it cannot carry"),
+        };
+    }
     match side.kind.as_str() {
         "file" => bytes(side.size),
         "directory" => "a folder".to_owned(),
         "symlink" => "a link".to_owned(),
-        // "other" is what the supervisor records for content it cannot
-        // classify from the change it kept, which includes directories.
-        "other" | "" => "something".to_owned(),
+        "" => "something".to_owned(),
         other => other.to_owned(),
     }
 }
@@ -1433,6 +1439,7 @@ mod tests {
             kind: "file".into(),
             size,
             mtime_seconds: 0,
+            unsynchronizable: None,
         };
         let folder = ConflictSide {
             present: true,
@@ -1476,7 +1483,51 @@ mod tests {
             sides(&session(folder.clone(), folder), "happy"),
             "ours a folder · theirs a folder"
         );
+        // Content that cannot be carried is the *reason* for the conflict,
+        // so it outranks the entry's own kind. A folder that reads as "a
+        // folder" on both sides tells the reader nothing about why two
+        // folders will not reconcile.
+        let blocked = ConflictSide {
+            present: true,
+            kind: "directory".into(),
+            unsynchronizable: Some(autobahn::supervisor::Unsynchronizable {
+                entries: 121,
+                example: "happy/packages/cli/link".into(),
+                reason: "excluded from synchronization".into(),
+            }),
+            ..ConflictSide::default()
+        };
+        assert_eq!(
+            sides(&session(gone.clone(), blocked), "happy"),
+            "deleted on ours"
+        );
         // A path that is not in conflict has nothing to say.
         assert_eq!(sides(&session(gone.clone(), gone), "elsewhere"), "");
+    }
+
+    #[test]
+    fn a_side_that_cannot_be_carried_says_so_rather_than_naming_its_kind() {
+        use autobahn::supervisor::{ConflictSide, Unsynchronizable};
+        let blocked = |entries: u64| ConflictSide {
+            present: true,
+            kind: "directory".into(),
+            unsynchronizable: Some(Unsynchronizable {
+                entries,
+                example: "happy/packages/cli/link".into(),
+                reason: "excluded from synchronization".into(),
+            }),
+            ..ConflictSide::default()
+        };
+        assert_eq!(held(&blocked(121)), "121 entries it cannot carry");
+        assert_eq!(held(&blocked(1)), "1 entry it cannot carry");
+        // Without one, the entry's own kind still describes it.
+        assert_eq!(
+            held(&ConflictSide {
+                present: true,
+                kind: "directory".into(),
+                ..ConflictSide::default()
+            }),
+            "a folder"
+        );
     }
 }

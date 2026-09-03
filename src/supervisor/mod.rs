@@ -63,6 +63,27 @@ pub struct ConflictSide {
     pub size: u64,
     /// The file's modification time in seconds since the epoch, for a file.
     pub mtime_seconds: i64,
+    /// Content on this side that cannot be synchronized, when there is any.
+    ///
+    /// This is frequently the *reason* for the conflict rather than a
+    /// detail of it: reconciliation propagates one side over the other
+    /// freely, but it refuses to overwrite a side holding content it never
+    /// scanned, and reports a conflict instead. Without this the listing
+    /// shows two ordinary-looking sides and no cause, which reads as a
+    /// bug in the comparison.
+    #[serde(default)]
+    pub unsynchronizable: Option<Unsynchronizable>,
+}
+
+/// Content that synchronization cannot carry, summarized for a reader.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Unsynchronizable {
+    /// How many such entries this side holds.
+    pub entries: u64,
+    /// One of them, root-relative — enough to go and look.
+    pub example: String,
+    /// Why that one cannot be synchronized.
+    pub reason: String,
 }
 
 /// A conflict, with what each side held.
@@ -1201,7 +1222,58 @@ pub fn alert_summary(status: &SessionStatus) -> String {
 /// for it: the newest node each side's changes carry at the conflict's
 /// root, or absence.
 fn conflict_detail(conflict: &crate::tree::Conflict) -> ConflictDetail {
-    use crate::tree::{Change, Content};
+    use crate::tree::{path_join, Change, Content, Node};
+
+    // Everything on this side that synchronization cannot carry, found by
+    // walking the changes rather than by looking at the conflict's root.
+    // The blocking entry is usually *not* at the root — a directory is
+    // refused because of one unreadable file somewhere beneath it — so the
+    // root alone can never name the cause.
+    fn unsynchronizable(changes: &[Change]) -> Option<Unsynchronizable> {
+        fn walk(
+            path: &str,
+            node: &Node,
+            found: &mut Vec<(String, String)>,
+            faults: &mut Vec<(String, String)>,
+        ) {
+            match &node.content {
+                Content::Directory(children) => {
+                    for child in children.iter() {
+                        walk(&path_join(path, &child.name), child, found, faults);
+                    }
+                }
+                Content::Problematic { message } => {
+                    let entry = (path.to_owned(), message.clone());
+                    faults.push(entry.clone());
+                    found.push(entry);
+                }
+                Content::Untracked => {
+                    found.push((path.to_owned(), "excluded from synchronization".to_owned()))
+                }
+                _ => {}
+            }
+        }
+        let mut found = Vec::new();
+        let mut faults = Vec::new();
+        for change in changes {
+            if let Some(node) = &change.new {
+                walk(&change.path, node, &mut found, &mut faults);
+            }
+        }
+        // An unreadable entry is preferred as the example over an excluded
+        // one. Both stop the propagation, but they ask for opposite things:
+        // an exclusion is policy the reader chose and can leave alone, an
+        // unreadable entry is a fault to go and fix. Children are
+        // name-sorted, so without this rule an ignored file beginning with
+        // "a" hides the broken one two directories down.
+        let (example, reason) = faults.first().or_else(|| found.first())?.clone();
+        Some(Unsynchronizable {
+            entries: found.len() as u64,
+            example,
+            reason,
+        })
+    }
+
     let side = |changes: &[Change]| -> ConflictSide {
         // The change at the conflict root itself describes the side; a
         // conflict rooted at a directory carries changes beneath it, and
@@ -1211,28 +1283,47 @@ fn conflict_detail(conflict: &crate::tree::Conflict) -> ConflictDetail {
             .find(|change| change.path == conflict.root)
             .or_else(|| changes.first())
             .and_then(|change| change.new.as_ref());
+        let blocking = unsynchronizable(changes);
         match node {
-            None => ConflictSide::default(),
+            None => ConflictSide {
+                unsynchronizable: blocking,
+                ..Default::default()
+            },
             Some(node) => match &node.content {
                 Content::File { metadata, .. } => ConflictSide {
                     present: true,
                     kind: "file".into(),
                     size: metadata.size,
                     mtime_seconds: metadata.mtime_seconds,
+                    unsynchronizable: blocking,
                 },
                 Content::Directory(_) => ConflictSide {
                     present: true,
                     kind: "directory".into(),
+                    unsynchronizable: blocking,
                     ..Default::default()
                 },
                 Content::Symlink { .. } => ConflictSide {
                     present: true,
                     kind: "symlink".into(),
+                    unsynchronizable: blocking,
                     ..Default::default()
                 },
-                _ => ConflictSide {
+                // Named for what it is rather than as "other". These are
+                // the two ways content exists without being synchronized,
+                // and they call for opposite responses: an ignore rule is
+                // policy the reader chose, an unreadable entry is a fault
+                // to go and fix.
+                Content::Untracked => ConflictSide {
                     present: true,
-                    kind: "other".into(),
+                    kind: "excluded from synchronization".into(),
+                    unsynchronizable: blocking,
+                    ..Default::default()
+                },
+                Content::Problematic { .. } => ConflictSide {
+                    present: true,
+                    kind: "unreadable".into(),
+                    unsynchronizable: blocking,
                     ..Default::default()
                 },
             },
@@ -1477,6 +1568,51 @@ pub fn read_status(state_root: &Path, identifier: &str) -> Result<Option<Session
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The entry that blocks a conflict is almost never the entry the
+    /// conflict is named after: a directory is refused because of one file
+    /// somewhere beneath it. Looking only at the root therefore reports
+    /// two ordinary sides and no cause at all.
+    #[test]
+    fn a_conflict_names_the_content_that_cannot_be_carried() {
+        use crate::tree::{Change, Conflict, Content, Node};
+        let unreadable = Node {
+            name: "socket".into(),
+            content: Content::Problematic {
+                message: "unsupported entry type".into(),
+            },
+        };
+        let excluded = Node {
+            name: "big.bin".into(),
+            content: Content::Untracked,
+        };
+        let tree = Node::directory(
+            "happy",
+            vec![Node::directory("packages", vec![unreadable]), excluded],
+        );
+        let detail = conflict_detail(&Conflict {
+            root: "happy".into(),
+            alpha_changes: Vec::new(),
+            beta_changes: vec![Change {
+                path: "happy".into(),
+                old: None,
+                new: Some(tree),
+            }],
+        });
+
+        // The side is still a directory; what it *holds* is the diagnosis.
+        assert_eq!(detail.beta.kind, "directory");
+        let blocking = detail.beta.unsynchronizable.expect("a cause is recorded");
+        assert_eq!(blocking.entries, 2);
+        // `big.bin` sorts first and would be found first, but it is merely
+        // excluded. The unreadable entry is the one worth naming.
+        assert_eq!(blocking.example, "happy/packages/socket");
+        assert_eq!(blocking.reason, "unsupported entry type");
+
+        // A side with nothing of the kind says nothing, rather than
+        // reporting an empty cause.
+        assert!(detail.alpha.unsynchronizable.is_none());
+    }
 
     /// A list that has not changed is not written out again.
     ///

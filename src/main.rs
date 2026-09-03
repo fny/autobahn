@@ -1401,6 +1401,26 @@ fn run_issues(
                 };
                 println!("        alpha  {}", describe(&detail.alpha));
                 println!("        {:<6} {}", plan.host, describe(&detail.beta));
+                // Why it is a conflict at all. Two sides that merely
+                // differ are reconciled; a side holding content that was
+                // never scanned is not overwritten, and that refusal is
+                // what the reader is actually looking at. Without it the
+                // listing shows a difference and no reason for the
+                // stalemate.
+                for (side, name) in [(&detail.alpha, "alpha"), (&detail.beta, &plan.host)] {
+                    let Some(blocking) = &side.unsynchronizable else {
+                        continue;
+                    };
+                    let count = match blocking.entries {
+                        1 => "1 entry".to_owned(),
+                        many => format!("{many} entries"),
+                    };
+                    println!(
+                        "        {name} holds {count} synchronization cannot carry, \
+                         so neither side is overwritten"
+                    );
+                    println!("          {} — {}", blocking.example, blocking.reason);
+                }
             }
         }
         if !selected.is_empty() {

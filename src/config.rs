@@ -84,20 +84,15 @@ pub struct Config {
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Alerts {
-    /// Run for any alert. The catchall over every state below.
+    /// Run when something needs a person. The only hook.
+    ///
+    /// There were once six — one per state, plus one for the all-clear —
+    /// and the split earned nothing. Every state ends the same way, with
+    /// someone opening a terminal, so the hook that told you *which* state
+    /// only moved the branching from the command into the config. What
+    /// state it is belongs in the message, and `AUTOBAHN_SUMMARY` carries
+    /// it.
     pub on_alert: Option<String>,
-    /// Run when the last alert clears.
-    pub on_recovered: Option<String>,
-    /// Run when both sides changed the same path.
-    pub on_conflicts: Option<String>,
-    /// Run when paths could not be read or written.
-    pub on_blocked: Option<String>,
-    /// Run on a safety halt.
-    pub on_halted: Option<String>,
-    /// Run when a destination cannot be reached.
-    pub on_unreachable: Option<String>,
-    /// Run when a cycle failed for some other reason.
-    pub on_errored: Option<String>,
     /// How long a condition must hold before it counts. Short enough to be
     /// timely, long enough that a blip is never mentioned.
     pub alert_after: Option<DurationSpec>,
@@ -387,19 +382,6 @@ impl Config {
                 .map_err(|message| anyhow!("invalid configuration:\n  alerts.{what}: {message}")),
         };
 
-        let mut on_each = BTreeMap::new();
-        for (alert, command) in [
-            (Alert::Conflicts, &alerts.on_conflicts),
-            (Alert::Blocked, &alerts.on_blocked),
-            (Alert::Halted, &alerts.on_halted),
-            (Alert::Unreachable, &alerts.on_unreachable),
-            (Alert::Errored, &alerts.on_errored),
-        ] {
-            if let Some(command) = command {
-                on_each.insert(alert, command.clone());
-            }
-        }
-
         let mut after = BTreeMap::new();
         for (name, spec) in &alerts.after {
             let Some(alert) = Alert::parse(name) else {
@@ -420,8 +402,6 @@ impl Config {
 
         Ok(crate::alerts::AlertPlan {
             on_alert: alerts.on_alert.clone(),
-            on_recovered: alerts.on_recovered.clone(),
-            on_each,
             after,
             default_after: duration(&alerts.alert_after, "alert_after", DEFAULT_ALERT_AFTER)?,
             repeat_after: duration(&alerts.repeat_after, "repeat_after", Duration::ZERO)?,

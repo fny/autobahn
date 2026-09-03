@@ -1412,7 +1412,6 @@ fn watch_alerts(
                         .collect::<Vec<_>>()
                         .join(","),
                 ),
-                Fire::Recovered => ("all clear".to_owned(), 0, String::new()),
             };
             let environment = vec![
                 ("AUTOBAHN_SUMMARY".to_owned(), summary),
@@ -1421,7 +1420,6 @@ fn watch_alerts(
                 (
                     "AUTOBAHN_EVENT".to_owned(),
                     match fire {
-                        Fire::Recovered => "recovered".to_owned(),
                         Fire::Alert { repeat: true, .. } => "repeat".to_owned(),
                         Fire::Alert { .. } => "alert".to_owned(),
                     },

@@ -82,12 +82,8 @@ impl Alert {
 /// The resolved alert configuration.
 #[derive(Clone, Debug, Default)]
 pub struct AlertPlan {
-    /// Run for any alert. The catchall.
+    /// Run when something needs a person. The only hook.
     pub on_alert: Option<String>,
-    /// Run when the last alert clears.
-    pub on_recovered: Option<String>,
-    /// Run for one specific alert, in addition to the catchall.
-    pub on_each: BTreeMap<Alert, String>,
     /// How long a condition must hold before it counts, per alert.
     pub after: BTreeMap<Alert, Duration>,
     /// How long a condition must hold before it counts, for alerts with no
@@ -105,7 +101,7 @@ impl AlertPlan {
     /// Whether anything is configured to run at all. Nothing is observed,
     /// timed, or recorded when nothing would come of it.
     pub fn is_configured(&self) -> bool {
-        self.on_alert.is_some() || self.on_recovered.is_some() || !self.on_each.is_empty()
+        self.on_alert.is_some()
     }
 
     /// How long this alert must hold before it counts.
@@ -146,8 +142,6 @@ pub enum Fire {
         /// A repeat of an unchanged set rather than news.
         repeat: bool,
     },
-    /// Everything that was alerting has cleared.
-    Recovered,
 }
 
 /// Decides when to fire, from what it is shown.
@@ -227,11 +221,13 @@ impl Alerter {
         }
 
         if confirmed.is_empty() {
-            // Everything cleared. Only worth saying if something was said.
-            let had = !self.fired.is_empty();
+            // Everything cleared. The state is reset so the next alert
+            // fires, and nothing is said: an all-clear is a notification
+            // that asks for nothing, and a stream of them is what teaches
+            // someone to stop reading the ones that do.
             self.fired.clear();
             self.fired_at = None;
-            return had.then_some(Fire::Recovered);
+            return None;
         }
 
         self.fired = confirmed.clone();
@@ -260,23 +256,11 @@ impl Alerter {
         }
     }
 
-    /// The commands a firing should run: the catchall, then each specific
-    /// hook whose alert is present. Both fire — `on_alert` is a superset,
-    /// not an alternative — so a configuration naming only specific hooks
-    /// gets only those.
-    pub fn commands(&self, fire: &Fire) -> Vec<String> {
-        match fire {
-            Fire::Recovered => self.plan.on_recovered.iter().cloned().collect(),
-            Fire::Alert { alerts, .. } => {
-                let mut commands: Vec<String> = self.plan.on_alert.iter().cloned().collect();
-                for alert in alerts {
-                    if let Some(command) = self.plan.on_each.get(alert) {
-                        commands.push(command.clone());
-                    }
-                }
-                commands
-            }
-        }
+    /// The command a firing should run. One hook, so at most one command;
+    /// which states are alerting is in the summary the hook is handed, not
+    /// in which hook is chosen.
+    pub fn commands(&self, _fire: &Fire) -> Vec<String> {
+        self.plan.on_alert.iter().cloned().collect()
     }
 }
 
@@ -386,7 +370,6 @@ mod tests {
     fn plan() -> AlertPlan {
         AlertPlan {
             on_alert: Some("notify".into()),
-            on_recovered: Some("clear".into()),
             default_after: Duration::from_secs(30),
             timeout: Duration::from_secs(10),
             ..AlertPlan::default()
@@ -544,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_announced_once_and_only_if_something_was() {
+    fn clearing_says_nothing_but_does_reset_the_state() {
         let mut alerter = Alerter::new(plan());
         let start = Instant::now();
         let down = [session("a", &[Alert::Conflicts])];
@@ -554,12 +537,16 @@ mod tests {
         assert!(alerter
             .observe(&down, start + Duration::from_secs(31))
             .is_some());
-        assert_eq!(
-            alerter.observe(&up, start + Duration::from_secs(40)),
-            Some(Fire::Recovered)
-        );
-        // Once. Staying healthy is not repeatedly good news.
+        // Clearing says nothing. An all-clear asks for no action, and a
+        // stream of notifications that ask for nothing is what teaches
+        // someone to stop reading the ones that do.
+        assert_eq!(alerter.observe(&up, start + Duration::from_secs(40)), None);
         assert_eq!(alerter.observe(&up, start + Duration::from_secs(50)), None);
+        // But the state is reset, so the next alert is news again.
+        alerter.observe(&down, start + Duration::from_secs(60));
+        assert!(alerter
+            .observe(&down, start + Duration::from_secs(91))
+            .is_some());
     }
 
     #[test]
@@ -639,24 +626,21 @@ mod tests {
     }
 
     #[test]
-    fn the_catchall_and_the_specific_hooks_both_fire() {
-        let alerter = Alerter::new(AlertPlan {
-            on_each: BTreeMap::from([
-                (Alert::Halted, "page".to_owned()),
-                (Alert::Conflicts, "mention".to_owned()),
-            ]),
-            ..plan()
-        });
-        let fire = Fire::Alert {
+    fn one_hook_runs_whatever_the_alert_is() {
+        let alerter = Alerter::new(plan());
+        let fire = |alert| Fire::Alert {
             summary: String::new(),
-            alerts: BTreeSet::from([Alert::Halted]),
+            alerts: BTreeSet::from([alert]),
             sessions: 1,
             repeat: false,
         };
-        // The catchall, plus the hook for the alert that is present — and
-        // not the one for the alert that is not.
-        assert_eq!(alerter.commands(&fire), vec!["notify", "page"]);
-        assert_eq!(alerter.commands(&Fire::Recovered), vec!["clear"]);
+        // Which states are alerting is in the summary the hook is handed,
+        // not in which hook is chosen. There is only the one.
+        assert_eq!(alerter.commands(&fire(Alert::Halted)), vec!["notify"]);
+        assert_eq!(alerter.commands(&fire(Alert::Conflicts)), vec!["notify"]);
+        // And nothing at all when none is configured.
+        let quiet = Alerter::new(AlertPlan::default());
+        assert!(quiet.commands(&fire(Alert::Halted)).is_empty());
     }
 
     #[test]

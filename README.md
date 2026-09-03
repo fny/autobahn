@@ -242,26 +242,31 @@ nobody told. `[alerts]` runs a command when that happens:
 
 ```toml
 [alerts]
-on_alert     = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
-on_recovered = "terminal-notifier -title autobahn -message 'all clear'"
-alert_after  = "30s"
+on_alert    = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
+alert_after = "30s"
 
 [alerts.after]
 unreachable = "5m"    # a sleeping laptop deserves patience
 halted      = "0s"    # a safety halt does not
 ```
 
-`on_alert` is the catchall over every state above; `on_conflicts`,
-`on_blocked`, `on_halted`, `on_unreachable` and `on_errored` name one each
-and fire in addition to it. Three rules make it usable rather than
-maddening:
+`on_alert` is the only hook. Which states are alerting is in the summary
+it is handed, not in which hook is chosen — a hook per state only moved
+the branching out of the command and into the config, and every state
+ends the same way, with someone opening a terminal. Four rules make it
+usable rather than maddening:
 
 - **Nothing runs while everything is healthy.** Silence is the normal
   state.
+- **Nothing runs when it clears, either.** An all-clear asks for no
+  action, and a stream of notifications that ask for nothing is what
+  teaches you to stop reading the ones that do.
 - **A condition must hold for `alert_after` before it counts.** A wifi
   handover that takes every session unreachable for eight seconds is never
   mentioned — it fixed itself — and a sleeping laptop produces one
-  notification rather than fifteen.
+  notification rather than fifteen. `[alerts.after]` tunes that per state,
+  which is timing rather than routing: a blip means something different
+  for a sleeping laptop than for a safety halt.
 - **An alert fires when the set of sessions in trouble changes**, never on
   repetition. `repeat_after` opts into a nag; it is off by default.
 
@@ -546,9 +551,9 @@ reading overlapping trees are legal — nothing writes the shared region
 not.
 
 **Unless the outer session ignores the inner root.** Then they do not
-overlap at all: the outer never scans, writes, or records anything
-beneath that path. This is how you synchronize a project and ship its
-build output somewhere else:
+overlap at all: the outer never scans, records, or writes into that
+path. This is how you synchronize a project and ship its build output
+somewhere else:
 
 ```toml
 [groups.project]
@@ -566,6 +571,20 @@ betas = ["web.example.com:/srv/www"]
 Both run side by side: the first destination receives the project
 without `dist`, the second receives `dist`. Remove the `ignores` line
 and the configuration is refused again.
+
+One thing an ignore does *not* protect against, and it is worth knowing
+before you arrange it this way: **deleting the directory above an
+ignored path takes the ignored path with it.** If `~/project` is
+deleted, `dist` goes too, and the inner session then finds its root
+missing. An ignore says which files synchronization carries, not which
+files exist, and a deletion is an instruction about the directory —
+obeying it halfway would leave a tree that is neither deleted nor
+synchronized and that nothing can ever clear.
+
+The inner session stops there rather than passing the loss on: a
+missing source root is an error, so `web.example.com` keeps its copy
+and waits for a person. That is the protection — not that the inner
+tree cannot be deleted, but that its deletion never travels.
 
 The check sees only one configuration load. Two autobahn processes with
 separate config files can still nest their endpoints, because neither
@@ -636,7 +655,14 @@ automatically, on first contact.
 - A corrupt ancestor is an error, not a silent reset (a reset would
   resurrect deletions).
 - A missing *source* root is an error, not an empty source (a typo'd path
-  plus a mirroring mode must not empty the destination).
+  plus a mirroring mode must not empty the destination). This is also what
+  stops a deletion from travelling through a nested session whose root was
+  inside an ignored path.
+- Ignored content is never **overwritten** — "do not synchronize this"
+  cannot become "replace it with the peer's copy" — but it is removed
+  along with a directory that is deleted around it. Content that could not
+  be *read* blocks even that: nobody has seen what is there, so removing
+  the directory around it is not a decision anyone made.
 
 ## Scope
 

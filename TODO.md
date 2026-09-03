@@ -64,7 +64,11 @@ committed.
   must survive incremental scans (which adopt subtrees without visiting
   them) or it silently empties; A/B the scan hot path before commit.
 
-- [ ] **`conflicts` says "no conflicts" for a halted session.** Structural:
+- [x] **`conflicts` says "no conflicts" for a halted session.** Done, as
+  part of `issues`: a failed session is listed by its state, and a filter
+  that excludes every path does not exclude it.
+
+- [ ] ~~superseded~~ **`conflicts` says "no conflicts" for a halted session.** Structural:
   the cycle bails before `report.conflicts` is assigned, so a halted
   session records zero conflicts, and `run_conflicts` skips sessions with
   an empty list. A group that has not synchronized in a day reports an

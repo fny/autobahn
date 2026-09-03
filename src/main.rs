@@ -258,8 +258,10 @@ enum Command {
     /// Stop and start the login service — after a configuration edit, or an
     /// upgrade.
     Restart,
-    /// List every conflict, with what each side holds and how to resolve it.
-    Conflicts {
+    /// Everything that needs you: conflicts, blocked paths, and halts,
+    /// grouped by cause with the command that clears each one.
+    #[command(alias = "conflicts")]
+    Issues {
         /// A group name, or a folder (`.`, an absolute path, a `~` path)
         /// inside a synchronized root. Omit for every group.
         selector: Option<String>,
@@ -480,7 +482,7 @@ fn main() {
             state_root,
             "reset",
         ),
-        Command::Conflicts {
+        Command::Issues {
             selector,
             path,
             host,
@@ -489,7 +491,7 @@ fn main() {
             json,
             config,
             state_root,
-        } => run_conflicts(
+        } => run_issues(
             config, state_root, selector, path, host, depth, filter, json,
         ),
         Command::Mi { config, state_root } => run_shop(config, state_root),
@@ -1077,9 +1079,135 @@ fn relative_path(selection: &Selection, explicit: Option<String>) -> Result<Stri
     }
 }
 
-/// Lists every conflict with what each side holds.
+/// The path inside a recorded blocked entry.
+///
+/// The entries are written as `side path: message` by the supervisor.
+/// Splitting them back apart is what lets the listing group by cause and
+/// scope by path.
+fn blocked_path(entry: &str) -> Option<&str> {
+    let rest = entry.split_once(' ')?.1;
+    Some(match rest.find(": ") {
+        Some(end) => &rest[..end],
+        None => rest,
+    })
+}
+
+/// The side, path and cause of a recorded blocked entry.
+///
+/// The cause is the innermost message. The wrapping context repeats the
+/// file's own path, so twenty files that failed for one reason would
+/// otherwise read as twenty separate reasons.
+fn blocked_parts(entry: &str) -> (&str, &str, &str) {
+    let (side, rest) = entry.split_once(' ').unwrap_or(("", entry));
+    let (path, message) = match rest.find(": ") {
+        Some(end) => (&rest[..end], &rest[end + 2..]),
+        None => (rest, ""),
+    };
+    let cause = message.rsplit(": ").next().unwrap_or(message);
+    (side, path, cause)
+}
+
+/// Groups paths by where they are, and names the directory each group
+/// shares.
+///
+/// A single cause can cover unrelated places — one permission problem in
+/// one tree and another somewhere else — and those have nothing in common
+/// but the reason. Clustering by the first segment separates them, and
+/// each cluster then names the deepest directory all of its paths share.
+fn clusters(paths: &[&str]) -> Vec<(String, usize)> {
+    let mut grouped: Vec<(&str, Vec<&str>)> = Vec::new();
+    for path in paths {
+        let head = path.split('/').next().unwrap_or(path);
+        match grouped.iter_mut().find(|(other, _)| *other == head) {
+            Some((_, members)) => members.push(path),
+            None => grouped.push((head, vec![path])),
+        }
+    }
+    grouped
+        .into_iter()
+        .map(|(head, members)| {
+            let prefix = common_prefix(&members);
+            let prefix = if prefix.is_empty() {
+                head.to_owned()
+            } else {
+                prefix
+            };
+            (prefix, members.len())
+        })
+        .collect()
+}
+
+/// The longest directory prefix shared by every path.
+fn common_prefix(paths: &[&str]) -> String {
+    let Some(first) = paths.first() else {
+        return String::new();
+    };
+    let mut prefix: Vec<&str> = first.split('/').collect();
+    // A file name is never part of the shared directory.
+    prefix.pop();
+    for path in &paths[1..] {
+        let segments: Vec<&str> = path.split('/').collect();
+        let shared = prefix
+            .iter()
+            .zip(segments.iter())
+            .take_while(|(left, right)| left == right)
+            .count();
+        prefix.truncate(shared);
+    }
+    prefix.join("/")
+}
+
+/// What to do about a group of blocked paths.
+///
+/// Specific where it can be. A permission problem on a remote destination
+/// gets the `ssh` and the path filled in, because "check the permissions"
+/// is advice and this is a command.
+fn blocked_fix(
+    side: &str,
+    cause: &str,
+    prefix: &str,
+    plan: &autobahn::config::SessionPlan,
+) -> Vec<String> {
+    let mut fixes = Vec::new();
+    let where_ = if prefix.is_empty() { "." } else { prefix };
+    if cause.contains("Permission denied") {
+        match side {
+            "beta" => {
+                let spec = plan.beta_spec();
+                match spec.split_once(':') {
+                    Some((destination, root)) => {
+                        let user = destination.split('@').next().unwrap_or(destination);
+                        fixes.push(format!(
+                            "ssh {destination} 'sudo chown -R {user} {root}/{where_}'"
+                        ));
+                    }
+                    None => fixes.push(format!("sudo chown -R \"$(whoami)\" {spec}/{where_}")),
+                }
+            }
+            _ => fixes.push(format!(
+                "sudo chown -R \"$(whoami)\" {}/{where_}",
+                plan.alpha_spec
+            )),
+        }
+        // An ignore is only the answer for something generated. The
+        // deepest hidden directory in the path is that; the last segment
+        // is often a version ("0.9.10") or a real folder ("static"), and
+        // ignoring either would be worse than the permissions.
+        if let Some(name) = prefix.split('/').rev().find(|name| name.starts_with('.')) {
+            fixes.push(format!("or add \"{name}\" to the group's ignores"));
+        }
+    } else if cause.contains("refusing to create over existing content") {
+        fixes.push(format!(
+            "autobahn diff {} <path>, then remove or rename one side",
+            plan.group
+        ));
+    }
+    fixes
+}
+
+/// Lists everything that needs a person, grouped by cause.
 #[allow(clippy::too_many_arguments)]
-fn run_conflicts(
+fn run_issues(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
     selector: Option<String>,
@@ -1129,13 +1257,21 @@ fn run_conflicts(
         let mut report = autobahn::supervisor::status_report(&selection.plans, &state_root);
         for group in &mut report.groups {
             for session in &mut group.sessions {
-                if let Some(matches) = &matches {
-                    session.conflicts.retain(|conflict| matches(&conflict.path));
-                }
+                let keep = |path: &str| {
+                    within(path) && matches.as_ref().is_none_or(|matches| matches(path))
+                };
+                session.conflicts.retain(|conflict| keep(&conflict.path));
+                session
+                    .blocked
+                    .retain(|blocked| keep(blocked_path(blocked).unwrap_or(blocked)));
             }
-            group
-                .sessions
-                .retain(|session| !session.conflicts.is_empty());
+            // A session that failed has no lists to show and still needs
+            // someone, so its state is what keeps it here.
+            group.sessions.retain(|session| {
+                !session.conflicts.is_empty()
+                    || !session.blocked.is_empty()
+                    || matches!(session.state.as_str(), "halted" | "unreachable" | "errored")
+            });
         }
         report.groups.retain(|group| !group.sessions.is_empty());
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -1148,15 +1284,20 @@ fn run_conflicts(
         let Some(status) = read_status(&state_root, &plan.identifier())? else {
             continue;
         };
-        if status.conflicts.is_empty() {
-            continue;
-        }
-        let selected: Vec<&String> = status
-            .conflicts
+        let keep =
+            |path: &str| within(path) && matches.as_ref().is_none_or(|matches| matches(path));
+        let selected: Vec<&String> = status.conflicts.iter().filter(|path| keep(path)).collect();
+        let blocked: Vec<&String> = status
+            .blocked
             .iter()
-            .filter(|path| within(path) && matches.as_ref().is_none_or(|matches| matches(path)))
+            .filter(|entry| keep(blocked_path(entry).unwrap_or(entry)))
             .collect();
-        if selected.is_empty() {
+        // A failure has no list of its own and still needs someone. Its
+        // state is what puts it here, and a filter that excludes every
+        // path does not exclude it.
+        let state = autobahn::supervisor::classify_state(&status);
+        let failed = matches!(state.as_str(), "halted" | "unreachable" | "errored");
+        if selected.is_empty() && blocked.is_empty() && !failed {
             continue;
         }
         // The group's heading waits until something under it survived the
@@ -1172,7 +1313,31 @@ fn run_conflicts(
             );
         }
         println!("  {}", plan.beta_spec());
-        total += selected.len();
+        total += selected.len() + blocked.len();
+
+        if failed {
+            total += 1;
+            println!("\n    \x1b[31m{state}\x1b[0m");
+            if let Some(error) = &status.error {
+                println!("      {}", error.trim_start_matches("halted: "));
+            }
+            if state == "halted" {
+                println!("      fix: make the two sides agree, then it resumes");
+            }
+        }
+
+        if selected.is_empty() && blocked.is_empty() {
+            continue;
+        }
+        if !selected.is_empty() {
+            println!(
+                "\n    \x1b[33m{}\x1b[0m",
+                match selected.len() {
+                    1 => "1 conflict".to_owned(),
+                    many => format!("{many} conflicts"),
+                }
+            );
+        }
 
         // Rolled up, a conflict list becomes a map of where the trouble
         // is: seven hundred paths under one folder are one fact about that
@@ -1193,12 +1358,12 @@ fn run_conflicts(
             continue;
         }
 
-        for path in selected {
+        for path in &selected {
             let detail = status
                 .conflict_details
                 .iter()
-                .find(|detail| &detail.path == path);
-            println!("    {path}");
+                .find(|detail| &&detail.path == path);
+            println!("      {path}");
             if let Some(detail) = detail {
                 let describe = |side: &autobahn::supervisor::ConflictSide| -> String {
                     if !side.present {
@@ -1213,20 +1378,76 @@ fn run_conflicts(
                         kind => kind.to_owned(),
                     }
                 };
-                println!("      alpha  {}", describe(&detail.alpha));
-                println!("      {:<6} {}", plan.host, describe(&detail.beta));
+                println!("        alpha  {}", describe(&detail.alpha));
+                println!("        {:<6} {}", plan.host, describe(&detail.beta));
             }
         }
-        println!(
-            "    → autobahn resolve {} <path> --keep alpha|{}|both",
-            plan.group, plan.host
-        );
+        if !selected.is_empty() {
+            let where_ = match &scope {
+                Some(scope) => scope.clone(),
+                None if selected.len() == 1 => selected[0].clone(),
+                None => "<path>".to_owned(),
+            };
+            println!(
+                "      fix: autobahn resolve {} {where_} --keep alpha|{}|both",
+                plan.group, plan.host
+            );
+        }
+
+        // Blocked paths, grouped by what stopped them. Twenty files under
+        // one directory that all failed for one reason are one problem
+        // with one fix, and listing them separately hides that.
+        let mut causes: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+        for entry in &blocked {
+            let (side, path, cause) = blocked_parts(entry);
+            match causes
+                .iter_mut()
+                .find(|(other_side, other_cause, _)| *other_side == side && *other_cause == cause)
+            {
+                Some((_, _, paths)) => paths.push(path),
+                None => causes.push((side, cause, vec![path])),
+            }
+        }
+        for (side, cause, paths) in &causes {
+            println!(
+                "\n    \x1b[33m{} on {side}\x1b[0m \x1b[2m— {cause}\x1b[0m",
+                match paths.len() {
+                    1 => "1 blocked".to_owned(),
+                    many => format!("{many} blocked"),
+                }
+            );
+            // One cause can still cover unrelated places. These twenty
+            // are one permission problem in `azure` and another in
+            // `arcturus`, and their shared prefix is nothing at all — so
+            // the paths are clustered by where they are before the
+            // directory they share is named.
+            for (prefix, count) in clusters(paths) {
+                match (count, prefix.as_str()) {
+                    (1, _) => println!(
+                        "      {}",
+                        paths
+                            .iter()
+                            .find(|path| path.starts_with(&prefix))
+                            .copied()
+                            .unwrap_or(&prefix)
+                    ),
+                    (count, "") => println!("      {count} paths"),
+                    (count, prefix) => println!("      {count} under {prefix}/"),
+                }
+                for (index, fix) in blocked_fix(side, cause, &prefix, plan).iter().enumerate() {
+                    match index {
+                        0 => println!("        fix: {fix}"),
+                        _ => println!("             {fix}"),
+                    }
+                }
+            }
+        }
     }
     if total == 0 {
         match (&scope, &filter) {
-            (Some(scope), _) => println!("no conflicts under {scope}"),
-            (None, Some(pattern)) => println!("no conflicts match {pattern:?}"),
-            (None, None) => println!("no conflicts"),
+            (Some(scope), _) => println!("nothing needs you under {scope}"),
+            (None, Some(pattern)) => println!("nothing needs you matching {pattern:?}"),
+            (None, None) => println!("nothing needs you"),
         }
     }
     Ok(())
@@ -2369,7 +2590,10 @@ fn print_report(report: &CycleReport) {
 
 #[cfg(test)]
 mod tests {
-    use super::{conflict_filter, format_estimate, parse_remote, render_status_entry, roll_up};
+    use super::{
+        blocked_fix, blocked_parts, blocked_path, clusters, common_prefix, conflict_filter,
+        format_estimate, parse_remote, render_status_entry, roll_up,
+    };
 
     #[test]
     fn remote_specification_parsing() {
@@ -2604,5 +2828,98 @@ mod tests {
         // And a path with nothing recorded expands to nothing, which is
         // what sends the command back to taking the path at its word.
         assert!(under("bench").is_empty());
+    }
+
+    /// Twenty blocked paths are not twenty problems.
+    ///
+    /// The recorded entry carries the failing file's own path inside its
+    /// message, so the messages all differ. The innermost cause is what
+    /// they share, and that is what turns twenty lines into one.
+    #[test]
+    fn blocked_entries_are_read_back_into_side_path_and_cause() {
+        let entry = "beta azure/backend/.ruff_cache/0.9.10/104972: unable to read file: \
+                     unable to open /home/ubuntu/Workspace/azure/backend/.ruff_cache/0.9.10/104972: \
+                     Permission denied (os error 13)";
+        let (side, path, cause) = blocked_parts(entry);
+        assert_eq!(side, "beta");
+        assert_eq!(path, "azure/backend/.ruff_cache/0.9.10/104972");
+        assert_eq!(cause, "Permission denied (os error 13)");
+        assert_eq!(blocked_path(entry), Some(path));
+
+        // A message with no wrapping context is its own cause.
+        let (side, path, cause) =
+            blocked_parts("alpha notes.txt: refusing to create over existing content");
+        assert_eq!((side, path), ("alpha", "notes.txt"));
+        assert_eq!(cause, "refusing to create over existing content");
+    }
+
+    /// One cause can cover unrelated places, and those share nothing but
+    /// the reason.
+    #[test]
+    fn paths_cluster_by_where_they_are_before_a_directory_is_named() {
+        // The real shape: sixteen under one tree, four under another, and
+        // no prefix in common. Naming the shared directory of all twenty
+        // would name the root, and the fix would be "chown everything".
+        let mut paths: Vec<&str> = vec![
+            "azure/backend/.ruff_cache/0.9.10/a",
+            "azure/backend/.ruff_cache/0.9.10/b",
+            "arcturus/frontend/static/images/one.png",
+            "arcturus/frontend/static/logos/two.svg",
+        ];
+        assert_eq!(common_prefix(&paths), "", "nothing is shared by all four");
+        assert_eq!(
+            clusters(&paths),
+            vec![
+                ("azure/backend/.ruff_cache/0.9.10".to_owned(), 2),
+                ("arcturus/frontend/static".to_owned(), 2),
+            ]
+        );
+
+        // A single path clusters to its own directory.
+        paths.truncate(1);
+        assert_eq!(
+            clusters(&paths),
+            vec![("azure/backend/.ruff_cache/0.9.10".to_owned(), 1)]
+        );
+    }
+
+    /// The ignore suggestion has to name something generated.
+    #[test]
+    fn an_ignore_is_suggested_only_for_a_generated_directory() {
+        let plan = |group: &str| -> autobahn::config::SessionPlan {
+            let text = format!(
+                "[groups.{group}]\nalpha = \"/tmp/a\"\nmode = \"two-way-conflict\"\nbetas = [\"u@h:/tmp/b\"]\n"
+            );
+            toml::from_str::<autobahn::config::Config>(&text)
+                .expect("parses")
+                .plans()
+                .expect("plans")
+                .remove(0)
+        };
+        let plan = plan("g");
+
+        // The last segment is a version. The generated directory is the
+        // hidden one above it, and that is what may be ignored.
+        let fixes = blocked_fix(
+            "beta",
+            "Permission denied (os error 13)",
+            "azure/backend/.ruff_cache/0.9.10",
+            &plan,
+        );
+        assert!(
+            fixes[0].starts_with("ssh u@h 'sudo chown -R u "),
+            "{fixes:?}"
+        );
+        assert!(fixes[1].contains("\".ruff_cache\""), "{fixes:?}");
+
+        // Nothing hidden in the path, so no ignore is offered: ignoring a
+        // real folder is worse than fixing its ownership.
+        let fixes = blocked_fix(
+            "beta",
+            "Permission denied (os error 13)",
+            "arcturus/frontend/static",
+            &plan,
+        );
+        assert_eq!(fixes.len(), 1, "{fixes:?}");
     }
 }

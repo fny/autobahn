@@ -175,8 +175,6 @@ autobahn verify project    # next cycle re-reads every byte, catching
                            # content whose metadata never moved
 autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
-
-autobahn mi                # the shop: watch it work, and clear the queue
 ```
 
 When a session has been working long enough that its silence would look
@@ -317,54 +315,6 @@ this as one versioned document, for scripts and user interfaces. Each
 session carries a `progress` object while a supervisor is running —
 `--filter` applies to the JSON too, while `--depth`, being a way of
 reading a list, does not.
-
-### The shop
-
-```sh
-autobahn mi
-```
-
-An easter egg that turned useful. Every session is an order, an order
-fills as its transfer does, and the shop is open when a supervisor
-answers and shuttered when none does. Every number on it is real — it
-reads the same `status --json` document as everything else.
-
-```
-  ╔══════════════════════════════════════════════════════════════╗
-  ║               🥖  A U T O B Á N H   M Ì  🥖                  ║
-  ║ ◉ OPEN                    15 orders · 1 filling · 3.4 MB/s   ║
-  ╚══════════════════════════════════════════════════════════════╝
-
-  ▸ voltai   → fny.voltai.party   🥖[▓▓▓▓▓░░░░░░░]  filling   1,204 of 8,530
-    vibe     → boite              🥖[▓▓▓▓▓▓▓▓▓▓▓▓]  disputed  2 waiting
-```
-
-**The counter** is the useful half. `⏎` on an order opens its issues as a
-tree — cause, then place, then path — and every level can be acted on, so
-one keypress settles a whole directory or a single file.
-
-```
-  ┌──────────────────────────────────────────────────────────────┐
-  │ the counter  voltai → fny.voltai.party            3 waiting  │
-  │ ▸ 1 conflict                        both sides changed these │
-  │ ▸ 1 blocked on alpha                       unicode collision │
-  │ ▾ 20 blocked on beta            Permission denied (os error) │
-  │   ▾ azure/backend/.ruff_cache/0.9.10/                     16 │
-  │       10497280429343070344                                   │
-  │   ▸ arcturus/frontend/apps/web/public/static/              4 │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-`↑↓` move, `⏎` or `→` opens a branch, `←` closes it and then the counter.
-On a conflict, `a` keeps alpha's version, `t` keeps that destination's,
-`b` keeps both — running the same `resolve` you would type, on whichever
-paths the selected level covers. Blocked paths autobahn cannot clear
-itself, since the commands are `sudo` over ssh and a password prompt has
-nowhere to appear, so `c` copies the fix to the clipboard instead. `f`
-rushes an order, and `q` closes the shop.
-
-Under the counter, the last few lines the supervisor wrote — the only
-view of the log there is.
 
 ### The menu bar app
 

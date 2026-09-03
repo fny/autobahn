@@ -1703,8 +1703,8 @@ fn node_at<'a>(
     Some(node)
 }
 
-/// The first entry at or beneath `node` that synchronization cannot carry,
-/// as a root-relative path and the reason, or `None` when there is none.
+/// The first entry at or beneath `node` that could not be *scanned*, as a
+/// root-relative path and the reason, or `None` when there is none.
 ///
 /// A transition refuses to remove such an entry — content reconciliation
 /// never scanned is content nobody decided to delete — and refuses
@@ -1718,7 +1718,12 @@ fn unsynchronizable_within(node: &autobahn::tree::Node, path: &str) -> Option<(S
             .iter()
             .find_map(|child| unsynchronizable_within(child, &path_join(path, &child.name))),
         Content::Problematic { message } => Some((path.to_owned(), message.clone())),
-        Content::Untracked => Some((path.to_owned(), "excluded from synchronization".to_owned())),
+        // Excluded content is deliberately *not* an obstacle, exactly as
+        // it is not one for an ordinary deletion: the removal leaves it
+        // where it is, and what remains holds nothing synchronization can
+        // see, so it becomes invisible and the conflict settles. Refusing
+        // here would make `resolve` stricter than the cycle it stands in
+        // for, which is the one thing it must never be.
         _ => None,
     }
 }
@@ -2070,9 +2075,20 @@ fn run_resolve(
                     blocked.push((path.clone(), side.clone(), example, reason));
                     continue;
                 }
+                // The *synchronizable* subtree, which is what the cycle
+                // would pass. An expectation is what the removal is
+                // permitted to take away, so handing it the raw scan would
+                // ask for the excluded entries too — and those are refused
+                // one by one, leaving the tree half-taken. Filtered, the
+                // removal takes what synchronization knows about and steps
+                // over the rest, exactly as an ordinary deletion does.
+                let Some(expectation) = node.synchronizable_subtree() else {
+                    // Nothing here is synchronization's to remove.
+                    continue;
+                };
                 removals.push(autobahn::tree::Change {
                     path: path.clone(),
-                    old: Some(node.clone()),
+                    old: Some(expectation),
                     new: None,
                 });
             }
@@ -2091,10 +2107,20 @@ fn run_resolve(
             for problem in &outcome.problems {
                 refused.push((problem.path.clone(), problem.message.clone()));
             }
+            // A removal succeeded when nothing synchronization knew about
+            // survived it. Usually that means the path is gone; where the
+            // tree held excluded entries the directory itself necessarily
+            // remains, holding only them, and it is then invisible — so
+            // the conflict is settled even though something is still on
+            // disk. Counting only outright disappearance reports "settled
+            // 0" for a resolution that fully worked.
             settled += outcome
                 .results
                 .iter()
-                .filter(|result| result.is_none())
+                .filter(|result| match result {
+                    None => true,
+                    Some(node) => node.children().is_empty(),
+                })
                 .count();
         }
     }

@@ -202,6 +202,31 @@ committed.
   expects. `issues` and the shop both print it, so the mislabel is
   visible. Worth finding out which change it is actually looking at.
 
+## Ignored content and deletions (2026-09-03)
+
+- [x] **A deletion could not propagate past ignored content.** Deleting a
+  directory holding a `.git` or a `node_modules` became a conflict that
+  no resolution could settle, which is to say most project directories
+  could never be deleted through synchronization at all. An ignore says
+  which files synchronization *carries*, not which files exist, so a
+  deletion now takes the tree whole. Measured: -5.3 ms of p50, no tail
+  stalls (an earlier design that left the ignored entries behind and hid
+  the leftover directory cost 6-9 s on two A/B legs in five, from a
+  tree-walk on the reconcile hot path).
+
+- [x] **The nested-sync exception.** An ignored path that is another
+  session's root is the one case where this costs something nobody
+  agreed to. No new machinery was needed: the second session finds its
+  root gone and stops, carrying nothing to its own peer. Covered by
+  `a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted`.
+
+- [ ] **That nested case reports as *errored*, not *halted*.** The
+  session stops and protects its peer, so the behaviour is right, but
+  `alpha root ... does not exist` is a plain error — so `on_error` fires
+  where `on_halt` belongs, and `status` says the wrong word. A vanished
+  root is the definition of a safety halt. Deciding this changes which
+  alert hook fires, so it is worth saying out loud before doing it.
+
 ## Carried over (not yet asked for, noted so they aren't lost)
 
 - [ ] 21 blocked paths on `fny.voltai.party` — root-owned

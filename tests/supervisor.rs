@@ -1429,13 +1429,131 @@ fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
     }
 }
 
-/// Retiring a side means deleting it, and a transition will not delete
-/// content reconciliation never scanned. It refuses bottom-up, so asking
-/// anyway strips everything around the excluded entry and leaves the
-/// conflict open — a half-deleted tree, which is worse than either
-/// outcome. So the refusal happens before anything is touched.
+/// Ignored content is invisible, so it must not stand in the way of an
+/// ordinary deletion. Nearly every project directory holds a `.git` or a
+/// `node_modules`, and while excluded content blocked deletions none of
+/// them could be deleted through synchronization at all: the deletion
+/// became a conflict that no resolution could settle.
 #[test]
-fn resolve_will_not_half_delete_a_tree_holding_excluded_content() {
+fn deleting_a_project_propagates_even_though_it_holds_ignored_content() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("b1");
+    write(&alpha, "seed", "seed");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[defaults]\nmode = \"two-way-conflict\"\nignores = [\".git\", \"node_modules\"]\n\
+             [groups.r]\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+    assert!(cli(&world, &config, &["sync"]).0);
+
+    write(&beta, "project/.git/HEAD", "ref");
+    write(&beta, "project/node_modules/dep.js", "dep");
+    write(&beta, "project/src/main.rs", "fn main() {}");
+    cli(&world, &config, &["sync"]);
+    assert_eq!(read(&alpha, "project/src/main.rs"), "fn main() {}");
+    assert!(!alpha.join("project/.git").exists(), "ignored, so not sent");
+
+    fs::remove_dir_all(alpha.join("project")).unwrap();
+    let (_, first) = cli(&world, &config, &["sync"]);
+
+    // The whole tree goes, ignored content included. An ignore says which
+    // files synchronization *carries*, not which files exist; deleting a
+    // directory is an instruction about the directory, and taking the
+    // source while leaving the `.git` and the `node_modules` obeys
+    // neither reading — the tree is not deleted, and what stays is litter
+    // synchronization can never clear.
+    assert!(
+        !beta.join("project").exists(),
+        "the tree evaporated: {first}"
+    );
+
+    // And nothing is reported as an obstacle on the way.
+    assert!(!first.contains("blocked"), "{first}");
+
+    for _ in 0..3 {
+        let (_, text) = cli(&world, &config, &["sync"]);
+        assert!(text.contains("0 change(s) to alpha"), "quiet: {text}");
+        assert!(text.contains("0 change(s) to beta"), "quiet: {text}");
+    }
+    let (_, issues) = cli(&world, &config, &["conflicts"]);
+    assert!(issues.contains("nothing needs you"), "{issues}");
+}
+
+/// The one case where deleting an ignored path costs something nobody
+/// agreed to: the ignored path is *another session's root*. Group A never
+/// looked inside it, so its deletion takes the tree whole — and the second
+/// session then finds its root gone.
+///
+/// It must stop there. The copy inside group A's tree is the deletion that
+/// was asked for; the copy on the far side of the nested session is not,
+/// and no session may carry a loss it did not originate.
+#[test]
+fn a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted() {
+    let world = World::new();
+    let outer_alpha = world.directory("outer-alpha");
+    let outer_beta = world.directory("outer-beta");
+    let inner_beta = world.directory("inner-beta");
+
+    let outer = world.path("outer.toml");
+    fs::write(
+        &outer,
+        format!(
+            "[groups.outer]\nmode = \"two-way-conflict\"\nignores = [\"nested\"]\n\
+             alpha = \"{}\"\nbetas = [\"{}\"]\n",
+            outer_alpha.display(),
+            outer_beta.display()
+        ),
+    )
+    .unwrap();
+    // The inner session's root lives inside the outer session's ignored
+    // path, which is the only reason the outer session may delete it.
+    let inner = world.path("inner.toml");
+    fs::write(
+        &inner,
+        format!(
+            "[groups.inner]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            outer_beta.join("proj/nested").display(),
+            inner_beta.display()
+        ),
+    )
+    .unwrap();
+
+    // A sibling, so deleting `proj` is not also emptying the root — that
+    // trips a different guard and would prove nothing about this one.
+    write(&outer_alpha, "other.txt", "keep");
+    write(&outer_alpha, "proj/src/main.rs", "code");
+    assert!(cli(&world, &outer, &["sync"]).0);
+    write(&outer_beta, "proj/nested/data.txt", "precious");
+    assert!(cli(&world, &inner, &["sync"]).0);
+    assert_eq!(read(&inner_beta, "data.txt"), "precious");
+
+    fs::remove_dir_all(outer_alpha.join("proj")).unwrap();
+    let (ok, text) = cli(&world, &outer, &["sync"]);
+    assert!(ok, "{text}");
+    // The tree went whole, the nested root with it.
+    assert!(!outer_beta.join("proj").exists(), "{text}");
+
+    // The nested session refuses to carry that loss any further.
+    let (ok, text) = cli(&world, &inner, &["sync"]);
+    assert!(!ok, "the nested session must not succeed: {text}");
+    assert!(text.contains("does not exist"), "{text}");
+    assert_eq!(read(&inner_beta, "data.txt"), "precious");
+}
+
+/// A conflict whose losing side holds ignored content settles like any
+/// other. The removal takes what synchronization knows about and leaves
+/// the rest, and what remains is invisible — the same rule the cycle
+/// follows for an ordinary deletion. `resolve` must not be stricter than
+/// the cycle it stands in for.
+#[test]
+fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
     let world = World::new();
     let alpha = world.directory("alpha");
     let beta = world.directory("b1");
@@ -1453,15 +1571,14 @@ fn resolve_will_not_half_delete_a_tree_holding_excluded_content() {
     .unwrap();
     assert!(cli(&world, &config, &["sync"]).0);
 
-    // A project on beta holding an ignored `.git`, which reaches alpha
-    // without it — then alpha deletes the project. That is "deleted on
-    // ours" against a side that cannot be fully removed.
+    // A genuine disagreement, not a deletion: a file on one side and a
+    // project directory on the other, both new since the ancestor.
+    write(&alpha, "project", "alpha's file");
     write(&beta, "project/.git/HEAD", "ref");
     write(&beta, "project/src/main.rs", "fn main() {}");
     cli(&world, &config, &["sync"]);
-    assert!(alpha.join("project/src/main.rs").exists(), "it propagated");
-    fs::remove_dir_all(alpha.join("project")).unwrap();
-    cli(&world, &config, &["sync"]);
+    let (_, listed) = cli(&world, &config, &["conflicts"]);
+    assert!(listed.contains("project"), "a conflict: {listed}");
 
     let (ok, text) = cli(
         &world,
@@ -1469,27 +1586,16 @@ fn resolve_will_not_half_delete_a_tree_holding_excluded_content() {
         &["resolve", "r", "project", "--keep", "alpha", "--yes"],
     );
     assert!(ok, "{text}");
-    assert!(text.contains("settled 0 of 1"), "it says so: {text}");
-    assert!(text.contains("not settled"), "{text}");
-    assert!(text.contains("--keep both"), "it names a way out: {text}");
-    // Nothing was taken, not even the part it could have taken.
-    assert!(beta.join("project/.git/HEAD").exists(), "{text}");
-    assert_eq!(read(&beta, "project/src/main.rs"), "fn main() {}");
-
-    // And the way out it names actually works: a rename moves the whole
-    // tree, ignored content included, so the conflict settles.
-    let (ok, text) = cli(
-        &world,
-        &config,
-        &["resolve", "r", "project", "--keep", "both", "--yes"],
-    );
-    assert!(ok, "{text}");
+    assert!(text.contains("settled 1 of 1"), "{text}");
     for _ in 0..3 {
         cli(&world, &config, &["sync"]);
     }
-    assert_eq!(read(&beta, "project.b1/src/main.rs"), "fn main() {}");
-    assert!(beta.join("project.b1/.git/HEAD").exists(), "git survives");
-    assert_eq!(read(&alpha, "project.b1/src/main.rs"), "fn main() {}");
+
+    // Alpha's version won everywhere, and the loser's tree went whole —
+    // resolution follows the same rule the cycle does, so a `.git` inside
+    // the losing version is no more of an obstacle here than there.
+    assert_eq!(read(&alpha, "project"), "alpha's file");
+    assert_eq!(read(&beta, "project"), "alpha's file");
     let (_, after) = cli(&world, &config, &["conflicts"]);
     assert!(after.contains("nothing needs you"), "{after}");
 }

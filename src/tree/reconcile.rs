@@ -50,6 +50,50 @@ fn non_deletion_changes(changes: &[Change]) -> Vec<Change> {
         .collect()
 }
 
+/// The part of a side's unsynchronizable content that must block the change
+/// about to be propagated onto it.
+///
+/// What blocks depends on the change, not only on the content. Excluded
+/// content must never be *overwritten* — "do not synchronize this" cannot
+/// mean "replace it with the peer's copy" — but it need not block a
+/// *deletion*, which leaves it exactly where it is. Treating it as an
+/// obstacle in both directions made an ordinary action impossible: a
+/// project directory almost always holds a `.git` or a `node_modules`, so
+/// deleting one turned into a conflict that no resolution could settle.
+fn blocking(incoming: Option<&Node>, unsynchronizable: Vec<Change>) -> Vec<Change> {
+    fn unreadable(node: &Node) -> bool {
+        match &node.content {
+            Content::Problematic { .. } => true,
+            Content::Directory(children) => children.iter().any(unreadable),
+            _ => false,
+        }
+    }
+    // Content arriving would be written *over* whatever is here, and an
+    // excluded entry is exactly the thing that must not be overwritten:
+    // "do not synchronize this" cannot mean "replace it with the peer's
+    // copy". Everything unsynchronizable blocks a write.
+    if incoming.is_some() {
+        return unsynchronizable;
+    }
+    // A deletion is different. It removes what synchronization knows about
+    // and leaves the excluded entries where they are, so nothing excluded
+    // is destroyed by letting it through — while blocking it makes an
+    // ordinary action impossible, since a project directory almost always
+    // holds a `.git` or a `node_modules` and could then never be deleted
+    // through synchronization at all.
+    //
+    // Unreadable content still blocks even a deletion: there the objection
+    // is not policy but ignorance. Nobody has seen what is there, so
+    // removing the directory around it is not a decision anyone made.
+    unsynchronizable
+        .into_iter()
+        .filter(|change| {
+            change.new.as_ref().is_some_and(unreadable)
+                || change.old.as_ref().is_some_and(unreadable)
+        })
+        .collect()
+}
+
 /// Indicates whether or not optional content is nil-or-untracked.
 fn nil_or_untracked(node: Option<&Node>) -> bool {
     match node {
@@ -296,7 +340,8 @@ impl Reconciler {
         let alpha_diff = diff_at(path, ancestor, alpha_sync.as_ref());
         let beta_diff = diff_at(path, ancestor, beta_sync.as_ref());
         if beta_diff.is_empty() {
-            let beta_unsynchronizable = diff_at(path, beta_sync.as_ref(), beta);
+            let beta_unsynchronizable =
+                blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -312,7 +357,10 @@ impl Reconciler {
             }
             return;
         } else if alpha_diff.is_empty() {
-            let alpha_unsynchronizable = diff_at(path, alpha_sync.as_ref(), alpha);
+            let alpha_unsynchronizable = blocking(
+                beta_sync.as_ref(),
+                diff_at(path, alpha_sync.as_ref(), alpha),
+            );
             if !alpha_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -338,7 +386,7 @@ impl Reconciler {
         // side with the partial deletion.
         if alpha_non_deletion.is_empty() && beta_non_deletion.is_empty() {
             if alpha_sync.is_none() {
-                let beta_unsynchronizable = diff_at(path, beta_sync.as_ref(), beta);
+                let beta_unsynchronizable = blocking(None, diff_at(path, beta_sync.as_ref(), beta));
                 if !beta_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
@@ -353,7 +401,8 @@ impl Reconciler {
                     });
                 }
             } else {
-                let alpha_unsynchronizable = diff_at(path, alpha_sync.as_ref(), alpha);
+                let alpha_unsynchronizable =
+                    blocking(None, diff_at(path, alpha_sync.as_ref(), alpha));
                 if !alpha_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
@@ -375,7 +424,8 @@ impl Reconciler {
         // content over it (this is also what enables manual conflict
         // resolution by deleting the losing side).
         if beta_non_deletion.is_empty() {
-            let beta_unsynchronizable = diff_at(path, beta_sync.as_ref(), beta);
+            let beta_unsynchronizable =
+                blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -391,7 +441,10 @@ impl Reconciler {
             }
             return;
         } else if alpha_non_deletion.is_empty() {
-            let alpha_unsynchronizable = diff_at(path, alpha_sync.as_ref(), alpha);
+            let alpha_unsynchronizable = blocking(
+                beta_sync.as_ref(),
+                diff_at(path, alpha_sync.as_ref(), alpha),
+            );
             if !alpha_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -417,7 +470,8 @@ impl Reconciler {
                 beta_changes: beta_non_deletion,
             });
         } else {
-            let beta_unsynchronizable = diff_at(path, beta_sync.as_ref(), beta);
+            let beta_unsynchronizable =
+                blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -448,7 +502,7 @@ impl Reconciler {
         let beta_sync = beta.and_then(Node::synchronizable_subtree);
         let beta_non_deletion = non_deletion_changes(&diff_at(path, ancestor, beta_sync.as_ref()));
         if beta_non_deletion.is_empty() {
-            let beta_unsynchronizable = diff_at(path, beta_sync.as_ref(), beta);
+            let beta_unsynchronizable = blocking(alpha, diff_at(path, beta_sync.as_ref(), beta));
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -538,7 +592,7 @@ impl Reconciler {
         // content, unless beta carries unsynchronizable content (which can't
         // be removed), in which case indicate a conflict.
         let beta_sync = beta.and_then(Node::synchronizable_subtree);
-        let beta_unsynchronizable = diff_at(path, beta_sync.as_ref(), beta);
+        let beta_unsynchronizable = blocking(alpha, diff_at(path, beta_sync.as_ref(), beta));
         if !beta_unsynchronizable.is_empty() {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),

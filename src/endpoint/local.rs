@@ -2010,11 +2010,53 @@ impl Transitioner<'_> {
                     }
                 }
                 None => {
-                    self.problem(
-                        &child_path,
-                        "refusing to remove unexpected content that appeared since the last scan",
+                    // Two very different things reach here. An expectation
+                    // never mentions excluded content, so an ignored entry
+                    // is *always* unaccounted for; the last scan is what
+                    // tells them apart, since it records excluded entries
+                    // as untracked nodes and knows nothing of an entry that
+                    // arrived after it ran.
+                    let excluded = matches!(
+                        self.scanned_node(&child_path).map(|node| &node.content),
+                        Some(Content::Untracked)
                     );
-                    unexpected = true;
+                    if !excluded {
+                        self.problem(
+                            &child_path,
+                            "refusing to remove unexpected content that appeared since the last scan",
+                        );
+                        unexpected = true;
+                        continue;
+                    }
+                    // Excluded content goes with the directory around it.
+                    //
+                    // An ignore says which files synchronization carries,
+                    // not which files exist. Deleting a directory is an
+                    // instruction about the directory, and honouring it
+                    // halfway — taking the source and leaving the `.git`
+                    // and the `node_modules` — obeys neither reading: the
+                    // tree is not deleted, and what remains is litter that
+                    // nobody asked for and that synchronization can never
+                    // clear.
+                    //
+                    // Nothing here was ever scanned, so there is no
+                    // expectation to validate against and none is
+                    // pretended. The protection for the case that matters
+                    // — another session's root sitting inside an ignored
+                    // path — is that session's own root-deletion halt,
+                    // which stops it before it carries the loss any
+                    // further.
+                    let removed = match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => fs::remove_dir_all(entry.path()),
+                        _ => fs::remove_file(entry.path()),
+                    };
+                    if let Err(error) = removed {
+                        self.problem(
+                            &child_path,
+                            format!("unable to remove excluded content: {error}"),
+                        );
+                        unexpected = true;
+                    }
                 }
             }
         }

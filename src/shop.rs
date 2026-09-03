@@ -47,6 +47,8 @@ enum Key {
     Flush,
     Keep(Winner),
     Copy,
+    Yes,
+    No,
     Quit,
 }
 
@@ -128,7 +130,18 @@ struct Shop<'a> {
     working: Arc<Mutex<Option<String>>>,
     rate: Rate,
     ticker: Vec<String>,
+    /// A settlement waiting to be approved. Resolution overwrites a file
+    /// someone deliberately edited, on every destination in the group —
+    /// too much to hang on one keystroke.
+    pending: Option<Pending>,
     frame: u64,
+}
+
+/// A settlement asked for and not yet approved.
+struct Pending {
+    winner: Winner,
+    paths: Vec<String>,
+    question: String,
 }
 
 /// Runs the shop until the reader closes up.
@@ -149,6 +162,7 @@ pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>
         working: Arc::default(),
         rate: Rate::default(),
         ticker: Vec::new(),
+        pending: None,
         frame: 0,
     };
     let mut refreshed = Instant::now();
@@ -217,6 +231,20 @@ impl Shop<'_> {
     }
 
     fn press(&mut self, key: Key) -> bool {
+        // A question is answered before anything else is read. Otherwise a
+        // key meant for the tree acts on the settlement instead.
+        if self.pending.is_some() {
+            match key {
+                Key::Yes => {
+                    if let Some(pending) = self.pending.take() {
+                        self.run_settlement(pending);
+                    }
+                }
+                Key::No | Key::Close | Key::Quit => self.pending = None,
+                _ => {}
+            }
+            return false;
+        }
         let open = self.counter.is_some();
         match (open, key) {
             (_, Key::Quit) => return true,
@@ -309,7 +337,42 @@ impl Shop<'_> {
             1 => format!("settled {}", paths[0]),
             many => format!("settled {many} paths"),
         };
-        let commands = paths
+        let _ = (keep, told);
+        // Asked, not done. The answer arrives as `y` or `n`.
+        self.pending = Some(Pending {
+            winner,
+            question: format!(
+                "keep {} for {} — overwrites the other side everywhere. y/n",
+                match winner {
+                    Winner::Alpha => "ours".to_owned(),
+                    Winner::Beta => format!("{}'s", counter.host),
+                    Winner::Both => "both".to_owned(),
+                },
+                match paths.len() {
+                    1 => paths[0].clone(),
+                    many => format!("{many} paths"),
+                }
+            ),
+            paths,
+        });
+        let _ = group;
+    }
+
+    /// Runs a settlement that has been approved.
+    fn run_settlement(&mut self, pending: Pending) {
+        let Some(counter) = &self.counter else { return };
+        let keep = match pending.winner {
+            Winner::Alpha => "alpha".to_owned(),
+            Winner::Beta => counter.host.clone(),
+            Winner::Both => "both".to_owned(),
+        };
+        let group = counter.group.clone();
+        let told = match pending.paths.len() {
+            1 => format!("settled {}", pending.paths[0]),
+            many => format!("settled {many} paths"),
+        };
+        let commands = pending
+            .paths
             .iter()
             .map(|path| {
                 vec![
@@ -593,6 +656,9 @@ fn held(side: &autobahn::supervisor::ConflictSide) -> String {
         "file" => bytes(side.size),
         "directory" => "a folder".to_owned(),
         "symlink" => "a link".to_owned(),
+        // "other" is what the supervisor records for content it cannot
+        // classify from the change it kept, which includes directories.
+        "other" | "" => "something".to_owned(),
         other => other.to_owned(),
     }
 }
@@ -921,10 +987,13 @@ impl Shop<'_> {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clone();
+        if let Some(pending) = &self.pending {
+            return format!("\x1b[33m{}\x1b[0m", pending.question);
+        }
         let keys = match (&self.counter, self.selected().map(|row| row.act)) {
             (None, _) => "↑↓ choose · ⏎ counter · f rush · q close the shop",
             (Some(_), Some(Act::Conflicts(_))) => {
-                "↑↓ ⏎ open · ← back · a ours · t theirs · b both · q close the shop"
+                "↑↓ ⏎ open · ← back · o ours · t theirs · b both · q close the shop"
             }
             (Some(_), Some(Act::Blocked(_))) => {
                 "↑↓ ⏎ open · ← back · c copy the fix · q close the shop"
@@ -1060,10 +1129,12 @@ fn parse(bytes: &[u8]) -> (Vec<Key>, Vec<u8>) {
             [b'h', ..] => (Some(Key::Close), 1),
             [b'l', ..] | [b'\r', ..] | [b'\n', ..] => (Some(Key::Open), 1),
             [b'f', ..] => (Some(Key::Flush), 1),
-            [b'a', ..] => (Some(Key::Keep(Winner::Alpha)), 1),
+            [b'o', ..] => (Some(Key::Keep(Winner::Alpha)), 1),
             [b't', ..] => (Some(Key::Keep(Winner::Beta)), 1),
             [b'b', ..] => (Some(Key::Keep(Winner::Both)), 1),
             [b'c', ..] => (Some(Key::Copy), 1),
+            [b'y', ..] => (Some(Key::Yes), 1),
+            [b'n', ..] => (Some(Key::No), 1),
             [b'q', ..] | [0x03, ..] => (Some(Key::Quit), 1),
             _ => (None, 1),
         };
@@ -1343,7 +1414,18 @@ mod tests {
         assert_eq!(parse(b"\x1bq").0, vec![Key::Close, Key::Quit]);
         // And the letters still work.
         assert_eq!(parse(b"jkl").0, vec![Key::Down, Key::Up, Key::Open]);
-        assert_eq!(parse(b"atb").0.len(), 3);
+        // `o` keeps ours, not `a`: the row says "ours", so the key that
+        // acts on it should too.
+        assert_eq!(
+            parse(b"otb").0,
+            vec![
+                Key::Keep(Winner::Alpha),
+                Key::Keep(Winner::Beta),
+                Key::Keep(Winner::Both)
+            ]
+        );
+        assert!(parse(b"a").0.is_empty(), "the old key does nothing");
+        assert_eq!(parse(b"yn").0, vec![Key::Yes, Key::No]);
     }
 
     /// A conflict says which side lost the file.

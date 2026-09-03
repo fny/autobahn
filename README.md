@@ -358,9 +358,10 @@ one keypress settles a whole directory or a single file.
 ```
 
 `↑↓` move, `⏎` or `→` opens a branch, `←` closes it and then the counter.
-On a conflict, `a` keeps alpha's version, `t` keeps that destination's,
-`b` keeps both — running the same `resolve` you would type, on whichever
-paths the selected level covers. Blocked paths autobahn cannot clear
+On a conflict, `o` keeps ours, `t` keeps theirs, `b` keeps both — and each
+asks before it acts, because resolution overwrites a file someone edited
+on every destination in the group. It then runs the same `resolve` you
+would type, on whichever paths the selected level covers. Blocked paths autobahn cannot clear
 itself, since the commands are `sudo` over ssh and a password prompt has
 nowhere to appear, so `c` copies the fix to the clipboard instead. `f`
 rushes an order, and `q` closes the shop.

@@ -1067,6 +1067,17 @@ impl Endpoint for LocalEndpoint {
             None => match fs::remove_file(&full) {
                 Ok(()) => Ok(()),
                 Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
+                // A tree, not a file. `resolve` replaces one file's bytes
+                // with another's, and "no bytes" means removing it — which
+                // a directory refuses. Saying so beats the raw errno,
+                // which reads as a permission or a bug.
+                Err(error) if fs::symlink_metadata(&full).is_ok_and(|m| m.is_dir()) => Err(error)
+                    .with_context(|| {
+                        format!(
+                            "{path} is a directory. Resolving replaces one file's content, \
+                             so it cannot settle a whole tree — make the two sides agree by hand"
+                        )
+                    }),
                 Err(error) => {
                     Err(error).with_context(|| format!("unable to remove {}", full.display()))
                 }

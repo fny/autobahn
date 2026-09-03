@@ -109,6 +109,24 @@ committed.
   version per record, or write down why the conversion at open is
   sufficient.
 
+## Found while building the shop (2026-09-03)
+
+- [ ] **`resolve` cannot settle a directory conflict.** It replaces one
+  file's bytes, so "keep ours" on a deleted directory means removing a
+  tree, and `remove_file` refuses it. The failure now explains itself
+  rather than leaking `Is a directory (os error 21)`, but the conflict
+  still cannot be settled from either the CLI or the shop. Doing it
+  properly means resolution using stage and transition rather than
+  read_file/write_file — the machinery exists, `resolve` does not use it.
+  Until then the two sides must be made to agree by hand.
+
+- [ ] **A directory conflict is recorded as kind "other".**
+  `conflict_detail` maps `Content::Directory` to "directory", but a real
+  one (`vibe` → `boite`, the `happy` and `voltagen` trees) comes back as
+  "other" — so the change it inspects is not the directory node it
+  expects. `issues` and the shop both print it, so the mislabel is
+  visible. Worth finding out which change it is actually looking at.
+
 ## Carried over (not yet asked for, noted so they aren't lost)
 
 - [ ] 21 blocked paths on `fny.voltai.party` — root-owned

@@ -8,6 +8,7 @@ use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod pager;
+mod shop;
 
 use autobahn::config::Config;
 use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
@@ -286,6 +287,16 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// The shop.
+    #[command(hide = true)]
+    Mi {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
     /// Show how the two sides of a file differ.
     ///
     /// The file may be named by a filesystem path inside a synchronized
@@ -474,6 +485,7 @@ fn main() {
             config,
             state_root,
         } => run_conflicts(config, state_root, selector, host, depth, filter, json),
+        Command::Mi { config, state_root } => run_shop(config, state_root),
         Command::Diff {
             selector,
             path,
@@ -1231,6 +1243,14 @@ fn conflict_filter(pattern: &str) -> Result<Box<dyn Fn(&str) -> bool>> {
         .with_context(|| format!("unable to read the filter {pattern:?} as a pattern"))?
         .compile_matcher();
     Ok(Box::new(move |path: &str| glob.is_match(path)))
+}
+
+/// Opens the shop.
+fn run_shop(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> {
+    let plans = load_config(config.clone())?.plans()?;
+    let state_root = resolve_state_root(state_root)?;
+    let selected: Vec<&autobahn::config::SessionPlan> = plans.iter().collect();
+    shop::run(&selected, &state_root, config)
 }
 
 /// Shows how the two sides of one file differ, with the system's diff.

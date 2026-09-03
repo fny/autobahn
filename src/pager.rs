@@ -27,6 +27,11 @@ extern "C" fn interrupt(_: libc::c_int) {
     INTERRUPTED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Whether a signal has asked the display to leave.
+pub(crate) fn interrupted() -> bool {
+    INTERRUPTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 /// Asks a running display to leave, as if the reader had pressed `q`.
 ///
 /// For the thread that supervises beneath `watch`: when it fails there is
@@ -231,13 +236,13 @@ fn terminal_size() -> Option<(usize, usize)> {
 /// The terminal, taken over for the display's lifetime and given back on
 /// the way out — including out through a panic, which is why this is a
 /// guard rather than a pair of calls.
-struct Terminal {
+pub(crate) struct Terminal {
     /// The settings to restore.
     saved: libc::termios,
 }
 
 impl Terminal {
-    fn enter() -> Result<Terminal> {
+    pub(crate) fn enter() -> Result<Terminal> {
         let mut saved: libc::termios = unsafe { std::mem::zeroed() };
         if unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut saved) } != 0 {
             return Err(std::io::Error::last_os_error())

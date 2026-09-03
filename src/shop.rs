@@ -434,10 +434,14 @@ impl Shop<'_> {
             self.branch(
                 &mut rows,
                 "conflicts".to_owned(),
-                format!("{} conflict", plural(paths.len())),
+                match paths.len() {
+                    1 => "1 conflict".to_owned(),
+                    many => format!("{many} conflicts"),
+                },
                 "both sides changed these".to_owned(),
                 &paths,
                 &|paths| Act::Conflicts(paths),
+                &|path| sides(session, path),
             );
         }
 
@@ -464,10 +468,12 @@ impl Shop<'_> {
             self.branch(
                 &mut rows,
                 format!("blocked/{side}/{cause}"),
-                format!("{} blocked on {side}", plural(paths.len())),
+                format!("{} blocked on {side}", paths.len()),
                 cause.to_owned(),
                 &paths,
                 &|_| Act::Blocked(fixes.clone()),
+                // A blocked path's cause is already on its heading.
+                &|_| String::new(),
             );
         }
         rows
@@ -484,6 +490,7 @@ impl Shop<'_> {
     }
 
     /// Emits one heading and, when it is open, the places under it.
+    #[allow(clippy::too_many_arguments)]
     fn branch(
         &self,
         rows: &mut Vec<Row>,
@@ -492,6 +499,7 @@ impl Shop<'_> {
         detail: String,
         paths: &[&str],
         act: &dyn Fn(Vec<String>) -> Act,
+        describe: &dyn Fn(&str) -> String,
     ) {
         let all: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
         let open = self.expanded.contains(&key);
@@ -527,7 +535,7 @@ impl Shop<'_> {
                     false => format!("{prefix}/"),
                 },
                 detail: match single {
-                    true => String::new(),
+                    true => describe(here[0]),
                     false => format!("{count}"),
                 },
                 children: !single,
@@ -544,7 +552,7 @@ impl Shop<'_> {
                         .strip_prefix(&format!("{prefix}/"))
                         .unwrap_or(path)
                         .to_owned(),
-                    detail: String::new(),
+                    detail: describe(path),
                     children: false,
                     act: act(vec![path.to_owned()]),
                 });
@@ -553,11 +561,39 @@ impl Shop<'_> {
     }
 }
 
-/// "1 thing" or "4 things", without the awkward parenthesis.
-fn plural(count: usize) -> String {
-    match count {
-        1 => "1".to_owned(),
-        many => format!("{many}"),
+/// What each side holds at a conflicting path.
+///
+/// The question a conflict raises first is which side changed, and the
+/// sharpest case is a deletion: one side has the file and the other does
+/// not. Naming only the path leaves the reader to go and look.
+///
+/// "ours" and "theirs" rather than alpha and the destination's name,
+/// because those are the words on the keys that settle it.
+fn sides(session: &SessionReport, path: &str) -> String {
+    let Some(detail) = session
+        .conflicts
+        .iter()
+        .find(|conflict| conflict.path == path)
+    else {
+        return String::new();
+    };
+    let (ours, theirs) = (&detail.alpha, &detail.beta);
+    match (ours.present, theirs.present) {
+        // The deletion cases, said outright.
+        (false, true) => "deleted on ours".to_owned(),
+        (true, false) => "deleted on theirs".to_owned(),
+        (false, false) => String::new(),
+        (true, true) => format!("ours {} · theirs {}", held(ours), held(theirs)),
+    }
+}
+
+/// One side of a conflict, in a few characters.
+fn held(side: &autobahn::supervisor::ConflictSide) -> String {
+    match side.kind.as_str() {
+        "file" => bytes(side.size),
+        "directory" => "a folder".to_owned(),
+        "symlink" => "a link".to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -811,12 +847,12 @@ impl Shop<'_> {
     }
 
     /// The counter: the issue tree for one order.
-    fn counter_rows(&self, room: usize, width: usize) -> Vec<String> {
+    fn counter_rows(&self, room: usize, columns: usize) -> Vec<String> {
         let Some(counter) = &self.counter else {
             return Vec::new();
         };
         let rows = self.rows();
-        let inner = width.saturating_sub(4);
+        let inner = columns.saturating_sub(4);
         let mut lines = vec![
             dim(&format!("  ┌{}┐", "─".repeat(inner))),
             format!(
@@ -827,10 +863,13 @@ impl Shop<'_> {
                         "\x1b[1mthe counter\x1b[0m {}",
                         dim(&format!("{} → {}", counter.group, counter.host))
                     ),
+                    // What is waiting is the number of things wrong, not
+                    // the number of headings they group under.
                     &format!(
                         "\x1b[33m{} waiting\x1b[0m",
-                        rows.first()
-                            .map_or(0, |_| rows.iter().filter(|row| row.depth == 0).count())
+                        self.at_counter()
+                            .map_or(0, |(_, session)| session.conflicts.len()
+                                + session.blocked.len())
                     ),
                     inner.saturating_sub(2)
                 ),
@@ -849,12 +888,16 @@ impl Shop<'_> {
                 (true, false) => "▸",
                 (false, _) => " ",
             };
-            let text = format!(
-                "{}{marker} {} {}",
+            // The label on the left, what it holds on the right. A
+            // detail that trails the label puts every one at a different
+            // column and makes the list unreadable down the page.
+            let room = inner.saturating_sub(2);
+            let left = format!(
+                "{}{marker} {}",
                 "  ".repeat(row.depth),
-                shorten(&row.label, inner.saturating_sub(row.depth * 2 + 24)),
-                dim(&row.detail),
+                shorten(&row.label, room.saturating_sub(width(&row.detail) + 4)),
             );
+            let text = between(&left, &dim(&row.detail), room);
             let text = if here {
                 format!("\x1b[7m{}\x1b[0m", strip(&text))
             } else {
@@ -1301,5 +1344,65 @@ mod tests {
         // And the letters still work.
         assert_eq!(parse(b"jkl").0, vec![Key::Down, Key::Up, Key::Open]);
         assert_eq!(parse(b"atb").0.len(), 3);
+    }
+
+    /// A conflict says which side lost the file.
+    ///
+    /// "this path conflicts" leaves the reader to go and look at two
+    /// machines. The first question a conflict raises is which side
+    /// changed, and a deletion is the sharpest form of it.
+    #[test]
+    fn a_conflicting_path_says_what_each_side_holds() {
+        use autobahn::supervisor::{ConflictDetail, ConflictSide};
+        let file = |size: u64| ConflictSide {
+            present: true,
+            kind: "file".into(),
+            size,
+            mtime_seconds: 0,
+        };
+        let folder = ConflictSide {
+            present: true,
+            kind: "directory".into(),
+            ..ConflictSide::default()
+        };
+        let gone = ConflictSide::default();
+
+        let session = |alpha: ConflictSide, beta: ConflictSide| SessionReport {
+            host: "boite".into(),
+            beta: "boite".into(),
+            mode: "two-way-conflict".into(),
+            state: "conflicts".into(),
+            cycles: 1,
+            age_seconds: Some(1),
+            conflicts: vec![ConflictDetail {
+                path: "happy".into(),
+                alpha,
+                beta,
+            }],
+            blocked: Vec::new(),
+            error: None,
+            progress: None,
+        };
+
+        // The words match the keys that settle it: `a` keeps ours, `t`
+        // keeps theirs.
+        assert_eq!(
+            sides(&session(gone.clone(), folder.clone()), "happy"),
+            "deleted on ours"
+        );
+        assert_eq!(
+            sides(&session(folder.clone(), gone.clone()), "happy"),
+            "deleted on theirs"
+        );
+        assert_eq!(
+            sides(&session(file(8_600), file(9_000)), "happy"),
+            "ours 8.4 kB · theirs 8.8 kB"
+        );
+        assert_eq!(
+            sides(&session(folder.clone(), folder), "happy"),
+            "ours a folder · theirs a folder"
+        );
+        // A path that is not in conflict has nothing to say.
+        assert_eq!(sides(&session(gone.clone(), gone), "elsewhere"), "");
     }
 }

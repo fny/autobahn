@@ -15,6 +15,9 @@ use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
 use autobahn::endpoint::Endpoint;
 use autobahn::tree::{apply, nodes_share_storage, reconcile, Content, Node, SyncMode};
 
+mod common;
+use common::Restore;
+
 fn main() {
     let root = PathBuf::from(
         std::env::args()
@@ -34,12 +37,19 @@ fn main() {
     let encoded = bincode::serialize(&settled.root).expect("ancestor encodes");
     let reloaded: Option<Node> = bincode::deserialize(&encoded).expect("ancestor decodes");
 
+    // One file changes, and is put back the moment the rescan has seen it.
+    // The guard runs on a panic too, which matters because the root worth
+    // measuring is a real tree — possibly a live synchronization root,
+    // where an edit left behind propagates to every other machine.
     let victim = first_file(settled.root.as_ref(), String::new()).expect("a file");
     let path = root.join(&victim);
     let mut content = std::fs::read(&path).expect("readable");
+    let restore = Restore::of(&path, content.clone());
     content.extend_from_slice(b"\nedited\n");
     std::fs::write(&path, &content).expect("writable");
     let edited = endpoint.scan().expect("rescan should succeed");
+    // Everything below works from the in-memory snapshots.
+    drop(restore);
 
     println!("after one edit, directories sharing storage:\n");
     report(
@@ -79,7 +89,6 @@ fn main() {
     );
     println!("  ({} change(s) applied)", result.beta_transitions.len());
 
-    std::fs::write(&path, &content[..content.len() - 8]).expect("restorable");
     let _ = std::fs::remove_dir_all(&staging);
 }
 

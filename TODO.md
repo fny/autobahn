@@ -269,6 +269,59 @@ Metadata walk of the `voltai` roots, cold, `find` excluding `target`:
   digest reuse means a full walk of 606k entries is sub-second. Do not
   reach for this again without measuring a warm supervisor.
 
+## What the fny stalls actually were (measured 2026-09-09)
+
+Every earlier theory was wrong. Instrumenting the agent itself — to a
+file, because its stderr is discarded — found two independent causes,
+both now fixed on the live system.
+
+- [x] **The remote watch could never be established.** `~/Workspace` on
+  fny has 325,509 directories before ignores; `fs.inotify.max_user_watches`
+  was 256,423. The recursive inotify watch walked the tree for ~20s, hit
+  `ENOSPC` deep inside a `.venv/__pycache__` it would never scan, failed,
+  and retried every 30s — *inside* `snapshot()`, so every scan request
+  blocked behind it. Watch count oscillated 207k → 127 → 197k. That was
+  the "23s scan every 53s". Mitigated: `max_user_watches = 1048576`,
+  persisted in `/etc/sysctl.d/60-autobahn-inotify.conf`; the watch now
+  holds at 330,612. Worst `unchanged` scan exchange fell 22.4s → 7.1s.
+
+- [x] **The Mac did a full 233k-entry scan every cycle.** Any transition
+  problem calls `distrust_baseline()`, which clears `last_full_scan`. The
+  one blocked path (a unicode-collision twin fny held as two files) was
+  refused every cycle, so every cycle forced a full walk of alpha. Fixed
+  by deleting the NFD twin on fny (hash-identical to the NFC one).
+  Blocked is now 0; full scans went from every cycle to every 120s.
+
+- [ ] **Durable fix: do not watch ignored directories.** The sysctl is a
+  per-host mitigation. 39,252 directories need a watch; 325,509 get one.
+  On Linux, notify's `Recursive` walks with `WalkDir` and has no filter
+  hook, and it extends to new subdirectories only for parents registered
+  recursive (`inotify.rs:67`). So: walk with the scanner's ignore rule,
+  add `NonRecursive` watches per directory, and add a watch on
+  `Create(Folder)` for non-ignored paths from a dispatch thread that owns
+  the watcher (the callback cannot). Keep `Recursive` on macOS (FSEvents
+  is native). Agent-side → epoch bump; A/B on fny, not locally.
+
+- [ ] **A permanent refusal should not force a full rescan every cycle.**
+  `distrust_baseline()` is right when the disk disagreed with the
+  snapshot; it is wrong for a refusal the snapshot predicted (a collision,
+  an unwritable parent). Distinguish the two in `TransitionOutcome`, or
+  rate-limit distrust per path.
+
+- [ ] **Agent stderr is discarded.** `remote.rs:330` uses `spawn_quiet`
+  (`stderr(Stdio::null())`) for the connection that succeeds, so "unable
+  to watch for changes; falling back to interval polling" is never seen.
+  fny's watch was failing every 30s for days with no trace. Pipe agent
+  stderr to the controller log with a host prefix.
+
+- [ ] **Progress `seconds` reports epoch time** when a side's scan window
+  was never begun (`seconds=1788990744` in a status sample). Guard the
+  subtraction.
+
+- [ ] **~210s stall after a supervisor restart** on fny: building 330k
+  watches (~50s) plus the first full snapshot. Startup-only; goes away
+  with the durable watch fix (39k watches).
+
 ## Carried over (not yet asked for, noted so they aren't lost)
 
 - [ ] 21 blocked paths on `fny.voltai.party` — root-owned

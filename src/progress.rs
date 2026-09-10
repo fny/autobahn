@@ -244,6 +244,12 @@ pub struct Progress {
     staged_total: AtomicU64,
     /// Bytes transferred, and the total this cycle will transfer.
     staged_bytes: AtomicU64,
+    /// Files and bytes moved over this session's whole life — every batch
+    /// staged, never reset, seeded from the previous run's record. The
+    /// per-transfer counters above answer "how far along"; these answer
+    /// "how much, ever", which is what a shop's tally is.
+    moved_files: AtomicU64,
+    moved_bytes: AtomicU64,
     staged_bytes_total: AtomicU64,
     /// Changes applied, and the total this cycle will apply.
     applied: AtomicU64,
@@ -261,6 +267,8 @@ impl Default for Progress {
             staged: AtomicU64::new(0),
             staged_total: AtomicU64::new(0),
             staged_bytes: AtomicU64::new(0),
+            moved_files: AtomicU64::new(0),
+            moved_bytes: AtomicU64::new(0),
             staged_bytes_total: AtomicU64::new(0),
             applied: AtomicU64::new(0),
             applied_total: AtomicU64::new(0),
@@ -294,6 +302,20 @@ impl Progress {
     }
 
     /// Announces the size of the transfer a cycle is about to perform.
+    /// Restores the lifetime tally recorded by a previous run.
+    pub fn seed_moved(&self, files: u64, bytes: u64) {
+        self.moved_files.store(files, Ordering::Relaxed);
+        self.moved_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// Files and bytes moved over this session's life.
+    pub fn moved(&self) -> (u64, u64) {
+        (
+            self.moved_files.load(Ordering::Relaxed),
+            self.moved_bytes.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn begin_staging(&self, files: u64, bytes: u64) {
         self.staged.store(0, Ordering::Relaxed);
         self.staged_bytes.store(0, Ordering::Relaxed);
@@ -307,6 +329,8 @@ impl Progress {
     pub fn staged(&self, files: u64, bytes: u64) {
         self.staged.fetch_add(files, Ordering::Relaxed);
         self.staged_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.moved_files.fetch_add(files, Ordering::Relaxed);
+        self.moved_bytes.fetch_add(bytes, Ordering::Relaxed);
     }
 
     /// Announces the number of changes a cycle is about to apply.
@@ -393,6 +417,8 @@ impl Progress {
             staged_total,
             staged_bytes: self.staged_bytes.load(Ordering::Relaxed),
             staged_bytes_total: self.staged_bytes_total.load(Ordering::Relaxed),
+            moved_files: self.moved_files.load(Ordering::Relaxed),
+            moved_bytes: self.moved_bytes.load(Ordering::Relaxed),
             applied,
             applied_total,
             remaining_seconds,
@@ -422,6 +448,10 @@ pub struct ProgressSnapshot {
     /// Bytes transferred so far, of the total this cycle will transfer.
     pub staged_bytes: u64,
     pub staged_bytes_total: u64,
+    /// Files moved over the session's whole life.
+    pub moved_files: u64,
+    /// Bytes moved over the session's whole life.
+    pub moved_bytes: u64,
     /// Changes applied so far, of the total this cycle will apply.
     pub applied: u64,
     pub applied_total: u64,

@@ -2990,6 +2990,8 @@ mod tests {
             staged_total: 0,
             staged_bytes: 0,
             staged_bytes_total: 0,
+            moved_files: 0,
+            moved_bytes: 0,
             applied: 0,
             applied_total: 0,
             remaining_seconds: None,

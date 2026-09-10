@@ -815,11 +815,23 @@ impl Shop<'_> {
                 .filter_map(|(_, session)| session.progress.as_ref())
                 .map(|progress| progress.staged_bytes)
                 .sum();
-            let mut parts = vec![format!("{} orders", orders.len())];
+            // The tally a shop keeps: how much has gone out the door, ever,
+            // and — while something is on the counter — how fast.
+            let (files, total) = orders
+                .iter()
+                .filter_map(|(_, session)| session.progress.as_ref())
+                .fold((0u64, 0u64), |(f, b), progress| {
+                    (f + progress.moved_files, b + progress.moved_bytes)
+                });
+            let mut parts = vec![
+                format!("{} orders", orders.len()),
+                format!("{} files", thousands(files)),
+                bytes(total),
+            ];
             if filling > 0 {
                 parts.push(format!("{filling} filling"));
                 parts.push(format!("{}/s", bytes(self.rate.per_second as u64)));
-                parts.push(bytes(moved));
+                parts.push(format!("{} moving", bytes(moved)));
             }
             dim(&parts.join(" · "))
         } else {
@@ -857,39 +869,39 @@ impl Shop<'_> {
         // disputed) and what it is doing (checking the pantry) — and one
         // word cannot carry both. The outcome owns the word and the
         // colour, always: an order does not stop being disputed because it
-        // is being looked at. The activity has a column of its own.
+        // is being looked at. Everything after it packs left: the activity
+        // when it is worth mentioning, then what is waiting or how long
+        // ago. A fixed column for each left most of the row empty.
         let (word, colour) = outcome_word(&session.state);
+        let mut tail = Vec::new();
         let activity = activity_column(working);
+        if !activity.is_empty() {
+            tail.push(activity);
+        }
         let waiting = session.conflicts.len() + session.blocked.len();
-        let detail = if waiting > 0 {
-            format!("{waiting} waiting")
+        if waiting > 0 {
+            tail.push(format!("{waiting} waiting"));
         } else if working.is_none() {
-            session
-                .age_seconds
-                .map(|age| format!("{age}s ago"))
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
+            if let Some(age) = session.age_seconds {
+                tail.push(format!("{age}s ago"));
+            }
+        }
+        let tail = tail.join(" · ");
         const MARKER: usize = 2;
         const GROUP: usize = 9;
+        const HOST: usize = 12;
         const OUTCOME: usize = 14;
-        const ACTIVITY: usize = 26;
-        const DETAIL: usize = 12;
         let loaf = 2 + 1 + BAGUETTE + 1;
-        let host = width
-            .saturating_sub(2 + MARKER + GROUP + 3 + loaf + 2 + OUTCOME + 1 + ACTIVITY + 1 + DETAIL)
-            .clamp(8, 30);
+        let room = width.saturating_sub(2 + MARKER + GROUP + 3 + HOST + 2 + loaf + 2 + OUTCOME + 1);
         format!(
-            "  {}{} {} {}  {}  {} {} {}",
+            "  {}{} {} {}  {}  {} {}",
             if here { "\x1b[7m▸\x1b[0m " } else { "  " },
             pad(&dim(&shorten(group, GROUP)), GROUP),
             dim("→"),
-            pad(&shorten(&self.host_name(&session.host), host), host),
+            pad(&shorten(&self.host_name(&session.host), HOST), HOST),
             baguette(session, working.map(|progress| progress.phase), self.frame),
             pad(&format!("{colour}{word}\x1b[0m"), OUTCOME),
-            pad(&dim(&shorten(&activity, ACTIVITY)), ACTIVITY),
-            dim(&shorten(&detail, DETAIL)),
+            dim(&shorten(&tail, room)),
         )
     }
 
@@ -1561,6 +1573,8 @@ mod tests {
             staged_total: 0,
             staged_bytes: 0,
             staged_bytes_total: 0,
+            moved_files: 0,
+            moved_bytes: 0,
             applied: 0,
             applied_total: 0,
             remaining_seconds: None,

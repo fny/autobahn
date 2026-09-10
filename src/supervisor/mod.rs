@@ -146,6 +146,12 @@ pub struct SessionStatus {
     /// The entry count beta's last completed scan reported.
     #[serde(default)]
     pub beta_entries: u64,
+    /// Files and bytes moved over the session's life, carried across
+    /// restarts. The shop's tally.
+    #[serde(default)]
+    pub moved_files: u64,
+    #[serde(default)]
+    pub moved_bytes: u64,
 }
 
 /// The outcome of one session's participation in a single-pass run.
@@ -304,6 +310,7 @@ impl Supervisor {
                     if status.beta_entries > 0 {
                         progress.beta.seed_expected(status.beta_entries);
                     }
+                    progress.seed_moved(status.moved_files, status.moved_bytes);
                 }
                 progress
             })
@@ -634,6 +641,8 @@ impl<'a> Worker<'a> {
             updated_at: epoch_seconds(),
             alpha_entries: self.progress.alpha.expected_total(),
             beta_entries: self.progress.beta.expected_total(),
+            moved_files: self.progress.moved().0,
+            moved_bytes: self.progress.moved().1,
         };
         self.publish(&status);
         if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
@@ -680,6 +689,8 @@ impl<'a> Worker<'a> {
             updated_at: epoch_seconds(),
             alpha_entries: self.progress.alpha.expected_total(),
             beta_entries: self.progress.beta.expected_total(),
+            moved_files: self.progress.moved().0,
+            moved_bytes: self.progress.moved().1,
         };
         match result {
             Ok((digest, report)) => {
@@ -1976,6 +1987,8 @@ mod tests {
             error: None,
             updated_at: 12345,
             alpha_entries: 1_000,
+            moved_files: 0,
+            moved_bytes: 0,
             beta_entries: 1_002,
         };
         write_status(directory.path(), "abc123", &status).expect("status should write");

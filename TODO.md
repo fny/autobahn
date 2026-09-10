@@ -338,6 +338,15 @@ both now fixed on the live system.
   folded encoding and request the agent's, and diff the two trees — the
   first differing node names the fold rule the two sides disagree on.
 
+- [ ] **The control socket is not versioned.** Adding two fields to
+  `ProgressSnapshot` made every new CLI read the still-healthy running
+  supervisor as "reports running, but is not answering" until the service
+  was restarted — the bincode frame no longer decoded, and the failure
+  looked like an outage. Same class as the agent epoch, one hop closer to
+  home. Either carry the version in the control request and answer a
+  mismatch with "restart the service to match this build", or make the
+  snapshot self-describing.
+
 ## Carried over (not yet asked for, noted so they aren't lost)
 
 - [ ] 21 blocked paths on `fny.voltai.party` — root-owned

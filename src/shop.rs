@@ -1074,7 +1074,7 @@ impl Shop<'_> {
                 ("↑↓", "choose"),
                 ("⏎", "details"),
                 ("f", "rush"),
-                ("h", "help"),
+                ("?", "help"),
                 ("q", "quit"),
             ],
             (Some(_), Some(Act::Conflicts(_))) => &[
@@ -1371,9 +1371,8 @@ fn parse(bytes: &[u8]) -> (Vec<Key>, Vec<u8>) {
             [0x1b, ..] => (Some(Key::Close), 1),
             [b'k', ..] => (Some(Key::Up), 1),
             [b'j', ..] => (Some(Key::Down), 1),
-            // `h` is help, not vim-left: the words on this screen need
-            // explaining more than a second binding for `←` does.
-            [b'h', ..] | [b'?', ..] => (Some(Key::Help), 1),
+            [b'h', ..] => (Some(Key::Close), 1),
+            [b'?', ..] => (Some(Key::Help), 1),
             [b'l', ..] | [b'\r', ..] | [b'\n', ..] => (Some(Key::Open), 1),
             [b'f', ..] => (Some(Key::Flush), 1),
             [b'o', ..] => (Some(Key::Keep(Winner::Alpha)), 1),

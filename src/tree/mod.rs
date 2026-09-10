@@ -143,6 +143,17 @@ pub struct Problem {
     pub path: String,
     /// The problem description.
     pub message: String,
+    /// Whether the filesystem was found to disagree with the snapshot the
+    /// operation was validated against — a file changed since the scan,
+    /// an entry of another type where a directory was recorded, content
+    /// that appeared unannounced. That is the one kind of problem that
+    /// proves the snapshot stale and justifies a full rescan. A refusal
+    /// the snapshot predicted — a permission the endpoint lacks, a name
+    /// that folds onto an existing one — says nothing about the snapshot,
+    /// and treating it as though it did cost a full walk of the root on
+    /// every cycle for as long as the refusal stood.
+    #[serde(default)]
+    pub disagreement: bool,
 }
 
 /// Joins a parent path and a child name using the synchronization path
@@ -293,6 +304,7 @@ impl Node {
                 problems.push(Problem {
                     path: components.join("/"),
                     message: message.clone(),
+                    disagreement: false,
                 });
                 return;
             }

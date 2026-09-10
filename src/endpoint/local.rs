@@ -184,49 +184,153 @@ impl PendingChanges {
     }
 }
 
-/// A recursive filesystem watcher over the synchronization root, recording
-/// changed paths for incremental scanning and signaling waiters.
+/// Watches `start` and every directory beneath it that the scanner would
+/// visit, one non-recursive watch each, skipping ignored directories and
+/// never following symbolic links.
+///
+/// A directory that vanished or cannot be read is skipped, exactly as the
+/// backend's own recursive walk skips it. Anything else — the kernel's
+/// watch limit above all — fails the whole watch, so the observer falls
+/// back to polling and says so, rather than watching part of the tree in
+/// silence.
+#[cfg(target_os = "linux")]
+fn watch_tree(
+    watcher: &Mutex<notify::RecommendedWatcher>,
+    root: &Path,
+    start: &Path,
+    ignores: &crate::scan::IgnoreSet,
+) -> Result<()> {
+    use notify::Watcher;
+    let relative = |path: &Path| -> Option<String> {
+        let mut parts = Vec::new();
+        for component in path.strip_prefix(root).ok()?.components() {
+            let std::path::Component::Normal(name) = component else {
+                return None;
+            };
+            parts.push(name.to_str()?.to_owned());
+        }
+        Some(parts.join("/"))
+    };
+    let mut stack = vec![start.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        // Ignores are consulted on the way in, as the scanner does. A name
+        // that cannot be expressed cannot be matched, and is watched — the
+        // safe direction.
+        if dir != root {
+            if let Some(relative) = relative(&dir) {
+                if ignores.ignored(&relative, true) {
+                    continue;
+                }
+            }
+        }
+        if let Err(error) = watcher
+            .lock()
+            .expect("the watcher lock is never poisoned")
+            .watch(&dir, notify::RecursiveMode::NonRecursive)
+        {
+            let skippable = match &error.kind {
+                notify::ErrorKind::PathNotFound => true,
+                notify::ErrorKind::Io(io) => matches!(
+                    io.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied
+                ),
+                _ => false,
+            };
+            if skippable {
+                continue;
+            }
+            return Err(anyhow::Error::new(error))
+                .with_context(|| format!("unable to watch {}", dir.display()));
+        }
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            // `symlink_metadata`, so a link to a directory is not a
+            // directory here: the watch never follows links.
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A filesystem watcher over the synchronization root, recording changed
+/// paths for incremental scanning and signaling waiters.
+///
+/// On Linux the watch is built here rather than by the backend, and it
+/// skips ignored directories. The backend's recursive mode walks every
+/// directory under the root and takes one kernel watch for each, ignored
+/// or not: on a root of 325,509 directories of which 39,252 are scanned,
+/// that walk took ~20 seconds and then failed on the kernel's watch limit
+/// deep inside a `.venv` — and the failure retried every 30 seconds,
+/// inside the scan request, for days, reported to a discarded stderr.
+/// Watching only what the scanner would visit keeps the count at what the
+/// tree actually needs, and keeps writes into build output out of the
+/// change record entirely.
 pub(crate) struct ChangeWatcher {
-    /// The watcher itself, retained for its lifetime side effect.
+    /// The watcher itself, retained for its lifetime side effect. On Linux
+    /// it is shared with the dispatch thread that extends it to
+    /// directories appearing after the watch was built.
+    #[cfg(target_os = "linux")]
+    _watcher: Arc<Mutex<notify::RecommendedWatcher>>,
+    #[cfg(not(target_os = "linux"))]
     _watcher: notify::RecommendedWatcher,
     /// The changed paths recorded since the last scan consumed them.
     pending: Arc<Mutex<PendingChanges>>,
 }
 
+impl PendingChanges {
+    /// Records one backend event: its paths, or the fact that the record
+    /// can no longer be trusted.
+    fn record(&mut self, event: notify::Result<notify::Event>) {
+        match event {
+            // A backend that lost events (a kernel queue overflow) flags the
+            // fact rather than reporting the paths.
+            Ok(event) if event.need_rescan() => self.give_up(),
+            Ok(event) => {
+                if self.paths.len() + event.paths.len() > MAXIMUM_PENDING_PATHS {
+                    self.give_up();
+                } else if !self.incomplete {
+                    self.paths.extend(event.paths);
+                }
+            }
+            Err(_) => self.give_up(),
+        }
+    }
+}
+
 impl ChangeWatcher {
-    /// Establishes a recursive watch over `root`, calling `notify` whenever
-    /// an event lands.
+    /// Establishes a watch over `root`, calling `notify` whenever an event
+    /// lands.
     ///
     /// The callback carries no payload: the paths accumulate in `pending`,
     /// and what a waiter needs to know is only that *something* happened.
     /// It runs on the watcher's own thread, so it must not block — the
     /// observer's signal takes a lock it holds for a counter increment and
     /// nothing more.
-    pub(crate) fn new(root: &Path, notify: impl Fn() + Send + 'static) -> Result<ChangeWatcher> {
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn new(
+        root: &Path,
+        _ignores: crate::scan::IgnoreSet,
+        notify: impl Fn() + Send + 'static,
+    ) -> Result<ChangeWatcher> {
         use notify::Watcher;
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                {
-                    let mut pending = recorder.lock().expect("the pending lock is never poisoned");
-                    match event {
-                        // A backend that lost events (a kernel queue overflow)
-                        // flags the fact rather than reporting the paths.
-                        Ok(event) if event.need_rescan() => pending.give_up(),
-                        Ok(event) => {
-                            if pending.paths.len() + event.paths.len() > MAXIMUM_PENDING_PATHS {
-                                pending.give_up();
-                            } else if !pending.incomplete {
-                                pending.paths.extend(event.paths);
-                            }
-                        }
-                        Err(_) => pending.give_up(),
-                    }
-                }
+                recorder
+                    .lock()
+                    .expect("the pending lock is never poisoned")
+                    .record(event);
                 notify();
             })
             .context("unable to create a filesystem watcher")?;
+        // FSEvents watches a tree natively, with one registration; there
+        // is nothing to prune.
         watcher
             .watch(root, notify::RecursiveMode::Recursive)
             .with_context(|| format!("unable to watch {}", root.display()))?;
@@ -234,6 +338,84 @@ impl ChangeWatcher {
             _watcher: watcher,
             pending,
         })
+    }
+
+    /// Establishes a watch over `root`, calling `notify` whenever an event
+    /// lands. See the type's documentation for why the walk is done here.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn new(
+        root: &Path,
+        ignores: crate::scan::IgnoreSet,
+        notify: impl Fn() + Send + 'static,
+    ) -> Result<ChangeWatcher> {
+        let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        // Events cross a channel to a thread that owns the watcher.
+        // Extending the watch to a directory that just appeared needs the
+        // watcher, and the backend's callback cannot reach it.
+        let (sender, events) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+            let _ = sender.send(event);
+        })
+        .context("unable to create a filesystem watcher")?;
+        let watcher = Arc::new(Mutex::new(watcher));
+        watch_tree(&watcher, root, root, &ignores)?;
+
+        let recorder = Arc::clone(&pending);
+        let extender = Arc::downgrade(&watcher);
+        let root = root.to_path_buf();
+        std::thread::Builder::new()
+            .name("autobahn-watch".into())
+            .spawn(move || {
+                while let Ok(event) = events.recv() {
+                    // Ends with the watcher: dropping the `ChangeWatcher`
+                    // drops the last strong reference, the backend and its
+                    // sender with it, and the receive above then fails.
+                    let Some(watcher) = extender.upgrade() else {
+                        break;
+                    };
+                    // A directory that appeared, or arrived by rename, is
+                    // watched before its event is recorded, so the scan the
+                    // event provokes runs with the watch already in place.
+                    // A tree created faster than events arrive is walked on
+                    // the way in, which is what makes an untar safe.
+                    if let Ok(event) = &event {
+                        if matches!(
+                            event.kind,
+                            notify::EventKind::Create(_)
+                                | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                        ) {
+                            for path in &event.paths {
+                                let is_directory = std::fs::symlink_metadata(path)
+                                    .map(|metadata| metadata.is_dir())
+                                    .unwrap_or(false);
+                                if is_directory {
+                                    let _ = watch_tree(&watcher, &root, path, &ignores);
+                                }
+                            }
+                        }
+                    }
+                    recorder
+                        .lock()
+                        .expect("the pending lock is never poisoned")
+                        .record(event);
+                    notify();
+                }
+            })
+            .context("unable to start the watch dispatch thread")?;
+        Ok(ChangeWatcher {
+            _watcher: watcher,
+            pending,
+        })
+    }
+
+    /// The raw paths recorded so far, for tests of what the watch sees.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn recorded(&self) -> Vec<PathBuf> {
+        self.pending
+            .lock()
+            .expect("the pending lock is never poisoned")
+            .paths
+            .clone()
     }
 
     /// Records paths this process is about to change, exactly as the
@@ -1179,15 +1361,19 @@ impl Endpoint for LocalEndpoint {
         self.observer
             .invalidate(transitions.iter().map(|change| change.path.as_str()));
 
-        // A problem means the filesystem disagreed with the snapshot the
+        // A disagreement means the filesystem differed from the snapshot the
         // transition was validated against, so the snapshot is known to be
         // wrong somewhere. Incremental scanning trusts the snapshot for
         // everything a watcher has not flagged, and a watcher notification
         // may not even have been delivered yet — so the next scan reads
         // everything rather than adopting a record already proven stale.
-        if !outcome.problems.is_empty() {
+        if outcome.problems.iter().any(|problem| problem.disagreement) {
             // Shared, so every session over this root is told: the baseline
-            // they would all adopt is the one proven wrong.
+            // they would all adopt is the one proven wrong. Only a
+            // *disagreement* earns this. A refusal the snapshot predicted —
+            // a permission, a folded name — proves nothing about the
+            // snapshot, and one that stands for weeks would otherwise force
+            // a full walk of the root every cycle for as long as it stood.
             self.observer.distrust_baseline();
         }
 
@@ -1400,6 +1586,18 @@ impl Transitioner<'_> {
         self.problems.push(Problem {
             path: path.to_owned(),
             message: message.into(),
+            disagreement: false,
+        });
+    }
+
+    /// Records a problem that proves the snapshot wrong: the disk holds
+    /// something other than what the last scan recorded at this path. See
+    /// [`Problem::disagreement`] for why this is kept apart from a refusal.
+    fn disagreement(&mut self, path: &str, message: impl Into<String>) {
+        self.problems.push(Problem {
+            path: path.to_owned(),
+            message: message.into(),
+            disagreement: true,
         });
     }
 
@@ -1894,7 +2092,7 @@ impl Transitioner<'_> {
         match &expectation.content {
             Content::File { digest, .. } => {
                 if let Err(message) = self.validate_file(path, &metadata, digest) {
-                    self.problem(path, format!("refusing to remove this file: {message}"));
+                    self.disagreement(path, format!("refusing to remove this file: {message}"));
                     return Some(expectation.clone());
                 }
                 match fs::remove_file(target) {
@@ -1907,7 +2105,7 @@ impl Transitioner<'_> {
             }
             Content::Symlink { target: expected } => {
                 if !metadata.file_type().is_symlink() {
-                    self.problem(
+                    self.disagreement(
                         path,
                         "refusing to remove this entry: expected a symbolic link, but found other content",
                     );
@@ -1916,7 +2114,7 @@ impl Transitioner<'_> {
                 match fs::read_link(target) {
                     Ok(actual) if actual.to_str() == Some(expected.as_str()) => {}
                     Ok(_) => {
-                        self.problem(
+                        self.disagreement(
                             path,
                             "refusing to remove this symbolic link: it has been retargeted since the last scan",
                         );
@@ -1955,7 +2153,7 @@ impl Transitioner<'_> {
         expectation: &Node,
     ) -> Option<Node> {
         if !metadata.file_type().is_dir() {
-            self.problem(
+            self.disagreement(
                 path,
                 "refusing to remove this entry: expected a directory, but found other content",
             );
@@ -2021,7 +2219,7 @@ impl Transitioner<'_> {
                         Some(Content::Untracked)
                     );
                     if !excluded {
-                        self.problem(
+                        self.disagreement(
                             &child_path,
                             "refusing to remove unexpected content that appeared since the last scan",
                         );
@@ -2117,7 +2315,7 @@ impl Transitioner<'_> {
                 }
             };
             if let Err(message) = self.validate_file(path, &metadata, old_digest) {
-                self.problem(path, format!("refusing to replace this file: {message}"));
+                self.disagreement(path, format!("refusing to replace this file: {message}"));
                 return Some(old.clone());
             }
 
@@ -3292,6 +3490,41 @@ mod tests {
         assert_eq!(read(&fixture.beta_root, "new/copy.txt"), "shared content");
     }
 
+    /// A refusal the snapshot predicted is not a disagreement. The parent
+    /// directory refuses the write, and the snapshot said nothing wrong
+    /// about it — so this must not be recorded as proof that the snapshot
+    /// is stale, which is what used to force a full walk of the root on
+    /// every cycle for as long as a refusal like this stood.
+    #[test]
+    fn a_refused_write_is_not_a_disagreement() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new();
+        write(&fixture.alpha_root, "locked/new.txt", "arriving");
+        std::fs::create_dir_all(fixture.beta_root.join("locked")).unwrap();
+        let alpha = fixture.alpha.scan().expect("scan should succeed");
+        fixture.beta.scan().expect("scan should succeed");
+        let expectation = node_at(&alpha, "locked/new.txt");
+        let locked = fixture.beta_root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let outcome = fixture
+            .beta
+            .transition(vec![Change {
+                path: "locked/new.txt".into(),
+                old: None,
+                new: Some(expectation),
+            }])
+            .expect("transition should succeed");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
+        assert!(
+            !outcome.problems[0].disagreement,
+            "a permission refusal was recorded as a disagreement: {}",
+            outcome.problems[0].message
+        );
+    }
+
     #[test]
     fn refuses_to_remove_a_file_modified_since_the_scan() {
         let mut fixture = Fixture::new();
@@ -3321,6 +3554,9 @@ mod tests {
             "{}",
             outcome.problems[0].message
         );
+        // The disk disagreed with the snapshot: that is what earns a full
+        // rescan, and it is recorded as such.
+        assert!(outcome.problems[0].disagreement);
         // The content survives, and the result reflects that.
         assert_eq!(
             read(&fixture.beta_root, "keep.txt"),
@@ -4347,6 +4583,95 @@ mod tests {
         assert_eq!(
             folded_twin(directory.path(), "REPORT.MD"),
             Some(("Report.md".to_owned(), "casing collision"))
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod watch_tests {
+    use super::ChangeWatcher;
+    use crate::scan::IgnoreSet;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    fn recorded_within(watcher: &ChangeWatcher, wanted: &Path, deadline: Duration) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if watcher.recorded().iter().any(|path| path == wanted) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// The point of building the watch here: an ignored directory has no
+    /// watch, so a write beneath it is never even seen — it costs no kernel
+    /// watch and no entry in the change record.
+    #[test]
+    fn an_ignored_directory_is_not_watched() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("kept")).unwrap();
+        std::fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
+        let ignores = IgnoreSet::new(&["node_modules".to_string()]).expect("ignores");
+        let watcher = ChangeWatcher::new(root.path(), ignores, || {}).expect("watch");
+
+        std::fs::write(root.path().join("kept/a"), b"a").unwrap();
+        std::fs::write(root.path().join("node_modules/pkg/b"), b"b").unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("kept/a"),
+            Duration::from_secs(3)
+        ));
+        std::thread::sleep(Duration::from_millis(300));
+        let ignored = root.path().join("node_modules");
+        let recorded = watcher.recorded();
+        assert!(
+            recorded.iter().all(|path| !path.starts_with(&ignored)),
+            "a write beneath an ignored directory was recorded: {recorded:?}"
+        );
+    }
+
+    /// A directory that appears after the watch was built is watched
+    /// before its own event is recorded, so what is then written beneath
+    /// it is seen — unless it is ignored, in which case it is left alone
+    /// exactly like one that was there from the start.
+    #[test]
+    fn a_directory_that_appears_later_is_watched_unless_ignored() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let ignores = IgnoreSet::new(&["target".to_string()]).expect("ignores");
+        let watcher = ChangeWatcher::new(root.path(), ignores, || {}).expect("watch");
+
+        std::fs::create_dir(root.path().join("fresh")).unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("fresh"),
+            Duration::from_secs(3)
+        ));
+        std::fs::write(root.path().join("fresh/f"), b"f").unwrap();
+        assert!(
+            recorded_within(
+                &watcher,
+                &root.path().join("fresh/f"),
+                Duration::from_secs(3)
+            ),
+            "a file beneath a directory that appeared later was not seen"
+        );
+
+        std::fs::create_dir(root.path().join("target")).unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("target"),
+            Duration::from_secs(3)
+        ));
+        std::fs::write(root.path().join("target/out"), b"o").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            !watcher
+                .recorded()
+                .iter()
+                .any(|path| path == &root.path().join("target/out")),
+            "a write beneath an ignored directory that appeared later was recorded"
         );
     }
 }

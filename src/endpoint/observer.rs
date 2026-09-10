@@ -209,7 +209,11 @@ impl RootObserver {
             }
         }
         let signal = Arc::clone(&self.signal);
-        match crate::endpoint::local::ChangeWatcher::new(&self.key.root, move || signal.advance()) {
+        match crate::endpoint::local::ChangeWatcher::new(
+            &self.key.root,
+            self.ignores.clone(),
+            move || signal.advance(),
+        ) {
             Ok(watcher) => {
                 if state.watch_retry_after.take().is_some() {
                     eprintln!("[{}] watching resumed", self.key.root.display());

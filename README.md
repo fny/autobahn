@@ -411,6 +411,12 @@ apps/macos/build.sh          # builds Autobahn.app
 open apps/macos/Autobahn.app # or drag it to /Applications
 ```
 
+`release.sh` is the other half, and only for an app someone downloads:
+it signs with a Developer ID certificate, sends the result to Apple to be
+scanned, and staples the verdict to the bundle so Gatekeeper trusts it
+offline. A copy that arrives by `scp`, or through autobahn itself, is
+never quarantined and never needs any of that.
+
 The app is a way to launch `autobahn tray`, not a second implementation
 of it: the same binary, the same `resolve` a terminal would run. What the
 bundle adds is an *identity*. macOS attaches a notification's icon to the

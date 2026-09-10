@@ -69,6 +69,9 @@ enum Act {
     /// that would clear them go to the clipboard instead: they are `sudo`
     /// over ssh, and a password prompt has nowhere to appear here.
     Blocked(Vec<String>),
+    /// A row that only tells you something. Every order can be opened, and
+    /// a healthy one has nothing to act on — but plenty worth reading.
+    Nothing,
 }
 
 /// One line of the counter's tree.
@@ -312,9 +315,6 @@ impl Shop<'_> {
         let Some((group, session)) = orders.get(self.cursor) else {
             return;
         };
-        if session.conflicts.is_empty() && session.blocked.is_empty() {
-            return;
-        }
         self.counter = Some(Counter {
             group: (*group).to_owned(),
             host: session.host.clone(),
@@ -488,10 +488,63 @@ impl Shop<'_> {
     /// supervisor finds without any state of its own beyond which keys are
     /// open. A branch that disappears takes its expansion with it.
     fn rows(&self) -> Vec<Row> {
-        let Some((_, session)) = self.at_counter() else {
+        let Some((group, session)) = self.at_counter() else {
             return Vec::new();
         };
         let mut rows = Vec::new();
+
+        // What the order is, before what is wrong with it. A healthy order
+        // has nothing to settle and is worth opening anyway: this is the
+        // only place the shop says where a session syncs from and to, how
+        // long it has been running, and how much it has carried.
+        let alpha = self
+            .report
+            .groups
+            .iter()
+            .find(|candidate| candidate.name == group)
+            .map(|candidate| candidate.alpha.clone())
+            .unwrap_or_default();
+        let mut fact = |label: &str, detail: String| {
+            if !detail.is_empty() {
+                rows.push(Row {
+                    depth: 0,
+                    key: format!("fact:{label}"),
+                    label: label.to_owned(),
+                    detail,
+                    children: false,
+                    act: Act::Nothing,
+                });
+            }
+        };
+        fact("from", alpha);
+        fact("to", session.beta.clone());
+        fact("mode", session.mode.clone());
+        let cycles = match session.age_seconds {
+            Some(age) => format!("{} · last {age}s ago", thousands(session.cycles)),
+            None => thousands(session.cycles),
+        };
+        fact("cycles", cycles);
+        if let Some(progress) = &session.progress {
+            let entries = match (progress.alpha.expected, progress.beta.expected) {
+                (Some(a), Some(b)) => format!("{} here · {} there", thousands(a), thousands(b)),
+                (Some(a), None) | (None, Some(a)) => thousands(a),
+                (None, None) => String::new(),
+            };
+            fact("entries", entries);
+            if progress.moved_files > 0 {
+                fact(
+                    "carried",
+                    format!(
+                        "{} files · {}",
+                        thousands(progress.moved_files),
+                        bytes(progress.moved_bytes)
+                    ),
+                );
+            }
+        }
+        if let Some(error) = &session.error {
+            fact("error", error.clone());
+        }
 
         if !session.conflicts.is_empty() {
             let paths: Vec<&str> = session
@@ -923,12 +976,20 @@ impl Shop<'_> {
                     ),
                     // What is waiting is the number of things wrong, not
                     // the number of headings they group under.
-                    &format!(
-                        "\x1b[33m{} waiting\x1b[0m",
-                        self.at_counter()
-                            .map_or(0, |(_, session)| session.conflicts.len()
-                                + session.blocked.len())
-                    ),
+                    &match self.at_counter() {
+                        // Nothing is waiting on a healthy order, and
+                        // "0 waiting" in warning yellow is a warning about
+                        // nothing. It says what the order is instead.
+                        Some((_, session)) => {
+                            let waiting = session.conflicts.len() + session.blocked.len();
+                            let (word, colour) = outcome_word(&session.state);
+                            match waiting {
+                                0 => format!("{colour}{word}\x1b[0m"),
+                                many => format!("\x1b[33m{many} waiting\x1b[0m"),
+                            }
+                        }
+                        None => String::new(),
+                    },
                     inner.saturating_sub(2)
                 ),
                 dim("│")
@@ -1002,17 +1063,14 @@ impl Shop<'_> {
                 ("b", "both"),
                 ("q", "quit"),
             ],
+            (Some(_), Some(Act::Nothing)) | (Some(_), None) => {
+                &[("↑↓", "choose"), ("←", "back"), ("q", "quit")]
+            }
             (Some(_), Some(Act::Blocked(_))) => &[
                 ("↑↓", "choose"),
                 ("⏎", "open"),
                 ("←", "back"),
                 ("c", "copy the fix"),
-                ("q", "quit"),
-            ],
-            (Some(_), None) => &[
-                ("↑↓", "choose"),
-                ("⏎", "open"),
-                ("←", "back"),
                 ("q", "quit"),
             ],
         };

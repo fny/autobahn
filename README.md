@@ -369,9 +369,11 @@ the work has gone on long enough to be worth mentioning: the same rule
 `status` applies, so a routine scan is never announced and one that
 drags names itself without displacing the outcome.
 
-**The counter** is the useful half. `⏎` on an order opens its issues as a
-tree — cause, then place, then path — and every level can be acted on, so
-one keypress settles a whole directory or a single file.
+**The counter** is the useful half. `⏎` opens any order — where it syncs
+from and to, its mode, how many cycles it has run and how much it has
+carried — and then its issues as a tree: cause, then place, then path.
+Every level of that tree can be acted on, so one keypress settles a whole
+directory or a single file.
 
 ```
   ┌──────────────────────────────────────────────────────────────┐

@@ -1820,8 +1820,9 @@ fn a_session_needing_attention_runs_the_configured_hook() {
         let reported = fs::read_to_string(&fired).expect("the hook wrote its environment");
         let fields: Vec<&str> = reported.split('|').collect();
         assert!(
-            fields[0].contains("work@") && fields[0].contains("conflicts"),
-            "the summary names the session and what is wrong: {reported}"
+            fields[0].contains("work → ") && fields[0].contains("1 conflict"),
+            "the summary names the session, source to destination, and what is \
+             wrong — in the singular, for one file: {reported}"
         );
         assert_eq!(fields[1], "conflicts", "the states are listed: {reported}");
         assert_eq!(fields[2], "alert", "the event is an alert: {reported}");

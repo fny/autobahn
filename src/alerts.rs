@@ -136,7 +136,12 @@ pub enum Fire {
     /// Sessions need attention. Carries the one-line summary and which
     /// alerts are present, for the hooks to be chosen and described.
     Alert {
+        /// One line: the whole story when there is one thing to say, a
+        /// count of things when there are several.
         summary: String,
+        /// One indented line per thing, for a hook that can show more than
+        /// a headline.
+        detail: String,
         alerts: BTreeSet<Alert>,
         sessions: usize,
         /// A repeat of an unchanged set rather than news.
@@ -236,6 +241,14 @@ impl Alerter {
     }
 
     /// Builds the description of a firing from the sessions it covers.
+    ///
+    /// Two shapes of trouble, told two ways. A path-level condition — a
+    /// conflict, a blocked path, a halt — belongs to a session and gets a
+    /// line naming it, source to destination. A host-level condition —
+    /// the machine is asleep, or refused the key — belongs to the host,
+    /// and every session on it says the same thing; five lines for one
+    /// sleeping laptop is noise, so they collapse to one line per host that
+    /// says how many groups are waiting on it.
     fn describe(
         &self,
         sessions: &[SessionAlerts],
@@ -243,13 +256,70 @@ impl Alerter {
         repeat: bool,
     ) -> Fire {
         let keys: BTreeSet<&String> = confirmed.iter().map(|(key, _)| key).collect();
-        let lines: Vec<String> = sessions
+        let alerting: Vec<&SessionAlerts> = sessions
             .iter()
             .filter(|session| keys.contains(&session.key()))
-            .map(|session| format!("{}: {}", session.key(), session.summary))
             .collect();
+        let hosts: Vec<&str> = alerting.iter().map(|s| s.host.as_str()).collect();
+
+        // Host first, so a host's sessions collapse; the reason is the
+        // first session's, and they all carry the same one.
+        let mut away: std::collections::BTreeMap<&str, (usize, &str)> =
+            std::collections::BTreeMap::new();
+        let mut lines = Vec::new();
+        let mut groups = BTreeSet::new();
+        for session in &alerting {
+            if session.alerts.contains(&Alert::Unreachable) {
+                away.entry(session.host.as_str())
+                    .or_insert((0, session.summary.as_str()))
+                    .0 += 1;
+            } else {
+                groups.insert(session.group.as_str());
+                lines.push(format!(
+                    "{} → {}: {}",
+                    session.group,
+                    short_host(&session.host, &hosts),
+                    session.summary
+                ));
+            }
+        }
+        let host_lines: Vec<String> = away
+            .iter()
+            .map(|(host, (count, reason))| {
+                format!(
+                    "{} {reason} — {} paused",
+                    short_host(host, &hosts),
+                    plural(*count, "group")
+                )
+            })
+            .collect();
+
+        // One thing: say it. Several: count them, and let the detail name
+        // them.
+        let summary = match (lines.len(), host_lines.len()) {
+            (1, 0) => lines[0].clone(),
+            (0, 1) => host_lines[0].clone(),
+            _ => {
+                let mut parts = Vec::new();
+                if !groups.is_empty() {
+                    let verb = if groups.len() == 1 { "needs" } else { "need" };
+                    parts.push(format!("{} {verb} you", plural(groups.len(), "group")));
+                }
+                if !host_lines.is_empty() {
+                    parts.push(format!("{} away", plural(host_lines.len(), "host")));
+                }
+                parts.join(", ")
+            }
+        };
+        let detail = lines
+            .iter()
+            .chain(host_lines.iter())
+            .map(|line| format!("  {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         Fire::Alert {
-            summary: lines.join("; "),
+            summary,
+            detail,
             alerts: confirmed.iter().map(|(_, alert)| *alert).collect(),
             sessions: keys.len(),
             repeat,
@@ -261,6 +331,38 @@ impl Alerter {
     /// in which hook is chosen.
     pub fn commands(&self, _fire: &Fire) -> Vec<String> {
         self.plan.on_alert.iter().cloned().collect()
+    }
+}
+
+/// `1 conflict`, `2 conflicts`. The one that used to read "1 conflicts" in
+/// every alert.
+pub(crate) fn plural(count: usize, word: &str) -> String {
+    match count {
+        1 => format!("1 {word}"),
+        _ => format!("{count} {word}s"),
+    }
+}
+
+/// A host name cut to its first label when that is enough to tell it from
+/// the others in the same alert. `fny.voltai.party` reads as `fny`; a local
+/// destination path is left alone, and so is a name whose first label
+/// another host shares.
+pub(crate) fn short_host(host: &str, all: &[&str]) -> String {
+    // Only a name with a domain behind its first label has anything to
+    // cut: `fny.voltai.party` is `fny`, but `faraz.vip` is already the
+    // name, and cut to `faraz` it would read as a person.
+    if host.contains('/') || host.matches('.').count() < 2 {
+        return host.to_owned();
+    }
+    let Some((first, _)) = host.split_once('.') else {
+        return host.to_owned();
+    };
+    let ambiguous = all
+        .iter()
+        .any(|other| *other != host && other.split('.').next() == Some(first));
+    match ambiguous {
+        true => host.to_owned(),
+        false => first.to_owned(),
     }
 }
 
@@ -377,12 +479,107 @@ mod tests {
     }
 
     fn session(host: &str, alerts: &[Alert]) -> SessionAlerts {
+        session_in("work", host, alerts, "summary")
+    }
+
+    fn session_in(group: &str, host: &str, alerts: &[Alert], summary: &str) -> SessionAlerts {
         SessionAlerts {
-            group: "work".into(),
+            group: group.into(),
             host: host.into(),
             alerts: alerts.to_vec(),
-            summary: "summary".into(),
+            summary: summary.into(),
         }
+    }
+
+    /// Five sessions on one sleeping laptop are one fact, not five.
+    #[test]
+    fn a_host_that_is_away_is_one_line_however_many_groups_wait_on_it() {
+        let mut alerter = Alerter::new(plan());
+        let start = Instant::now();
+        let sessions = [
+            session_in("aws", "boite", &[Alert::Unreachable], "is unreachable"),
+            session_in("shared", "boite", &[Alert::Unreachable], "is unreachable"),
+            session_in("vibe", "boite", &[Alert::Unreachable], "is unreachable"),
+        ];
+        alerter.observe(&sessions, start);
+        let Some(Fire::Alert {
+            summary,
+            detail,
+            sessions,
+            ..
+        }) = alerter.observe(&sessions, start + Duration::from_secs(31))
+        else {
+            panic!("expected an alert");
+        };
+        assert_eq!(summary, "boite is unreachable — 3 groups paused");
+        assert_eq!(detail, "  boite is unreachable — 3 groups paused");
+        assert_eq!(sessions, 3);
+    }
+
+    /// A single thing is said outright; several are counted, and the
+    /// detail names each one, source to destination, with the host cut to
+    /// what tells it apart.
+    #[test]
+    fn several_things_are_counted_in_the_headline_and_named_in_the_detail() {
+        let mut alerter = Alerter::new(plan());
+        let start = Instant::now();
+        let sessions = [
+            session_in(
+                "voltai",
+                "fny.voltai.party",
+                &[Alert::Conflicts],
+                "1 conflict",
+            ),
+            session_in("vibe", "faraz.vip", &[Alert::Conflicts], "57 conflicts"),
+            session_in("aws", "boite", &[Alert::Unreachable], "refused the key"),
+        ];
+        alerter.observe(&sessions, start);
+        let Some(Fire::Alert {
+            summary, detail, ..
+        }) = alerter.observe(&sessions, start + Duration::from_secs(31))
+        else {
+            panic!("expected an alert");
+        };
+        assert_eq!(summary, "2 groups need you, 1 host away");
+        assert_eq!(
+            detail,
+            "  voltai → fny: 1 conflict\n  vibe → faraz.vip: 57 conflicts\n  boite refused the key — 1 group paused"
+        );
+
+        // And one thing alone is the whole headline.
+        let mut alerter = Alerter::new(plan());
+        let one = [session_in(
+            "voltai",
+            "fny.voltai.party",
+            &[Alert::Blocked],
+            "21 blocked paths",
+        )];
+        alerter.observe(&one, start);
+        let Some(Fire::Alert { summary, .. }) =
+            alerter.observe(&one, start + Duration::from_secs(31))
+        else {
+            panic!("expected an alert");
+        };
+        assert_eq!(summary, "voltai → fny: 21 blocked paths");
+    }
+
+    #[test]
+    fn words_are_counted_correctly_and_hosts_are_cut_only_when_unambiguous() {
+        assert_eq!(plural(1, "conflict"), "1 conflict");
+        assert_eq!(plural(2, "conflict"), "2 conflicts");
+        assert_eq!(plural(0, "group"), "0 groups");
+        assert_eq!(
+            short_host("fny.voltai.party", &["fny.voltai.party", "boite"]),
+            "fny"
+        );
+        assert_eq!(short_host("boite", &["boite"]), "boite");
+        assert_eq!(short_host("faraz.vip", &["faraz.vip"]), "faraz.vip");
+        assert_eq!(short_host("/Users/x/beta.d", &[]), "/Users/x/beta.d");
+        // Two hosts sharing a first label keep their full names.
+        assert_eq!(
+            short_host("fny.voltai.party", &["fny.voltai.party", "fny.example.org"]),
+            "fny.voltai.party"
+        );
     }
 
     #[test]
@@ -477,12 +674,17 @@ mod tests {
             .expect("the batch alerts");
         match fire {
             Fire::Alert {
-                sessions, summary, ..
+                sessions,
+                summary,
+                detail,
+                ..
             } => {
                 assert_eq!(sessions, 3);
-                assert_eq!(summary.matches("work@").count(), 3);
+                // Three hosts away at once: counted in the headline, one
+                // line each in the detail.
+                assert_eq!(summary, "3 hosts away");
+                assert_eq!(detail.lines().count(), 3);
             }
-            other => panic!("expected an alert, got {other:?}"),
         }
     }
 
@@ -522,7 +724,6 @@ mod tests {
                 assert_eq!(sessions, 2);
                 assert!(alerts.contains(&Alert::Halted));
             }
-            other => panic!("expected an alert, got {other:?}"),
         }
     }
 
@@ -612,7 +813,6 @@ mod tests {
                 assert_eq!(sessions, 1);
                 assert_eq!(alerts, BTreeSet::from([Alert::Halted]));
             }
-            other => panic!("expected an alert, got {other:?}"),
         }
         // The unreachable host joins only once its own period has passed.
         assert_eq!(
@@ -630,6 +830,7 @@ mod tests {
         let alerter = Alerter::new(plan());
         let fire = |alert| Fire::Alert {
             summary: String::new(),
+            detail: String::new(),
             alerts: BTreeSet::from([alert]),
             sessions: 1,
             repeat: false,

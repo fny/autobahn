@@ -1203,19 +1203,45 @@ pub fn alerts_for(status: &SessionStatus) -> Vec<crate::alerts::Alert> {
 
 /// How to describe a session's conditions in one line.
 pub fn alert_summary(status: &SessionStatus) -> String {
+    use crate::alerts::plural;
     let mut parts = Vec::new();
     match classify_state(status).as_str() {
-        state @ ("halted" | "unreachable" | "errored") => parts.push(state.to_owned()),
+        // Read after the host name: "boite refused the key".
+        "unreachable" => {
+            parts.push(unreachable_reason(status.error.as_deref().unwrap_or("")).to_owned())
+        }
+        state @ ("halted" | "errored") => parts.push(state.to_owned()),
         _ => {
             if !status.conflicts.is_empty() {
-                parts.push(format!("{} conflicts", status.conflicts.len()));
+                parts.push(plural(status.conflicts.len(), "conflict"));
             }
             if !status.blocked.is_empty() {
-                parts.push(format!("{} blocked", status.blocked.len()));
+                parts.push(plural(status.blocked.len(), "blocked path"));
             }
         }
     }
     parts.join(", ")
+}
+
+/// Why a destination could not be reached, from ssh's own words — which
+/// the error carries, now that a spawned agent's stderr is kept rather
+/// than discarded. A sleeping laptop and a rejected key both used to read
+/// "unreachable", and they ask for opposite things: wait, or go fix it.
+pub fn unreachable_reason(error: &str) -> &'static str {
+    if error.contains("Permission denied") {
+        "refused the key"
+    } else if error.contains("HOST IDENTIFICATION HAS CHANGED")
+        || error.contains("Host key verification failed")
+    {
+        "changed its host key"
+    } else if error.contains("Could not resolve hostname")
+        || error.contains("Name or service not known")
+        || error.contains("nodename nor servname provided")
+    {
+        "does not resolve"
+    } else {
+        "is unreachable"
+    }
 }
 
 /// Describes a conflict's sides from the changes reconciliation recorded
@@ -1397,14 +1423,16 @@ fn watch_alerts(
 
         if let Some(fire) = alerter.observe(&sessions, std::time::Instant::now()) {
             let commands = alerter.commands(&fire);
-            let (summary, count, states) = match &fire {
+            let (summary, detail, count, states) = match &fire {
                 Fire::Alert {
                     summary,
+                    detail,
                     alerts,
                     sessions,
                     ..
                 } => (
                     summary.clone(),
+                    detail.clone(),
                     *sessions,
                     alerts
                         .iter()
@@ -1415,6 +1443,7 @@ fn watch_alerts(
             };
             let environment = vec![
                 ("AUTOBAHN_SUMMARY".to_owned(), summary),
+                ("AUTOBAHN_DETAIL".to_owned(), detail),
                 ("AUTOBAHN_ALERT_COUNT".to_owned(), count.to_string()),
                 ("AUTOBAHN_STATES".to_owned(), states),
                 (
@@ -1566,6 +1595,28 @@ pub fn read_status(state_root: &Path, identifier: &str) -> Result<Option<Session
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_rejected_key_is_not_a_sleeping_laptop() {
+        assert_eq!(
+            unreachable_reason(
+                "unable to reach boite: claude@boite: Permission denied (publickey)."
+            ),
+            "refused the key"
+        );
+        assert_eq!(
+            unreachable_reason("WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!"),
+            "changed its host key"
+        );
+        assert_eq!(
+            unreachable_reason("ssh: Could not resolve hostname fny.voltai.party"),
+            "does not resolve"
+        );
+        assert_eq!(
+            unreachable_reason("ssh: connect to host boite port 22: Operation timed out"),
+            "is unreachable"
+        );
+    }
 
     /// The entry that blocks a conflict is almost never the entry the
     /// conflict is named after: a directory is refused because of one file

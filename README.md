@@ -270,8 +270,12 @@ usable rather than maddening:
 - **An alert fires when the set of sessions in trouble changes**, never on
   repetition. `repeat_after` opts into a nag; it is off by default.
 
-Hooks get `$AUTOBAHN_SUMMARY` (one line naming the sessions and what is
-wrong), `$AUTOBAHN_ALERT_COUNT`, `$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`,
+Hooks get `$AUTOBAHN_SUMMARY` (one line: the whole story when there is
+one thing wrong, a count when there are several — `voltai → fny: 1
+conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you,
+1 host away`), `$AUTOBAHN_DETAIL` (one indented line per thing, for a
+hook that can show more than a headline), `$AUTOBAHN_ALERT_COUNT`,
+`$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`,
 and the full `status --json` document on standard input. They run off the
 cycle and cannot affect or delay synchronization: a hook is killed if it
 outstays `timeout`, and is skipped while a previous one is still running.

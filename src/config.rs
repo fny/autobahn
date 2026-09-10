@@ -60,6 +60,11 @@ const DEFAULT_ALERT_TIMEOUT: Duration = Duration::from_secs(30);
 /// specify one.
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 
+/// How long everything must be clear before returning trouble is news.
+/// Long enough that a file two machines are both editing is reported once
+/// rather than on every return.
+const DEFAULT_SETTLE_AFTER: Duration = Duration::from_secs(15 * 60);
+
 /// The parsed configuration file.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -99,6 +104,10 @@ pub struct Alerts {
     /// How often to fire again while the alerting set is unchanged. Absent
     /// or zero never repeats.
     pub repeat_after: Option<DurationSpec>,
+    /// How long everything must stay clear before trouble returning counts
+    /// as news. Without it, a condition that comes and goes — two machines
+    /// editing one file — notifies on every return.
+    pub settle_after: Option<DurationSpec>,
     /// How long a hook may run before it is killed.
     pub timeout: Option<DurationSpec>,
     /// Per-state overrides of `alert_after`, keyed by state name.
@@ -405,6 +414,7 @@ impl Config {
             after,
             default_after: duration(&alerts.alert_after, "alert_after", DEFAULT_ALERT_AFTER)?,
             repeat_after: duration(&alerts.repeat_after, "repeat_after", Duration::ZERO)?,
+            settle_after: duration(&alerts.settle_after, "settle_after", DEFAULT_SETTLE_AFTER)?,
             timeout: duration(&alerts.timeout, "timeout", DEFAULT_ALERT_TIMEOUT)?,
         })
     }

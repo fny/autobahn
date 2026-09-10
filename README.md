@@ -271,6 +271,11 @@ usable rather than maddening:
   for a sleeping laptop than for a safety halt.
 - **An alert fires when the set of sessions in trouble changes**, never on
   repetition. `repeat_after` opts into a nag; it is off by default.
+- **Trouble that comes and goes is reported once.** A conflict on a file
+  two machines are both editing appears, clears, and returns all day.
+  Everything must stay clear for `settle_after` (15 minutes by default)
+  before a return counts as news rather than as the same trouble
+  continuing — otherwise one flapping session is a notification a minute.
 
 Hooks get `$AUTOBAHN_SUMMARY` (one line: the whole story when there is
 one thing wrong, a count when there are several — `voltai → fny: 1

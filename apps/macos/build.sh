@@ -19,6 +19,12 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp apps/macos/Info.plist "$APP/Contents/Info.plist"
 cp target/release/autobahn "$APP/Contents/MacOS/autobahn"
 cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
+# macOS tags a copied executable with com.apple.provenance, and codesign
+# refuses a bundle carrying one — with errSecInternalComponent, which
+# says nothing about attributes and sends you looking at the key instead.
+# Signing the same binary outside a bundle succeeds, which is what makes
+# it so misleading.
+xattr -cr "$APP"
 # Signed with the best identity in the keychain. An unsigned bundle is
 # refused a notification identity altogether, which is what the bundle is
 # for; ad-hoc earns one but is anonymous, so macOS treats every rebuild as
@@ -35,9 +41,12 @@ fi
 if [ -n "$IDENTITY" ]; then
     # The hardened runtime and a secure timestamp are what notarising
     # later requires, and cost nothing now.
-    codesign --force --deep --options runtime --timestamp \
+    # No --deep: Apple deprecated it, and on a bundle whose only code is
+    # the executable it produces a signature claiming resources that are
+    # not there. The fallback drops the timestamp, which needs the network.
+    codesign --force --options runtime --timestamp \
              --sign "$IDENTITY" "$APP" 2>/dev/null ||
-    codesign --force --deep --sign "$IDENTITY" "$APP"   # no network for the timestamp
+    codesign --force --options runtime --sign "$IDENTITY" "$APP"
     echo "signed as: $IDENTITY"
 else
     codesign --force --sign - "$APP"

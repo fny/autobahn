@@ -93,6 +93,9 @@ pub struct AlertPlan {
     /// never repeats, which is the default: a notification that returns
     /// while you are already working on it teaches you to ignore it.
     pub repeat_after: Duration,
+    /// How long a condition must be *gone* before its return counts as
+    /// news rather than as the same trouble continuing.
+    pub settle_after: Duration,
     /// How long a hook may run before it is killed.
     pub timeout: Duration,
 }
@@ -162,6 +165,9 @@ pub struct Alerter {
     /// The set most recently fired for, and when.
     fired: BTreeSet<(String, Alert)>,
     fired_at: Option<Instant>,
+    /// When the alerting set went empty, while the last firing is still
+    /// remembered. `None` means either nothing has fired or it has settled.
+    cleared_at: Option<Instant>,
 }
 
 impl Alerter {
@@ -171,6 +177,7 @@ impl Alerter {
             seen: HashMap::new(),
             fired: BTreeSet::new(),
             fired_at: None,
+            cleared_at: None,
         }
     }
 
@@ -226,14 +233,30 @@ impl Alerter {
         }
 
         if confirmed.is_empty() {
-            // Everything cleared. The state is reset so the next alert
-            // fires, and nothing is said: an all-clear is a notification
-            // that asks for nothing, and a stream of them is what teaches
-            // someone to stop reading the ones that do.
-            self.fired.clear();
-            self.fired_at = None;
+            // Everything cleared. Nothing is said — an all-clear is a
+            // notification that asks for nothing, and a stream of them is
+            // what teaches someone to stop reading the ones that do.
+            //
+            // But the record is not dropped yet. A conflict on a file two
+            // machines are both editing appears, clears, and returns all
+            // day; clearing here made every return count as news, and one
+            // flapping session produced a notification a minute. It has to
+            // stay gone for `settle_after` before its return is news
+            // again, which is the difference between "this is still going
+            // on" and "this has come back".
+            match self.cleared_at {
+                Some(at) if now.duration_since(at) >= self.plan.settle_after => {
+                    self.fired.clear();
+                    self.fired_at = None;
+                    self.cleared_at = None;
+                }
+                None if !self.fired.is_empty() => self.cleared_at = Some(now),
+                _ => {}
+            }
             return None;
         }
+        // Something is present again, so it never settled.
+        self.cleared_at = None;
 
         self.fired = confirmed.clone();
         self.fired_at = Some(now);
@@ -474,6 +497,7 @@ mod tests {
             on_alert: Some("notify".into()),
             default_after: Duration::from_secs(30),
             timeout: Duration::from_secs(10),
+            settle_after: Duration::from_secs(15 * 60),
             ..AlertPlan::default()
         }
     }
@@ -727,8 +751,45 @@ mod tests {
         }
     }
 
+    /// A conflict on a file two machines are both editing appears, clears,
+    /// and returns all day. Reported once: the second arrival is the same
+    /// trouble continuing, not news. Before this, one flapping session
+    /// produced a notification a minute.
     #[test]
-    fn clearing_says_nothing_but_does_reset_the_state() {
+    fn trouble_that_comes_and_goes_is_reported_once() {
+        let mut alerter = Alerter::new(plan());
+        let start = Instant::now();
+        let down = [session("boite", &[Alert::Conflicts])];
+        let up = [session("boite", &[])];
+        let mut at = |seconds: u64| start + Duration::from_secs(seconds);
+
+        alerter.observe(&down, at(0));
+        assert!(
+            alerter.observe(&down, at(31)).is_some(),
+            "the first is news"
+        );
+        // Three full flaps inside the settling period say nothing.
+        for cycle in 0..3 {
+            let base = 60 + cycle * 120;
+            assert_eq!(alerter.observe(&up, at(base)), None);
+            alerter.observe(&down, at(base + 30));
+            assert_eq!(
+                alerter.observe(&down, at(base + 61)),
+                None,
+                "flap {cycle} was announced again"
+            );
+        }
+        // Gone long enough to have settled, its return is news again.
+        assert_eq!(alerter.observe(&up, at(1_000)), None);
+        alerter.observe(&down, at(2_000));
+        assert!(
+            alerter.observe(&down, at(2_031)).is_some(),
+            "trouble returning after it settled is news"
+        );
+    }
+
+    #[test]
+    fn clearing_says_nothing_and_resets_only_once_it_has_settled() {
         let mut alerter = Alerter::new(plan());
         let start = Instant::now();
         let down = [session("a", &[Alert::Conflicts])];
@@ -743,10 +804,12 @@ mod tests {
         // someone to stop reading the ones that do.
         assert_eq!(alerter.observe(&up, start + Duration::from_secs(40)), None);
         assert_eq!(alerter.observe(&up, start + Duration::from_secs(50)), None);
-        // But the state is reset, so the next alert is news again.
-        alerter.observe(&down, start + Duration::from_secs(60));
+        // And the state is reset once it has stayed clear — trouble that
+        // returns before then is the same trouble, and says nothing. See
+        // `trouble_that_comes_and_goes_is_reported_once`.
+        alerter.observe(&down, start + Duration::from_secs(1_000));
         assert!(alerter
-            .observe(&down, start + Duration::from_secs(91))
+            .observe(&down, start + Duration::from_secs(1_031))
             .is_some());
     }
 

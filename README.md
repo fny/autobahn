@@ -355,14 +355,19 @@ answers and shuttered when none does. Every number on it is real — it
 reads the same `status --json` document as everything else.
 
 ```
-  ╔══════════════════════════════════════════════════════════════╗
-  ║               🥖  A U T O B Á N H   M Ì  🥖                  ║
-  ║ ◉ OPEN                    15 orders · 1 filling · 3.4 MB/s   ║
-  ╚══════════════════════════════════════════════════════════════╝
+  ◉ OPEN   🥖 AUTOBÁNH MÌ   15 orders · 1 filling · 3.4 MB/s
 
-  ▸ voltai   → fny.voltai.party   🥖[▓▓▓▓▓░░░░░░░]  filling   1,204 of 8,530
-    vibe     → boite              🥖[▓▓▓▓▓▓▓▓▓▓▓▓]  disputed  2 waiting
+  ▸ voltai   → fny     🥖[▓▓▓▓▓░░░░░░░]  served    filling · 1,204 of 8,530
+    vibe     → boite   🥖[▓▓▓▓▓▓▓▓▓▓▓▓]  disputed                         2 waiting
+    voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s   1 waiting
 ```
+
+An order is always *something* — served, disputed, out of stock — and
+sometimes also *doing* something. The first has the coloured word and
+never gives it up. The second has a column of its own, filled only once
+the work has gone on long enough to be worth mentioning: the same rule
+`status` applies, so a routine scan is never announced and one that
+drags names itself without displacing the outcome.
 
 **The counter** is the useful half. `⏎` on an order opens its issues as a
 tree — cause, then place, then path — and every level can be acted on, so

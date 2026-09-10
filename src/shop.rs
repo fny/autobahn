@@ -222,6 +222,19 @@ impl Shop<'_> {
             .sum()
     }
 
+    /// A host as the rail names it: cut to its first label when that is
+    /// enough to tell it from the others — the same rule the alerts use, so
+    /// `fny.voltai.party` is `fny` on both.
+    fn host_name(&self, host: &str) -> String {
+        let hosts: Vec<&str> = self
+            .report
+            .groups
+            .iter()
+            .flat_map(|group| group.sessions.iter().map(|session| session.host.as_str()))
+            .collect();
+        autobahn::alerts::short_host(host, &hosts)
+    }
+
     /// The order the counter is open on.
     fn at_counter(&self) -> Option<(&str, &SessionReport)> {
         let counter = self.counter.as_ref()?;
@@ -812,23 +825,11 @@ impl Shop<'_> {
         } else {
             String::new()
         };
-        let inner = width.saturating_sub(4);
-        vec![
-            dim(&format!("  ╔{}╗", "═".repeat(inner))),
-            format!(
-                "  {}{}{}",
-                dim("║"),
-                centered("🥖  \x1b[1mA U T O B Á N H   M Ì\x1b[0m  🥖", inner),
-                dim("║")
-            ),
-            format!(
-                "  {} {} {}",
-                dim("║"),
-                between(&lamp, &tally, inner.saturating_sub(2)),
-                dim("║")
-            ),
-            dim(&format!("  ╚{}╝", "═".repeat(inner))),
-        ]
+        // One line, read left to right: the lamp, the name, the tally. The
+        // boxed banner this replaces spent four rows of a small terminal on
+        // a border, and the name reads no worse without it.
+        let _ = width;
+        vec![format!("  {lamp}   🥖 \x1b[1mAUTOBÁNH MÌ\x1b[0m   {tally}")]
     }
 
     fn shuttered(&self, width: usize) -> Vec<String> {
@@ -852,65 +853,46 @@ impl Shop<'_> {
             .progress
             .as_ref()
             .filter(|progress| progress.phase.is_working());
-        let (word, colour) = match (
-            working.map(|progress| progress.phase),
-            session.state.as_str(),
-        ) {
-            (Some(Phase::Connecting), _) => ("taking the order", ""),
-            (Some(Phase::Scanning), _) => ("checking the pantry", ""),
-            (Some(Phase::Reconciling), _) => ("reading the ticket", ""),
-            (Some(Phase::Staging), _) => ("filling", ""),
-            (Some(Phase::Applying), _) => ("wrapping", ""),
-            (Some(Phase::Saving), _) => ("ringing it up", ""),
-            (_, "synchronized") => ("served", "\x1b[32m"),
-            (_, "conflicts") => ("disputed", "\x1b[33m"),
-            (_, "blocked") => ("out of stock", "\x1b[33m"),
-            (_, "halted") => ("kitchen closed", "\x1b[31m"),
-            (_, "unreachable") => ("supplier away", "\x1b[31m"),
-            (_, "errored") => ("burnt", "\x1b[31m"),
-            (_, "paused") => ("on break", "\x1b[2m"),
-            _ => ("not started", "\x1b[2m"),
-        };
+        // Two things are true of a busy order — what it is (served,
+        // disputed) and what it is doing (checking the pantry) — and one
+        // word cannot carry both. The outcome owns the word and the
+        // colour, always: an order does not stop being disputed because it
+        // is being looked at. The activity has a column of its own.
+        let (word, colour) = outcome_word(&session.state);
+        let activity = activity_column(working);
         let waiting = session.conflicts.len() + session.blocked.len();
-        let detail = match working {
-            Some(progress) if progress.phase == Phase::Staging && progress.staged_total > 0 => {
-                format!(
-                    "{} of {}",
-                    thousands(progress.staged),
-                    thousands(progress.staged_total)
-                )
-            }
-            Some(progress) => format!("{}s", progress.seconds),
-            None if waiting > 0 => format!("{waiting} waiting"),
-            None => match session.age_seconds {
-                Some(age) => format!("{age}s ago"),
-                None => String::new(),
-            },
+        let detail = if waiting > 0 {
+            format!("{waiting} waiting")
+        } else if working.is_none() {
+            session
+                .age_seconds
+                .map(|age| format!("{age}s ago"))
+                .unwrap_or_default()
+        } else {
+            String::new()
         };
-
-        // Fixed columns. The destination takes whatever the terminal has
-        // left over, so the baguette and the state word never move.
         const MARKER: usize = 2;
         const GROUP: usize = 9;
-        const STATE: usize = 20;
-        const DETAIL: usize = 14;
+        const OUTCOME: usize = 14;
+        const ACTIVITY: usize = 26;
+        const DETAIL: usize = 12;
         let loaf = 2 + 1 + BAGUETTE + 1;
         let host = width
-            .saturating_sub(2 + MARKER + GROUP + 3 + loaf + 2 + STATE + 1 + DETAIL)
+            .saturating_sub(2 + MARKER + GROUP + 3 + loaf + 2 + OUTCOME + 1 + ACTIVITY + 1 + DETAIL)
             .clamp(8, 30);
         format!(
-            "  {}{} {} {}  {}  {}{}",
+            "  {}{} {} {}  {}  {} {} {}",
             if here { "\x1b[7m▸\x1b[0m " } else { "  " },
             pad(&dim(&shorten(group, GROUP)), GROUP),
             dim("→"),
-            pad(&shorten(&session.host, host), host),
+            pad(&shorten(&self.host_name(&session.host), host), host),
             baguette(session, working.map(|progress| progress.phase), self.frame),
-            pad(&format!("{colour}{word}\x1b[0m"), STATE),
+            pad(&format!("{colour}{word}\x1b[0m"), OUTCOME),
+            pad(&dim(&shorten(&activity, ACTIVITY)), ACTIVITY),
             dim(&shorten(&detail, DETAIL)),
         )
     }
 
-    /// The counter: the issue tree for one order.
     fn counter_rows(&self, room: usize, columns: usize) -> Vec<String> {
         let Some(counter) = &self.counter else {
             return Vec::new();
@@ -1024,6 +1006,55 @@ fn grid(mut lines: Vec<String>, height: usize, width: usize, footer: String) -> 
 }
 
 /// The baguette, filled to whatever is true of the order.
+/// What an order *is*: the word and the colour the outcome owns.
+fn outcome_word(state: &str) -> (&'static str, &'static str) {
+    match state {
+        "synchronized" => ("served", "\x1b[32m"),
+        "conflicts" => ("disputed", "\x1b[33m"),
+        "blocked" => ("out of stock", "\x1b[33m"),
+        "halted" => ("kitchen closed", "\x1b[31m"),
+        "unreachable" => ("supplier away", "\x1b[31m"),
+        "errored" => ("burnt", "\x1b[31m"),
+        "paused" => ("on break", "\x1b[2m"),
+        _ => ("not started", "\x1b[2m"),
+    }
+}
+
+/// What an order is *doing*, in the shop's words.
+fn activity_word(phase: Phase) -> &'static str {
+    match phase {
+        Phase::Connecting => "taking the order",
+        Phase::Scanning => "checking the pantry",
+        Phase::Reconciling => "reading the ticket",
+        Phase::Staging => "filling",
+        Phase::Applying => "wrapping",
+        Phase::Saving => "ringing it up",
+        _ => "",
+    }
+}
+
+/// The activity column: the phase and how long, once the work has gone on
+/// long enough to be worth mentioning, and nothing before that.
+///
+/// The threshold is `status`'s own, so the two agree: a routine scan is
+/// never announced anywhere, and one that drags names itself in both.
+fn activity_column(working: Option<&autobahn::progress::ProgressSnapshot>) -> String {
+    match working {
+        Some(progress) if progress.working_seconds >= crate::SLOW_PHASE_SECONDS => {
+            let detail = match progress.phase {
+                Phase::Staging if progress.staged_total > 0 => format!(
+                    "{} of {}",
+                    thousands(progress.staged),
+                    thousands(progress.staged_total)
+                ),
+                _ => format!("{}s", progress.working_seconds),
+            };
+            format!("{} · {detail}", activity_word(progress.phase))
+        }
+        _ => String::new(),
+    }
+}
+
 fn baguette(session: &SessionReport, phase: Option<Phase>, frame: u64) -> String {
     let filled = |count: usize, colour: &str| {
         let count = count.min(BAGUETTE);
@@ -1207,6 +1238,7 @@ fn strip(text: &str) -> String {
     out
 }
 
+#[cfg(test)]
 fn centered(text: &str, columns: usize) -> String {
     let visible = width(text);
     let left = columns.saturating_sub(visible) / 2;
@@ -1503,6 +1535,46 @@ mod tests {
         );
         // A path that is not in conflict has nothing to say.
         assert_eq!(sides(&session(gone.clone(), gone), "elsewhere"), "");
+    }
+
+    /// The row's two columns: the outcome never gives up its word, and the
+    /// activity appears only once it has gone on long enough to be worth
+    /// mentioning — `status`'s threshold, so the two never disagree.
+    #[test]
+    fn a_busy_order_keeps_its_outcome_and_names_its_activity_only_when_it_drags() {
+        use autobahn::progress::{Phase, ProgressSnapshot, SideSnapshot};
+        let side = || SideSnapshot {
+            active: true,
+            entries: 0,
+            bytes: 0,
+            expected: None,
+            seconds: 0,
+            remaining_seconds: None,
+        };
+        let scanning = |working_seconds: u64| ProgressSnapshot {
+            phase: Phase::Scanning,
+            seconds: working_seconds,
+            working_seconds,
+            alpha: side(),
+            beta: side(),
+            staged: 0,
+            staged_total: 0,
+            staged_bytes: 0,
+            staged_bytes_total: 0,
+            applied: 0,
+            applied_total: 0,
+            remaining_seconds: None,
+        };
+        assert_eq!(outcome_word("conflicts"), ("disputed", "\x1b[33m"));
+        // A routine scan says nothing.
+        assert_eq!(activity_column(Some(&scanning(2))), "");
+        // One that drags says what and how long.
+        assert_eq!(
+            activity_column(Some(&scanning(crate::SLOW_PHASE_SECONDS + 1))),
+            format!("checking the pantry · {}s", crate::SLOW_PHASE_SECONDS + 1)
+        );
+        // And an order at rest has no activity at all.
+        assert_eq!(activity_column(None), "");
     }
 
     #[test]

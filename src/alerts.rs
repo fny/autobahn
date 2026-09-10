@@ -336,7 +336,7 @@ impl Alerter {
 
 /// `1 conflict`, `2 conflicts`. The one that used to read "1 conflicts" in
 /// every alert.
-pub(crate) fn plural(count: usize, word: &str) -> String {
+pub fn plural(count: usize, word: &str) -> String {
     match count {
         1 => format!("1 {word}"),
         _ => format!("{count} {word}s"),
@@ -347,7 +347,7 @@ pub(crate) fn plural(count: usize, word: &str) -> String {
 /// the others in the same alert. `fny.voltai.party` reads as `fny`; a local
 /// destination path is left alone, and so is a name whose first label
 /// another host shares.
-pub(crate) fn short_host(host: &str, all: &[&str]) -> String {
+pub fn short_host(host: &str, all: &[&str]) -> String {
     // Only a name with a domain behind its first label has anything to
     // cut: `fny.voltai.party` is `fny`, but `faraz.vip` is already the
     // name, and cut to `faraz` it would read as a person.

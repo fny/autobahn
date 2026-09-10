@@ -557,6 +557,34 @@ alpha is now whatever arrived most recently. Neither is wrong, but the
 second only suits a fan-out you push *from* rather than edit at both
 ends.
 
+### Ignores a tree carries itself
+
+A directory can name its own ignores in an `autobahn.toml` beside its
+contents, and they apply to everything below it:
+
+```toml
+# ~/project/apps/web/autobahn.toml
+ignores = [
+  "build",        # anything called build, at any depth below this file
+  "/.cache",      # only this directory's .cache — a leading slash anchors
+  "!dist",        # take back something the session-wide config excluded
+]
+```
+
+The patterns are written from where the file sits, not from the
+synchronization root, because whoever writes one is describing their own
+project and cannot know where the root happens to be. Rules read
+outward-in and the last match decides, so a nested file can re-include
+what the group excluded but an outer rule can never override a project's
+own.
+
+The file synchronizes like any other, which is what makes the two sides
+agree about it. In the window before it arrives, the side that has it
+scans less — and the peer's copy is *not* deleted: content that is
+ignored on one side and present on the other is left exactly as it is.
+Ignoring something never removes it from anywhere; it stops being
+compared, which is a different thing.
+
 ### Overlapping and nested roots
 
 Several sessions may share a root exactly. That is the fan-out, star,

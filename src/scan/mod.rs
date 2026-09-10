@@ -318,7 +318,21 @@ pub fn recount(snapshot: &mut Snapshot) {
 
 /// The mutable state of a single scan operation: the ignore set being
 /// applied, a reusable digest buffer, and the running statistics.
+/// The name of the file a directory uses to add ignores of its own.
+pub const NESTED_IGNORES: &str = "autobahn.toml";
+
+/// The ignores a nested `autobahn.toml` carries.
+#[derive(serde::Deserialize)]
+struct NestedIgnores {
+    #[serde(default)]
+    ignores: Vec<String>,
+}
+
 struct Scanner<'a> {
+    /// Ignore sets contributed by `autobahn.toml` files above the entry
+    /// being scanned, innermost last. Empty for a tree that carries none,
+    /// which is the case that has to stay free.
+    nested: Vec<IgnoreSet>,
     /// The ignore set consulted for every entry.
     ignores: &'a IgnoreSet,
     /// The behavior of the filesystem being scanned.
@@ -368,6 +382,7 @@ impl<'a> Scanner<'a> {
     ) -> Scanner<'a> {
         Scanner {
             ignores,
+            nested: Vec::new(),
             behavior,
             symlink_mode,
             max_file_size,
@@ -418,6 +433,43 @@ impl<'a> Scanner<'a> {
     /// `dirty` carries the incremental scan's marks for this position:
     /// `None` means nothing beneath this directory changed, so the
     /// baseline's subtree is adopted whole without touching the filesystem.
+    /// The ignore rules in force: the session's, plus whatever the
+    /// `autobahn.toml` files above this point added.
+    fn ignores(&self) -> &IgnoreSet {
+        self.nested.last().unwrap_or(self.ignores)
+    }
+
+    /// Adopts the ignores a directory carries, if it carries any.
+    ///
+    /// Returns whether a set was pushed, so the caller knows to pop it.
+    /// The file is opened only when the listing already showed it is
+    /// there, so a tree without one pays a name comparison per directory
+    /// and nothing else.
+    ///
+    /// A file that cannot be read or parsed is passed over rather than
+    /// reported. It is itself a synchronized file, most likely mid-write
+    /// or mid-transfer, and a scan that refused to proceed would take the
+    /// whole session down over a typo.
+    fn push_nested(&mut self, disk_path: &Path, path: &str, present: bool) -> bool {
+        if !present {
+            return false;
+        }
+        let Ok(text) = fs::read_to_string(disk_path.join(NESTED_IGNORES)) else {
+            return false;
+        };
+        let Ok(nested) = toml::from_str::<NestedIgnores>(&text) else {
+            return false;
+        };
+        if nested.ignores.is_empty() {
+            return false;
+        }
+        let Ok(extended) = self.ignores().extended(&nested.ignores, path) else {
+            return false;
+        };
+        self.nested.push(extended);
+        true
+    }
+
     fn scan_directory(
         &mut self,
         disk_path: &Path,
@@ -452,6 +504,9 @@ impl<'a> Scanner<'a> {
             let dirty = dirty.expect("a non-relisted directory is marked");
             self.directories += 1;
             self.counted(0);
+            let carries = baseline.child(NESTED_IGNORES).is_some();
+            let pushed = self.push_nested(disk_path, path, carries);
+
             let mut children = Vec::with_capacity(baseline.children().len());
             for baseline_child in baseline.children() {
                 let Some(child_dirty) = dirty.children.get(&baseline_child.name) else {
@@ -469,6 +524,9 @@ impl<'a> Scanner<'a> {
                 ) {
                     children.push(node);
                 }
+            }
+            if pushed {
+                self.nested.pop();
             }
             if let Content::Directory(baseline_children) = &baseline.content {
                 if adoptable(&children, baseline_children) {
@@ -488,6 +546,13 @@ impl<'a> Scanner<'a> {
         };
         self.directories += 1;
         self.counted(0);
+
+        // The listing is already in hand, so noticing the file costs a
+        // name comparison rather than a stat.
+        let carries = entries
+            .iter()
+            .any(|(name, _)| name.as_os_str() == NESTED_IGNORES);
+        let pushed = self.push_nested(disk_path, path, carries);
 
         let mut children = Vec::with_capacity(entries.len());
         for (raw_name, entry_path) in entries {
@@ -553,7 +618,7 @@ impl<'a> Scanner<'a> {
                 // Classification still needs the entry's type for the
                 // ignore set, so probe before recording the problem.
                 let ignored = fs::symlink_metadata(&entry_path)
-                    .map(|metadata| self.ignores.ignored(&child_path, metadata.is_dir()))
+                    .map(|metadata| self.ignores().ignored(&child_path, metadata.is_dir()))
                     .unwrap_or(false);
                 children.push(Node {
                     name,
@@ -592,6 +657,9 @@ impl<'a> Scanner<'a> {
         // bottom-up: a subdirectory that adopted its own baseline storage
         // compares pointer-equal here, so an unchanged subtree collapses to
         // a single Arc clone at its top.
+        if pushed {
+            self.nested.pop();
+        }
         if let Some(Content::Directory(baseline_children)) = baseline.map(|node| &node.content) {
             if adoptable(&unique, baseline_children) {
                 return Content::Directory(baseline_children.clone());
@@ -631,7 +699,7 @@ impl<'a> Scanner<'a> {
 
         // Ignores are consulted before any descent, which is what keeps
         // ignored subtrees from costing anything at all.
-        if self.ignores.ignored(child_path, file_type.is_dir()) {
+        if self.ignores().ignored(child_path, file_type.is_dir()) {
             return Some(Node {
                 name,
                 content: Content::Untracked,
@@ -1627,6 +1695,110 @@ mod tests {
         }
         // Problematic content isn't synchronizable, so it isn't counted.
         assert_eq!(snapshot.files, 1);
+    }
+
+    #[test]
+    fn a_tree_carries_its_own_ignores() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(
+            root_path,
+            "project/autobahn.toml",
+            "ignores = [\"build\", \"/scratch\"]\n",
+        );
+        write(root_path, "project/src/main.rs", "fn main() {}");
+        write(root_path, "project/build/out.o", "object");
+        write(root_path, "project/deep/build/out.o", "object");
+        write(root_path, "project/scratch/note.txt", "note");
+        // Anchored to the file's own directory, so an identically named
+        // directory beside it is untouched — the writer was describing
+        // their project, not the root it happens to sit in.
+        write(root_path, "scratch/keep.txt", "keep");
+        write(root_path, "build/keep.txt", "keep");
+
+        let snapshot = scan(
+            root_path,
+            None,
+            &ignores(&[]),
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+        let project = child(root, "project");
+
+        // A bare name applies at any depth *below that directory*.
+        assert!(matches!(
+            child(project, "build").content,
+            Content::Untracked
+        ));
+        let deep = child(project, "deep");
+        assert!(matches!(child(deep, "build").content, Content::Untracked));
+        // A leading slash anchors to the file's directory, not the root.
+        assert!(matches!(
+            child(project, "scratch").content,
+            Content::Untracked
+        ));
+        // Everything else is untouched, inside and outside.
+        assert!(matches!(
+            child(project, "src").content,
+            Content::Directory(_)
+        ));
+        assert!(matches!(
+            child(root, "scratch").content,
+            Content::Directory(_)
+        ));
+        assert!(matches!(
+            child(root, "build").content,
+            Content::Directory(_)
+        ));
+        // The file itself synchronizes, or the two sides could never agree
+        // about what it says.
+        assert!(matches!(
+            child(project, "autobahn.toml").content,
+            Content::File { .. }
+        ));
+    }
+
+    /// The rules read outward-in, so a project can take back something the
+    /// session excluded for everything else — which is the only way a
+    /// blanket ignore can have an exception without editing the config.
+    #[test]
+    fn a_nested_file_can_re_include_what_the_session_excluded() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(root_path, "app/autobahn.toml", "ignores = [\"!dist\"]\n");
+        write(root_path, "app/dist/bundle.js", "bundled");
+        write(root_path, "other/dist/bundle.js", "bundled");
+
+        let snapshot = scan(
+            root_path,
+            None,
+            &ignores(&["dist"]),
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+
+        let app = child(root, "app");
+        assert!(
+            matches!(child(app, "dist").content, Content::Directory(_)),
+            "the nested file takes it back"
+        );
+        let other = child(root, "other");
+        assert!(
+            matches!(child(other, "dist").content, Content::Untracked),
+            "and only where it says so"
+        );
     }
 
     #[test]

@@ -1067,7 +1067,7 @@ impl Shop<'_> {
         // whole line made the only instructions on screen the hardest
         // thing on it to read.
         if self.help {
-            return format!("\x1b[1many key\x1b[0m returns to the shop");
+            return "\x1b[1many key\x1b[0m returns to the shop".to_owned();
         }
         let keys: &[(&str, &str)] = match (&self.counter, self.selected().map(|row| row.act)) {
             (None, _) => &[
@@ -1236,7 +1236,7 @@ fn baguette(session: &SessionReport, phase: Option<Phase>, frame: u64) -> String
 fn help_page(width: usize) -> Vec<String> {
     let inner = width.saturating_sub(4);
     let mut lines = vec![
-        format!("  \x1b[1mthe shop\x1b[0m"),
+        "  \x1b[1mthe shop\x1b[0m".to_owned(),
         String::new(),
         dim("  every session is a customer; what it is doing right now is their order."),
         String::new(),
@@ -1271,7 +1271,7 @@ fn help_page(width: usize) -> Vec<String> {
         ));
     }
     lines.push(String::new());
-    lines.push(format!("  \x1b[1mwhat it is doing\x1b[0m"));
+    lines.push("  \x1b[1mwhat it is doing\x1b[0m".to_owned());
     lines.push(dim(
         "    said only once the work has run long enough to be worth saying",
     ));
@@ -1287,7 +1287,7 @@ fn help_page(width: usize) -> Vec<String> {
         lines.push(format!("    {}  {}", pad(word, 20), dim(what)));
     }
     lines.push(String::new());
-    lines.push(format!("  \x1b[1mthe loaf\x1b[0m"));
+    lines.push("  \x1b[1mthe loaf\x1b[0m".to_owned());
     lines.push(dim(
         "    how much of the transfer is done — full and green when the two sides agree,",
     ));
@@ -1295,7 +1295,7 @@ fn help_page(width: usize) -> Vec<String> {
         "    full and plain when they do not, and ✖ when the session is down.",
     ));
     lines.push(String::new());
-    lines.push(format!("  \x1b[1mkeys\x1b[0m"));
+    lines.push("  \x1b[1mkeys\x1b[0m".to_owned());
     let keys: &[(&str, &str)] = &[
         ("↑↓", "choose a customer"),
         ("⏎", "open the counter: where it syncs, and anything wrong"),

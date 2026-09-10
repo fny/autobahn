@@ -177,6 +177,7 @@ autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
 
 autobahn mi                # the shop: watch it work, and clear the queue
+                           # (h explains every word on the screen)
 ```
 
 When a session has been working long enough that its silence would look

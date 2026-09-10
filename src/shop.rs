@@ -49,6 +49,7 @@ enum Key {
     Copy,
     Yes,
     No,
+    Help,
     Quit,
 }
 
@@ -137,6 +138,8 @@ struct Shop<'a> {
     /// someone deliberately edited, on every destination in the group —
     /// too much to hang on one keystroke.
     pending: Option<Pending>,
+    /// Whether the help page is covering the shop.
+    help: bool,
     frame: u64,
 }
 
@@ -166,6 +169,7 @@ pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>
         rate: Rate::default(),
         ticker: Vec::new(),
         pending: None,
+        help: false,
         frame: 0,
     };
     let mut refreshed = Instant::now();
@@ -259,6 +263,17 @@ impl Shop<'_> {
                 Key::No | Key::Close | Key::Quit => self.pending = None,
                 _ => {}
             }
+            return false;
+        }
+        // The help page covers everything, so it answers everything: any
+        // key puts it away, which is what someone who opened it by
+        // accident will press.
+        if self.help {
+            self.help = false;
+            return key == Key::Quit;
+        }
+        if key == Key::Help {
+            self.help = true;
             return false;
         }
         let open = self.counter.is_some();
@@ -789,6 +804,10 @@ impl Shop<'_> {
         lines.extend(self.sign(width));
         lines.push(String::new());
 
+        if self.help {
+            lines.extend(help_page(width));
+            return grid(lines, height, width, self.footer());
+        }
         if !self.report.supervisor_running {
             lines.extend(self.shuttered(width));
             return grid(lines, height, width, self.footer());
@@ -1047,11 +1066,15 @@ impl Shop<'_> {
         // key itself is bold and its meaning is plain text. Dimming the
         // whole line made the only instructions on screen the hardest
         // thing on it to read.
+        if self.help {
+            return format!("\x1b[1many key\x1b[0m returns to the shop");
+        }
         let keys: &[(&str, &str)] = match (&self.counter, self.selected().map(|row| row.act)) {
             (None, _) => &[
                 ("↑↓", "choose"),
                 ("⏎", "details"),
                 ("f", "rush"),
+                ("h", "help"),
                 ("q", "quit"),
             ],
             (Some(_), Some(Act::Conflicts(_))) => &[
@@ -1204,6 +1227,95 @@ fn baguette(session: &SessionReport, phase: Option<Phase>, frame: u64) -> String
     }
 }
 
+/// The help page: the words on the shop's screen, and what they mean.
+///
+/// The vocabulary is the whole reason this exists. "checking the pantry"
+/// and "out of stock" are good jokes and poor documentation, and a reader
+/// who cannot map them back to scanning and unreadable files is reading
+/// decoration.
+fn help_page(width: usize) -> Vec<String> {
+    let inner = width.saturating_sub(4);
+    let mut lines = vec![
+        format!("  \x1b[1mthe shop\x1b[0m"),
+        String::new(),
+        dim("  every session is a customer; what it is doing right now is their order."),
+        String::new(),
+        format!("  \x1b[1mwhat an order is\x1b[0m"),
+    ];
+    let pairs: &[(&str, &str, &str)] = &[
+        ("served", "\x1b[32m", "both sides agree; nothing to do"),
+        ("disputed", "\x1b[33m", "both sides changed the same thing"),
+        (
+            "out of stock",
+            "\x1b[33m",
+            "paths autobahn could not read or write",
+        ),
+        (
+            "kitchen closed",
+            "\x1b[31m",
+            "halted for safety; it will not act",
+        ),
+        (
+            "supplier away",
+            "\x1b[31m",
+            "the far side cannot be reached",
+        ),
+        ("burnt", "\x1b[31m", "the cycle failed"),
+        ("on break", "\x1b[2m", "paused"),
+    ];
+    for (word, colour, what) in pairs {
+        lines.push(format!(
+            "    {}  {}",
+            pad(&format!("{colour}{word}\x1b[0m"), 16),
+            dim(what)
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!("  \x1b[1mwhat it is doing\x1b[0m"));
+    lines.push(dim(
+        "    said only once the work has run long enough to be worth saying",
+    ));
+    let doing: &[(&str, &str)] = &[
+        ("taking the order", "opening the connection"),
+        ("checking the pantry", "scanning a tree for what changed"),
+        ("reading the ticket", "working out what to move"),
+        ("filling", "transferring content"),
+        ("wrapping", "writing it into place"),
+        ("ringing it up", "recording what was agreed"),
+    ];
+    for (word, what) in doing {
+        lines.push(format!("    {}  {}", pad(word, 20), dim(what)));
+    }
+    lines.push(String::new());
+    lines.push(format!("  \x1b[1mthe loaf\x1b[0m"));
+    lines.push(dim(
+        "    how much of the transfer is done — full and green when the two sides agree,",
+    ));
+    lines.push(dim(
+        "    full and plain when they do not, and ✖ when the session is down.",
+    ));
+    lines.push(String::new());
+    lines.push(format!("  \x1b[1mkeys\x1b[0m"));
+    let keys: &[(&str, &str)] = &[
+        ("↑↓", "choose a customer"),
+        ("⏎", "open the counter: where it syncs, and anything wrong"),
+        ("←", "back"),
+        ("o / t / b", "settle a dispute: ours, theirs, or keep both"),
+        ("c", "copy the commands that would clear a blocked path"),
+        ("f", "rush — sync every session now"),
+        ("q", "quit"),
+    ];
+    for (key, what) in keys {
+        lines.push(format!(
+            "    {}  {}",
+            pad(&format!("\x1b[1m{key}\x1b[0m"), 11),
+            dim(what)
+        ));
+    }
+    let _ = inner;
+    lines
+}
+
 /// Reads whatever keys are waiting.
 fn keys() -> Vec<Key> {
     // An escape sequence can arrive split across two reads — three bytes
@@ -1259,7 +1371,9 @@ fn parse(bytes: &[u8]) -> (Vec<Key>, Vec<u8>) {
             [0x1b, ..] => (Some(Key::Close), 1),
             [b'k', ..] => (Some(Key::Up), 1),
             [b'j', ..] => (Some(Key::Down), 1),
-            [b'h', ..] => (Some(Key::Close), 1),
+            // `h` is help, not vim-left: the words on this screen need
+            // explaining more than a second binding for `←` does.
+            [b'h', ..] | [b'?', ..] => (Some(Key::Help), 1),
             [b'l', ..] | [b'\r', ..] | [b'\n', ..] => (Some(Key::Open), 1),
             [b'f', ..] => (Some(Key::Flush), 1),
             [b'o', ..] => (Some(Key::Keep(Winner::Alpha)), 1),

@@ -877,7 +877,7 @@ impl Shop<'_> {
                     (f + progress.moved_files, b + progress.moved_bytes)
                 });
             let mut parts = vec![
-                format!("{} orders", orders.len()),
+                autobahn::alerts::plural(orders.len(), "customer"),
                 format!("{} files", thousands(files)),
                 bytes(total),
             ];

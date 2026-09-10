@@ -370,7 +370,7 @@ the work has gone on long enough to be worth mentioning: the same rule
 `status` applies, so a routine scan is never announced and one that
 drags names itself without displacing the outcome.
 
-**The counter** is the useful half. `⏎` opens any order — where it syncs
+**The counter** is the useful half. `ret` opens any order — where it syncs
 from and to, its mode, how many cycles it has run and how much it has
 carried — and then its issues as a tree: cause, then place, then path.
 Every level of that tree can be acted on, so one keypress settles a whole
@@ -390,7 +390,7 @@ directory or a single file.
   └──────────────────────────────────────────────────────────────┘
 ```
 
-`↑↓` move, `⏎` or `→` opens a branch, `←` closes it and then the counter.
+`↑↓` move, `ret` or `→` opens a branch, `←` closes it and then the counter.
 On a conflict, `o` keeps ours, `t` keeps theirs, `b` keeps both — and each
 asks before it acts, because resolution overwrites a file someone edited
 on every destination in the group. It then runs the same `resolve` you

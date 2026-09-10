@@ -1072,14 +1072,14 @@ impl Shop<'_> {
         let keys: &[(&str, &str)] = match (&self.counter, self.selected().map(|row| row.act)) {
             (None, _) => &[
                 ("↑↓", "choose"),
-                ("⏎", "details"),
+                ("ret", "details"),
                 ("f", "rush"),
                 ("?", "help"),
                 ("q", "quit"),
             ],
             (Some(_), Some(Act::Conflicts(_))) => &[
                 ("↑↓", "choose"),
-                ("⏎", "open"),
+                ("ret", "open"),
                 ("←", "back"),
                 ("o", "ours"),
                 ("t", "theirs"),
@@ -1091,7 +1091,7 @@ impl Shop<'_> {
             }
             (Some(_), Some(Act::Blocked(_))) => &[
                 ("↑↓", "choose"),
-                ("⏎", "open"),
+                ("ret", "open"),
                 ("←", "back"),
                 ("c", "copy the fix"),
                 ("q", "quit"),
@@ -1298,7 +1298,10 @@ fn help_page(width: usize) -> Vec<String> {
     lines.push("  \x1b[1mkeys\x1b[0m".to_owned());
     let keys: &[(&str, &str)] = &[
         ("↑↓", "choose a customer"),
-        ("⏎", "open the counter: where it syncs, and anything wrong"),
+        (
+            "ret",
+            "open the counter: where it syncs, and anything wrong",
+        ),
         ("←", "back"),
         ("o / t / b", "settle a dispute: ours, theirs, or keep both"),
         ("c", "copy the commands that would clear a blocked path"),

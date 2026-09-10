@@ -327,6 +327,17 @@ both now fixed on the live system.
   with the durable watch fix (39k watches).
   Should be gone with 7119f85 (39k watches to build, not 330k); verify on the next restart.
 
+- [ ] **`fold_transition` diverges on ~2% of transition-cycles.** The
+  cause of every "baseline could not be reproduced" 21 MB re-send. Both
+  sides run the same fold over the same transitions and outcome, and
+  about one time in fifty the two encodings differ. Perfectly
+  correlated with transitions (sessions with none never miss; five
+  sessions with them missed at 1.2–2.4%). Dormant since the chown and
+  the collision fix removed the perpetual transitions, so there is no
+  live reproduction. To find it: on a miss, have the controller keep its
+  folded encoding and request the agent's, and diff the two trees — the
+  first differing node names the fold rule the two sides disagree on.
+
 ## Carried over (not yet asked for, noted so they aren't lost)
 
 - [ ] 21 blocked paths on `fny.voltai.party` — root-owned

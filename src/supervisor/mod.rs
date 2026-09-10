@@ -1457,6 +1457,14 @@ fn watch_alerts(
                 ("AUTOBAHN_DETAIL".to_owned(), detail),
                 ("AUTOBAHN_ALERT_COUNT".to_owned(), count.to_string()),
                 ("AUTOBAHN_STATES".to_owned(), states),
+                // An absolute path, because a hook runs with the
+                // service's working directory, not the reader's.
+                (
+                    "AUTOBAHN_ICON".to_owned(),
+                    crate::icon::ensure(state_root)
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                ),
                 (
                     "AUTOBAHN_EVENT".to_owned(),
                     match fire {

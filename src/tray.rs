@@ -553,7 +553,7 @@ impl App {
                 } else {
                     continue;
                 };
-                notify(&title, &body);
+                notify_with(&title, &body, crate::icon::ensure(&self.state_root));
             }
         }
     }
@@ -606,7 +606,7 @@ impl App {
             Ok(()) => self.last_error = None,
             Err(error) => {
                 let message = format!("{error:#}");
-                notify("autobahn", &message);
+                notify_with("autobahn", &message, crate::icon::ensure(&self.state_root));
                 self.last_error = Some(message);
             }
         }
@@ -621,7 +621,14 @@ impl App {
 /// when this was first tried. A separate process cannot do that. On Linux
 /// notify-rust speaks D-Bus and returns; it is still detached, since the
 /// bus can stall too.
-fn notify(title: &str, body: &str) {
+/// Raises a notification, carrying autobahn's own icon where the platform
+/// allows one.
+///
+/// On macOS `osascript` shows Script Editor's icon and offers no way to
+/// change it, so a notifier that does is preferred when one is installed
+/// and the plain script is the fallback. That is the whole reason the
+/// binary carries an image at all.
+fn notify_with(title: &str, body: &str, icon: Option<PathBuf>) {
     if std::env::var_os("AUTOBAHN_TRAY_DEBUG").is_some() {
         eprintln!("notify: {title} — {body}");
     }
@@ -636,6 +643,20 @@ fn notify(title: &str, body: &str) {
                 escape(&body),
                 escape(&title)
             );
+            if let Some(icon) = icon.as_ref().filter(|path| path.exists()) {
+                if let Ok(notifier) = which_notifier() {
+                    let _ = std::process::Command::new(notifier)
+                        .args([
+                            "-title", &title, "-message", &body, "-group", "autobahn", "-appIcon",
+                        ])
+                        .arg(icon)
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                    return;
+                }
+            }
             let _ = std::process::Command::new("osascript")
                 .args(["-e", &script])
                 .stdin(std::process::Stdio::null())
@@ -645,13 +666,36 @@ fn notify(title: &str, body: &str) {
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = notify_rust::Notification::new()
-                .summary(&title)
-                .body(&body)
-                .appname("autobahn")
-                .show();
+            let mut notification = notify_rust::Notification::new();
+            notification.summary(&title).body(&body).appname("autobahn");
+            if let Some(icon) = icon.as_ref().filter(|path| path.exists()) {
+                notification.icon(&icon.display().to_string());
+            }
+            let _ = notification.show();
         }
     });
+}
+
+/// The first notifier on `PATH` that takes an icon. Looked up rather than
+/// configured: someone who has one has it for everything, and someone who
+/// does not gets the plain notification without being asked to install
+/// anything.
+#[cfg(target_os = "macos")]
+fn which_notifier() -> Result<PathBuf, ()> {
+    for directory in std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        // A login service inherits a sparse PATH, and Homebrew is where
+        // this comes from on the machines that have it.
+        .chain(["/opt/homebrew/bin", "/usr/local/bin"].map(PathBuf::from))
+    {
+        let candidate = directory.join("terminal-notifier");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(())
 }
 
 fn run_quiet(mut command: std::process::Command) -> Result<()> {

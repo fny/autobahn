@@ -292,7 +292,7 @@ both now fixed on the live system.
   by deleting the NFD twin on fny (hash-identical to the NFC one).
   Blocked is now 0; full scans went from every cycle to every 120s.
 
-- [ ] **Durable fix: do not watch ignored directories.** The sysctl is a
+- [x] **Durable fix: do not watch ignored directories.** The sysctl is a
   per-host mitigation. 39,252 directories need a watch; 325,509 get one.
   On Linux, notify's `Recursive` walks with `WalkDir` and has no filter
   hook, and it extends to new subdirectories only for parents registered
@@ -301,26 +301,31 @@ both now fixed on the live system.
   `Create(Folder)` for non-ignored paths from a dispatch thread that owns
   the watcher (the callback cannot). Keep `Recursive` on macOS (FSEvents
   is native). Agent-side → epoch bump; A/B on fny, not locally.
+  Done in 7119f85 (epoch 8): Linux builds the watch itself with the scanner's ignore rule, one non-recursive watch per directory, extended on the way in for directories that appear. A/B on fny: +0.4 ms p50 inside a 3.1 ms spread, no stalls.
 
-- [ ] **A permanent refusal should not force a full rescan every cycle.**
+- [x] **A permanent refusal should not force a full rescan every cycle.**
   `distrust_baseline()` is right when the disk disagreed with the
   snapshot; it is wrong for a refusal the snapshot predicted (a collision,
   an unwritable parent). Distinguish the two in `TransitionOutcome`, or
   rate-limit distrust per path.
+  Done in 7119f85: `Problem.disagreement` marks the six sites where the disk was found to differ from the snapshot; only those distrust the baseline. Tested both ways.
 
-- [ ] **Agent stderr is discarded.** `remote.rs:330` uses `spawn_quiet`
+- [x] **Agent stderr is discarded.** `remote.rs:330` uses `spawn_quiet`
   (`stderr(Stdio::null())`) for the connection that succeeds, so "unable
   to watch for changes; falling back to interval polling" is never seen.
   fny's watch was failing every 30s for days with no trace. Pipe agent
   stderr to the controller log with a host prefix.
+  Done in 2a0764d: held until the handshake, then printed with the host in front or attached to the failure.
 
-- [ ] **Progress `seconds` reports epoch time** when a side's scan window
+- [x] **Progress `seconds` reports epoch time** when a side's scan window
   was never begun (`seconds=1788990744` in a status sample). Guard the
   subtraction.
+  Done in 2a0764d: zero means never; an idle side has been scanning for no time.
 
-- [ ] **~210s stall after a supervisor restart** on fny: building 330k
+- [x] **~210s stall after a supervisor restart** on fny: building 330k
   watches (~50s) plus the first full snapshot. Startup-only; goes away
   with the durable watch fix (39k watches).
+  Should be gone with 7119f85 (39k watches to build, not 330k); verify on the next restart.
 
 ## Carried over (not yet asked for, noted so they aren't lost)
 

@@ -243,7 +243,8 @@ nobody told. `[alerts]` runs a command when that happens:
 
 ```toml
 [alerts]
-on_alert    = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
+on_alert    = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
+               -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\""
 alert_after = "30s"
 
 [alerts.after]
@@ -276,7 +277,8 @@ one thing wrong, a count when there are several — `voltai → fny: 1
 conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you,
 1 host away`), `$AUTOBAHN_DETAIL` (one indented line per thing, for a
 hook that can show more than a headline), `$AUTOBAHN_ALERT_COUNT`,
-`$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`,
+`$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`, `$AUTOBAHN_ICON` (autobahn's own
+icon, written into the state directory so a notifier can point at it),
 and the full `status --json` document on standard input. They run off the
 cycle and cannot affect or delay synchronization: a hook is killed if it
 outstays `timeout`, and is skipped while a previous one is still running.

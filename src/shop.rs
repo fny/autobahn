@@ -896,7 +896,7 @@ impl Shop<'_> {
         format!(
             "  {}{} {} {}  {}  {} {}",
             if here { "\x1b[7m▸\x1b[0m " } else { "  " },
-            pad(&dim(&shorten(group, GROUP)), GROUP),
+            pad(&shorten(group, GROUP), GROUP),
             dim("→"),
             pad(&shorten(&self.host_name(&session.host), HOST), HOST),
             baguette(session, working.map(|progress| progress.phase), self.frame),
@@ -982,20 +982,49 @@ impl Shop<'_> {
         if let Some(pending) = &self.pending {
             return format!("\x1b[33m{}\x1b[0m", pending.question);
         }
-        let keys = match (&self.counter, self.selected().map(|row| row.act)) {
-            (None, _) => "↑↓ choose · ⏎ counter · f rush · q close the shop",
-            (Some(_), Some(Act::Conflicts(_))) => {
-                "↑↓ ⏎ open · ← back · o ours · t theirs · b both · q close the shop"
-            }
-            (Some(_), Some(Act::Blocked(_))) => {
-                "↑↓ ⏎ open · ← back · c copy the fix · q close the shop"
-            }
-            (Some(_), None) => "↑↓ ⏎ open · ← back · q close the shop",
+        // The keys are the one part of the screen a reader acts on, so the
+        // key itself is bold and its meaning is plain text. Dimming the
+        // whole line made the only instructions on screen the hardest
+        // thing on it to read.
+        let keys: &[(&str, &str)] = match (&self.counter, self.selected().map(|row| row.act)) {
+            (None, _) => &[
+                ("↑↓", "choose"),
+                ("⏎", "details"),
+                ("f", "rush"),
+                ("q", "quit"),
+            ],
+            (Some(_), Some(Act::Conflicts(_))) => &[
+                ("↑↓", "choose"),
+                ("⏎", "open"),
+                ("←", "back"),
+                ("o", "ours"),
+                ("t", "theirs"),
+                ("b", "both"),
+                ("q", "quit"),
+            ],
+            (Some(_), Some(Act::Blocked(_))) => &[
+                ("↑↓", "choose"),
+                ("⏎", "open"),
+                ("←", "back"),
+                ("c", "copy the fix"),
+                ("q", "quit"),
+            ],
+            (Some(_), None) => &[
+                ("↑↓", "choose"),
+                ("⏎", "open"),
+                ("←", "back"),
+                ("q", "quit"),
+            ],
         };
+        let keys = keys
+            .iter()
+            .map(|(key, what)| format!("\x1b[1m{key}\x1b[0m {what}"))
+            .collect::<Vec<_>>()
+            .join(&dim(" · "));
         match told.as_deref() {
-            Some("running") => format!("{}   {}", dim(keys), "working…"),
-            Some(told) => format!("{}   {}", dim(keys), dim(told)),
-            None => dim(keys),
+            Some("running") => format!("{keys}   working…"),
+            Some(told) => format!("{keys}   {}", dim(told)),
+            None => keys,
         }
     }
 }
@@ -1101,8 +1130,13 @@ fn baguette(session: &SessionReport, phase: Option<Phase>, frame: u64) -> String
             bread.push_str(&dim("]"));
             bread
         }
+        // At rest the loaf says one thing: the transfer is done, nothing
+        // is moving. Green only when the two sides actually agree — a full
+        // *yellow* loaf beside "disputed" read as a progress bar claiming
+        // completion in a warning colour, next to a word already carrying
+        // the warning. The verdict is the word's job.
         (_, "synchronized") => filled(BAGUETTE, "\x1b[32m"),
-        (_, "conflicts" | "blocked") => filled(BAGUETTE, "\x1b[33m"),
+        (_, "conflicts" | "blocked") => filled(BAGUETTE, ""),
         (_, "halted" | "unreachable" | "errored") => format!(
             "🥖{}\x1b[31m✖\x1b[0m{}",
             dim("["),
@@ -1369,6 +1403,37 @@ mod tests {
         assert_eq!(shorten("azure/backend/app.py", 10), "…nd/app.py");
         assert_eq!(width(&shorten("azure/backend/app.py", 10)), 10);
         assert!(width(&shorten("a/very/long/path/indeed.txt", 12)) <= 12);
+    }
+
+    /// The loaf is a transfer indicator, not a second status light. A
+    /// disputed order's transfer is done — nothing is moving — so its loaf
+    /// is full and uncoloured; only agreement earns the green, and only a
+    /// session that is down loses the loaf entirely.
+    #[test]
+    fn only_agreement_colours_the_loaf() {
+        let session = |state: &str| SessionReport {
+            host: "boite".into(),
+            beta: "boite".into(),
+            mode: "two-way-conflict".into(),
+            state: state.into(),
+            cycles: 1,
+            age_seconds: Some(1),
+            conflicts: Vec::new(),
+            blocked: Vec::new(),
+            error: None,
+            progress: None,
+        };
+        assert!(baguette(&session("synchronized"), None, 0).contains("\x1b[32m"));
+        for state in ["conflicts", "blocked"] {
+            let loaf = baguette(&session(state), None, 0);
+            assert!(!loaf.contains("\x1b[33m"), "{state}: {loaf:?}");
+            assert!(!loaf.contains("\x1b[32m"), "{state}: {loaf:?}");
+            assert!(
+                loaf.contains("▓"),
+                "{state} has moved its content: {loaf:?}"
+            );
+        }
+        assert!(baguette(&session("halted"), None, 0).contains("✖"));
     }
 
     #[test]

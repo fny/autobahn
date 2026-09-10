@@ -355,11 +355,11 @@ answers and shuttered when none does. Every number on it is real — it
 reads the same `status --json` document as everything else.
 
 ```
-  ◉ OPEN   🥖 AUTOBÁNH MÌ   15 orders · 1 filling · 3.4 MB/s
+  ◉ OPEN   🥖 AUTOBÁNH MÌ   15 orders · 12,480 files · 3.4 GB · 1 filling · 2.1 MB/s
 
   ▸ voltai   → fny     🥖[▓▓▓▓▓░░░░░░░]  served    filling · 1,204 of 8,530
-    vibe     → boite   🥖[▓▓▓▓▓▓▓▓▓▓▓▓]  disputed                         2 waiting
-    voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s   1 waiting
+    vibe     → boite   🥖[▓▓▓▓▓▓▓▓▓▓▓▓]  disputed  2 waiting
+    voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s · 1 waiting
 ```
 
 An order is always *something* — served, disputed, out of stock — and

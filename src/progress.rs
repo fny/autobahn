@@ -204,7 +204,11 @@ impl SideProgress {
         // "43,421 of ~1". A finished scan's count *equals* its total, which
         // is not the same thing and must not be erased.
         .filter(|expected| !active || *expected > entries);
-        let elapsed = elapsed_since(self.since.load(Ordering::Relaxed));
+        // Only a running scan has been scanning for any length of time.
+        let elapsed = match active {
+            true => elapsed_since(self.since.load(Ordering::Relaxed)),
+            false => Duration::ZERO,
+        };
         SideSnapshot {
             active,
             entries,
@@ -487,6 +491,11 @@ fn now_millis() -> u64 {
 /// future (a clock that moved) reads as no time at all rather than as a
 /// wrapped-around eternity.
 fn elapsed_since(millis: u64) -> Duration {
+    // Zero is "never began", not the epoch: measured against it, a side
+    // that had not started scanning reported 1,788,990,744 seconds.
+    if millis == 0 {
+        return Duration::ZERO;
+    }
     Duration::from_millis(now_millis().saturating_sub(millis))
 }
 

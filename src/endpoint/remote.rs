@@ -327,7 +327,7 @@ fn establish_ssh(destination: &str) -> Result<AgentConnection> {
     let argv = Connection::ssh_argv(destination, Some(&remote_command));
     let attempt = |quiet: bool| -> Result<AgentConnection> {
         let connection = if quiet {
-            Connection::spawn_quiet(&argv)?
+            Connection::spawn_relayed(&argv, destination)?
         } else {
             Connection::spawn(&argv)?
         };

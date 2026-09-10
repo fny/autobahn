@@ -74,6 +74,8 @@ struct Shared {
     state: Mutex<Router>,
     /// The next channel identifier to assign.
     next_channel: AtomicU32,
+    /// The agent's relayed standard error, kept for the connection's life.
+    _stderr: Option<super::StderrRelay>,
 }
 
 /// One channel's routing slot.
@@ -109,7 +111,12 @@ impl AgentConnection {
     /// Establishes a multiplexed connection: exchanges handshakes
     /// (enforcing version equality) and starts the response router. A
     /// handshake failure reaps the spawned process before reporting.
-    pub fn connect(connection: Connection) -> Result<AgentConnection> {
+    pub fn connect(mut connection: Connection) -> Result<AgentConnection> {
+        // Held until the handshake proves the far side is an agent. After
+        // that it is the agent's own voice, and everything it says about
+        // itself — a watch it could not establish above all — is worth
+        // hearing. Before that it is ssh's, and belongs in the error.
+        let stderr = connection.take_stderr_relay();
         let (mut reader, mut writer, child) = connection.into_parts();
 
         // Exchange handshakes. Ours goes out first (the agent does the
@@ -128,12 +135,26 @@ impl AgentConnection {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            return Err(error);
+            // Read after the reap, so what ssh wrote on its way out has
+            // arrived. Best effort: the relay thread may still be a line
+            // behind, and a diagnosis short one line beats none.
+            let said = stderr
+                .as_ref()
+                .map(|relay| relay.held().join("\n"))
+                .unwrap_or_default();
+            return Err(match said.is_empty() {
+                true => error,
+                false => error.context(format!("the far side said: {said}")),
+            });
+        }
+        if let Some(relay) = &stderr {
+            relay.release();
         }
 
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
+            _stderr: stderr,
             state: Mutex::new(Router {
                 channels: HashMap::new(),
                 open: 0,

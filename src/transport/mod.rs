@@ -39,6 +39,7 @@ use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::de::DeserializeOwned;
@@ -85,6 +86,81 @@ pub(crate) fn ssh_options() -> Vec<&'static str> {
 /// A bidirectional byte-stream connection to an agent (typically a child
 /// process's stdio: `ssh host autobahn agent` for remote roots, or a direct
 /// `autobahn agent` child for testing — the identical code path minus SSH).
+/// A spawned agent's standard error, held until the connection proves
+/// itself and relayed line by line after that.
+///
+/// The speculative first connection to a host fails routinely — that is
+/// how a missing agent is discovered — and its stderr is the remote
+/// shell's "no such file", which must not print. But the connection that
+/// *succeeds* is the one whose agent then runs for days, and everything it
+/// says about itself went to the same discarded stream: a watch that could
+/// not be established was retried every 30 seconds for a week with no
+/// trace anywhere. So the lines are held until the handshake, then either
+/// printed (with the host in front, since several agents share one log)
+/// or attached to the failure, which is the ssh diagnosis the error was
+/// missing.
+pub struct StderrRelay {
+    state: Arc<Mutex<RelayState>>,
+}
+
+struct RelayState {
+    label: String,
+    released: bool,
+    held: Vec<String>,
+}
+
+/// How many lines are kept back before the handshake. A failure's
+/// diagnosis is in the first few; a runaway is not worth the memory.
+const HELD_STDERR_LINES: usize = 64;
+
+impl StderrRelay {
+    fn start(label: String, stderr: std::process::ChildStderr) -> StderrRelay {
+        let state = Arc::new(Mutex::new(RelayState {
+            label,
+            released: false,
+            held: Vec::new(),
+        }));
+        let relay = Arc::clone(&state);
+        // Best effort: if the thread cannot start, the pipe fills and the
+        // agent's writes to stderr block, which is a stall rather than a
+        // fault — and starting a thread does not fail on a working host.
+        let _ = std::thread::Builder::new()
+            .name("autobahn-agent-stderr".into())
+            .spawn(move || {
+                use std::io::BufRead;
+                for line in std::io::BufReader::new(stderr).lines() {
+                    let Ok(line) = line else { break };
+                    let mut state = relay.lock().unwrap_or_else(|e| e.into_inner());
+                    if state.released {
+                        eprintln!("[{}] {line}", state.label);
+                    } else if state.held.len() < HELD_STDERR_LINES {
+                        state.held.push(line);
+                    }
+                }
+            });
+        StderrRelay { state }
+    }
+
+    /// Prints what was held and everything after it, prefixed by the host.
+    pub fn release(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.released = true;
+        let label = state.label.clone();
+        for line in state.held.drain(..) {
+            eprintln!("[{label}] {line}");
+        }
+    }
+
+    /// What the agent said before the connection was given up on.
+    pub fn held(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .held
+            .clone()
+    }
+}
+
 pub struct Connection {
     /// The stream carrying frames from the agent.
     reader: Box<dyn Read + Send>,
@@ -92,6 +168,9 @@ pub struct Connection {
     writer: Box<dyn Write + Send>,
     /// The agent process, if this connection owns one.
     child: Option<Child>,
+    /// The child's standard error, when it is being relayed rather than
+    /// inherited or discarded.
+    stderr: Option<StderrRelay>,
 }
 
 impl Connection {
@@ -106,17 +185,41 @@ impl Connection {
         Connection::spawn_inner(argv, Stdio::inherit())
     }
 
-    /// Spawns as [`spawn`](Connection::spawn) does, but discards the child's
-    /// standard error.
+    /// Spawns as [`spawn`](Connection::spawn) does, but holds the child's
+    /// standard error back until [`release_stderr`](Connection::release_stderr)
+    /// — see [`StderrRelay`].
     ///
     /// For the *speculative* first connection to a host, whose failure is
     /// the ordinary way a missing agent is discovered: the remote shell's
     /// "no such file or directory" is expected, is followed by an install
     /// and a retry, and printing it makes routine bootstrapping look like a
-    /// fault. A failure that is not routine still surfaces, through the
-    /// installer's own diagnostics.
-    pub fn spawn_quiet(argv: &[String]) -> Result<Connection> {
-        Connection::spawn_inner(argv, Stdio::null())
+    /// fault. Held rather than discarded, so that the connection that
+    /// succeeds keeps its agent's voice, and one that fails for a real
+    /// reason carries ssh's own words in its error.
+    pub fn spawn_relayed(argv: &[String], label: &str) -> Result<Connection> {
+        let mut connection = Connection::spawn_inner(argv, Stdio::piped())?;
+        if let Some(stderr) = connection
+            .child
+            .as_mut()
+            .and_then(|child| child.stderr.take())
+        {
+            connection.stderr = Some(StderrRelay::start(label.to_owned(), stderr));
+        }
+        Ok(connection)
+    }
+
+    /// Lets a held standard error through. A no-op for a connection whose
+    /// stderr was inherited.
+    pub fn release_stderr(&self) {
+        if let Some(relay) = &self.stderr {
+            relay.release();
+        }
+    }
+
+    /// Takes the relay, for a caller that will consume the connection but
+    /// wants to decide about its stderr afterwards.
+    pub(crate) fn take_stderr_relay(&mut self) -> Option<StderrRelay> {
+        self.stderr.take()
     }
 
     fn spawn_inner(argv: &[String], stderr: Stdio) -> Result<Connection> {
@@ -142,6 +245,7 @@ impl Connection {
             reader: Box::new(reader),
             writer: Box::new(writer),
             child: Some(child),
+            stderr: None,
         })
     }
 
@@ -154,6 +258,7 @@ impl Connection {
             reader,
             writer,
             child: None,
+            stderr: None,
         }
     }
 

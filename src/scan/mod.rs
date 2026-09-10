@@ -193,7 +193,6 @@ pub fn validate_portable_target(path: &str, target: &str) -> Result<(), String> 
 /// content; unreadable entries appear as problematic content. A missing root
 /// yields a snapshot with no content.
 #[allow(clippy::too_many_arguments)] // a scan is configured, not builder-shaped
-#[allow(clippy::too_many_arguments)]
 pub fn scan(
     root: &Path,
     baseline: Option<&Snapshot>,

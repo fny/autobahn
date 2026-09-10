@@ -244,7 +244,8 @@ nobody told. `[alerts]` runs a command when that happens:
 ```toml
 [alerts]
 on_alert    = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
-               -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\""
+               -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\" \\
+               -execute \"$AUTOBAHN_OPEN\""
 alert_after = "30s"
 
 [alerts.after]
@@ -255,7 +256,7 @@ halted      = "0s"    # a safety halt does not
 `on_alert` is the only hook. Which states are alerting is in the summary
 it is handed, not in which hook is chosen — a hook per state only moved
 the branching out of the command and into the config, and every state
-ends the same way, with someone opening a terminal. Four rules make it
+ends the same way, with someone opening a terminal. Six rules make it
 usable rather than maddening:
 
 - **Nothing runs while everything is healthy.** Silence is the normal
@@ -269,8 +270,18 @@ usable rather than maddening:
   notification rather than fifteen. `[alerts.after]` tunes that per state,
   which is timing rather than routing: a blip means something different
   for a sleeping laptop than for a safety halt.
-- **An alert fires when the set of sessions in trouble changes**, never on
-  repetition. `repeat_after` opts into a nag; it is off by default.
+- **An alert fires when something *joins* the set of sessions in trouble**,
+  never on repetition, and never on recovery. A cascade coming back one
+  host at a time used to notify on the way up as loudly as on the way
+  down; a session that recovers and fails again inside the same episode is
+  the trouble already reported, not new trouble. `repeat_after` opts into
+  a nag; it is off by default.
+- **A cascade is held for `coalesce_after` and reported once.** A closing
+  laptop does not take its sessions together: each goes when its own
+  connection times out, seconds apart, so every arrival changed the set
+  and every change was news. The window (60 seconds by default) runs from
+  the first arrival nobody has been told about, not from the latest, so a
+  steady trickle cannot hold the notification back indefinitely.
 - **Trouble that comes and goes is reported once.** A conflict on a file
   two machines are both editing appears, clears, and returns all day.
   Everything must stay clear for `settle_after` (15 minutes by default)
@@ -284,6 +295,9 @@ conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you,
 hook that can show more than a headline), `$AUTOBAHN_ALERT_COUNT`,
 `$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`, `$AUTOBAHN_ICON` (autobahn's own
 icon, written into the state directory so a notifier can point at it),
+`$AUTOBAHN_OPEN` (a ready command that opens the shop on the full detail,
+for a notifier that can run something on click — `terminal-notifier
+-execute`, a tray menu item — since one line is all a notification holds),
 and the full `status --json` document on standard input. They run off the
 cycle and cannot affect or delay synchronization: a hook is killed if it
 outstays `timeout`, and is skipped while a previous one is still running.

@@ -60,6 +60,12 @@ const DEFAULT_ALERT_TIMEOUT: Duration = Duration::from_secs(30);
 /// specify one.
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 
+/// How long a grown alerting set is held before it is reported. Long
+/// enough that a laptop closing — which takes its sessions one at a time,
+/// as each connection times out — is one notification rather than one per
+/// session. Short enough that a real halt is not sat on.
+const DEFAULT_COALESCE_AFTER: Duration = Duration::from_secs(60);
+
 /// How long everything must be clear before returning trouble is news.
 /// Long enough that a file two machines are both editing is reported once
 /// rather than on every return.
@@ -108,6 +114,9 @@ pub struct Alerts {
     /// as news. Without it, a condition that comes and goes — two machines
     /// editing one file — notifies on every return.
     pub settle_after: Option<DurationSpec>,
+    /// How long to hold a grown alerting set before reporting it, so a
+    /// cascade arrives as one notification instead of one per part.
+    pub coalesce_after: Option<DurationSpec>,
     /// How long a hook may run before it is killed.
     pub timeout: Option<DurationSpec>,
     /// Per-state overrides of `alert_after`, keyed by state name.
@@ -415,6 +424,11 @@ impl Config {
             default_after: duration(&alerts.alert_after, "alert_after", DEFAULT_ALERT_AFTER)?,
             repeat_after: duration(&alerts.repeat_after, "repeat_after", Duration::ZERO)?,
             settle_after: duration(&alerts.settle_after, "settle_after", DEFAULT_SETTLE_AFTER)?,
+            coalesce_after: duration(
+                &alerts.coalesce_after,
+                "coalesce_after",
+                DEFAULT_COALESCE_AFTER,
+            )?,
             timeout: duration(&alerts.timeout, "timeout", DEFAULT_ALERT_TIMEOUT)?,
         })
     }

@@ -96,6 +96,15 @@ pub struct AlertPlan {
     /// How long a condition must be *gone* before its return counts as
     /// news rather than as the same trouble continuing.
     pub settle_after: Duration,
+    /// How long to hold a grown set before saying anything, so a cascade
+    /// arrives as one notification instead of one per part.
+    ///
+    /// A confirmation period only groups conditions that begin together.
+    /// A closing laptop does not do that: sessions go one at a time as
+    /// each connection times out, every arrival changes the set, and every
+    /// change was news. This window is what makes the difference between
+    /// "three hosts went away" and three notifications.
+    pub coalesce_after: Duration,
     /// How long a hook may run before it is killed.
     pub timeout: Duration,
 }
@@ -168,6 +177,10 @@ pub struct Alerter {
     /// When the alerting set went empty, while the last firing is still
     /// remembered. `None` means either nothing has fired or it has settled.
     cleared_at: Option<Instant>,
+    /// When something new first appeared that has not been said yet. The
+    /// coalescing window runs from here, not from the latest arrival, so a
+    /// cascade that keeps growing still reports on time.
+    pending_since: Option<Instant>,
 }
 
 impl Alerter {
@@ -178,6 +191,7 @@ impl Alerter {
             fired: BTreeSet::new(),
             fired_at: None,
             cleared_at: None,
+            pending_since: None,
         }
     }
 
@@ -216,22 +230,6 @@ impl Alerter {
             .cloned()
             .collect();
 
-        if confirmed == self.fired {
-            // Unchanged. Silence, unless a repeat was asked for — and
-            // never a repeat of nothing.
-            if confirmed.is_empty() || self.plan.repeat_after.is_zero() {
-                return None;
-            }
-            let due = self
-                .fired_at
-                .is_some_and(|at| now.duration_since(at) >= self.plan.repeat_after);
-            if !due {
-                return None;
-            }
-            self.fired_at = Some(now);
-            return Some(self.describe(sessions, &confirmed, true));
-        }
-
         if confirmed.is_empty() {
             // Everything cleared. Nothing is said — an all-clear is a
             // notification that asks for nothing, and a stream of them is
@@ -244,6 +242,7 @@ impl Alerter {
             // stay gone for `settle_after` before its return is news
             // again, which is the difference between "this is still going
             // on" and "this has come back".
+            self.pending_since = None;
             match self.cleared_at {
                 Some(at) if now.duration_since(at) >= self.plan.settle_after => {
                     self.fired.clear();
@@ -258,7 +257,41 @@ impl Alerter {
         // Something is present again, so it never settled.
         self.cleared_at = None;
 
-        self.fired = confirmed.clone();
+        // Only growth is news. `fired` is the high-water mark of the
+        // episode, not the last set seen, so a session recovering while
+        // others are still in trouble says nothing, and the same session
+        // failing again says nothing either — it is the trouble that was
+        // already reported, coming and going. A cascade recovering one
+        // host at a time used to notify on the way back up as loudly as on
+        // the way down.
+        let grown = confirmed.difference(&self.fired).next().is_some();
+
+        if !grown {
+            // Nothing new. Silence, unless a repeat was asked for.
+            if self.plan.repeat_after.is_zero() {
+                return None;
+            }
+            let due = self
+                .fired_at
+                .is_some_and(|at| now.duration_since(at) >= self.plan.repeat_after);
+            if !due {
+                return None;
+            }
+            self.fired_at = Some(now);
+            return Some(self.describe(sessions, &confirmed, true));
+        }
+
+        // Something new. Hold it, and let anything else arriving inside the
+        // window join it. The clock runs from the first unreported arrival,
+        // so a cascade that keeps growing is still reported one window
+        // after it began rather than being deferred for as long as it lasts.
+        let waiting_since = *self.pending_since.get_or_insert(now);
+        if now.duration_since(waiting_since) < self.plan.coalesce_after {
+            return None;
+        }
+
+        self.pending_since = None;
+        self.fired.extend(confirmed.iter().cloned());
         self.fired_at = Some(now);
         Some(self.describe(sessions, &confirmed, false))
     }
@@ -498,6 +531,9 @@ mod tests {
             default_after: Duration::from_secs(30),
             timeout: Duration::from_secs(10),
             settle_after: Duration::from_secs(15 * 60),
+            // Existing cases predate coalescing and test the other rules;
+            // the window has its own tests below.
+            coalesce_after: Duration::ZERO,
             ..AlertPlan::default()
         }
     }
@@ -679,6 +715,115 @@ mod tests {
         assert!(alerter
             .observe(&down, start + Duration::from_secs(40))
             .is_some());
+    }
+
+    fn coalescing_plan(window: Duration) -> AlertPlan {
+        AlertPlan {
+            coalesce_after: window,
+            ..plan()
+        }
+    }
+
+    /// The closing-laptop case. Sessions do not go together: each one goes
+    /// when its own connection times out, seconds apart. Every arrival
+    /// changed the set, and every change was news, so one closing lid
+    /// produced a notification per session.
+    #[test]
+    fn a_cascade_that_arrives_over_time_is_one_notification() {
+        let mut alerter = Alerter::new(coalescing_plan(Duration::from_secs(60)));
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let away = |hosts: &[&str]| -> Vec<SessionAlerts> {
+            hosts
+                .iter()
+                .map(|host| session(host, &[Alert::Unreachable]))
+                .collect()
+        };
+
+        // Hosts go one at a time, each confirmed 30 seconds after it goes.
+        assert_eq!(alerter.observe(&away(&["a"]), at(0)), None);
+        assert_eq!(
+            alerter.observe(&away(&["a"]), at(31)),
+            None,
+            "held, not sent"
+        );
+        assert_eq!(alerter.observe(&away(&["a", "b"]), at(40)), None);
+        assert_eq!(alerter.observe(&away(&["a", "b", "c"]), at(50)), None);
+
+        // One notification, one window after the first arrival, naming all
+        // three — including the ones that arrived while it was held.
+        let fire = alerter
+            .observe(&away(&["a", "b", "c"]), at(91))
+            .expect("the window closes");
+        let Fire::Alert {
+            sessions, summary, ..
+        } = fire;
+        assert_eq!(sessions, 3);
+        assert_eq!(summary, "3 hosts away");
+
+        // And nothing more for the same trouble.
+        assert_eq!(alerter.observe(&away(&["a", "b", "c"]), at(200)), None);
+    }
+
+    /// Waking the laptop brings the sessions back one at a time, the same
+    /// way they left. A shrinking set asks nothing of anyone, so it says
+    /// nothing — and a host that drops again is the trouble already
+    /// reported, not new trouble.
+    #[test]
+    fn recovery_is_silent_and_a_relapse_is_not_news() {
+        let mut alerter = Alerter::new(coalescing_plan(Duration::ZERO));
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let away = |hosts: &[&str]| -> Vec<SessionAlerts> {
+            hosts
+                .iter()
+                .map(|host| session(host, &[Alert::Unreachable]))
+                .collect()
+        };
+
+        alerter.observe(&away(&["a", "b"]), at(0));
+        assert!(alerter.observe(&away(&["a", "b"]), at(31)).is_some());
+
+        // Coming back, one at a time: silence.
+        assert_eq!(alerter.observe(&away(&["a"]), at(40)), None);
+        // Going again, before everything has settled: still the same
+        // trouble, so still silence.
+        assert_eq!(alerter.observe(&away(&["a", "b"]), at(50)), None);
+        assert_eq!(alerter.observe(&away(&["a", "b"]), at(90)), None);
+    }
+
+    /// The window groups what is already happening; it does not defer a
+    /// notification behind a cascade that keeps going. The clock runs from
+    /// the first arrival that has not been reported, not from the latest,
+    /// so a steady trickle cannot hold it back indefinitely.
+    #[test]
+    fn the_window_runs_from_the_first_arrival_not_the_latest() {
+        let mut alerter = Alerter::new(coalescing_plan(Duration::from_secs(60)));
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let away = |count: usize| -> Vec<SessionAlerts> {
+            ["a", "b", "c", "d", "e"][..count]
+                .iter()
+                .map(|host| session(host, &[Alert::Unreachable]))
+                .collect()
+        };
+
+        // A host goes every 20 seconds and none of them come back. With
+        // `alert_after` at 30s, the first is confirmed at t=40, which is
+        // when the window opens.
+        assert_eq!(alerter.observe(&away(1), at(0)), None);
+        assert_eq!(alerter.observe(&away(2), at(20)), None);
+        assert_eq!(alerter.observe(&away(3), at(40)), None, "window opens here");
+        assert_eq!(alerter.observe(&away(4), at(60)), None);
+        assert_eq!(alerter.observe(&away(5), at(80)), None);
+
+        // It closes 60 seconds after it opened, even though hosts are
+        // still arriving, and reports everything confirmed by then.
+        let fire = alerter
+            .observe(&away(5), at(101))
+            .expect("the window closes");
+        let Fire::Alert { sessions, .. } = fire;
+        assert_eq!(sessions, 4, "the four confirmed by t=101");
     }
 
     #[test]

@@ -637,6 +637,19 @@ fn notify_with(title: &str, body: &str, icon: Option<PathBuf>) {
     std::thread::spawn(move || {
         #[cfg(target_os = "macos")]
         {
+            // Inside the app bundle the notification is autobahn's own:
+            // macOS takes the icon from the bundle that sent it, which is
+            // the whole reason the bundle exists. Outside it, there is no
+            // identity to claim and the fallbacks below are the best that
+            // an unsigned command line can do.
+            if let Some(bundle) = bundle_identifier() {
+                if notify_rust::set_application(&bundle).is_ok() {
+                    let mut notification = notify_rust::Notification::new();
+                    notification.summary(&title).body(&body);
+                    let _ = notification.show();
+                    return;
+                }
+            }
             let escape = |text: &str| text.replace('\\', "\\\\").replace('"', "\\\"");
             let script = format!(
                 "display notification \"{}\" with title \"{}\"",
@@ -674,6 +687,25 @@ fn notify_with(title: &str, body: &str, icon: Option<PathBuf>) {
             let _ = notification.show();
         }
     });
+}
+
+/// This process's bundle identifier, when it is running inside one.
+///
+/// Read from the bundle's own `Info.plist` rather than hardcoded, so a
+/// copy someone renamed or re-signed still announces what it actually is.
+#[cfg(target_os = "macos")]
+fn bundle_identifier() -> Option<String> {
+    let executable = std::env::current_exe().ok()?;
+    let contents = executable.parent()?.parent()?;
+    if !contents.ends_with("Contents") {
+        return None;
+    }
+    let plist = std::fs::read_to_string(contents.join("Info.plist")).ok()?;
+    // The identifier follows its key, and the file is small enough that
+    // finding it this way beats taking a plist parser as a dependency.
+    let after = plist.split("<key>CFBundleIdentifier</key>").nth(1)?;
+    let value = after.split("<string>").nth(1)?.split("</string>").next()?;
+    Some(value.trim().to_owned())
 }
 
 /// The first notifier on `PATH` that takes an icon. Looked up rather than

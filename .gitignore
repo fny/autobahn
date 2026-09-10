@@ -1,2 +1,3 @@
 /target
 bench/verify/hosts-*.json
+apps/macos/Autobahn.app/

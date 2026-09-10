@@ -407,9 +407,21 @@ view of the log there is.
 ### The menu bar app
 
 ```sh
-cargo build --release --features tray
-autobahn tray &
+apps/macos/build.sh          # builds Autobahn.app
+open apps/macos/Autobahn.app # or drag it to /Applications
 ```
+
+The app is a way to launch `autobahn tray`, not a second implementation
+of it: the same binary, the same `resolve` a terminal would run. What the
+bundle adds is an *identity*. macOS attaches a notification's icon to the
+bundle that sent it, and a bare executable has none — which is why
+`-appIcon` is ignored from the command line and every alert wears the
+icon of whatever ran it. Inside the bundle the icon is autobahn's.
+
+The menu bar icon is a dot in the colour of the worst session: green when
+everything is synchronized, amber for conflicts, red for a halt. The menu
+lists every group and session, and any conflicting path opens a submenu
+offering to keep alpha's version, the destination's, or both.
 
 An icon whose colour is the state of every session — green when all
 are synchronized, yellow when any is in conflict, red when any is halted

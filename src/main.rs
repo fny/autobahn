@@ -415,8 +415,38 @@ enum Command {
     Agent,
 }
 
+/// Whether this process is the app bundle's executable, started with no
+/// arguments — which is how macOS launches one.
+///
+/// The check is the path, not an environment variable: a bundle's
+/// executable always sits at `…/Contents/MacOS/`, and anything that
+/// reaches this binary through a shell has arguments.
+fn bundled_launch() -> bool {
+    if std::env::args_os().nth(1).is_some() {
+        return false;
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| {
+            let parent = path.parent()?.to_owned();
+            Some(parent.ends_with("Contents/MacOS"))
+        })
+        .unwrap_or(false)
+}
+
 fn main() {
-    let cli = Cli::parse();
+    // Double-clicked inside the app bundle, macOS runs the executable with
+    // no arguments. There is no other way for a bundle to say what its
+    // binary should do, and the binary is the same one the terminal runs.
+    let cli = match bundled_launch() {
+        true => Cli {
+            command: Command::Tray {
+                config: None,
+                state_root: None,
+            },
+        },
+        false => Cli::parse(),
+    };
     let result = match cli.command {
         Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
         Command::Watch {

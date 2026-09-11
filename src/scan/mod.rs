@@ -319,6 +319,16 @@ pub fn recount(snapshot: &mut Snapshot) {
 /// The mutable state of a single scan operation: the ignore set being
 /// applied, a reusable digest buffer, and the running statistics.
 struct Scanner<'a> {
+    /// Whether the walk is currently inside a directory the patterns
+    /// ignore, entered only because a negation names something below it.
+    /// Inside such a region an entry is ignored by virtue of where it is,
+    /// unless a negation re-includes it — the patterns cannot be asked
+    /// "is this ignored", because nothing matches the contents of a
+    /// bare-named directory; their exclusion was the pruning, and the
+    /// pruning is what this region replaces. The region ends at the first
+    /// re-included directory, so what is brought back is brought back
+    /// whole.
+    within_ignored: bool,
     /// The ignore set consulted for every entry.
     ignores: &'a IgnoreSet,
     /// The behavior of the filesystem being scanned.
@@ -367,6 +377,7 @@ impl<'a> Scanner<'a> {
         progress: Option<&'a crate::progress::SideProgress>,
     ) -> Scanner<'a> {
         Scanner {
+            within_ignored: false,
             ignores,
             behavior,
             symlink_mode,
@@ -553,7 +564,7 @@ impl<'a> Scanner<'a> {
                 // Classification still needs the entry's type for the
                 // ignore set, so probe before recording the problem.
                 let ignored = fs::symlink_metadata(&entry_path)
-                    .map(|metadata| self.ignores.ignored(&child_path, metadata.is_dir()))
+                    .map(|metadata| self.entry_ignored(&child_path, metadata.is_dir()))
                     .unwrap_or(false);
                 children.push(Node {
                     name,
@@ -604,6 +615,17 @@ impl<'a> Scanner<'a> {
     /// entry has vanished since it was listed (or was never there: an
     /// incremental walk of baseline children can reach a removed entry
     /// whose parent listing hasn't been repeated).
+    /// Whether an entry is ignored, given where the walk is. Outside an
+    /// ignored region the patterns decide as usual. Inside one, the
+    /// question inverts: everything is ignored except what a negation
+    /// explicitly re-includes.
+    fn entry_ignored(&self, child_path: &str, is_directory: bool) -> bool {
+        match self.within_ignored {
+            true => !self.ignores.re_included(child_path, is_directory),
+            false => self.ignores.ignored(child_path, is_directory),
+        }
+    }
+
     fn scan_entry(
         &mut self,
         name: String,
@@ -631,15 +653,31 @@ impl<'a> Scanner<'a> {
 
         // Ignores are consulted before any descent, which is what keeps
         // ignored subtrees from costing anything at all.
-        if self.ignores.ignored(child_path, file_type.is_dir()) {
+        let is_directory = file_type.is_dir();
+        // Ignores are consulted before any descent, which is what keeps
+        // ignored subtrees from costing anything at all. The exception is
+        // a directory that a negation names something inside: pruning
+        // there would mean nothing below is ever tested, so the negation
+        // could never be consulted. Such a directory is walked instead,
+        // as an ignored region, and its contents are decided one by one.
+        let ignored = self.entry_ignored(child_path, is_directory);
+        if ignored && !(is_directory && self.ignores.holds_a_re_inclusion(child_path)) {
             return Some(Node {
                 name,
                 content: Content::Untracked,
             });
         }
 
-        let content = if file_type.is_dir() {
-            self.scan_directory(entry_path, child_path, baseline, dirty)
+        let content = if is_directory {
+            let outer = self.within_ignored;
+            // An ignored directory opens a region; a re-included one ends
+            // it. Without the second half the negation would bring the
+            // directory back but not what is in it, which is not what
+            // anyone means by re-including.
+            self.within_ignored = ignored;
+            let content = self.scan_directory(entry_path, child_path, baseline, dirty);
+            self.within_ignored = outer;
+            content
         } else if file_type.is_file() {
             self.scan_file(entry_path, &metadata, baseline)
         } else if file_type.is_symlink() {
@@ -1629,11 +1667,47 @@ mod tests {
         assert_eq!(snapshot.files, 1);
     }
 
+    /// The plain case has to stay free: an ignored directory with nothing
+    /// re-included beneath it is never opened, and appears as a single
+    /// untracked entry.
     #[test]
-    fn ignored_directories_are_never_descended_despite_negations() {
+    fn an_ignored_directory_with_no_re_inclusion_is_never_descended() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(root_path, "vendor/junk.txt", "junk");
+        write(root_path, "src/main.rs", "fn main() {}");
+        let set = ignores(&["vendor"]);
+        let snapshot = scan(
+            root_path,
+            None,
+            &set,
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+
+        let vendor = child(root, "vendor");
+        assert!(matches!(vendor.content, Content::Untracked));
+        assert!(vendor.child("junk.txt").is_none(), "never opened");
+        assert_eq!(snapshot.files, 1);
+        assert_eq!(snapshot.directories, 2);
+    }
+
+    /// A negation naming something inside an ignored directory makes the
+    /// walk enter it after all. Everything inside stays ignored except
+    /// what the negation names — so `vendor` with `!vendor/keep.txt` now
+    /// means what `vendor/*` with `!vendor/keep.txt` always meant.
+    #[test]
+    fn a_negation_beneath_an_ignored_directory_is_honoured() {
         let directory = tempdir().expect("temporary directory should be creatable");
         let root_path = directory.path();
         write(root_path, "vendor/keep.txt", "keep");
+        write(root_path, "vendor/junk.txt", "junk");
         write(root_path, "src/main.rs", "fn main() {}");
         let set = ignores(&["vendor", "!vendor/keep.txt"]);
         let snapshot = scan(
@@ -1651,10 +1725,58 @@ mod tests {
         let root = snapshot.root.as_ref().expect("root should exist");
 
         let vendor = child(root, "vendor");
-        assert!(matches!(vendor.content, Content::Untracked));
-        assert!(vendor.child("keep.txt").is_none());
-        assert_eq!(snapshot.files, 1);
-        assert_eq!(snapshot.directories, 2);
+        assert!(
+            matches!(vendor.content, Content::Directory(_)),
+            "walked, because a negation names something inside"
+        );
+        let keep = vendor.child("keep.txt").expect("re-included");
+        assert!(matches!(keep.content, Content::File { .. }));
+        let junk = vendor.child("junk.txt").expect("present but untracked");
+        assert!(
+            matches!(junk.content, Content::Untracked),
+            "inside the region, everything not re-included stays ignored"
+        );
+        assert_eq!(snapshot.files, 2);
+        assert_eq!(snapshot.directories, 3);
+    }
+
+    /// The region ends at a re-included directory: what is brought back is
+    /// brought back whole, contents and all, not as an empty shell.
+    #[test]
+    fn a_re_included_directory_comes_back_with_its_contents() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root_path = directory.path();
+        write(root_path, "vendor/keep/deep/file.txt", "deep");
+        write(root_path, "vendor/junk.txt", "junk");
+        let set = ignores(&["vendor", "!vendor/keep"]);
+        let snapshot = scan(
+            root_path,
+            None,
+            &set,
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect("scan should succeed");
+        let root = snapshot.root.as_ref().expect("root should exist");
+
+        let keep = child(child(root, "vendor"), "keep");
+        assert!(matches!(keep.content, Content::Directory(_)));
+        let file = child(child(keep, "deep"), "file.txt");
+        assert!(
+            matches!(file.content, Content::File { .. }),
+            "nothing inside a re-included directory is still in the region"
+        );
+        assert!(matches!(
+            child(root, "vendor")
+                .child("junk.txt")
+                .expect("present")
+                .content,
+            Content::Untracked
+        ));
     }
 
     #[test]

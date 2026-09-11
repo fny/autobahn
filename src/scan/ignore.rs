@@ -6,16 +6,21 @@
 //! `!keep.log` ignores every log file except one, while the reverse order
 //! ignores all of them.
 //!
-//! # Limitation
+//! # Re-including beneath an ignored directory
 //!
-//! A negation cannot resurrect content beneath an ignored directory. Scans
-//! never descend into an ignored directory (that is the entire point of
-//! ignoring one), so no path inside it is ever tested against the pattern
-//! list. The pattern list `["node_modules", "!node_modules/keep"]` therefore
-//! leaves `node_modules/keep` unscanned, even though [`IgnoreSet::ignored`]
-//! reports that path itself as unignored when asked directly. Re-including
-//! content requires that its ancestors remain unignored, e.g. by ignoring
-//! `node_modules/*` and then re-including `node_modules/keep`.
+//! Scans do not descend into an ignored directory — that is the point of
+//! ignoring one, and what keeps `node_modules` free. The exception is a
+//! directory that a negation names something inside: `["node_modules",
+//! "!node_modules/keep"]` walks `node_modules` after all, with everything
+//! in it ignored except what a negation re-includes. So the two spellings
+//! `.yarn` and `.yarn/*` agree once a negation is involved, where they
+//! used not to. See [`IgnoreSet::holds_a_re_inclusion`].
+//!
+//! This is one place autobahn is deliberately more forgiving than git,
+//! which refuses to re-include under an excluded directory. The change is
+//! safe for every configuration that runs today: before it, such a
+//! configuration was refused at startup, so nothing that synchronizes now
+//! changes shape.
 
 use anyhow::{bail, Context, Result};
 use globset::{GlobBuilder, GlobMatcher};
@@ -82,6 +87,29 @@ impl Pattern {
     }
 }
 
+/// Every directory that a wildcard-free negation names something inside,
+/// including the intermediate ones: `!a/b/c.txt` needs `a` and `a/b` both
+/// walkable, or the walk stops before it ever reaches the file.
+fn reachable_directories(patterns: &[Pattern]) -> std::collections::HashSet<String> {
+    let mut reachable = std::collections::HashSet::new();
+    for pattern in patterns.iter().filter(|pattern| pattern.negated) {
+        let source = pattern.matcher.glob().glob();
+        // Compiled any-depth patterns carry the prefix the compiler added;
+        // the path they name is what follows it.
+        let path = source.strip_prefix("**/").unwrap_or(source);
+        // A wildcard anywhere makes the ancestors unknowable, and guessing
+        // would mean walking directories on the chance that something
+        // inside is re-included.
+        if path.contains(['*', '?', '[']) {
+            continue;
+        }
+        for (at, _) in path.match_indices('/') {
+            reachable.insert(path[..at].to_owned());
+        }
+    }
+    reachable
+}
+
 /// A compiled set of ignore patterns.
 ///
 /// Patterns follow gitignore-style semantics over root-relative paths:
@@ -93,6 +121,16 @@ impl Pattern {
 pub struct IgnoreSet {
     /// The patterns, in source order.
     patterns: Vec<Pattern>,
+    /// Directories that a negation names something inside, so that one
+    /// of them being ignored does not prune the walk — its contents are
+    /// then decided by the patterns, and the negation gets its say.
+    ///
+    /// Computed once, from the patterns alone. Only negations without
+    /// wildcards contribute, because they are the only ones naming a
+    /// directory this can know in advance; a negation that re-includes a
+    /// directory *itself* (`!**/src/**/build/`) needs no help, since the
+    /// walk never pruned there to begin with.
+    reachable: std::collections::HashSet<String>,
 }
 
 impl Default for IgnoreSet {
@@ -128,7 +166,38 @@ impl IgnoreSet {
         for pattern in patterns {
             compiled.push(Pattern::compile(pattern)?);
         }
-        Ok(IgnoreSet { patterns: compiled })
+        let reachable = reachable_directories(&compiled);
+        Ok(IgnoreSet {
+            patterns: compiled,
+            reachable,
+        })
+    }
+
+    /// Whether the walk must enter this directory even though it is
+    /// ignored, because a negation names something inside it.
+    ///
+    /// Asked only where the walk is about to prune — once per ignored
+    /// directory, not once per entry — against a set built at compile
+    /// time. A pattern list with no negations has an empty set, and the
+    /// first test short-circuits before any hashing.
+    pub fn holds_a_re_inclusion(&self, path: &str) -> bool {
+        !self.reachable.is_empty() && self.reachable.contains(path)
+    }
+
+    /// Inside an ignored region, whether an explicit negation saves this
+    /// entry. Everything else in the region is ignored by virtue of where
+    /// it is, so the question is not "does anything ignore it" but "does
+    /// anything re-include it". The last matching pattern decides, as ever.
+    pub fn re_included(&self, path: &str, is_directory: bool) -> bool {
+        for pattern in self.patterns.iter().rev() {
+            if pattern.directory_only && !is_directory {
+                continue;
+            }
+            if pattern.matcher.is_match(path) {
+                return pattern.negated;
+            }
+        }
+        false
     }
 
     /// Reports negations that can never re-include anything.
@@ -139,13 +208,13 @@ impl IgnoreSet {
     /// saying `*.jar`, and the reader has no way to see it: the line is
     /// still there, and it does nothing.
     ///
-    /// Two causes, both always a mistake rather than a matter of taste:
+    /// One cause, and always a mistake rather than a matter of taste: a
+    /// later pattern ignores it again, so last-match-wins overwrites it
+    /// with something further down the list.
     ///
-    /// - A later pattern ignores it again. Last match wins, so the
-    ///   negation is overwritten by something further down the list.
-    /// - An ancestor directory is ignored. Scans never descend into an
-    ///   ignored directory, so nothing inside is ever tested — the
-    ///   limitation described at the top of this module.
+    /// An ancestor being ignored used to belong here too. It no longer
+    /// does — such a directory is walked anyway, so the negation is
+    /// consulted and takes effect. See [`IgnoreSet::holds_a_re_inclusion`].
     ///
     /// Only negations with no wildcards are examined, because those are
     /// the only ones that name a path this can test directly. That is a
@@ -173,21 +242,6 @@ impl IgnoreSet {
                     later.matcher.glob().glob()
                 ));
                 continue;
-            }
-
-            // Every ancestor, nearest first: the innermost ignored one is
-            // the directory the scan actually stops at.
-            let mut ancestors: Vec<&str> =
-                path.match_indices('/').map(|(at, _)| &path[..at]).collect();
-            ancestors.reverse();
-            if let Some(ancestor) = ancestors
-                .into_iter()
-                .find(|ancestor| self.ignored(ancestor, true))
-            {
-                dead.push(format!(
-                    "!{path} can never take effect: its directory {ancestor} is ignored, and \
-                     scans do not descend into an ignored directory"
-                ));
             }
         }
         dead
@@ -247,16 +301,59 @@ mod tests {
         assert!(!set.ignored("gradle-wrapper.jar", false));
     }
 
-    /// Scans never descend into an ignored directory, so re-including
-    /// something inside one cannot work however it is written.
+    /// Re-including beneath an ignored directory used to be impossible:
+    /// the walk pruned at the directory, so nothing below was ever tested.
+    /// The set now tells the walk to enter it, and the negation takes
+    /// effect — so the two spellings agree, and this is no longer dead.
     #[test]
-    fn a_negation_beneath_an_ignored_directory_is_reported() {
-        let set =
-            IgnoreSet::new(&[".yarn".to_owned(), "!.yarn/patches".to_owned()]).expect("compiles");
-        let dead = set.dead_negations();
-        assert_eq!(dead.len(), 1, "{dead:?}");
-        assert!(dead[0].contains(".yarn/patches"), "{dead:?}");
-        assert!(dead[0].contains("is ignored"), "{dead:?}");
+    fn a_negation_beneath_an_ignored_directory_is_live() {
+        let set = ignores(&[".yarn", "!.yarn/patches"]);
+        assert!(
+            set.dead_negations().is_empty(),
+            "{:?}",
+            set.dead_negations()
+        );
+        assert!(
+            set.holds_a_re_inclusion(".yarn"),
+            "the walk must enter .yarn to reach the re-inclusion"
+        );
+        assert!(set.re_included(".yarn/patches", true));
+        assert!(!set.re_included(".yarn/cache", true), "still ignored");
+    }
+
+    /// Every level has to stay walkable, or the walk stops before it
+    /// reaches the file.
+    #[test]
+    fn a_deep_re_inclusion_keeps_every_level_walkable() {
+        let set = ignores(&["a", "!a/b/c.txt"]);
+        assert!(set.holds_a_re_inclusion("a"));
+        assert!(set.holds_a_re_inclusion("a/b"));
+        assert!(
+            !set.holds_a_re_inclusion("a/b/c.txt"),
+            "the file is not a door"
+        );
+    }
+
+    /// A pattern list with no negations pays nothing: the set is empty
+    /// and the walk prunes exactly as before.
+    #[test]
+    fn without_negations_nothing_is_kept_walkable() {
+        let set = ignores(&["node_modules", "target"]);
+        assert!(!set.holds_a_re_inclusion("node_modules"));
+        assert!(!set.holds_a_re_inclusion("target"));
+    }
+
+    /// A negation that re-includes a directory *itself* needs no help —
+    /// the walk never pruned there — and a wildcard one contributes no
+    /// door, because its ancestors cannot be known in advance.
+    #[test]
+    fn a_wildcard_negation_contributes_no_door() {
+        let set = ignores(&["build/", "!**/src/**/build/"]);
+        assert!(!set.holds_a_re_inclusion("src"));
+        assert!(
+            !set.ignored("src/x/build", true),
+            "re-included on its own merits"
+        );
     }
 
     /// The correct idiom for the case above — ignore the contents, not the

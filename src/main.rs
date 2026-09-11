@@ -397,6 +397,19 @@ enum Command {
         /// unless asked.
         #[arg(long, value_name = "DAYS")]
         agent_staging_older_than: Option<u64>,
+        /// Also remove superseded agent binaries from the remote hosts this
+        /// configuration names. Agents are installed per version and
+        /// nothing has ever removed them, so a host accumulates one ~5 MB
+        /// binary per version it has ever been contacted by. Off by
+        /// default: everything else here is local, and this reaches out
+        /// over SSH to every configured host.
+        #[arg(long)]
+        agents: bool,
+        /// How many superseded agent binaries to leave on each host, so an
+        /// older controller reconnecting still finds its agent in place.
+        /// The version in use is always kept and does not count.
+        #[arg(long, value_name = "N", default_value_t = 1)]
+        keep_agents: usize,
     },
     /// Re-read every file's content on the sessions' next cycle, making
     /// content that changed without its metadata moving (restored
@@ -557,7 +570,16 @@ fn main() {
             state_root,
             dry_run,
             agent_staging_older_than,
-        } => run_clean(config, state_root, dry_run, agent_staging_older_than),
+            agents,
+            keep_agents,
+        } => run_clean(
+            config,
+            state_root,
+            dry_run,
+            agent_staging_older_than,
+            agents,
+            keep_agents,
+        ),
         Command::Sync {
             alpha: None,
             beta: None,
@@ -2232,6 +2254,8 @@ fn run_clean(
     state_root: Option<PathBuf>,
     dry_run: bool,
     agent_staging_older_than: Option<u64>,
+    agents: bool,
+    keep_agents: usize,
 ) -> Result<()> {
     use autobahn::session::{EndpointPairLock, SessionLock};
     use std::collections::HashSet;
@@ -2375,7 +2399,65 @@ fn run_clean(
         }
     }
 
-    if removed == 0 && in_use == 0 {
+    // Superseded agent binaries on the remote hosts. Everything above is
+    // local; this reaches out, so it is asked for rather than assumed, and
+    // a host that cannot be reached is reported and stepped over rather
+    // than failing the whole clean — one sleeping laptop must not stop the
+    // rest of a fleet being tidied.
+    let mut agents_removed = 0usize;
+    if agents {
+        use autobahn::config::EndpointTarget;
+        let mut destinations: Vec<String> = plans
+            .iter()
+            .flat_map(|plan| [&plan.alpha, &plan.beta])
+            .filter_map(|target| match target {
+                // A session driven through a custom agent command does not
+                // use the installed-agent path at all, so there is nothing
+                // of ours on the far side to prune.
+                EndpointTarget::Remote {
+                    destination,
+                    agent_command: None,
+                    ..
+                } => Some(destination.clone()),
+                _ => None,
+            })
+            .collect();
+        destinations.sort();
+        destinations.dedup();
+
+        for destination in destinations {
+            match autobahn::transport::install::prune_agents(&destination, keep_agents, dry_run) {
+                Ok(pruned) if pruned.removed.is_empty() => {
+                    println!(
+                        "{destination}: {} agent(s), nothing superseded",
+                        pruned.kept.len()
+                    );
+                }
+                Ok(pruned) => {
+                    println!(
+                        "{verb} {} superseded agent(s) on {destination}: {} (kept {})",
+                        pruned.removed.len(),
+                        pruned.removed.join(", "),
+                        pruned.kept.join(", ")
+                    );
+                    agents_removed += pruned.removed.len();
+                }
+                Err(error) => {
+                    println!("skipped {destination} ({error:#})");
+                    in_use += 1;
+                }
+            }
+        }
+    }
+
+    // Counted rather than measured: the bytes are on the far side, and a
+    // second round of SSH to size them would cost more than the number is
+    // worth. An agent binary is about 5 MB.
+    if agents_removed > 0 {
+        println!("{verb} {agents_removed} superseded agent binary(ies) from the remote hosts");
+    }
+
+    if removed == 0 && in_use == 0 && agents_removed == 0 {
         println!("nothing to clean");
     } else {
         println!(

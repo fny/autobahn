@@ -175,6 +175,7 @@ autobahn verify project    # next cycle re-reads every byte, catching
                            # content whose metadata never moved
 autobahn clean --dry-run   # what state belongs to sessions no longer
 autobahn clean             # in the config; then remove it
+autobahn clean --agents    # also prune superseded agents on remote hosts
 
 autobahn mi                # the shop: watch it work, and clear the queue
                            # (? explains every word on the screen)
@@ -472,6 +473,18 @@ eventually let go: it removes ancestors, status records, staged content,
 and endpoint locks for any session the config no longer describes.
 Anything a running session holds is skipped, and the files in the
 synchronized trees are never touched.
+
+`clean --agents` extends that to the far side. Agents are installed per
+version at `~/.autobahn/bin/autobahn-<version>`, which is what lets a
+fleet upgrade itself host by host with no lockstep — but nothing has ever
+removed the old ones, so a host accumulates one binary (about 5 MB) for
+every version that has ever contacted it. `--agents` removes the
+superseded ones from every remote host the config names, keeping the
+version in use plus `--keep-agents` older ones (one by default) so an
+older controller reconnecting still finds its agent in place. It is off
+by default because everything else `clean` does is local, and this
+reaches out over SSH; a host that cannot be reached is reported and
+stepped over rather than failing the run.
 
 Each (alpha, beta) pair becomes its own session, and sessions are
 independent: a host being down just means its session retries with backoff

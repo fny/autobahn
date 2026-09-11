@@ -249,6 +249,115 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// What a prune found and did on one host.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pruned {
+    /// The versions removed, oldest first.
+    pub removed: Vec<String>,
+    /// The versions left in place, including the one in use.
+    pub kept: Vec<String>,
+}
+
+/// Removes superseded agent binaries from a remote host, keeping the
+/// version this controller runs plus `keep` older ones for rollback.
+///
+/// Agents are installed per version and nothing has ever removed them, so
+/// a host contacted by a year of controllers accumulates a year of ~5 MB
+/// binaries. They are kept deliberately — an older controller reconnecting
+/// finds its agent already there — but "kept deliberately" and "kept
+/// forever" are not the same thing.
+///
+/// The version in use is never removed, whatever `keep` says. Ordering is
+/// by the remote file's modification time rather than by parsing the
+/// version out of the name: the name carries an epoch as well as a
+/// semantic version, so "newest" is a question about when a controller
+/// last needed it, which is what the mtime records.
+pub fn prune_agents(destination: &str, keep: usize, dry_run: bool) -> Result<Pruned> {
+    let current = format!("autobahn-{}", protocol::version());
+    // Oldest first, one name per line. `ls -t` is newest first, so this is
+    // reversed on arrival rather than trusting a second sort remotely.
+    let script = "ls -t ~/.autobahn/bin/ 2>/dev/null | grep '^autobahn-' || true";
+    let output = ssh_command(destination, script)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("unable to list the agents on {destination}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        match detail.is_empty() {
+            true => bail!("unable to list the agents on {destination}"),
+            false => bail!("unable to list the agents on {destination}: {detail}"),
+        }
+    }
+
+    let newest_first: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        // A half-finished upload is named `.autobahn-tmp-install-…`, which
+        // does not match, but an interrupted rename could leave anything;
+        // only well-formed agent names are ever considered.
+        .filter(|name| name.starts_with("autobahn-") && !name.contains('/'))
+        .map(str::to_owned)
+        .collect();
+
+    let (kept, mut removed) = select_agents(&newest_first, &current, keep);
+
+    if removed.is_empty() || dry_run {
+        removed.reverse();
+        return Ok(Pruned { removed, kept });
+    }
+
+    // Removed by exact name under the one directory, never by pattern: a
+    // glob here would be a remote `rm` whose reach depends on what happens
+    // to be on the far side.
+    let names = removed
+        .iter()
+        .map(|name| format!("~/.autobahn/bin/{name}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let script = format!("rm -f {names}");
+    let output = ssh_command(destination, &script)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("unable to remove the agents on {destination}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        match detail.is_empty() {
+            true => bail!("unable to remove the agents on {destination}"),
+            false => bail!("unable to remove the agents on {destination}: {detail}"),
+        }
+    }
+    removed.reverse();
+    Ok(Pruned { removed, kept })
+}
+
+/// Chooses which agent binaries to keep, given the remote directory
+/// newest first. Pure, so the policy is testable without a host.
+///
+/// The version in use is always kept and never spends a `keep` slot:
+/// asking to keep one previous version should leave two binaries, not one
+/// plus a gap where the working agent used to be.
+fn select_agents(
+    newest_first: &[String],
+    current: &str,
+    keep: usize,
+) -> (Vec<String>, Vec<String>) {
+    let mut kept = Vec::new();
+    let mut removed = Vec::new();
+    let mut spare = keep;
+    for name in newest_first {
+        if name == current {
+            kept.push(name.clone());
+        } else if spare > 0 {
+            spare -= 1;
+            kept.push(name.clone());
+        } else {
+            removed.push(name.clone());
+        }
+    }
+    (kept, removed)
+}
+
 /// Builds an SSH command running `script` on the destination. The option
 /// terminator keeps a hostile destination (one beginning with `-`) from
 /// being parsed as an SSH option such as `ProxyCommand`.
@@ -334,6 +443,64 @@ mod tests {
         // The fallback that lets a single-platform fleet skip bundles
         // entirely depends on these namings agreeing.
         assert_eq!(local_platform(), platform_name("Linux", "x86_64"));
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| (*name).to_owned()).collect()
+    }
+
+    /// The agent in use is never a candidate, whatever it costs. Removing
+    /// it would take every session on that host down until the controller
+    /// reinstalled it.
+    #[test]
+    fn the_version_in_use_is_never_removed() {
+        let all = names(&[
+            "autobahn-0.4.0+e8",
+            "autobahn-0.4.0+e9",
+            "autobahn-0.4.0+e5",
+        ]);
+        let (kept, removed) = select_agents(&all, "autobahn-0.4.0+e9", 0);
+        assert_eq!(kept, names(&["autobahn-0.4.0+e9"]));
+        assert_eq!(
+            removed,
+            names(&["autobahn-0.4.0+e8", "autobahn-0.4.0+e5"]),
+            "everything else goes when no rollback is asked for"
+        );
+    }
+
+    /// Keeping one previous version must leave two binaries, not one. The
+    /// version in use does not spend a rollback slot.
+    #[test]
+    fn the_current_version_does_not_spend_a_rollback_slot() {
+        let all = names(&[
+            "autobahn-0.4.0+e9",
+            "autobahn-0.4.0+e8",
+            "autobahn-0.4.0+e7",
+            "autobahn-0.4.0+e6",
+        ]);
+        let (kept, removed) = select_agents(&all, "autobahn-0.4.0+e9", 1);
+        assert_eq!(kept, names(&["autobahn-0.4.0+e9", "autobahn-0.4.0+e8"]));
+        assert_eq!(removed, names(&["autobahn-0.4.0+e7", "autobahn-0.4.0+e6"]));
+    }
+
+    /// A host this controller has never contacted has no agent of ours in
+    /// place. Nothing is in use there, so nothing is protected, but the
+    /// rollback allowance still applies.
+    #[test]
+    fn a_host_without_this_version_still_keeps_its_allowance() {
+        let all = names(&["autobahn-0.4.0+e8", "autobahn-0.4.0+e7"]);
+        let (kept, removed) = select_agents(&all, "autobahn-0.4.0+e9", 1);
+        assert_eq!(kept, names(&["autobahn-0.4.0+e8"]));
+        assert_eq!(removed, names(&["autobahn-0.4.0+e7"]));
+    }
+
+    /// Fewer agents than the allowance removes nothing at all.
+    #[test]
+    fn nothing_is_removed_when_there_is_nothing_superseded() {
+        let all = names(&["autobahn-0.4.0+e9"]);
+        let (kept, removed) = select_agents(&all, "autobahn-0.4.0+e9", 1);
+        assert_eq!(kept, all);
+        assert!(removed.is_empty());
     }
 
     #[test]

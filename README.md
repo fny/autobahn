@@ -483,18 +483,24 @@ concern, and name the ones each group wants:
 
 ```toml
 [defaults]
-ignore_files = ["common"]
+ignore_files = ["common.gitignore"]
 
 [groups.work]
-ignore_files = ["rust", "node"]
+ignore_files = ["Rust.gitignore", "~/dotfiles/node.gitignore"]
 ```
 
-Entries are names, not paths. `"rust"` finds `Rust.gitignore` — matching
-ignores case, because template collections capitalise and configurations
-usually do not — and `"Rust.gitignore"` works too. A name containing a
-path separator or `..` is refused rather than followed, so a
-configuration cannot read a file elsewhere on the machine. The files
-themselves are gitignore syntax: comments, blank lines and all.
+An entry is one of two things, decided by whether it looks like a path:
+
+- A bare file name is a file in `~/.autobahn/ignores`, named exactly.
+  Nothing is appended, and the directory is not searched for something
+  close, so `"Rust"` does not find `Rust.gitignore`.
+- Anything with a separator, or starting with `~`, is a path taken as
+  written; `~/` expands against the home directory.
+
+A relative path is refused. The supervisor runs under a login service,
+whose working directory is not the one the line was written in, so
+"relative to here" has no answer that stays right. The files themselves
+are gitignore syntax: comments, blank lines and all.
 
 Naming files, rather than loading whatever the directory holds, is
 deliberate. Ignore patterns are decided last-match-wins, so order *is*

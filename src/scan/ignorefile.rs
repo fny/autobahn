@@ -7,11 +7,13 @@
 //!
 //! ```toml
 //! [defaults]
-//! ignore_files = ["common"]
+//! ignore_files = ["common.gitignore"]
 //!
 //! [groups.work]
-//! ignore_files = ["rust", "node"]
+//! ignore_files = ["Rust.gitignore", "Node.gitignore"]
 //! ```
+//!
+//! A name is the file's name exactly, extension and capitals included.
 //!
 //! Naming them, rather than loading whatever the directory happens to
 //! hold, is deliberate. Ignore patterns are decided last-match-wins, so
@@ -28,69 +30,69 @@ use anyhow::{bail, Context, Result};
 /// The directory holding ignore files, under the state root.
 pub const DIRECTORY: &str = "ignores";
 
-/// The extension tried when a name does not match a file directly, so that
-/// `"rust"` finds `Rust.gitignore` — which is what these files are called
-/// when they come from a template collection.
-const EXTENSION: &str = "gitignore";
-
-/// Reads the patterns from one named ignore file.
+/// Reads the patterns from one ignore file.
 ///
-/// Names resolve within the ignore directory only: a name containing a
-/// path separator, or `..`, is refused rather than followed, so a
-/// configuration cannot read a file elsewhere on the machine by naming it.
-pub fn read(directory: &Path, name: &str) -> Result<Vec<String>> {
-    if name.is_empty() {
-        bail!("an ignore file name cannot be empty");
-    }
-    if name.contains('/') || name.contains('\\') || name.contains("..") {
-        bail!(
-            "invalid ignore file name {name:?}: names resolve inside {} and cannot contain a \
-             path",
-            directory.display()
-        );
-    }
-
-    let path = resolve(directory, name).ok_or_else(|| {
-        let available = list(directory);
-        match available.is_empty() {
-            true => anyhow::anyhow!(
-                "no ignore file named {name:?} in {} (the directory is empty or absent)",
-                directory.display()
-            ),
-            false => anyhow::anyhow!(
-                "no ignore file named {name:?} in {} (available: {})",
-                directory.display(),
-                available.join(", ")
-            ),
-        }
-    })?;
-
+/// An entry is one of two things, decided by whether it looks like a path:
+///
+/// - A bare file name (`"Rust.gitignore"`) is the name of a file in the
+///   ignore directory, matched exactly. Nothing is appended and case is
+///   not ignored: naming one file and silently reading another is worse
+///   than typing an extension.
+/// - Anything containing a separator, or beginning with `~`, is a path
+///   taken as written. `~/` expands against the home directory, because a
+///   configuration is written by a person and that is how a person writes
+///   a path in one.
+///
+/// A relative path is refused rather than guessed at. The supervisor runs
+/// under a login service, whose working directory is not the one the
+/// reader was in when they wrote the line, so "relative to here" has no
+/// answer that would still be right tomorrow.
+pub fn read(directory: &Path, entry: &str) -> Result<Vec<String>> {
+    let path = locate(directory, entry)?;
     let text = std::fs::read_to_string(&path)
         .with_context(|| format!("unable to read the ignore file {}", path.display()))?;
     Ok(parse(&text))
 }
 
-/// Finds the file a name refers to: the name itself, or the name with the
-/// usual extension, matched without regard to case because a template
-/// collection capitalises its files and a configuration usually does not.
-fn resolve(directory: &Path, name: &str) -> Option<PathBuf> {
-    let direct = directory.join(name);
-    if direct.is_file() {
-        return Some(direct);
+/// Turns a configured entry into the file it names.
+fn locate(directory: &Path, entry: &str) -> Result<PathBuf> {
+    if entry.trim().is_empty() {
+        bail!("an ignore file entry cannot be empty");
     }
-    let suffixed = directory.join(format!("{name}.{EXTENSION}"));
-    if suffixed.is_file() {
-        return Some(suffixed);
+
+    let looks_like_a_path = entry.starts_with('~') || entry.contains('/');
+    if !looks_like_a_path {
+        let path = directory.join(entry);
+        if path.is_file() {
+            return Ok(path);
+        }
+        let available = list(directory);
+        bail!(match available.is_empty() {
+            true => format!(
+                "no ignore file named {entry:?} in {} (the directory is empty or absent)",
+                directory.display()
+            ),
+            false => format!(
+                "no ignore file named {entry:?} in {} (available: {})",
+                directory.display(),
+                available.join(", ")
+            ),
+        });
     }
-    let wanted = name.to_ascii_lowercase();
-    std::fs::read_dir(directory)
-        .ok()?
-        .flatten()
-        .find_map(|entry| {
-            let file = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            let matches = file == wanted || file == format!("{wanted}.{EXTENSION}");
-            (matches && entry.path().is_file()).then(|| entry.path())
-        })
+
+    let path = crate::paths::expand_tilde(entry)
+        .with_context(|| format!("invalid ignore file path {entry:?}"))?;
+    if !path.is_absolute() {
+        bail!(
+            "ignore file path {entry:?} is relative; give an absolute path (or one starting \
+             with ~/), because the supervisor's working directory is not the one this was \
+             written in"
+        );
+    }
+    if !path.is_file() {
+        bail!("no ignore file at {}", path.display());
+    }
+    Ok(path)
 }
 
 /// The names available in the directory, for the message shown when one is
@@ -157,31 +159,79 @@ mod tests {
         );
     }
 
+    /// A bare name is the filename as written: nothing is appended to it
+    /// and the directory is not searched for something close. Whether the
+    /// name is compared with regard to case is the filesystem's business,
+    /// not autobahn's — the same name resolves on APFS and does not on
+    /// ext4, and being stricter than the filesystem underneath would be
+    /// its own kind of surprise.
     #[test]
-    fn a_name_cannot_escape_the_directory() {
-        let directory = std::env::temp_dir();
-        for name in ["../secrets", "a/b", "..", ""] {
-            assert!(read(&directory, name).is_err(), "{name:?} must be refused");
-        }
-    }
-
-    #[test]
-    fn a_name_finds_a_capitalised_template() {
+    fn a_bare_name_is_the_filename_as_written() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         std::fs::write(directory.path().join("Rust.gitignore"), "target\n").expect("the template");
         assert_eq!(
-            read(directory.path(), "rust").expect("the patterns"),
+            read(directory.path(), "Rust.gitignore").expect("the patterns"),
             vec!["target"]
         );
+        for near_miss in ["rust", "Rust", "Rust.gitignore.txt"] {
+            assert!(
+                read(directory.path(), near_miss).is_err(),
+                "{near_miss:?} must not resolve: no extension is appended"
+            );
+        }
+    }
+
+    /// A path is taken as written, wherever it points.
+    #[test]
+    fn a_path_is_read_from_where_it_says() {
+        let elsewhere = tempfile::tempdir().expect("a temporary directory");
+        let file = elsewhere.path().join("mine.gitignore");
+        std::fs::write(&file, "# mine\nbuild\n").expect("the file");
+        let ignores = tempfile::tempdir().expect("the ignore directory");
+        assert_eq!(
+            read(ignores.path(), &file.display().to_string()).expect("the patterns"),
+            vec!["build"]
+        );
+    }
+
+    /// `~/` is how a person writes a path in a configuration, so it has to
+    /// mean what they meant.
+    #[test]
+    fn a_tilde_expands_against_the_home_directory() {
+        let ignores = tempfile::tempdir().expect("the ignore directory");
+        let error =
+            read(ignores.path(), "~/definitely-not-here.gitignore").expect_err("no such file");
+        let message = format!("{error:#}");
+        assert!(
+            !message.contains('~'),
+            "the path must be expanded: {message}"
+        );
+        assert!(message.contains("definitely-not-here"), "{message}");
+    }
+
+    /// A service's working directory is not the one the line was written
+    /// in, so a relative path is refused rather than guessed at.
+    #[test]
+    fn a_relative_path_is_refused() {
+        let ignores = tempfile::tempdir().expect("the ignore directory");
+        let error = read(ignores.path(), "some/where.gitignore").expect_err("relative");
+        assert!(format!("{error:#}").contains("relative"), "{error:#}");
+    }
+
+    #[test]
+    fn an_empty_entry_is_refused() {
+        let ignores = tempfile::tempdir().expect("the ignore directory");
+        assert!(read(ignores.path(), "").is_err());
+        assert!(read(ignores.path(), "   ").is_err());
     }
 
     #[test]
     fn a_missing_name_says_what_is_available() {
         let directory = tempfile::tempdir().expect("a temporary directory");
         std::fs::write(directory.path().join("Rust.gitignore"), "target\n").expect("write");
-        let error = read(directory.path(), "python").expect_err("no such file");
+        let error = read(directory.path(), "Python.gitignore").expect_err("no such file");
         let message = format!("{error:#}");
-        assert!(message.contains("python"), "{message}");
+        assert!(message.contains("Python.gitignore"), "{message}");
         assert!(message.contains("Rust.gitignore"), "{message}");
     }
 }

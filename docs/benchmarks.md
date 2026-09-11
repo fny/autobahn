@@ -1,9 +1,10 @@
 # Benchmark: autobahn vs mutagen
 
 > **These numbers describe autobahn 0.3.0.** The current version is
-> 0.4.0, and two of its changes move measured quantities. Neither
-> alters a conclusion here, but the specific figures below are no
-> longer what the current binary produces — see
+> 0.4.0, and three of its changes move measured quantities: two make it
+> slightly slower, and one removes the cause of its multi-second
+> outliers. None alters a conclusion here, but the specific figures
+> below are no longer what the current binary produces — see
 > [Currency](#currency-what-changed-since-these-numbers) at the end.
 
 autobahn 0.3.0 against mutagen 0.19.0-dev, on matched pairs of
@@ -11,10 +12,10 @@ autobahn 0.3.0 against mutagen 0.19.0-dev, on matched pairs of
 three concurrency levels, ten repeats of each of fifteen cells: **150 jobs,
 300 tool-runs, ~440,000 latency samples.**
 
-The full per-cell tables are in [BENCHMARK-MATRIX.md](BENCHMARK-MATRIX.md).
+The full per-cell tables are in [the benchmark matrix](./benchmark-matrix.md).
 The method, and the defects it was designed to prevent, are in
-[bench/README.md](bench/README.md). An implementation explanation of the
-gaps is in [docs/MUTAGEN.md](docs/MUTAGEN.md).
+[bench/README.md](../bench/README.md). An implementation explanation of the
+gaps is in [Why mutagen is slower](./mutagen.md).
 
 ## Headline
 
@@ -61,7 +62,7 @@ tree size or agent count. mutagen's moves with both.** On the 4k corpus
 mutagen goes from 62 ms to 2,690 ms as agents go from 1 to 100, on a tree
 that never grew. autobahn goes from 41 ms to 78 ms.
 
-The reason is structural and is set out in [docs/MUTAGEN.md](docs/MUTAGEN.md):
+The reason is structural and is set out in [Why mutagen is slower](./mutagen.md):
 no official mutagen build has recursive watching on Linux, so every change
 event triggers a full scan of the whole tree. autobahn scans only what
 changed.
@@ -90,7 +91,7 @@ Two CPU results are worth separating out.
 permanently, to poll a tree that is not changing.
 
 **The destination host.** In the one-direction cells the destination does no
-editing. mutagen still used 117–125% of a core there, against 16–35% for
+editing. mutagen still used 114–125% of a core there, against 16–35% for
 autobahn. The receiving side rescans and reserializes the whole tree on
 every cycle.
 
@@ -112,7 +113,7 @@ costs to stay caught up afterward.
 These numbers were taken with the corpus faulted fully into the volume and
 the page cache dropped before each run. Without that control the measurement
 reports storage behavior rather than tool behavior — see
-[bench/README.md](bench/README.md#lessons-paid-for).
+[bench/README.md](../bench/README.md#lessons-paid-for).
 
 ## Where autobahn is weakest
 
@@ -171,6 +172,16 @@ reconnection and a full rescan, during which nothing moves at all. Failing
 only when a cycle applies *no* transitions would distinguish a genuinely
 stuck session from a merely busy one.
 
+**Fixed since.** That is now what happens (`db09681`). When the follow-up
+cycles run out, the supervisor keeps the work they did and carries on;
+the session stays up and the watcher paces the next attempt. It fails
+only when the *same content at the same digest* is missing on two
+cycles running, which means staging is not producing it at all rather
+than racing the writers. The binary measured here predates the fix —
+the restarts counted above are the defect firing — and it has not been
+re-measured, so the tail figures in this document still stand until a
+re-run replaces them.
+
 ## Confidence
 
 - **150 of 150 jobs completed.** One run was excluded: a destination host
@@ -189,8 +200,12 @@ Raw JSONL for every job is in `bench/results-bench-1787811723/`.
 
 ## Currency: what changed since these numbers
 
+**The session restart behind the multi-second outliers is gone** — see
+[Where autobahn is weakest](#where-autobahn-is-weakest). That should
+improve the 99th-percentile column; it is not yet measured.
+
 The measurements above were taken at 0.3.0. Since then the correctness
-work described in `docs/correctness/` landed, and every change touching
+work described in [`correctness/`](./correctness/) landed, and every change touching
 a hot path was A/B measured on a 63,000-file local corpus before it
 shipped. Most measured flat. Two did not, and both make autobahn
 slower:
@@ -238,3 +253,10 @@ pair), and a different workload than the benchmark. They are an honest
 adjustment, not a substitute measurement. Only a re-run on matched
 instance pairs produces citable 0.4.0 figures; the raw A/B reports
 behind the table above are kept alongside the benchmark aggregates.
+
+## See also
+
+- [The benchmark matrix](./benchmark-matrix.md) — every cell, every percentile
+- [Why mutagen is slower](./mutagen.md) — where the gaps come from, in mutagen's code
+- [How autobahn works](./how-it-works.md) — the design these numbers come from
+- [bench/README.md](../bench/README.md) — the method, and how to run it yourself

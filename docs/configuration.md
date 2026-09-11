@@ -113,7 +113,11 @@ own and nothing backgrounds itself: `start` with no service installed
 says so and points at `install` or `watch`.
 
 The supervisor holds the config in memory, so an edit takes effect on
-`restart`.
+`restart`. A restart does not ask the supervisor to stop: the service
+manager kills it and starts it again. That is safe — writes are staged and
+published by rename, and the ancestor journal is built to survive a crash
+at any point (see [Safety](./safety.md)) — but a cycle in flight is
+abandoned and redone.
 
 ## See also
 

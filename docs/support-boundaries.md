@@ -58,6 +58,6 @@ parent and ignore the rest.
 
 ## See also
 
-- [Safety rules](./safety.md) — what is guaranteed inside these boundaries
+- [Safety](./safety.md) — what is guaranteed inside these boundaries
 - [Overlapping and nested roots](./nesting.md) — the one-owner rule in practice
 - [Commands](./commands.md) — `verify`

@@ -25,6 +25,21 @@ cargo test --release --test e2e             # real agents over stdio
 Reconciliation and scanning are shared by everything, so a change there
 runs the supervisor and e2e suites too.
 
+The integration suites run with a private `HOME`
+(`tests/common::isolate_home`). Endpoint locks and agent-side staging live
+under `$HOME/.autobahn` by design, so that two processes disagreeing about
+their state root still meet at the lock — which meant that, before this,
+every test run left staging directories and locks in your real state root.
+
+Build the tray feature into its own target directory:
+
+```sh
+CARGO_TARGET_DIR=target/tray cargo build --release --features tray
+```
+
+That is what `apps/macos/build.sh` does. The login service runs
+`target/release/autobahn`, and a feature build there replaces it.
+
 ## The A/B gate
 
 Every hot-path change is measured before it ships, because analysis
@@ -41,8 +56,8 @@ lands on both. A difference smaller than the leg-to-leg spread is noise;
 a difference that reverses sign between runs is certainly noise. Three
 legs cannot tell a small effect from chance — use five.
 
-`bench/README.md` covers the rest of the harness, and `BENCHMARK.md` the
-published comparison against mutagen.
+`bench/README.md` covers the rest of the harness, and
+[Benchmarks](./benchmarks.md) the published comparison against mutagen.
 
 ## Compatibility epochs
 
@@ -71,13 +86,13 @@ synchronization engine: enum-based trees with name-sorted, copy-on-write
 shared children; scan metadata resident on the nodes themselves; linear-
 merge reconciliation; streaming transfers end to end. What required
 convention and adversarial review to keep safe in Go, the borrow checker
-and `Arc::make_mut` enforce structurally here. [Why mutagen is slower](./MUTAGEN.md)
+and `Arc::make_mut` enforce structurally here. [Why mutagen is slower](./mutagen.md)
 sets out where the difference comes from in mutagen's code.
 
 [Mutagen]: https://github.com/mutagen-io/mutagen
 
 ## See also
 
-- [How autobahn works](./HOW-IT-WORKS.md) — the design and its reasoning
-- [Safety rules](./safety.md) — what the tests pin
+- [How autobahn works](./how-it-works.md) — the design and its reasoning
+- [Safety](./safety.md) — what the tests pin
 - [State](./state.md) — agents, epochs, and what lives in `~/.autobahn`

@@ -34,11 +34,11 @@ Enter [Mutagen](https://github.com/mutagen-io/mutagen) which promised snappy fil
 
 ## Why autobahn?
 
-- **Fast.** A cold sync of a 40,000-file, 227MB tree to another region
-  takes about 5 seconds; after that, a changed file lands on the other
-  side in ~150ms. Transfers send only deltas, LZ4-compressed.
-- **Light.** The remote agent uses ~9MB of memory. The supervisor managing
-  many sessions uses ~40MB. There is no background daemon.
+- **Fast.** A changed file lands on the other side in about 50 ms on a
+  40,000-file tree, and in under 200 ms on a half-million-file Chromium
+  checkout. Transfers send only deltas, LZ4-compressed.
+- **Light.** 33 MB for a 40,000-file tree and 249 MB for Chromium. Idle,
+  it uses 0.2% of a core. There is no background daemon.
 - **Zero remote setup.** Nothing to install on the far side — autobahn
   streams its own agent over the same SSH connection on first contact,
   and upgrades roll out host by host the same way.
@@ -47,8 +47,30 @@ Enter [Mutagen](https://github.com/mutagen-io/mutagen) which promised snappy fil
   file" and "this file never existed here" — so it never propagates a
   deletion it can't justify, refuses to overwrite files that changed
   mid-sync, and halts entirely if a whole sync root disappears.
+  [How errors are prevented](docs/safety.md).
 - **Honest about conflicts.** If both sides changed the same file, the
   default mode reports the conflict and touches nothing.
+
+## The numbers
+
+Against mutagen, on matched pairs of AWS machines — fifteen cells, ten
+repeats each, about 440,000 latency samples:
+
+| | autobahn | mutagen | |
+|---|---|---|---|
+| Propagate one edit, Chromium (505k files) | **188 ms** | 7,118 ms | 37.8× |
+| Propagate one edit, 40k files, 10 agents | **52 ms** | 1,854 ms | 35.4× |
+| Peak memory, Chromium | **249 MB** | 2,033 MB | 8.2× |
+| CPU while idle, Chromium | **0.2%** | 50% | 250× |
+| First sync, Chromium | 423 s | 418 s | ~1% |
+
+autobahn is faster in all fifteen cells. The one row where the two tie is
+the first sync, which is bound by the disk rather than by either tool;
+where they differ is in what it costs to stay caught up afterwards.
+
+These figures were measured at 0.3.0. What has moved since, and why, is in
+[Benchmarks](docs/benchmarks.md); [Why mutagen is slower](docs/mutagen.md)
+traces each gap to mutagen's code.
 
 ## Installing
 
@@ -132,6 +154,9 @@ config — the hold times, coalescing and the rest are built in:
 on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\" -execute \"$AUTOBAHN_OPEN\""
 ```
 
+On a Mac there is also a [menu bar app](docs/macos-app.md) that shows the
+state of every session at a glance and settles conflicts from a menu.
+
 That's the whole setup. Everything else is in the documentation.
 
 ## Documentation
@@ -151,17 +176,21 @@ That's the whole setup. Everything else is in the documentation.
 
 **Understanding it**
 
-- [Safety rules](docs/safety.md) — what is refused, and why
+- [Safety](docs/safety.md) — how errors are prevented, and where the guarantees stop
+- [How autobahn works](docs/how-it-works.md) — the design and its reasoning
 - [Overlapping and nested roots](docs/nesting.md)
 - [Scope and support boundaries](docs/support-boundaries.md)
-- [How autobahn works](docs/HOW-IT-WORKS.md) — the design and its reasoning
-- [Why mutagen is slower](docs/MUTAGEN.md)
+
+**Measuring it**
+
+- [Benchmarks](docs/benchmarks.md) — autobahn against mutagen, and what has changed since
+- [The benchmark matrix](docs/benchmark-matrix.md) — every cell, every percentile
+- [Why mutagen is slower](docs/mutagen.md) — each gap, traced to mutagen's code
 
 **Working on it**
 
 - [Development](docs/development.md) — building, targeted tests, the A/B gate
 - [Correctness](docs/correctness/) — the invariants and what enforces them
-- [Benchmarks](BENCHMARK.md)
 
 The [documentation index](docs/README.md) lists every page.
 

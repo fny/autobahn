@@ -1,7 +1,7 @@
 # Why mutagen is slower and uses more memory
 
-The [benchmark](../BENCHMARK.md) measured mutagen at approximately 2 GB of
-memory against autobahn's 273 MB on a Chromium checkout. It measured a 7 to
+The [benchmark](./benchmarks.md) measured mutagen at 2,033 MB of peak
+memory against autobahn's 249 MB on a Chromium checkout. It measured a 7 to
 9 second median propagation latency against autobahn's fraction of a
 second. This document explains where those numbers come from in mutagen's
 code.
@@ -67,9 +67,13 @@ destination and 902 MB for the source. Doubled, that is 1,294 MB and 1,803
 MB, against 1,430 MB and 2,065 MB measured. The model sits 10 to 15% low,
 and per-cycle garbage explains the rest.
 
+Those two measured peaks come from the run the model was built against.
+The published matrix is a separate run with the same shape: 1,361 MB and
+2,033 MB for Chromium with one agent.
+
 ### Why the ratio grows with file count
 
-The benchmark measured a 2.6× gap at 4,000 files and a 7.6× gap at 505,000.
+The benchmark measured a 3.1× gap at 4,000 files and an 8.2× gap at 505,000.
 The marginal cost of one more file is approximately **4,022 bytes** for
 mutagen and **507 bytes** for autobahn. Fixed overhead dominates at 4,000
 files, which is why the ratio looks small there. The gap is per-entry, so it
@@ -143,7 +147,7 @@ a 1 second interval would separate them, and that test has not been run.
 ## Why concurrency makes it worse on the same tree
 
 On an unchanged 4,000-file tree, mutagen went from 62 ms with one writer to
-1,028 ms with ten and 2,680 ms with a hundred. The tree never grew. Four
+1,037 ms with ten and 2,690 ms with a hundred. The tree never grew. Four
 mechanisms compound.
 
 **The debouncers reset instead of expiring.** `state/coalescer.go:64` calls
@@ -169,9 +173,9 @@ for the next tick.
 
 ## Why the destination burns more than a core
 
-In the one-direction cells the destination does no editing. Mutagen still
-used 104 to 124% of a core there, against approximately a third of a core
-for autobahn.
+In the one-direction cells the destination does no editing. On Chromium
+mutagen still used 114 to 125% of a core there, against 16 to 35% for
+autobahn.
 
 The receiving endpoint does not do less work. For each `Scan` it runs a full
 scan, because the preceding `Transition` disabled acceleration
@@ -213,3 +217,9 @@ gets.
 - Upstream has in-flight work on several of these behaviors, including a
   compact tree and an inline cache timestamp. This document describes the
   released code that the benchmark measured.
+
+## See also
+
+- [Benchmarks](./benchmarks.md) — the measurements this document explains
+- [The benchmark matrix](./benchmark-matrix.md) — every cell, every percentile
+- [How autobahn works](./how-it-works.md) — autobahn's side of the same decisions

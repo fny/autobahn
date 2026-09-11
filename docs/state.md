@@ -92,4 +92,4 @@ names the bundle and its age when that happens.
 - [Commands](./commands.md) — `clean`, `reset`, `verify`
 - [Ignores](./ignores.md) — the `ignores/` directory
 - [The log](./logging.md) — `service.log`
-- [Safety rules](./safety.md) — why a corrupt ancestor is an error, not a reset
+- [Safety](./safety.md) — why a corrupt ancestor is an error, not a reset

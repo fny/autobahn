@@ -77,5 +77,5 @@ can see the other — see [Support boundaries](./support-boundaries.md).
 ## See also
 
 - [Ignores](./ignores.md) — ignored means absent, and what that does not cover
-- [Safety rules](./safety.md) — a missing source root halts rather than empties
+- [Safety](./safety.md) — a missing source root halts rather than empties
 - [Modes](./modes.md) — which side is written in each

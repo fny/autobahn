@@ -1,7 +1,7 @@
 # A/B reports
 
 The raw output behind the "Currency" section of
-[BENCHMARK.md](../../BENCHMARK.md), and behind the A/B claims in the
+[docs/benchmarks.md](../../docs/benchmarks.md), and behind the A/B claims in the
 commit messages of every hot-path change.
 
 These are *not* the benchmark. The benchmark measures autobahn against

@@ -38,6 +38,20 @@ still mean everything twice.
 It is a view over `status --json`, polled every few seconds, and holds
 no state of its own. macOS and Linux (with a system tray).
 
+## Starting it
+
+Open `apps/macos/Autobahn.app`, or drag it to `/Applications` and open it
+there. **It does not start at login on its own**: add it under System
+Settings → General → Login Items. The supervisor is separate and already
+survives logout through `autobahn install`; the app only watches it.
+
+From a terminal, `autobahn tray` runs the same menu bar app — but only in
+a binary built with `--features tray`. A plain build answers that it has
+no menu bar app. `build.sh` builds that binary into `target/tray`
+(`AUTOBAHN_TRAY_TARGET` moves it), never `target/release`: the login
+service runs `target/release/autobahn` through a symlink, and an app build
+must not replace it.
+
 ## The icon
 
 The app's icon is `Autobahn.icon`, an Icon Composer bundle at the root of

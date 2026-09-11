@@ -15,7 +15,7 @@ autobahn is, how to install it, and the minimum to get a group syncing.
 | [Commands](./commands.md) | asking a running supervisor things; what the state words mean; one-off syncs |
 | [Conflicts](./conflicts.md) | `issues`, `conflicts`, `diff`, `resolve` — and how resolution actually works |
 | [The shop](./shop.md) | `autobahn mi`: watch it work, and clear the queue from a tree you can act on |
-| [The menu bar app](./macos-app.md) | an icon in the colour of the worst session; signing and notarising |
+| [The menu bar app](./macos-app.md) | the Autobahn sign in the menu bar; starting it; its icon; signing |
 | [The log](./logging.md) | levels, what `debug` adds, rotation |
 | [State](./state.md) | what lives in `~/.autobahn`, `clean`, agents and compatibility epochs |
 
@@ -23,11 +23,18 @@ autobahn is, how to install it, and the minimum to get a group syncing.
 
 | page | what it covers |
 |---|---|
-| [Safety rules](./safety.md) | what a cycle does, and the deletions and overwrites that are refused |
+| [Safety](./safety.md) | how errors are prevented: the ten guarantees, the startup checks, how they are tested, and where they stop |
+| [How autobahn works](./how-it-works.md) | the design: the problem, the decisions, and what they cost |
 | [Overlapping and nested roots](./nesting.md) | what is refused and why, and how to ignore an inner root |
 | [Scope and support boundaries](./support-boundaries.md) | platforms, filesystems, and the cases outside the guarantees |
-| [How autobahn works](./HOW-IT-WORKS.md) | the design: the problem, the decisions, and what they cost |
-| [Why mutagen is slower](./MUTAGEN.md) | where the memory and latency difference comes from, in mutagen's code |
+
+## Measuring it
+
+| page | what it covers |
+|---|---|
+| [Benchmarks](./benchmarks.md) | autobahn against mutagen on matched AWS pairs, where autobahn is weakest, and what has changed since |
+| [The benchmark matrix](./benchmark-matrix.md) | every cell, every percentile, memory and CPU on both hosts |
+| [Why mutagen is slower](./mutagen.md) | where the memory and latency gaps come from, in mutagen's code |
 
 ## Working on it
 
@@ -36,5 +43,4 @@ autobahn is, how to install it, and the minimum to get a group syncing.
 | [Development](./development.md) | building, targeted tests, the A/B gate, compatibility epochs |
 | [`correctness/`](./correctness/) | the invariants, the code that enforces each, the tests, and the residuals |
 | [`reviews/`](./reviews/) | adversarial reviews of specific subsystems |
-| [`../BENCHMARK.md`](../BENCHMARK.md) | the published comparison against mutagen |
-| [`../bench/README.md`](../bench/README.md) | the benchmark harness |
+| [`../bench/README.md`](../bench/README.md) | the benchmark harness, and how to run it |

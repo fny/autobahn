@@ -74,4 +74,4 @@ suits a fan-out you push *from* rather than edit at both ends.
 
 - [Configuration](./configuration.md) — where `mode` goes
 - [Conflicts](./conflicts.md) — settling a disagreement once it is reported
-- [Safety rules](./safety.md) — the deletions that are refused in every mode
+- [Safety](./safety.md) — the deletions that are refused in every mode

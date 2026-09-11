@@ -108,4 +108,4 @@ an ignored path is another session's root.
 
 - [Configuration](./configuration.md) — the `ignores` and `ignore_files` keys
 - [Overlapping and nested roots](./nesting.md) — ignoring an inner root
-- [Safety rules](./safety.md) — what is never removed
+- [Safety](./safety.md) — what is never removed

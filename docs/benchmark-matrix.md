@@ -5,13 +5,13 @@
 > each mutating cycle of a remote session) and the first-synchronization
 > cells slightly higher (published content is re-hashed at the moment of
 > publication). The reasoning and the measurements are in
-> [BENCHMARK.md](BENCHMARK.md#currency-what-changed-since-these-numbers).
+> [the summary](./benchmarks.md#currency-what-changed-since-these-numbers).
 > Both changes buy correctness properties, and neither changes a
 > conclusion in these tables.
 
 Every cell, every percentile. The summary and the interpretation are in
-[BENCHMARK.md](BENCHMARK.md). The method is in
-[bench/README.md](bench/README.md).
+[the benchmark summary](./benchmarks.md). The method is in
+[bench/README.md](../bench/README.md).
 
 **Setup.** Matched pairs of `c6i.4xlarge` instances, one AWS availability
 zone, 200 GB gp3 volumes. Chromium at 504,940 files with symbolic links
@@ -76,7 +76,8 @@ backs off, reconnects and rescans, and nothing propagates meanwhile.
 Restarts number 30 across `chromium-100-bidir`, 8 across `4k-100`, and 2 in
 a single `chromium-1` run. Every cell with a multi-second outlier has them,
 and every cell without them has a clean tail. Details in
-[BENCHMARK.md](BENCHMARK.md#where-autobahn-is-weakest).
+[the summary](./benchmarks.md#where-autobahn-is-weakest). The defect has since
+been fixed; the summary says how.
 
 **mutagen's ordering is not monotonic in agent count.** On the 40k corpus it
 is slower at 10 agents (1,854 ms) than at 100 (1,602 ms). Both are far above
@@ -177,7 +178,7 @@ does no editing, yet mutagen sustains more than a core there. It rescans and
 reserializes the whole tree on every cycle.
 
 An implementation account of all three findings is in
-[docs/MUTAGEN.md](docs/MUTAGEN.md).
+[Why mutagen is slower](./mutagen.md).
 
 ## First synchronization
 
@@ -199,9 +200,15 @@ the smaller trees.
 Without the storage controls these numbers are meaningless: an uncontrolled
 run charged the first tool 434 s and the second 125 s for identical work,
 purely from snapshot block loading. See
-[bench/README.md](bench/README.md#lessons-paid-for).
+[bench/README.md](../bench/README.md#lessons-paid-for).
 
 ---
 
 Raw JSONL for all 150 jobs, the plan, and per-pair driver logs are in
 `bench/results-bench-1787811723/`.
+
+## See also
+
+- [Benchmarks](./benchmarks.md) — the summary, and what has changed since
+- [Why mutagen is slower](./mutagen.md) — the implementation account
+- [bench/README.md](../bench/README.md) — the method

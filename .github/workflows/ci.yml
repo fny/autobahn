@@ -7,8 +7,12 @@
 # macOS runners are the scarce ones: slower to start, and a free account
 # runs only a handful at a time. So there is exactly one macOS job, on the
 # same image the release uses, running the suite and building the app on
-# one runner and one cache; and a newer push cancels an older run of the
-# same branch before it spends a runner on stale code.
+# one runner and one cache. It starts only after the Linux job passes —
+# a change that fails formatting, lints or tests there is broken anyway —
+# and a newer push cancels an older run of the same branch before it
+# spends a runner on stale code. For a change that cannot touch macOS,
+# put [skip mac] in the head commit's message (or a pull request's title)
+# and the macOS job is skipped; everything else still runs.
 name: CI
 
 on:
@@ -56,6 +60,12 @@ jobs:
         run: cargo test --release
 
   mac:
+    # A job with `needs` runs only if what it needs succeeded, and that
+    # still holds with an `if` of its own: this adds the skip marker to it.
+    needs: linux
+    if: >-
+      ${{ !contains(github.event.head_commit.message, '[skip mac]')
+          && !contains(github.event.pull_request.title, '[skip mac]') }}
     runs-on: macos-15
     timeout-minutes: 45
     steps:

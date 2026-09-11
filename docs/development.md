@@ -15,6 +15,13 @@ artwork, and the release workflow. There is one macOS job, which runs the
 suite and then builds the app, signed ad-hoc; the certificate belongs to
 the release alone. A newer push cancels an older run of the same branch.
 
+macOS runners are the slow and scarce ones, so the macOS job waits for the
+Linux job and runs only if it passed — a change that fails there is broken
+anyway. For a change that cannot touch macOS, put `[skip mac]` in the
+head commit's message, or in a pull request's title, and the macOS job is
+skipped while everything else runs. Only the head commit of a push is
+read, so the marker has to be on the last commit you push.
+
 ## Targeted tests
 
 The full suite takes minutes. Run the part that covers the change:

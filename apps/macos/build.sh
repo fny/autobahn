@@ -25,18 +25,25 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp apps/macos/Info.plist "$APP/Contents/Info.plist"
 cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn"
-# The icon is compiled from assets/Autobahn.icon by Xcode's own asset compiler,
-# exactly as Xcode would build it: Assets.car carries the full Icon
-# Composer rendering (light, dark and tinted, with the glass) that macOS
-# 26 draws, and Autobahn.icns is the flat fallback older systems use.
-# Without Xcode, the committed approximation stands in.
-if xcrun --find actool >/dev/null 2>&1; then
-    xcrun actool assets/Autobahn.icon --compile "$APP/Contents/Resources" \
-          --app-icon Autobahn --platform macosx --minimum-deployment-target 11.0 \
-          --output-partial-info-plist "$(mktemp)" >/dev/null
+# The icon is compiled from assets/Autobahn.icon by Xcode's own asset
+# compiler, exactly as Xcode would build it: Assets.car carries the full
+# Icon Composer rendering (light, dark and tinted, with the glass) that
+# macOS 26 draws, and Autobahn.icns is the flat fallback older systems use.
+#
+# Only Xcode 26's actool knows Icon Composer bundles; an older one fails
+# on it. That, or no Xcode at all, falls back to the committed
+# assets/autobahn.icns — itself actool's own fallback output, written by
+# scripts/build-icon.sh — so the app always gets the real icon, only
+# without the macOS 26 variants.
+if xcrun --find actool >/dev/null 2>&1 &&
+   xcrun actool assets/Autobahn.icon --compile "$APP/Contents/Resources" \
+         --app-icon Autobahn --platform macosx --minimum-deployment-target 11.0 \
+         --output-partial-info-plist "$(mktemp)" >/dev/null 2>&1; then
     ICON_NAME=Autobahn
 else
-    echo "no Xcode: using the approximated assets/autobahn.icns" >&2
+    echo "actool cannot compile assets/Autobahn.icon (no Xcode, or one older" \
+         "than 26): using the committed assets/autobahn.icns" >&2
+    rm -f "$APP/Contents/Resources/Assets.car" "$APP/Contents/Resources/Autobahn.icns"
     cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
     ICON_NAME=autobahn
 fi

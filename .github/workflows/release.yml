@@ -3,6 +3,11 @@
 # downloaded set doubles as an agents directory for cross-platform
 # controllers. Linux binaries are static musl (no libc version constraints);
 # macOS binaries link only the always-present libSystem.
+#
+# It also publishes the menu bar app, signed and notarised, as
+# Autobahn-macos-aarch64.zip. That job runs in the protected "release"
+# environment, which holds the signing secrets and waits for approval;
+# see docs/macos-app.md for what the environment must contain.
 name: Release
 
 on:
@@ -58,8 +63,71 @@ jobs:
           path: autobahn-${{ matrix.platform }}
           if-no-files-found: error
 
+  app:
+    # The menu bar app, signed with the Developer ID certificate and
+    # notarised by Apple, so a downloaded copy opens without Gatekeeper
+    # refusing it. The credentials live in the protected "release"
+    # environment: a job that names it waits for approval before any secret
+    # reaches the runner, and pull requests from forks never receive them.
+    runs-on: macos-15
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Use Xcode 26 if the runner has it
+        # Only Xcode 26's actool compiles the Icon Composer bundle. Without
+        # it, build.sh falls back to the committed .icns: still the real
+        # icon, only without the macOS 26 variants.
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
+          xcodebuild -version
+      - name: Import the Developer ID certificate
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          # A throwaway keychain with a random password, added to the search
+          # list so codesign and security find the identity in it.
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD=$(openssl rand -hex 24)
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KEYCHAIN" \
+            -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+          rm "$RUNNER_TEMP/certificate.p12"
+      - name: Write the notary key
+        env:
+          NOTARY_KEY: ${{ secrets.NOTARY_API_KEY }}
+        run: printf '%s' "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
+      - name: Build, sign, notarise and staple
+        env:
+          AUTOBAHN_NOTARY_KEY: ${{ runner.temp }}/notary.p8
+          AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          AUTOBAHN_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+          AUTOBAHN_RELEASE_ZIP: Autobahn-macos-aarch64.zip
+        run: apps/macos/release.sh
+      - name: Remove the credentials
+        # Whether the build passed or failed. The runner is discarded after
+        # the job anyway; this is so nothing outlives the step that needed it.
+        if: always()
+        run: |
+          security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Autobahn-macos-aarch64
+          path: Autobahn-macos-aarch64.zip
+          if-no-files-found: error
+
   release:
-    needs: build
+    needs: [build, app]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -70,7 +138,7 @@ jobs:
           mkdir agents
           cp autobahn-* agents/
           tar czf autobahn-agents.tar.gz agents
-          sha256sum autobahn-* > SHA256SUMS
+          sha256sum autobahn-* Autobahn-macos-aarch64.zip > SHA256SUMS
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -84,4 +152,5 @@ jobs:
             autobahn-darwin-aarch64 \
             autobahn-darwin-x86_64 \
             autobahn-agents.tar.gz \
+            Autobahn-macos-aarch64.zip \
             SHA256SUMS

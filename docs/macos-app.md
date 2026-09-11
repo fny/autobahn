@@ -75,18 +75,57 @@ code in `src/tray.rs`; `assets/sign.svg` is the same shape at full size.
 
 ## Signing and notarising
 
-`release.sh` is the other half, and only for an app someone downloads:
-it signs with a Developer ID certificate, sends the result to Apple to be
-scanned, and staples the verdict to the bundle so Gatekeeper trusts it
-offline. A copy that arrives by `scp`, or through autobahn itself, is
-never quarantined and never needs any of that.
+A downloaded app has to be signed with a Developer ID certificate and
+notarised — scanned by Apple, with the verdict stapled inside the bundle
+so Gatekeeper trusts it offline. A copy that arrives by `scp`, or through
+autobahn itself, is never quarantined and needs none of that.
 
-Before the first release, store the notarisation credentials once:
+`apps/macos/release.sh` does the whole thing, on a laptop or in CI:
+
+```sh
+apps/macos/release.sh     # build, sign, notarise, staple
+```
+
+On a laptop it signs with the Developer ID certificate in your keychain
+and notarises with credentials stored once:
 
 ```sh
 xcrun notarytool store-credentials autobahn \
     --apple-id you@example.com --team-id TEAMID --password <app-specific>
 ```
+
+### In CI
+
+Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `app` job
+runs the same script on a macOS runner and attaches the result to the
+release as `Autobahn-macos-aarch64.zip`. That job uses the protected
+`release` environment, which must hold five secrets:
+
+| secret | what it is |
+|---|---|
+| `DEVELOPER_ID_P12` | the Developer ID Application certificate and its private key, exported as a `.p12` and base64-encoded |
+| `DEVELOPER_ID_P12_PASSWORD` | the password the `.p12` was exported with |
+| `NOTARY_API_KEY` | an App Store Connect API key, the contents of its `AuthKey_….p8` file |
+| `NOTARY_KEY_ID` | that key's ID — the part of the filename after `AuthKey_` |
+| `NOTARY_ISSUER_ID` | the issuer ID shown above the key list in App Store Connect → Users and Access → Integrations |
+
+The certificate can sign anything as you, so it is kept where it can do
+the least harm:
+
+- The environment requires approval, so a release waits for you before
+  any secret reaches a runner.
+- Pull requests from forks never receive secrets, and the job runs only
+  on tags, which only people with write access can push.
+- The certificate goes into a throwaway keychain that is deleted when the
+  job ends, whether it passed or failed.
+
+If the certificate ever leaks, revoke it in your Apple Developer account.
+
+The CI build is Apple Silicon only, like a local one. The runner's default
+Xcode may be older than 26, whose `actool` is the only one that compiles
+the Icon Composer bundle; the job picks Xcode 26 when the runner has it,
+and otherwise `build.sh` uses the committed `assets/autobahn.icns`, which
+is the same icon without the macOS 26 variants.
 
 ## A guided tour
 

@@ -23,6 +23,7 @@ pub mod alerts;
 pub mod config;
 pub mod endpoint;
 pub mod icon;
+pub mod logging;
 pub mod ownership;
 pub mod paths;
 pub mod persist;

@@ -177,6 +177,12 @@ enum Command {
         /// display.
         #[arg(long)]
         log: bool,
+        /// Write the detail needed to explain a cycle after it has gone:
+        /// timings, what content was asked for and whether it arrived, and
+        /// what the supervisor decided next. Equivalent to `log = "debug"`
+        /// in the configuration, or `AUTOBAHN_LOG=debug`.
+        #[arg(long)]
+        debug: bool,
     },
     /// Show the recorded status of every configured session, grouped by
     /// group (optionally filtered by group and host).
@@ -467,7 +473,8 @@ fn main() {
             state_root,
             conflicts,
             log,
-        } => run_watch(config, state_root, conflicts, log),
+            debug,
+        } => run_watch(config, state_root, conflicts, log, debug),
         Command::Install { config, state_root } => {
             autobahn::service::install(config.as_deref(), state_root.as_deref()).map(|()| {
                 println!("installed and started the login service");
@@ -923,6 +930,7 @@ fn run_watch(
     state_root: Option<PathBuf>,
     expand_conflicts: bool,
     log: bool,
+    debug: bool,
 ) -> Result<()> {
     let configuration = load_config(config)?;
     let plans = configuration.plans()?;
@@ -933,6 +941,13 @@ fn run_watch(
     // startup failure, not a silent no-op discovered on the night the
     // alert was meant to fire.
     let alerts = configuration.alert_plan()?;
+    // The level is settled before the first line is written. `--debug`
+    // beats the file, and `AUTOBAHN_LOG` beats both, so a level can be
+    // turned up for one run without editing anything.
+    autobahn::logging::set_level(match debug {
+        true => Some(autobahn::logging::Level::Debug),
+        false => configuration.log_level()?,
+    });
     let state_root = resolve_state_root(state_root)?;
 
     // Said before the first cycle, while someone is still looking at the

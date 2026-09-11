@@ -88,6 +88,21 @@ pub struct Config {
     /// What to run when a session needs attention.
     #[serde(default)]
     pub alerts: Alerts,
+    /// How much the supervisor writes to its log: "quiet", "normal" (the
+    /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
+    pub log: Option<String>,
+}
+
+impl Config {
+    /// The configured log level, if the file names a valid one.
+    pub fn log_level(&self) -> Result<Option<crate::logging::Level>> {
+        let Some(name) = &self.log else {
+            return Ok(None);
+        };
+        crate::logging::Level::parse(name)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("unknown log level {name:?} (quiet, normal, or debug)"))
+    }
 }
 
 /// The `[alerts]` section: commands the supervisor runs when sessions need

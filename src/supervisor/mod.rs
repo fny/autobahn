@@ -333,7 +333,7 @@ impl Supervisor {
             Ok(listener) => Some(listener),
             Err(error) => {
                 // Control is a convenience, not a prerequisite for syncing.
-                eprintln!("control socket unavailable: {error:#}");
+                crate::complain!("control socket unavailable: {error:#}");
                 None
             }
         };
@@ -353,9 +353,13 @@ impl Supervisor {
             scope.spawn(move || {
                 while !stop.load(Ordering::Relaxed) {
                     match crate::service::rotate_log() {
-                        Ok(true) => eprintln!("the service log reached its cap and was rotated"),
+                        Ok(true) => {
+                            crate::complain!("the service log reached its cap and was rotated")
+                        }
                         Ok(false) => {}
-                        Err(error) => eprintln!("unable to rotate the service log: {error:#}"),
+                        Err(error) => {
+                            crate::complain!("unable to rotate the service log: {error:#}")
+                        }
                     }
                     sleep_interruptible(LOG_CHECK_INTERVAL, stop);
                 }
@@ -403,7 +407,10 @@ impl Supervisor {
                         let result = worker.attempt();
                         let failed = result.is_err();
                         if let Err(error) = worker.conclude(&result) {
-                            eprintln!("[{}] unable to record status: {error:#}", plan.display());
+                            crate::complain!(
+                                "[{}] unable to record status: {error:#}",
+                                plan.display()
+                            );
                         }
                         if failed {
                             failures = failures.saturating_add(1);
@@ -494,7 +501,14 @@ impl<'a> Worker<'a> {
                 // and an unreachable one is where a session sits until it
                 // times out.
                 self.progress.enter(crate::progress::Phase::Connecting);
+                crate::debug!("[{}] connecting", self.plan.display());
+                let connecting = std::time::Instant::now();
                 let mut session = connect(self.plan, self.state_root, self.pool)?;
+                crate::debug!(
+                    "[{}] connected in {:.2}s",
+                    self.plan.display(),
+                    connecting.elapsed().as_secs_f64()
+                );
                 session.set_progress(self.progress.clone());
                 self.session = Some(session);
             }
@@ -502,7 +516,50 @@ impl<'a> Worker<'a> {
             if std::mem::take(&mut self.verify_pending) {
                 session.request_verify();
             }
-            run_cycles(session)
+            let started = std::time::Instant::now();
+            let outcome = run_cycles(session, &self.plan.display());
+            let elapsed = started.elapsed();
+            // A cycle that found nothing is not worth a line even here.
+            // At a five-second interval an idle session would otherwise
+            // write seventeen thousand lines a day saying so, and the log
+            // rotates on size — debug would evict the very evidence it was
+            // turned on to collect. Anything that did work, took long
+            // enough to be interesting, or failed still gets its line.
+            let worth_saying = match &outcome {
+                Err(_) => true,
+                Ok((digest, _)) => {
+                    digest.alpha_transitions > 0
+                        || digest.beta_transitions > 0
+                        || digest.conflicts > 0
+                        || digest.problems > 0
+                        || digest.cycles > 1
+                        || elapsed >= QUIET_CYCLE_CEILING
+                }
+            };
+            if worth_saying {
+                crate::debug!(
+                    "[{}] cycle {} in {:.2}s{}",
+                    self.plan.display(),
+                    match &outcome {
+                        Ok(_) => "finished",
+                        Err(_) => "failed",
+                    },
+                    elapsed.as_secs_f64(),
+                    match &outcome {
+                        Ok((digest, _)) => format!(
+                            ": {} inner cycle(s), {} to alpha, {} to beta, {} conflict(s), \
+                             {} blocked",
+                            digest.cycles,
+                            digest.alpha_transitions,
+                            digest.beta_transitions,
+                            digest.conflicts,
+                            digest.problems
+                        ),
+                        Err(error) => format!(": {error:#}"),
+                    }
+                );
+            }
+            outcome
         })();
         if let Ok((digest, _)) = &result {
             self.cycles += digest.cycles;
@@ -577,7 +634,7 @@ impl<'a> Worker<'a> {
         self.progress.rest(crate::progress::Phase::Paused);
         self.record_state("paused");
         if self.verbose {
-            println!("[{}] paused", self.plan.display());
+            crate::note!("[{}] paused", self.plan.display());
         }
         while !stop.load(Ordering::Relaxed) && flags.paused.load(Ordering::Relaxed) {
             std::thread::sleep(STOP_POLL_INTERVAL);
@@ -601,21 +658,21 @@ impl<'a> Worker<'a> {
         let _lock = match SessionLock::acquire(state_directory.clone()) {
             Ok(lock) => lock,
             Err(error) => {
-                eprintln!("[{}] unable to reset: {error:#}", self.plan.display());
+                crate::complain!("[{}] unable to reset: {error:#}", self.plan.display());
                 return;
             }
         };
         if let Err(error) =
             crate::session::ancestor::AncestorStore::reset(&state_directory.join("ancestor"))
         {
-            eprintln!(
+            crate::complain!(
                 "[{}] unable to reset the ancestor: {error:#}",
                 self.plan.display()
             );
             return;
         }
         if self.verbose {
-            println!(
+            crate::note!(
                 "[{}] reset: the next cycle merges both sides additively",
                 self.plan.display()
             );
@@ -646,7 +703,7 @@ impl<'a> Worker<'a> {
         };
         self.publish(&status);
         if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
-            eprintln!(
+            crate::complain!(
                 "[{}] unable to record status: {error:#}",
                 self.plan.display()
             );
@@ -667,7 +724,7 @@ impl<'a> Worker<'a> {
         if let Err(error) = result {
             if error.downcast_ref::<SessionLockHeld>().is_some() {
                 if self.verbose {
-                    eprintln!("[{display}] skipped: {error:#}");
+                    crate::complain!("[{display}] skipped: {error:#}");
                 }
                 return Ok(());
             }
@@ -716,9 +773,10 @@ impl<'a> Worker<'a> {
                 };
                 if self.verbose {
                     if digest.alpha_transitions > 0 || digest.beta_transitions > 0 {
-                        println!(
+                        crate::note!(
                             "[{display}] synchronized: {} change(s) to alpha, {} change(s) to beta",
-                            digest.alpha_transitions, digest.beta_transitions
+                            digest.alpha_transitions,
+                            digest.beta_transitions
                         );
                     }
                     // Only what changed. A session holding the same
@@ -751,7 +809,7 @@ impl<'a> Worker<'a> {
                 .into();
                 status.error = Some(format!("{error:#}"));
                 if self.verbose {
-                    eprintln!("[{display}] error: {error:#}");
+                    crate::complain!("[{display}] error: {error:#}");
                 }
             }
         }
@@ -768,11 +826,17 @@ impl<'a> Worker<'a> {
     }
 }
 
+/// How long an otherwise uneventful cycle must take before it is worth a
+/// debug line. A cycle that changed nothing and finished promptly says
+/// nothing; one that changed nothing and took seconds is the shape of a
+/// problem worth seeing, and is rare enough to be cheap to record.
+const QUIET_CYCLE_CEILING: Duration = Duration::from_secs(1);
+
 /// Runs one cycle plus bounded follow-ups while staged content is reported
 /// missing. Exhausting the cap with content *still* missing is a failure,
 /// not a quiet success: the destination is churning faster than content can
 /// be transferred, and automation must not read that as "synchronized".
-fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
+fn run_cycles(session: &mut Session, display: &str) -> Result<(CycleDigest, CycleReport)> {
     let mut digest = CycleDigest::default();
     let mut previously_missing: std::collections::HashMap<String, crate::tree::Digest> =
         std::collections::HashMap::new();
@@ -793,6 +857,23 @@ fn run_cycles(session: &mut Session) -> Result<(CycleDigest, CycleReport)> {
         // failing to produce this content at all — a wiped staging
         // directory, a cleaner, a supply defect — and that is worth an
         // error and the backoff that follows one.
+        for request in &report.missing_staged {
+            crate::debug!(
+                "[{}] staged content missing: {} ({}){}",
+                display,
+                request.path,
+                request
+                    .digest
+                    .iter()
+                    .take(4)
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect::<String>(),
+                match previously_missing.get(&request.path) == Some(&request.digest) {
+                    true => " — the same content as the previous cycle",
+                    false => " — asking again",
+                }
+            );
+        }
         if report
             .missing_staged
             .iter()
@@ -1049,10 +1130,10 @@ fn report_changes(
         // A fresh worker. Counts, so a restart does not reprint
         // everything a session has been holding all along.
         if !conflicts.is_empty() {
-            eprintln!("[{display}] {} conflict(s)", conflicts.len());
+            crate::complain!("[{display}] {} conflict(s)", conflicts.len());
         }
         if !blocked.is_empty() {
-            eprintln!("[{display}] {} blocked path(s)", blocked.len());
+            crate::complain!("[{display}] {} blocked path(s)", blocked.len());
         }
         return;
     };
@@ -1064,13 +1145,13 @@ fn report_changes(
         let appeared: Vec<&String> = now.iter().filter(|entry| !before.contains(entry)).collect();
         let cleared = before.iter().filter(|entry| !now.contains(entry)).count();
         for entry in appeared.iter().take(NAMED) {
-            eprintln!("[{display}] {what}: {entry}");
+            crate::complain!("[{display}] {what}: {entry}");
         }
         if appeared.len() > NAMED {
-            eprintln!("[{display}] {what}: and {} more", appeared.len() - NAMED);
+            crate::complain!("[{display}] {what}: and {} more", appeared.len() - NAMED);
         }
         if cleared > 0 {
-            eprintln!("[{display}] {what}: {cleared} cleared, {} left", now.len());
+            crate::complain!("[{display}] {what}: {cleared} cleared, {} left", now.len());
         }
     }
 }
@@ -1899,8 +1980,8 @@ mod tests {
         )
         .expect("the session should construct");
 
-        let error =
-            run_cycles(&mut session).expect_err("unappearing content must surface as an error");
+        let error = run_cycles(&mut session, "test")
+            .expect_err("unappearing content must surface as an error");
         assert!(
             format!("{error:#}").contains("staging is failing"),
             "{error:#}"
@@ -2006,7 +2087,7 @@ mod tests {
         .expect("the session should construct");
 
         let (digest, report) =
-            run_cycles(&mut session).expect("churn must not be reported as a failure");
+            run_cycles(&mut session, "test").expect("churn must not be reported as a failure");
         assert!(report.missing_staged_files, "the flag must survive the cap");
         assert_eq!(digest.cycles, MAXIMUM_FOLLOW_UP_CYCLES as u64 + 1);
     }

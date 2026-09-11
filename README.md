@@ -474,6 +474,33 @@ and endpoint locks for any session the config no longer describes.
 Anything a running session holds is skipped, and the files in the
 synchronized trees are never touched.
 
+### The log
+
+The supervisor's log is the only account of a session that outlives the
+cycle it describes. A transient failure — staging not producing content,
+a connection dropping mid-frame — clears itself before anyone opens the
+status page, so the log is where the evidence has to be. Every line
+carries a local timestamp, and `log` sets how much is written:
+
+```toml
+log = "debug"     # quiet | normal (the default) | debug
+```
+
+`AUTOBAHN_LOG=debug` overrides the file for one run, and `watch --debug`
+does the same, so a level can be turned up while something is being
+chased without editing anything. An unknown level is refused at startup
+rather than ignored.
+
+`debug` adds what is needed to explain a cycle after it has gone: how
+long connecting took, how long each cycle took and what it moved, and —
+the one that matters when staging misbehaves — the path and content
+digest of anything that was asked for and did not arrive, and whether it
+was the same content as the cycle before. A cycle that changed nothing
+and finished promptly stays silent even here: at a five-second interval
+an idle session would otherwise write seventeen thousand lines a day
+saying so, and the log rotates on size, so debug would evict the very
+evidence it was turned on to collect.
+
 `clean --agents` extends that to the far side. Agents are installed per
 version at `~/.autobahn/bin/autobahn-<version>`, which is what lets a
 fleet upgrade itself host by host with no lockstep — but nothing has ever

@@ -20,6 +20,7 @@ use autobahn::scan::{IgnoreSet, SymlinkMode};
 use autobahn::session::{CycleReport, SafetyHalt, Session};
 use autobahn::transport::Connection;
 use autobahn::tree::SyncMode;
+mod common;
 
 /// The transports a scenario can run over.
 #[derive(Clone, Copy, PartialEq)]
@@ -44,6 +45,7 @@ struct Harness {
 
 impl Harness {
     fn new(mode: SyncMode, transport: Transport) -> Harness {
+        common::isolate_home();
         let keep = tempfile::tempdir().expect("tempdir");
         let alpha = keep.path().join("alpha");
         let beta = keep.path().join("beta");

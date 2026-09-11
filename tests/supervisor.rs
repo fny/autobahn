@@ -16,9 +16,11 @@ use tempfile::TempDir;
 
 use autobahn::config::{Config, SessionPlan};
 use autobahn::supervisor::{read_status, SessionOutcome, SessionStatus, Supervisor};
+mod common;
 
 /// Returns the path of the autobahn binary under test (used as the agent).
 fn agent_binary() -> &'static str {
+    common::isolate_home();
     env!("CARGO_BIN_EXE_autobahn")
 }
 
@@ -30,6 +32,7 @@ struct World {
 
 impl World {
     fn new() -> World {
+        common::isolate_home();
         World {
             keep: TempDir::new().expect("temporary directory should be creatable"),
         }

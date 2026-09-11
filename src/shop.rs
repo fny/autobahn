@@ -1596,6 +1596,8 @@ mod tests {
             blocked: Vec::new(),
             error: None,
             progress: None,
+            alerts: Vec::new(),
+            alert_summary: String::new(),
         };
         assert!(baguette(&session("synchronized"), None, 0).contains("\x1b[32m"));
         for state in ["conflicts", "blocked"] {
@@ -1625,6 +1627,8 @@ mod tests {
             blocked: Vec::new(),
             error: None,
             progress: None,
+            alerts: Vec::new(),
+            alert_summary: String::new(),
         };
         let served = width(&baguette(&session("synchronized"), None, 0));
         for state in ["halted", "conflicts", "blocked", "unreachable", "never-run"] {
@@ -1746,6 +1750,8 @@ mod tests {
             blocked: Vec::new(),
             error: None,
             progress: None,
+            alerts: Vec::new(),
+            alert_summary: String::new(),
         };
 
         // The words match the keys that settle it: `a` keeps ours, `t`

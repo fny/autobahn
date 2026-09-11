@@ -1105,6 +1105,16 @@ pub struct SessionReport {
     /// and reports it. Everything else in this record is what the last
     /// cycle left behind; this is the only live field.
     pub progress: Option<crate::progress::ProgressSnapshot>,
+    /// The alerting conditions this session is in, decided by the same
+    /// rule the supervisor's hook uses, so a second reader of the report
+    /// — the tray — cannot disagree with it about what needs a person.
+    /// Not part of the JSON document: `state`, `conflicts`, `blocked` and
+    /// `error` already carry the facts, and this is their reading.
+    #[serde(skip)]
+    pub alerts: Vec<crate::alerts::Alert>,
+    /// How to describe the session in one line when it is alerting.
+    #[serde(skip)]
+    pub alert_summary: String,
 }
 
 /// Writes what changed about a session's conflicts and blocked paths.
@@ -1208,6 +1218,9 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 blocked: Vec::new(),
                 error: None,
                 progress: progress.clone(),
+                // Not in trouble; it has simply not started.
+                alerts: Vec::new(),
+                alert_summary: String::new(),
             },
             Some(status) => SessionReport {
                 host: plan.host.clone(),
@@ -1220,6 +1233,8 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 blocked: status.blocked.clone(),
                 error: status.error.clone(),
                 progress: progress.clone(),
+                alerts: alerts_for(&status),
+                alert_summary: alert_summary(&status),
             },
         };
         match groups.last_mut() {

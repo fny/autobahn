@@ -22,11 +22,14 @@ ways to settle it (show the diff; keep alpha's, keep that destination's,
 keep both), which run the same `resolve` a terminal would. The menu also
 starts, stops, and restarts the login service and opens its log.
 
-A session entering conflict, halting, or going unreachable raises a
-desktop notification from the tray itself, as does its recovery. This is
-the tray's own notification path, separate from `on_alert`, and it does
-not apply the alerter's rules — no hold time, no coalescing, and
-recoveries are announced.
+When no `on_alert` hook is configured, the tray raises desktop
+notifications itself, under exactly the rules the hook would use — a
+condition must hold before it counts, only something *joining* the set
+in trouble is news, a cascade is gathered into one, and recovery is
+silent. See [Alerts](./alerts.md) for the rules. When a hook *is*
+configured, the tray stays quiet: the hook is the one place
+notifications come from, and two sources with identical rules would
+still mean everything twice.
 
 It is a view over `status --json`, polled every few seconds, and holds
 no state of its own. macOS and Linux (with a system tray).

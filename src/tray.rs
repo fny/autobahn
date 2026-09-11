@@ -142,12 +142,27 @@ fn run_loop(
     config: Option<PathBuf>,
     state_root: PathBuf,
 ) -> Result<()> {
+    // The alerter's plan comes from the configuration, so the tray holds
+    // exactly the timing the hook does. A configuration that cannot be
+    // read yet — the tray may start before one exists — gets the built-in
+    // plan, which is the same thing minus the hook.
+    let plan = {
+        let path = match &config {
+            Some(path) => path.clone(),
+            None => crate::paths::default_config_path()?,
+        };
+        crate::config::Config::load(&path)
+            .and_then(|config| config.alert_plan())
+            .or_else(|_| crate::config::Config::default().alert_plan())?
+    };
+    let hook_configured = plan.on_alert.is_some();
     let mut app = App {
         config,
         state_root,
         tray: None,
         actions: HashMap::new(),
-        last_states: HashMap::new(),
+        alerter: crate::alerts::Alerter::new(plan),
+        hook_configured,
         health: Health::Idle,
         report: None,
         last_error: None,
@@ -165,9 +180,18 @@ struct App {
     tray: Option<TrayIcon>,
     /// Menu item ids to what choosing them does.
     actions: HashMap<muda::MenuId, Action>,
-    /// Each session's state at the last poll, keyed by group@host, for
-    /// noticing transitions.
-    last_states: HashMap<String, String>,
+    /// Decides when a notification is due, from what the report shows.
+    /// The same policy the supervisor's hook uses — confirmation, only
+    /// growth is news, a cascade gathered into one, trouble that comes and
+    /// goes reported once — so the tray cannot say something the hook
+    /// would not. Before this it announced every transition, recoveries
+    /// included, with no hold time and no coalescing, and was a second
+    /// source of exactly the storm the hook's rules exist to prevent.
+    alerter: crate::alerts::Alerter,
+    /// Whether `on_alert` is configured. When it is, the hook is the one
+    /// place notifications come from and the tray stays quiet: two
+    /// sources with identical rules still means everything twice.
+    hook_configured: bool,
     health: Health,
     report: Option<StatusReport>,
     /// The last action's failure, shown at the top of the menu until an
@@ -239,7 +263,7 @@ impl App {
                 return;
             }
         };
-        self.notify_transitions(&report);
+        self.notify(&report);
         let health = health_of(&report);
         if health != self.health {
             if let Some(tray) = &self.tray {
@@ -502,59 +526,34 @@ impl App {
         model.service_restart.set_enabled(restart);
     }
 
-    /// Raises a desktop notification for each session whose state changed
-    /// to or from something that needs attention.
-    fn notify_transitions(&mut self, report: &StatusReport) {
-        let first = self.last_states.is_empty();
-        for group in &report.groups {
-            for session in &group.sessions {
-                let key = format!("{}@{}", group.name, session.host);
-                let previous = self.last_states.insert(key, session.state.clone());
-                if first {
-                    continue; // the initial poll establishes a baseline, silently
-                }
-                let Some(previous) = previous else { continue };
-                if previous == session.state {
-                    continue;
-                }
-                let attention = |state: &str| {
-                    matches!(state, "conflicts" | "halted" | "unreachable" | "errored")
-                };
-                let (title, body) = if attention(&session.state) {
-                    (
-                        format!("{} — {}", group.alpha, session.state),
-                        match session.state.as_str() {
-                            "conflicts" => format!(
-                                "{}: {} conflict(s), first {}",
-                                session.host,
-                                session.conflicts.len(),
-                                session
-                                    .conflicts
-                                    .first()
-                                    .map(|c| c.path.as_str())
-                                    .unwrap_or("")
-                            ),
-                            _ => format!(
-                                "{}: {}",
-                                session.host,
-                                session
-                                    .error
-                                    .as_deref()
-                                    .map(|e| e.rsplit(": ").next().unwrap_or(e))
-                                    .unwrap_or(&session.state)
-                            ),
-                        },
-                    )
-                } else if attention(&previous) {
-                    (
-                        format!("{} — synchronized again", group.alpha),
-                        format!("{} recovered", session.host),
-                    )
-                } else {
-                    continue;
-                };
-                notify_with(&title, &body, crate::icon::ensure(&self.state_root));
-            }
+    /// Shows the alerter what every session is in, and raises a desktop
+    /// notification if it says one is due. The report already carries
+    /// each session's alerting conditions, decided by the supervisor's
+    /// own rule, so nothing here reinterprets a state word.
+    fn notify(&mut self, report: &StatusReport) {
+        if self.hook_configured {
+            return;
+        }
+        let sessions: Vec<crate::alerts::SessionAlerts> = report
+            .groups
+            .iter()
+            .flat_map(|group| {
+                group
+                    .sessions
+                    .iter()
+                    .map(move |session| crate::alerts::SessionAlerts {
+                        group: group.name.clone(),
+                        host: session.host.clone(),
+                        alerts: session.alerts.clone(),
+                        summary: session.alert_summary.clone(),
+                    })
+            })
+            .collect();
+        if let Some(crate::alerts::Fire::Alert {
+            summary, detail, ..
+        }) = self.alerter.observe(&sessions, std::time::Instant::now())
+        {
+            notify_with(&summary, &detail, crate::icon::ensure(&self.state_root));
         }
     }
 

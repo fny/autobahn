@@ -1,4 +1,4 @@
-# Autobahn
+# Autobahn <picture><source media="(prefers-color-scheme: dark)" srcset="assets/sign-white.svg"><img src="assets/sign.svg" alt="" height="32"></picture>
 
 *Real-time sync with unmatched speed and German safety standards.*
 

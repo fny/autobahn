@@ -65,10 +65,9 @@ fi
 
 # Downloads one release asset by name.
 #
-# A private repository's browser download URL returns 404 even with a
-# token — only the API serves its assets — so the GitHub CLI is preferred
-# when it is present and authenticated. Public releases need no
-# credentials at all, and fall through to the plain URL.
+# The GitHub CLI is used when it is present and logged in, and the plain
+# release URL otherwise. Both serve the same assets; the plain URL needs
+# no credentials at all.
 if have gh && gh auth status >/dev/null 2>&1; then
     fetch() {
         gh release download ${VERSION_TAG:+"$VERSION_TAG"} \
@@ -123,8 +122,7 @@ if ! fetch "autobahn-$PLATFORM" "$WORK/autobahn" 2>/dev/null; then
 Check that the release exists and that 'gh auth status' succeeds."
     fi
     die "unable to download the $PLATFORM build from $BASE.
-If $REPO is private, install the GitHub CLI and run 'gh auth login' —
-private release assets are not served over plain download URLs."
+Check that the release exists."
 fi
 
 # verify before installing

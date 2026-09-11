@@ -4,10 +4,13 @@
 # controllers. Linux binaries are static musl (no libc version constraints);
 # macOS binaries link only the always-present libSystem.
 #
-# It also publishes the menu bar app, signed and notarised, as
-# Autobahn-macos-aarch64.zip. That job runs in the protected "release"
-# environment, which holds the signing secrets and waits for approval;
-# see docs/macos-app.md for what the environment must contain.
+# The macOS side — both command-line binaries, and the menu bar app as
+# Autobahn-macos-aarch64.zip — is signed with the Developer ID certificate
+# and notarised by Apple, so a copy downloaded in a browser is not refused
+# by Gatekeeper. It is built in one job, the only one holding the
+# certificate, inside the protected "release" environment, which waits for
+# approval before any secret reaches a runner. docs/macos-app.md lists what
+# that environment must contain.
 name: Release
 
 on:
@@ -18,25 +21,17 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  linux:
     strategy:
       matrix:
         include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
+          - target: x86_64-unknown-linux-musl
             platform: linux-x86_64
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-musl
+          - target: aarch64-unknown-linux-musl
             platform: linux-aarch64
             linker: aarch64-linux-gnu-gcc
             packages: gcc-aarch64-linux-gnu
-          - os: macos-14
-            target: aarch64-apple-darwin
-            platform: darwin-aarch64
-          - os: macos-14
-            target: x86_64-apple-darwin
-            platform: darwin-x86_64
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,17 +58,20 @@ jobs:
           path: autobahn-${{ matrix.platform }}
           if-no-files-found: error
 
-  app:
-    # The menu bar app, signed with the Developer ID certificate and
-    # notarised by Apple, so a downloaded copy opens without Gatekeeper
-    # refusing it. The credentials live in the protected "release"
-    # environment: a job that names it waits for approval before any secret
-    # reaches the runner, and pull requests from forks never receive them.
+  mac:
+    # Both command-line binaries and the menu bar app, each signed with the
+    # Developer ID certificate and notarised by Apple. The curl installer
+    # never quarantines anything; a copy downloaded by hand is quarantined,
+    # and Gatekeeper refuses a quarantined executable it cannot attribute.
+    # Secrets reach this job only after approval, and never reach pull
+    # requests from forks.
     runs-on: macos-15
     environment: release
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
       - name: Use Xcode 26 if the runner has it
         # Only Xcode 26's actool compiles the Icon Composer bundle. Without
         # it, build.sh falls back to the committed .icns: still the real
@@ -82,6 +80,13 @@ jobs:
           XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
           if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
           xcodebuild -version
+      - name: Build the command-line binaries
+        run: |
+          for pair in aarch64-apple-darwin:darwin-aarch64 x86_64-apple-darwin:darwin-x86_64; do
+            target=${pair%%:*}; platform=${pair##*:}
+            cargo build --release --target "$target"
+            cp "target/$target/release/autobahn" "autobahn-$platform"
+          done
       - name: Import the Developer ID certificate
         env:
           P12: ${{ secrets.DEVELOPER_ID_P12 }}
@@ -106,7 +111,13 @@ jobs:
         env:
           NOTARY_KEY: ${{ secrets.NOTARY_API_KEY }}
         run: printf '%s' "$NOTARY_KEY" > "$RUNNER_TEMP/notary.p8"
-      - name: Build, sign, notarise and staple
+      - name: Sign and notarise the command-line binaries
+        env:
+          AUTOBAHN_NOTARY_KEY: ${{ runner.temp }}/notary.p8
+          AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          AUTOBAHN_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: apps/macos/notarize-cli.sh autobahn-darwin-aarch64 autobahn-darwin-x86_64
+      - name: Build, sign, notarise and staple the app
         env:
           AUTOBAHN_NOTARY_KEY: ${{ runner.temp }}/notary.p8
           AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
@@ -122,18 +133,23 @@ jobs:
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
       - uses: actions/upload-artifact@v4
         with:
-          name: Autobahn-macos-aarch64
-          path: Autobahn-macos-aarch64.zip
+          name: mac
+          path: |
+            autobahn-darwin-aarch64
+            autobahn-darwin-x86_64
+            Autobahn-macos-aarch64.zip
           if-no-files-found: error
 
   release:
-    needs: [build, app]
+    needs: [linux, mac]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - name: Assemble the agents bundle and checksums
+        # The agents bundle takes the lower-case autobahn-* binaries, which
+        # now include the signed macOS ones; the app archive is Autobahn-*.
         run: |
           mkdir agents
           cp autobahn-* agents/

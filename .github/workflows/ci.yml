@@ -1,11 +1,39 @@
-# Manual-trigger CI: both jobs run only when asked (workflow_dispatch),
-# because the repository is private and macOS runner minutes bill at ten
-# times the Linux rate. Trigger with:
+# CI on every push to master and every pull request — except changes that
+# cannot affect a build or its tests: prose, the docs, benchmark reports,
+# README artwork, and the release workflow (which only runs on tags, and is
+# not something this workflow could exercise). Also runnable by hand:
 #   gh workflow run ci.yml
+#
+# macOS runners are the scarce ones: slower to start, and a free account
+# runs only a handful at a time. So there is exactly one macOS job, on the
+# same image the release uses, running the suite and building the app on
+# one runner and one cache; and a newer push cancels an older run of the
+# same branch before it spends a runner on stale code.
 name: CI
 
 on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'bench/**'
+      - 'LICENSE*'
+      - 'assets/sign*'
+      - '.github/workflows/release.yml'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+      - 'bench/**'
+      - 'LICENSE*'
+      - 'assets/sign*'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_TERM_COLOR: always
@@ -28,18 +56,33 @@ jobs:
         run: cargo test --release
 
   mac:
-    runs-on: macos-latest
-    timeout-minutes: 30
+    runs-on: macos-15
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      # Caches target/, which holds both the plain build and target/tray.
       - uses: Swatinem/rust-cache@v2
+      - name: Use Xcode 26 if the runner has it
+        # Only Xcode 26's actool compiles the Icon Composer bundle; without
+        # it build.sh falls back to the committed .icns, and this says which.
+        run: |
+          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
+          xcodebuild -version
       - name: Tests
         run: cargo test --release
-      # The menu bar app cannot be exercised on a runner, but it can be
-      # kept compiling.
-      - name: Build with the tray
-        run: cargo build --release --features tray
+      - name: Build the app
+        # Signed ad-hoc: this job holds no certificate and needs none to
+        # prove the app still compiles, bundles its icon, and signs. Real
+        # signing belongs to the release, behind approval.
+        run: apps/macos/build.sh
+      - name: Check the bundle
+        run: |
+          APP=apps/macos/Autobahn.app
+          codesign --verify --strict "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$APP/Contents/Info.plist"
+          ls "$APP/Contents/Resources"
 
   # Linux on ARM: the deployment target for Graviton instances. The code
   # needs no platform-specific anything here — this job exists to keep that

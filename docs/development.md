@@ -9,7 +9,11 @@ scripts/build-agents.sh       # cross-build the agents bundle
 gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
 ```
 
-CI runs only when triggered (`workflow_dispatch`), not on every push.
+CI runs on every push to `master` and every pull request, except changes
+that cannot affect a build — Markdown, `docs/`, `bench/`, the README
+artwork, and the release workflow. There is one macOS job, which runs the
+suite and then builds the app, signed ad-hoc; the certificate belongs to
+the release alone. A newer push cancels an older run of the same branch.
 
 ## Targeted tests
 

@@ -90,7 +90,8 @@ from the environment, for a non-interactive install.
 To do it by hand instead, grab a binary from [Releases](../../releases):
 each release ships `autobahn-<os>-<arch>` binaries (Linux binaries are
 static — they run on any distribution), an `autobahn-agents.tar.gz`
-bundle, and `SHA256SUMS`.
+bundle, and `SHA256SUMS`. The macOS binaries are signed and notarised, and
+the menu bar app ships beside them as `Autobahn-macos-aarch64.zip`.
 
 ```sh
 # Put your platform's binary on your PATH:

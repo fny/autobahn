@@ -96,10 +96,13 @@ xcrun notarytool store-credentials autobahn \
 
 ### In CI
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `app` job
-runs the same script on a macOS runner and attaches the result to the
-release as `Autobahn-macos-aarch64.zip`. That job uses the protected
-`release` environment, which must hold five secrets:
+Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job
+builds and signs everything macOS on one runner: the two command-line
+binaries, signed and notarised by `apps/macos/notarize-cli.sh`, and the
+app, by the same `release.sh` as above, attached to the release as
+`Autobahn-macos-aarch64.zip`. It is the only job holding the certificate,
+and it uses the protected `release` environment, which must hold five
+secrets:
 
 | secret | what it is |
 |---|---|
@@ -121,7 +124,9 @@ the least harm:
 
 If the certificate ever leaks, revoke it in your Apple Developer account.
 
-The CI build is Apple Silicon only, like a local one. The runner's default
+The app is Apple Silicon only; the command-line binaries cover Intel as
+well. A command-line binary cannot be stapled, so Gatekeeper checks its
+notarisation online the first time it runs. The runner's default
 Xcode may be older than 26, whose `actool` is the only one that compiles
 the Icon Composer bundle; the job picks Xcode 26 when the runner has it,
 and otherwise `build.sh` uses the committed `assets/autobahn.icns`, which

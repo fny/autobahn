@@ -131,6 +131,68 @@ impl IgnoreSet {
         Ok(IgnoreSet { patterns: compiled })
     }
 
+    /// Reports negations that can never re-include anything.
+    ///
+    /// Combining ignore files written independently is where these appear.
+    /// Each file is written as though it were the only one, so a template
+    /// that carefully says `!gradle-wrapper.jar` is undone by a later file
+    /// saying `*.jar`, and the reader has no way to see it: the line is
+    /// still there, and it does nothing.
+    ///
+    /// Two causes, both always a mistake rather than a matter of taste:
+    ///
+    /// - A later pattern ignores it again. Last match wins, so the
+    ///   negation is overwritten by something further down the list.
+    /// - An ancestor directory is ignored. Scans never descend into an
+    ///   ignored directory, so nothing inside is ever tested — the
+    ///   limitation described at the top of this module.
+    ///
+    /// Only negations with no wildcards are examined, because those are
+    /// the only ones that name a path this can test directly. That is a
+    /// deliberate floor: every report is a real dead line, and a pattern
+    /// too general to decide is left alone rather than guessed at.
+    pub fn dead_negations(&self) -> Vec<String> {
+        let mut dead = Vec::new();
+        for (index, pattern) in self.patterns.iter().enumerate() {
+            if !pattern.negated {
+                continue;
+            }
+            let source = pattern.matcher.glob().glob();
+            // Compiled any-depth patterns carry the prefix the compiler
+            // added; the path they name is what follows it.
+            let path = source.strip_prefix("**/").unwrap_or(source);
+            if path.contains(['*', '?', '[']) {
+                continue;
+            }
+
+            if let Some(later) = self.patterns[index + 1..].iter().find(|later| {
+                !later.negated && !later.directory_only && later.matcher.is_match(path)
+            }) {
+                dead.push(format!(
+                    "!{path} can never take effect: {} later ignores it again",
+                    later.matcher.glob().glob()
+                ));
+                continue;
+            }
+
+            // Every ancestor, nearest first: the innermost ignored one is
+            // the directory the scan actually stops at.
+            let mut ancestors: Vec<&str> =
+                path.match_indices('/').map(|(at, _)| &path[..at]).collect();
+            ancestors.reverse();
+            if let Some(ancestor) = ancestors
+                .into_iter()
+                .find(|ancestor| self.ignored(ancestor, true))
+            {
+                dead.push(format!(
+                    "!{path} can never take effect: its directory {ancestor} is ignored, and \
+                     scans do not descend into an ignored directory"
+                ));
+            }
+        }
+        dead
+    }
+
     /// Indicates whether or not the root-relative path (with `is_directory`
     /// disambiguating directory-only patterns) is ignored.
     pub fn ignored(&self, path: &str, is_directory: bool) -> bool {
@@ -157,6 +219,67 @@ mod tests {
     fn ignores(patterns: &[&str]) -> IgnoreSet {
         let patterns: Vec<String> = patterns.iter().map(|p| (*p).to_owned()).collect();
         IgnoreSet::new(&patterns).expect("patterns should compile")
+    }
+
+    /// The exact clash that combining independent templates produces:
+    /// one file protects a file by name, a later file ignores it by kind.
+    #[test]
+    fn a_negation_undone_by_a_later_pattern_is_reported() {
+        let set = IgnoreSet::new(&[
+            "*.jar".to_owned(),
+            "!gradle-wrapper.jar".to_owned(),
+            "*.jar".to_owned(),
+        ])
+        .expect("compiles");
+        let dead = set.dead_negations();
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains("gradle-wrapper.jar"), "{dead:?}");
+        assert!(dead[0].contains("later ignores it again"), "{dead:?}");
+    }
+
+    /// A negation that wins is not reported: it is the whole reason the
+    /// last-match-wins ordering exists.
+    #[test]
+    fn a_negation_that_takes_effect_is_left_alone() {
+        let set = IgnoreSet::new(&["*.jar".to_owned(), "!gradle-wrapper.jar".to_owned()])
+            .expect("compiles");
+        assert!(set.dead_negations().is_empty());
+        assert!(!set.ignored("gradle-wrapper.jar", false));
+    }
+
+    /// Scans never descend into an ignored directory, so re-including
+    /// something inside one cannot work however it is written.
+    #[test]
+    fn a_negation_beneath_an_ignored_directory_is_reported() {
+        let set =
+            IgnoreSet::new(&[".yarn".to_owned(), "!.yarn/patches".to_owned()]).expect("compiles");
+        let dead = set.dead_negations();
+        assert_eq!(dead.len(), 1, "{dead:?}");
+        assert!(dead[0].contains(".yarn/patches"), "{dead:?}");
+        assert!(dead[0].contains("is ignored"), "{dead:?}");
+    }
+
+    /// The correct idiom for the case above — ignore the contents, not the
+    /// directory — must not be reported. This is what the real templates
+    /// use, so a false positive here would make the check unusable.
+    #[test]
+    fn ignoring_the_contents_rather_than_the_directory_is_correct() {
+        let set =
+            IgnoreSet::new(&[".yarn/*".to_owned(), "!.yarn/patches".to_owned()]).expect("compiles");
+        assert!(
+            set.dead_negations().is_empty(),
+            "{:?}",
+            set.dead_negations()
+        );
+    }
+
+    /// A negation general enough that no single path decides it is left
+    /// alone: the check reports only what it can prove.
+    #[test]
+    fn a_wildcard_negation_is_not_guessed_at() {
+        let set = IgnoreSet::new(&["build/".to_owned(), "!**/src/**/build/".to_owned()])
+            .expect("compiles");
+        assert!(set.dead_negations().is_empty());
     }
 
     #[test]

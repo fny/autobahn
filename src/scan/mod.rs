@@ -1,6 +1,7 @@
 //! Filesystem scanning.
 
 pub mod ignore;
+pub mod ignorefile;
 pub mod probes;
 
 use std::ffi::OsString;

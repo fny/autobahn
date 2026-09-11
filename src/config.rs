@@ -159,6 +159,10 @@ pub struct Defaults {
     /// Ignore patterns prepended to every group's own.
     #[serde(default)]
     pub ignores: Vec<String>,
+    /// Names of files in `~/.autobahn/ignores` whose patterns are applied
+    /// before every group's own, in the order written.
+    #[serde(default)]
+    pub ignore_files: Vec<String>,
     /// The default interval, in seconds, between synchronization cycles.
     pub interval: Option<u64>,
     /// The default durability class for the ancestor journal: "process"
@@ -213,6 +217,10 @@ pub struct Group {
     /// Ignore patterns, appended to the defaults' patterns.
     #[serde(default)]
     pub ignores: Vec<String>,
+    /// Names of files in `~/.autobahn/ignores`, applied after the
+    /// defaults' patterns and before this group's own.
+    #[serde(default)]
+    pub ignore_files: Vec<String>,
     /// The interval, in seconds, between cycles (falls back to the defaults).
     pub interval: Option<u64>,
     /// The durability class for the ancestor journal (falls back to the
@@ -450,6 +458,15 @@ impl Config {
 
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
         let mut errors = Vec::new();
+        // Ignore files live under the *default* state root, not under an
+        // override: they are the reader's own library of patterns, shared
+        // by every configuration, and not part of any session's state.
+        // Nothing is read unless a group names a file, so a reader who
+        // does not use the directory never pays for it — or notices that
+        // it is missing.
+        let ignore_directory = crate::paths::default_state_root()
+            .map(|root| root.join(crate::scan::ignorefile::DIRECTORY))
+            .unwrap_or_default();
         let mut plans = Vec::new();
         // Two plans over the same roots would synchronize the same trees
         // concurrently (and, when textually identical, share session state),
@@ -551,13 +568,50 @@ impl Config {
                 _ => group.alpha.clone(),
             };
 
-            let mut ignores = self.defaults.ignores.clone();
+            // Widest first, narrowest last, because the last matching
+            // pattern decides: the defaults' files, then the defaults'
+            // own patterns, then the group's files, then the group's own.
+            // A group can therefore re-include something a shared file
+            // excluded, which is the point of having both.
+            let mut ignores = Vec::new();
+            let mut ignore_errors = Vec::new();
+            for (source, names) in [
+                ("the defaults'", &self.defaults.ignore_files),
+                ("its own", &group.ignore_files),
+            ] {
+                for file in names {
+                    match crate::scan::ignorefile::read(&ignore_directory, file) {
+                        Ok(patterns) => ignores.extend(patterns),
+                        Err(error) => {
+                            ignore_errors.push(format!("{source} ignore_files: {error:#}"))
+                        }
+                    }
+                }
+                if source == "the defaults'" {
+                    ignores.extend(self.defaults.ignores.iter().cloned());
+                }
+            }
             ignores.extend(group.ignores.iter().cloned());
+            for error in ignore_errors {
+                errors.push(format!("group '{name}': {error}"));
+            }
             // Compile the combined patterns now, so a bad pattern is a
             // configuration error alongside the others rather than a runtime
             // failure discovered only by the affected session's worker.
-            if let Err(error) = IgnoreSet::new(&ignores) {
-                errors.push(format!("group '{name}': invalid ignore pattern: {error:#}"));
+            match IgnoreSet::new(&ignores) {
+                Err(error) => {
+                    errors.push(format!("group '{name}': invalid ignore pattern: {error:#}"))
+                }
+                // A line that cannot ever do anything is a mistake worth
+                // refusing, not a preference: combining ignore files
+                // written independently is exactly how they appear, and
+                // the reader cannot see it by looking at either file.
+                Ok(compiled) => errors.extend(
+                    compiled
+                        .dead_negations()
+                        .into_iter()
+                        .map(|dead| format!("group '{name}': {dead}")),
+                ),
             }
             let interval = Duration::from_secs(
                 group

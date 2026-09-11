@@ -474,6 +474,45 @@ and endpoint locks for any session the config no longer describes.
 Anything a running session holds is skipped, and the files in the
 synchronized trees are never touched.
 
+### Ignore files
+
+A useful ignore list for a language ecosystem runs to dozens of lines,
+which is more than belongs in a configuration file next to the hosts and
+the intervals. Keep those in `~/.autobahn/ignores` instead, one file per
+concern, and name the ones each group wants:
+
+```toml
+[defaults]
+ignore_files = ["common"]
+
+[groups.work]
+ignore_files = ["rust", "node"]
+```
+
+Entries are names, not paths. `"rust"` finds `Rust.gitignore` — matching
+ignores case, because template collections capitalise and configurations
+usually do not — and `"Rust.gitignore"` works too. A name containing a
+path separator or `..` is refused rather than followed, so a
+configuration cannot read a file elsewhere on the machine. The files
+themselves are gitignore syntax: comments, blank lines and all.
+
+Naming files, rather than loading whatever the directory holds, is
+deliberate. Ignore patterns are decided last-match-wins, so order *is*
+meaning: `!gradle-wrapper.jar` followed by `*.jar` is not the same list
+as the reverse. A directory scan would order them by whatever the
+filesystem returned, and dropping in a new file would silently change
+what the existing ones mean. A written list is an order someone chose and
+can see. Patterns apply widest first: the defaults' files, the defaults'
+own `ignores`, the group's files, then the group's own `ignores` — so a
+group can re-include something a shared file excluded.
+
+Combining files written independently has one failure the reader cannot
+see by looking at either file: a negation that can never take effect,
+because a later pattern ignores it again, or because its parent directory
+is ignored and scans never descend into one. Those are refused at
+startup, named individually. A line that cannot ever do anything is a
+mistake, not a preference.
+
 ### The log
 
 The supervisor's log is the only account of a session that outlives the

@@ -243,16 +243,27 @@ means a conflict or a permission that stopped working sits there with
 nobody told. `[alerts]` runs a command when that happens:
 
 ```toml
-[alerts]
-on_alert    = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
-               -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\" \\
-               -execute \"$AUTOBAHN_OPEN\""
-alert_after = "30s"
-
-[alerts.after]
-unreachable = "5m"    # a sleeping laptop deserves patience
-halted      = "0s"    # a safety halt does not
+on_alert = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
+            -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\" \\
+            -execute \"$AUTOBAHN_OPEN\""
 ```
+
+That is the whole of it. How long each state must hold before it counts is
+built in and tuned per state, because a sleeping laptop and a safety halt
+do not deserve the same patience:
+
+| state | holds for | why |
+| --- | --- | --- |
+| `halted` | 0s | a safety halt is never transient |
+| `conflicts`, `blocked` | 30s | needs a person, but not this second |
+| `errored` | 2m | transient failures heal in a cycle or two |
+| `unreachable` | 5m | a sleeping laptop is the common case |
+
+`[advanced.alerts]` can override those, along with `coalesce_after`,
+`settle_after`, `repeat_after` and the hook `timeout`. It is a separate
+section so that finding yourself in it is itself the message: these have
+correct values already, and `alert_after` written there replaces the whole
+table rather than sitting behind it.
 
 `on_alert` is the only hook. Which states are alerting is in the summary
 it is handed, not in which hook is chosen — a hook per state only moved

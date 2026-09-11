@@ -52,6 +52,24 @@ use crate::tree::SyncMode;
 /// conditions that persist.
 const DEFAULT_ALERT_AFTER: Duration = Duration::from_secs(30);
 
+/// How long each state must hold before it counts, where 30 seconds is
+/// the wrong answer. These exist so that nobody has to know they exist:
+/// a reader who writes only `on_alert` gets the behaviour they would have
+/// arrived at themselves after a fortnight of being woken up wrongly.
+///
+/// A safety halt is never transient, so it waits for nothing. A laptop is
+/// usually asleep rather than broken, and comes back. An error is usually
+/// a staging hiccup or a dropped frame, and heals in a cycle or two.
+fn built_in_after(alert: crate::alerts::Alert) -> Duration {
+    use crate::alerts::Alert;
+    match alert {
+        Alert::Halted => Duration::ZERO,
+        Alert::Unreachable => Duration::from_secs(5 * 60),
+        Alert::Errored => Duration::from_secs(2 * 60),
+        Alert::Conflicts | Alert::Blocked => DEFAULT_ALERT_AFTER,
+    }
+}
+
 /// How long an alert hook may run before it is killed. Generous for a
 /// notification, short enough that a wedged hook is noticed.
 const DEFAULT_ALERT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -75,22 +93,45 @@ const DEFAULT_SETTLE_AFTER: Duration = Duration::from_secs(15 * 60);
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Settings inherited by every group.
-    #[serde(default)]
-    pub defaults: Defaults,
+    /// Run when a session needs a person. The only hook — which states are
+    /// alerting is in the message it is handed, not in which hook fires.
+    ///
+    /// Top level, because it is the one thing about alerting that anyone
+    /// should have to write. It is safe bare where a `defaults` key would
+    /// not be: `on_alert` is a valid key nowhere else, so one written after
+    /// a `[groups.x]` header is refused rather than silently absorbed.
+    pub on_alert: Option<String>,
     /// Hosts excluded from every group. A disabled beta host drops that
     /// beta; a disabled alpha host drops the whole group.
     #[serde(default)]
     pub disabled: Vec<String>,
-    /// The synchronization groups, keyed by name.
-    #[serde(default)]
-    pub groups: BTreeMap<String, Group>,
-    /// What to run when a session needs attention.
-    #[serde(default)]
-    pub alerts: Alerts,
     /// How much the supervisor writes to its log: "quiet", "normal" (the
     /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
     pub log: Option<String>,
+    /// Settings inherited by every group.
+    #[serde(default)]
+    pub defaults: Defaults,
+    /// The synchronization groups, keyed by name.
+    #[serde(default)]
+    pub groups: BTreeMap<String, Group>,
+    /// Tuning that has a correct value already.
+    #[serde(default)]
+    pub advanced: Advanced,
+    /// Retired. Kept only so that a configuration written against the old
+    /// shape gets an answer rather than "unknown field `alerts`".
+    pub alerts: Option<toml::Value>,
+}
+
+/// The `[advanced]` section: settings whose defaults are the right answer.
+/// Grouped under one heading so that finding yourself here is itself the
+/// message — the subsystem comes second because the warning should land
+/// first.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Advanced {
+    /// Alerter timing.
+    #[serde(default)]
+    pub alerts: AlertsAdvanced,
 }
 
 impl Config {
@@ -105,38 +146,37 @@ impl Config {
     }
 }
 
-/// The `[alerts]` section: commands the supervisor runs when sessions need
-/// someone, and how long a condition must hold before it counts.
+/// The `[advanced.alerts]` section: how long things must hold, how long to
+/// wait, and how long before a hook is given up on.
+///
+/// These are not preferences. They are the values that make the alerter
+/// usable rather than maddening, and there is no second right answer a
+/// reader would discover by trying. They are configurable because a fleet
+/// somewhere will need one of them moved, not because anyone should.
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Alerts {
-    /// Run when something needs a person. The only hook.
-    ///
-    /// There were once six — one per state, plus one for the all-clear —
-    /// and the split earned nothing. Every state ends the same way, with
-    /// someone opening a terminal, so the hook that told you *which* state
-    /// only moved the branching from the command into the config. What
-    /// state it is belongs in the message, and `AUTOBAHN_SUMMARY` carries
-    /// it.
-    pub on_alert: Option<String>,
-    /// How long a condition must hold before it counts. Short enough to be
-    /// timely, long enough that a blip is never mentioned.
+pub struct AlertsAdvanced {
+    /// How long a condition must hold before it counts, for states with no
+    /// entry of their own.
     pub alert_after: Option<DurationSpec>,
-    /// How often to fire again while the alerting set is unchanged. Absent
-    /// or zero never repeats.
-    pub repeat_after: Option<DurationSpec>,
-    /// How long everything must stay clear before trouble returning counts
-    /// as news. Without it, a condition that comes and goes — two machines
-    /// editing one file — notifies on every return.
-    pub settle_after: Option<DurationSpec>,
-    /// How long to hold a grown alerting set before reporting it, so a
-    /// cascade arrives as one notification instead of one per part.
-    pub coalesce_after: Option<DurationSpec>,
-    /// How long a hook may run before it is killed.
-    pub timeout: Option<DurationSpec>,
-    /// Per-state overrides of `alert_after`, keyed by state name.
+    /// Per-state confirmation periods, keyed by state name. Overrides the
+    /// built-in table, which is already tuned per state: a sleeping laptop
+    /// and a safety halt do not deserve the same patience.
     #[serde(default)]
     pub after: BTreeMap<String, DurationSpec>,
+    /// How long a grown alerting set is held before it is reported, so a
+    /// cascade arrives as one notification rather than one per part.
+    pub coalesce_after: Option<DurationSpec>,
+    /// How long everything must stay clear before trouble returning counts
+    /// as news rather than as the same trouble continuing.
+    pub settle_after: Option<DurationSpec>,
+    /// How often to fire again while the alerting set is unchanged. Absent
+    /// or zero never repeats, which is the default: a notification that
+    /// returns while you are already working on it teaches you to ignore
+    /// it.
+    pub repeat_after: Option<DurationSpec>,
+    /// How long a hook may run before it is killed.
+    pub timeout: Option<DurationSpec>,
 }
 
 /// A duration as written in the configuration: a plain number of seconds,
@@ -416,19 +456,48 @@ impl Config {
     pub fn alert_plan(&self) -> Result<crate::alerts::AlertPlan> {
         use crate::alerts::Alert;
 
-        let alerts = &self.alerts;
+        // A configuration written against the old shape is answered, not
+        // merely rejected: the keys moved, and the reader should be told
+        // where to rather than left with "unknown field".
+        if self.alerts.is_some() {
+            bail!(
+                "invalid configuration:\n  [alerts] has moved: put `on_alert` at the top \
+                 level, and anything else that was in [alerts] under [advanced.alerts]. \
+                 The per-state hold times are now built in, so [alerts.after] can usually \
+                 just be deleted."
+            );
+        }
+
+        let advanced = &self.advanced.alerts;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
             None => Ok(fallback),
-            Some(spec) => parse_duration(spec)
-                .map_err(|message| anyhow!("invalid configuration:\n  alerts.{what}: {message}")),
+            Some(spec) => parse_duration(spec).map_err(|message| {
+                anyhow!("invalid configuration:\n  advanced.alerts.{what}: {message}")
+            }),
         };
 
-        let mut after = BTreeMap::new();
-        for (name, spec) in &alerts.after {
+        // Three layers, narrowest last. The built-in table gives every
+        // state a considered value. `alert_after`, when written, is a
+        // statement about the whole thing — "hold everything this long" —
+        // so it replaces the built-ins rather than sitting behind them,
+        // which would have made it dead the moment every state had an
+        // entry. `[after]` then overrides individual states.
+        let default_after = duration(&advanced.alert_after, "alert_after", DEFAULT_ALERT_AFTER)?;
+        let mut after: BTreeMap<Alert, Duration> = Alert::all()
+            .into_iter()
+            .map(|alert| {
+                let hold = match advanced.alert_after {
+                    Some(_) => default_after,
+                    None => built_in_after(alert),
+                };
+                (alert, hold)
+            })
+            .collect();
+        for (name, spec) in &advanced.after {
             let Some(alert) = Alert::parse(name) else {
                 let known: Vec<&str> = Alert::all().iter().map(|alert| alert.name()).collect();
                 bail!(
-                    "invalid configuration:\n  alerts.after.{name}: unknown state \
+                    "invalid configuration:\n  advanced.alerts.after.{name}: unknown state \
                      (expected one of: {})",
                     known.join(", ")
                 );
@@ -436,23 +505,23 @@ impl Config {
             after.insert(
                 alert,
                 parse_duration(spec).map_err(|message| {
-                    anyhow!("invalid configuration:\n  alerts.after.{name}: {message}")
+                    anyhow!("invalid configuration:\n  advanced.alerts.after.{name}: {message}")
                 })?,
             );
         }
 
         Ok(crate::alerts::AlertPlan {
-            on_alert: alerts.on_alert.clone(),
+            on_alert: self.on_alert.clone(),
             after,
-            default_after: duration(&alerts.alert_after, "alert_after", DEFAULT_ALERT_AFTER)?,
-            repeat_after: duration(&alerts.repeat_after, "repeat_after", Duration::ZERO)?,
-            settle_after: duration(&alerts.settle_after, "settle_after", DEFAULT_SETTLE_AFTER)?,
+            default_after,
+            repeat_after: duration(&advanced.repeat_after, "repeat_after", Duration::ZERO)?,
+            settle_after: duration(&advanced.settle_after, "settle_after", DEFAULT_SETTLE_AFTER)?,
             coalesce_after: duration(
-                &alerts.coalesce_after,
+                &advanced.coalesce_after,
                 "coalesce_after",
                 DEFAULT_COALESCE_AFTER,
             )?,
-            timeout: duration(&alerts.timeout, "timeout", DEFAULT_ALERT_TIMEOUT)?,
+            timeout: duration(&advanced.timeout, "timeout", DEFAULT_ALERT_TIMEOUT)?,
         })
     }
 
@@ -1127,6 +1196,105 @@ mod tests {
 
     fn parse(text: &str) -> Config {
         toml::from_str(text).expect("configuration should parse")
+    }
+
+    /// The whole point of the built-in table: a reader who writes only the
+    /// hook gets per-state patience they never had to know about.
+    #[test]
+    fn one_line_of_configuration_gets_considered_hold_times() {
+        use crate::alerts::Alert;
+        let config = parse(r#"on_alert = "notify me""#);
+        let plan = config.alert_plan().expect("a plan");
+
+        assert_eq!(plan.on_alert.as_deref(), Some("notify me"));
+        assert_eq!(plan.after(Alert::Halted), Duration::ZERO, "never transient");
+        assert_eq!(plan.after(Alert::Unreachable), Duration::from_secs(300));
+        assert_eq!(plan.after(Alert::Errored), Duration::from_secs(120));
+        assert_eq!(plan.after(Alert::Conflicts), Duration::from_secs(30));
+        assert_eq!(plan.after(Alert::Blocked), Duration::from_secs(30));
+        // And the rest of the timing, which nobody should have to write.
+        assert_eq!(plan.coalesce_after, DEFAULT_COALESCE_AFTER);
+        assert_eq!(plan.settle_after, DEFAULT_SETTLE_AFTER);
+        assert_eq!(plan.repeat_after, Duration::ZERO, "a nag is opt-in");
+    }
+
+    /// `alert_after` is a statement about all of it. Without this it was
+    /// dead on arrival: every state had a built-in entry, so the map
+    /// lookup always hit and the global value was never consulted.
+    #[test]
+    fn a_written_alert_after_replaces_the_built_in_table() {
+        use crate::alerts::Alert;
+        let config = parse(
+            r#"
+            on_alert = "notify me"
+
+            [advanced.alerts]
+            alert_after = "1s"
+            "#,
+        );
+        let plan = config.alert_plan().expect("a plan");
+        for alert in Alert::all() {
+            assert_eq!(
+                plan.after(alert),
+                Duration::from_secs(1),
+                "{} should follow the written value",
+                alert.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_advanced_section_overrides_the_built_in_table() {
+        use crate::alerts::Alert;
+        let config = parse(
+            r#"
+            on_alert = "notify me"
+
+            [advanced.alerts]
+            coalesce_after = "5s"
+
+            [advanced.alerts.after]
+            unreachable = "1m"
+            "#,
+        );
+        let plan = config.alert_plan().expect("a plan");
+        assert_eq!(plan.after(Alert::Unreachable), Duration::from_secs(60));
+        assert_eq!(plan.coalesce_after, Duration::from_secs(5));
+        // Untouched states keep their built-in value rather than falling
+        // back to a single global one.
+        assert_eq!(plan.after(Alert::Errored), Duration::from_secs(120));
+    }
+
+    /// A configuration written against the old shape is answered, not
+    /// merely rejected.
+    #[test]
+    fn the_old_alerts_section_says_where_everything_went() {
+        let config = parse(
+            r#"
+            [alerts]
+            on_alert = "notify me"
+            alert_after = "30s"
+            "#,
+        );
+        let error = format!("{:#}", config.alert_plan().expect_err("retired"));
+        assert!(error.contains("[alerts] has moved"), "{error}");
+        assert!(error.contains("top level"), "{error}");
+        assert!(error.contains("[advanced.alerts]"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_state_is_refused_with_the_known_ones() {
+        let config = parse(
+            r#"
+            on_alert = "notify me"
+
+            [advanced.alerts.after]
+            exploded = "1m"
+            "#,
+        );
+        let error = format!("{:#}", config.alert_plan().expect_err("unknown state"));
+        assert!(error.contains("exploded"), "{error}");
+        assert!(error.contains("unreachable"), "{error}");
     }
 
     #[test]

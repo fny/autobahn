@@ -117,7 +117,7 @@ impl AlertPlan {
     }
 
     /// How long this alert must hold before it counts.
-    fn after(&self, alert: Alert) -> Duration {
+    pub fn after(&self, alert: Alert) -> Duration {
         self.after
             .get(&alert)
             .copied()

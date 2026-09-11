@@ -1766,14 +1766,15 @@ fn a_session_needing_attention_runs_the_configured_hook() {
 
     let configuration = format!(
         r#"
+        on_alert = "cat > {fired}.stdin; printf '%s' \"$AUTOBAHN_SUMMARY|$AUTOBAHN_STATES|$AUTOBAHN_EVENT\" > {fired}"
+
         [groups.work]
         alpha = "{alpha}"
         mode = "two-way-conflict"
         interval = 1
         betas = ["{beta}"]
 
-        [alerts]
-        on_alert = "cat > {fired}.stdin; printf '%s' \"$AUTOBAHN_SUMMARY|$AUTOBAHN_STATES|$AUTOBAHN_EVENT\" > {fired}"
+        [advanced.alerts]
         alert_after = "1s"
         # This case is about the hook running at all. Coalescing has its
         # own tests; without this the window would hold the hook for a

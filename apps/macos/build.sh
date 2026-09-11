@@ -13,11 +13,18 @@ set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 APP="${1:-apps/macos/Autobahn.app}"
 
-cargo build --release --features tray
+# Built into its own target directory, never the default one. The login
+# service runs the binary at target/release through a symlink, and a
+# feature build into the same place silently replaced it — a superset, so
+# nothing broke, but the service was one restart away from running
+# whatever the last unrelated build left there. Same fragility as a stale
+# agent bundle, and the same fix: separate outputs, nothing shared.
+TARGET="${AUTOBAHN_TRAY_TARGET:-target/tray}"
+CARGO_TARGET_DIR="$TARGET" cargo build --release --features tray
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp apps/macos/Info.plist "$APP/Contents/Info.plist"
-cp target/release/autobahn "$APP/Contents/MacOS/autobahn"
+cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn"
 cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
 # macOS tags a copied executable with com.apple.provenance, and codesign
 # refuses a bundle carrying one — with errSecInternalComponent, which

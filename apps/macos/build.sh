@@ -25,13 +25,13 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp apps/macos/Info.plist "$APP/Contents/Info.plist"
 cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn"
-# The icon is compiled from Autobahn.icon by Xcode's own asset compiler,
+# The icon is compiled from assets/Autobahn.icon by Xcode's own asset compiler,
 # exactly as Xcode would build it: Assets.car carries the full Icon
 # Composer rendering (light, dark and tinted, with the glass) that macOS
 # 26 draws, and Autobahn.icns is the flat fallback older systems use.
 # Without Xcode, the committed approximation stands in.
 if xcrun --find actool >/dev/null 2>&1; then
-    xcrun actool Autobahn.icon --compile "$APP/Contents/Resources" \
+    xcrun actool assets/Autobahn.icon --compile "$APP/Contents/Resources" \
           --app-icon Autobahn --platform macosx --minimum-deployment-target 11.0 \
           --output-partial-info-plist "$(mktemp)" >/dev/null
     ICON_NAME=Autobahn

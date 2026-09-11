@@ -54,8 +54,7 @@ must not replace it.
 
 ## The icon
 
-The app's icon is `Autobahn.icon`, an Icon Composer bundle at the root of
-the repository. Edit it in Icon Composer (it ships inside Xcode), and
+The app's icon is `assets/Autobahn.icon`, an Icon Composer bundle. Edit it in Icon Composer (it ships inside Xcode), and
 `build.sh` compiles it with Xcode's asset compiler, `actool`, exactly as
 Xcode would: the bundle gets `Assets.car`, carrying the light, dark and
 tinted variants macOS 26 draws, and `Autobahn.icns` as the flat fallback

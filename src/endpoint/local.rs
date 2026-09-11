@@ -24,7 +24,7 @@
 //!   with the [`TEMPORARY_PREFIX`] that scans skip, so an in-flight (or
 //!   abandoned) transition is never mistaken for synchronizable content.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, Metadata, Permissions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
@@ -152,6 +152,14 @@ pub struct LocalEndpoint {
     ///
     /// [`stage_begin`]: Endpoint::stage_begin
     receive: Option<ReceiveState>,
+    /// The digests requested since the last sweep, as staging names. A
+    /// staged blob no request in the cycle referenced is dead: everything
+    /// asked for was published, or discarded with its refusal reported.
+    /// What is left is the previous version of a file that changed while
+    /// its transfer was in flight — re-requested under a new digest, and
+    /// never referenced again. Nothing else ever removed those, and a busy
+    /// tree with large files accumulated gigabytes of them.
+    requested: HashSet<String>,
 }
 
 /// The number of changed paths a watcher will accumulate before giving up
@@ -573,6 +581,7 @@ impl LocalEndpoint {
             #[cfg(test)]
             between_announce_and_writes: None,
             seen_generation: 0,
+            requested: HashSet::new(),
             last_snapshot: None,
             supply: None,
             receive: None,
@@ -609,6 +618,36 @@ impl LocalEndpoint {
     /// it has been fully received and verified.
     fn staged_path(&self, digest: &Digest) -> PathBuf {
         staged_path(&self.staging_root, digest)
+    }
+
+    /// Removes staged blobs that no request since the last sweep referenced,
+    /// then forgets the requests.
+    ///
+    /// Only names that are a digest are candidates. Anything else in the
+    /// directory is a temporary mid-write, and belongs to whoever is
+    /// writing it. Removal failures are ignored: this is a cache, and a
+    /// blob that will not go today goes on a later cycle.
+    ///
+    /// Called only at the end of a transition, never between a stage and
+    /// its transition, so a blob staged this cycle is never swept before it
+    /// is published — and content surviving an interrupted run is kept,
+    /// because a crash means no transition ran to sweep it.
+    fn sweep_staging(&mut self) {
+        let requested = std::mem::take(&mut self.requested);
+        let Ok(entries) = fs::read_dir(&self.staging_root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let is_digest = name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit());
+            if !is_digest || requested.contains(name) {
+                continue;
+            }
+            if entry.file_type().is_ok_and(|kind| kind.is_file()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
     }
 
     /// Decides whether the local-content index is worth building for a
@@ -1102,6 +1141,9 @@ impl Endpoint for LocalEndpoint {
             // from fresh scans, which drops any vanished or changed source
             // path from consideration.
             let hex = digest_hex(&request.digest);
+            // Recorded before the de-duplication below: a digest asked for
+            // twice is still one this cycle needs.
+            self.requested.insert(hex.clone());
             if !staged.insert(hex.clone()) {
                 continue;
             }
@@ -1404,6 +1446,11 @@ impl Endpoint for LocalEndpoint {
                 None => self.last_snapshot = None,
             }
         }
+        // Everything this cycle asked for has now been published or
+        // discarded, so any blob still in staging that no request named is
+        // a leftover — and this is the one point where that is known for
+        // certain, on both sides, with no message needed.
+        self.sweep_staging();
         Ok(outcome)
     }
 }
@@ -3977,6 +4024,69 @@ mod tests {
             .stage_begin(requests)
             .expect("staging should begin");
         assert!(needs.is_empty(), "{needs:?}");
+    }
+
+    /// The leak this closes: a blob for a version of a file that changed
+    /// while in flight is never referenced again, and used to stay
+    /// forever. A stray blob no request names is removed once the cycle's
+    /// transition completes; a temporary that is not a digest is not
+    /// touched, because it is someone's write in progress.
+    #[test]
+    fn unreferenced_staged_content_is_swept_after_a_cycle() {
+        let mut fixture = Fixture::new();
+        let staging = fixture._keep.path().join("staging-beta");
+        write(&fixture.alpha_root, "file.txt", "content");
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+
+        let stray = staging.join("ab".repeat(32));
+        fs::write(&stray, b"a previous version nobody will ask for").expect("stray");
+        let temporary = staging.join(".autobahn-tmp-in-flight");
+        fs::write(&temporary, b"mid-write").expect("temporary");
+
+        fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should succeed");
+
+        assert_eq!(read(&fixture.beta_root, "file.txt"), "content", "published");
+        assert!(!stray.exists(), "the unreferenced blob is swept");
+        assert!(temporary.exists(), "a non-digest name is left alone");
+    }
+
+    /// A blob a request named this cycle survives the sweep even when the
+    /// cycle published nothing — the survivor path relies on it being
+    /// there next time. Once a cycle passes without naming it, it goes.
+    #[test]
+    fn content_requested_this_cycle_is_kept_and_forgotten_content_is_not() {
+        let mut fixture = Fixture::new();
+        let staging = fixture._keep.path().join("staging-beta");
+        write(&fixture.alpha_root, "file.txt", "content");
+        let transitions = fixture.beta_transitions();
+        fixture.stage(&transitions);
+        let blob = staging.join(digest_hex(&transition_dependencies(&transitions)[0].digest));
+        assert!(blob.exists(), "staged");
+
+        // A fresh cycle asks for the same content, finds it staged, and
+        // then transitions nothing: the blob was requested, so it stays.
+        let requests = transition_dependencies(&transitions);
+        let needs = fixture
+            .beta
+            .stage_begin(requests)
+            .expect("staging should begin");
+        assert!(needs.is_empty(), "{needs:?}");
+        fixture
+            .beta
+            .transition(Vec::new())
+            .expect("an empty transition");
+        assert!(blob.exists(), "requested this cycle, so kept");
+
+        // A cycle that never asks for it is the signal it is dead.
+        fixture
+            .beta
+            .transition(Vec::new())
+            .expect("an empty transition");
+        assert!(!blob.exists(), "unreferenced for a whole cycle, so swept");
     }
 
     #[test]

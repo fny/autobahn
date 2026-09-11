@@ -9,7 +9,7 @@ the binary itself).
 | `config.toml` | the configuration — the source of truth |
 | `sessions/<id>/` | each session's ancestor and journal: what was last agreed between its two roots |
 | `status/<id>.json` | what each session is doing, or last did; what `status` reads |
-| `staging/` | in-flight content, held aside until verified, then renamed into place |
+| `staging/` | in-flight content, held aside until verified, then renamed into place; swept at the end of every cycle, so a version that changed while in flight does not linger |
 | `endpoint-locks/` | one lock per pair of roots, so two sessions never write one tree from independent ancestors |
 | `agents/` | the agent bundle — binaries for platforms other than this one |
 | `bin/autobahn-<version>` | on a *remote* host: the agent this controller streamed there |

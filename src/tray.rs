@@ -163,6 +163,7 @@ fn run_loop(
         actions: HashMap::new(),
         alerter: crate::alerts::Alerter::new(plan),
         hook_configured,
+        ink: menu_bar_ink(),
         health: Health::Idle,
         report: None,
         last_error: None,
@@ -193,6 +194,9 @@ struct App {
     /// sources with identical rules still means everything twice.
     hook_configured: bool,
     health: Health,
+    /// The menu bar's ink at the last poll. The sign is drawn in it, so a
+    /// switch between light and dark redraws the icon on the next poll.
+    ink: Ink,
     report: Option<StatusReport>,
     /// The last action's failure, shown at the top of the menu until an
     /// action succeeds — a notification can be missed.
@@ -229,7 +233,7 @@ impl winit::application::ApplicationHandler<Wake> for App {
             let menu = Menu::new();
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_icon(icon(Health::Idle))
+                .with_icon(icon(Health::Idle, menu_bar_ink()))
                 .with_tooltip("autobahn")
                 .build()
                 .expect("unable to create the tray icon");
@@ -265,11 +269,13 @@ impl App {
         };
         self.notify(&report);
         let health = health_of(&report);
-        if health != self.health {
+        let ink = menu_bar_ink();
+        if health != self.health || ink != self.ink {
             if let Some(tray) = &self.tray {
-                let _ = tray.set_icon(Some(icon(health)));
+                let _ = tray.set_icon(Some(icon(health, ink)));
             }
             self.health = health;
+            self.ink = ink;
         }
         let shape = shape_of(&report);
         let rebuild = match &self.model {
@@ -846,30 +852,227 @@ fn health_of(report: &StatusReport) -> Health {
     health
 }
 
-/// A filled circle in the health's colour, drawn in code so there is no
-/// asset to ship or lose.
-fn icon(health: Health) -> Icon {
-    const SIZE: u32 = 22;
-    let (r, g, b) = match health {
-        Health::Idle => (150u8, 150u8, 150u8),
-        Health::Good => (52, 199, 89),
-        Health::Attention => (255, 204, 0),
-        Health::Bad => (255, 69, 58),
+/// The colour the menu bar draws its own glyphs in.
+type Ink = (u8, u8, u8);
+
+/// Reads the menu bar's ink: white on a dark bar, black on a light one.
+///
+/// A template image would let macOS pick this itself, but a template is
+/// recoloured whole, and the state dot has to keep its colour — so the
+/// app asks which appearance is in effect and draws the sign to match.
+/// This follows the system appearance, which is what the bar follows
+/// except where a wallpaper darkens or lightens it on its own.
+#[cfg(target_os = "macos")]
+fn menu_bar_ink() -> Ink {
+    use objc2_app_kit::NSApplication;
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return (0, 0, 0);
     };
+    let name = NSApplication::sharedApplication(mtm)
+        .effectiveAppearance()
+        .name()
+        .to_string();
+    // Every dark appearance — DarkAqua, VibrantDark, the high-contrast
+    // variants — carries the word; matching on it covers them all.
+    if name.contains("Dark") {
+        (255, 255, 255)
+    } else {
+        (0, 0, 0)
+    }
+}
+
+/// Elsewhere the bar's colour is not knowable, so the sign is drawn in a
+/// grey that reads on either.
+#[cfg(not(target_os = "macos"))]
+fn menu_bar_ink() -> Ink {
+    (142, 142, 147)
+}
+
+/// The Autobahn sign — two lanes to the horizon under a bridge — in the
+/// menu bar's ink, with the health in a dot at the corner, drawn in code
+/// so there is no asset to ship or lose.
+///
+/// Idle is the sign alone, faded. Every other health keeps the sign solid
+/// and adds the dot in that health's colour, ringed by a transparent gap
+/// so it sits *on* the sign rather than merging with it — the same gap
+/// runs under the bridge, which is what makes it a bridge rather than a
+/// stripe. Rendered at 36 pixels, exactly twice the 18 points macOS shows
+/// a status image at, so a Retina bar gets it pixel for pixel.
+fn icon(health: Health, ink: Ink) -> Icon {
+    Icon::from_rgba(icon_rgba(health, ink), 36, 36).expect("a valid icon")
+}
+
+/// The icon's pixels, straight RGBA, row-major, 36 by 36.
+fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
+    const SIZE: u32 = 36;
+    // Geometry is expressed in a 22-unit square, the size it was designed
+    // at, and scaled here.
+    const UNIT: f32 = SIZE as f32 / 22.0;
+    // Samples per pixel edge: sixteen per pixel is enough for the slanted
+    // lane edges to be smooth at this size.
+    const SS: u32 = 4;
+
+    let dot: Option<(u8, u8, u8)> = match health {
+        Health::Idle => None,
+        Health::Good => Some((52, 199, 89)),
+        Health::Attention => Some((255, 204, 0)),
+        Health::Bad => Some((255, 69, 58)),
+    };
+    let sign_alpha = match health {
+        Health::Idle => 0.28,
+        _ => 1.0,
+    };
+
+    // The two lanes, as quadrilaterals, and the bridge with its gap.
+    let left = [(2.5, 20.0), (8.0, 20.0), (10.2, 3.0), (8.9, 3.0)];
+    let right = [(14.0, 20.0), (19.5, 20.0), (13.1, 3.0), (11.8, 3.0)];
+    let inside = |polygon: &[(f32, f32); 4], x: f32, y: f32| -> bool {
+        // Even-odd crossing test.
+        let mut hit = false;
+        let mut j = 3;
+        for i in 0..4 {
+            let (xi, yi) = polygon[i];
+            let (xj, yj) = polygon[j];
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                hit = !hit;
+            }
+            j = i;
+        }
+        hit
+    };
+    let in_sign = |x: f32, y: f32| -> bool {
+        let bridge = (1.5..=20.5).contains(&x) && (9.9..=12.1).contains(&y);
+        let gap = (1.5..=20.5).contains(&x) && (12.1..13.2).contains(&y);
+        if gap {
+            return false;
+        }
+        bridge || inside(&left, x, y) || inside(&right, x, y)
+    };
+    let (dot_x, dot_y, dot_r, ring_r) = (17.0f32, 17.2f32, 3.0f32, 4.3f32);
+
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-    let centre = (SIZE as f32 - 1.0) / 2.0;
-    let radius = SIZE as f32 / 2.0 - 2.0;
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - centre;
-            let dy = y as f32 - centre;
-            let distance = (dx * dx + dy * dy).sqrt();
-            // A one-pixel soft edge, so the circle is not jagged.
-            let alpha = ((radius - distance + 0.5).clamp(0.0, 1.0) * 255.0) as u8;
-            rgba.extend_from_slice(&[r, g, b, alpha]);
+    for py in 0..SIZE {
+        for px in 0..SIZE {
+            // Coverage of this pixel by the sign and by the dot, each in
+            // [0, 1]; the ring keeps them from ever sharing a pixel.
+            let mut sign = 0u32;
+            let mut dotted = 0u32;
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) / UNIT;
+                    let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / UNIT;
+                    let d = ((x - dot_x).powi(2) + (y - dot_y).powi(2)).sqrt();
+                    if dot.is_some() && d <= dot_r {
+                        dotted += 1;
+                    } else if dot.is_some() && d <= ring_r {
+                        // Transparent: the gap around the dot.
+                    } else if in_sign(x, y) {
+                        sign += 1;
+                    }
+                }
+            }
+            let samples = (SS * SS) as f32;
+            let (r, g, b, a) = if dotted > 0 {
+                let (r, g, b) = dot.unwrap_or(ink);
+                (r, g, b, dotted as f32 / samples)
+            } else {
+                (ink.0, ink.1, ink.2, sign as f32 / samples * sign_alpha)
+            };
+            rgba.extend_from_slice(&[r, g, b, (a * 255.0).round() as u8]);
         }
     }
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("a valid icon")
+    rgba
+}
+
+#[cfg(test)]
+mod icon_tests {
+    use super::*;
+
+    fn pixels(health: Health, ink: Ink) -> Vec<[u8; 4]> {
+        // `Icon` keeps its buffer private, so the test rebuilds it the
+        // same way `icon` does and asks tray-icon only to accept it.
+        let _ = icon(health, ink);
+        render(health, ink)
+    }
+
+    /// The renderer, exposed to the test as the raw buffer.
+    fn render(health: Health, ink: Ink) -> Vec<[u8; 4]> {
+        let built = icon_rgba(health, ink);
+        built.chunks(4).map(|c| [c[0], c[1], c[2], c[3]]).collect()
+    }
+
+    fn art(px: &[[u8; 4]]) -> String {
+        let mut out = String::new();
+        for y in 0..36 {
+            for x in 0..36 {
+                let [r, g, b, a] = px[y * 36 + x];
+                out.push(match (a, (r, g, b)) {
+                    (0, _) => '·',
+                    (a, _) if a < 96 => '░',
+                    (_, (52, 199, 89)) | (_, (255, 204, 0)) | (_, (255, 69, 58)) => '●',
+                    (a, _) if a < 200 => '▒',
+                    _ => '█',
+                });
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn every_state_renders_and_the_shape_is_what_was_drawn() {
+        for (ink, ink_name) in [((0, 0, 0), "black"), ((255, 255, 255), "white")] {
+            for (health, name) in [
+                (Health::Idle, "idle"),
+                (Health::Good, "good"),
+                (Health::Attention, "attention"),
+                (Health::Bad, "bad"),
+            ] {
+                let px = pixels(health, ink);
+                assert_eq!(px.len(), 36 * 36);
+                eprintln!("--- {name} on {ink_name} ink ---\n{}", art(&px));
+
+                let at = |x: usize, y: usize| px[y * 36 + x];
+                // The bridge is solid ink across the middle …
+                let bridge = at(18, 18);
+                assert_eq!(
+                    (bridge[0], bridge[1], bridge[2]),
+                    ink,
+                    "{name}: bridge is ink"
+                );
+                // … faded when idle, full otherwise.
+                match health {
+                    Health::Idle => assert!(
+                        bridge[3] > 50 && bridge[3] < 100,
+                        "{name}: faded, got {}",
+                        bridge[3]
+                    ),
+                    _ => assert_eq!(bridge[3], 255, "{name}: solid"),
+                }
+                // The gap under the bridge is transparent where a lane runs.
+                let gap = at(9, 20);
+                assert_eq!(
+                    gap[3], 0,
+                    "{name}: the gap under the bridge is clear, got {:?}",
+                    gap
+                );
+                // The dot: absent when idle, present and pure-coloured otherwise.
+                let centre = at(28, 28);
+                match health {
+                    Health::Idle => assert_eq!(
+                        (centre[0], centre[1], centre[2]),
+                        ink,
+                        "{name}: no dot when idle — the lane shows through"
+                    ),
+                    Health::Good => assert_eq!(centre, [52, 199, 89, 255]),
+                    Health::Attention => assert_eq!(centre, [255, 204, 0, 255]),
+                    Health::Bad => assert_eq!(centre, [255, 69, 58, 255]),
+                }
+                // Well outside everything: transparent.
+                assert_eq!(at(1, 1)[3], 0, "{name}: corner is clear");
+            }
+        }
+    }
 }
 
 /// How long a phase must have run before the menu reports it in place of

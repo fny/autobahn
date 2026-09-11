@@ -906,7 +906,7 @@ mod tests {
         let start = Instant::now();
         let down = [session("boite", &[Alert::Conflicts])];
         let up = [session("boite", &[])];
-        let mut at = |seconds: u64| start + Duration::from_secs(seconds);
+        let at = |seconds: u64| start + Duration::from_secs(seconds);
 
         alerter.observe(&down, at(0));
         assert!(

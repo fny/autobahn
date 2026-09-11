@@ -14,9 +14,13 @@ icon of whatever ran it. Inside the bundle the icon is autobahn's.
 
 ## What it shows
 
-An icon whose colour is the state of every session — green when all are
-synchronized, yellow when any is in conflict, red when any is halted or
-unreachable, grey when nothing is running — and a menu with the detail:
+The Autobahn sign — two lanes to the horizon under a bridge — drawn in
+the menu bar's own ink, black or white, with the state of every session
+in a dot at its corner: green when all are synchronized, amber when any
+is in conflict, red when any is halted or unreachable. When nothing is
+running the sign fades and the dot is gone. It follows the system
+appearance, so a switch between light and dark redraws it on the next
+poll. And a menu with the detail:
 each group, each destination with its state, and under each conflict the
 ways to settle it (show the diff; keep alpha's, keep that destination's,
 keep both), which run the same `resolve` a terminal would. The menu also

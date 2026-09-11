@@ -9,8 +9,7 @@ scripts/build-agents.sh       # cross-build the agents bundle
 gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
 ```
 
-CI is manual rather than push-triggered: the repository is private, and
-macOS runner minutes bill at ten times the Linux rate.
+CI runs only when triggered (`workflow_dispatch`), not on every push.
 
 ## Targeted tests
 

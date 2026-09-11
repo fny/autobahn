@@ -82,9 +82,7 @@ That installs the command onto your `PATH` and the agent bundle into
 `~/.autobahn/agents`, which is where the controller looks when it needs
 to bootstrap a host whose platform differs from your own. `--prefix`
 chooses where the command goes, `--no-agents` skips the bundle, and
-`--version` pins a release. (While this repository is private, the
-script needs the GitHub CLI: private release assets are not served over
-plain download URLs.)
+`--version` pins a release.
 
 `AUTOBAHN_PREFIX` and `AUTOBAHN_HOME` set the same two destinations
 from the environment, for a non-interactive install.

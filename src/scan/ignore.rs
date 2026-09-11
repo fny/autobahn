@@ -35,29 +35,6 @@ struct Pattern {
 
 impl Pattern {
     /// Compiles a single source pattern.
-    /// Compiles a pattern written from inside `prefix`, so that its
-    /// anchoring is relative to that directory rather than to the root.
-    fn compile_under(pattern: &str, prefix: &str) -> Result<Pattern> {
-        if prefix.is_empty() {
-            return Pattern::compile(pattern);
-        }
-        // The `!` has to stay in front, so it is lifted off, the prefix
-        // applied to what it negates, and then put back.
-        let (negated, rest) = match pattern.strip_prefix('!') {
-            Some(rest) => ("!", rest),
-            None => ("", pattern),
-        };
-        // A pattern with no separator matches at any depth — but only at
-        // any depth *below this directory*, which is what the recursive
-        // prefix says. One with a separator was anchored to the root the
-        // writer had in mind, which is this directory.
-        let anchored = match rest.contains('/') {
-            true => format!("{prefix}/{}", rest.trim_start_matches('/')),
-            false => format!("{prefix}/**/{rest}"),
-        };
-        Pattern::compile(&format!("{negated}{anchored}"))
-    }
-
     fn compile(pattern: &str) -> Result<Pattern> {
         let mut expression = pattern;
 
@@ -146,24 +123,6 @@ impl IgnoreSet {
     }
 
     /// Compiles an ignore set from patterns.
-    /// A copy of this set with more patterns, written as though the
-    /// directory at `prefix` were the root.
-    ///
-    /// For the ignores a tree carries in its own `autobahn.toml`: the
-    /// person writing one is describing that directory, not the
-    /// synchronization root above it, and would have to know where the
-    /// root happened to be for anything else to make sense. Appended
-    /// rather than merged, because the last matching pattern decides — so
-    /// a nested file can re-include (`!`) something an outer rule
-    /// excluded, and never the reverse.
-    pub fn extended(&self, patterns: &[String], prefix: &str) -> Result<IgnoreSet> {
-        let mut compiled = self.patterns.clone();
-        for pattern in patterns {
-            compiled.push(Pattern::compile_under(pattern, prefix)?);
-        }
-        Ok(IgnoreSet { patterns: compiled })
-    }
-
     pub fn new(patterns: &[String]) -> Result<IgnoreSet> {
         let mut compiled = Vec::with_capacity(patterns.len());
         for pattern in patterns {

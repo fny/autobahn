@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 22 22" width="1024" height="1024">
+  <!-- The Autobahn sign: two lanes converging to the horizon under a bridge.
+       Same geometry as the menu bar icon (src/tray.rs). The gap beneath the
+       bridge is cut from the lanes, so the background stays transparent. -->
+  <g fill="#000">
+    <polygon points="5.474,12.100 9.022,12.100 10.200,3.000 8.900,3.000"/>
+    <polygon points="2.500,20.000 8.000,20.000 8.880,13.200 5.060,13.200"/>
+    <polygon points="12.978,12.100 16.526,12.100 13.100,3.000 11.800,3.000"/>
+    <polygon points="14.000,20.000 19.500,20.000 16.940,13.200 13.120,13.200"/>
+    <rect x="1.5" y="9.9" width="19" height="2.2"/>
+  </g>
+</svg>

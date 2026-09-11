@@ -1,0 +1,59 @@
+# The menu bar app
+
+```sh
+apps/macos/build.sh          # builds Autobahn.app
+open apps/macos/Autobahn.app # or drag it to /Applications
+```
+
+The app is a way to launch `autobahn tray`, not a second implementation
+of it: the same binary, the same `resolve` a terminal would run. What the
+bundle adds is an *identity*. macOS attaches a notification's icon to the
+bundle that sent it, and a bare executable has none — which is why
+`-appIcon` is ignored from the command line and every alert wears the
+icon of whatever ran it. Inside the bundle the icon is autobahn's.
+
+## What it shows
+
+An icon whose colour is the state of every session — green when all are
+synchronized, yellow when any is in conflict, red when any is halted or
+unreachable, grey when nothing is running — and a menu with the detail:
+each group, each destination with its state, and under each conflict the
+ways to settle it (show the diff; keep alpha's, keep that destination's,
+keep both), which run the same `resolve` a terminal would. The menu also
+starts, stops, and restarts the login service and opens its log.
+
+A session entering conflict, halting, or going unreachable raises a
+desktop notification from the tray itself, as does its recovery. This is
+the tray's own notification path, separate from `on_alert`, and it does
+not apply the alerter's rules — no hold time, no coalescing, and
+recoveries are announced.
+
+It is a view over `status --json`, polled every few seconds, and holds
+no state of its own. macOS and Linux (with a system tray).
+
+## Signing and notarising
+
+`release.sh` is the other half, and only for an app someone downloads:
+it signs with a Developer ID certificate, sends the result to Apple to be
+scanned, and staples the verdict to the bundle so Gatekeeper trusts it
+offline. A copy that arrives by `scp`, or through autobahn itself, is
+never quarantined and never needs any of that.
+
+Before the first release, store the notarisation credentials once:
+
+```sh
+xcrun notarytool store-credentials autobahn \
+    --apple-id you@example.com --team-id TEAMID --password <app-specific>
+```
+
+## A guided tour
+
+`scripts/mi` runs a guided tour of all of this against throwaway
+directories — every command, and every state a session can report,
+printed as the binary actually produces them.
+
+## See also
+
+- [Alerts](./alerts.md) — the hook, which is where the rules live
+- [The shop](./shop.md) — the terminal counterpart
+- [Conflicts](./conflicts.md) — what the menu's resolve items do

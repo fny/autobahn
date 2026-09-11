@@ -1,0 +1,83 @@
+# Development
+
+```sh
+cargo build --release         # Rust stable, Unix only
+cargo test --release          # unit + end-to-end suites (e2e spawns real agents)
+cargo clippy --all-targets
+scripts/mi                    # a guided tour of every command and state
+scripts/build-agents.sh       # cross-build the agents bundle
+gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
+```
+
+CI is manual rather than push-triggered: the repository is private, and
+macOS runner minutes bill at ten times the Linux rate.
+
+## Targeted tests
+
+The full suite takes minutes. Run the part that covers the change:
+
+```sh
+cargo test --release --lib -- scan::        # one module
+cargo test --release --test supervisor      # the supervisor integration suite
+cargo test --release --test e2e             # real agents over stdio
+```
+
+Reconciliation and scanning are shared by everything, so a change there
+runs the supervisor and e2e suites too.
+
+## The A/B gate
+
+Every hot-path change is measured before it ships, because analysis
+estimates of these costs have been wrong every time they were tried:
+
+```sh
+bench/ab.sh <binary-A> <binary-B> --legs 5
+```
+
+It runs two binaries in interleaved legs over one synthetic corpus and
+reports latency percentiles side by side. Interleaving is what makes the
+comparison honest on a shared machine: any drift in the machine's state
+lands on both. A difference smaller than the leg-to-leg spread is noise;
+a difference that reverses sign between runs is certainly noise. Three
+legs cannot tell a small effect from chance — use five.
+
+`bench/README.md` covers the rest of the harness, and `BENCHMARK.md` the
+published comparison against mutagen.
+
+## Compatibility epochs
+
+A change that breaks the wire protocol, or that makes two versions
+disagree about a tree — a scan rule, an ignore rule — must bump
+`COMPATIBILITY_EPOCH` in `src/protocol.rs`. See
+[State](./state.md#compatibility-epochs) for how it is enforced. After a
+bump, the agents bundle must be rebuilt before the supervisor is
+restarted, or the stale bundle is uploaded under the new name and every
+session fails its handshake.
+
+## Correctness
+
+The correctness work — the invariants the design claims, the code that
+enforces each one, the tests that check it, and the residuals
+deliberately left open — is written down in
+[`correctness/`](./correctness/). [`INVARIANTS.md`](./correctness/INVARIANTS.md)
+is the entry point. Adversarial reviews of specific subsystems are in
+[`reviews/`](./reviews/).
+
+## Lineage
+
+Autobahn is a from-scratch Rust distillation of the architecture that
+emerged from a deep memory/performance overhaul of [Mutagen]'s
+synchronization engine: enum-based trees with name-sorted, copy-on-write
+shared children; scan metadata resident on the nodes themselves; linear-
+merge reconciliation; streaming transfers end to end. What required
+convention and adversarial review to keep safe in Go, the borrow checker
+and `Arc::make_mut` enforce structurally here. [Why mutagen is slower](./MUTAGEN.md)
+sets out where the difference comes from in mutagen's code.
+
+[Mutagen]: https://github.com/mutagen-io/mutagen
+
+## See also
+
+- [How autobahn works](./HOW-IT-WORKS.md) — the design and its reasoning
+- [Safety rules](./safety.md) — what the tests pin
+- [State](./state.md) — agents, epochs, and what lives in `~/.autobahn`

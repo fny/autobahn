@@ -22,7 +22,6 @@ betas = [
 autobahn watch
 ```
 
-
 ## Motivation
 
  - I don't like running agents on my computer.
@@ -69,9 +68,9 @@ plain download URLs.)
 from the environment, for a non-interactive install.
 
 To do it by hand instead, grab a binary from [Releases](../../releases):
-each release ships
-`autobahn-<os>-<arch>` binaries (Linux binaries are static — they run on
-any distribution), an `autobahn-agents.tar.gz` bundle, and `SHA256SUMS`.
+each release ships `autobahn-<os>-<arch>` binaries (Linux binaries are
+static — they run on any distribution), an `autobahn-agents.tar.gz`
+bundle, and `SHA256SUMS`.
 
 ```sh
 # Put your platform's binary on your PATH:
@@ -89,10 +88,6 @@ mkdir -p ~/.autobahn
 tar xzf autobahn-agents.tar.gz -C ~/.autobahn    # creates ~/.autobahn/agents/
 ```
 
-The bundle is looked for in `AUTOBAHN_AGENTS_DIR`, then
-`~/.autobahn/agents`, then an `agents` directory beside the binary — so
-a bundle that travels with a relocatable binary keeps working.
-
 Or build from source with `cargo build --release` (Rust stable, Unix only).
 
 ## Getting started
@@ -107,783 +102,73 @@ destinations (the *betas*):
 [defaults]                  # inherited by every group; any key can be
 mode = "two-way-conflict"       # overridden per group
 ignores = [".git"]
-interval = 5                # heartbeat seconds between cycles
 
 [groups.project]
 alpha = "~/project"         # the source root you edit
 betas = [                   # everywhere it fans out to
-  "build.example.com",              # inherits the alpha path (~/project
-                                    # in *that* host's home)
+  "build.example.com",              # inherits the alpha path
   "user@lab.example.com:/srv/project",
   "/mnt/backup/project",            # local paths work too
 ]
 ignores = ["target"]        # appended to the defaults' ignores
-
-[groups.dotfiles]
-alpha = "~/.config/shell"
-mode = "one-way-alpha"
-betas = ["build.example.com"]
 ```
 
 Then run it:
 
 ```sh
 autobahn watch              # every configured session, here, until Ctrl-C
+autobahn install            # ...or as a login service that survives logout
 ```
 
-On a terminal, `watch` is a live `autobahn status` that repaints as
-sessions report; piped to a file it logs one line per event instead.
-To keep syncing when no terminal is:
+Both sides watch their filesystems natively (inotify/FSEvents), so edits
+on either end propagate within a fraction of a second. Remote endpoints
+use the scp-style `[user@]host:path` syntax you already know, key-based
+SSH auth, and *either* side of a group may be remote.
 
-```sh
-autobahn install            # register a login service, and start it
-autobahn stop               # stop it (it returns at the next login)
-autobahn start
-autobahn restart            # after editing the config, or upgrading
-autobahn uninstall          # stop it, and unregister it
-```
-
-The service is launchd on macOS and a systemd user unit on Linux —
-inspect it with `launchctl` or `systemctl --user` like any other — and
-it logs to `~/.autobahn/service.log`. There is no daemon of autobahn's
-own and nothing backgrounds itself: `start` with no service installed
-says so and points at `install` or `watch`.
-
-That's the whole setup. Both sides watch their filesystems natively
-(inotify/FSEvents), so edits on either end propagate within a fraction of
-a second; the configured interval is only a fallback heartbeat. Remote
-endpoints use the scp-style `[user@]host:path` syntax you already know,
-key-based SSH auth, and *either* side of a group may be remote — you can
-pull from a build server, or relay between two remote hosts through your
-machine.
-
-Asking a running supervisor things, whether it is `watch` or the service:
-
-```sh
-autobahn status            # what every session is doing, or last did
-autobahn status project    # ...filtered to one group
-autobahn status .          # ...to whatever syncs the working directory
-autobahn status ~/project  # ...or any folder inside a synchronized root
-autobahn status --conflicts   # list every conflicting path, not a count
-autobahn status --live     # ...repainting, as it happens (Ctrl-C leaves)
-
-autobahn sync              # one pass over every session, then exit
-autobahn flush             # sync everything right now
-autobahn reset project     # forget the baseline; next cycle merges both
-                           # sides additively (resurrects deletions)
-autobahn verify project    # next cycle re-reads every byte, catching
-                           # content whose metadata never moved
-autobahn clean --dry-run   # what state belongs to sessions no longer
-autobahn clean             # in the config; then remove it
-autobahn clean --agents    # also prune superseded agents on remote hosts
-
-autobahn mi                # the shop: watch it work, and clear the queue
-                           # (? explains every word on the screen)
-```
-
-When a session has been working long enough that its silence would look
-like death — a cold sync, a first scan, an unreachable host — `status`
-says what it is doing, how long it has been at it, and, where the numbers
-allow an honest one, an estimate:
-
-```
-~/Workspace/Voltai voltai
-  ubuntu@fny.voltai.party:~/Workspace
-    status: scanning, 6m20s elapsed
-      alpha: 412,331 of ~1,470,000 entries (28%), about 14m left
-      beta: scanning for 6m20s
-    mode: two-way-conflict
-```
-
-Routine cycles say nothing. They finish in well under a second, and a
-line that flickered into "scanning" every few seconds would report
-nothing while hiding what the reader came for — so a phase earns the line
-only after the session has been working for five seconds, counted across
-the whole run rather than restarted at each step.
-
-To watch it happen rather than sample it, `autobahn status --live`
-repaints twice a second and shows every phase however brief. It is a
-read-only window onto whatever supervisor is already running — the login
-service, or a `watch` in another terminal. (`watch` is the same display,
-but it also does the synchronizing.)
-
-Both scroll, with the keys a pager has trained everyone to try: arrows
-and `j`/`k` by the line, PgUp/PgDn and space/`b` by the screen, `g`/`G`
-or Home/End for the ends, `q` to leave. A footer says where you are in
-the list. The content keeps refreshing underneath while you move around
-in it, and leaving — by `q` or Ctrl-C — gives the terminal back with the
-scrollback intact.
-
-A session between cycles is described by how its last cycle ended, as
-before; so is a paused one, and one backing off from an error, both of
-which the recorded status already names. The estimate is withheld unless the phase has been running long
-enough to have a rate and has a total to measure against — a first scan
-of a tree nothing has ever counted reports its progress and its elapsed
-time, and no estimate. A remote scan happens inside one request on the
-far side, so it reports that it is running and for how long, without
-counts.
-
-### What a session's state means
-
-Two questions, not one word list. **Did the cycle run?** If it did not:
-`unreachable` (the host is not answering — usually clears itself),
-`halted` (a safety refusal — retrying will *never* clear it), or `errored`
-(it failed for some other reason; the message is the evidence). If it did
-run, the tree is in sync except for what the cycle could not carry:
-`conflicts` (both sides changed a path — you pick a winner) and `blocked`
-(a path could not be read or written — you fix the filesystem).
-
-Conflicts and blocked paths co-occur, so both counts are reported rather
-than one hiding the other.
-
-### Being told
-
-A supervisor running as a login service is invisible by design, which
-means a conflict or a permission that stopped working sits there with
-nobody told. `[alerts]` runs a command when that happens:
+To be told when something needs you, add one line at the top of the
+config — the hold times, coalescing and the rest are built in:
 
 ```toml
-on_alert = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
-            -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\" \\
-            -execute \"$AUTOBAHN_OPEN\""
+on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\" -execute \"$AUTOBAHN_OPEN\""
 ```
 
-That is the whole of it. How long each state must hold before it counts is
-built in and tuned per state, because a sleeping laptop and a safety halt
-do not deserve the same patience:
+That's the whole setup. Everything else is in the documentation.
 
-| state | holds for | why |
-| --- | --- | --- |
-| `halted` | 0s | a safety halt is never transient |
-| `conflicts`, `blocked` | 30s | needs a person, but not this second |
-| `errored` | 2m | transient failures heal in a cycle or two |
-| `unreachable` | 5m | a sleeping laptop is the common case |
+## Documentation
 
-`[advanced.alerts]` can override those, along with `coalesce_after`,
-`settle_after`, `repeat_after` and the hook `timeout`. It is a separate
-section so that finding yourself in it is itself the message: these have
-correct values already, and `alert_after` written there replaces the whole
-table rather than sitting behind it.
+**Using it**
 
-`on_alert` is the only hook. Which states are alerting is in the summary
-it is handed, not in which hook is chosen — a hook per state only moved
-the branching out of the command and into the config, and every state
-ends the same way, with someone opening a terminal. Six rules make it
-usable rather than maddening:
+- [Configuration](docs/configuration.md) — every key, where it lives, what it defaults to
+- [Modes](docs/modes.md) — the four sync modes, case by case, and which to pick
+- [Ignores](docs/ignores.md) — patterns, ignore files, negations
+- [Alerts](docs/alerts.md) — the one hook, and when it fires
+- [Commands](docs/commands.md) — `status`, `sync`, `flush`, `reset`, `verify`, and one-off syncs
+- [Conflicts](docs/conflicts.md) — `issues`, `conflicts`, `diff`, `resolve`
+- [The shop](docs/shop.md) — `autobahn mi`
+- [The menu bar app](docs/macos-app.md) — `Autobahn.app`
+- [The log](docs/logging.md) — levels and what `debug` adds
+- [State](docs/state.md) — `~/.autobahn`, `clean`, agents
 
-- **Nothing runs while everything is healthy.** Silence is the normal
-  state.
-- **Nothing runs when it clears, either.** An all-clear asks for no
-  action, and a stream of notifications that ask for nothing is what
-  teaches you to stop reading the ones that do.
-- **A condition must hold for `alert_after` before it counts.** A wifi
-  handover that takes every session unreachable for eight seconds is never
-  mentioned — it fixed itself — and a sleeping laptop produces one
-  notification rather than fifteen. `[alerts.after]` tunes that per state,
-  which is timing rather than routing: a blip means something different
-  for a sleeping laptop than for a safety halt.
-- **An alert fires when something *joins* the set of sessions in trouble**,
-  never on repetition, and never on recovery. A cascade coming back one
-  host at a time used to notify on the way up as loudly as on the way
-  down; a session that recovers and fails again inside the same episode is
-  the trouble already reported, not new trouble. `repeat_after` opts into
-  a nag; it is off by default.
-- **A cascade is held for `coalesce_after` and reported once.** A closing
-  laptop does not take its sessions together: each goes when its own
-  connection times out, seconds apart, so every arrival changed the set
-  and every change was news. The window (60 seconds by default) runs from
-  the first arrival nobody has been told about, not from the latest, so a
-  steady trickle cannot hold the notification back indefinitely.
-- **Trouble that comes and goes is reported once.** A conflict on a file
-  two machines are both editing appears, clears, and returns all day.
-  Everything must stay clear for `settle_after` (15 minutes by default)
-  before a return counts as news rather than as the same trouble
-  continuing — otherwise one flapping session is a notification a minute.
+**Understanding it**
 
-Hooks get `$AUTOBAHN_SUMMARY` (one line: the whole story when there is
-one thing wrong, a count when there are several — `voltai → fny: 1
-conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you,
-1 host away`), `$AUTOBAHN_DETAIL` (one indented line per thing, for a
-hook that can show more than a headline), `$AUTOBAHN_ALERT_COUNT`,
-`$AUTOBAHN_STATES`, `$AUTOBAHN_EVENT`, `$AUTOBAHN_ICON` (autobahn's own
-icon, written into the state directory so a notifier can point at it),
-`$AUTOBAHN_OPEN` (a ready command that opens the shop on the full detail,
-for a notifier that can run something on click — `terminal-notifier
--execute`, a tray menu item — since one line is all a notification holds),
-and the full `status --json` document on standard input. They run off the
-cycle and cannot affect or delay synchronization: a hook is killed if it
-outstays `timeout`, and is skipped while a previous one is still running.
+- [Safety rules](docs/safety.md) — what is refused, and why
+- [Overlapping and nested roots](docs/nesting.md)
+- [Scope and support boundaries](docs/support-boundaries.md)
+- [How autobahn works](docs/HOW-IT-WORKS.md) — the design and its reasoning
+- [Why mutagen is slower](docs/MUTAGEN.md)
 
-The service runs under launchd or systemd with a sparse environment, so
-give commands absolute paths — and on Linux, `notify-send` needs
-`DBUS_SESSION_BUS_ADDRESS`.
+**Working on it**
 
-When two sides disagree about a file, `status` names it and these three
-settle it:
+- [Development](docs/development.md) — building, targeted tests, the A/B gate
+- [Correctness](docs/correctness/) — the invariants and what enforces them
+- [Benchmarks](BENCHMARK.md)
 
-```sh
-autobahn issues                     # everything that needs you, grouped by cause
-autobahn issues voltai autobahn     # ...under one folder
-autobahn conflicts                  # every conflict, with what each side holds
-autobahn conflicts ~/project        # ...for whatever group syncs that folder
-autobahn conflicts voltai autobahn  # ...to one folder inside the group
-autobahn conflicts --depth 1        # roll up: which top-level folders, and how many
-autobahn conflicts --filter vulns   # only paths containing "vulns"
-autobahn conflicts --filter '*.ts'  # ...or matching a glob, at any depth
-autobahn diff ./src/main.rs         # the two sides of a file, as a unified diff
-autobahn diff project src/main.rs   # same file, by group and root-relative path
-
-autobahn resolve ./src/main.rs --keep alpha       # my version wins, everywhere
-autobahn resolve project src/main.rs --keep boite # boite's version wins, everywhere
-autobahn resolve project src/main.rs --keep both  # keep alpha's; the loser is
-                                                  # renamed aside as main.rs.boite
-autobahn resolve voltai autobahn --keep alpha     # every conflict under one folder
-autobahn resolve project a.rs b.rs c.rs --keep alpha  # several at once, one pass
-autobahn resolve ~/project --all --keep boite     # every conflict in the group
-```
-
-A winner is named as `status` names it: `alpha`, or a destination's host
-(or path). Its version reaches alpha and every other destination, so one
-command settles a conflict across a whole fan-out — including
-destinations whose own conflict was with a *third* version.
-
-It asks before it acts, unless you pass `--yes` (`-y`).
-
-What it does is retire the *losing* version, not copy the winning one:
-the losing side's copy is removed, or moved aside for `--keep both`, and
-the next cycle carries the winner across. That is why it settles a
-conflict between a file and a whole directory, which no amount of
-copying bytes can do — reconciliation already propagates one side's
-content over the other's deletion, for a file, a symbolic link, or a
-tree alike.
-
-Two things follow. The removal goes through the same transition path a
-cycle uses, so an entry that changed since the command started is
-refused and reported rather than destroyed; run the command again to
-settle it. And the winner arrives on the next cycle, so the command
-flushes the supervisor before returning. Without a supervisor running,
-run `autobahn sync` once. Nothing here touches the ancestor.
-
-`--depth` turns a long list into a map of where the trouble is —
-seven hundred paths under one folder are one fact about that folder —
-and each level tells you how to look inside the next. `--filter` takes a
-plain word (matched anywhere in the path, ignoring case) or a glob:
-without a slash it matches at any depth, with one it is anchored to the
-root.
-
-`autobahn status --json` and `autobahn conflicts --json` print all of
-this as one versioned document, for scripts and user interfaces. Each
-session carries a `progress` object while a supervisor is running —
-`--filter` applies to the JSON too, while `--depth`, being a way of
-reading a list, does not.
-
-### The shop
-
-```sh
-autobahn mi
-```
-
-An easter egg that turned useful. Every session is an order, an order
-fills as its transfer does, and the shop is open when a supervisor
-answers and shuttered when none does. Every number on it is real — it
-reads the same `status --json` document as everything else.
-
-```
-  ◉ OPEN   🥖 AUTOBÁNH MÌ   15 customers · 12,480 files · 3.4 GB · 1 filling · 2.1 MB/s
-
-  ▸ voltai   → fny     🥖[▓▓▓▓▓░░░░░░░]  served    filling · 1,204 of 8,530
-    vibe     → boite   🥖[▓▓▓▓▓▓▓▓▓▓▓▓]  disputed  2 waiting
-    voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s · 1 waiting
-```
-
-An order is always *something* — served, disputed, out of stock — and
-sometimes also *doing* something. The first has the coloured word and
-never gives it up. The second has a column of its own, filled only once
-the work has gone on long enough to be worth mentioning: the same rule
-`status` applies, so a routine scan is never announced and one that
-drags names itself without displacing the outcome.
-
-**The counter** is the useful half. `ret` opens any order — where it syncs
-from and to, its mode, how many cycles it has run and how much it has
-carried — and then its issues as a tree: cause, then place, then path.
-Every level of that tree can be acted on, so one keypress settles a whole
-directory or a single file.
-
-```
-  ┌──────────────────────────────────────────────────────────────┐
-  │ the counter  voltai → fny.voltai.party            3 waiting  │
-  │ ▾ 2 conflicts                       both sides changed these │
-  │     happy                                    deleted on ours │
-  │     voltagen                                 deleted on ours │
-  │ ▸ 1 blocked on alpha                       unicode collision │
-  │ ▾ 20 blocked on beta            Permission denied (os error) │
-  │   ▾ azure/backend/.ruff_cache/0.9.10/                     16 │
-  │       10497280429343070344                                   │
-  │   ▸ arcturus/frontend/apps/web/public/static/              4 │
-  └──────────────────────────────────────────────────────────────┘
-```
-
-`↑↓` move, `ret` or `→` opens a branch, `←` closes it and then the counter.
-On a conflict, `o` keeps ours, `t` keeps theirs, `b` keeps both — and each
-asks before it acts, because resolution overwrites a file someone edited
-on every destination in the group. It then runs the same `resolve` you
-would type, on whichever paths the selected level covers. Blocked paths autobahn cannot clear
-itself, since the commands are `sudo` over ssh and a password prompt has
-nowhere to appear, so `c` copies the fix to the clipboard instead. `f`
-rushes an order, and `q` closes the shop.
-
-Under the counter, the last few lines the supervisor wrote — the only
-view of the log there is.
-
-### The menu bar app
-
-```sh
-apps/macos/build.sh          # builds Autobahn.app
-open apps/macos/Autobahn.app # or drag it to /Applications
-```
-
-`release.sh` is the other half, and only for an app someone downloads:
-it signs with a Developer ID certificate, sends the result to Apple to be
-scanned, and staples the verdict to the bundle so Gatekeeper trusts it
-offline. A copy that arrives by `scp`, or through autobahn itself, is
-never quarantined and never needs any of that.
-
-The app is a way to launch `autobahn tray`, not a second implementation
-of it: the same binary, the same `resolve` a terminal would run. What the
-bundle adds is an *identity*. macOS attaches a notification's icon to the
-bundle that sent it, and a bare executable has none — which is why
-`-appIcon` is ignored from the command line and every alert wears the
-icon of whatever ran it. Inside the bundle the icon is autobahn's.
-
-The menu bar icon is a dot in the colour of the worst session: green when
-everything is synchronized, amber for conflicts, red for a halt. The menu
-lists every group and session, and any conflicting path opens a submenu
-offering to keep alpha's version, the destination's, or both.
-
-An icon whose colour is the state of every session — green when all
-are synchronized, yellow when any is in conflict, red when any is halted
-or unreachable, grey when nothing is running — and a menu with the
-detail: each group, each destination with its state, and under each
-conflict the ways to settle it (show the diff; keep alpha's, keep that
-destination's, keep both), which run the same `resolve` a terminal
-would. A session entering conflict, halting, or going unreachable
-raises a desktop notification, as does its recovery. The menu also
-starts, stops, and restarts the login service and opens its log.
-
-It is a view over `status --json`, polled every few seconds, and holds
-no state of its own. macOS and Linux (with a system tray).
-
-`scripts/mi` runs a guided tour of all of this against throwaway
-directories — every command, and every state a session can report,
-printed as the binary actually produces them.
-
-Removing a group from the config stops its sessions but keeps their
-state, so that adding the group back later resumes from memory rather
-than re-merging two drifted trees. `clean` is how that state is
-eventually let go: it removes ancestors, status records, staged content,
-and endpoint locks for any session the config no longer describes.
-Anything a running session holds is skipped, and the files in the
-synchronized trees are never touched.
-
-### Ignore files
-
-A useful ignore list for a language ecosystem runs to dozens of lines,
-which is more than belongs in a configuration file next to the hosts and
-the intervals. Keep those in `~/.autobahn/ignores` instead, one file per
-concern, and name the ones each group wants:
-
-```toml
-[defaults]
-ignore_files = ["common.gitignore"]
-
-[groups.work]
-ignore_files = ["Rust.gitignore", "~/dotfiles/node.gitignore"]
-```
-
-An entry is one of two things, decided by whether it looks like a path:
-
-- A bare file name is a file in `~/.autobahn/ignores`, named exactly.
-  Nothing is appended, and the directory is not searched for something
-  close, so `"Rust"` does not find `Rust.gitignore`.
-- Anything with a separator, or starting with `~`, is a path taken as
-  written; `~/` expands against the home directory.
-
-A relative path is refused. The supervisor runs under a login service,
-whose working directory is not the one the line was written in, so
-"relative to here" has no answer that stays right. The files themselves
-are gitignore syntax: comments, blank lines and all.
-
-Naming files, rather than loading whatever the directory holds, is
-deliberate. Ignore patterns are decided last-match-wins, so order *is*
-meaning: `!gradle-wrapper.jar` followed by `*.jar` is not the same list
-as the reverse. A directory scan would order them by whatever the
-filesystem returned, and dropping in a new file would silently change
-what the existing ones mean. A written list is an order someone chose and
-can see. Patterns apply widest first: the defaults' files, the defaults'
-own `ignores`, the group's files, then the group's own `ignores` — so a
-group can re-include something a shared file excluded.
-
-Combining files written independently has one failure the reader cannot
-see by looking at either file: a negation that can never take effect,
-because a later pattern ignores it again, or because its parent directory
-is ignored and scans never descend into one. Those are refused at
-startup, named individually. A line that cannot ever do anything is a
-mistake, not a preference.
-
-### The log
-
-The supervisor's log is the only account of a session that outlives the
-cycle it describes. A transient failure — staging not producing content,
-a connection dropping mid-frame — clears itself before anyone opens the
-status page, so the log is where the evidence has to be. Every line
-carries a local timestamp, and `log` sets how much is written:
-
-```toml
-log = "debug"     # quiet | normal (the default) | debug
-```
-
-`AUTOBAHN_LOG=debug` overrides the file for one run, and `watch --debug`
-does the same, so a level can be turned up while something is being
-chased without editing anything. An unknown level is refused at startup
-rather than ignored.
-
-`debug` adds what is needed to explain a cycle after it has gone: how
-long connecting took, how long each cycle took and what it moved, and —
-the one that matters when staging misbehaves — the path and content
-digest of anything that was asked for and did not arrive, and whether it
-was the same content as the cycle before. A cycle that changed nothing
-and finished promptly stays silent even here: at a five-second interval
-an idle session would otherwise write seventeen thousand lines a day
-saying so, and the log rotates on size, so debug would evict the very
-evidence it was turned on to collect.
-
-`clean --agents` extends that to the far side. Agents are installed per
-version at `~/.autobahn/bin/autobahn-<version>`, which is what lets a
-fleet upgrade itself host by host with no lockstep — but nothing has ever
-removed the old ones, so a host accumulates one binary (about 5 MB) for
-every version that has ever contacted it. `--agents` removes the
-superseded ones from every remote host the config names, keeping the
-version in use plus `--keep-agents` older ones (one by default) so an
-older controller reconnecting still finds its agent in place. It is off
-by default because everything else `clean` does is local, and this
-reaches out over SSH; a host that cannot be reached is reported and
-stepped over rather than failing the run.
-
-Each (alpha, beta) pair becomes its own session, and sessions are
-independent: a host being down just means its session retries with backoff
-and heals the moment the host answers — the others never notice. Sessions
-targeting the same host share one SSH connection.
-
-The config file is the source of truth. There is no separate registry of
-sessions to drift out of date: what the file says is what runs.
-
-### All the options
-
-| Key | Where | What it does |
-|---|---|---|
-| `alpha` | group | The source root: a local path, or `[user@]host:path`. |
-| `betas` | group | Destinations: local paths and/or remote specs. A remote beta with no path inherits the alpha's path. |
-| `mode` | both | Synchronization mode — see the table below. |
-| `ignores` | both | Gitignore-style patterns. Defaults' patterns apply first, then the group's. |
-| `interval` | both | Seconds between heartbeat cycles (watching makes this a fallback, not the reaction time). |
-| `symlink_mode` | both | `raw` (sync verbatim, default), `portable` (validate portability), or `ignore`. |
-| `file_mode` / `directory_mode` | both | Octal permissions for created files/directories (default `600`/`700`). |
-| `max_file_size` | both | Files larger than this (e.g. `"100MB"`, `"2GiB"`) stay on disk but are left out of syncing — never mistaken for deletions. |
-| `max_entry_count` | both | If a scan finds more entries than this, the cycle fails — a guard against pointing a session at the wrong directory. |
-| `staging` | both | Where in-flight content lives: `state` (default), `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
-| `default_owner` / `default_group` | both | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights. |
-| `durability` | both | `process` (default) or `power`. The default survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
-| `agent_command` | group | Advanced: reach remote endpoints through this command instead of SSH. |
-| `disabled` | top level | Host names to skip everywhere. A disabled beta host drops that beta; a disabled alpha host drops its whole group. |
-
-"Both" means the key works in `[defaults]` and per group, with the group
-winning. An endpoint spec is treated as remote unless it visibly looks like
-a local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
-
-### Which mode do I want?
-
-A mode is a direction and a policy. The direction is whether changes
-flow both ways or only from alpha to beta. The policy is what happens
-when the two sides disagree about a file: it is reported as a
-**conflict** and left alone, or **alpha** wins.
-
-| | conflict | alpha wins |
-|---|---|---|
-| **two-way** | `two-way-conflict` (default) | `two-way-alpha` |
-| **one-way** | `one-way-conflict` | `one-way-alpha` |
-
-| Mode | Reach for it when… |
-|---|---|
-| `two-way-conflict` | You edit on both sides and want nothing lost, ever. |
-| `two-way-alpha` | You edit on both sides but alpha is the truth when they collide. |
-| `one-way-conflict` | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
-| `one-way-alpha` | Backups, artifact distribution — beta should be *identical*. Also spelled `mirror`. |
-
-The modes differ only in six situations. Everything else — an
-unchanged file, a new file on alpha, a rename — behaves identically in
-all four. This is what each mode actually does, case by case:
-
-| | `two-way-conflict` | `two-way-alpha` | `one-way-conflict` | `one-way-alpha` |
-|---|---|---|---|---|
-| Alpha edits a file | → beta | → beta | → beta | → beta |
-| Beta edits a file | → alpha | → alpha | stays on beta, **reported as a conflict** | **overwritten** from alpha |
-| Both edit the same file | **conflict**; both sides keep their own | alpha's version wins, silently | **conflict**; both sides keep their own | alpha's version wins, silently |
-| Alpha deletes a file | → beta | → beta | → beta | → beta |
-| Beta creates a new file | kept | kept | kept | **deleted** |
-| Beta deletes a file | → alpha | → alpha | restored from alpha | restored from alpha |
-
-Three things in that table surprise people:
-
-**`one-way-conflict` is not "ignore beta".** It refuses to overwrite
-anything beta changed, and *tells you* — a file edited on beta is
-reported as a conflict every cycle until you resolve it. That is the
-mode's whole point: alpha pushes outward, but never destroys work that
-appeared on the far side. If you want beta's edits silently discarded,
-you want `one-way-alpha`.
-
-**`one-way-alpha` deletes files it has never seen.** Beta is made
-*identical* to alpha, so logs, caches, and anything else generated on
-beta are removed. Never point it at a directory the far side also
-writes to.
-
-**Deletions propagate in every mode**, including the one-way ones —
-deleting on alpha deletes on beta. What varies is only the reverse
-direction. (A deletion large enough to look like a vanished disk halts
-the session instead; see the safety rules.)
-
-The earlier spellings — `two-way-safe`, `two-way-resolved`,
-`one-way-safe`, `one-way-replica` — are still accepted, so existing
-configurations keep working.
-
-#### Modes and fan-out
-
-When one alpha fans out to several betas, each destination is its own
-session, and the mode decides what happens when two betas change the
-same file at once. Under `two-way-conflict`, whichever lands first reaches
-alpha and the other session reports a conflict — both edits survive,
-one needs a human. Under `two-way-alpha`, the second edit
-overwrites the first everywhere, silently, because "alpha wins" and
-alpha is now whatever arrived most recently. Neither is wrong, but the
-second only suits a fan-out you push *from* rather than edit at both
-ends.
-
-### Overlapping and nested roots
-
-Several sessions may share a root exactly. That is the fan-out, star,
-and relay shape above, and it is ordinary: those sessions share one
-watcher and one scan of the root, and each write is validated against
-the scan it was reconciled from.
-
-*Nesting* is different, and is refused when either endpoint is written:
-
-```
-sessions 'dist@/web/dist' and 'project@/backup/project': endpoint
-/srv/project/dist is nested inside /srv/project and at least one of
-them is written; two sessions cannot safely write one tree region from
-independent ancestors. Add it to the outer group's `ignores` if the
-outer session should leave that subtree alone
-```
-
-The reason is the ancestor. Two sessions writing one region each keep
-their own record of what was last agreed, so each reads the other's
-writes as user edits and propagates them back — indefinitely, with
-neither able to notice. Sharing a root exactly avoids this because the
-sessions share one observation of it; nesting gives them genuinely
-separate views, so it cannot.
-
-"Written" is the test, not the mode. An alpha is written only in the
-two-way modes; a beta is written in every mode. So two one-way sources
-reading overlapping trees are legal — nothing writes the shared region
-— while any nesting involving a destination, or a two-way source, is
-not.
-
-**Unless the outer session ignores the inner root.** Then they do not
-overlap at all: the outer never scans, records, or writes into that
-path. This is how you synchronize a project and ship its build output
-somewhere else:
-
-```toml
-[groups.project]
-alpha = "~/project"
-mode = "two-way-conflict"
-ignores = ["dist"]          # the outer session leaves it alone
-betas = ["build.example.com"]
-
-[groups.dist]
-alpha = "~/project/dist"    # nested, but excluded above
-mode = "one-way-alpha"
-betas = ["web.example.com:/srv/www"]
-```
-
-Both run side by side: the first destination receives the project
-without `dist`, the second receives `dist`. Remove the `ignores` line
-and the configuration is refused again.
-
-One thing an ignore does *not* protect against, and it is worth knowing
-before you arrange it this way: **deleting the directory above an
-ignored path takes the ignored path with it.** If `~/project` is
-deleted, `dist` goes too, and the inner session then finds its root
-missing. An ignore says which files synchronization carries, not which
-files exist, and a deletion is an instruction about the directory —
-obeying it halfway would leave a tree that is neither deleted nor
-synchronized and that nothing can ever clear.
-
-The inner session stops there rather than passing the loss on: a
-missing source root is an error, so `web.example.com` keeps its copy
-and waits for a person. That is the protection — not that the inner
-tree cannot be deleted, but that its deletion never travels.
-
-The check sees only one configuration load. Two autobahn processes with
-separate config files can still nest their endpoints, because neither
-can see the other — see the support boundaries.
-
-## One-off syncs and scripting
-
-Underneath the supervisor sits a single-session command, useful for
-trying a pairing before committing it to the config, and for scripts that
-need a sync that converges and *exits* with a status code:
-
-```sh
-# One bidirectional pass, then exit:
-autobahn sync ~/project /mnt/backup/project
-
-# Local ↔ remote over SSH:
-autobahn sync ~/project user@host:/srv/project
-
-# Keep watching, like a one-group `watch`:
-autobahn sync ~/project user@host:/srv/project --watch
-
-# Mirror exactly, ignoring build artifacts:
-autobahn sync ~/project host:/srv/project \
-    --watch --mode one-way-alpha --ignore target --ignore '*.log'
-```
-
-One-shots share session state with the supervisor (same roots → same
-session), so deletions propagate correctly across runs, conflicts are
-detected across runs, and interrupted transfers resume. A `sync` and a
-supervisor can never race the same pairing: each session's state is
-exclusively locked while it runs.
-
-## What's happening under the hood
-
-Every cycle: scan both sides (accelerated by a persisted cache — unchanged
-files are never re-read), reconcile the two scans three-way against the
-remembered ancestor, transfer only what's needed as rsync-style deltas,
-stage incoming content safely off to the side, verify its integrity, then
-swap it into place with atomic renames. A file being written mid-transfer
-is detected by digest and simply retried next cycle — partial content
-never lands.
-
-Autobahn adapts to each filesystem it touches, probing per root:
-executable bits are propagated around volumes that can't store them,
-names recompose to NFC on decomposing (HFS+-style) volumes, and
-case-insensitive volumes refuse case-colliding siblings instead of
-corrupting them.
-
-Everything autobahn keeps lives under one directory, `~/.autobahn`, on
-every machine it touches — configuration, per-session state, status
-records, installed agents, and staged content. Removing it is a full
-uninstall (aside from the binary itself).
-
-Remote hosts need nothing pre-installed. Connections invoke a versioned
-agent path (`~/.autobahn/bin/autobahn-<version>`); when it's missing —
-a fresh host, or your first connect after upgrading — the controller
-probes the platform, streams the matching agent into place over the same
-SSH connection, and retries. Upgrades therefore roll out host by host,
-automatically, on first contact.
-
-### Safety rules
-
-- Deleting or emptying a synchronization root **halts the session** rather
-  than propagating the deletion.
-- Transitions verify on-disk state against what was scanned before
-  replacing or removing anything; concurrent modifications become reported
-  problems, never data loss.
-- A corrupt ancestor is an error, not a silent reset (a reset would
-  resurrect deletions).
-- A missing *source* root is an error, not an empty source (a typo'd path
-  plus a mirroring mode must not empty the destination). This is also what
-  stops a deletion from travelling through a nested session whose root was
-  inside an ignored path.
-- Ignored content is never **overwritten** — "do not synchronize this"
-  cannot become "replace it with the peer's copy" — but it is removed
-  along with a directory that is deleted around it. Content that could not
-  be *read* blocks even that: nobody has seen what is there, so removing
-  the directory around it is not a decision anyone made.
+The [documentation index](docs/README.md) lists every page.
 
 ## Scope
 
-Unix only. The full test suite runs green on **Linux (x86-64 and
-arm64), macOS (Apple Silicon), and FreeBSD**; CI covers all four on
-demand. macOS is a first-class target, not a build target: its Unicode
-normalization, case-folding, and atomic-creation behaviors are
-implemented against the platform's own primitives and exercised on real
-APFS volumes. Windows would be a port rather than a build target.
-
-Transport is SSH (or any stdio subprocess) — no Docker, no daemon, no
-port forwarding.
-
-## Development
-
-```sh
-cargo test                    # unit + end-to-end suites (e2e spawns real agents)
-cargo clippy --all-targets
-scripts/mi                    # a guided tour of every command and state
-scripts/build-agents.sh       # cross-build the agents bundle
-gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
-```
-
-CI is manual rather than push-triggered: the repository is private, and
-macOS runner minutes bill at ten times the Linux rate.
-
-The correctness work — the invariants the design claims, the code that
-enforces each one, the tests that check it, and the residuals
-deliberately left open — is written down in `docs/correctness/`.
-`INVARIANTS.md` is the entry point, and was itself the subject of an
-independent adversarial review whose confirmed findings are fixed.
-
-Autobahn is a from-scratch Rust distillation of the architecture that
-emerged from a deep memory/performance overhaul of [Mutagen]'s
-synchronization engine: enum-based trees with name-sorted, copy-on-write
-shared children; scan metadata resident on the nodes themselves; linear-
-merge reconciliation; streaming transfers end to end. What required
-convention and adversarial review to keep safe in Go, the borrow checker
-and `Arc::make_mut` enforce structurally here.
-
-[Mutagen]: https://github.com/mutagen-io/mutagen
-
-## Support boundaries
-
-- **Local filesystems.** Synchronization roots are expected to live on
-  local filesystems (ext4, XFS, APFS, and the like). Network mounts —
-  NFS, SMB/CIFS, FUSE — are best-effort: client-side attribute caching
-  can hide another client's writes from both scanning and the checks
-  that guard destructive operations, change notification is absent or
-  incomplete, and lock semantics depend on the server. If a root must
-  live on a network mount, treat this client as the only writer.
-  autobahn prints a warning when it detects such a root.
-- **One owner per pair of trees.** Two sessions synchronizing the same
-  pair of roots are excluded per user on one machine, even across
-  different `--state-root`/`--state-dir` settings. *Sharing* one root
-  across sessions is fine and pinned by tests — fan-out, star and relay
-  topologies all work, because those sessions share one watcher and one
-  scan of that root. What is not supported is the same pair of trees
-  driven from *different machines*, different Unix users, or different
-  state roots: the exclusion lock is local to one of those, so nothing
-  detects the overlap and deliberate changes can be silently undone.
-- **Timestamp-preserving rewrites.** A tool that rewrites a file with
-  identical length while restoring its modification time (reproducible
-  builds, `touch -r`) defeats metadata-based change detection, as it
-  does in every synchronizer of this design. `autobahn verify` is the
-  escape hatch: the next cycle re-reads every byte, so such content
-  becomes visible and is synchronized normally.
-- **Live databases and other multi-file formats.** A SQLite database is
-  three interdependent files changing many times per second, and a
-  synchronizer captures them file by file. Syncing one *in one
-  direction* works — the copy lags while writes are in flight and
-  catches up within a cycle or two of them stopping — but a database
-  written on **both** sides produces a conflict that nothing can merge,
-  because two diverged databases cannot be reconciled as bytes. Keep
-  such files on one side (ignore them, or use a one-way mode), or
-  synchronize a snapshot (`sqlite3 app.db ".backup snap.db"`) rather
-  than the live file.
+Unix only: Linux (x86-64 and arm64), macOS (Apple Silicon), and FreeBSD,
+with macOS a first-class target rather than a build target. Transport is
+SSH — no Docker, no daemon, no port forwarding. Roots must live on local
+filesystems; network mounts are best-effort. The full list of what is
+and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).

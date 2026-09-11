@@ -25,7 +25,24 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp apps/macos/Info.plist "$APP/Contents/Info.plist"
 cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn"
-cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
+# The icon is compiled from Autobahn.icon by Xcode's own asset compiler,
+# exactly as Xcode would build it: Assets.car carries the full Icon
+# Composer rendering (light, dark and tinted, with the glass) that macOS
+# 26 draws, and Autobahn.icns is the flat fallback older systems use.
+# Without Xcode, the committed approximation stands in.
+if xcrun --find actool >/dev/null 2>&1; then
+    xcrun actool Autobahn.icon --compile "$APP/Contents/Resources" \
+          --app-icon Autobahn --platform macosx --minimum-deployment-target 11.0 \
+          --output-partial-info-plist "$(mktemp)" >/dev/null
+    ICON_NAME=Autobahn
+else
+    echo "no Xcode: using the approximated assets/autobahn.icns" >&2
+    cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
+    ICON_NAME=autobahn
+fi
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile $ICON_NAME" "$APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $ICON_NAME" "$APP/Contents/Info.plist" 2>/dev/null ||
+/usr/libexec/PlistBuddy -c "Set :CFBundleIconName $ICON_NAME" "$APP/Contents/Info.plist"
 # macOS tags a copied executable with com.apple.provenance, and codesign
 # refuses a bundle carrying one — with errSecInternalComponent, which
 # says nothing about attributes and sends you looking at the key instead.

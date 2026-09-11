@@ -1,9 +1,6 @@
 {
   "fill" : {
-    "linear-gradient" : [
-      "display-p3:0.54652,0.31756,0.65357,1.00000",
-      "display-p3:0.33350,0.00000,0.20002,1.00000"
-    ],
+    "automatic-gradient" : "extended-gray:0.00000,1.00000",
     "orientation" : {
       "start" : {
         "x" : 0.5,
@@ -19,15 +16,15 @@
     {
       "layers" : [
         {
-          "glass" : true,
+          "glass" : false,
           "hidden" : false,
           "image-name" : "Autobahn Transparent.png",
           "name" : "Autobahn Transparent",
           "position" : {
-            "scale" : 1,
+            "scale" : 0.6,
             "translation-in-points" : [
-              7,
-              69.578125
+              4.899999999999977,
+              0
             ]
           }
         }

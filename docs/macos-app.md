@@ -38,6 +38,28 @@ still mean everything twice.
 It is a view over `status --json`, polled every few seconds, and holds
 no state of its own. macOS and Linux (with a system tray).
 
+## The icon
+
+The app's icon is `Autobahn.icon`, an Icon Composer bundle at the root of
+the repository. Edit it in Icon Composer (it ships inside Xcode), and
+`build.sh` compiles it with Xcode's asset compiler, `actool`, exactly as
+Xcode would: the bundle gets `Assets.car`, carrying the light, dark and
+tinted variants macOS 26 draws, and `Autobahn.icns` as the flat fallback
+older systems use. Without Xcode, `build.sh` falls back to the committed
+`assets/autobahn.icns`.
+
+`scripts/build-icon.sh` regenerates the committed files from the bundle:
+`assets/autobahn.icns` and `assets/notification.png` — the icon every
+alert wears, embedded in the binary — both from `actool`, and
+`assets/autobahn.png`, the artwork at 1024 pixels. That last one comes
+from Icon Composer's exporter, `ictool`, and is full bleed: the squircle
+runs edge to edge, which suits a README or a website but is about a
+quarter larger than an app icon should be. Rerun the script after
+changing the bundle.
+
+The menu bar glyph is not this icon. It is the Autobahn sign, drawn in
+code in `src/tray.rs`; `assets/sign.svg` is the same shape at full size.
+
 ## Signing and notarising
 
 `release.sh` is the other half, and only for an app someone downloads:

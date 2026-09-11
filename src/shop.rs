@@ -1240,7 +1240,7 @@ fn help_page(width: usize) -> Vec<String> {
         String::new(),
         dim("  every session is a customer; what it is doing right now is their order."),
         String::new(),
-        format!("  \x1b[1mwhat an order is\x1b[0m"),
+        "  \x1b[1mwhat an order is\x1b[0m".to_owned(),
     ];
     let pairs: &[(&str, &str, &str)] = &[
         ("served", "\x1b[32m", "both sides agree; nothing to do"),
@@ -1496,7 +1496,7 @@ fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);

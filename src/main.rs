@@ -1578,6 +1578,9 @@ fn roll_up(paths: &[&String], depth: usize) -> Vec<(String, usize)> {
     grouped
 }
 
+/// A predicate over root-relative paths, chosen by `conflict_filter`.
+type PathFilter = Box<dyn Fn(&str) -> bool>;
+
 /// Builds the predicate behind `conflicts --filter`.
 ///
 /// Two behaviours, chosen by what the pattern looks like, because a
@@ -1587,7 +1590,7 @@ fn roll_up(paths: &[&String], depth: usize) -> Vec<(String, usize)> {
 /// the way the same pattern behaves in an ignore file; one with a slash is
 /// anchored to the root, since that is what writing the separator asks
 /// for.
-fn conflict_filter(pattern: &str) -> Result<Box<dyn Fn(&str) -> bool>> {
+fn conflict_filter(pattern: &str) -> Result<PathFilter> {
     if !pattern.contains(['*', '?', '[', '{']) {
         let needle = pattern.to_lowercase();
         return Ok(Box::new(move |path: &str| {
@@ -1822,6 +1825,7 @@ fn free_name(root: Option<&autobahn::tree::Node>, path: &str, side: &str) -> Str
     unreachable!("the counter is unbounded")
 }
 
+#[allow(clippy::too_many_arguments)] // one parameter per command-line flag
 fn run_resolve(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
@@ -2946,7 +2950,7 @@ fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);

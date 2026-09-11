@@ -366,6 +366,7 @@ struct Scanner<'a> {
 
 impl<'a> Scanner<'a> {
     /// Creates a scanner applying the specified ignore set.
+    #[allow(clippy::too_many_arguments)] // a scan is configured, not builder-shaped
     fn new(
         ignores: &'a IgnoreSet,
         behavior: &'a FilesystemBehavior,

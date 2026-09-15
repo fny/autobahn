@@ -18,13 +18,21 @@ The Autobahn sign — two lanes to the horizon under a bridge — drawn in
 the menu bar's own ink, black or white, with the state of every session
 in a dot at its corner: green when all are synchronized, amber when any
 is in conflict, red when any is halted or unreachable. When nothing is
-running the sign fades and the dot is gone. It follows the system
-appearance, so a switch between light and dark redraws it on the next
-poll. And a menu with the detail:
+running the sign is struck through — the mark a wifi icon uses for *off*
+— and the dot is gone. Its ink is the menu bar's
+own, read from the status item's button — which matters on macOS 26,
+where the menu bar picks black or white from the wallpaper behind it, so
+a light system over a dark wallpaper still has a white menu bar. When the
+bar's ink changes, the sign follows on the next poll. And a menu with the detail:
 each group, each destination with its state, and under each conflict the
 ways to settle it (show the diff; keep alpha's, keep that destination's,
 keep both), which run the same `resolve` a terminal would. The menu also
 starts, stops, and restarts the login service and opens its log.
+
+Choices are queued, not run where you click. They go to a worker thread
+and run in the order you made them, and the menu says how many are
+waiting. So a second choice made while the first is still running is
+kept rather than lost, and a slow resolve cannot freeze the menu bar.
 
 When no `on_alert` hook is configured, the tray raises desktop
 notifications itself, under exactly the rules the hook would use — a

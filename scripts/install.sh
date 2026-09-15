@@ -3,7 +3,7 @@
 # Installs autobahn and the agent bundle it uses to bootstrap remote
 # hosts.
 #
-#   curl -fsSL https://raw.githubusercontent.com/fny/autobahn/master/scripts/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
 #
 # or, having cloned the repository:
 #

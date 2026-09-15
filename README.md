@@ -1,6 +1,8 @@
 # Autobahn <picture><source media="(prefers-color-scheme: dark)" srcset="assets/sign-white.svg"><img src="assets/sign.svg" alt="" height="32"></picture>
 
-*Real-time sync with unmatched speed and German safety standards.*
+*Subsecond sync with German precision.*
+
+Sold? Jump to [Getting Started](#getting-started).
 
 ## What
 
@@ -8,54 +10,62 @@ Autobahn keeps directories in sync across machines in fractions of a second.
 
 ```toml
 # ~/.autobahn/config.toml
-[groups.formel1]
-alpha = "~/golfwagen"
+[defaults]
+mode = "two-way-conflict"
+
+[groups.formula1]
+alpha = "~/Designs" # pick a folder
 betas = [
-  "audi.de",
-  "mercedes-benz.de",
-  "porsche.de",
-  "man.eu",
+  "ubuntu@audi.de:~/Workspace/Designs", # Specify as much as you want
+  "ec2-user@mercedes-benz.de",
+  "porsche.de"
+]
+
+[groups.vibe]
+mode = "two-way-alpha" # alpha wins on conflicts
+alpha = "~/vibecoding"
+betas = [
+  # Specify the targets (from ssh config)
+  "ubuntu@audi.de:~/Workspace/Designs",
+  "ec2-user@mercedes-benz.de",
+  "porsche.de"
 ]
 ```
 
 ```sh
-autobahn watch
+autobahn watch # watch once
+autobahn install # or run as a service
 ```
 
 ## Motivation
 
- - I don't like running agents on my computer.
- - I have a several VMs where my agents have free reign to `rm -rf`
- - I want to see edits live on my machine.
- - I want my agents to see edits live on their machines.
- - I want to use tools on my machine to interact with my code.
+ - I don't like running agents on my computer
+ - I want to edit files along side them
+ - I want to use local tools to interact the files
 
-Enter [Mutagen](https://github.com/mutagen-io/mutagen) which promised snappy file sync. Aside from the clunky UX, it scaled well to tens of thousands of files but at hundreds of thousands of files, RAM began to explode.
+Enter [Mutagen](https://github.com/mutagen-io/mutagen) which promised snappy file sync for small files. Aside from the clunky UX, it scaled decently to tens of thousands of files, but at hundreds of thousands of files, RAM began to baloon to gigs.
 
-## Why autobahn?
+Hence Autobahn was born.
 
-- **Fast.** A changed file lands on the other side in about 50 ms on a
+## Why Autobahn?
+
+- **Fast** A changed file lands on the other side in about 50 ms on a
   40,000-file tree, and in under 200 ms on a half-million-file Chromium
-  checkout. Transfers send only deltas, LZ4-compressed.
-- **Light.** 33 MB for a 40,000-file tree and 249 MB for Chromium. Idle,
-  it uses 0.2% of a core. There is no background daemon.
-- **Zero remote setup.** Nothing to install on the far side — autobahn
-  streams its own agent over the same SSH connection on first contact,
-  and upgrades roll out host by host the same way.
-- **Safe by default.** Three-way reconciliation against a remembered
-  baseline means autobahn knows the difference between "you deleted this
-  file" and "this file never existed here" — so it never propagates a
-  deletion it can't justify, refuses to overwrite files that changed
-  mid-sync, and halts entirely if a whole sync root disappears.
-  [How errors are prevented](docs/safety.md).
-- **Honest about conflicts.** If both sides changed the same file, the
-  default mode reports the conflict and touches nothing.
+  checkout. Not too shabby.
+- **Light** 33 MB for a 40,000-file tree and 249 MB for Chromium. Idle,
+  it uses 0.2% of a core.
+- **Zero remote setup.** Autobahn streams its own sync agent over SSH
+  on first contact, and upgrades roll out the same way.
+- **Safe.** Autobahn performs three-way reconciliation against a remembered
+  baseline. "You deleted this file" never conflicts with "this file never
+  existed here." You can even calibrate your risk tolerance with different
+  sync modes. [How errors are prevented](docs/safety.md).
+- **User friendly.** We have a TUI and a tray item that works on most
+  operating systems.
 
-## The numbers
+## Benchmarks
 
-Against mutagen, on matched pairs of AWS machines — fifteen cells, ten
-repeats each, about 440,000 latency samples:
-
+<!-- Todo update this if posbile-->
 | | autobahn | mutagen | |
 |---|---|---|---|
 | Propagate one edit, Chromium (505k files) | **188 ms** | 7,118 ms | 37.8× |
@@ -72,17 +82,42 @@ These figures were measured at 0.3.0. What has moved since, and why, is in
 [Benchmarks](docs/benchmarks.md); [Why mutagen is slower](docs/mutagen.md)
 traces each gap to mutagen's code.
 
-## Installing
+## Getting Started
+
+First run
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fny/autobahn/master/scripts/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
 ```
 
-That installs the command onto your `PATH` and the agent bundle into
-`~/.autobahn/agents`, which is where the controller looks when it needs
-to bootstrap a host whose platform differs from your own. `--prefix`
-chooses where the command goes, `--no-agents` skips the bundle, and
-`--version` pins a release.
+Then run `autobahn init` to create an `~/.autobahn/config.toml` example and modify it. For details on configuration options, see [Configuration](docs/configuration.md).
+
+For installation customizations like home directory and more see [Custom Installation](#custom-installation).
+
+## AI Warning
+
+With great vibe coding comes great responsibilitiy. I have:
+
+ - Scanned all the code in this repo
+ - Run extensive soak testing
+ - Used Autobahn on my own for weeks
+ - Had guardrail-free models do cybersecurity scans
+ - Run Autobahn successfully through thousands of benchmarks
+
+Most of the internal documentation is written by LLMs. I've audited and edited alsmost all of it
+
+## Custom Installation
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
+```
+
+ - Installs `autobahn` to your `PATH`
+ - Copies the agent bundle into `~/.autobahn/agents`, which is where the controller looks when it needs
+to bootstrap a host whose platform differs from your own.
+ - `--prefix` chooses where the command goes
+ - `--no-agents` skips the agent bundle (generally a bad idea)
+ - `--version` pins a release.
 
 `AUTOBAHN_PREFIX` and `AUTOBAHN_HOME` set the same two destinations
 from the environment, for a non-interactive install.
@@ -166,11 +201,11 @@ That's the whole setup. Everything else is in the documentation.
 - [Modes](docs/modes.md) — the four sync modes, case by case, and which to pick
 - [Ignores](docs/ignores.md) — patterns, ignore files, negations
 - [Alerts](docs/alerts.md) — the one hook, and when it fires
-- [Commands](docs/commands.md) — `status`, `sync`, `flush`, `reset`, `verify`, and one-off syncs
-- [Conflicts](docs/conflicts.md) — `issues`, `conflicts`, `diff`, `resolve`
-- [The shop](docs/shop.md) — `autobahn mi`
-- [The menu bar app](docs/macos-app.md) — `Autobahn.app`
-- [The log](docs/logging.md) — levels and what `debug` adds
+- [Commands](docs/commands.md)
+- [Conflicts](docs/conflicts.md)
+- [TUI](docs/shop.md) — `autobahn mi`
+- [Menu bar app](docs/macos-app.md) — `Autobahn.app`
+- [Loging](docs/logging.md) — levels and what `debug` adds
 - [State](docs/state.md) — `~/.autobahn`, `clean`, agents
 
 **Understanding it**
@@ -197,6 +232,5 @@ The [documentation index](docs/README.md) lists every page.
 
 Unix only: Linux (x86-64 and arm64), macOS (Apple Silicon), and FreeBSD,
 with macOS a first-class target rather than a build target. Transport is
-SSH — no Docker, no daemon, no port forwarding. Roots must live on local
-filesystems; network mounts are best-effort. The full list of what is
+SSH. Roots must live on local filesystems: network mounts are best-effort. The full list of what is
 and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).

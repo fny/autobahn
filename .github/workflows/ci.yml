@@ -1,4 +1,4 @@
-# CI on every push to master and every pull request — except changes that
+# CI on every push to main and every pull request — except changes that
 # cannot affect a build or its tests: prose, the docs, benchmark reports,
 # README artwork, and the release workflow (which only runs on tags, and is
 # not something this workflow could exercise). Also runnable by hand:
@@ -17,7 +17,7 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
     paths-ignore:
       - '**.md'
       - 'docs/**'

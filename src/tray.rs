@@ -924,8 +924,8 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
     };
 
     // The two lanes, as quadrilaterals, and the bridge with its gap.
-    let left = [(2.5, 20.0), (8.0, 20.0), (10.2, 3.0), (8.9, 3.0)];
-    let right = [(14.0, 20.0), (19.5, 20.0), (13.1, 3.0), (11.8, 3.0)];
+    let left = [(2.5, 19.5), (8.0, 19.5), (10.2, 2.5), (8.9, 2.5)];
+    let right = [(14.0, 19.5), (19.5, 19.5), (13.1, 2.5), (11.8, 2.5)];
     let inside = |polygon: &[(f32, f32); 4], x: f32, y: f32| -> bool {
         // Even-odd crossing test.
         let mut hit = false;
@@ -941,14 +941,14 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
         hit
     };
     let in_sign = |x: f32, y: f32| -> bool {
-        let bridge = (1.5..=20.5).contains(&x) && (9.9..=12.1).contains(&y);
-        let gap = (1.5..=20.5).contains(&x) && (12.1..13.2).contains(&y);
+        let bridge = (1.5..=20.5).contains(&x) && (9.4..=11.6).contains(&y);
+        let gap = (1.5..=20.5).contains(&x) && (11.6..12.7).contains(&y);
         if gap {
             return false;
         }
         bridge || inside(&left, x, y) || inside(&right, x, y)
     };
-    let (dot_x, dot_y, dot_r, ring_r) = (17.0f32, 17.2f32, 3.0f32, 4.3f32);
+    let (dot_x, dot_y, dot_r, ring_r) = (17.0f32, 16.7f32, 3.0f32, 4.3f32);
 
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for py in 0..SIZE {
@@ -1050,7 +1050,7 @@ mod icon_tests {
                     _ => assert_eq!(bridge[3], 255, "{name}: solid"),
                 }
                 // The gap under the bridge is transparent where a lane runs.
-                let gap = at(9, 20);
+                let gap = at(9, 19);
                 assert_eq!(
                     gap[3], 0,
                     "{name}: the gap under the bridge is clear, got {:?}",

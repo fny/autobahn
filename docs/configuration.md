@@ -4,6 +4,10 @@ Everything autobahn does is described in one file, `~/.autobahn/config.toml`.
 There is no separate registry of sessions to drift out of date: what the
 file says is what runs.
 
+`autobahn init` writes that file for you: the defaults, every mode
+explained in a comment, and one example group to edit. The rest of this
+page is every key it can hold.
+
 ## The shape
 
 Each **group** fans one source root (the *alpha*) out to any number of

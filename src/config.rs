@@ -33,6 +33,67 @@
 //! an explicit path inherits the group's alpha path *as written* (so a
 //! home-relative alpha resolves against each remote host's own home).
 
+/// A starting configuration, written by `autobahn init`.
+///
+/// It lives here, beside the schema it has to satisfy, so the test below
+/// can hold it to that schema: a template that does not load would be a
+/// poor way to meet the tool. The example group is commented out, so a
+/// fresh install describes no sessions and starts nothing until someone
+/// means it to.
+pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
+# Written by `autobahn init`. Every key is explained in docs/configuration.md.
+#
+# An unknown key is refused when autobahn starts, rather than ignored, so a
+# typo here tells you instead of quietly doing nothing.
+
+# Run when a session needs a person: a conflict, a halt, a host that has
+# been away a while. It is the only hook — which state it is in is in the
+# message, not in which hook runs. Uncomment it and make it something your
+# desktop shows.
+# on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\" -execute \"$AUTOBAHN_OPEN\""
+
+# How much the supervisor writes to its log: quiet, normal, or debug.
+# Every line carries a timestamp whichever you pick.
+# log = "normal"
+
+[defaults]
+# Inherited by every group below. Any group can override any of it.
+
+# The mode is a direction, and what happens when both sides changed one
+# file. There is no default: direction is never guessed.
+#
+#   two-way-conflict   both ways; a clash is reported and nothing is touched
+#   two-way-alpha      both ways; alpha's version wins a clash, silently
+#   one-way-conflict   alpha to beta; an edit on beta is reported, not overwritten
+#   one-way-alpha      alpha to beta; beta is made identical (also spelled "mirror")
+mode = "two-way-conflict"
+
+# Applied everywhere, in gitignore syntax: a bare name matches at any
+# depth, a leading "/" anchors to the root of the group, "!" puts something
+# back, and the last pattern that matches decides.
+ignores = [".git", ".DS_Store", "node_modules", "target"]
+
+# Seconds between heartbeat cycles. Both sides also watch the filesystem,
+# so this is the fallback, not how fast a change travels.
+interval = 5
+
+# A group sends one source folder (the alpha) to any number of
+# destinations (the betas). Each pair is its own session, and one failing
+# never stops the others.
+#
+# This example is commented out, so a fresh install starts nothing. Edit
+# the paths, uncomment it, and run `autobahn watch`.
+#
+# [groups.project]
+# alpha = "~/project"
+# betas = [
+#   "build.example.com",                 # uses the alpha's path on that host
+#   "user@lab.example.com:/srv/project", # or name a path
+#   "/mnt/backup/project",               # a local path works too
+# ]
+# ignores = ["dist", "*.log"]            # added to the defaults' ignores
+"##;
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1193,6 +1254,41 @@ fn host_of(destination: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The template `autobahn init` writes has to satisfy the schema in
+    /// this file, and say only true things about it.
+    #[test]
+    fn the_starting_template_loads_and_describes_nothing() {
+        let config = parse(TEMPLATE);
+        assert_eq!(config.defaults.mode.as_deref(), Some("two-way-conflict"));
+        assert!(config
+            .defaults
+            .ignores
+            .iter()
+            .any(|pattern| pattern == ".git"));
+        assert_eq!(
+            config.plans().expect("the template plans").len(),
+            0,
+            "the example group is commented out, so a fresh install starts nothing"
+        );
+    }
+
+    /// Every mode the template's comment names is a mode the parser takes.
+    /// A comment is documentation that cannot be compiled, so this compiles
+    /// it: renaming a mode without touching the template turns this red.
+    #[test]
+    fn the_template_names_only_real_modes() {
+        let named: Vec<&str> = TEMPLATE
+            .lines()
+            .filter_map(|line| line.strip_prefix("#   "))
+            .filter_map(|line| line.split_whitespace().next())
+            .filter(|word| word.contains("-way-"))
+            .collect();
+        assert_eq!(named.len(), 4, "four modes are described: {named:?}");
+        for mode in named {
+            parse_mode(mode).unwrap_or_else(|error| panic!("{mode}: {error}"));
+        }
+    }
 
     fn parse(text: &str) -> Config {
         toml::from_str(text).expect("configuration should parse")

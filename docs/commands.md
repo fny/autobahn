@@ -1,5 +1,20 @@
 # Commands
 
+Writing a configuration to start from:
+
+```sh
+autobahn init                     # write ~/.autobahn/config.toml
+autobahn init --config ./try.toml # ...or somewhere else
+autobahn init --force             # replace one, keeping the old beside it
+```
+
+It writes the defaults, every mode explained in a comment, and one
+example group that is commented out — so a fresh install describes
+nothing and starts nothing until you have edited it and meant it. It
+refuses to replace a configuration that already exists unless you pass
+`--force`, which keeps the previous file as `config.toml.bak`. Whatever
+it writes, it reads back before it reports success.
+
 Asking a running supervisor things, whether it is `watch` or the login
 service:
 

@@ -429,6 +429,16 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Write a starting configuration: the defaults, every mode explained,
+    /// and one example group to edit. Refuses to replace one that exists.
+    Init {
+        /// Where to write it (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Replace an existing configuration, keeping the old one beside it.
+        #[arg(long)]
+        force: bool,
+    },
     /// Run as a synchronization agent on standard input/output (invoked on
     /// remote hosts by the sync command; not intended for interactive use).
     Agent,
@@ -572,6 +582,7 @@ fn main() {
         Command::Tray { .. } => Err(anyhow::anyhow!(
             "this build has no menu bar app; build one with `cargo build --release --features tray`"
         )),
+        Command::Init { config, force } => run_init(config, force),
         Command::Clean {
             config,
             state_root,
@@ -2268,6 +2279,60 @@ fn run_resolve(
 /// A session that is *running* holds its lock, and a lock that cannot be
 /// acquired means the state behind it is in use; such state is skipped and
 /// reported rather than removed from under a live process.
+/// Writes a starting configuration, and proves it loads before saying so.
+///
+/// A template that did not load would be a poor introduction to a tool
+/// whose whole point is that the file is the source of truth — so this
+/// reads back what it wrote rather than trusting it.
+fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
+    let path = match config {
+        Some(path) => path,
+        None => paths::default_config_path()?,
+    };
+    if path.exists() {
+        if !force {
+            bail!(
+                "{} already exists. `--force` replaces it, keeping the old one beside it",
+                path.display()
+            );
+        }
+        let previous = path.with_extension("toml.bak");
+        std::fs::copy(&path, &previous).with_context(|| {
+            format!(
+                "unable to keep {} at {}",
+                path.display(),
+                previous.display()
+            )
+        })?;
+        println!("kept the previous configuration at {}", previous.display());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+    }
+    // Written beside and renamed, so an interrupted write never leaves a
+    // half-written configuration where a whole one used to be.
+    let temporary = path.with_extension("toml.new");
+    std::fs::write(&temporary, autobahn::config::TEMPLATE)
+        .with_context(|| format!("unable to write {}", temporary.display()))?;
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("unable to move {} into place", temporary.display()))?;
+
+    let sessions = autobahn::config::Config::load(&path)
+        .and_then(|config| config.plans())
+        .with_context(|| {
+            format!(
+                "the configuration just written at {} does not load",
+                path.display()
+            )
+        })?
+        .len();
+    println!("wrote {}", path.display());
+    println!("  it describes {sessions} session(s): edit the example group to add one");
+    println!("  then `autobahn watch`, or `autobahn install` to run it as a login service");
+    Ok(())
+}
+
 fn run_clean(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,

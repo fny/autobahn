@@ -897,7 +897,10 @@ impl Config {
         // anything else is documented as unsupported.
         let writable = |plan: &SessionPlan, alpha: bool| -> bool {
             if alpha {
-                matches!(plan.mode, SyncMode::TwoWaySafe | SyncMode::TwoWayResolved)
+                matches!(
+                    plan.mode,
+                    SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved
+                )
             } else {
                 true
             }
@@ -1105,14 +1108,17 @@ pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
     // existing configurations keep working.
     match mode {
         "two-way-conflict" | "two-way-safe" => Ok(SyncMode::TwoWaySafe),
+        // Off the grid: two-way-conflict that also refuses to trust a
+        // large directory going empty or missing on one side.
+        "two-way-paranoid" => Ok(SyncMode::TwoWayParanoid),
         "two-way-alpha" | "two-way-resolved" => Ok(SyncMode::TwoWayResolved),
         "one-way-conflict" | "one-way-safe" => Ok(SyncMode::OneWaySafe),
         // "mirror" is what everyone calls this shape (rsync --delete), so
         // it is accepted too.
         "one-way-alpha" | "one-way-replica" | "mirror" => Ok(SyncMode::OneWayReplica),
         other => Err(format!(
-            "unknown mode '{other}' (expected one of: two-way-conflict, two-way-alpha, \
-             one-way-conflict, one-way-alpha)"
+            "unknown mode '{other}' (expected one of: two-way-conflict, two-way-paranoid, \
+             two-way-alpha, one-way-conflict, one-way-alpha)"
         )),
     }
 }
@@ -1121,6 +1127,7 @@ pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
 pub fn mode_name(mode: SyncMode) -> &'static str {
     match mode {
         SyncMode::TwoWaySafe => "two-way-conflict",
+        SyncMode::TwoWayParanoid => "two-way-paranoid",
         SyncMode::TwoWayResolved => "two-way-alpha",
         SyncMode::OneWaySafe => "one-way-conflict",
         SyncMode::OneWayReplica => "one-way-alpha",

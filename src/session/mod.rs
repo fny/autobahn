@@ -39,22 +39,6 @@ pub enum SafetyHalt {
     /// one side.
     #[error("halted: one side's synchronization root was emptied; propagate the deletion manually or restore the content, then run again")]
     RootEmptied,
-    /// A directory below the root is present on both sides but empty on
-    /// one, where the ancestor records a substantial tree — the signature
-    /// of a filesystem that went away and left its mountpoint behind.
-    #[error(
-        "halted: {path} is empty on {side} but holds {entries} entries on the other side. \
-         A mounted filesystem there is probably not mounted — check before doing anything. \
-         If the emptying was deliberate, empty the other side too and it will resume"
-    )]
-    SubtreeEmptied {
-        /// The directory's root-relative path.
-        path: String,
-        /// The side it is empty on.
-        side: &'static str,
-        /// How many entries the ancestor records beneath it.
-        entries: usize,
-    },
 }
 
 /// A report of one synchronization cycle.
@@ -484,13 +468,6 @@ impl Session {
             beta_root.as_ref(),
             self.mode,
         );
-        if let Some(emptied) = &reconciliation.emptied_subtree {
-            bail!(SafetyHalt::SubtreeEmptied {
-                path: emptied.path.clone(),
-                side: emptied.side,
-                entries: emptied.entries,
-            });
-        }
         report.conflicts = reconciliation.conflicts;
 
         // Safety: refuse to propagate a root deletion.
@@ -828,8 +805,8 @@ fn stage(
 /// Detects the emptied-root condition at the root itself: the ancestor was
 /// non-trivial, and exactly one side now presents an absent or childless
 /// root while the other retains content. Emptied directories *below* the
-/// root are detected by reconciliation during the walk it already performs
-/// (`Reconciliation::emptied_subtree`); a separate whole-tree pass here
+/// root are reconciliation's concern, and only in the paranoid mode (see
+/// `tree::reconcile::PARANOID_MINIMUM`); a separate whole-tree pass here
 /// measured at twenty milliseconds per cycle on a sixty-thousand-entry
 /// tree, dominating the latency of every edit. The ancestor count — the
 /// only expensive part — runs lazily, only when the rare one-side-empty
@@ -1091,85 +1068,6 @@ mod tests {
             Some(&empty),
             Some(&trivial)
         ));
-    }
-
-    /// Emptied directories *below* the root are reconciliation's to spot,
-    /// during the walk it already performs.
-    #[test]
-    fn emptied_subtree_detection_rides_reconciliation() {
-        let big_data =
-            |n: u8| Node::directory("data", (1..=n).map(|i| file(&format!("f{i}"), i)).collect());
-        let with_mount = Node::directory("", vec![file("readme", 9), big_data(9)]);
-        let mount_emptied =
-            Node::directory("", vec![file("readme", 9), Node::directory("data", vec![])]);
-        // A vanished mount: data/ exists but is empty on one side only.
-        let result = crate::tree::reconcile(
-            Some(&with_mount),
-            Some(&mount_emptied),
-            Some(&with_mount),
-            SyncMode::TwoWaySafe,
-        );
-        let emptied = result.emptied_subtree.expect("an emptied mount halts");
-        assert_eq!(emptied.path, "data");
-        assert_eq!(emptied.side, "alpha", "the side it is empty on is named");
-        assert_eq!(emptied.entries, 9, "and how much the ancestor recorded");
-
-        // A directory that vanished *entirely* is a different signature
-        // with a different cause, and it propagates.
-        //
-        // A mountpoint belongs to the parent filesystem, so a filesystem
-        // going away leaves the directory behind, empty — the case above.
-        // A directory that is gone was removed by someone, and removing a
-        // directory is something people do. Guarding this shape too was
-        // tried, and it cost a halt on every deliberate deletion to catch
-        // the minority of mountpoints that are removed on eject.
-        let mount_deleted = Node::directory("", vec![file("readme", 9)]);
-        let result = crate::tree::reconcile(
-            Some(&with_mount),
-            Some(&mount_deleted),
-            Some(&with_mount),
-            SyncMode::TwoWaySafe,
-        );
-        assert!(
-            result.emptied_subtree.is_none(),
-            "a deleted directory propagates rather than halting"
-        );
-        assert!(
-            !result.beta_transitions.is_empty(),
-            "and the deletion actually reaches the other side"
-        );
-
-        // A small directory's outright deletion still propagates without
-        // ceremony.
-        let with_small_data = Node::directory("", vec![file("readme", 9), big_data(3)]);
-        let small_deleted = Node::directory("", vec![file("readme", 9)]);
-        let result = crate::tree::reconcile(
-            Some(&with_small_data),
-            Some(&small_deleted),
-            Some(&with_small_data),
-            SyncMode::TwoWaySafe,
-        );
-        assert!(result.emptied_subtree.is_none());
-
-        // Small directories may be emptied without ceremony.
-        let with_small = Node::directory(
-            "",
-            vec![
-                file("readme", 9),
-                Node::directory("queue", vec![file("job", 1), file("job2", 2)]),
-            ],
-        );
-        let small_emptied = Node::directory(
-            "",
-            vec![file("readme", 9), Node::directory("queue", vec![])],
-        );
-        let result = crate::tree::reconcile(
-            Some(&with_small),
-            Some(&small_emptied),
-            Some(&with_small),
-            SyncMode::TwoWaySafe,
-        );
-        assert!(result.emptied_subtree.is_none());
     }
 
     /// `clean` decides which lock directories are live by recomputing their

@@ -270,16 +270,21 @@ and lease validation, not on mutual exclusion.
 when the ancestor proves the other side already had it; two-sided
 divergence is a conflict, left unresolved; a proposed deletion and a
 proposed modification of the same path re-propagates the content. Mass
-disappearance is halted, not propagated: a root or large subtree
-(eight or more ancestor entries) that is empty — or absent entirely,
-a removed mountpoint's signature (finding I7-A closed that form) — on
-exactly one side halts the session rather than deleting the other
-side.
+disappearance of a *root* is halted, not propagated: a root that is
+empty or absent on exactly one side halts the session rather than
+deleting the other side. Below the root, the same shape — a directory
+of eight or more ancestor entries emptied on one side — is deletions
+and propagates in every mode but `two-way-paranoid`, where it is a
+conflict at the directory, and where a large directory gone on one
+side against an untouched other side is restored. (It was a halt in
+every mode until the guard fired on `git gc` packing loose refs; the
+tree alone cannot tell a vanished mount from a tool's cleanup, so the
+choice is now the mode's.)
 
-**Enforced by**: `src/tree/reconcile.rs` (the safe-mode rules;
-`Reconciliation::emptied_subtree` riding the descend path;
-`EMPTIED_SUBTREE_MINIMUM`), `src/session/mod.rs`
-(`one_side_emptied_root`, the root-deletion refusal, `SafetyHalt`).
+**Enforced by**: `src/tree/reconcile.rs` (the safe-mode rules; the
+paranoid guard and restore rule, `PARANOID_MINIMUM`),
+`src/session/mod.rs` (`one_side_emptied_root`, the root-deletion
+refusal, `SafetyHalt`).
 
 **Checked by**: the reconcile property suite
 (`conflict_free_reconciliation_converges`, `agreement_emits_nothing`,
@@ -291,7 +296,9 @@ side.
 `one_way_modes_never_touch_alpha`,
 `content_leaving_tracked_scope_never_reads_as_deletion`,
 `emptied_root_detection`,
-`emptied_subtree_detection_rides_reconciliation`.
+`paranoid_treats_an_emptied_large_directory_as_a_conflict`,
+`paranoid_restores_a_large_directory_gone_from_one_side`,
+`paranoid_lets_the_emptying_side_win_once_the_full_copy_is_retired`.
 
 **Boundary.** A vanished mount holding fewer than eight entries — one
 huge file — evades the count guard: RETAINED.md §1. The guard also

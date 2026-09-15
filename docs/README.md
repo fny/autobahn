@@ -9,7 +9,7 @@ autobahn is, how to install it, and the minimum to get a group syncing.
 | page | what it covers |
 |---|---|
 | [Configuration](./configuration.md) | every key in `~/.autobahn/config.toml`, where it lives, what it defaults to |
-| [Modes](./modes.md) | the four sync modes, what each does case by case, and which to pick |
+| [Modes](./modes.md) | the sync modes, what each does case by case, and which to pick |
 | [Ignores](./ignores.md) | pattern semantics, ignore files, negations, and what "ignored" does not protect |
 | [Alerts](./alerts.md) | the one hook, what it receives, and the rules for when it fires |
 | [Commands](./commands.md) | asking a running supervisor things; what the state words mean; one-off syncs |

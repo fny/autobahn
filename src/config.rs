@@ -63,6 +63,8 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 # file. There is no default: direction is never guessed.
 #
 #   two-way-conflict   both ways; a clash is reported and nothing is touched
+#   two-way-paranoid   as above, and a large directory that turns up empty
+#                      on one side is a conflict, not a deletion to copy
 #   two-way-alpha      both ways; alpha's version wins a clash, silently
 #   one-way-conflict   alpha to beta; an edit on beta is reported, not overwritten
 #   one-way-alpha      alpha to beta; beta is made identical (also spelled "mirror")
@@ -1280,18 +1282,30 @@ mod tests {
         );
     }
 
-    /// Every mode the template's comment names is a mode the parser takes.
+    /// The template's comment names every mode, and only real ones.
+    ///
     /// A comment is documentation that cannot be compiled, so this compiles
-    /// it: renaming a mode without touching the template turns this red.
+    /// it. The expected list is taken from the parser's own error rather
+    /// than written here as a count: a mode added without a line in the
+    /// template then fails this test instead of quietly making the file lie,
+    /// which is exactly how `two-way-paranoid` was first missed.
     #[test]
-    fn the_template_names_only_real_modes() {
+    fn the_template_names_every_mode() {
         let named: Vec<&str> = TEMPLATE
             .lines()
             .filter_map(|line| line.strip_prefix("#   "))
             .filter_map(|line| line.split_whitespace().next())
             .filter(|word| word.contains("-way-"))
             .collect();
-        assert_eq!(named.len(), 4, "four modes are described: {named:?}");
+        let advertised = parse_mode("not-a-mode").expect_err("an unknown mode is refused");
+        let canonical: Vec<&str> = advertised
+            .split(['(', ')', ':', ',', ' ', '\'', '\n'])
+            .filter(|word| word.contains("-way-"))
+            .collect();
+        assert_eq!(
+            named, canonical,
+            "the template must name every mode the parser accepts, in its order"
+        );
         for mode in named {
             parse_mode(mode).unwrap_or_else(|error| panic!("{mode}: {error}"));
         }

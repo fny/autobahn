@@ -30,6 +30,8 @@ use winit::event_loop::{ControlFlow, EventLoop, EventLoopProxy};
 enum Wake {
     Tick,
     Menu(muda::MenuId),
+    /// A queued action finished, so the menu and the icon are stale.
+    Done,
 }
 
 use crate::config::SessionPlan;
@@ -156,14 +158,46 @@ fn run_loop(
             .or_else(|_| crate::config::Config::default().alert_plan())?
     };
     let hook_configured = plan.on_alert.is_some();
+    // Actions run on a worker thread, one after another. Before this
+    // they ran on the event loop, so a second menu choice was lost while
+    // the first was still running and a slow resolve froze the menu bar
+    // for as long as it took.
+    let (queue, jobs) = std::sync::mpsc::channel::<Action>();
+    let queued = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failure: std::sync::Arc<std::sync::Mutex<Option<String>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    {
+        let waker: EventLoopProxy<Wake> = event_loop.create_proxy();
+        let queued = queued.clone();
+        let failure = failure.clone();
+        let config = config.clone();
+        let state_root = state_root.clone();
+        std::thread::spawn(move || {
+            for action in jobs {
+                let outcome = run_action(action, config.as_ref(), &state_root);
+                queued.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                if let Err(error) = outcome {
+                    // Kept for the loop to raise: a notification belongs
+                    // on the main thread.
+                    *failure.lock().unwrap_or_else(|error| error.into_inner()) =
+                        Some(format!("{error:#}"));
+                }
+                let _ = waker.send_event(Wake::Done);
+            }
+        });
+    }
+
     let mut app = App {
         config,
         state_root,
+        queue,
+        queued,
+        failure,
         tray: None,
         actions: HashMap::new(),
         alerter: crate::alerts::Alerter::new(plan),
         hook_configured,
-        ink: menu_bar_ink(),
+        ink: menu_bar_ink(None),
         health: Health::Idle,
         report: None,
         last_error: None,
@@ -198,6 +232,13 @@ struct App {
     /// switch between light and dark redraws the icon on the next poll.
     ink: Ink,
     report: Option<StatusReport>,
+    /// Chosen actions, handed to the worker thread in the order they
+    /// were chosen.
+    queue: std::sync::mpsc::Sender<Action>,
+    /// How many are waiting or running, for the menu to report.
+    queued: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// What the worker's last failure was, for the loop to raise.
+    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// The last action's failure, shown at the top of the menu until an
     /// action succeeds — a notification can be missed.
     last_error: Option<String>,
@@ -212,6 +253,21 @@ impl winit::application::ApplicationHandler<Wake> for App {
         }
         match wake {
             Wake::Tick => self.refresh(),
+            Wake::Done => {
+                match self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    Some(message) => {
+                        notify_with("autobahn", &message, crate::icon::ensure(&self.state_root));
+                        self.last_error = Some(message);
+                    }
+                    None => self.last_error = None,
+                }
+                self.refresh();
+            }
             Wake::Menu(id) => {
                 if let Some(action) = self.actions.get(&id).cloned() {
                     match action {
@@ -233,7 +289,7 @@ impl winit::application::ApplicationHandler<Wake> for App {
             let menu = Menu::new();
             let tray = TrayIconBuilder::new()
                 .with_menu(Box::new(menu))
-                .with_icon(icon(Health::Idle, menu_bar_ink()))
+                .with_icon(icon(Health::Idle, menu_bar_ink(None)))
                 .with_tooltip("autobahn")
                 .build()
                 .expect("unable to create the tray icon");
@@ -269,7 +325,7 @@ impl App {
         };
         self.notify(&report);
         let health = health_of(&report);
-        let ink = menu_bar_ink();
+        let ink = menu_bar_ink(self.tray.as_ref());
         if health != self.health || ink != self.ink {
             if let Some(tray) = &self.tray {
                 let _ = tray.set_icon(Some(icon(health, ink)));
@@ -384,6 +440,10 @@ impl App {
             .collect();
         let count = |state: &str| sessions.iter().filter(|s| s.state == state).count();
         let mut parts = Vec::new();
+        match self.queued.load(std::sync::atomic::Ordering::SeqCst) {
+            0 => {}
+            one => parts.push(format!("{one} queued")),
+        }
         if !report.supervisor_running {
             parts.push(
                 match report.service.as_str() {
@@ -563,58 +623,70 @@ impl App {
         }
     }
 
-    /// Performs a chosen action by running the CLI — the same command a
-    /// terminal would, so the app cannot resolve differently than the
-    /// user could.
+    /// Queues a chosen action. Several choices stack up and run in the
+    /// order they were made, so the menu answers at once however long the
+    /// work takes.
     fn perform(&mut self, action: Action) {
-        let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("autobahn"));
-        // --config and --state-root belong to the subcommand, so they go
-        // after it.
-        let mut command = std::process::Command::new(&exe);
-        let mut common: Vec<std::ffi::OsString> = Vec::new();
-        if let Some(config) = &self.config {
-            common.push("--config".into());
-            common.push(config.clone().into());
+        // Nothing to run: the refresh that follows is the whole effect.
+        if matches!(action, Action::Refresh | Action::Quit) {
+            return;
         }
-        common.push("--state-root".into());
-        common.push(self.state_root.clone().into());
-        let outcome: Result<()> = match action {
-            Action::Resolve { group, path, keep } => {
-                // The menu item is the confirmation, and nothing here
-                // could answer a prompt.
-                command.args(["resolve", &group, &path, "--keep", &keep, "--yes"]);
-                command.args(&common);
-                run_quiet(command)
-            }
-            Action::Diff { group, path, host } => {
-                // The diff is written to a file and opened with whatever
-                // the desktop opens text with — a menu cannot show one.
-                command.args(["diff", &group, &path, "--host", &host]);
-                command.args(&common);
-                match command.output() {
-                    Ok(output) => {
-                        let file = std::env::temp_dir()
-                            .join(format!("autobahn-diff-{}.diff", path.replace('/', "_")));
-                        let _ = std::fs::write(&file, &output.stdout);
-                        open_path(&file)
-                    }
-                    Err(error) => Err(error.into()),
+        self.queued
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.queue.send(action).is_err() {
+            self.queued
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            self.last_error = Some("the worker thread has stopped".to_owned());
+        }
+    }
+}
+
+/// Runs one action by invoking the CLI — the same command a terminal
+/// would, so the app cannot resolve differently than the user could.
+fn run_action(
+    action: Action,
+    config: Option<&PathBuf>,
+    state_root: &std::path::Path,
+) -> Result<()> {
+    let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("autobahn"));
+    // --config and --state-root belong to the subcommand, so they go
+    // after it.
+    let mut command = std::process::Command::new(&exe);
+    let mut common: Vec<std::ffi::OsString> = Vec::new();
+    if let Some(config) = config {
+        common.push("--config".into());
+        common.push(config.clone().into());
+    }
+    common.push("--state-root".into());
+    common.push(state_root.to_path_buf().into());
+    match action {
+        Action::Resolve { group, path, keep } => {
+            // The menu item is the confirmation, and nothing here could
+            // answer a prompt.
+            command.args(["resolve", &group, &path, "--keep", &keep, "--yes"]);
+            command.args(&common);
+            run_quiet(command)
+        }
+        Action::Diff { group, path, host } => {
+            // The diff is written to a file and opened with whatever the
+            // desktop opens text with — a menu cannot show one.
+            command.args(["diff", &group, &path, "--host", &host]);
+            command.args(&common);
+            match command.output() {
+                Ok(output) => {
+                    let file = std::env::temp_dir()
+                        .join(format!("autobahn-diff-{}.diff", path.replace('/', "_")));
+                    let _ = std::fs::write(&file, &output.stdout);
+                    open_path(&file)
                 }
-            }
-            Action::OpenLog => crate::service::log_path().and_then(|log| open_path(&log)),
-            Action::ServiceStart => crate::service::start(),
-            Action::ServiceStop => crate::service::stop(),
-            Action::ServiceRestart => crate::service::restart(),
-            Action::Refresh | Action::Quit => Ok(()),
-        };
-        match outcome {
-            Ok(()) => self.last_error = None,
-            Err(error) => {
-                let message = format!("{error:#}");
-                notify_with("autobahn", &message, crate::icon::ensure(&self.state_root));
-                self.last_error = Some(message);
+                Err(error) => Err(error.into()),
             }
         }
+        Action::OpenLog => crate::service::log_path().and_then(|log| open_path(&log)),
+        Action::ServiceStart => crate::service::start(),
+        Action::ServiceStop => crate::service::stop(),
+        Action::ServiceRestart => crate::service::restart(),
+        Action::Refresh | Action::Quit => Ok(()),
     }
 }
 
@@ -860,21 +932,32 @@ type Ink = (u8, u8, u8);
 /// A template image would let macOS pick this itself, but a template is
 /// recoloured whole, and the state dot has to keep its colour — so the
 /// app asks which appearance is in effect and draws the sign to match.
-/// This follows the system appearance, which is what the bar follows
-/// except where a wallpaper darkens or lightens it on its own.
+///
+/// It asks the status item's own button, not the application. macOS 26
+/// chooses the menu bar's ink from the wallpaper behind it, and the
+/// application's appearance does not follow: a light system over a dark
+/// wallpaper reports Aqua to the application while the menu bar draws
+/// in white, and a sign drawn from the application's answer came out
+/// black among white neighbours. The button lives in the menu bar's own
+/// window, so its appearance is the one the bar actually draws with.
+/// Before the status item exists there is no button, and the
+/// application's appearance stands in until the first poll.
 #[cfg(target_os = "macos")]
-fn menu_bar_ink() -> Ink {
-    use objc2_app_kit::NSApplication;
+fn menu_bar_ink(tray: Option<&TrayIcon>) -> Ink {
+    // The trait carries `effectiveAppearance` for both the button and
+    // the application.
+    use objc2_app_kit::{NSAppearanceCustomization, NSApplication};
     let Some(mtm) = objc2::MainThreadMarker::new() else {
         return (0, 0, 0);
     };
-    let name = NSApplication::sharedApplication(mtm)
-        .effectiveAppearance()
-        .name()
-        .to_string();
+    let appearance = tray
+        .and_then(|tray| tray.ns_status_item())
+        .and_then(|item| item.button(mtm))
+        .map(|button| button.effectiveAppearance())
+        .unwrap_or_else(|| NSApplication::sharedApplication(mtm).effectiveAppearance());
     // Every dark appearance — DarkAqua, VibrantDark, the high-contrast
     // variants — carries the word; matching on it covers them all.
-    if name.contains("Dark") {
+    if appearance.name().to_string().contains("Dark") {
         (255, 255, 255)
     } else {
         (0, 0, 0)
@@ -884,7 +967,7 @@ fn menu_bar_ink() -> Ink {
 /// Elsewhere the bar's colour is not knowable, so the sign is drawn in a
 /// grey that reads on either.
 #[cfg(not(target_os = "macos"))]
-fn menu_bar_ink() -> Ink {
+fn menu_bar_ink(_tray: Option<&TrayIcon>) -> Ink {
     (142, 142, 147)
 }
 
@@ -892,8 +975,9 @@ fn menu_bar_ink() -> Ink {
 /// menu bar's ink, with the health in a dot at the corner, drawn in code
 /// so there is no asset to ship or lose.
 ///
-/// Idle is the sign alone, faded. Every other health keeps the sign solid
-/// and adds the dot in that health's colour, ringed by a transparent gap
+/// Idle is the sign struck through, the mark a wifi icon uses for *off*.
+/// Every other health draws the sign plain and adds the dot in that
+/// health's colour, ringed by a transparent gap
 /// so it sits *on* the sign rather than merging with it — the same gap
 /// runs under the bridge, which is what makes it a bridge rather than a
 /// stripe. Rendered at 36 pixels, exactly twice the 18 points macOS shows
@@ -918,14 +1002,27 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
         Health::Attention => Some((255, 204, 0)),
         Health::Bad => Some((255, 69, 58)),
     };
-    let sign_alpha = match health {
-        Health::Idle => 0.28,
-        _ => 1.0,
+    // Idle strikes the sign through rather than fading it. A faded sign
+    // says "nothing is running" too quietly: at a glance it reads as a
+    // dim sign, not as a state. The slash is the mark every wifi and
+    // bell icon already uses for *off*, so it needs no explaining.
+    let slash = matches!(health, Health::Idle);
+    // Bottom left to top right, the direction SF Symbols draws it. Half
+    // the stroke's width, then the transparent gap that keeps it from
+    // merging with the lanes it crosses — the same trick as the dot's
+    // ring, and as the gap under the bridge.
+    let (ax, ay, bx, by) = (3.4f32, 19.2f32, 18.6f32, 2.8f32);
+    let (slash_half, slash_gap) = (1.1f32, 1.1f32);
+    // Distance from a point to that segment.
+    let off_slash = |x: f32, y: f32| -> f32 {
+        let (dx, dy) = (bx - ax, by - ay);
+        let t = (((x - ax) * dx + (y - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+        ((x - (ax + t * dx)).powi(2) + (y - (ay + t * dy)).powi(2)).sqrt()
     };
 
     // The two lanes, as quadrilaterals, and the bridge with its gap.
-    let left = [(2.5, 20.0), (8.0, 20.0), (10.2, 3.0), (8.9, 3.0)];
-    let right = [(14.0, 20.0), (19.5, 20.0), (13.1, 3.0), (11.8, 3.0)];
+    let left = [(2.5, 19.5), (8.0, 19.5), (10.2, 2.5), (8.9, 2.5)];
+    let right = [(14.0, 19.5), (19.5, 19.5), (13.1, 2.5), (11.8, 2.5)];
     let inside = |polygon: &[(f32, f32); 4], x: f32, y: f32| -> bool {
         // Even-odd crossing test.
         let mut hit = false;
@@ -941,14 +1038,14 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
         hit
     };
     let in_sign = |x: f32, y: f32| -> bool {
-        let bridge = (1.5..=20.5).contains(&x) && (9.9..=12.1).contains(&y);
-        let gap = (1.5..=20.5).contains(&x) && (12.1..13.2).contains(&y);
+        let bridge = (1.5..=20.5).contains(&x) && (9.4..=11.6).contains(&y);
+        let gap = (1.5..=20.5).contains(&x) && (11.6..12.7).contains(&y);
         if gap {
             return false;
         }
         bridge || inside(&left, x, y) || inside(&right, x, y)
     };
-    let (dot_x, dot_y, dot_r, ring_r) = (17.0f32, 17.2f32, 3.0f32, 4.3f32);
+    let (dot_x, dot_y, dot_r, ring_r) = (17.0f32, 16.7f32, 3.0f32, 4.3f32);
 
     let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
     for py in 0..SIZE {
@@ -962,10 +1059,15 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
                     let x = (px as f32 + (sx as f32 + 0.5) / SS as f32) / UNIT;
                     let y = (py as f32 + (sy as f32 + 0.5) / SS as f32) / UNIT;
                     let d = ((x - dot_x).powi(2) + (y - dot_y).powi(2)).sqrt();
+                    let across = if slash { off_slash(x, y) } else { f32::MAX };
                     if dot.is_some() && d <= dot_r {
                         dotted += 1;
                     } else if dot.is_some() && d <= ring_r {
                         // Transparent: the gap around the dot.
+                    } else if across <= slash_half {
+                        sign += 1;
+                    } else if across <= slash_half + slash_gap {
+                        // Transparent: the gap beside the slash.
                     } else if in_sign(x, y) {
                         sign += 1;
                     }
@@ -976,7 +1078,7 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
                 let (r, g, b) = dot.unwrap_or(ink);
                 (r, g, b, dotted as f32 / samples)
             } else {
-                (ink.0, ink.1, ink.2, sign as f32 / samples * sign_alpha)
+                (ink.0, ink.1, ink.2, sign as f32 / samples)
             };
             rgba.extend_from_slice(&[r, g, b, (a * 255.0).round() as u8]);
         }
@@ -1033,29 +1135,38 @@ mod icon_tests {
                 eprintln!("--- {name} on {ink_name} ink ---\n{}", art(&px));
 
                 let at = |x: usize, y: usize| px[y * 36 + x];
-                // The bridge is solid ink across the middle …
-                let bridge = at(18, 18);
+                // The bridge is solid ink across the middle, probed left
+                // of centre, clear of where the idle slash crosses it.
+                let bridge = at(5, 18);
                 assert_eq!(
                     (bridge[0], bridge[1], bridge[2]),
                     ink,
                     "{name}: bridge is ink"
                 );
-                // … faded when idle, full otherwise.
-                match health {
-                    Health::Idle => assert!(
-                        bridge[3] > 50 && bridge[3] < 100,
-                        "{name}: faded, got {}",
-                        bridge[3]
-                    ),
-                    _ => assert_eq!(bridge[3], 255, "{name}: solid"),
-                }
+                assert_eq!(bridge[3], 255, "{name}: the bridge is solid");
                 // The gap under the bridge is transparent where a lane runs.
-                let gap = at(9, 20);
+                let gap = at(9, 19);
                 assert_eq!(
                     gap[3], 0,
                     "{name}: the gap under the bridge is clear, got {:?}",
                     gap
                 );
+                // Idle alone is struck through. Above the bridge and to
+                // the right of both lanes nothing else is ever drawn, so
+                // the region carries ink when idle and none otherwise.
+                // A region, not a point: the slash's own edges move
+                // whenever the geometry is nudged, and a fixed probe
+                // then tests the nudge instead of the drawing.
+                let struck = (0..15)
+                    .flat_map(|y| (26..36).map(move |x| (x, y)))
+                    .filter(|&(x, y)| at(x, y)[3] > 200)
+                    .count();
+                match health {
+                    Health::Idle => {
+                        assert!(struck > 15, "{name}: struck through, got {struck}")
+                    }
+                    _ => assert_eq!(struck, 0, "{name}: nothing above the lanes"),
+                }
                 // The dot: absent when idle, present and pure-coloured otherwise.
                 let centre = at(28, 28);
                 match health {

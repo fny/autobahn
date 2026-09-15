@@ -198,7 +198,7 @@ That's the whole setup. Everything else is in the documentation.
 **Using it**
 
 - [Configuration](docs/configuration.md) — every key, where it lives, what it defaults to
-- [Modes](docs/modes.md) — the four sync modes, case by case, and which to pick
+- [Modes](docs/modes.md) — the sync modes, case by case, and which to pick
 - [Ignores](docs/ignores.md) — patterns, ignore files, negations
 - [Alerts](docs/alerts.md) — the one hook, and when it fires
 - [Commands](docs/commands.md)

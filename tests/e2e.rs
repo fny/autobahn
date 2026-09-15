@@ -193,8 +193,9 @@ fn build_tree(root: &Path) {
 }
 
 /// All four synchronization modes.
-const ALL_MODES: [SyncMode; 4] = [
+const ALL_MODES: [SyncMode; 5] = [
     SyncMode::TwoWaySafe,
+    SyncMode::TwoWayParanoid,
     SyncMode::TwoWayResolved,
     SyncMode::OneWaySafe,
     SyncMode::OneWayReplica,
@@ -260,7 +261,7 @@ fn beta_addition_semantics_by_mode() {
         harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved => {
                 assert!(alpha_added.exists(), "{mode:?}: addition should propagate");
                 harness.assert_trees_equal("beta addition");
             }
@@ -294,7 +295,7 @@ fn beta_modification_semantics_by_mode() {
         let report = harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved => {
                 let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
                 assert_eq!(alpha_content, "modified on beta", "{mode:?}");
                 harness.assert_trees_equal("beta modification");

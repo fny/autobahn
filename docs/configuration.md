@@ -125,7 +125,7 @@ abandoned and redone.
 
 ## See also
 
-- [Modes](./modes.md) — which of the four to pick, and what each does case by case
+- [Modes](./modes.md) — which to pick, and what each does case by case
 - [Ignores](./ignores.md) — pattern semantics, ignore files, and negations
 - [Alerts](./alerts.md) — the one hook, and when it fires
 - [Overlapping and nested roots](./nesting.md) — what is refused and why

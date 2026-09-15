@@ -94,6 +94,13 @@ pub enum SyncMode {
     /// Bidirectional synchronization that surfaces conflicts without
     /// resolving them.
     TwoWaySafe,
+    /// `TwoWaySafe`, plus suspicion of large one-sided disappearances: a
+    /// directory the ancestor records with many entries that turns up
+    /// empty on one side is a conflict rather than a deletion to
+    /// propagate, and one that is gone on one side while the other is
+    /// untouched is restored rather than deleted. See
+    /// `reconcile::PARANOID_MINIMUM`.
+    TwoWayParanoid,
     /// Bidirectional synchronization that resolves conflicts in alpha's
     /// favor.
     TwoWayResolved,

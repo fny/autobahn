@@ -8,15 +8,15 @@ scratch. None of these are forgotten; all of them are chosen.
 
 ## 1. Single-huge-file mounts evade the emptied guard
 
-**The residual.** The emptied-tree guard triggers on a directory that
-is empty — or, since the invariants review, absent entirely — on
-exactly one side, with an ancestor recording eight or more entries
-(two at the root). A vanished mount holding one multi-terabyte
-database image, or a handful of very large media files, stays under
-the count and its disappearance propagates as deletion. That
-sub-threshold shape is the whole remaining residual: the
-absent-directory signature above the threshold (a removed mountpoint,
-`rm -rf` of the directory itself) now halts like the emptied one.
+**The residual.** The emptied-tree guard — now the `two-way-paranoid`
+mode's conflict-and-restore rules; below the root the other modes
+propagate the emptying, since the guard as a halt fired on `git gc`
+packing loose refs — triggers on a directory that is empty or absent
+on exactly one side, with an ancestor recording eight or more entries
+(two at the root, where the halt remains in every mode). A vanished
+mount holding one multi-terabyte database image, or a handful of very
+large media files, stays under the count and its disappearance
+propagates as deletion, in the paranoid mode too.
 
 **Why retained.** The alternative — a byte-magnitude trigger — was
 examined and rejected in review round five, by both reviewers, because

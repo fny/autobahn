@@ -13,16 +13,6 @@ use super::{diff_at, path_join, Change, Conflict, Content, Node, SyncMode};
 /// The outcome of reconciliation.
 #[derive(Debug, Default)]
 pub struct Reconciliation {
-    /// A directory the ancestor records as non-trivial that presents as
-    /// existing-but-empty on exactly one side — the signature of a vanished
-    /// mount below the root (a deliberate deletion removes the directory
-    /// itself). The session halts before applying any transition when this
-    /// is set. Detected here, during the walk reconciliation already does,
-    /// because a separate whole-tree pass measured at twenty milliseconds
-    /// per cycle on a sixty-thousand-entry tree; the expensive part (the
-    /// subtree count) runs only when the rare empty-versus-populated
-    /// trigger fires.
-    pub emptied_subtree: Option<EmptiedSubtree>,
     /// Changes to apply to the ancestor (beyond those implied by successful
     /// transitions).
     pub ancestor_changes: Vec<Change>,
@@ -116,32 +106,27 @@ fn shallow_equal(a: Option<&Node>, b: Option<&Node>) -> bool {
     }
 }
 
-/// A directory that a filesystem appears to have vanished from underneath:
-/// present on both sides, empty on one, and recorded by the ancestor as
-/// holding a substantial tree.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct EmptiedSubtree {
-    /// The root-relative path of the directory.
-    pub path: String,
-    /// The side it is empty on.
-    pub side: &'static str,
-    /// How many entries the ancestor records beneath it.
-    pub entries: usize,
-}
+/// The size at which the paranoid mode stops trusting a one-sided
+/// disappearance. A vanished mount, a wiped checkout, or a tool's cleanup
+/// usually took a substantial tree with it; emptying or removing a small
+/// directory is ordinary housekeeping and propagates in every mode.
+pub const PARANOID_MINIMUM: usize = 8;
 
-/// The size at which an emptied directory below the root trips the safety
-/// halt. A vanished mount usually held a substantial tree; a user emptying
-/// a small directory while keeping it is ordinary housekeeping.
-const EMPTIED_SUBTREE_MINIMUM: usize = 8;
-
-/// Counts the entries below a node. Called only when the emptied-subtree
-/// trigger has already fired, which is what keeps the guard off the
-/// per-cycle cost of every ordinary reconciliation.
-fn entries_below(node: &Node) -> usize {
-    node.children()
-        .iter()
-        .map(|child| 1 + entries_below(child))
-        .sum()
+/// Whether the ancestor records a directory large enough for the paranoid
+/// mode to guard. Counted only once the cheap shape test has fired, which
+/// keeps the guard off the per-cycle cost of every ordinary reconciliation:
+/// a whole-tree pass measured at twenty milliseconds per cycle on a
+/// sixty-thousand-entry tree.
+fn large_in_ancestor(ancestor: Option<&Node>) -> bool {
+    fn entries_below(node: &Node) -> usize {
+        node.children()
+            .iter()
+            .map(|child| 1 + entries_below(child))
+            .sum()
+    }
+    ancestor.is_some_and(|node| {
+        matches!(node.content, Content::Directory(_)) && entries_below(node) >= PARANOID_MINIMUM
+    })
 }
 
 impl Reconciler {
@@ -202,38 +187,38 @@ impl Reconciler {
 
         // If alpha and beta agree (shallowly) at this path, then recurse.
         if shallow_equal(alpha, beta) {
-            // The vanished-filesystem guard, at the only place it can
-            // trigger: both sides hold a directory here, and exactly one of
-            // them is empty.
+            // The paranoid mode's emptied-directory guard: both sides hold
+            // a directory here, exactly one of them is empty, and the
+            // ancestor says it was substantial. Plain three-way merging
+            // would read that as one side deleting every entry and carry
+            // the deletions across; the shape is just as often a mount
+            // that went away and left its mountpoint behind, or a tool
+            // that swept a directory clean (`git gc` packing loose refs),
+            // so the paranoid mode reports it as a conflict at the
+            // directory and lets a person name the winner. The full side's
+            // entries are not walked, so nothing beneath moves until then.
             //
-            // Only this shape is guarded, and the distinction is the whole
-            // point. A mountpoint is a directory belonging to the *parent*
-            // filesystem, so a filesystem that goes away — unplugged,
-            // dropped share, restarted container — leaves the directory
-            // behind and empty. A deliberate deletion removes the directory
-            // itself, and propagates like any other deletion.
-            //
-            // The guard once covered the absent shape too, on the grounds
-            // that some mountpoints are removed on eject (macOS `/Volumes`
-            // among them). That is true, and it cost every ordinary
-            // directory deletion a halt to catch it — a bad trade, since
-            // the two causes are indistinguishable from the tree alone.
-            // Telling them apart needs the device number recorded at scan
-            // time, which is the proper fix and is not this.
-            if !path.is_empty() && self.result.emptied_subtree.is_none() {
+            // Every other mode propagates it. This was once a halt in all
+            // of them, and it stopped whole sessions for exactly the tool
+            // cleanups above.
+            if self.mode == SyncMode::TwoWayParanoid && !path.is_empty() {
                 let empty = |node: Option<&Node>| {
                     matches!(node, Some(node)
                         if matches!(node.content, Content::Directory(_))
                             && node.children().is_empty())
                 };
-                if empty(alpha) != empty(beta)
-                    && ancestor.is_some_and(|node| entries_below(node) >= EMPTIED_SUBTREE_MINIMUM)
-                {
-                    self.result.emptied_subtree = Some(EmptiedSubtree {
+                if empty(alpha) != empty(beta) && large_in_ancestor(ancestor) {
+                    let change = |side: Option<&Node>| Change {
                         path: path.to_owned(),
-                        side: if empty(alpha) { "alpha" } else { "beta" },
-                        entries: ancestor.map(entries_below).unwrap_or(0),
+                        old: ancestor.cloned(),
+                        new: side.and_then(Node::synchronizable_subtree),
+                    };
+                    self.result.conflicts.push(Conflict {
+                        root: path.to_owned(),
+                        alpha_changes: vec![change(alpha)],
+                        beta_changes: vec![change(beta)],
                     });
+                    return;
                 }
             }
             // If the ancestor disagrees, then record an ancestor update at
@@ -311,7 +296,7 @@ impl Reconciler {
 
         // Alpha and beta disagree at this path; dispatch by mode.
         match self.mode {
-            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved => {
                 self.handle_disagreement_bidirectional(path, ancestor, alpha, beta)
             }
             SyncMode::OneWaySafe => {
@@ -339,6 +324,45 @@ impl Reconciler {
         // carries unsynchronizable content, which indicates a conflict).
         let alpha_diff = diff_at(path, ancestor, alpha_sync.as_ref());
         let beta_diff = diff_at(path, ancestor, beta_sync.as_ref());
+
+        // The paranoid mode's other rule: a large directory that is gone
+        // on one side while the other still holds exactly what the
+        // ancestor recorded is restored, not deleted. Partly for its own
+        // sake — the mode exists for people who would rather re-delete
+        // than lose a tree to a vanished disk — and partly because it is
+        // what makes the emptied-directory conflict above resolvable in
+        // the full side's favour: `resolve` retires the empty directory,
+        // which leaves precisely this shape, and without this rule the
+        // untouched side would then follow the deletion it was meant to
+        // win against. A deletion made against a *changed* other side is
+        // not this shape, so the emptying side can still win: retiring the
+        // full copy leaves two pure deletions, and the fuller one carries.
+        if self.mode == SyncMode::TwoWayParanoid
+            && !path.is_empty()
+            && large_in_ancestor(ancestor)
+            && alpha.is_none() != beta.is_none()
+        {
+            let alpha_gone = alpha.is_none();
+            let (kept, kept_diff) = if alpha_gone {
+                (beta_sync.clone(), &beta_diff)
+            } else {
+                (alpha_sync.clone(), &alpha_diff)
+            };
+            if kept_diff.is_empty() {
+                let restore = Change {
+                    path: path.to_owned(),
+                    old: None,
+                    new: kept,
+                };
+                if alpha_gone {
+                    self.result.alpha_transitions.push(restore);
+                } else {
+                    self.result.beta_transitions.push(restore);
+                }
+                return;
+            }
+        }
+
         if beta_diff.is_empty() {
             let beta_unsynchronizable =
                 blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
@@ -463,7 +487,7 @@ impl Reconciler {
 
         // Both sides have non-deletion changes: conflict, or forced
         // resolution in alpha's favor in resolved mode.
-        if self.mode == SyncMode::TwoWaySafe {
+        if matches!(self.mode, SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid) {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
                 alpha_changes: alpha_non_deletion,
@@ -696,6 +720,193 @@ mod tests {
         );
     }
 
+    /// A large directory at `data/`, and the shapes the paranoid mode
+    /// cares about: emptied on one side, gone on one side.
+    fn large(n: u8) -> Node {
+        dir(
+            "data",
+            (1..=n).map(|i| file(&format!("f{i}"), i, false)).collect(),
+        )
+    }
+
+    /// The paranoid mode reports a large directory emptied on one side as a
+    /// conflict at the directory; every other mode carries the emptying
+    /// across as the deletions it literally is.
+    #[test]
+    fn paranoid_treats_an_emptied_large_directory_as_a_conflict() {
+        let ancestor = dir("", vec![file("readme", 9, false), large(9)]);
+        let emptied = dir("", vec![file("readme", 9, false), dir("data", vec![])]);
+
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&emptied),
+            Some(&ancestor),
+            SyncMode::TwoWayParanoid,
+        );
+        assert_eq!(result.conflicts.len(), 1, "{result:?}");
+        let conflict = &result.conflicts[0];
+        assert_eq!(conflict.root, "data");
+        // Both sides are described at the directory, so the report can
+        // show a directory on each side rather than an absence.
+        let node = |changes: &[Change]| changes[0].new.clone().expect("present");
+        assert!(node(&conflict.alpha_changes).children().is_empty());
+        assert_eq!(node(&conflict.beta_changes).children().len(), 9);
+        assert!(
+            result.alpha_transitions.is_empty() && result.beta_transitions.is_empty(),
+            "nothing beneath moves while the conflict stands: {result:?}"
+        );
+
+        // The other side being the empty one names it the same way.
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&ancestor),
+            Some(&emptied),
+            SyncMode::TwoWayParanoid,
+        );
+        assert_eq!(result.conflicts.len(), 1);
+        assert_eq!(result.conflicts[0].root, "data");
+
+        // Everywhere else it is nine deletions, and they propagate. This
+        // was a session halt in every mode once, and it stopped whole
+        // sessions for `git gc` packing a directory of loose refs.
+        for mode in [
+            SyncMode::TwoWaySafe,
+            SyncMode::TwoWayResolved,
+            SyncMode::OneWaySafe,
+            SyncMode::OneWayReplica,
+        ] {
+            let result = reconcile(Some(&ancestor), Some(&emptied), Some(&ancestor), mode);
+            assert!(result.conflicts.is_empty(), "{mode:?}: {result:?}");
+            assert_eq!(result.beta_transitions.len(), 9, "{mode:?}: {result:?}");
+            assert!(result.beta_transitions.iter().all(|c| c.new.is_none()));
+        }
+    }
+
+    /// Below the threshold, emptying is housekeeping in every mode.
+    #[test]
+    fn paranoid_lets_a_small_directory_be_emptied() {
+        let ancestor = dir("", vec![file("readme", 9, false), large(3)]);
+        let emptied = dir("", vec![file("readme", 9, false), dir("data", vec![])]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&emptied),
+            Some(&ancestor),
+            SyncMode::TwoWayParanoid,
+        );
+        assert!(result.conflicts.is_empty(), "{result:?}");
+        assert_eq!(result.beta_transitions.len(), 3);
+    }
+
+    /// A large directory gone on one side while the other holds exactly
+    /// what the ancestor recorded is restored in the paranoid mode, and
+    /// deleted in every other. This is also the second half of resolving
+    /// the emptied-directory conflict in the full side's favour: `resolve`
+    /// retires the empty directory, and the next cycle sees this shape.
+    #[test]
+    fn paranoid_restores_a_large_directory_gone_from_one_side() {
+        let ancestor = dir("", vec![file("readme", 9, false), large(9)]);
+        let gone = dir("", vec![file("readme", 9, false)]);
+
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&gone),
+            Some(&ancestor),
+            SyncMode::TwoWayParanoid,
+        );
+        assert!(result.conflicts.is_empty(), "{result:?}");
+        assert!(result.beta_transitions.is_empty(), "{result:?}");
+        assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
+        let restore = &result.alpha_transitions[0];
+        assert_eq!(restore.path, "data");
+        assert!(restore.old.is_none());
+        assert_eq!(restore.new.as_ref().expect("restored").children().len(), 9);
+
+        // Symmetric.
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&ancestor),
+            Some(&gone),
+            SyncMode::TwoWayParanoid,
+        );
+        assert_eq!(result.beta_transitions.len(), 1);
+        assert!(result.beta_transitions[0].new.is_some());
+
+        // Elsewhere the deletion is honoured.
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&gone),
+            Some(&ancestor),
+            SyncMode::TwoWaySafe,
+        );
+        assert_eq!(result.beta_transitions.len(), 1);
+        assert!(result.beta_transitions[0].new.is_none());
+
+        // A small directory is deleted in the paranoid mode too.
+        let ancestor = dir("", vec![file("readme", 9, false), large(3)]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&gone),
+            Some(&ancestor),
+            SyncMode::TwoWayParanoid,
+        );
+        assert!(result.alpha_transitions.is_empty());
+        assert_eq!(result.beta_transitions.len(), 1);
+        assert!(result.beta_transitions[0].new.is_none());
+    }
+
+    /// The other resolution: the emptying side wins. `resolve` retires the
+    /// full copy, leaving two pure deletions — the whole directory on one
+    /// side, its entries on the other — and the fuller one carries, so
+    /// the directory ends up gone everywhere rather than restored.
+    #[test]
+    fn paranoid_lets_the_emptying_side_win_once_the_full_copy_is_retired() {
+        let ancestor = dir("", vec![file("readme", 9, false), large(9)]);
+        let gone = dir("", vec![file("readme", 9, false)]);
+        let emptied = dir("", vec![file("readme", 9, false), dir("data", vec![])]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&gone),
+            Some(&emptied),
+            SyncMode::TwoWayParanoid,
+        );
+        assert!(result.conflicts.is_empty(), "{result:?}");
+        assert!(result.alpha_transitions.is_empty(), "{result:?}");
+        assert_eq!(result.beta_transitions.len(), 1, "{result:?}");
+        assert_eq!(result.beta_transitions[0].path, "data");
+        assert!(result.beta_transitions[0].new.is_none());
+    }
+
+    /// The restore rule needs the kept side untouched. A deletion against
+    /// an edited directory is the ordinary edit-beats-delete case, in the
+    /// paranoid mode as in the others.
+    #[test]
+    fn paranoid_restore_rule_yields_to_an_edited_other_side() {
+        let ancestor = dir("", vec![large(9)]);
+        let gone = dir("", vec![]);
+        let mut edited_children: Vec<Node> =
+            (1..=9).map(|i| file(&format!("f{i}"), i, false)).collect();
+        edited_children[0] = file("f1", 42, false);
+        let edited = dir("", vec![dir("data", edited_children)]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&gone),
+            Some(&edited),
+            SyncMode::TwoWayParanoid,
+        );
+        assert!(result.conflicts.is_empty(), "{result:?}");
+        assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
+        assert_eq!(result.alpha_transitions[0].path, "data");
+        assert_eq!(
+            result.alpha_transitions[0]
+                .new
+                .as_ref()
+                .expect("edit wins")
+                .children()
+                .len(),
+            9
+        );
+    }
+
     #[test]
     fn content_leaving_tracked_scope_never_reads_as_deletion() {
         // A synchronized file crosses a size limit (or otherwise stops
@@ -713,6 +924,7 @@ mod tests {
         );
         for mode in [
             SyncMode::TwoWaySafe,
+            SyncMode::TwoWayParanoid,
             SyncMode::TwoWayResolved,
             SyncMode::OneWaySafe,
             SyncMode::OneWayReplica,
@@ -1040,10 +1252,11 @@ mod tests {
             ancestor_spec in proptest::array::uniform4(0u8..49),
             alpha_spec in proptest::array::uniform4(0u8..49),
             beta_spec in proptest::array::uniform4(0u8..49),
-            mode_index in 0usize..4,
+            mode_index in 0usize..5,
         ) {
             let mode = [
                 SyncMode::TwoWaySafe,
+                SyncMode::TwoWayParanoid,
                 SyncMode::TwoWayResolved,
                 SyncMode::OneWaySafe,
                 SyncMode::OneWayReplica,

@@ -47,6 +47,7 @@ enum Key {
     Flush,
     Keep(Winner),
     Copy,
+    Mark,
     Yes,
     No,
     Help,
@@ -131,6 +132,10 @@ struct Shop<'a> {
     cursor: usize,
     counter: Option<Counter>,
     expanded: BTreeSet<String>,
+    /// Rows marked to be settled together, by row key. Resolution reads
+    /// each losing side once per invocation, so twenty marked paths cost
+    /// one scan settled together and twenty settled one at a time.
+    marked: BTreeSet<String>,
     working: Arc<Mutex<Option<String>>>,
     rate: Rate,
     ticker: Vec<String>,
@@ -165,6 +170,7 @@ pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>
         cursor: 0,
         counter: None,
         expanded: BTreeSet::new(),
+        marked: BTreeSet::new(),
         working: Arc::default(),
         rate: Rate::default(),
         ticker: Vec::new(),
@@ -290,7 +296,10 @@ impl Shop<'_> {
                     Some(key) => {
                         self.expanded.remove(&key);
                     }
-                    None => self.counter = None,
+                    None => {
+                        self.counter = None;
+                        self.marked.clear();
+                    }
                 }
             }
             (true, Key::Open) => {
@@ -312,6 +321,7 @@ impl Shop<'_> {
                 }
             }
             (true, Key::Keep(winner)) => self.settle(winner),
+            (true, Key::Mark) => self.mark(),
             (true, Key::Copy) => self.copy_fix(),
             (true, _) => {}
             (false, Key::Up) => self.cursor = self.cursor.saturating_sub(1),
@@ -343,29 +353,35 @@ impl Shop<'_> {
         self.rows().into_iter().nth(cursor)
     }
 
-    fn settle(&mut self, winner: Winner) {
+    /// Marks or unmarks the row under the cursor, so that several can be
+    /// settled together.
+    fn mark(&mut self) {
         let Some(row) = self.selected() else { return };
-        let Act::Conflicts(paths) = row.act else {
-            return;
-        };
-        let Some(counter) = &self.counter else { return };
-        if paths.is_empty() || self.busy() {
+        if !matches!(row.act, Act::Conflicts(_)) {
+            self.say("only a dispute can be marked".to_owned());
             return;
         }
-        let keep = match winner {
-            Winner::Alpha => "alpha".to_owned(),
-            Winner::Beta => counter.host.clone(),
-            Winner::Both => "both".to_owned(),
+        if !self.marked.remove(&row.key) {
+            self.marked.insert(row.key);
+        }
+    }
+
+    fn settle(&mut self, winner: Winner) {
+        if self.busy() {
+            // Said, not swallowed. A key that does nothing and reports
+            // nothing reads as a shop that has stopped responding, which
+            // is what this looked like before.
+            self.say("still working — the last settlement is running".to_owned());
+            return;
+        }
+        let Some(host) = self.counter.as_ref().map(|counter| counter.host.clone()) else {
+            return;
         };
-        // One invocation per path. `resolve` takes a folder, but the tree
-        // has already decided exactly which paths this row covers, and a
-        // folder would sweep in whatever appeared since.
-        let group = counter.group.clone();
-        let told = match paths.len() {
-            1 => format!("settled {}", paths[0]),
-            many => format!("settled {many} paths"),
-        };
-        let _ = (keep, told);
+        let rows = self.rows();
+        let paths = settling(&rows, &self.marked, self.selected().as_ref());
+        if paths.is_empty() {
+            return;
+        }
         // Asked, not done. The answer arrives as `y` or `n`.
         self.pending = Some(Pending {
             winner,
@@ -373,7 +389,7 @@ impl Shop<'_> {
                 "keep {} for {} — overwrites the other side everywhere. y/n",
                 match winner {
                     Winner::Alpha => "ours".to_owned(),
-                    Winner::Beta => format!("{}'s", counter.host),
+                    Winner::Beta => format!("{host}'s"),
                     Winner::Both => "both".to_owned(),
                 },
                 match paths.len() {
@@ -383,7 +399,6 @@ impl Shop<'_> {
             ),
             paths,
         });
-        let _ = group;
     }
 
     /// Runs a settlement that has been approved.
@@ -406,6 +421,8 @@ impl Shop<'_> {
         command.extend(pending.paths.iter().cloned());
         command.extend(["--keep".to_owned(), keep, "--yes".to_owned()]);
         self.spawn(vec![command], told, "could not settle".to_owned());
+        // The marks named this settlement; they do not carry into the next.
+        self.marked.clear();
     }
 
     /// Puts the commands that would clear a blocked row on the clipboard.
@@ -1030,10 +1047,18 @@ impl Shop<'_> {
             // detail that trails the label puts every one at a different
             // column and makes the list unreadable down the page.
             let room = inner.saturating_sub(2);
+            let ticked = if self.marked.contains(&row.key) {
+                "◉ "
+            } else {
+                ""
+            };
             let left = format!(
-                "{}{marker} {}",
+                "{}{marker} {ticked}{}",
                 "  ".repeat(row.depth),
-                shorten(&row.label, room.saturating_sub(width(&row.detail) + 4)),
+                shorten(
+                    &row.label,
+                    room.saturating_sub(width(&row.detail) + 4 + width(ticked))
+                ),
             );
             let text = between(&left, &dim(&row.detail), room);
             let text = if here {
@@ -1081,6 +1106,7 @@ impl Shop<'_> {
                 ("↑↓", "choose"),
                 ("ret", "open"),
                 ("←", "back"),
+                ("spc", "mark"),
                 ("o", "ours"),
                 ("t", "theirs"),
                 ("b", "both"),
@@ -1102,10 +1128,14 @@ impl Shop<'_> {
             .map(|(key, what)| format!("\x1b[1m{key}\x1b[0m {what}"))
             .collect::<Vec<_>>()
             .join(&dim(" · "));
+        let marked = match self.marked.len() {
+            0 => String::new(),
+            many => format!("   {}", dim(&format!("{many} marked"))),
+        };
         match told.as_deref() {
-            Some("running") => format!("{keys}   working…"),
-            Some(told) => format!("{keys}   {}", dim(told)),
-            None => keys,
+            Some("running") => format!("{keys}{marked}   working…"),
+            Some(told) => format!("{keys}{marked}   {}", dim(told)),
+            None => format!("{keys}{marked}"),
         }
     }
 }
@@ -1240,7 +1270,7 @@ fn help_page(width: usize) -> Vec<String> {
         String::new(),
         dim("  every session is a customer; what it is doing right now is their order."),
         String::new(),
-        format!("  \x1b[1mwhat an order is\x1b[0m"),
+        "  \x1b[1mwhat an order is\x1b[0m".to_owned(),
     ];
     let pairs: &[(&str, &str, &str)] = &[
         ("served", "\x1b[32m", "both sides agree; nothing to do"),
@@ -1303,6 +1333,7 @@ fn help_page(width: usize) -> Vec<String> {
             "open the counter: where it syncs, and anything wrong",
         ),
         ("←", "back"),
+        ("spc", "mark a dispute; marked ones are settled together"),
         ("o / t / b", "settle a dispute: ours, theirs, or keep both"),
         ("c", "copy the commands that would clear a blocked path"),
         ("f", "rush — sync every session now"),
@@ -1382,6 +1413,7 @@ fn parse(bytes: &[u8]) -> (Vec<Key>, Vec<u8>) {
             [b't', ..] => (Some(Key::Keep(Winner::Beta)), 1),
             [b'b', ..] => (Some(Key::Keep(Winner::Both)), 1),
             [b'c', ..] => (Some(Key::Copy), 1),
+            [b' ', ..] => (Some(Key::Mark), 1),
             [b'y', ..] => (Some(Key::Yes), 1),
             [b'n', ..] => (Some(Key::No), 1),
             [b'q', ..] | [0x03, ..] => (Some(Key::Quit), 1),
@@ -1496,7 +1528,7 @@ fn thousands(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (index, digit) in digits.chars().enumerate() {
-        if index > 0 && (digits.len() - index) % 3 == 0 {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
             out.push(',');
         }
         out.push(digit);
@@ -1860,5 +1892,86 @@ mod tests {
             }),
             "a folder"
         );
+    }
+}
+
+/// The paths one settlement covers: every marked row's, or the row under
+/// the cursor when nothing is marked.
+///
+/// Deduplicated, and that is the point of using a set. A marked heading
+/// already carries every path beneath it, so marking a folder and then a
+/// file inside it would otherwise name that file twice — and `resolve`
+/// would be told to settle it twice in one command.
+fn settling(rows: &[Row], marked: &BTreeSet<String>, cursor: Option<&Row>) -> Vec<String> {
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    if marked.is_empty() {
+        if let Some(Act::Conflicts(here)) = cursor.map(|row| &row.act) {
+            paths.extend(here.iter().cloned());
+        }
+    } else {
+        for row in rows.iter().filter(|row| marked.contains(&row.key)) {
+            if let Act::Conflicts(here) = &row.act {
+                paths.extend(here.iter().cloned());
+            }
+        }
+    }
+    paths.into_iter().collect()
+}
+
+#[cfg(test)]
+mod settling_tests {
+    use super::*;
+
+    fn row(key: &str, paths: &[&str]) -> Row {
+        Row {
+            depth: 0,
+            key: key.to_owned(),
+            label: String::new(),
+            detail: String::new(),
+            children: false,
+            act: Act::Conflicts(paths.iter().map(|path| path.to_string()).collect()),
+        }
+    }
+
+    #[test]
+    fn nothing_marked_settles_the_row_under_the_cursor() {
+        let rows = vec![row("a", &["one"]), row("b", &["two"])];
+        assert_eq!(
+            settling(&rows, &BTreeSet::new(), Some(&rows[1])),
+            vec!["two".to_owned()]
+        );
+    }
+
+    #[test]
+    fn marks_beat_the_cursor_and_gather_every_marked_row() {
+        let rows = vec![row("a", &["one"]), row("b", &["two"]), row("c", &["three"])];
+        let marked: BTreeSet<String> = ["a", "c"].iter().map(|key| key.to_string()).collect();
+        // The cursor is on "b", which is not marked and does not count.
+        assert_eq!(
+            settling(&rows, &marked, Some(&rows[1])),
+            vec!["one".to_owned(), "three".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_folder_and_a_file_inside_it_name_that_file_once() {
+        let rows = vec![
+            row("conflicts", &["src/a", "src/b"]),
+            row("conflicts/src//src/a", &["src/a"]),
+        ];
+        let marked: BTreeSet<String> = rows.iter().map(|row| row.key.clone()).collect();
+        assert_eq!(
+            settling(&rows, &marked, None),
+            vec!["src/a".to_owned(), "src/b".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_marked_row_that_is_not_a_dispute_contributes_nothing() {
+        let mut blocked = row("blocked", &[]);
+        blocked.act = Act::Blocked(vec!["sudo chown …".to_owned()]);
+        let rows = vec![blocked, row("conflicts", &["one"])];
+        let marked: BTreeSet<String> = ["blocked".to_owned()].into_iter().collect();
+        assert!(settling(&rows, &marked, None).is_empty());
     }
 }

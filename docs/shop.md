@@ -32,7 +32,8 @@ The useful half. `ret` opens any order — where it syncs from and to, its
 mode, how many cycles it has run and how much it has carried — and then
 its issues as a tree: cause, then place, then path. Every level of that
 tree can be acted on, so one keypress settles a whole directory or a
-single file.
+single file. `spc` marks a level; mark as many as you like and one
+keypress settles all of them together.
 
 ```
   ┌──────────────────────────────────────────────────────────────┐
@@ -58,6 +59,7 @@ single file.
 | `o` | keep ours |
 | `t` | keep theirs |
 | `b` | keep both |
+| `spc` | mark a dispute, to settle several together |
 | `c` | copy the fix for a blocked path to the clipboard |
 | `f` | rush an order (flush it now) |
 | `?` | help |
@@ -66,7 +68,12 @@ single file.
 Each of `o`, `t` and `b` asks before it acts, because resolution
 overwrites a file someone edited on every destination in the group. It
 then runs the same `resolve` you would type, on whichever paths the
-selected level covers. Blocked paths autobahn cannot clear itself, since
+selected level covers — or on every marked level at once, as a single
+command. That is also the faster way round: resolution reads each losing
+side once per invocation, so twenty paths settled together cost one scan
+and twenty settled one by one cost twenty. Marking a folder and a file
+inside it is safe; the file is named once. The marks are forgotten once
+the settlement runs, and when you leave the counter. Blocked paths autobahn cannot clear itself, since
 the commands are `sudo` over ssh and a password prompt has nowhere to
 appear — so `c` copies the fix instead.
 

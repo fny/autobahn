@@ -20,7 +20,7 @@ pub fn isolate_home() {
     HOME.call_once(|| {
         let home = tempfile::tempdir()
             .expect("a private home for the test process")
-            .into_path();
+            .keep();
         std::env::set_var("HOME", &home);
     });
 }

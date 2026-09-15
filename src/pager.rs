@@ -265,8 +265,9 @@ impl Terminal {
 
         INTERRUPTED.store(false, std::sync::atomic::Ordering::SeqCst);
         unsafe {
-            libc::signal(libc::SIGINT, interrupt as libc::sighandler_t);
-            libc::signal(libc::SIGTERM, interrupt as libc::sighandler_t);
+            let handler = interrupt as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            libc::signal(libc::SIGINT, handler);
+            libc::signal(libc::SIGTERM, handler);
         }
 
         // The alternate screen, like a pager: the display takes the

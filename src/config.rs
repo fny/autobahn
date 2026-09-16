@@ -68,6 +68,11 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 #   two-way-alpha      both ways; alpha's version wins a clash, silently
 #   one-way-conflict   alpha to beta; an edit on beta is reported, not overwritten
 #   one-way-alpha      alpha to beta; beta is made identical (also spelled "mirror")
+#
+# Experimental: as the two-way modes, and a beta takes the lead while the
+# alpha is away (docs/peering.md). The alpha must be this machine.
+#   peering-conflict-experimental
+#   peering-alpha-experimental
 mode = "two-way-conflict"
 
 # Applied everywhere, in gitignore syntax: a bare name matches at any
@@ -195,7 +200,47 @@ pub struct Advanced {
     /// Alerter timing.
     #[serde(default)]
     pub alerts: AlertsAdvanced,
+    /// Peering timing. The section carries the experiment's suffix as the
+    /// modes do, so a configuration that names it says so on its face.
+    #[serde(default, rename = "peering-experimental")]
+    pub peering: PeeringAdvanced,
 }
+
+/// The `[advanced.peering-experimental]` section: how long a lease lives,
+/// and how long a peer waits past a dead lease before it takes the lead.
+///
+/// As with the alerter's timing, the defaults are the answer. A blip must
+/// never cause a failover, so the wait is long; a leader that is really
+/// gone costs the wait once. Both are here for the fleet that needs them
+/// moved, not for tuning.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PeeringAdvanced {
+    /// How long a lease stays valid after the leader last renewed it. The
+    /// leader renews on every cycle, so this is a number of missed cycles
+    /// expressed as time.
+    pub ttl: Option<DurationSpec>,
+    /// How long a candidate waits after the lease went stale before it
+    /// takes the lead. This is the blip window.
+    pub failover_after: Option<DurationSpec>,
+}
+
+/// Peering timing, resolved: what the supervisor runs with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PeeringPlan {
+    /// How long a lease stays valid after its last renewal.
+    pub ttl: Duration,
+    /// How long a candidate waits past a stale lease before it leads.
+    pub failover_after: Duration,
+}
+
+/// The lease lifetime as shipped: six missed five-second cycles.
+pub const DEFAULT_PEERING_TTL: Duration = Duration::from_secs(30);
+
+/// The blip window as shipped: long enough for a router restart or a
+/// laptop lid closed for a minute, short enough that a leader that is
+/// really gone is replaced within a few minutes.
+pub const DEFAULT_PEERING_FAILOVER_AFTER: Duration = Duration::from_secs(120);
 
 impl Config {
     /// The configured log level, if the file names a valid one.
@@ -413,6 +458,10 @@ pub struct SessionPlan {
     pub default_owner: Option<String>,
     /// The group for created entries (`None` to leave ownership alone).
     pub default_group: Option<String>,
+    /// Peering, when the mode asks for it: the betas can take the lead
+    /// while the alpha is away, with this timing. `None` for the plain
+    /// modes. Reconciliation never looks at this; `mode` says all it needs.
+    pub peering: Option<PeeringPlan>,
     /// The stable identifier isolating this session's state, derived from
     /// the *resolved* endpoint identities (see
     /// [`resolve_for_identity`](crate::paths::resolve_for_identity)) so that
@@ -458,6 +507,17 @@ impl SessionPlan {
     /// Returns the stable identifier isolating this session's state.
     pub fn identifier(&self) -> String {
         self.identifier.clone()
+    }
+
+    /// The mode as the configuration spells it: the peering spelling for
+    /// a peering plan, the canonical grid name otherwise. What `status`
+    /// shows, so a reader sees the word they wrote.
+    pub fn mode_name(&self) -> &'static str {
+        match (self.peering, self.mode) {
+            (Some(_), SyncMode::TwoWayResolved) => "peering-alpha-experimental",
+            (Some(_), _) => "peering-conflict-experimental",
+            (None, mode) => mode_name(mode),
+        }
     }
 }
 
@@ -588,8 +648,53 @@ impl Config {
         })
     }
 
+    /// The peering timing, from `[advanced.peering-experimental]` and the
+    /// built-in defaults. Resolved whether or not any group is in a
+    /// peering mode: a bad value is a configuration error either way.
+    pub fn peering_plan(&self) -> Result<PeeringPlan> {
+        let advanced = &self.advanced.peering;
+        let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
+            None => Ok(fallback),
+            Some(spec) => parse_duration(spec).map_err(|message| {
+                anyhow!("invalid configuration:\n  advanced.peering-experimental.{what}: {message}")
+            }),
+        };
+        let ttl = duration(&advanced.ttl, "ttl", DEFAULT_PEERING_TTL)?;
+        let failover_after = duration(
+            &advanced.failover_after,
+            "failover_after",
+            DEFAULT_PEERING_FAILOVER_AFTER,
+        )?;
+        // A lease has to be stale before anyone may act on it; a wait
+        // shorter than the lease would mean acting on a lease that is
+        // still good.
+        if failover_after < ttl {
+            bail!(
+                "invalid configuration:\n  advanced.peering-experimental.failover_after \
+                 ({}s) is shorter than ttl ({}s); a peer must not take the lead while the \
+                 lease is still valid",
+                failover_after.as_secs(),
+                ttl.as_secs()
+            );
+        }
+        if ttl.is_zero() {
+            bail!("invalid configuration:\n  advanced.peering-experimental.ttl must not be zero");
+        }
+        Ok(PeeringPlan {
+            ttl,
+            failover_after,
+        })
+    }
+
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
         let mut errors = Vec::new();
+        let peering = match self.peering_plan() {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                errors.push(format!("{error:#}"));
+                None
+            }
+        };
         // Ignore files live under the *default* state root, not under an
         // override: they are the reader's own library of patterns, shared
         // by every configuration, and not part of any session's state.
@@ -611,20 +716,26 @@ impl Config {
         let mut identities: HashMap<(String, String), String> = HashMap::new();
 
         for (name, group) in &self.groups {
-            let mode = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
-                Some(mode) => match parse_mode(mode) {
-                    Ok(mode) => Some(mode),
+            let (mode, peers) = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
+                Some(mode) => match parse_mode_spec(mode) {
+                    Ok((mode, peers)) => (Some(mode), peers),
                     Err(message) => {
                         errors.push(format!("group '{name}': {message}"));
-                        None
+                        (None, false)
                     }
                 },
                 None => {
                     errors.push(format!(
                         "group '{name}' has no mode and the defaults specify none"
                     ));
-                    None
+                    (None, false)
                 }
+            };
+            // Peering is a property of the plan, not of reconciliation:
+            // the mode word carries it, the timing comes from the section.
+            let peering = match (peers, peering) {
+                (true, Some(plan)) => Some(plan),
+                _ => None,
             };
             let power_durability = match group
                 .durability
@@ -690,6 +801,20 @@ impl Config {
             // session of the group flows through that endpoint.
             if let Some(EndpointTarget::Remote { destination, .. }) = &alpha {
                 if self.disabled.iter().any(|d| d == host_of(destination)) {
+                    continue;
+                }
+            }
+            // Peering assumes the alpha is the machine this configuration
+            // runs on: it is the one member that is never dialed, so it
+            // has to be the one doing the dialing. A remote alpha would
+            // mean a supervisor on a third machine, which the lease and
+            // the handoff do not model.
+            if peering.is_some() {
+                if let Some(EndpointTarget::Remote { .. }) = &alpha {
+                    errors.push(format!(
+                        "group '{name}': a peering mode needs a local alpha; '{}' is remote",
+                        group.alpha
+                    ));
                     continue;
                 }
             }
@@ -856,6 +981,16 @@ impl Config {
                         }
                     };
                 if let EndpointTarget::Local(path) = &target {
+                    // A peer is a machine that can take the lead. A local
+                    // path is this machine again, and this machine is the
+                    // alpha already.
+                    if peering.is_some() {
+                        errors.push(format!(
+                            "group '{name}' beta '{beta}': a peering mode needs every beta on \
+                             another host"
+                        ));
+                        continue;
+                    }
                     // The same working-directory hazard as a relative alpha,
                     // and the trap that catches unexpanded `~user` forms.
                     if !path.is_absolute() {
@@ -901,6 +1036,7 @@ impl Config {
                     staging,
                     default_owner: default_owner.clone(),
                     default_group: default_group.clone(),
+                    peering,
                     identifier,
                 };
                 // A beta that is the alpha, or nested either way around,
@@ -1162,26 +1298,40 @@ pub fn parse_duration(spec: &DurationSpec) -> Result<Duration, String> {
         .ok_or_else(|| format!("duration '{text}' overflows"))
 }
 
-/// Parses a synchronization mode name.
+/// Parses a synchronization mode name to what reconciliation runs.
+///
+/// A peering spelling parses to the reconciliation mode it wraps; the
+/// peering itself is a property of the plan, read by [`parse_mode_spec`].
 pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
+    parse_mode_spec(mode).map(|(mode, _)| mode)
+}
+
+/// Parses a synchronization mode name: the reconciliation mode, and
+/// whether the name asks for peering.
+pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
     // The names are a grid: direction, then what happens when the two
     // sides disagree about a file — it is reported as a conflict, or alpha
     // wins. The older names (safe, resolved, replica) described the same
     // four modes without exposing that structure; they stay accepted so
     // existing configurations keep working.
     match mode {
-        "two-way-conflict" | "two-way-safe" => Ok(SyncMode::TwoWaySafe),
+        "two-way-conflict" | "two-way-safe" => Ok((SyncMode::TwoWaySafe, false)),
         // Off the grid: two-way-conflict that also refuses to trust a
         // large directory going empty or missing on one side.
-        "two-way-paranoid" => Ok(SyncMode::TwoWayParanoid),
-        "two-way-alpha" | "two-way-resolved" => Ok(SyncMode::TwoWayResolved),
-        "one-way-conflict" | "one-way-safe" => Ok(SyncMode::OneWaySafe),
+        "two-way-paranoid" => Ok((SyncMode::TwoWayParanoid, false)),
+        "two-way-alpha" | "two-way-resolved" => Ok((SyncMode::TwoWayResolved, false)),
+        "one-way-conflict" | "one-way-safe" => Ok((SyncMode::OneWaySafe, false)),
         // "mirror" is what everyone calls this shape (rsync --delete), so
         // it is accepted too.
-        "one-way-alpha" | "one-way-replica" | "mirror" => Ok(SyncMode::OneWayReplica),
+        "one-way-alpha" | "one-way-replica" | "mirror" => Ok((SyncMode::OneWayReplica, false)),
+        // A third direction: two-way, and the betas can take the lead
+        // while the alpha is away. Experimental, and spelled so.
+        "peering-conflict-experimental" => Ok((SyncMode::TwoWaySafe, true)),
+        "peering-alpha-experimental" => Ok((SyncMode::TwoWayResolved, true)),
         other => Err(format!(
             "unknown mode '{other}' (expected one of: two-way-conflict, two-way-paranoid, \
-             two-way-alpha, one-way-conflict, one-way-alpha)"
+             two-way-alpha, one-way-conflict, one-way-alpha, peering-conflict-experimental, \
+             peering-alpha-experimental)"
         )),
     }
 }
@@ -1291,16 +1441,17 @@ mod tests {
     /// which is exactly how `two-way-paranoid` was first missed.
     #[test]
     fn the_template_names_every_mode() {
+        let is_mode = |word: &&str| word.contains("-way-") || word.starts_with("peering-");
         let named: Vec<&str> = TEMPLATE
             .lines()
             .filter_map(|line| line.strip_prefix("#   "))
             .filter_map(|line| line.split_whitespace().next())
-            .filter(|word| word.contains("-way-"))
+            .filter(is_mode)
             .collect();
         let advertised = parse_mode("not-a-mode").expect_err("an unknown mode is refused");
         let canonical: Vec<&str> = advertised
             .split(['(', ')', ':', ',', ' ', '\'', '\n'])
-            .filter(|word| word.contains("-way-"))
+            .filter(is_mode)
             .collect();
         assert_eq!(
             named, canonical,
@@ -2142,5 +2293,129 @@ mod tests {
         );
         assert_eq!(parse_mode("mirror").unwrap(), SyncMode::OneWayReplica);
         assert!(parse_mode("bidirectional").is_err());
+    }
+
+    /// The peering spellings parse to the two-way modes they wrap and
+    /// carry the peering flag; a plan spells them back the way they were
+    /// written.
+    #[test]
+    fn peering_modes_parse_and_print_back() {
+        assert_eq!(
+            parse_mode_spec("peering-conflict-experimental").unwrap(),
+            (SyncMode::TwoWaySafe, true)
+        );
+        assert_eq!(
+            parse_mode_spec("peering-alpha-experimental").unwrap(),
+            (SyncMode::TwoWayResolved, true)
+        );
+        assert_eq!(
+            parse_mode_spec("two-way-conflict").unwrap(),
+            (SyncMode::TwoWaySafe, false)
+        );
+        // The refusal message advertises them, which the template test
+        // also relies on.
+        let advertised = parse_mode("nope").unwrap_err();
+        assert!(advertised.contains("peering-conflict-experimental"));
+        assert!(advertised.contains("peering-alpha-experimental"));
+
+        let config = parse(
+            r#"
+            [groups.g]
+            mode = "peering-alpha-experimental"
+            alpha = "/tmp/a"
+            betas = ["u@h:/tmp/b"]
+            "#,
+        );
+        let plans = config.plans().expect("plans");
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].mode, SyncMode::TwoWayResolved);
+        assert_eq!(plans[0].mode_name(), "peering-alpha-experimental");
+        let peering = plans[0].peering.expect("a peering plan");
+        assert_eq!(peering.ttl, DEFAULT_PEERING_TTL);
+        assert_eq!(peering.failover_after, DEFAULT_PEERING_FAILOVER_AFTER);
+
+        let config = parse(
+            r#"
+            [groups.g]
+            mode = "two-way-alpha"
+            alpha = "/tmp/a"
+            betas = ["u@h:/tmp/b"]
+            "#,
+        );
+        let plans = config.plans().expect("plans");
+        assert!(plans[0].peering.is_none());
+        assert_eq!(plans[0].mode_name(), "two-way-alpha");
+    }
+
+    /// The timing section: read, defaulted, and refused when the wait is
+    /// shorter than the lease it is supposed to wait for.
+    #[test]
+    fn peering_timing_is_read_defaulted_and_checked() {
+        let config = parse(
+            r#"
+            [advanced.peering-experimental]
+            ttl = "10s"
+            failover_after = 45
+            [groups.g]
+            mode = "peering-conflict-experimental"
+            alpha = "/tmp/a"
+            betas = ["u@h:/tmp/b"]
+            "#,
+        );
+        let peering = config.plans().expect("plans")[0].peering.expect("peering");
+        assert_eq!(peering.ttl, Duration::from_secs(10));
+        assert_eq!(peering.failover_after, Duration::from_secs(45));
+
+        let config = parse(
+            r#"
+            [advanced.peering-experimental]
+            ttl = "60s"
+            failover_after = "30s"
+            [groups.g]
+            mode = "peering-conflict-experimental"
+            alpha = "/tmp/a"
+            betas = ["u@h:/tmp/b"]
+            "#,
+        );
+        let error = config.plans().unwrap_err().to_string();
+        assert!(error.contains("failover_after"), "{error}");
+        assert!(error.contains("shorter than ttl"), "{error}");
+
+        // A bad section is an error even for a configuration with no
+        // peering group: an unknown key is refused everywhere.
+        let result: std::result::Result<Config, _> = toml::from_str(
+            r#"
+            [advanced.peering-experimental]
+            lease = "10s"
+            "#,
+        );
+        assert!(result.is_err(), "unknown keys are refused");
+    }
+
+    /// Peering names the machine the configuration runs on as the alpha,
+    /// and every peer as another host.
+    #[test]
+    fn peering_needs_a_local_alpha_and_remote_betas() {
+        let config = parse(
+            r#"
+            [groups.g]
+            mode = "peering-conflict-experimental"
+            alpha = "u@h:/tmp/a"
+            betas = ["v@k:/tmp/b"]
+            "#,
+        );
+        let error = config.plans().unwrap_err().to_string();
+        assert!(error.contains("needs a local alpha"), "{error}");
+
+        let config = parse(
+            r#"
+            [groups.g]
+            mode = "peering-conflict-experimental"
+            alpha = "/tmp/a"
+            betas = ["/tmp/b", "u@h:/tmp/c"]
+            "#,
+        );
+        let error = config.plans().unwrap_err().to_string();
+        assert!(error.contains("every beta on another host"), "{error}");
     }
 }

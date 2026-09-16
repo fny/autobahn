@@ -2735,7 +2735,7 @@ fn render_status(
             });
             render_status_entry(
                 &plan.beta_spec(),
-                autobahn::config::mode_name(plan.mode),
+                plan.mode_name(),
                 status.as_ref(),
                 progress,
                 live,

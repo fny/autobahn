@@ -25,7 +25,7 @@ use std::time::{Duration, SystemTime};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{mode_name, EndpointTarget, SessionPlan};
+use crate::config::{EndpointTarget, SessionPlan};
 use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
@@ -686,7 +686,7 @@ impl<'a> Worker<'a> {
             host: self.plan.host.clone(),
             alpha: self.plan.alpha_spec.clone(),
             beta: self.plan.beta_spec(),
-            mode: mode_name(self.plan.mode).to_owned(),
+            mode: self.plan.mode_name().to_owned(),
             state: state.to_owned(),
             cycles: self.cycles,
             last_alpha_transitions: 0,
@@ -734,7 +734,7 @@ impl<'a> Worker<'a> {
             host: self.plan.host.clone(),
             alpha: self.plan.alpha_spec.clone(),
             beta: self.plan.beta_spec(),
-            mode: mode_name(self.plan.mode).to_owned(),
+            mode: self.plan.mode_name().to_owned(),
             state: "synchronized".into(),
             cycles: self.cycles,
             last_alpha_transitions: 0,
@@ -1210,7 +1210,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
             None => SessionReport {
                 host: plan.host.clone(),
                 beta: plan.beta_spec(),
-                mode: crate::config::mode_name(plan.mode).to_owned(),
+                mode: plan.mode_name().to_owned(),
                 state: "never-run".into(),
                 cycles: 0,
                 age_seconds: None,
@@ -1225,7 +1225,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
             Some(status) => SessionReport {
                 host: plan.host.clone(),
                 beta: plan.beta_spec(),
-                mode: crate::config::mode_name(plan.mode).to_owned(),
+                mode: plan.mode_name().to_owned(),
                 state: classify_state(&status),
                 cycles: status.cycles,
                 age_seconds: Some(now.saturating_sub(status.updated_at)),

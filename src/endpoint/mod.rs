@@ -258,6 +258,34 @@ pub trait Endpoint: Send {
         anyhow::bail!("this endpoint cannot move entries")
     }
 
+    /// Peering: presents the controller's lease on this endpoint's host.
+    /// Only an agent-backed endpoint can hold one; a local endpoint is the
+    /// controller's own machine, which never fences itself.
+    fn lease(&mut self, _lease: &crate::peering::Lease) -> Result<crate::peering::LeaseAnswer> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
+    /// Peering: sends the leader's ancestor record for this session, and
+    /// learns the generation the host's copy stands at afterwards.
+    fn ancestor_record(&mut self, _generation: u64, _changes: &[Change]) -> Result<u64> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
+    /// Peering: replaces the host's ancestor copy for this session.
+    fn ancestor_checkpoint(&mut self, _generation: u64, _ancestor: Option<&Node>) -> Result<u64> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
+    /// Peering: writes one of the files a follower needs on the host.
+    fn put_peering_file(&mut self, _name: &str, _bytes: &[u8]) -> Result<()> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
+    /// Peering: what the host holds for this session.
+    fn peering_state(&mut self) -> Result<crate::peering::State> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
     /// A monotone measure of how much change this endpoint has recorded but
     /// not yet had consumed by a scan, used to tell a burst of writes from a
     /// single one. Two samples that agree mean nothing arrived in between.

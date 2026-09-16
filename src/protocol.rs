@@ -111,6 +111,34 @@ pub enum Request {
     /// without moving its content, and the losing side is the only place
     /// that content exists.
     Rename(String, String),
+    /// Peering: present the controller's lease on this host, renewing it
+    /// or learning that a newer leader holds it. Sent first on a channel
+    /// by a controller in a peering mode, and again on every cycle. A
+    /// channel that presents a term below the host's lease is fenced:
+    /// every write it asks for is refused until it presents a term at
+    /// least as high.
+    Lease(crate::peering::Lease),
+    /// Peering: the changes that took the leader's ancestor for this
+    /// session from `generation - 1` to `generation`, so the host's copy
+    /// stays level with the leader's. The answer carries the copy's
+    /// generation; one that is not `generation` means the record was not
+    /// applied and a checkpoint is due.
+    AncestorRecord {
+        generation: u64,
+        changes: Vec<Change>,
+    },
+    /// Peering: the leader's whole ancestor for this session, replacing
+    /// the host's copy at `generation`.
+    AncestorCheckpoint {
+        generation: u64,
+        ancestor: Option<crate::tree::Node>,
+    },
+    /// Peering: a file a follower needs — `config.toml`, `name`, or
+    /// `ignores/<file>` — written under the host's peering directory.
+    /// Nothing else can be named.
+    PutPeeringFile { name: String, bytes: Vec<u8> },
+    /// Peering: what the host holds for this session.
+    PeeringState,
 }
 
 /// The header of a snapshot sent as a delta.
@@ -180,6 +208,13 @@ pub enum Response {
     File(Option<Vec<u8>>),
     /// Acknowledgement of Rename.
     Written,
+    /// The answer to a presented lease.
+    Lease(crate::peering::LeaseAnswer),
+    /// The generation the host's ancestor copy stands at after an
+    /// `AncestorRecord` or an `AncestorCheckpoint`.
+    Recorded { generation: u64 },
+    /// What the host holds for the channel's session.
+    PeeringState(crate::peering::State),
 }
 
 /// A controller-to-agent frame on a multiplexed connection.
@@ -232,7 +267,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 11;
+pub const COMPATIBILITY_EPOCH: u32 = 12;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

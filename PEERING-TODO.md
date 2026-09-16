@@ -31,16 +31,17 @@ Rules the build must keep:
 
 ## Phase 2 — the protocol
 
-- [ ] `Request::Lease(Lease)` / `Response::Lease(LeaseAnswer)` — renew or fence
-- [ ] `Request::AncestorRecord { generation, changes }` / `Response::Recorded { generation }`
-- [ ] `Request::AncestorCheckpoint { generation, ancestor }` for a peer with no copy or a mismatched generation
-- [ ] `Request::PutPeeringFile { name, bytes }` for `config.toml`, `ignores/<name>`, `name`
-- [ ] `Request::PeeringState` / `Response::PeeringState` — what the agent holds (lease, generation per session)
-- [ ] Agent: `~/.autobahn/peering/` (honours `AUTOBAHN_HOME`), `lease.json` read once per connection
-- [ ] Fence: a channel whose lease term is below the stored term gets `Transition`, `StagePush`, `Rename` refused with a named error; `Scan` still answered
-- [ ] Agent-side `AncestorStore` copy under `peering/ancestors/<session>/`
-- [ ] `COMPATIBILITY_EPOCH` bump; `response_kind` names the new variants
-- [ ] Tests: fence refuses a lower term and admits an equal or higher one; a record advances the copy; a checkpoint replaces it
+- [x] `Request::Lease(Lease)` / `Response::Lease(LeaseAnswer)` — renew or fence
+- [x] `Request::AncestorRecord { generation, changes }` / `Response::Recorded { generation }`
+- [x] `Request::AncestorCheckpoint { generation, ancestor }` for a peer with no copy or a mismatched generation
+- [x] `Request::PutPeeringFile { name, bytes }` for `config.toml`, `ignores/<name>`, `name`
+- [x] `Request::PeeringState` / `Response::PeeringState` — what the agent holds (lease, generation per session)
+- [x] Agent: `~/.autobahn/peering/` (honours `AUTOBAHN_HOME`); `lease.json` read at every `Lease` request, so channels see each other's terms through the file
+- [x] Fence: a channel whose lease term is below the stored term gets every write refused with a named error (`Transition`, `StagePush`, `Rename`, and the peering writes); `Scan` still answered. A same-term claim by a different leader is refused too
+- [x] Agent-side `AncestorStore` copy under `peering/ancestors/<session>/` (`peering::AncestorCopy`)
+- [x] `COMPATIBILITY_EPOCH` 11 → 12; `response_kind` names the new variants
+- [x] Tests: unit tests in `peering.rs`; `peering_fence_and_ancestor_copy_over_the_wire` in the e2e suite against a real agent
+- Residual: a channel that never presents a lease is not fenced, so a one-off `sync` or `resolve` from any machine can still write a peer. Peering trusts the operator here; noted in the docs
 
 ## Phase 3 — the leader
 

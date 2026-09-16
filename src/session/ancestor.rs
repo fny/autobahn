@@ -252,6 +252,23 @@ impl AncestorStore {
         self.sync_appends = enabled;
     }
 
+    /// The generation the stored ancestor stands at: zero before any
+    /// record, and one more after each.
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Replaces the stored ancestor outright with `ancestor` at
+    /// `generation`, journal and all. A peer's copy of a leader's ancestor
+    /// is brought level this way when the leader's records cannot be
+    /// applied to it — the copy is behind, or has never held anything —
+    /// and the generation is the leader's, so the next record fits.
+    pub(crate) fn checkpoint_at(&mut self, generation: u64, ancestor: Option<&Node>) -> Result<()> {
+        self.checkpoint(generation, ancestor)?;
+        self.generation = generation;
+        Ok(())
+    }
+
     /// Records the paths the current cycle is about to mutate, before any
     /// endpoint transition runs. Does not advance the generation: an
     /// intent is a marker, not a state.

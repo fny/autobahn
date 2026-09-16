@@ -529,6 +529,14 @@ fn serve_channel<W: Write>(
     let mut last_sent: Option<Snapshot> = None;
     // The operations of a snapshot delta in flight, drained by ScanPull.
     let mut pending: std::collections::VecDeque<crate::rsync::Op> = Default::default();
+    // Peering. The fence is the lease this channel was refused against:
+    // while it is set, nothing this channel asks for may change the host.
+    // It is per channel, not per connection, because each channel is one
+    // controller's session and presents its own term. The ancestor copy
+    // is opened on first use — most channels never see a peering request.
+    let peering_directory = crate::peering::directory();
+    let mut fence: Option<crate::peering::Lease> = None;
+    let mut copy: Option<crate::peering::AncestorCopy> = None;
     while let Ok(request) = requests.recv() {
         // What becomes of the record of what this channel has transmitted,
         // *if* this response reaches the controller. It is applied only
@@ -537,7 +545,92 @@ fn serve_channel<W: Write>(
         // previous model, and recording the new one here would make the
         // next rescan report "unchanged" against a tree it never received.
         let mut anchor = Anchor::Keep;
+        // The fence refuses every write. Reads still answer, so a fenced
+        // controller can see the tree it is no longer allowed to change,
+        // and its scans keep the session's model honest for when it is
+        // allowed again.
+        let writes = matches!(
+            request,
+            Request::Transition(_)
+                | Request::StagePush(_)
+                | Request::Rename(..)
+                | Request::AncestorRecord { .. }
+                | Request::AncestorCheckpoint { .. }
+                | Request::PutPeeringFile { .. }
+        );
+        if let (true, Some(held)) = (writes, &fence) {
+            let response = Response::Error(format!(
+                "fenced: this host's lease is held by {} at term {}; a controller at a lower \
+                 term may not write here",
+                held.leader, held.term
+            ));
+            if serve_send(output, channel, response).is_err() {
+                return;
+            }
+            continue;
+        }
         let result = match request {
+            Request::Lease(lease) => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| {
+                    let held = crate::peering::read_lease(directory)?;
+                    match held {
+                        Some(held) if !held.admits(&lease) => {
+                            fence = Some(held.clone());
+                            Ok(Response::Lease(crate::peering::LeaseAnswer::Refused {
+                                current: held,
+                            }))
+                        }
+                        _ => {
+                            crate::peering::write_lease(directory, &lease)?;
+                            fence = None;
+                            Ok(Response::Lease(crate::peering::LeaseAnswer::Accepted))
+                        }
+                    }
+                }),
+            Request::AncestorRecord {
+                generation,
+                changes,
+            } => open_copy(&peering_directory, &initialize.session, &mut copy)
+                .and_then(|copy| copy.record(generation, &changes))
+                .map(|generation| Response::Recorded { generation }),
+            Request::AncestorCheckpoint {
+                generation,
+                ancestor,
+            } => open_copy(&peering_directory, &initialize.session, &mut copy)
+                .and_then(|copy| copy.checkpoint(generation, ancestor))
+                .map(|generation| Response::Recorded { generation }),
+            Request::PutPeeringFile { name, bytes } => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| crate::peering::write_pushed_file(directory, &name, &bytes))
+                .map(|()| Response::Written),
+            Request::PeeringState => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| {
+                    let lease = crate::peering::read_lease(directory)?;
+                    let generation = match &copy {
+                        Some(copy) => Some(copy.generation()),
+                        None if crate::peering::ancestor_copy_path(
+                            directory,
+                            &initialize.session,
+                        )
+                        .exists() =>
+                        {
+                            Some(
+                                open_copy(&peering_directory, &initialize.session, &mut copy)?
+                                    .generation(),
+                            )
+                        }
+                        None => None,
+                    };
+                    Ok(Response::PeeringState(crate::peering::State {
+                        lease,
+                        generation,
+                    }))
+                }),
             Request::Scan => endpoint.scan().and_then(|snapshot| {
                 // Root identity settles the whole snapshot: its statistics
                 // are derived from the hierarchy, leaving only the probed
@@ -785,6 +878,20 @@ fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
     };
     LocalEndpoint::new(root, staging_root, options)
         .with_context(|| format!("unable to create an endpoint for {}", initialize.root))
+}
+
+/// The channel's ancestor copy, opened on first use and kept for the
+/// channel's lifetime.
+fn open_copy<'a>(
+    directory: &Result<PathBuf>,
+    session: &str,
+    slot: &'a mut Option<crate::peering::AncestorCopy>,
+) -> Result<&'a mut crate::peering::AncestorCopy> {
+    if slot.is_none() {
+        let directory = directory.as_ref().map_err(|error| anyhow!("{error:#}"))?;
+        *slot = Some(crate::peering::AncestorCopy::open(directory, session)?);
+    }
+    Ok(slot.as_mut().expect("just opened"))
 }
 
 /// Returns the handshake describing this build.

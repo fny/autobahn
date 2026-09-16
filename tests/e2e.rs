@@ -843,3 +843,155 @@ fn every_cut_connection_recovers_to_a_safe_tree() {
         assert!(cut_points > 0, "the sweep never engaged a cut");
     }
 }
+
+/// Peering, against a real agent: a channel that presents a lease term
+/// below the host's is fenced — every write refused, reads still answered
+/// — until it presents a term at least as high; the ancestor copy follows
+/// records and takes a checkpoint when it cannot.
+#[test]
+fn peering_fence_and_ancestor_copy_over_the_wire() {
+    use autobahn::peering::{Lease, LeaseAnswer};
+    use autobahn::tree::{Change, Node};
+    use std::time::Duration;
+
+    common::isolate_home();
+    let keep = tempfile::tempdir().expect("tempdir");
+    let root = keep.path().join("root");
+    fs::create_dir_all(&root).unwrap();
+    let binary = env!("CARGO_BIN_EXE_autobahn").to_owned();
+    let connect = || {
+        let connection =
+            Connection::spawn(&[binary.clone(), "agent".to_owned()]).expect("spawn agent");
+        RemoteEndpoint::connect(
+            connection,
+            Initialize {
+                root: root.to_string_lossy().into_owned(),
+                session: "peering-e2e".into(),
+                ignores: Vec::new(),
+                symlink_mode: SymlinkMode::Raw,
+                file_mode: None,
+                directory_mode: None,
+                side: "beta".into(),
+                staging: Default::default(),
+                max_file_size: None,
+                max_entry_count: None,
+                default_owner: None,
+                default_group: None,
+            },
+        )
+        .expect("connect agent")
+    };
+    let ttl = Duration::from_secs(30);
+
+    // A first lease on a host that holds none is accepted, and a renewal
+    // at the same term from the same leader too.
+    let mut endpoint = connect();
+    assert_eq!(
+        endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap(),
+        LeaseAnswer::Accepted
+    );
+    assert_eq!(
+        endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap(),
+        LeaseAnswer::Accepted
+    );
+    let state = endpoint.peering_state().unwrap();
+    assert_eq!(
+        state.lease.as_ref().map(|l| (l.term, l.leader.as_str())),
+        Some((5, "alpha"))
+    );
+    assert_eq!(state.generation, None, "no ancestor copy yet");
+
+    // A newer leader takes the host; the old leader, on its own channel,
+    // is then refused and fenced: it can scan, it cannot write.
+    let mut newer = connect();
+    assert_eq!(
+        newer.lease(&Lease::new("u@h:/x", 6, ttl)).unwrap(),
+        LeaseAnswer::Accepted
+    );
+    match endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap() {
+        LeaseAnswer::Refused { current } => {
+            assert_eq!(current.term, 6);
+            assert_eq!(current.leader, "u@h:/x");
+        }
+        other => panic!("the old leader should be refused, got {other:?}"),
+    }
+    endpoint.scan().expect("reads still answer while fenced");
+    let error = endpoint
+        .put_peering_file("name", b"u@h:/x")
+        .expect_err("a write while fenced is refused");
+    assert!(format!("{error:#}").contains("fenced"), "{error:#}");
+    let error = endpoint
+        .transition(vec![Change {
+            path: "new".into(),
+            old: None,
+            new: Some(Node::directory("new", Vec::new())),
+        }])
+        .expect_err("a transition while fenced is refused");
+    assert!(format!("{error:#}").contains("fenced"), "{error:#}");
+    // A same-term claim by a *different* leader is a split and is refused.
+    let mut split = connect();
+    assert!(matches!(
+        split.lease(&Lease::new("other", 6, ttl)).unwrap(),
+        LeaseAnswer::Refused { .. }
+    ));
+    // Presenting a higher term lifts the fence.
+    assert_eq!(
+        endpoint.lease(&Lease::new("alpha", 7, ttl)).unwrap(),
+        LeaseAnswer::Accepted
+    );
+    endpoint
+        .put_peering_file("name", b"u@h:/x")
+        .expect("writes again");
+
+    // The ancestor copy: the first record carries the tree; a record for
+    // a generation the copy is not at is answered with where it stands;
+    // a checkpoint moves it there; the next record then applies.
+    let tree = |names: &[&str]| {
+        Node::directory(
+            "",
+            names
+                .iter()
+                .map(|n| Node::directory(*n, Vec::new()))
+                .collect(),
+        )
+    };
+    let creation = Change {
+        path: String::new(),
+        old: None,
+        new: Some(tree(&["a"])),
+    };
+    assert_eq!(endpoint.ancestor_record(1, &[creation]).unwrap(), 1);
+    assert_eq!(
+        endpoint.ancestor_record(4, &[]).unwrap(),
+        1,
+        "a record the copy cannot apply reports the copy's generation"
+    );
+    assert_eq!(
+        endpoint
+            .ancestor_checkpoint(3, Some(&tree(&["a", "b"])))
+            .unwrap(),
+        3
+    );
+    let addition = Change {
+        path: "c".into(),
+        old: None,
+        new: Some(Node::directory("c", Vec::new())),
+    };
+    assert_eq!(endpoint.ancestor_record(4, &[addition]).unwrap(), 4);
+    assert_eq!(endpoint.peering_state().unwrap().generation, Some(4));
+
+    // A fresh connection sees what the host holds: the copy survived.
+    let mut again = connect();
+    let state = again.peering_state().unwrap();
+    assert_eq!(state.generation, Some(4));
+    assert_eq!(state.lease.map(|l| l.term), Some(7));
+
+    // Only the files a follower needs can be pushed.
+    let error = again
+        .put_peering_file("../escape", b"x")
+        .expect_err("an unknown file name is refused");
+    assert!(
+        format!("{error:#}").contains("not a file peering pushes"),
+        "{error:#}"
+    );
+}

@@ -26,6 +26,7 @@ pub mod icon;
 pub mod logging;
 pub mod ownership;
 pub mod paths;
+pub mod peering;
 pub mod persist;
 pub mod progress;
 pub mod protocol;

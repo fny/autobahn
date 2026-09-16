@@ -17,7 +17,7 @@ use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome
 use crate::protocol::{Initialize, Request, Response, ScanDelta};
 use crate::transport::mux::{AgentChannel, AgentConnection, AgentPool};
 use crate::transport::{self, Connection};
-use crate::tree::{Change, Snapshot};
+use crate::tree::{Change, Node, Snapshot};
 
 /// The failure raised when a destination cannot be reached at all: the
 /// host is down, asleep, or refusing the connection.
@@ -424,6 +424,53 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
+    fn lease(&mut self, lease: &crate::peering::Lease) -> Result<crate::peering::LeaseAnswer> {
+        match self.exchange(Request::Lease(lease.clone()))? {
+            Response::Lease(answer) => Ok(answer),
+            response => Err(unexpected_response(&response, "lease")),
+        }
+    }
+
+    fn ancestor_record(&mut self, generation: u64, changes: &[Change]) -> Result<u64> {
+        let request = Request::AncestorRecord {
+            generation,
+            changes: changes.to_vec(),
+        };
+        match self.exchange(request)? {
+            Response::Recorded { generation } => Ok(generation),
+            response => Err(unexpected_response(&response, "recorded")),
+        }
+    }
+
+    fn ancestor_checkpoint(&mut self, generation: u64, ancestor: Option<&Node>) -> Result<u64> {
+        let request = Request::AncestorCheckpoint {
+            generation,
+            ancestor: ancestor.cloned(),
+        };
+        match self.exchange(request)? {
+            Response::Recorded { generation } => Ok(generation),
+            response => Err(unexpected_response(&response, "recorded")),
+        }
+    }
+
+    fn put_peering_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        let request = Request::PutPeeringFile {
+            name: name.to_owned(),
+            bytes: bytes.to_vec(),
+        };
+        match self.exchange(request)? {
+            Response::Written => Ok(()),
+            response => Err(unexpected_response(&response, "written")),
+        }
+    }
+
+    fn peering_state(&mut self) -> Result<crate::peering::State> {
+        match self.exchange(Request::PeeringState)? {
+            Response::PeeringState(state) => Ok(state),
+            response => Err(unexpected_response(&response, "peering state")),
+        }
+    }
+
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         match self.exchange(Request::Rename(from.to_owned(), to.to_owned()))? {
             Response::Written => Ok(()),
@@ -549,6 +596,9 @@ fn response_kind(response: &Response) -> &'static str {
         Response::ScanOps(_) => "scan operations",
         Response::File(_) => "file",
         Response::Written => "written",
+        Response::Lease(_) => "lease",
+        Response::Recorded { .. } => "recorded",
+        Response::PeeringState(_) => "peering state",
     }
 }
 

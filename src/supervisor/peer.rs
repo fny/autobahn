@@ -122,8 +122,37 @@ fn lead(
     let supervisor =
         super::Supervisor::new(star.plans, state_root.to_path_buf(), verbose).with_peering(context);
     let inner_stop = AtomicBool::new(false);
+    // The attach socket: the alpha dials in here, and its connection
+    // becomes the endpoint of the session that has the alpha's side.
+    let socket = directory.join(peering::ATTACH_SOCKET);
+    let _ = std::fs::remove_file(&socket);
+    let listener = std::os::unix::net::UnixListener::bind(&socket)
+        .with_context(|| format!("unable to listen at {}", socket.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("unable to configure the attach socket")?;
     std::thread::scope(|scope| -> Result<()> {
         let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
+        let acceptor = &inner_stop;
+        let supervisor_ref = &supervisor;
+        scope.spawn(move || {
+            while !acceptor.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        if let Err(error) = accept_attachment(stream, supervisor_ref) {
+                            crate::complain!("peering: an attachment was refused: {error:#}");
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(ROLE_POLL);
+                    }
+                    Err(error) => {
+                        crate::complain!("peering: the attach socket failed: {error:#}");
+                        return;
+                    }
+                }
+            }
+        });
         // The supervisor runs until it is told to stop; this thread tells
         // it to, when it has stepped down or the process is stopping.
         // Meanwhile it renews this host's own lease: nobody dials a
@@ -143,19 +172,148 @@ fn lead(
                 break;
             }
             if renewed.elapsed() >= ttl / 2 {
-                if let Err(error) = peering::write_lease(directory, &Lease::new(&name, term, ttl)) {
-                    crate::complain!("peering: unable to renew the lease locally: {error:#}");
+                // Only a lease that still names this peer at this term is
+                // renewed. A handoff writes the next leader's lease here
+                // while the sessions are still passing it on; renewing
+                // over that would hand the lead back to nobody and have
+                // this peer take it up again from itself.
+                let still_mine = peering::read_lease(directory)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|lease| lease.leader == name && lease.term == term);
+                if still_mine {
+                    if let Err(error) =
+                        peering::write_lease(directory, &Lease::new(&name, term, ttl))
+                    {
+                        crate::complain!("peering: unable to renew the lease locally: {error:#}");
+                    }
                 }
                 renewed = std::time::Instant::now();
             }
             std::thread::sleep(ROLE_POLL);
         }
         inner_stop.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_file(&socket);
         match watcher.join() {
             Ok(result) => result,
             Err(_) => anyhow::bail!("the supervisor panicked"),
         }
     })
+}
+
+/// Reads an attachment's greeting — the peer's name on a line — and
+/// offers the connection to the supervisor under that name.
+fn accept_attachment(
+    stream: std::os::unix::net::UnixStream,
+    supervisor: &super::Supervisor,
+) -> Result<()> {
+    stream
+        .set_nonblocking(false)
+        .context("unable to configure the attachment")?;
+    let mut reader = std::io::BufReader::new(
+        stream
+            .try_clone()
+            .context("unable to clone the attachment")?,
+    );
+    let mut name = String::new();
+    std::io::BufRead::read_line(&mut reader, &mut name).context("unable to read the greeting")?;
+    let name = name.trim().to_owned();
+    if name != peering::ALPHA {
+        anyhow::bail!("{name:?} is not a peer that attaches");
+    }
+    crate::note!("peering: {name} attached");
+    let connection = crate::transport::Connection::from_streams(Box::new(reader), Box::new(stream));
+    supervisor.offer_attachment(&name, connection);
+    Ok(())
+}
+
+/// The alpha's `watch` when its groups peer: lead until fenced, then
+/// attach to whoever leads until the lease names the alpha again, and
+/// lead again. The configured alpha is never dialed, so while a beta
+/// leads the alpha makes itself an endpoint by dialing the beta.
+pub fn run_alpha(
+    config_path: &Path,
+    directory: &Path,
+    plans: &[crate::config::SessionPlan],
+    alerts: &crate::alerts::AlertPlan,
+    state_root: &Path,
+    verbose: bool,
+    stop: &AtomicBool,
+) -> Result<()> {
+    let interval = plans
+        .iter()
+        .map(|plan| plan.interval)
+        .min()
+        .unwrap_or(Duration::from_secs(5));
+    let failover_after = plans
+        .iter()
+        .find_map(|plan| plan.peering)
+        .map(|plan| plan.failover_after)
+        .unwrap_or(crate::config::DEFAULT_PEERING_FAILOVER_AFTER);
+    while !stop.load(Ordering::Relaxed) {
+        let context =
+            super::PeeringContext::for_alpha(config_path.to_path_buf(), directory.to_path_buf())?;
+        match context.role() {
+            Role::Leader { term, .. } => {
+                crate::note!("peering: leading as the alpha at term {term}");
+                let supervisor =
+                    super::Supervisor::new(plans.to_vec(), state_root.to_path_buf(), verbose)
+                        .with_alerts(alerts.clone())
+                        .with_peering(context);
+                let inner_stop = AtomicBool::new(false);
+                std::thread::scope(|scope| -> Result<()> {
+                    let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
+                    loop {
+                        if stop.load(Ordering::Relaxed) || watcher.is_finished() {
+                            break;
+                        }
+                        if let Role::Follower { leader, term } = supervisor.role() {
+                            crate::note!("peering: {leader} leads at term {term}; attaching");
+                            break;
+                        }
+                        std::thread::sleep(ROLE_POLL);
+                    }
+                    inner_stop.store(true, Ordering::Relaxed);
+                    match watcher.join() {
+                        Ok(result) => result,
+                        Err(_) => anyhow::bail!("the supervisor panicked"),
+                    }
+                })?;
+            }
+            Role::Follower { leader, .. } => {
+                // Attach, and serve as an agent until the leader lets go
+                // — it does when it hands the lead back, or dies.
+                let destination = peering::destination_of(&leader).to_owned();
+                let argv = peering::attach_argv(&destination);
+                crate::note!("peering: attaching to {leader}");
+                if let Err(error) = crate::transport::attach_as_agent(&argv) {
+                    crate::complain!("peering: the attachment to {leader} ended: {error:#}");
+                }
+                // The lease says whether the lead came back. A stale lease
+                // from a beta that died is taken over as a beta would take
+                // it — the alpha is the head of the order, so it waits only
+                // the configured time.
+                let now = peering::now_seconds();
+                match peering::read_lease(directory)? {
+                    Some(lease) if lease.leader == peering::ALPHA => {}
+                    Some(lease)
+                        if lease.is_stale_at(now) && lease.stale_for_at(now) >= failover_after =>
+                    {
+                        crate::note!(
+                            "peering: the lease of {} went stale; leading again",
+                            lease.leader
+                        );
+                        let ttl = Duration::from_secs(lease.ttl_seconds);
+                        let next = peering::Lease::new(peering::ALPHA, lease.term + 1, ttl);
+                        peering::write_lease(directory, &next)?;
+                    }
+                    _ => super::sleep_interruptible(interval, stop),
+                }
+            }
+            Role::Off => anyhow::bail!("no plan is in a peering mode"),
+        }
+    }
+    Ok(())
 }
 
 /// What `status` reads on a peer while it follows: a small file beside

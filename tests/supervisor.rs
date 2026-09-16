@@ -2075,11 +2075,12 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     let pushed = format!(
         r#"
         [advanced.peering-experimental]
-        ttl = "1s"
-        failover_after = "1s"
+        ttl = "2s"
+        failover_after = "2s"
 
         [groups.g]
         mode = "peering-conflict-experimental"
+        interval = 1
         alpha = "/nonexistent/alpha"
         agent_command = "{script}"
         betas = ["peer:{peer_root}", "other:{other_root}"]
@@ -2179,4 +2180,162 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         stop.store(true, Ordering::Relaxed);
         peer.join().expect("the peer thread").expect("the peer ran");
     });
+}
+
+/// Peering, phase 5, the whole loop from the alpha's side. A beta leads;
+/// the alpha comes back and dials the beta as it always did, is fenced,
+/// and steps down; it then dials in and attaches as an agent; the beta
+/// runs their session over the attachment and, once it settles, hands
+/// the lead back; the alpha leads again and dials the beta as before.
+#[test]
+fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
+    use autobahn::peering::{self, Lease};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let world = World::new();
+    let alpha_root = world.directory("alpha-root");
+    let peer_root = world.directory("peer-root");
+    let peer_home = world.directory("peer-home");
+    write(&alpha_root, "from-alpha.txt", "from the alpha");
+    write(&peer_root, "from-peer.txt", "from the peer");
+    let peer_script = peering_agent_script(&world, &peer_home);
+
+    // What the alpha pushed to the peer before it went away: a star of
+    // one beta, its own root as the alpha, and the session's identifier.
+    let configuration = format!(
+        r#"
+        [advanced.peering-experimental]
+        ttl = "2s"
+        failover_after = "2s"
+
+        [groups.g]
+        mode = "peering-conflict-experimental"
+        interval = 1
+        alpha = "{alpha_root}"
+        agent_command = "{script}"
+        betas = ["peer:{peer_root}"]
+        "#,
+        alpha_root = alpha_root.display(),
+        script = peer_script.display(),
+        peer_root = peer_root.display(),
+    );
+    let plans = world.plans(&configuration);
+    let name = format!("peer:{}", peer_root.display());
+    let peering_directory = peer_home.join(".autobahn").join("peering");
+    peering::write_pushed_file(&peering_directory, "config.toml", configuration.as_bytes())
+        .unwrap();
+    peering::write_pushed_file(&peering_directory, "name", name.as_bytes()).unwrap();
+    peering::write_pushed_file(
+        &peering_directory,
+        "sessions/g",
+        plans[0].identifier().as_bytes(),
+    )
+    .unwrap();
+    peering::write_lease(
+        &peering_directory,
+        &Lease {
+            leader: peering::ALPHA.to_owned(),
+            term: 3,
+            renewed_at: peering::now_seconds().saturating_sub(120),
+            ttl_seconds: 2,
+        },
+    )
+    .unwrap();
+    // The alpha remembers leading at term 3, and reaches the peer's attach
+    // socket directly rather than over ssh. This variable is process-wide;
+    // this is the one test that sets it.
+    let alpha_directory = peering::directory().expect("the alpha's peering directory");
+    peering::write_lease(
+        &alpha_directory,
+        &Lease::new(peering::ALPHA, 3, Duration::from_secs(30)),
+    )
+    .unwrap();
+    let socket = peering_directory.join(peering::ATTACH_SOCKET);
+    std::env::set_var(
+        peering::ATTACH_COMMAND_VARIABLE,
+        format!(
+            "{} peering attach --socket {}",
+            agent_binary(),
+            socket.display()
+        ),
+    );
+
+    let stop = AtomicBool::new(false);
+    let peer_state = world.state_root();
+    let alpha_state = world.path("alpha-state");
+    let alerts = autobahn::alerts::AlertPlan::default();
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let peer = scope.spawn(|| {
+            autobahn::supervisor::peer::run(&peering_directory, &peer_state, true, &stop)
+        });
+        assert!(
+            wait_until(Duration::from_secs(20), || socket.exists()),
+            "the peer should lead and listen for the alpha"
+        );
+
+        // The alpha comes back.
+        let alpha = scope.spawn(|| {
+            autobahn::supervisor::peer::run_alpha(
+                &world.path("config.toml"),
+                &alpha_directory,
+                &plans,
+                &alerts,
+                &alpha_state,
+                true,
+                &stop,
+            )
+        });
+
+        // Fenced, attached, synchronized both ways over the attachment.
+        assert!(
+            wait_until(Duration::from_secs(30), || peer_root
+                .join("from-alpha.txt")
+                .exists()
+                && alpha_root.join("from-peer.txt").exists()),
+            "the attached session should carry both roots' files"
+        );
+        // The lead comes back to the alpha at the next term, on both hosts.
+        assert!(
+            wait_until(Duration::from_secs(30), || {
+                let theirs = peering::read_lease(&peering_directory).ok().flatten();
+                let mine = peering::read_lease(&alpha_directory).ok().flatten();
+                theirs.is_some_and(|l| l.leader == peering::ALPHA && l.term == 5)
+                    && mine.is_some_and(|l| l.leader == peering::ALPHA && l.term == 5)
+            }),
+            "the lead should come back to the alpha at term 5"
+        );
+        // The alpha leads again the ordinary way: it dials the peer's
+        // agent, and a new file crosses; the peer's lease stays fresh
+        // because the alpha renews it every cycle.
+        write(&alpha_root, "after.txt", "after the handback");
+        assert!(
+            wait_until(Duration::from_secs(30), || peer_root
+                .join("after.txt")
+                .exists()),
+            "the alpha should lead again and reach the peer"
+        );
+        std::thread::sleep(Duration::from_secs(3));
+        let theirs = peering::read_lease(&peering_directory)
+            .expect("readable")
+            .expect("held");
+        assert_eq!((theirs.leader.as_str(), theirs.term), (peering::ALPHA, 5));
+        assert!(
+            !theirs.is_stale_at(peering::now_seconds()),
+            "the alpha keeps the peer's lease fresh: {theirs:?}"
+        );
+        let status = autobahn::supervisor::peer::read_status(&peering_directory)
+            .expect("readable")
+            .expect("written");
+        assert_eq!(status.standing, "fresh", "{status:?}");
+
+        stop.store(true, Ordering::Relaxed);
+        peer.join().expect("the peer thread").expect("the peer ran");
+        alpha
+            .join()
+            .expect("the alpha thread")
+            .expect("the alpha ran");
+    });
+    std::env::remove_var(peering::ATTACH_COMMAND_VARIABLE);
 }

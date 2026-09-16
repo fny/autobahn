@@ -258,6 +258,39 @@ impl AncestorStore {
         self.generation
     }
 
+    /// The generation a store on disk stands at, by opening it. Zero for a
+    /// store that does not exist yet.
+    pub(crate) fn stored_generation(path: &Path) -> Result<u64> {
+        if !path.exists() && !journal_path(path).exists() {
+            return Ok(0);
+        }
+        let (store, _, _) = AncestorStore::open(path)?;
+        Ok(store.generation)
+    }
+
+    /// Replaces the store at `to` with the one at `from`: the journal is
+    /// removed first and copied last, for the same reason `reset` orders
+    /// its removals — a checkpoint alone is a state that was acknowledged
+    /// once, a journal against the wrong checkpoint is not.
+    pub(crate) fn copy_store(from: &Path, to: &Path) -> Result<()> {
+        AncestorStore::reset(to)?;
+        for (source, target) in [
+            (from.to_path_buf(), to.to_path_buf()),
+            (journal_path(from), journal_path(to)),
+        ] {
+            if source.exists() {
+                fs::copy(&source, &target).with_context(|| {
+                    format!(
+                        "unable to copy {} to {}",
+                        source.display(),
+                        target.display()
+                    )
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Replaces the stored ancestor outright with `ancestor` at
     /// `generation`, journal and all. A peer's copy of a leader's ancestor
     /// is brought level this way when the leader's records cannot be

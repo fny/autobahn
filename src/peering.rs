@@ -242,11 +242,15 @@ pub fn write_pushed_file(directory: &Path, name: &str, bytes: &[u8]) -> Result<(
 
 /// Whether a pushed file name is one of the few peering knows about.
 pub fn is_pushable(name: &str) -> bool {
+    let plain = |file: &str| !file.is_empty() && !file.contains('/') && file != "." && file != "..";
     match name {
         "config.toml" | "name" => true,
-        other => match other.strip_prefix("ignores/") {
-            Some(file) => !file.is_empty() && !file.contains('/') && file != "." && file != "..",
-            None => false,
+        other => match (
+            other.strip_prefix("ignores/"),
+            other.strip_prefix("sessions/"),
+        ) {
+            (Some(file), _) | (_, Some(file)) => plain(file),
+            _ => false,
         },
     }
 }
@@ -514,15 +518,21 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             .rsplit_once(':')
             .map(|(_, path)| path.to_owned())
             .unwrap_or_else(|| name.to_owned());
+        // The other betas as they were, and the configured alpha as a
+        // beta spec reached by attachment — so the star is never empty,
+        // and the attached plan gets every setting the group carries.
+        // Its sides are swapped back below.
+        let mut betas: Vec<String> = group
+            .betas
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != index)
+            .map(|(_, entry)| full(entry, &group.alpha))
+            .collect();
+        betas.push(format!("{}:{}", attached_destination(ALPHA), group.alpha));
         let mut turned = crate::config::Group {
             alpha: own_path,
-            betas: group
-                .betas
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, entry)| full(entry, &group.alpha))
-                .collect(),
+            betas,
             ..group.clone()
         };
         // The mode spelling is kept as written, so the plans say
@@ -538,9 +548,34 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         bail!("{name:?} is not a beta of any peering group in the pushed configuration");
     };
     config.groups = groups;
-    let plans = config
+    let planned = config
         .plans()
         .context("unable to plan the follower's star")?;
+    // The configured alpha's session: the alpha is reached by attachment,
+    // not dialed, and it keeps its side of the pair — so the session, and
+    // the ancestor copy the leader pushed under its identifier, is the
+    // same one the leader ran. Without a pushed identifier the session
+    // has no known past, and it is left out rather than started afresh.
+    let mut plans = Vec::with_capacity(planned.len());
+    for plan in planned {
+        let attached = match &plan.beta {
+            crate::config::EndpointTarget::Remote {
+                destination, path, ..
+            } if attached_name(destination).is_some() => Some(path.clone()),
+            _ => None,
+        };
+        match attached {
+            None => plans.push(plan),
+            Some(alpha_path) => {
+                let pushed = read_pushed_file(directory, &format!("sessions/{}", plan.group))?;
+                let Some(identifier) = pushed else {
+                    continue;
+                };
+                let identifier = String::from_utf8(identifier).context("the pushed session id")?;
+                plans.push(plan.attached_alpha(&alpha_path, identifier.trim().to_owned()));
+            }
+        }
+    }
     let interval = plans
         .iter()
         .map(|plan| plan.interval)
@@ -630,4 +665,90 @@ mod star_tests {
 
         assert!(derive_star(PUSHED, "nobody:/x", keep.path()).is_err());
     }
+}
+
+/// The host part of an endpoint reached by an attachment rather than by
+/// dialing: the configured alpha, from a beta that leads. The destination
+/// is `<name>@attached` — the user-at-host shape a spec already allows,
+/// with no colon in it, so `<name>@attached:<path>` parses as any remote
+/// spec does. The name is `alpha`, the one member that dials in.
+pub const ATTACHED_HOST: &str = "attached";
+
+/// The destination for an attached peer.
+pub fn attached_destination(name: &str) -> String {
+    format!("{name}@{ATTACHED_HOST}")
+}
+
+/// The peer name an attached destination carries, if it is one.
+pub fn attached_name(destination: &str) -> Option<&str> {
+    destination.strip_suffix(&format!("@{ATTACHED_HOST}"))
+}
+
+/// Which side of a session is the peer — the host the lease, the
+/// records and the files go to. The beta, except for a session a beta
+/// runs against the attached alpha.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PeerSide {
+    Alpha,
+    Beta,
+}
+
+/// The name of the attach socket in a leading peer's directory.
+pub const ATTACH_SOCKET: &str = "attach.sock";
+
+/// The environment variable that replaces the command the alpha runs to
+/// attach to a leader: an argv, whitespace-split, with `{destination}`
+/// standing for the leader's SSH destination. For tests, and for
+/// transports other than SSH.
+pub const ATTACH_COMMAND_VARIABLE: &str = "AUTOBAHN_PEERING_ATTACH";
+
+/// The command the alpha runs to attach to the leader at `destination`:
+/// `ssh <destination> autobahn peering attach`, unless the environment
+/// says otherwise.
+pub fn attach_argv(destination: &str) -> Vec<String> {
+    if let Ok(template) = std::env::var(ATTACH_COMMAND_VARIABLE) {
+        let argv: Vec<String> = template
+            .split_whitespace()
+            .map(|word| word.replace("{destination}", destination))
+            .collect();
+        if !argv.is_empty() {
+            return argv;
+        }
+    }
+    crate::transport::ssh_argv_for(destination, "autobahn peering attach")
+}
+
+/// The SSH destination of a leader named by its spec (`user@host:path`).
+pub fn destination_of(leader: &str) -> &str {
+    leader
+        .rsplit_once(':')
+        .map(|(destination, _)| destination)
+        .unwrap_or(leader)
+}
+
+/// Brings a session's ancestor level with the copy a leader pushed here,
+/// when the copy is newer: the session directory's store is replaced by
+/// the copy's files. A beta that starts to lead seeds its sessions this
+/// way; an alpha that gets the lead back adopts what the beta recorded
+/// meanwhile. Returns whether anything was adopted.
+pub fn adopt_newer_copy(state_root: &Path, directory: &Path, session: &str) -> Result<bool> {
+    let copy = ancestor_copy_path(directory, session);
+    if !copy.exists() {
+        return Ok(false);
+    }
+    let own = state_root.join("sessions").join(session).join("ancestor");
+    let copied = AncestorStore::stored_generation(&copy)?;
+    let held = match own.exists() {
+        true => AncestorStore::stored_generation(&own)?,
+        false => 0,
+    };
+    if copied <= held {
+        return Ok(false);
+    }
+    if let Some(parent) = own.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+    }
+    AncestorStore::copy_store(&copy, &own)?;
+    Ok(true)
 }

@@ -515,6 +515,34 @@ impl SessionPlan {
         self.identifier.clone()
     }
 
+    /// Peering: the session between the configured alpha and this host,
+    /// as a beta that leads runs it — the alpha reached by attachment and
+    /// still the alpha of the pair, this host's own root (the alpha of
+    /// `self`) as the beta, under the identifier the leader pushed so it
+    /// is the same session the leader ran.
+    pub(crate) fn attached_alpha(&self, alpha_path: &str, identifier: String) -> SessionPlan {
+        let own = match &self.alpha {
+            EndpointTarget::Local(path) => path.clone(),
+            EndpointTarget::Remote { path, .. } => PathBuf::from(path),
+        };
+        let alpha = EndpointTarget::Remote {
+            destination: crate::peering::attached_destination(crate::peering::ALPHA),
+            path: alpha_path.to_owned(),
+            agent_command: None,
+        };
+        let beta = EndpointTarget::Local(own);
+        SessionPlan {
+            host: crate::peering::ALPHA.to_owned(),
+            alpha_identity: target_identity(&alpha),
+            beta_identity: target_identity(&beta),
+            alpha_spec: alpha_path.to_owned(),
+            alpha,
+            beta,
+            identifier,
+            ..self.clone()
+        }
+    }
+
     /// The mode as the configuration spells it: the peering spelling for
     /// a peering plan, the canonical grid name otherwise. What `status`
     /// shows, so a reader sees the word they wrote.
@@ -886,6 +914,21 @@ impl Config {
                     .unwrap_or(DEFAULT_INTERVAL_SECONDS)
                     .max(1),
             );
+            // The lease is renewed once per cycle, and an idle session
+            // cycles once per interval: a lease that lives less than two
+            // intervals goes stale between renewals and reads as a dead
+            // leader every few seconds.
+            if let Some(plan) = peering {
+                if plan.ttl < interval.saturating_mul(2) {
+                    errors.push(format!(
+                        "group '{name}': advanced.peering-experimental.ttl ({}s) must be at \
+                         least twice the interval ({}s); the lease is renewed once per cycle",
+                        plan.ttl.as_secs(),
+                        interval.as_secs()
+                    ));
+                    continue;
+                }
+            }
             let symlink_mode = match group
                 .symlink_mode
                 .as_deref()

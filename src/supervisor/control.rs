@@ -37,6 +37,12 @@ pub enum ControlRequest {
     /// Report what every supervised session is doing right now. The one
     /// request that reads rather than writes.
     Progress,
+    /// Peering: hand the lead to the named peer — `alpha`, or a beta's
+    /// spec — at the next term, and step down.
+    Yield {
+        /// Who leads next.
+        to: String,
+    },
 }
 
 /// Selects sessions by group and destination.
@@ -110,11 +116,16 @@ pub(crate) struct Entry {
     pub progress: Arc<crate::progress::Progress>,
 }
 
+/// Peering: what the control socket calls to hand the lead on.
+pub type YieldHandle = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
+
 /// The registry mapping sessions to their control flags, shared between the
 /// socket thread and the workers.
 pub(crate) struct Registry {
     /// One entry per supervised session.
     pub entries: Vec<Entry>,
+    /// Peering: how to hand the lead on, when this supervisor leads.
+    pub yield_to: Option<YieldHandle>,
 }
 
 impl Registry {
@@ -122,6 +133,26 @@ impl Registry {
     fn apply(&self, request: &ControlRequest) -> ControlResponse {
         // Progress reads rather than writes, and selects nothing: the
         // caller wants the whole picture and matches it up itself.
+        if let ControlRequest::Yield { to } = request {
+            let Some(yield_to) = &self.yield_to else {
+                return ControlResponse::Error(
+                    "this supervisor is not leading a peering group".into(),
+                );
+            };
+            return match yield_to(to) {
+                Ok(()) => {
+                    // Every worker hands its peer the new lease on its
+                    // next attempt; woken, that is now.
+                    for entry in &self.entries {
+                        entry.control.wake.store(true, Ordering::Relaxed);
+                    }
+                    ControlResponse::Applied {
+                        sessions: self.entries.len(),
+                    }
+                }
+                Err(error) => ControlResponse::Error(format!("{error:#}")),
+            };
+        }
         if let ControlRequest::Progress = request {
             return ControlResponse::Progress(
                 self.entries
@@ -154,7 +185,9 @@ impl Registry {
                 control.verify.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
             }),
-            ControlRequest::Progress => unreachable!("progress is answered above"),
+            ControlRequest::Progress | ControlRequest::Yield { .. } => {
+                unreachable!("answered above")
+            }
         };
         let mut sessions = 0;
         for entry in &self.entries {
@@ -377,6 +410,7 @@ mod tests {
 
     fn registry() -> Registry {
         Registry {
+            yield_to: None,
             entries: vec![
                 entry("work", "host1"),
                 entry("work", "host2"),

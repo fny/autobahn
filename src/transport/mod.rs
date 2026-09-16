@@ -880,6 +880,34 @@ fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
         .with_context(|| format!("unable to create an endpoint for {}", initialize.root))
 }
 
+/// The argv that runs `remote_command` on `destination` over SSH, with the
+/// options every autobahn connection uses.
+pub fn ssh_argv_for(destination: &str, remote_command: &str) -> Vec<String> {
+    Connection::ssh_argv(destination, Some(remote_command))
+}
+
+/// Peering: runs `argv` — the alpha's way to a leader, `ssh <leader>
+/// autobahn peering attach` by default — and serves as an agent over its
+/// stdio until the far side closes. The alpha is never dialed; this is
+/// how it makes itself an endpoint of a session a beta leads.
+pub fn attach_as_agent(argv: &[String]) -> Result<()> {
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("the attach command is empty"))?;
+    let mut child = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .with_context(|| format!("unable to run {}", argv.join(" ")))?;
+    let stdin = child.stdin.take().expect("piped stdin");
+    let stdout = child.stdout.take().expect("piped stdout");
+    let served = serve_agent(stdout, stdin);
+    let _ = child.wait();
+    served
+}
+
 /// The channel's ancestor copy, opened on first use and kept for the
 /// channel's lifetime.
 fn open_copy<'a>(

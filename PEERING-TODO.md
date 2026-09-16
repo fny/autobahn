@@ -60,18 +60,19 @@ Rules the build must keep:
 - [x] Candidate order by stagger, not by asking: position *n* waits `failover_after + (n − 1) × ttl`. Two candidates at once are settled by the fence (same term, second leader refused)
 - [x] Takeover: `term + 1`, lease on self (renewed every `ttl / 2` while leading), then a supervisor whose sessions present the lease to every other beta on their first cycle
 - [x] Plans re-derived (`peering::derive_star`): own spec → local path, other betas unchanged, plain groups dropped. The configured alpha is *not* in the star — it dials in (phase 5)
-- [ ] Ancestors seeded from `peering/ancestors/` for the (alpha, me) pair when the alpha attaches (phase 5); a (me, other) pair starts without one
-- [ ] `peering-alpha-experimental`: the configured alpha stays the alpha of every pair it is in (phase 5, with the attach)
+- [x] Ancestors seeded from `peering/ancestors/` (`peering::adopt_newer_copy`, under the session lock, whenever the copy is newer): a beta that leads seeds the (alpha, me) session; an alpha that gets the lead back adopts what the beta recorded. A (me, other) pair starts without one
+- [x] `peering-alpha-experimental`: the configured alpha stays the alpha of every pair it is in — the attached session keeps the alpha on the alpha side and the leader pushes `sessions/<group>` so the identifier is the same
 - [x] Tests: `a_follower_turns_the_star_around` (unit); `a_peer_takes_the_lead_when_the_lease_goes_stale` (supervisor suite, real agents) — the takeover reaches the other beta with lease, name and config, and the returning old leader is fenced and steps down
 
 ## Phase 5 — the alpha dials in, and the handoff
 
-- [ ] `autobahn peering attach`: on the leader host, a bridge from stdio to the supervisor's control socket
-- [ ] The follower alpha runs `ssh <leader> autobahn peering attach` with its own agent loop on the ssh stdio
-- [ ] The supervisor accepts an attached agent as the endpoint of the pair with that peer
-- [ ] `autobahn peering yield --to <spec>`: finish the cycle, push records, write `term + 1` for the named peer everywhere, step down
-- [ ] The returning alpha asks for the lead once it has completed one settled cycle as a follower
-- [ ] Tests: an attached agent carries a cycle; a yield moves the lead in one cycle; a crash mid-yield falls back to the timeout
+- [x] `autobahn peering attach`: on the leader host, a bridge from stdio to the leading peer's `peering/attach.sock` (its own socket, not the control socket; the greeting is the peer's name)
+- [x] The alpha runs `ssh <leader> autobahn peering attach` (or `AUTOBAHN_PEERING_ATTACH`) with its own agent loop on the ssh stdio (`transport::attach_as_agent`); `supervisor::peer::run_alpha` is the alpha's lead ↔ attach state machine
+- [x] The supervisor accepts an attached agent as the endpoint of the pair with that peer: `<name>@attached:<path>` specs, an attachment slot in the agent pool, `Unreachable` until the alpha dials in
+- [x] `autobahn peering yield --to <spec>` over the control socket; every session hands the new lease to its peer on its next attempt, then the supervisor follows. The local lease names the new leader at once, and a leading peer renews only a lease that still names it
+- [x] The lead goes back to the alpha automatically: one settled cycle on the attached session yields to `alpha`; no ask is needed
+- [x] `ttl` must be at least twice the group's `interval` — the lease is renewed once per cycle
+- [x] Tests: `the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back` runs the whole loop with real agents: fenced, attached, synced both ways, handed back, leading and renewing again, the ancestor copy adopted. A crash mid-yield is covered by design (the local lease names the next leader; the timeout takes it from there), not by a test
 
 ## Phase 6 — docs and the rest
 

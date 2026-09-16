@@ -539,6 +539,30 @@ impl Shared {
 pub struct AgentPool {
     /// The per-key slots.
     slots: Mutex<HashMap<Vec<String>, Arc<Mutex<PoolSlot>>>>,
+    /// Peering: connections that dialed *in*, by the peer's name, waiting
+    /// for the session that will use them. The configured alpha attaches
+    /// to a beta that leads this way, since the alpha is never dialed.
+    attachments: Mutex<HashMap<String, super::Connection>>,
+}
+
+impl AgentPool {
+    /// Peering: offers a connection a peer opened to this supervisor. A
+    /// later offer for the same name replaces an earlier one that was
+    /// never taken — the peer reconnected.
+    pub fn offer_attachment(&self, name: &str, connection: super::Connection) {
+        self.attachments
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(name.to_owned(), connection);
+    }
+
+    /// Peering: takes the connection a peer opened, if one is waiting.
+    pub fn take_attachment(&self, name: &str) -> Option<super::Connection> {
+        self.attachments
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(name)
+    }
 }
 
 /// One pool slot: the live connection for a key, if any.

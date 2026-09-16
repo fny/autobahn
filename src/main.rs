@@ -42,6 +42,28 @@ struct Cli {
     command: Command,
 }
 
+/// The peering verbs.
+#[derive(Subcommand)]
+enum PeeringVerb {
+    /// Bridge standard input and output to the leading supervisor's attach
+    /// socket. The alpha runs this over SSH on a beta that leads; it is
+    /// not for typing.
+    Attach {
+        /// The attach socket (default: the peering directory's).
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+    /// Hand the lead to a peer: `alpha`, or a beta's spec.
+    Yield {
+        /// Who leads next.
+        #[arg(long)]
+        to: String,
+        /// The state root of the supervisor to ask.
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+}
+
 /// The synchronization mode, as expressed on the command line.
 #[derive(Clone, Copy, ValueEnum)]
 enum ModeArgument {
@@ -444,9 +466,40 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    /// Install the latest release over this one: the command, and the
+    /// agent bundle the controller streams to remote hosts.
+    ///
+    /// The bundle is refreshed before the login service restarts, so a
+    /// controller never comes back on a version whose agents it cannot
+    /// install. The binary it replaces is kept beside the new one, and
+    /// restored if the service does not come back.
+    Update {
+        /// Install this release rather than the latest stable one.
+        /// Prereleases are never picked up by default: a tester opts in
+        /// here by tag (`--version v0.5.0-dev.1`).
+        #[arg(long, value_name = "TAG")]
+        version: Option<String>,
+        /// Install the command here (defaults to ~/.local/bin, or
+        /// $AUTOBAHN_BIN_DIR).
+        #[arg(long, value_name = "DIR", alias = "prefix")]
+        bin_dir: Option<PathBuf>,
+        /// Leave the agent bundle alone. Only safe when every host you
+        /// synchronize with shares this machine's platform.
+        #[arg(long)]
+        no_agents: bool,
+        /// Report what would be installed, and where, without changing
+        /// anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Run as a synchronization agent on standard input/output (invoked on
     /// remote hosts by the sync command; not intended for interactive use).
     Agent,
+    /// Peering (experimental): attach to a leader, or hand the lead on.
+    Peering {
+        #[command(subcommand)]
+        verb: PeeringVerb,
+    },
 }
 
 /// Whether this process is the app bundle's executable, started with no
@@ -483,6 +536,7 @@ fn main() {
     };
     let result = match cli.command {
         Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
+        Command::Peering { verb } => run_peering(verb),
         Command::Watch {
             config,
             state_root,
@@ -919,6 +973,72 @@ fn peer_plans(
     Ok(Some((star.plans, header)))
 }
 
+/// `autobahn peering …`.
+fn run_peering(verb: PeeringVerb) -> Result<()> {
+    match verb {
+        PeeringVerb::Attach { socket } => {
+            let socket = match socket {
+                Some(socket) => socket,
+                None => autobahn::peering::directory()?.join(autobahn::peering::ATTACH_SOCKET),
+            };
+            let stream = std::os::unix::net::UnixStream::connect(&socket).with_context(|| {
+                format!(
+                    "unable to reach a leading supervisor at {} (is this host leading?)",
+                    socket.display()
+                )
+            })?;
+            // The greeting, then two pumps until either side closes.
+            let mut writer = stream.try_clone().context("unable to clone the socket")?;
+            std::io::Write::write_all(
+                &mut writer,
+                format!("{}\n", autobahn::peering::ALPHA).as_bytes(),
+            )
+            .context("unable to greet the supervisor")?;
+            let mut reader = stream;
+            let inbound = std::thread::spawn(move || {
+                // Not `io::copy` into stdout: that goes through a line
+                // buffer, and frames have no newlines to flush them.
+                use std::io::{Read, Write};
+                let mut stdout = std::io::stdout().lock();
+                let mut buffer = [0u8; 64 * 1024];
+                loop {
+                    match reader.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(count) => {
+                            if stdout.write_all(&buffer[..count]).is_err()
+                                || stdout.flush().is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            let mut stdin = std::io::stdin().lock();
+            let _ = std::io::copy(&mut stdin, &mut writer);
+            let _ = writer.shutdown(std::net::Shutdown::Write);
+            let _ = inbound.join();
+            Ok(())
+        }
+        PeeringVerb::Yield { to, state_root } => {
+            let state_root = resolve_state_root(state_root)?;
+            match autobahn::supervisor::control::send(
+                &state_root,
+                &autobahn::supervisor::control::ControlRequest::Yield { to: to.clone() },
+            )? {
+                autobahn::supervisor::control::ControlResponse::Applied { sessions } => {
+                    println!("handing the lead to {to}; {sessions} session(s) will pass it on");
+                    Ok(())
+                }
+                autobahn::supervisor::control::ControlResponse::Error(message) => {
+                    bail!("{message}")
+                }
+                other => bail!("unexpected answer: {other:?}"),
+            }
+        }
+    }
+}
+
 fn load_config(path: Option<PathBuf>) -> Result<Config> {
     let path = match path {
         Some(path) => path,
@@ -1027,13 +1147,8 @@ fn run_watch(
     // Peering, when any group asks for it. This machine is the configured
     // alpha of every such group (the configuration says so), so it leads
     // — unless its own lease file says a beta led while it was away.
-    let peering = match plans.iter().any(|plan| plan.peering.is_some()) {
-        true => Some(autobahn::supervisor::PeeringContext::for_alpha(
-            config_path,
-            autobahn::peering::directory()?,
-        )?),
-        false => None,
-    };
+    let peering = plans.iter().any(|plan| plan.peering.is_some());
+
     // The level is settled before the first line is written. `--debug`
     // beats the file, and `AUTOBAHN_LOG` beats both, so a level can be
     // turned up for one run without editing anything.
@@ -1056,13 +1171,21 @@ fn run_watch(
             "supervising {} session(s); status is available via `autobahn status`",
             plans.len()
         );
-        let mut supervisor = Supervisor::new(plans, state_root, true).with_alerts(alerts);
-        if let Some(peering) = peering {
-            supervisor = supervisor.with_peering(peering);
-        }
         // Runs until the process is terminated: agent processes exit when
         // their connection streams close, so no explicit cleanup is needed.
         let stop = std::sync::atomic::AtomicBool::new(false);
+        if peering {
+            return autobahn::supervisor::peer::run_alpha(
+                &config_path,
+                &autobahn::peering::directory()?,
+                &plans,
+                &alerts,
+                &state_root,
+                true,
+                &stop,
+            );
+        }
+        let supervisor = Supervisor::new(plans, state_root, true).with_alerts(alerts);
         return supervisor.run_watch(&stop);
     }
 
@@ -1078,12 +1201,24 @@ fn run_watch(
     let failure: Arc<Mutex<Option<String>>> = Arc::default();
     let reported = failure.clone();
     std::thread::spawn(move || {
-        let mut supervisor = Supervisor::new(plans, state_root, false).with_alerts(alerts);
-        if let Some(peering) = peering {
-            supervisor = supervisor.with_peering(peering);
-        }
         let stop = std::sync::atomic::AtomicBool::new(false);
-        if let Err(error) = supervisor.run_watch(&stop) {
+        let outcome = match peering {
+            true => autobahn::peering::directory().and_then(|directory| {
+                autobahn::supervisor::peer::run_alpha(
+                    &config_path,
+                    &directory,
+                    &plans,
+                    &alerts,
+                    &state_root,
+                    false,
+                    &stop,
+                )
+            }),
+            false => Supervisor::new(plans, state_root, false)
+                .with_alerts(alerts)
+                .run_watch(&stop),
+        };
+        if let Err(error) = outcome {
             *reported.lock().unwrap_or_else(|error| error.into_inner()) =
                 Some(format!("{error:#}"));
             pager::leave();

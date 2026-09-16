@@ -78,7 +78,7 @@ impl CycleReport {
     /// nothing in conflict, nothing reported. Only after such a cycle can
     /// the next one treat unchanged scans as proof that the two sides are
     /// still synchronized.
-    fn settled(&self) -> bool {
+    pub fn settled(&self) -> bool {
         !self.changed()
             && self.conflicts.is_empty()
             && !self.missing_staged_files
@@ -127,9 +127,12 @@ pub struct Session {
     settled_alpha: Option<Node>,
     /// Beta's hierarchy as of the last quiesced cycle.
     settled_beta: Option<Node>,
-    /// Peering: what this session presents to its beta when its
+    /// Peering: what this session presents to its peer when its
     /// supervisor leads. `None` for a plain mode, and for a follower.
     leadership: Option<crate::peering::Leadership>,
+    /// Peering: which side the peer is. The beta, except for the session
+    /// a beta that leads runs against the attached alpha.
+    peer_side: crate::peering::PeerSide,
     /// Peering: whether the beta's ancestor copy has been compared with
     /// this session's ancestor since the session connected. Done once,
     /// after the first accepted lease, so a beta that has no copy — or
@@ -286,6 +289,7 @@ impl Session {
             settled_alpha: None,
             settled_beta: None,
             leadership: None,
+            peer_side: crate::peering::PeerSide::Beta,
             copy_checked: false,
             _lock: lock,
         })
@@ -294,19 +298,32 @@ impl Session {
     /// Peering: adopts (or drops) the leadership this session presents to
     /// its beta. Set by a leading supervisor before every attempt, so a
     /// change of term reaches the next cycle.
-    pub fn set_leadership(&mut self, leadership: Option<crate::peering::Leadership>) {
-        if leadership != self.leadership {
+    pub fn set_leadership(
+        &mut self,
+        leadership: Option<crate::peering::Leadership>,
+        side: crate::peering::PeerSide,
+    ) {
+        if leadership != self.leadership || side != self.peer_side {
             self.copy_checked = false;
         }
         self.leadership = leadership;
+        self.peer_side = side;
+    }
+
+    /// Peering: the endpoint on the peer's side.
+    fn peer(&mut self) -> &mut Box<dyn Endpoint + Send> {
+        match self.peer_side {
+            crate::peering::PeerSide::Alpha => &mut self.alpha,
+            crate::peering::PeerSide::Beta => &mut self.beta,
+        }
     }
 
     /// Peering: writes the files a follower needs onto the beta's host.
     pub fn push_peering_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
         for (name, bytes) in files {
-            self.beta
+            self.peer()
                 .put_peering_file(name, bytes)
-                .with_context(|| format!("unable to push {name} to the beta"))?;
+                .with_context(|| format!("unable to push {name} to the peer"))?;
         }
         Ok(())
     }
@@ -318,7 +335,7 @@ impl Session {
         let Some(leadership) = self.leadership.clone() else {
             return Ok(());
         };
-        match self.beta.lease(&leadership.lease())? {
+        match self.peer().lease(&leadership.lease())? {
             crate::peering::LeaseAnswer::Accepted => {}
             crate::peering::LeaseAnswer::Refused { current } => {
                 return Err(crate::peering::Fenced { current }.into());
@@ -326,10 +343,11 @@ impl Session {
         }
         if !self.copy_checked {
             let generation = self.ancestor_store.generation();
-            let state = self.beta.peering_state()?;
+            let state = self.peer().peering_state()?;
             if state.generation != Some(generation) {
-                self.beta
-                    .ancestor_checkpoint(generation, self.ancestor.as_ref())?;
+                let ancestor = self.ancestor.clone();
+                self.peer()
+                    .ancestor_checkpoint(generation, ancestor.as_ref())?;
             }
             self.copy_checked = true;
         }
@@ -346,11 +364,12 @@ impl Session {
             return;
         }
         let generation = self.ancestor_store.generation();
-        let outcome = match self.beta.ancestor_record(generation, changes) {
+        let ancestor = self.ancestor.clone();
+        let outcome = match self.peer().ancestor_record(generation, changes) {
             Ok(reached) if reached == generation => Ok(()),
             Ok(_) => self
-                .beta
-                .ancestor_checkpoint(generation, self.ancestor.as_ref())
+                .peer()
+                .ancestor_checkpoint(generation, ancestor.as_ref())
                 .map(|_| ()),
             Err(error) => Err(error),
         };

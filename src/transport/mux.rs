@@ -229,7 +229,7 @@ impl AgentConnection {
                 .lock()
                 .expect("the state lock is never poisoned");
             if let Some(reason) = &state.dead {
-                bail!("the agent connection has failed: {reason}");
+                return Err(ConnectionFailed::new(reason).into());
             }
             if state.shutdown {
                 bail!("the agent connection has shut down");
@@ -254,10 +254,7 @@ impl AgentConnection {
                 Ok(Response::Initialized) => Ok(()),
                 Ok(Response::Error(message)) => bail!("remote error: {message}"),
                 Ok(_) => bail!("protocol error: unexpected answer to a channel open"),
-                Err(_) => bail!(
-                    "the agent connection failed during the channel open: {}",
-                    self.shared.death_reason()
-                ),
+                Err(_) => Err(ConnectionFailed::new(&self.shared.death_reason()).into()),
             }
         })();
         match opened {
@@ -327,7 +324,7 @@ impl AgentChannel {
                 .lock()
                 .expect("the state lock is never poisoned");
             if let Some(reason) = &state.dead {
-                bail!("the agent connection has failed: {reason}");
+                return Err(ConnectionFailed::new(reason).into());
             }
             let slot = state
                 .channels
@@ -347,19 +344,18 @@ impl AgentChannel {
                     slot.outstanding = slot.outstanding.saturating_sub(1);
                 }
             }
-            return Err(error).context("unable to send request to the agent");
+            // A write that fails is a connection that has failed, whatever
+            // the operating system called it.
+            return Err(ConnectionFailed::new(&format!("{error:#}")).into());
         }
         Ok(())
     }
 
     /// Receives the next owed response on this channel.
     pub fn receive_response(&mut self) -> Result<Response> {
-        self.receiver.recv().map_err(|_| {
-            anyhow!(
-                "the agent connection failed: {}",
-                self.shared.death_reason()
-            )
-        })
+        self.receiver
+            .recv()
+            .map_err(|_| ConnectionFailed::new(&self.shared.death_reason()).into())
     }
 
     /// Closes the channel, reporting any shutdown failure (dropping does
@@ -565,6 +561,33 @@ impl AgentPool {
     }
 }
 
+/// The agent connection has failed underneath a session: the far side
+/// closed it, or the transport broke. Typed so that the supervisor can
+/// tell "the host went away" from "something went wrong": a laptop
+/// waking from sleep finds every connection it held in this state, and
+/// the right answer is to reconnect, not to report.
+#[derive(Debug, thiserror::Error)]
+#[error("the agent connection has failed: {reason}")]
+pub struct ConnectionFailed {
+    /// What ended it, in the transport's words.
+    pub reason: String,
+}
+
+impl ConnectionFailed {
+    fn new(reason: &str) -> ConnectionFailed {
+        ConnectionFailed {
+            reason: reason.to_owned(),
+        }
+    }
+
+    /// Whether an error, anywhere in its chain, is a failed connection.
+    pub fn is_in(error: &anyhow::Error) -> bool {
+        error
+            .chain()
+            .any(|cause| cause.downcast_ref::<ConnectionFailed>().is_some())
+    }
+}
+
 /// One pool slot: the live connection for a key, if any.
 #[derive(Default)]
 struct PoolSlot {
@@ -767,6 +790,35 @@ mod tests {
         drop(client);
 
         assert_clean_exit(&finished);
+    }
+
+    /// A connection that dies underneath a channel answers every later
+    /// request with a typed failure, so a supervisor can tell "the host
+    /// went away" from "something went wrong" and reconnect rather than
+    /// report.
+    #[test]
+    fn a_connection_that_dies_underneath_a_channel_fails_typed() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        let (client, finished) = spawned_agent();
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        let mut channel = connection.open(initialize(&root)).expect("open");
+        // The agent goes away: its end of the pipes is dropped when its
+        // serving thread ends, which a shutdown frame brings about.
+        connection.shared.shutdown().expect("shutdown");
+        assert_clean_exit(&finished);
+        let error = channel
+            .exchange(Request::Scan)
+            .expect_err("a request over a dead connection fails");
+        assert!(
+            ConnectionFailed::is_in(&error),
+            "the failure is typed, not worded: {error:#}"
+        );
+        assert!(
+            !connection.usable(),
+            "and the pool would not reuse the connection"
+        );
     }
 
     #[test]

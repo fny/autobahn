@@ -896,7 +896,51 @@ impl<'a> Worker<'a> {
     /// would let a waiting successor acquire the session and publish a newer
     /// status that this worker's stale error write then overwrites.
     fn attempt(&mut self) -> Result<(CycleDigest, CycleReport)> {
-        let result = (|| {
+        // A connection that died underneath the session is reconnected
+        // once, right now, before anything is recorded. A laptop waking
+        // from sleep finds every connection it held dead; the reconnect
+        // usually succeeds at once, and then nothing was ever wrong. If
+        // it fails, *that* failure is recorded — the honest one, typed by
+        // how the connection could not be made.
+        let mut retried = false;
+        let result = loop {
+            let outcome = self.attempt_once();
+            if let Err(error) = &outcome {
+                if !retried && crate::transport::mux::ConnectionFailed::is_in(error) {
+                    crate::debug!(
+                        "[{}] the connection failed ({error:#}); reconnecting once",
+                        self.plan.display()
+                    );
+                    retried = true;
+                    self.session = None;
+                    continue;
+                }
+            }
+            break outcome;
+        };
+        if let Ok((digest, _)) = &result {
+            self.cycles += digest.cycles;
+        }
+        // Peering: the alpha is back and level. A beta leads only while
+        // the alpha is away, so one settled cycle with the alpha attached
+        // hands the lead back to it.
+        if let (Ok((_, report)), Some(peering)) = (&result, self.peering) {
+            if self.peer_side() == crate::peering::PeerSide::Alpha
+                && report.settled()
+                && matches!(peering.role(), crate::peering::Role::Leader { .. })
+            {
+                if let Err(error) = peering.yield_to(crate::peering::ALPHA) {
+                    crate::complain!("[{}] unable to yield: {error:#}", self.plan.display());
+                }
+            }
+        }
+        result
+    }
+
+    /// One attempt, as [`attempt`](Worker::attempt) makes it: connect if
+    /// not connected, then run a cycle.
+    fn attempt_once(&mut self) -> Result<(CycleDigest, CycleReport)> {
+        (|| {
             // Peering first: a handoff is handed on, and a follower
             // connects nothing.
             self.hand_on()?;
@@ -986,24 +1030,7 @@ impl<'a> Worker<'a> {
                 );
             }
             outcome
-        })();
-        if let Ok((digest, _)) = &result {
-            self.cycles += digest.cycles;
-        }
-        // Peering: the alpha is back and level. A beta leads only while
-        // the alpha is away, so one settled cycle with the alpha attached
-        // hands the lead back to it.
-        if let (Ok((_, report)), Some(peering)) = (&result, self.peering) {
-            if self.peer_side() == crate::peering::PeerSide::Alpha
-                && report.settled()
-                && matches!(peering.role(), crate::peering::Role::Leader { .. })
-            {
-                if let Err(error) = peering.yield_to(crate::peering::ALPHA) {
-                    crate::complain!("[{}] unable to yield: {error:#}", self.plan.display());
-                }
-            }
-        }
-        result
+        })()
     }
 
     /// Concludes an attempt: records its status (while any held lock is
@@ -1258,7 +1285,12 @@ impl<'a> Worker<'a> {
                 } else if error
                     .downcast_ref::<crate::endpoint::remote::Unreachable>()
                     .is_some()
+                    || crate::transport::mux::ConnectionFailed::is_in(error)
                 {
+                    // A connection that failed underneath the session is
+                    // the host being away, however the transport worded
+                    // it — and the alerter's patience for a host being
+                    // away is the right patience for it.
                     "unreachable"
                 } else {
                     "errored"
@@ -1825,7 +1857,16 @@ pub fn alert_summary(status: &SessionStatus) -> String {
         "unreachable" => {
             parts.push(unreachable_reason(status.error.as_deref().unwrap_or("")).to_owned())
         }
-        state @ ("halted" | "errored") => parts.push(state.to_owned()),
+        // The word alone told nobody anything: "errored" is every failure
+        // that is not a halt or an absent host. The message's last clause
+        // is the diagnosis, and it fits on the line.
+        state @ ("halted" | "errored") => match status.error.as_deref() {
+            Some(error) if !error.is_empty() => {
+                let clause = error.rsplit(": ").next().unwrap_or(error);
+                parts.push(format!("{state}: {clause}"));
+            }
+            _ => parts.push(state.to_owned()),
+        },
         _ => {
             if !status.conflicts.is_empty() {
                 parts.push(plural(status.conflicts.len(), "conflict"));
@@ -2613,6 +2654,45 @@ mod tests {
             run_cycles(&mut session, "test").expect("churn must not be reported as a failure");
         assert!(report.missing_staged_files, "the flag must survive the cap");
         assert_eq!(digest.cycles, MAXIMUM_FOLLOW_UP_CYCLES as u64 + 1);
+    }
+
+    /// The notification for an errored session carries the error's last
+    /// clause, not the bare word.
+    #[test]
+    fn an_errored_summary_says_what_the_error_was() {
+        let mut status = SessionStatus {
+            group: "g".into(),
+            host: "boite".into(),
+            alpha: "~/a".into(),
+            beta: "boite:~/a".into(),
+            mode: "two-way-conflict".into(),
+            state: "errored".into(),
+            cycles: 3,
+            last_alpha_transitions: 0,
+            last_beta_transitions: 0,
+            conflicts: Vec::new(),
+            conflict_details: Vec::new(),
+            blocked: Vec::new(),
+            error: Some(
+                "beta scan failed: the agent connection has failed: connection closed".into(),
+            ),
+            updated_at: 12345,
+            alpha_entries: 0,
+            beta_entries: 0,
+            moved_files: 0,
+            moved_bytes: 0,
+            role: String::new(),
+            term: 0,
+        };
+        assert_eq!(alert_summary(&status), "errored: connection closed");
+        status.error = None;
+        assert_eq!(alert_summary(&status), "errored");
+        status.state = "halted".into();
+        status.error = Some("halted: the synchronization root was deleted on one side".into());
+        assert_eq!(
+            alert_summary(&status),
+            "halted: the synchronization root was deleted on one side"
+        );
     }
 
     #[test]

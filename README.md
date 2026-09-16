@@ -115,11 +115,11 @@ curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.s
  - Installs `autobahn` to your `PATH`
  - Copies the agent bundle into `~/.autobahn/agents`, which is where the controller looks when it needs
 to bootstrap a host whose platform differs from your own.
- - `--prefix` chooses where the command goes
+ - `--bin-dir` chooses where the command goes
  - `--no-agents` skips the agent bundle (generally a bad idea)
  - `--version` pins a release.
 
-`AUTOBAHN_PREFIX` and `AUTOBAHN_HOME` set the same two destinations
+`AUTOBAHN_BIN_DIR` and `AUTOBAHN_HOME` set the same two destinations
 from the environment, for a non-interactive install.
 
 To do it by hand instead, grab a binary from [Releases](../../releases):

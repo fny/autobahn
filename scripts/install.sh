@@ -7,7 +7,7 @@
 #
 # or, having cloned the repository:
 #
-#   scripts/install.sh [--prefix DIR] [--version TAG] [--no-agents]
+#   scripts/install.sh [--bin-dir DIR] [--version TAG] [--no-agents]
 #
 # The command goes on your PATH; the agents go under ~/.autobahn, which is
 # where autobahn keeps everything else it owns. The agents are what let a
@@ -19,7 +19,10 @@
 set -eu
 
 REPO="fny/autobahn"
-PREFIX="${AUTOBAHN_PREFIX:-$HOME/.local/bin}"
+# The earlier name, AUTOBAHN_PREFIX, is still honoured: it was never a
+# prefix in the GNU sense (the binary went straight into it, not into
+# its bin/), which is why it was renamed.
+BIN_DIR="${AUTOBAHN_BIN_DIR:-${AUTOBAHN_PREFIX:-$HOME/.local/bin}}"
 STATE_HOME="${AUTOBAHN_HOME:-$HOME/.autobahn}"
 VERSION="latest"
 WITH_AGENTS=1
@@ -28,8 +31,8 @@ usage() {
     cat <<'USAGE'
 Usage: install.sh [options]
 
-  --prefix DIR    Install the command here (default: ~/.local/bin,
-                  or $AUTOBAHN_PREFIX)
+  --bin-dir DIR   Install the command here (default: ~/.local/bin,
+                  or $AUTOBAHN_BIN_DIR)
   --version TAG   Install this release rather than the latest one
   --no-agents     Skip the agent bundle. Only safe when every host you
                   synchronize with shares this machine's platform; the
@@ -40,7 +43,7 @@ USAGE
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --prefix) PREFIX="${2:?--prefix needs a directory}"; shift 2 ;;
+        --bin-dir|--prefix) BIN_DIR="${2:?$1 needs a directory}"; shift 2 ;;
         --version) VERSION="${2:?--version needs a tag}"; shift 2 ;;
         --no-agents) WITH_AGENTS=0; shift ;;
         --help|-h) usage; exit 0 ;;
@@ -145,13 +148,13 @@ else
 fi
 
 # the command
-mkdir -p "$PREFIX"
+mkdir -p "$BIN_DIR"
 chmod 755 "$WORK/autobahn"
 # Written to a temporary alongside the target and renamed, so a running
 # autobahn is never a half-written file.
-mv "$WORK/autobahn" "$PREFIX/.autobahn.install.$$"
-mv "$PREFIX/.autobahn.install.$$" "$PREFIX/autobahn"
-say "  installed $PREFIX/autobahn"
+mv "$WORK/autobahn" "$BIN_DIR/.autobahn.install.$$"
+mv "$BIN_DIR/.autobahn.install.$$" "$BIN_DIR/autobahn"
+say "  installed $BIN_DIR/autobahn"
 
 # the agents
 if [ "$WITH_AGENTS" -eq 1 ]; then
@@ -180,12 +183,12 @@ fi
 
 # is it reachable?
 case ":$PATH:" in
-    *":$PREFIX:"*) ;;
+    *":$BIN_DIR:"*) ;;
     *)
         say ""
-        say "$PREFIX is not on your PATH. Add it:"
+        say "$BIN_DIR is not on your PATH. Add it:"
         say ""
-        say "    export PATH=\"$PREFIX:\$PATH\""
+        say "    export PATH=\"$BIN_DIR:\$PATH\""
         say ""
         ;;
 esac

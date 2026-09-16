@@ -429,3 +429,205 @@ mod tests {
         assert_eq!(copy.ancestor.as_ref().map(|n| n.children().len()), Some(2));
     }
 }
+
+/// The star as a follower sees it: the plans it would run as leader, and
+/// where it stands in the order of succession.
+#[derive(Debug)]
+pub struct FollowerStar {
+    /// This host's own spec, as the leader named it.
+    pub name: String,
+    /// The plans this host runs when it leads: itself as the alpha, every
+    /// other beta as a beta. The configured alpha is not among them — it
+    /// is never dialed; it dials, and attaches (a later phase).
+    pub plans: Vec<crate::config::SessionPlan>,
+    /// The position in the order of succession: the alpha is 0, the
+    /// first beta 1, and so on. A candidate at position *n* waits *n − 1*
+    /// extra lease lifetimes before it acts, so the first live beta acts
+    /// first without anyone being asked.
+    pub position: usize,
+    /// The heartbeat interval, from the plans.
+    pub interval: Duration,
+    /// The peering timing, from the pushed configuration.
+    pub timing: crate::config::PeeringPlan,
+}
+
+/// The files a follower runs from, read from its peering directory.
+pub fn pushed_configuration(directory: &Path) -> Result<Option<(String, String)>> {
+    let Some(name) = read_pushed_file(directory, "name")? else {
+        return Ok(None);
+    };
+    let Some(config) = read_pushed_file(directory, "config.toml")? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        String::from_utf8(config).context("the pushed configuration is not UTF-8")?,
+        String::from_utf8(name).context("the pushed name is not UTF-8")?,
+    )))
+}
+
+/// Derives a follower's star from the leader's configuration and the name
+/// the leader gave this host.
+///
+/// The pushed configuration is the leader's star: a local alpha and remote
+/// betas, one of which is this host. Turned around, this host is the
+/// alpha — its own root, as a local path — and the other betas stay as
+/// they were. Groups not in a peering mode are the alpha's business and
+/// are dropped.
+pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<FollowerStar> {
+    let mut config: crate::config::Config =
+        toml::from_str(configuration).context("unable to parse the pushed configuration")?;
+    config.ignore_directory = Some(directory.join(crate::scan::ignorefile::DIRECTORY));
+    let timing = config.peering_plan()?;
+
+    // The name is matched against each beta entry as the leader would
+    // have spelled it in full: an entry without a path inherits the
+    // alpha's, which is how the leader's plans named this host.
+    let full = |entry: &str, alpha: &str| -> String {
+        let host_end = entry.find(':').unwrap_or(entry.len());
+        if host_end < entry.len() {
+            entry.to_owned()
+        } else {
+            format!("{entry}:{alpha}")
+        }
+    };
+    let mut position: Option<usize> = None;
+    let mut groups = std::collections::BTreeMap::new();
+    for (group_name, group) in &config.groups {
+        let mode = group.mode.as_deref().or(config.defaults.mode.as_deref());
+        let peering = match mode {
+            Some(mode) => crate::config::parse_mode_spec(mode)
+                .map(|(_, peering)| peering)
+                .unwrap_or(false),
+            None => false,
+        };
+        if !peering {
+            continue;
+        }
+        let Some(index) = group
+            .betas
+            .iter()
+            .position(|entry| full(entry, &group.alpha) == name)
+        else {
+            continue;
+        };
+        let own_path = name
+            .rsplit_once(':')
+            .map(|(_, path)| path.to_owned())
+            .unwrap_or_else(|| name.to_owned());
+        let mut turned = crate::config::Group {
+            alpha: own_path,
+            betas: group
+                .betas
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, entry)| full(entry, &group.alpha))
+                .collect(),
+            ..group.clone()
+        };
+        // The mode spelling is kept as written, so the plans say
+        // "peering" and carry the timing.
+        turned.mode = Some(mode.unwrap_or_default().to_owned());
+        groups.insert(group_name.clone(), turned);
+        position = Some(match position {
+            Some(existing) => existing.min(index + 1),
+            None => index + 1,
+        });
+    }
+    let Some(position) = position else {
+        bail!("{name:?} is not a beta of any peering group in the pushed configuration");
+    };
+    config.groups = groups;
+    let plans = config
+        .plans()
+        .context("unable to plan the follower's star")?;
+    let interval = plans
+        .iter()
+        .map(|plan| plan.interval)
+        .min()
+        .unwrap_or(Duration::from_secs(5));
+    Ok(FollowerStar {
+        name: name.to_owned(),
+        plans,
+        position,
+        interval,
+        timing,
+    })
+}
+
+/// How long a candidate at `position` waits past a stale lease before it
+/// acts: the configured wait, plus one lease lifetime for every member
+/// ahead of it in the order of succession other than the alpha.
+pub fn takeover_wait(position: usize, timing: &crate::config::PeeringPlan) -> Duration {
+    let ahead = position.saturating_sub(1) as u32;
+    timing.failover_after + timing.ttl.saturating_mul(ahead)
+}
+
+#[cfg(test)]
+mod star_tests {
+    use super::*;
+
+    const PUSHED: &str = r#"
+        [advanced.peering-experimental]
+        ttl = "10s"
+        failover_after = "20s"
+
+        [defaults]
+        mode = "two-way-conflict"
+
+        [groups.plain]
+        alpha = "/tmp/plain"
+        betas = ["x@h:/tmp/plain"]
+
+        [groups.g]
+        mode = "peering-conflict-experimental"
+        alpha = "/home/faraz/Workspace/Voltai"
+        betas = ["ubuntu@vm", "box2:/srv/ws"]
+        ignores = ["target"]
+    "#;
+
+    #[test]
+    fn a_follower_turns_the_star_around() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let star = derive_star(
+            PUSHED,
+            "ubuntu@vm:/home/faraz/Workspace/Voltai",
+            keep.path(),
+        )
+        .expect("a star");
+        assert_eq!(star.position, 1);
+        assert_eq!(
+            star.plans.len(),
+            1,
+            "the plain group is dropped: {:?}",
+            star.plans
+        );
+        let plan = &star.plans[0];
+        assert_eq!(plan.group, "g");
+        assert_eq!(plan.beta_spec(), "box2:/srv/ws");
+        assert!(
+            matches!(&plan.alpha, crate::config::EndpointTarget::Local(path)
+            if path == std::path::Path::new("/home/faraz/Workspace/Voltai"))
+        );
+        assert!(plan.peering.is_some());
+        assert!(plan.ignores.iter().any(|p| p == "target"));
+        assert_eq!(star.timing.ttl, Duration::from_secs(10));
+        assert_eq!(
+            takeover_wait(star.position, &star.timing),
+            Duration::from_secs(20)
+        );
+
+        let second = derive_star(PUSHED, "box2:/srv/ws", keep.path()).expect("a star");
+        assert_eq!(second.position, 2);
+        assert_eq!(
+            second.plans[0].beta_spec(),
+            "ubuntu@vm:/home/faraz/Workspace/Voltai"
+        );
+        assert_eq!(
+            takeover_wait(second.position, &second.timing),
+            Duration::from_secs(30)
+        );
+
+        assert!(derive_star(PUSHED, "nobody:/x", keep.path()).is_err());
+    }
+}

@@ -26,6 +26,8 @@ use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{EndpointTarget, SessionPlan};
+
+pub mod peer;
 use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
@@ -217,6 +219,9 @@ pub struct PeeringContext {
     /// This machine's own peering directory, where its role is remembered
     /// across restarts.
     directory: PathBuf,
+    /// Where the ignore files the configuration names are: the alpha's
+    /// own `ignores/`, or the pushed copies for a beta that leads.
+    ignores_directory: PathBuf,
     /// The role, shared with every worker.
     role: Arc<Mutex<crate::peering::Role>>,
 }
@@ -249,8 +254,22 @@ impl PeeringContext {
         Ok(PeeringContext {
             config_path,
             directory,
+            ignores_directory: crate::paths::default_state_root()?
+                .join(crate::scan::ignorefile::DIRECTORY),
             role: Arc::new(Mutex::new(role)),
         })
+    }
+
+    /// The context for a beta that took the lead: it leads as `leader`
+    /// (its own spec) at `term`, runs the pushed configuration, and
+    /// pushes the pushed ignore files on.
+    pub fn for_leader(directory: PathBuf, leader: String, term: u64) -> PeeringContext {
+        PeeringContext {
+            config_path: directory.join("config.toml"),
+            ignores_directory: directory.join(crate::scan::ignorefile::DIRECTORY),
+            directory,
+            role: Arc::new(Mutex::new(crate::peering::Role::Leader { leader, term })),
+        }
     }
 
     /// The role as it stands.
@@ -293,8 +312,8 @@ impl PeeringContext {
             .with_context(|| format!("unable to read {}", self.config_path.display()))?;
         files.push(("config.toml".to_owned(), config));
         files.push(("name".to_owned(), beta_spec.as_bytes().to_vec()));
-        let ignores = crate::paths::default_state_root()?.join(crate::scan::ignorefile::DIRECTORY);
-        if let Ok(entries) = std::fs::read_dir(&ignores) {
+        let ignores = &self.ignores_directory;
+        if let Ok(entries) = std::fs::read_dir(ignores) {
             let mut names: Vec<_> = entries
                 .filter_map(|entry| entry.ok())
                 .filter(|entry| entry.path().is_file())

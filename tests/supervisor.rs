@@ -2036,3 +2036,147 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     assert!(!beta.join("hello.txt").exists());
     assert_eq!(world.status(&plan).expect("a status").state, "following");
 }
+
+/// Peering, phase 4: a peer whose lease has been stale for its wait takes
+/// the lead at the next term, runs the leader's star turned around, and
+/// reaches the other beta; the old leader, back at its old term, is fenced.
+#[test]
+fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
+    use autobahn::peering::{self, Lease};
+    use autobahn::supervisor::PeeringContext;
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let world = World::new();
+    // Three machines: the alpha (never dialed here), this peer, and one
+    // other beta. Each beta has its own home, so its agent's peering
+    // directory is its own.
+    let peer_root = world.directory("peer-root");
+    let peer_home = world.directory("peer-home");
+    let other_root = world.directory("other-root");
+    let other_home = world.directory("other-home");
+    write(&peer_root, "from-peer.txt", "from the peer");
+    let other_script = world.path("other-agent.sh");
+    fs::write(
+        &other_script,
+        format!(
+            "#!/bin/sh\nHOME={home} exec {agent} agent\n",
+            home = other_home.display(),
+            agent = agent_binary()
+        ),
+    )
+    .expect("script");
+    let mut permissions = fs::metadata(&other_script).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&other_script, permissions).expect("executable");
+
+    // What the alpha pushed to this peer: its own star, with a lease
+    // lifetime and a wait short enough for a test.
+    let pushed = format!(
+        r#"
+        [advanced.peering-experimental]
+        ttl = "1s"
+        failover_after = "1s"
+
+        [groups.g]
+        mode = "peering-conflict-experimental"
+        alpha = "/nonexistent/alpha"
+        agent_command = "{script}"
+        betas = ["peer:{peer_root}", "other:{other_root}"]
+        "#,
+        script = other_script.display(),
+        peer_root = peer_root.display(),
+        other_root = other_root.display(),
+    );
+    let name = format!("peer:{}", peer_root.display());
+    let peering_directory = peer_home.join(".autobahn").join("peering");
+    peering::write_pushed_file(&peering_directory, "config.toml", pushed.as_bytes()).unwrap();
+    peering::write_pushed_file(&peering_directory, "name", name.as_bytes()).unwrap();
+    // The alpha's lease, last renewed a while ago.
+    let stale = Lease {
+        leader: peering::ALPHA.to_owned(),
+        term: 3,
+        renewed_at: peering::now_seconds().saturating_sub(120),
+        ttl_seconds: 1,
+    };
+    peering::write_lease(&peering_directory, &stale).unwrap();
+
+    let stop = AtomicBool::new(false);
+    let state_root = world.state_root();
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let peer = scope.spawn(|| {
+            autobahn::supervisor::peer::run(&peering_directory, &state_root, false, &stop)
+        });
+        // The peer takes the lead and its file reaches the other beta.
+        assert!(
+            wait_until(Duration::from_secs(20), || other_root
+                .join("from-peer.txt")
+                .exists()),
+            "the peer's file should reach the other beta"
+        );
+        let own = peering::read_lease(&peering_directory)
+            .expect("readable")
+            .expect("written");
+        assert_eq!((own.leader.as_str(), own.term), (name.as_str(), 4));
+        let theirs = other_home.join(".autobahn").join("peering");
+        assert!(
+            wait_until(Duration::from_secs(10), || {
+                peering::read_lease(&theirs)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|lease| lease.term == 4 && lease.leader == name)
+            }),
+            "the other beta holds the peer's lease"
+        );
+        assert_eq!(
+            fs::read_to_string(theirs.join("name")).expect("name pushed on"),
+            format!("other:{}", other_root.display())
+        );
+        assert_eq!(
+            fs::read_to_string(theirs.join("config.toml")).expect("config pushed on"),
+            pushed
+        );
+
+        // The old leader comes back at its old term and is fenced on the
+        // other beta: it steps down, writes nothing.
+        let old_alpha = world.directory("alpha-root");
+        write(&old_alpha, "from-alpha.txt", "late");
+        let plans = world.plans(&format!(
+            r#"
+            [groups.g]
+            mode = "peering-conflict-experimental"
+            alpha = "{alpha}"
+            agent_command = "{script}"
+            betas = ["other:{other_root}"]
+            "#,
+            alpha = old_alpha.display(),
+            script = other_script.display(),
+            other_root = other_root.display(),
+        ));
+        let alpha_directory = world.path("alpha-peering");
+        peering::write_lease(
+            &alpha_directory,
+            &Lease::new(peering::ALPHA, 3, Duration::from_secs(30)),
+        )
+        .unwrap();
+        let outcomes = Supervisor::new(plans.clone(), world.path("alpha-state"), false)
+            .with_peering(
+                PeeringContext::for_alpha(world.path("config.toml"), alpha_directory.clone())
+                    .expect("context"),
+            )
+            .run_once();
+        assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
+        assert!(!other_root.join("from-alpha.txt").exists());
+        let recorded = peering::read_lease(&alpha_directory)
+            .expect("readable")
+            .expect("recorded");
+        assert_eq!(
+            (recorded.leader.as_str(), recorded.term),
+            (name.as_str(), 4)
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        peer.join().expect("the peer thread").expect("the peer ran");
+    });
+}

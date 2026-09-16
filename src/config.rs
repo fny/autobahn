@@ -185,6 +185,12 @@ pub struct Config {
     /// Tuning that has a correct value already.
     #[serde(default)]
     pub advanced: Advanced,
+    /// Where `ignore_files` entries are looked up when set: a peer runs the
+    /// leader's pushed configuration against the pushed ignore files,
+    /// not against its own `~/.autobahn/ignores`. Never read from the
+    /// file itself.
+    #[serde(skip)]
+    pub ignore_directory: Option<PathBuf>,
     /// Retired. Kept only so that a configuration written against the old
     /// shape gets an answer rather than "unknown field `alerts`".
     pub alerts: Option<toml::Value>,
@@ -340,7 +346,7 @@ pub struct Defaults {
 
 /// A size limit as written in the configuration: a raw byte count or a
 /// suffixed string.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(untagged)]
 pub enum SizeSpec {
     /// A raw byte count.
@@ -351,7 +357,7 @@ pub enum SizeSpec {
 
 /// One synchronization group: a local alpha directory fanned out to one or
 /// more beta destinations.
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     /// The alpha synchronization root: a local path (`~` is expanded) or a
@@ -701,9 +707,12 @@ impl Config {
         // Nothing is read unless a group names a file, so a reader who
         // does not use the directory never pays for it — or notices that
         // it is missing.
-        let ignore_directory = crate::paths::default_state_root()
-            .map(|root| root.join(crate::scan::ignorefile::DIRECTORY))
-            .unwrap_or_default();
+        let ignore_directory = match &self.ignore_directory {
+            Some(directory) => directory.clone(),
+            None => crate::paths::default_state_root()
+                .map(|root| root.join(crate::scan::ignorefile::DIRECTORY))
+                .unwrap_or_default(),
+        };
         let mut plans = Vec::new();
         // Two plans over the same roots would synchronize the same trees
         // concurrently (and, when textually identical, share session state),

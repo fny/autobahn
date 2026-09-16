@@ -55,14 +55,14 @@ Rules the build must keep:
 
 ## Phase 4 — the follower and the takeover
 
-- [ ] `autobahn watch` on a host whose `peering/name` exists runs as a follower from `peering/config.toml`
-- [ ] The follower reads `peering/lease.json` each interval; stale for `failover_after` → candidate
-- [ ] Candidate order: the alpha, then the betas as listed; a candidate yields to a higher one that answers
-- [ ] Takeover: `term + 1`, lease on self, lease on every reachable peer, then sessions with self as alpha
-- [ ] Plans re-derived: own spec → local path, alpha → a remote spec of the alpha (only if reachable), other betas unchanged
-- [ ] Ancestors seeded from `peering/ancestors/` for the pairs it holds; a pair it does not hold starts without one
-- [ ] `peering-alpha-experimental`: the configured alpha stays the alpha of every pair it is in
-- [ ] Tests: a stale lease promotes the first beta; a second beta waits for the first; a returning old leader is fenced
+- [x] `autobahn watch` on a host whose `peering/name` exists runs `supervisor::peer::run` from `peering/config.toml`; a configuration of its own alongside is refused, not ignored
+- [x] The follower reads `peering/lease.json` each interval and writes `peering/follower.json`; stale for its wait → candidate. `autobahn status` on a peer shows the pushed star and the lease's standing
+- [x] Candidate order by stagger, not by asking: position *n* waits `failover_after + (n − 1) × ttl`. Two candidates at once are settled by the fence (same term, second leader refused)
+- [x] Takeover: `term + 1`, lease on self (renewed every `ttl / 2` while leading), then a supervisor whose sessions present the lease to every other beta on their first cycle
+- [x] Plans re-derived (`peering::derive_star`): own spec → local path, other betas unchanged, plain groups dropped. The configured alpha is *not* in the star — it dials in (phase 5)
+- [ ] Ancestors seeded from `peering/ancestors/` for the (alpha, me) pair when the alpha attaches (phase 5); a (me, other) pair starts without one
+- [ ] `peering-alpha-experimental`: the configured alpha stays the alpha of every pair it is in (phase 5, with the attach)
+- [x] Tests: `a_follower_turns_the_star_around` (unit); `a_peer_takes_the_lead_when_the_lease_goes_stale` (supervisor suite, real agents) — the takeover reaches the other beta with lease, name and config, and the returning old leader is fenced and steps down
 
 ## Phase 5 — the alpha dials in, and the handoff
 

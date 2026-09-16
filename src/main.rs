@@ -880,6 +880,45 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
 }
 
 /// Loads the groups configuration from an explicit or default path.
+/// On a peer — a machine a leader pushed a name to, with no configuration
+/// of its own — the plans are the leader's star turned around, and a line
+/// says what the peer is doing about the lease. `None` anywhere else.
+fn peer_plans(
+    config: &Option<PathBuf>,
+) -> Result<Option<(Vec<autobahn::config::SessionPlan>, String)>> {
+    if config.is_some() {
+        return Ok(None);
+    }
+    let directory = autobahn::peering::directory()?;
+    if !autobahn::supervisor::peer::is_peer(&directory) || paths::default_config_path()?.is_file() {
+        return Ok(None);
+    }
+    let Some((configuration, name)) = autobahn::peering::pushed_configuration(&directory)? else {
+        return Ok(None);
+    };
+    let star = autobahn::peering::derive_star(&configuration, &name, &directory)?;
+    let header = match autobahn::supervisor::peer::read_status(&directory)? {
+        Some(status) => match &status.lease {
+            Some(lease) => format!(
+                "peer {name}: {} leads at term {}; the lease is {}{}\n",
+                lease.leader,
+                lease.term,
+                status.standing,
+                match status.standing.as_str() {
+                    "fresh" => String::new(),
+                    _ => format!(
+                        " for {}s (this peer acts after {}s)",
+                        status.stale_seconds, status.wait_seconds
+                    ),
+                }
+            ),
+            None => format!("peer {name}: no lease yet; waiting for the leader\n"),
+        },
+        None => format!("peer {name}: not running; start it with `autobahn watch`\n"),
+    };
+    Ok(Some((star.plans, header)))
+}
+
 fn load_config(path: Option<PathBuf>) -> Result<Config> {
     let path = match path {
         Some(path) => path,
@@ -948,6 +987,34 @@ fn run_watch(
     log: bool,
     debug: bool,
 ) -> Result<()> {
+    let config_path = match &config {
+        Some(path) => path.clone(),
+        None => paths::default_config_path()?,
+    };
+    // A peer — a machine some leader pushed a name to — runs the leader's
+    // configuration, turned around, and not one of its own. The two
+    // cannot run side by side yet, so a configuration of its own is
+    // refused rather than quietly ignored.
+    if config.is_none() {
+        let directory = autobahn::peering::directory()?;
+        if autobahn::supervisor::peer::is_peer(&directory) {
+            if config_path.is_file() {
+                bail!(
+                    "this machine is a peer of another autobahn (it holds {}), and a                      configuration of its own at {} cannot run alongside that yet; move one                      of them aside",
+                    directory.join("name").display(),
+                    config_path.display()
+                );
+            }
+            autobahn::logging::set_level(match debug {
+                true => Some(autobahn::logging::Level::Debug),
+                false => None,
+            });
+            let state_root = resolve_state_root(state_root)?;
+            println!("following as a peer; status is available via `autobahn status`");
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            return autobahn::supervisor::peer::run(&directory, &state_root, !log, &stop);
+        }
+    }
     let configuration = load_config(config)?;
     let plans = configuration.plans()?;
     if plans.is_empty() {
@@ -2637,7 +2704,15 @@ fn run_status(
     live: bool,
     json: bool,
 ) -> Result<()> {
-    let plans = load_config(config)?.plans()?;
+    let plans = match peer_plans(&config)? {
+        Some((plans, header)) => {
+            if !json {
+                println!("{header}");
+            }
+            plans
+        }
+        None => load_config(config)?.plans()?,
+    };
     let state_root = resolve_state_root(state_root)?;
 
     let selection = select(&plans, group.as_deref(), host.as_deref())?;

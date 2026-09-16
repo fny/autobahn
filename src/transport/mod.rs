@@ -595,7 +595,10 @@ fn serve_channel<W: Write>(
                 // claiming this tree as its own would let the next scan
                 // answer "unchanged" for a hierarchy it never received.
                 if outcome.is_ok() && last_sent.is_some() {
-                    anchor = Anchor::To(endpoint.snapshot().cloned());
+                    anchor = Anchor::To(anchor_after_transition(
+                        last_sent.as_ref(),
+                        endpoint.snapshot(),
+                    ));
                 }
                 outcome.map(Response::Transition)
             }
@@ -634,6 +637,26 @@ fn serve_channel<W: Write>(
 /// obtain the exact bytes a delta was computed against.
 pub fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
     bincode::serialize(snapshot).context("unable to encode the snapshot")
+}
+
+/// What this channel should record as sent, once a transition succeeds.
+///
+/// Both sides fold the same achieved results, but from different copies.
+/// The controller folds the snapshot it last received and keeps that copy's
+/// scan stamp. This side's endpoint has already moved its stamp on, at a
+/// rescan that reported itself unchanged and so never reached the
+/// controller. The trees agree and the stamp does not, and the baseline is
+/// agreed by a digest over the whole encoding — so without carrying the
+/// controller's stamp across, the next delta names a baseline it cannot
+/// reproduce and the snapshot is resent in full.
+///
+/// The root is untouched, so the storage sharing that lets the next scan of
+/// an untouched tree report itself unchanged still holds.
+fn anchor_after_transition(sent: Option<&Snapshot>, folded: Option<&Snapshot>) -> Option<Snapshot> {
+    let sent = sent?;
+    let mut folded = folded?.clone();
+    folded.scanned_at_seconds = sent.scanned_at_seconds;
+    Some(folded)
 }
 
 /// Prepares a snapshot for transmission as a delta against `baseline` (the
@@ -1216,6 +1239,68 @@ pub(crate) mod tests {
     use std::sync::mpsc::{channel, Receiver, Sender};
 
     use crate::endpoint::FileRequest;
+
+    /// What this channel recorded as sent must encode exactly as the
+    /// controller's own model does. Every delta names its baseline by a
+    /// digest over that encoding, so one differing field costs a full
+    /// resend — and content equality, which is what the transition tests
+    /// assert, cannot see a difference like that.
+    #[test]
+    fn a_transition_anchors_to_what_the_controller_will_hold() {
+        use crate::tree::{Content, FileMetadata, Node};
+
+        let file = |name: &str, digest_byte: u8| Node {
+            name: name.to_owned(),
+            content: Content::File {
+                digest: [digest_byte; 32],
+                executable: false,
+                metadata: FileMetadata::default(),
+            },
+        };
+        // What the controller last received, stamped when that scan ran.
+        let sent = Snapshot {
+            root: Some(Node::directory("", vec![file("a", 1)])),
+            files: 1,
+            directories: 1,
+            symlinks: 0,
+            total_file_size: 0,
+            scanned_at_seconds: 100,
+            preserves_executability: true,
+        };
+        // A transition adds a file. Both sides fold the same achieved
+        // result, the controller from the snapshot above.
+        let transitions = vec![crate::tree::Change {
+            path: "b".to_owned(),
+            old: None,
+            new: Some(file("b", 2)),
+        }];
+        let outcome = crate::endpoint::TransitionOutcome {
+            results: vec![Some(file("b", 2))],
+            problems: Vec::new(),
+            missing_staged_files: false,
+            missing_staged: Vec::new(),
+        };
+        let controller = crate::endpoint::fold_transition(&sent, &transitions, &outcome)
+            .expect("the controller folds its own copy");
+
+        // This side's endpoint folded the same way, but a rescan that
+        // reported itself unchanged has since moved its scan stamp on.
+        let mut endpoint = controller.clone();
+        endpoint.scanned_at_seconds = 200;
+        assert_ne!(
+            encode_snapshot(&endpoint).expect("encodes"),
+            encode_snapshot(&controller).expect("encodes"),
+            "the fixture must reproduce the disagreement being guarded against"
+        );
+
+        let anchored = anchor_after_transition(Some(&sent), Some(&endpoint))
+            .expect("an anchor, once something has been sent");
+        assert_eq!(
+            encode_snapshot(&anchored).expect("encodes"),
+            encode_snapshot(&controller).expect("encodes"),
+            "the record of what was sent must encode as the controller's model does"
+        );
+    }
     use crate::tree::DIGEST_SIZE;
 
     /// The reading half of an in-memory pipe. Chunks arrive over a channel

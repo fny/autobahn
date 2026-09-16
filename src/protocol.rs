@@ -232,7 +232,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 10;
+pub const COMPATIBILITY_EPOCH: u32 = 11;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

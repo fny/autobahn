@@ -90,6 +90,9 @@ struct MenuModel {
 struct GroupItems {
     submenu: Submenu,
     sessions: Vec<SessionItems>,
+    /// The health its dot was last drawn for. Redrawing an unchanged dot
+    /// every poll would rebuild an image a few times a second for nothing.
+    health: Option<Health>,
 }
 
 struct SessionItems {
@@ -394,7 +397,11 @@ impl App {
                 });
             }
             let _ = menu.append(&submenu);
-            groups.push(GroupItems { submenu, sessions });
+            groups.push(GroupItems {
+                submenu,
+                sessions,
+                health: None,
+            });
         }
         let _ = menu.append(&PredefinedMenuItem::separator());
 
@@ -473,9 +480,26 @@ impl App {
         set_optional(&model.menu, &model.summary, &mut model.error, error_text);
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
+            // The menu bar carries the name of whatever needs attention.
+            // One group is named outright; several are the worst one and
+            // a count, because the menu bar is not a place for a list.
+            let troubled = troubled_groups(report);
+            let title = match troubled.split_first() {
+                None => None,
+                Some((first, [])) => Some(first.clone()),
+                Some((first, rest)) => Some(format!("{first} +{}", rest.len())),
+            };
+            tray.set_title(title.as_deref());
         }
 
         for (group, items) in report.groups.iter().zip(model.groups.iter_mut()) {
+            // The row carries its own state, so the group that needs a
+            // person is visible in the menu without opening its submenu.
+            let health = group_health(group, report.supervisor_running);
+            if items.health != Some(health) {
+                items.submenu.set_icon(Some(status_dot(health)));
+                items.health = Some(health);
+            }
             for (session, entry) in group.sessions.iter().zip(items.sessions.iter_mut()) {
                 // A session that is working says so; one that is not is
                 // described by how its last cycle ended. The same rule the
@@ -903,6 +927,108 @@ fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
             )
         })
         .collect()
+}
+
+/// The groups that need a person, worst first.
+///
+/// The coloured dot says *that* something is wrong; this says *which*,
+/// beside the icon, without opening the menu. It mirrors the states
+/// `health_of` treats as trouble, so the name and the colour can never
+/// disagree about whether there is a problem.
+fn troubled_groups(report: &StatusReport) -> Vec<String> {
+    if !report.supervisor_running {
+        return Vec::new();
+    }
+    // Lower ranks are worse, so the group named first is the one to look
+    // at first.
+    let rank = |state: &str| match state {
+        "halted" | "unreachable" | "errored" => Some(0u8),
+        "conflicts" | "blocked" => Some(1u8),
+        _ => None,
+    };
+    let mut troubled: Vec<(u8, String)> = report
+        .groups
+        .iter()
+        .filter_map(|group| {
+            group
+                .sessions
+                .iter()
+                .filter_map(|session| rank(session.state.as_str()))
+                .min()
+                .map(|worst| (worst, group.name.clone()))
+        })
+        .collect();
+    troubled.sort_by_key(|(worst, _)| *worst);
+    troubled.into_iter().map(|(_, name)| name).collect()
+}
+
+/// One group's state: its unhappiest session decides.
+///
+/// The same states `health_of` treats as trouble, so a group's dot and the
+/// icon's colour can never disagree.
+fn group_health(group: &crate::supervisor::GroupReport, supervisor_running: bool) -> Health {
+    if !supervisor_running {
+        return Health::Idle;
+    }
+    // Worst wins, and a session that has never run is not yet good news.
+    let rank = |health: Health| match health {
+        Health::Bad => 3u8,
+        Health::Attention => 2,
+        Health::Idle => 1,
+        Health::Good => 0,
+    };
+    let mut worst = Health::Good;
+    for session in &group.sessions {
+        let health = match session.state.as_str() {
+            "halted" | "unreachable" | "errored" => Health::Bad,
+            "conflicts" | "blocked" => Health::Attention,
+            "never-run" => Health::Idle,
+            _ => Health::Good,
+        };
+        if rank(health) > rank(worst) {
+            worst = health;
+        }
+    }
+    worst
+}
+
+/// A group's state as one dot, in the colours the icon already uses.
+///
+/// Menu images are pinned to 18 points, so this is drawn at 36 pixels —
+/// exactly twice, as the status icon is — and a retina menu gets it pixel
+/// for pixel. The dot is deliberately smaller than its box: it marks a row
+/// of text rather than standing as an icon of its own.
+fn status_dot(health: Health) -> muda::Icon {
+    const SIZE: u32 = 36;
+    const SS: u32 = 4;
+    const RADIUS: f32 = 7.5;
+    let (r, g, b) = match health {
+        Health::Idle => (142, 142, 147),
+        Health::Good => (52, 199, 89),
+        Health::Attention => (255, 204, 0),
+        Health::Bad => (255, 69, 58),
+    };
+    let centre = SIZE as f32 / 2.0;
+    let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
+    for py in 0..SIZE {
+        for px in 0..SIZE {
+            // Coverage of this pixel by the circle, in subsamples, so the
+            // edge is smooth at this size.
+            let mut covered = 0u32;
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = px as f32 + (sx as f32 + 0.5) / SS as f32;
+                    let y = py as f32 + (sy as f32 + 0.5) / SS as f32;
+                    if ((x - centre).powi(2) + (y - centre).powi(2)).sqrt() <= RADIUS {
+                        covered += 1;
+                    }
+                }
+            }
+            let alpha = (covered * 255 / (SS * SS)) as u8;
+            rgba.extend_from_slice(&[r, g, b, alpha]);
+        }
+    }
+    muda::Icon::from_rgba(rgba, SIZE, SIZE).expect("a valid dot")
 }
 
 fn health_of(report: &StatusReport) -> Health {

@@ -45,13 +45,13 @@ Rules the build must keep:
 
 ## Phase 3 — the leader
 
-- [ ] `Supervisor` knows its role: `Leader { term }` / `Follower` / `Off`
-- [ ] Lease renewed on every peer at every cycle start, on the session's own channel
-- [ ] `Lease` refused → the worker records `stepped-down`, the supervisor stops leading
-- [ ] After a settled cycle: `AncestorRecord` to that session's beta; `AncestorCheckpoint` when the beta reports a mismatch
-- [ ] `config.toml`, ignore files and `name` pushed on first contact and whenever their digest changes
-- [ ] `role` and `term` in `SessionStatus`, `status --json`, and the `status` text
-- [ ] Tests (supervisor suite, real agents): the record reaches the agent; a fenced agent stops a leader
+- [x] `Supervisor` knows its role (`PeeringContext`, `peering::Role`): `Leader { leader, term }` / `Follower` / `Off`; the alpha resumes its term from its own `lease.json`, or follows if that file names a beta
+- [x] Lease presented on every cycle start, on the session's own channel (`Session::present_lease`); once per session the beta's copy generation is compared and a checkpoint sent if it differs
+- [x] `Lease` refused → `peering::Fenced`; the supervisor steps down for every session, records the beta's lease locally, and the status says `following`
+- [x] After the ancestor advances: `AncestorRecord` to the beta; `AncestorCheckpoint` when the copy reports another generation. Best effort — a miss costs a checkpoint later, never the cycle
+- [x] `config.toml`, every file in `ignores/`, and `name` pushed after the lease is accepted, whenever their digest changes
+- [x] `role` and `term` in `SessionStatus`, on the group in `status --json`, and on the group line of the `status` text
+- [x] Tests (supervisor suite, real agents under their own `HOME`): the lease, files and copy reach the agent; a fenced leader steps down and stays down across a restart
 
 ## Phase 4 — the follower and the takeover
 

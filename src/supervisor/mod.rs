@@ -152,6 +152,12 @@ pub struct SessionStatus {
     pub moved_files: u64,
     #[serde(default)]
     pub moved_bytes: u64,
+    /// Peering: the supervisor's role when this was recorded — `leader`,
+    /// `follower`, or empty for a plain mode — and its term.
+    #[serde(default)]
+    pub role: String,
+    #[serde(default)]
+    pub term: u64,
 }
 
 /// The outcome of one session's participation in a single-pass run.
@@ -193,6 +199,125 @@ pub struct Supervisor {
     /// What to run when sessions need attention. Nothing is observed or
     /// timed when nothing is configured to run.
     alerts: crate::alerts::AlertPlan,
+    /// Peering, when any plan is in a peering mode: the role this
+    /// supervisor holds, shared by its workers.
+    peering: Option<PeeringContext>,
+}
+
+/// Peering, from the supervisor's side: the role, and what the leader
+/// pushes to its followers.
+///
+/// The role is one value for the whole supervisor. A lease is per host,
+/// so a fence answered on any session means another controller leads,
+/// and every session of this supervisor stops writing together.
+pub struct PeeringContext {
+    /// The configuration file the leader pushes, read at push time so a
+    /// follower gets the file as it is on disk.
+    config_path: PathBuf,
+    /// This machine's own peering directory, where its role is remembered
+    /// across restarts.
+    directory: PathBuf,
+    /// The role, shared with every worker.
+    role: Arc<Mutex<crate::peering::Role>>,
+}
+
+impl PeeringContext {
+    /// The context for a supervisor that is the configured alpha: it
+    /// leads at the term its own lease file remembers, or at a first
+    /// term, unless that file says a beta led while it was away — then it
+    /// follows, and stays a follower until a later phase hands the lead
+    /// back.
+    pub fn for_alpha(config_path: PathBuf, directory: PathBuf) -> Result<PeeringContext> {
+        let role = match crate::peering::alpha_term(&directory)? {
+            crate::peering::AlphaStart::Lead { term } => {
+                let lease = crate::peering::Lease::new(
+                    crate::peering::ALPHA,
+                    term,
+                    crate::config::DEFAULT_PEERING_TTL,
+                );
+                crate::peering::write_lease(&directory, &lease)?;
+                crate::peering::Role::Leader {
+                    leader: crate::peering::ALPHA.to_owned(),
+                    term,
+                }
+            }
+            crate::peering::AlphaStart::Follow { lease } => crate::peering::Role::Follower {
+                leader: lease.leader,
+                term: lease.term,
+            },
+        };
+        Ok(PeeringContext {
+            config_path,
+            directory,
+            role: Arc::new(Mutex::new(role)),
+        })
+    }
+
+    /// The role as it stands.
+    pub fn role(&self) -> crate::peering::Role {
+        self.role
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Steps down: another controller holds `current` on some host. The
+    /// alpha's own lease file records it too, so a restart does not come
+    /// back leading.
+    fn step_down(&self, current: &crate::peering::Lease) {
+        let mut role = self.role.lock().unwrap_or_else(|error| error.into_inner());
+        if let crate::peering::Role::Follower { term, .. } = &*role {
+            if *term >= current.term {
+                return;
+            }
+        }
+        crate::complain!(
+            "peering: {} leads at term {}; stepping down",
+            current.leader,
+            current.term
+        );
+        *role = crate::peering::Role::Follower {
+            leader: current.leader.clone(),
+            term: current.term,
+        };
+        if let Err(error) = crate::peering::write_lease(&self.directory, current) {
+            crate::complain!("peering: unable to record the lease locally: {error:#}");
+        }
+    }
+
+    /// The files a follower needs, as they are on disk right now: the
+    /// configuration, and every ignore file the configuration can name.
+    fn pushed_files(&self, beta_spec: &str) -> Result<Vec<(String, Vec<u8>)>> {
+        let mut files = Vec::new();
+        let config = std::fs::read(&self.config_path)
+            .with_context(|| format!("unable to read {}", self.config_path.display()))?;
+        files.push(("config.toml".to_owned(), config));
+        files.push(("name".to_owned(), beta_spec.as_bytes().to_vec()));
+        let ignores = crate::paths::default_state_root()?.join(crate::scan::ignorefile::DIRECTORY);
+        if let Ok(entries) = std::fs::read_dir(&ignores) {
+            let mut names: Vec<_> = entries
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().is_file())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            for name in names {
+                let bytes = std::fs::read(ignores.join(&name))
+                    .with_context(|| format!("unable to read {}", ignores.join(&name).display()))?;
+                files.push((format!("ignores/{name}"), bytes));
+            }
+        }
+        Ok(files)
+    }
+}
+
+/// The error a worker's attempt ends with while its supervisor follows:
+/// nothing was connected, nothing was written.
+#[derive(Debug, thiserror::Error)]
+#[error("following {leader} at term {term}; this supervisor is not leading")]
+pub struct Following {
+    pub leader: String,
+    pub term: u64,
 }
 
 impl Supervisor {
@@ -205,6 +330,7 @@ impl Supervisor {
             verbose,
             pool: AgentPool::default(),
             alerts: crate::alerts::AlertPlan::default(),
+            peering: None,
         }
     }
 
@@ -213,6 +339,21 @@ impl Supervisor {
     pub fn with_alerts(mut self, alerts: crate::alerts::AlertPlan) -> Supervisor {
         self.alerts = alerts;
         self
+    }
+
+    /// Adopts a peering context, so that sessions in a peering mode lead
+    /// (or follow) rather than run as plain sessions.
+    pub fn with_peering(mut self, peering: PeeringContext) -> Supervisor {
+        self.peering = Some(peering);
+        self
+    }
+
+    /// The peering role, for a caller that wants to show it.
+    pub fn role(&self) -> crate::peering::Role {
+        match &self.peering {
+            Some(peering) => peering.role(),
+            None => crate::peering::Role::Off,
+        }
     }
 
     /// Runs one attempt of every session in parallel and returns their
@@ -230,6 +371,7 @@ impl Supervisor {
                     scope.spawn(move || {
                         let mut worker =
                             Worker::new(plan, &self.state_root, &self.pool, self.verbose);
+                        worker.peering = self.peering.as_ref();
                         let result = worker.attempt();
                         let recorded = worker.conclude(&result);
                         let result = match (result, recorded) {
@@ -389,6 +531,7 @@ impl Supervisor {
                     sleep_interruptible(stagger, stop);
 
                     let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
+                    worker.peering = self.peering.as_ref();
                     worker.progress = progress;
                     worker.published = Some(published);
                     let identifier = plan.identifier();
@@ -461,6 +604,12 @@ struct Worker<'a> {
     /// Where the last recorded status is shared with the alerter. Absent
     /// when nothing is alerting, so a single pass costs nothing.
     published: Option<Arc<Mutex<Option<SessionStatus>>>>,
+    /// Peering, when the supervisor has it and this plan is in a peering
+    /// mode.
+    peering: Option<&'a PeeringContext>,
+    /// A digest of the files last pushed to the beta, so they go again
+    /// only when they change.
+    pushed: Option<[u8; 32]>,
 }
 
 impl<'a> Worker<'a> {
@@ -482,7 +631,62 @@ impl<'a> Worker<'a> {
             progress: Arc::default(),
             published: None,
             reported: None,
+            peering: None,
+            pushed: None,
         }
+    }
+
+    /// Peering: the supervisor's role as it applies to this plan — `Off`
+    /// for a plan in a plain mode whatever the supervisor holds.
+    fn role(&self) -> crate::peering::Role {
+        match (self.peering, self.plan.peering) {
+            (Some(peering), Some(_)) => peering.role(),
+            _ => crate::peering::Role::Off,
+        }
+    }
+
+    /// Peering, before an attempt: refuses to run while the supervisor
+    /// follows, and otherwise hands the session the leadership to present.
+    /// Returns the leadership, so the caller can push files after the
+    /// session exists.
+    fn leadership(&self) -> Result<Option<crate::peering::Leadership>> {
+        let (Some(peering), Some(plan)) = (self.peering, self.plan.peering) else {
+            return Ok(None);
+        };
+        match peering.role() {
+            crate::peering::Role::Off => Ok(None),
+            crate::peering::Role::Follower { leader, term } => {
+                Err(Following { leader, term }.into())
+            }
+            crate::peering::Role::Leader { leader, term } => Ok(Some(crate::peering::Leadership {
+                leader,
+                term,
+                ttl: plan.ttl,
+            })),
+        }
+    }
+
+    /// Peering, once the session is up: pushes the follower's files when
+    /// they have changed since the last push.
+    fn push_files(&mut self) -> Result<()> {
+        let Some(peering) = self.peering else {
+            return Ok(());
+        };
+        let files = peering.pushed_files(&self.plan.beta_spec())?;
+        let mut hasher = blake3::Hasher::new();
+        for (name, bytes) in &files {
+            hasher.update(name.as_bytes());
+            hasher.update(&(bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        }
+        let digest = *hasher.finalize().as_bytes();
+        if self.pushed == Some(digest) {
+            return Ok(());
+        }
+        let session = self.session.as_mut().expect("the session exists");
+        session.push_peering_files(&files)?;
+        self.pushed = Some(digest);
+        Ok(())
     }
 
     /// Runs one attempt: connect if not connected, then run a cycle (plus
@@ -495,6 +699,8 @@ impl<'a> Worker<'a> {
     /// status that this worker's stale error write then overwrites.
     fn attempt(&mut self) -> Result<(CycleDigest, CycleReport)> {
         let result = (|| {
+            // Peering first: a follower connects nothing.
+            let leadership = self.leadership()?;
             if self.session.is_none() {
                 // Connecting is its own phase because it is its own wait:
                 // the first connection to a host installs the agent there,
@@ -511,6 +717,17 @@ impl<'a> Worker<'a> {
                 );
                 session.set_progress(self.progress.clone());
                 self.session = Some(session);
+            }
+            let leading = leadership.is_some();
+            let session = self.session.as_mut().expect("the session was just created");
+            session.set_leadership(leadership);
+            if leading {
+                // The lease before anything else: a host another leader
+                // holds refuses it here, and this attempt ends without
+                // having written a byte — not even the follower's files,
+                // which would otherwise overwrite the real leader's.
+                session.present_lease()?;
+                self.push_files()?;
             }
             let session = self.session.as_mut().expect("the session was just created");
             if std::mem::take(&mut self.verify_pending) {
@@ -573,6 +790,13 @@ impl<'a> Worker<'a> {
     /// pooled agent process outlives them and is reaped only once its last
     /// channel and handle are gone.
     fn conclude(&mut self, result: &Result<(CycleDigest, CycleReport)>) -> Result<()> {
+        // Peering: a refused lease steps the whole supervisor down, before
+        // the status is written, so the record already says "follower".
+        if let (Err(error), Some(peering)) = (result, self.peering) {
+            if let Some(fenced) = error.downcast_ref::<crate::peering::Fenced>() {
+                peering.step_down(&fenced.current);
+            }
+        }
         let recorded = self.record(result);
         if result.is_err() {
             self.session = None;
@@ -700,6 +924,8 @@ impl<'a> Worker<'a> {
             beta_entries: self.progress.beta.expected_total(),
             moved_files: self.progress.moved().0,
             moved_bytes: self.progress.moved().1,
+            role: self.role().label().to_owned(),
+            term: self.role().term(),
         };
         self.publish(&status);
         if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
@@ -748,6 +974,8 @@ impl<'a> Worker<'a> {
             beta_entries: self.progress.beta.expected_total(),
             moved_files: self.progress.moved().0,
             moved_bytes: self.progress.moved().1,
+            role: self.role().label().to_owned(),
+            term: self.role().term(),
         };
         match result {
             Ok((digest, report)) => {
@@ -798,6 +1026,13 @@ impl<'a> Worker<'a> {
                 // message silently reclassified a session.
                 status.state = if error.downcast_ref::<crate::session::SafetyHalt>().is_some() {
                     "halted"
+                } else if error.downcast_ref::<Following>().is_some()
+                    || error.downcast_ref::<crate::peering::Fenced>().is_some()
+                {
+                    // Not trouble: another controller leads, and this one
+                    // is waiting its turn. The alerter does not know the
+                    // word, so it never wakes anyone for it.
+                    "following"
                 } else if error
                     .downcast_ref::<crate::endpoint::remote::Unreachable>()
                     .is_some()
@@ -1076,6 +1311,10 @@ pub struct StatusReport {
 /// One group's report.
 #[derive(Clone, Debug, Serialize)]
 pub struct GroupReport {
+    /// Peering: the supervisor's role for this group as its sessions last
+    /// recorded it — `leader`, `follower`, or empty — and the term.
+    pub role: String,
+    pub term: u64,
     pub name: String,
     /// The alpha root as written in the configuration.
     pub alpha: String,
@@ -1206,6 +1445,10 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 .find(|session| session.group == plan.group && session.host == plan.host)
                 .map(|session| session.progress.clone())
         });
+        let (role, term) = status
+            .as_ref()
+            .map(|status| (status.role.clone(), status.term))
+            .unwrap_or_default();
         let session = match status {
             None => SessionReport {
                 host: plan.host.clone(),
@@ -1240,6 +1483,8 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         match groups.last_mut() {
             Some(group) if group.name == plan.group => group.sessions.push(session),
             _ => groups.push(GroupReport {
+                role: role.clone(),
+                term,
                 name: plan.group.clone(),
                 alpha: plan.alpha_spec.clone(),
                 sessions: vec![session],
@@ -2128,6 +2373,8 @@ mod tests {
             alpha_entries: 1_000,
             moved_files: 0,
             moved_bytes: 0,
+            role: String::new(),
+            term: 0,
             beta_entries: 1_002,
         };
         write_status(directory.path(), "abc123", &status).expect("status should write");

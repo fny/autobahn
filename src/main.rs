@@ -957,6 +957,16 @@ fn run_watch(
     // startup failure, not a silent no-op discovered on the night the
     // alert was meant to fire.
     let alerts = configuration.alert_plan()?;
+    // Peering, when any group asks for it. This machine is the configured
+    // alpha of every such group (the configuration says so), so it leads
+    // — unless its own lease file says a beta led while it was away.
+    let peering = match plans.iter().any(|plan| plan.peering.is_some()) {
+        true => Some(autobahn::supervisor::PeeringContext::for_alpha(
+            config_path,
+            autobahn::peering::directory()?,
+        )?),
+        false => None,
+    };
     // The level is settled before the first line is written. `--debug`
     // beats the file, and `AUTOBAHN_LOG` beats both, so a level can be
     // turned up for one run without editing anything.
@@ -979,7 +989,10 @@ fn run_watch(
             "supervising {} session(s); status is available via `autobahn status`",
             plans.len()
         );
-        let supervisor = Supervisor::new(plans, state_root, true).with_alerts(alerts);
+        let mut supervisor = Supervisor::new(plans, state_root, true).with_alerts(alerts);
+        if let Some(peering) = peering {
+            supervisor = supervisor.with_peering(peering);
+        }
         // Runs until the process is terminated: agent processes exit when
         // their connection streams close, so no explicit cleanup is needed.
         let stop = std::sync::atomic::AtomicBool::new(false);
@@ -998,7 +1011,10 @@ fn run_watch(
     let failure: Arc<Mutex<Option<String>>> = Arc::default();
     let reported = failure.clone();
     std::thread::spawn(move || {
-        let supervisor = Supervisor::new(plans, state_root, false).with_alerts(alerts);
+        let mut supervisor = Supervisor::new(plans, state_root, false).with_alerts(alerts);
+        if let Some(peering) = peering {
+            supervisor = supervisor.with_peering(peering);
+        }
         let stop = std::sync::atomic::AtomicBool::new(false);
         if let Err(error) = supervisor.run_watch(&stop) {
             *reported.lock().unwrap_or_else(|error| error.into_inner()) =
@@ -2720,9 +2736,17 @@ fn render_status(
         // The folder leads, because that is what the reader is thinking
         // about; the group name follows because that is what reset and
         // status take as an argument.
+        // Peering: the role and term ride on the group line, since they
+        // belong to the supervisor rather than to any one destination.
+        let role = block[0]
+            .1
+            .as_ref()
+            .filter(|status| !status.role.is_empty())
+            .map(|status| format!("  {} (term {})", status.role, status.term))
+            .unwrap_or_default();
         let _ = writeln!(
             out,
-            "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
+            "\x1b[1m{}\x1b[0m \x1b[2m{}{role}\x1b[0m",
             plan.alpha_spec, plan.group
         );
 

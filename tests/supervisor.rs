@@ -1852,3 +1852,187 @@ fn a_session_needing_attention_runs_the_configured_hook() {
             .expect("supervision should succeed");
     });
 }
+
+/// A wrapper that runs the agent under its own home directory, so the
+/// agent's `~/.autobahn/peering` is not the leader's: in production they
+/// are on different machines, and the leader's own peering directory holds
+/// its term while the agent's holds the lease it was given.
+fn peering_agent_script(world: &World, agent_home: &Path) -> PathBuf {
+    let script = world.path("peering-agent.sh");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nHOME={home} exec {agent} agent\n",
+            home = agent_home.display(),
+            agent = agent_binary()
+        ),
+    )
+    .expect("script should be writable");
+    let mut permissions = fs::metadata(&script).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&script, permissions).expect("script should be executable");
+    script
+}
+
+/// Peering, phase 3: a leading supervisor presents its lease, pushes the
+/// follower's files, and keeps the beta's ancestor copy level — all of it
+/// visible on the beta's host afterwards.
+#[test]
+fn a_peering_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
+    use autobahn::supervisor::PeeringContext;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let agent_home = world.directory("agent-home");
+    write(&alpha, "hello.txt", "hello");
+    let script = peering_agent_script(&world, &agent_home);
+    let configuration = format!(
+        r#"
+        [groups.g]
+        mode = "peering-conflict-experimental"
+        alpha = "{alpha}"
+        agent_command = "{script}"
+        betas = ["peer:{beta}"]
+        "#,
+        alpha = alpha.display(),
+        script = script.display(),
+        beta = beta.display(),
+    );
+    let plans = world.plans(&configuration);
+    let plan = plans[0].clone();
+    let leader_directory = world.path("leader-peering");
+    let context = || {
+        PeeringContext::for_alpha(world.path("config.toml"), leader_directory.clone())
+            .expect("a peering context")
+    };
+
+    let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
+        .with_peering(context())
+        .run_once();
+    assert_all_synchronized(&outcomes);
+    assert_eq!(read(&beta, "hello.txt"), "hello");
+
+    // The beta's host now holds everything a follower needs.
+    let peering = agent_home.join(".autobahn").join("peering");
+    let lease = autobahn::peering::read_lease(&peering)
+        .expect("lease readable")
+        .expect("a lease was written");
+    assert_eq!((lease.leader.as_str(), lease.term), ("alpha", 1));
+    assert_eq!(
+        fs::read_to_string(peering.join("name")).expect("name"),
+        plan.beta_spec()
+    );
+    assert_eq!(
+        fs::read_to_string(peering.join("config.toml")).expect("config"),
+        configuration
+    );
+    let copy = autobahn::peering::ancestor_copy_path(&peering, &plan.identifier());
+    assert!(
+        copy.exists(),
+        "the ancestor copy exists at {}",
+        copy.display()
+    );
+
+    // The leader remembers its own term, and the status says what it is.
+    let own = autobahn::peering::read_lease(&leader_directory)
+        .expect("lease readable")
+        .expect("the leader's own lease");
+    assert_eq!((own.leader.as_str(), own.term), ("alpha", 1));
+    let status = world.status(&plan).expect("a status");
+    assert_eq!((status.role.as_str(), status.term), ("leader", 1));
+    assert_eq!(status.state, "synchronized");
+
+    // A change on the alpha reaches the beta, and the copy follows the
+    // ancestor: it stands at the same generation the leader does.
+    write(&alpha, "more.txt", "more");
+    let outcomes = Supervisor::new(plans, world.state_root(), false)
+        .with_peering(context())
+        .run_once();
+    assert_all_synchronized(&outcomes);
+    assert_eq!(read(&beta, "more.txt"), "more");
+    let lease = autobahn::peering::read_lease(&peering)
+        .expect("lease readable")
+        .expect("renewed");
+    assert_eq!(lease.term, 1, "the same leader keeps its term");
+}
+
+/// Peering, phase 3: a host whose lease names a newer leader refuses the
+/// old one, which steps down before a byte moves and stays down across a
+/// restart.
+#[test]
+fn a_fenced_peering_leader_steps_down_and_stays_down() {
+    use autobahn::peering::{write_lease, Lease};
+    use autobahn::supervisor::PeeringContext;
+    use std::time::Duration;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let agent_home = world.directory("agent-home");
+    write(&alpha, "hello.txt", "hello");
+    let script = peering_agent_script(&world, &agent_home);
+    let plans = world.plans(&format!(
+        r#"
+        [groups.g]
+        mode = "peering-conflict-experimental"
+        alpha = "{alpha}"
+        agent_command = "{script}"
+        betas = ["peer:{beta}"]
+        "#,
+        alpha = alpha.display(),
+        script = script.display(),
+        beta = beta.display(),
+    ));
+    let plan = plans[0].clone();
+    // The beta led at term 9 while the alpha was away.
+    let peering = agent_home.join(".autobahn").join("peering");
+    write_lease(
+        &peering,
+        &Lease::new(&plan.beta_spec(), 9, Duration::from_secs(30)),
+    )
+    .expect("the beta's lease");
+
+    let leader_directory = world.path("leader-peering");
+    let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
+        .with_peering(
+            PeeringContext::for_alpha(world.path("config.toml"), leader_directory.clone())
+                .expect("a peering context"),
+        )
+        .run_once();
+    assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
+    assert!(
+        !beta.join("hello.txt").exists(),
+        "a fenced leader writes nothing"
+    );
+    let status = world.status(&plan).expect("a status");
+    assert_eq!(status.state, "following", "{status:?}");
+    assert_eq!((status.role.as_str(), status.term), ("follower", 9));
+    // The beta's lease is untouched, and the alpha recorded it as its own.
+    let held = autobahn::peering::read_lease(&peering)
+        .expect("readable")
+        .expect("held");
+    assert_eq!(
+        (held.leader.as_str(), held.term),
+        (plan.beta_spec().as_str(), 9)
+    );
+    let own = autobahn::peering::read_lease(&leader_directory)
+        .expect("readable")
+        .expect("recorded");
+    assert_eq!(own.term, 9);
+
+    // A restart reads its own lease and comes back as a follower: it does
+    // not connect, and the beta is still untouched.
+    let context = PeeringContext::for_alpha(world.path("config.toml"), leader_directory)
+        .expect("a peering context");
+    assert!(matches!(
+        context.role(),
+        autobahn::peering::Role::Follower { term: 9, .. }
+    ));
+    let outcomes = Supervisor::new(plans, world.state_root(), false)
+        .with_peering(context)
+        .run_once();
+    assert!(outcomes[0].result.is_err());
+    assert!(!beta.join("hello.txt").exists());
+    assert_eq!(world.status(&plan).expect("a status").state, "following");
+}

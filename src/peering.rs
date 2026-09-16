@@ -106,6 +106,96 @@ pub struct State {
     pub generation: Option<u64>,
 }
 
+/// The leader name the configured alpha writes into its leases. A beta
+/// that leads writes its own spec instead.
+pub const ALPHA: &str = "alpha";
+
+/// What a supervisor is, in a peering group. Shared by every worker of
+/// the supervisor: a fence answered on one session steps the whole
+/// supervisor down, since the lease is per host, not per session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// No plan is in a peering mode.
+    Off,
+    /// This supervisor leads at `term`, and renews leases as `leader`.
+    Leader { leader: String, term: u64 },
+    /// Another controller holds the lead; this supervisor does not write.
+    Follower { leader: String, term: u64 },
+}
+
+impl Role {
+    /// The word `status` shows.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Role::Off => "",
+            Role::Leader { .. } => "leader",
+            Role::Follower { .. } => "follower",
+        }
+    }
+
+    /// The term, when there is one.
+    pub fn term(&self) -> u64 {
+        match self {
+            Role::Off => 0,
+            Role::Leader { term, .. } | Role::Follower { term, .. } => *term,
+        }
+    }
+}
+
+/// What a session presents to its beta on every cycle when its supervisor
+/// leads: the claim, with the lease lifetime the plan carries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Leadership {
+    /// Who leads, as the lease will say.
+    pub leader: String,
+    /// The term.
+    pub term: u64,
+    /// The lease lifetime.
+    pub ttl: Duration,
+}
+
+impl Leadership {
+    /// A lease renewed now.
+    pub fn lease(&self) -> Lease {
+        Lease::new(&self.leader, self.term, self.ttl)
+    }
+}
+
+/// The error a cycle ends with when the host refused its lease: another
+/// controller leads there. The worker steps the supervisor down on it.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "fenced: {} at term {} holds the lease on the beta; this supervisor stepped down",
+    current.leader,
+    current.term
+)]
+pub struct Fenced {
+    /// The lease the host holds.
+    pub current: Lease,
+}
+
+/// The term a supervisor that is the configured alpha resumes at: the
+/// one in its own lease file when that names the alpha, and otherwise a
+/// fresh first term. A lease naming another leader means a beta led
+/// while this machine was away, and this machine must not lead until
+/// that is settled — the caller decides what to do with that.
+pub fn alpha_term(directory: &Path) -> Result<AlphaStart> {
+    match read_lease(directory)? {
+        None => Ok(AlphaStart::Lead { term: 1 }),
+        Some(lease) if lease.leader == ALPHA => Ok(AlphaStart::Lead { term: lease.term }),
+        Some(lease) => Ok(AlphaStart::Follow { lease }),
+    }
+}
+
+/// How the alpha starts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum AlphaStart {
+    /// Lead, at this term.
+    Lead { term: u64 },
+    /// Another member led while the alpha was away; follow it.
+    Follow { lease: Lease },
+}
+
 /// Seconds since the Unix epoch, on this host's clock.
 pub fn now_seconds() -> u64 {
     SystemTime::now()

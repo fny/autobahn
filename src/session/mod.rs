@@ -127,6 +127,15 @@ pub struct Session {
     settled_alpha: Option<Node>,
     /// Beta's hierarchy as of the last quiesced cycle.
     settled_beta: Option<Node>,
+    /// Peering: what this session presents to its beta when its
+    /// supervisor leads. `None` for a plain mode, and for a follower.
+    leadership: Option<crate::peering::Leadership>,
+    /// Peering: whether the beta's ancestor copy has been compared with
+    /// this session's ancestor since the session connected. Done once,
+    /// after the first accepted lease, so a beta that has no copy — or
+    /// one from before a restart — gets a checkpoint even when the cycle
+    /// itself changes nothing.
+    copy_checked: bool,
     /// The exclusive lock on the session state directory, held for the
     /// session's lifetime (released when the file closes on drop).
     _lock: SessionLock,
@@ -276,8 +285,78 @@ impl Session {
             quiesced: false,
             settled_alpha: None,
             settled_beta: None,
+            leadership: None,
+            copy_checked: false,
             _lock: lock,
         })
+    }
+
+    /// Peering: adopts (or drops) the leadership this session presents to
+    /// its beta. Set by a leading supervisor before every attempt, so a
+    /// change of term reaches the next cycle.
+    pub fn set_leadership(&mut self, leadership: Option<crate::peering::Leadership>) {
+        if leadership != self.leadership {
+            self.copy_checked = false;
+        }
+        self.leadership = leadership;
+    }
+
+    /// Peering: writes the files a follower needs onto the beta's host.
+    pub fn push_peering_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
+        for (name, bytes) in files {
+            self.beta
+                .put_peering_file(name, bytes)
+                .with_context(|| format!("unable to push {name} to the beta"))?;
+        }
+        Ok(())
+    }
+
+    /// Peering, at the start of a cycle: presents the lease to the beta and
+    /// stops the cycle if the host refused it. Then, once per session,
+    /// makes sure the beta's ancestor copy matches this session's.
+    pub fn present_lease(&mut self) -> Result<()> {
+        let Some(leadership) = self.leadership.clone() else {
+            return Ok(());
+        };
+        match self.beta.lease(&leadership.lease())? {
+            crate::peering::LeaseAnswer::Accepted => {}
+            crate::peering::LeaseAnswer::Refused { current } => {
+                return Err(crate::peering::Fenced { current }.into());
+            }
+        }
+        if !self.copy_checked {
+            let generation = self.ancestor_store.generation();
+            let state = self.beta.peering_state()?;
+            if state.generation != Some(generation) {
+                self.beta
+                    .ancestor_checkpoint(generation, self.ancestor.as_ref())?;
+            }
+            self.copy_checked = true;
+        }
+        Ok(())
+    }
+
+    /// Peering, after the ancestor advanced: sends the record to the beta,
+    /// and a checkpoint if the copy could not apply it. Best effort — the
+    /// ancestor is already recorded here, and a copy that misses a record
+    /// asks for a checkpoint on the next one, so a failure costs a
+    /// message and a larger transfer later, never the cycle.
+    fn replicate_ancestor(&mut self, changes: &[Change]) {
+        if self.leadership.is_none() {
+            return;
+        }
+        let generation = self.ancestor_store.generation();
+        let outcome = match self.beta.ancestor_record(generation, changes) {
+            Ok(reached) if reached == generation => Ok(()),
+            Ok(_) => self
+                .beta
+                .ancestor_checkpoint(generation, self.ancestor.as_ref())
+                .map(|_| ()),
+            Err(error) => Err(error),
+        };
+        if let Err(error) = outcome {
+            crate::complain!("unable to replicate the ancestor to the beta: {error:#}");
+        }
     }
 
     /// Adopts the supervisor's progress record, so that what this session
@@ -370,6 +449,10 @@ impl Session {
     /// nothing to do", whether or not the work of looking was performed.
     pub fn run_cycle(&mut self) -> Result<CycleReport> {
         let mut report = CycleReport::default();
+
+        // Peering: the lease goes first. A host that refuses it ends the
+        // cycle before a single byte moves.
+        self.present_lease()?;
 
         // Scan both endpoints in parallel.
         self.progress.enter(crate::progress::Phase::Scanning);
@@ -613,6 +696,10 @@ impl Session {
             self.ancestor_store
                 .record(&ancestor_changes, new_ancestor.as_ref())?;
             self.ancestor = new_ancestor;
+            // Peering: the beta's copy follows, after this side's record
+            // is durable — a copy ahead of the truth is the one order
+            // that can mislead a leader later.
+            self.replicate_ancestor(&ancestor_changes);
         }
 
         // A cycle that applied nothing, hit no conflicts, and saw no

@@ -193,11 +193,21 @@ case ":$PATH:" in
         ;;
 esac
 
+# a starting configuration, the first time
+# A fresh install gets the template `autobahn init` writes: every mode
+# explained, one example group commented out, so the next step is to edit
+# a file rather than to find out what goes in one. An existing
+# configuration is never touched.
+if [ ! -e "$STATE_HOME/config.toml" ]; then
+    if AUTOBAHN_HOME="$STATE_HOME" "$BIN_DIR/autobahn" init >/dev/null 2>&1; then
+        say "  wrote a starting configuration to $STATE_HOME/config.toml"
+    fi
+fi
+
 say ""
 say "Done. Next:"
 say ""
-say "    autobahn sync ~/project user@host:/srv/project     # try a pairing"
+say "    ${EDITOR:-vi} $STATE_HOME/config.toml                    # describe what stays in sync"
+say "    autobahn watch                                     # and run it"
+say "    autobahn sync ~/project user@host:/srv/project     # or try one pairing"
 say "    autobahn --help                                    # everything else"
-say ""
-say "For continuous synchronization, describe your groups in"
-say "$STATE_HOME/config.toml and run 'autobahn watch'."

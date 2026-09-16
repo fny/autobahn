@@ -4,6 +4,15 @@ Everything autobahn keeps lives under one directory, `~/.autobahn`, on
 every machine it touches. Removing it is a full uninstall (aside from
 the binary itself).
 
+`AUTOBAHN_HOME` moves that directory, whole: the installer puts the
+agent bundle there, and every command reads its configuration and state
+from there. `autobahn install` writes the variable into the login
+service it registers, since a service inherits nothing from the shell
+it was installed from; re-run it after changing the variable. The
+variable is the controller's own — a remote host keeps its agent under
+its own `~/.autobahn` regardless. `--state-root` and `--config` on a
+command still override it.
+
 | path | holds |
 |---|---|
 | `config.toml` | the configuration — the source of truth |

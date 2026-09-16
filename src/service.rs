@@ -105,12 +105,18 @@ pub fn install(
         arguments.push("--state-root".to_owned());
         arguments.push(state_root.to_string_lossy().into_owned());
     }
+    // A login service inherits none of the shell's environment, so an
+    // `AUTOBAHN_HOME` in effect at install time is written into the unit:
+    // otherwise the service would keep its state in `~/.autobahn` while
+    // every command typed in that shell read another directory, and the
+    // two would never see each other's sessions.
+    let home = crate::paths::home_override()?;
     let log = log_path()?;
     if let Some(parent) = log.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
     }
-    platform::install(&executable, &arguments, &log)
+    platform::install(&executable, &arguments, &log, home.as_deref())
 }
 
 /// Stops the service and unregisters it.
@@ -198,7 +204,12 @@ mod platform {
             .replace('>', "&gt;")
     }
 
-    pub fn install(executable: &Path, arguments: &[String], log: &Path) -> Result<()> {
+    pub fn install(
+        executable: &Path,
+        arguments: &[String],
+        log: &Path,
+        home: Option<&Path>,
+    ) -> Result<()> {
         let plist = plist_path()?;
         if let Some(parent) = plist.parent() {
             std::fs::create_dir_all(parent)
@@ -211,6 +222,14 @@ mod platform {
         ));
         for argument in arguments {
             program_arguments.push_str(&format!("\t\t<string>{}</string>\n", escape(argument)));
+        }
+        let mut environment = String::new();
+        if let Some(home) = home {
+            environment.push_str(&format!(
+                "\t\t<key>{}</key>\n\t\t<string>{}</string>\n",
+                crate::paths::HOME_VARIABLE,
+                escape(&home.to_string_lossy())
+            ));
         }
         // RunAtLoad starts it at login; KeepAlive restarts it if it exits.
         // The PATH is set explicitly because launchd's environment carries
@@ -237,7 +256,7 @@ mod platform {
 	<dict>
 		<key>PATH</key>
 		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
-	</dict>
+{environment}	</dict>
 </dict>
 </plist>
 "#,
@@ -394,7 +413,12 @@ mod platform {
         command
     }
 
-    pub fn install(executable: &Path, arguments: &[String], log: &Path) -> Result<()> {
+    pub fn install(
+        executable: &Path,
+        arguments: &[String],
+        log: &Path,
+        home: Option<&Path>,
+    ) -> Result<()> {
         let unit = unit_path()?;
         if let Some(parent) = unit.parent() {
             std::fs::create_dir_all(parent)
@@ -405,6 +429,14 @@ mod platform {
             exec.push(' ');
             exec.push_str(argument);
         }
+        let environment = match home {
+            Some(home) => format!(
+                "Environment=\"{}={}\"\n",
+                crate::paths::HOME_VARIABLE,
+                home.to_string_lossy()
+            ),
+            None => String::new(),
+        };
         let content = format!(
             "[Unit]\n\
              Description=autobahn file synchronization\n\
@@ -412,6 +444,7 @@ mod platform {
              \n\
              [Service]\n\
              ExecStart={exec}\n\
+             {environment}\
              Restart=always\n\
              RestartSec=2\n\
              StandardOutput=append:{log}\n\
@@ -478,7 +511,7 @@ mod platform {
     use anyhow::{bail, Result};
     use std::path::Path;
 
-    pub fn install(_: &Path, _: &[String], _: &Path) -> Result<()> {
+    pub fn install(_: &Path, _: &[String], _: &Path, _: Option<&Path>) -> Result<()> {
         bail!("login services are supported on macOS (launchd) and Linux (systemd) only")
     }
     pub fn uninstall() -> Result<()> {

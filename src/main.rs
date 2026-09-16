@@ -36,7 +36,13 @@ const HELP_STYLES: clap::builder::Styles = clap::builder::Styles::styled()
 
 /// Fast, safe, SSH-focused bidirectional file synchronization.
 #[derive(Parser)]
-#[command(name = "autobahn", version, about, styles = HELP_STYLES)]
+#[command(
+    name = "autobahn",
+    version,
+    about,
+    styles = HELP_STYLES,
+    disable_help_subcommand = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -124,93 +130,6 @@ impl From<SymlinkModeArgument> for SymlinkMode {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Synchronize two roots, each a local path or a remote specification.
-    ///
-    /// Either root accepts a local path or an scp-style remote specification
-    /// ([user@]host:path), which connects over SSH (installing the matching
-    /// agent on the remote host on first contact).
-    Sync {
-        /// The alpha synchronization root (a local path or [user@]host:path).
-        /// With no roots at all, every session in the configuration is
-        /// synchronized once instead.
-        alpha: Option<String>,
-        /// The beta synchronization root (a local path or [user@]host:path).
-        beta: Option<String>,
-        /// The configuration file, for the no-roots form (defaults to
-        /// ~/.autobahn/config.toml).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Override the state root, for the no-roots form (defaults to
-        /// ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-        /// The synchronization mode.
-        #[arg(long, value_enum, default_value = "two-way-conflict")]
-        mode: ModeArgument,
-        /// Ignore patterns (gitignore-style; repeatable).
-        #[arg(long = "ignore")]
-        ignores: Vec<String>,
-        /// Symbolic link handling: ignore, portable, or raw.
-        #[arg(long, value_enum, default_value = "raw")]
-        symlink_mode: SymlinkModeArgument,
-        /// Permission bits (octal) for created files (default 0600).
-        #[arg(long)]
-        file_mode: Option<String>,
-        /// Permission bits (octal) for created directories (default 0700).
-        #[arg(long)]
-        directory_mode: Option<String>,
-        /// Keep running, synchronizing whenever content changes.
-        #[arg(long)]
-        watch: bool,
-        /// The polling interval, in seconds, used with --watch.
-        #[arg(long, default_value_t = 5)]
-        interval: u64,
-        /// Override the session state directory (defaults to
-        /// ~/.autobahn/sessions/<session-id>).
-        #[arg(long)]
-        state_dir: Option<PathBuf>,
-        /// Advanced: connect beta through this agent command (whitespace
-        /// split into argv) instead of SSH, treating BETA as the remote
-        /// root path. Used for testing and custom transports.
-        #[arg(long)]
-        beta_agent: Option<String>,
-        /// Advanced: connect alpha through this agent command (whitespace
-        /// split into argv) instead of SSH, treating ALPHA as the remote
-        /// root path. Used for testing and custom transports.
-        #[arg(long)]
-        alpha_agent: Option<String>,
-    },
-    /// Run every configured session here, in this terminal, until
-    /// interrupted. On a terminal the display is a live `autobahn status`;
-    /// when the output is a file or a pipe, one line is logged per event.
-    ///
-    /// The configuration fans groups of one local alpha directory out to
-    /// any number of local or remote betas; see the documentation for the
-    /// format. Sessions run in parallel, and a session whose destination is
-    /// unreachable backs off and heals automatically — it never blocks the
-    /// others. To keep this running when no terminal is, see `install`.
-    Watch {
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-        /// In the live display, list every conflicting path rather than a
-        /// count and an example.
-        #[arg(long)]
-        conflicts: bool,
-        /// Log one line per event even on a terminal, instead of the live
-        /// display.
-        #[arg(long)]
-        log: bool,
-        /// Write the detail needed to explain a cycle after it has gone:
-        /// timings, what content was asked for and whether it arrived, and
-        /// what the supervisor decided next. Equivalent to `log = "debug"`
-        /// in the configuration, or `AUTOBAHN_LOG=debug`.
-        #[arg(long)]
-        debug: bool,
-    },
     /// Show the recorded status of every configured session, grouped by
     /// group (optionally filtered by group and host).
     Status {
@@ -243,45 +162,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Wake configured sessions in a running supervisor for an immediate
-    /// synchronization cycle.
-    Flush {
-        /// Filter to a group.
-        group: Option<String>,
-        /// Filter to a destination within the group.
-        host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Reset sessions in a running supervisor: their synchronization
-    /// baselines are discarded, so the next cycle merges both sides
-    /// additively (resurrecting deletions). The group is required — a
-    /// reset is deliberate, never a default.
-    Reset {
-        /// The group to reset.
-        group: String,
-        /// Filter to a destination within the group.
-        host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Register the supervisor as a login service — launchd on macOS, a
-    /// systemd user unit on Linux — and start it now. It then runs across
-    /// logouts and reboots, restarting if it exits, logging to
-    /// ~/.autobahn/service.log.
-    Install {
-        /// Bake this configuration file into the service (defaults to
-        /// ~/.autobahn/config.toml).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Bake this state root into the service (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
-    /// Stop the login service and unregister it.
-    Uninstall,
     /// Start the installed login service. With none installed, this
     /// refuses and points at `install` (or `watch`, to run here instead).
     Start,
@@ -327,8 +207,18 @@ enum Command {
         state_root: Option<PathBuf>,
     },
     /// The shop.
-    #[command(hide = true)]
     Mi {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Run the menu bar app: an icon whose colour is the state of every
+    /// session, a menu with the detail, and the ways to settle each
+    /// conflict. Built with the `tray` feature.
+    Tray {
         /// The configuration file (defaults to ~/.autobahn/config.toml).
         #[arg(long)]
         config: Option<PathBuf>,
@@ -398,17 +288,14 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Run the menu bar app: an icon whose colour is the state of every
-    /// session, a menu with the detail, and the ways to settle each
-    /// conflict. Built with the `tray` feature.
-    Tray {
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
-        #[arg(long)]
-        config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
-        #[arg(long)]
-        state_root: Option<PathBuf>,
-    },
+    /// Run as a synchronization agent on standard input/output (invoked on
+    /// remote hosts by the sync command; not intended for interactive use).
+    ///
+    /// The protocol it speaks is autobahn's own and changes between
+    /// releases without notice — every agent must be the controller's
+    /// exact version, which the controller enforces. It is not an API,
+    /// and nothing but autobahn should drive it.
+    Agent,
     /// Remove state left behind by sessions the configuration no longer
     /// describes: their ancestors, status records, staged content, and
     /// endpoint locks. State for a running session is never touched, and
@@ -444,11 +331,10 @@ enum Command {
         #[arg(long, value_name = "N", default_value_t = 1)]
         keep_agents: usize,
     },
-    /// Re-read every file's content on the sessions' next cycle, making
-    /// content that changed without its metadata moving (restored
-    /// timestamps, reproducible-build rewrites) visible and synchronized.
-    Verify {
-        /// Filter to a group (defaults to every session).
+    /// Wake configured sessions in a running supervisor for an immediate
+    /// synchronization cycle.
+    Flush {
+        /// Filter to a group.
         group: Option<String>,
         /// Filter to a destination within the group.
         host: Option<String>,
@@ -465,6 +351,95 @@ enum Command {
         /// Replace an existing configuration, keeping the old one beside it.
         #[arg(long)]
         force: bool,
+    },
+    /// Register the supervisor as a login service — launchd on macOS, a
+    /// systemd user unit on Linux — and start it now. It then runs across
+    /// logouts and reboots, restarting if it exits, logging to
+    /// ~/.autobahn/service.log.
+    Install {
+        /// Bake this configuration file into the service (defaults to
+        /// ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Bake this state root into the service (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Stop the login service and unregister it.
+    Uninstall,
+    /// Peering (experimental): attach to a leader, or hand the lead on.
+    Peering {
+        #[command(subcommand)]
+        verb: PeeringVerb,
+    },
+    /// Reset sessions in a running supervisor: their synchronization
+    /// baselines are discarded, so the next cycle merges both sides
+    /// additively (resurrecting deletions). The group is required — a
+    /// reset is deliberate, never a default.
+    Reset {
+        /// The group to reset.
+        group: String,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Synchronize two roots, each a local path or a remote specification.
+    ///
+    /// Either root accepts a local path or an scp-style remote specification
+    /// ([user@]host:path), which connects over SSH (installing the matching
+    /// agent on the remote host on first contact).
+    Sync {
+        /// The alpha synchronization root (a local path or [user@]host:path).
+        /// With no roots at all, every session in the configuration is
+        /// synchronized once instead.
+        alpha: Option<String>,
+        /// The beta synchronization root (a local path or [user@]host:path).
+        beta: Option<String>,
+        /// The configuration file, for the no-roots form (defaults to
+        /// ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root, for the no-roots form (defaults to
+        /// ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// The synchronization mode.
+        #[arg(long, value_enum, default_value = "two-way-conflict")]
+        mode: ModeArgument,
+        /// Ignore patterns (gitignore-style; repeatable).
+        #[arg(long = "ignore")]
+        ignores: Vec<String>,
+        /// Symbolic link handling: ignore, portable, or raw.
+        #[arg(long, value_enum, default_value = "raw")]
+        symlink_mode: SymlinkModeArgument,
+        /// Permission bits (octal) for created files (default 0600).
+        #[arg(long)]
+        file_mode: Option<String>,
+        /// Permission bits (octal) for created directories (default 0700).
+        #[arg(long)]
+        directory_mode: Option<String>,
+        /// Keep running, synchronizing whenever content changes.
+        #[arg(long)]
+        watch: bool,
+        /// The polling interval, in seconds, used with --watch.
+        #[arg(long, default_value_t = 5)]
+        interval: u64,
+        /// Override the session state directory (defaults to
+        /// ~/.autobahn/sessions/<session-id>).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Advanced: connect beta through this agent command (whitespace
+        /// split into argv) instead of SSH, treating BETA as the remote
+        /// root path. Used for testing and custom transports.
+        #[arg(long)]
+        beta_agent: Option<String>,
+        /// Advanced: connect alpha through this agent command (whitespace
+        /// split into argv) instead of SSH, treating ALPHA as the remote
+        /// root path. Used for testing and custom transports.
+        #[arg(long)]
+        alpha_agent: Option<String>,
     },
     /// Install the latest release over this one: the command, and the
     /// agent bundle the controller streams to remote hosts.
@@ -492,13 +467,48 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
-    /// Run as a synchronization agent on standard input/output (invoked on
-    /// remote hosts by the sync command; not intended for interactive use).
-    Agent,
-    /// Peering (experimental): attach to a leader, or hand the lead on.
-    Peering {
-        #[command(subcommand)]
-        verb: PeeringVerb,
+    /// Re-read every file's content on the sessions' next cycle, making
+    /// content that changed without its metadata moving (restored
+    /// timestamps, reproducible-build rewrites) visible and synchronized.
+    Verify {
+        /// Filter to a group (defaults to every session).
+        group: Option<String>,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Run every configured session here, in this terminal, until
+    /// interrupted. On a terminal the display is a live `autobahn status`;
+    /// when the output is a file or a pipe, one line is logged per event.
+    ///
+    /// The configuration fans groups of one local alpha directory out to
+    /// any number of local or remote betas; see the documentation for the
+    /// format. Sessions run in parallel, and a session whose destination is
+    /// unreachable backs off and heals automatically — it never blocks the
+    /// others. To keep this running when no terminal is, see `install`.
+    Watch {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// In the live display, list every conflicting path rather than a
+        /// count and an example.
+        #[arg(long)]
+        conflicts: bool,
+        /// Log one line per event even on a terminal, instead of the live
+        /// display.
+        #[arg(long)]
+        log: bool,
+        /// Write the detail needed to explain a cycle after it has gone:
+        /// timings, what content was asked for and whether it arrived, and
+        /// what the supervisor decided next. Equivalent to `log = "debug"`
+        /// in the configuration, or `AUTOBAHN_LOG=debug`.
+        #[arg(long)]
+        debug: bool,
     },
 }
 

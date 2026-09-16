@@ -76,12 +76,12 @@ Rules the build must keep:
 
 ## Phase 6 — docs and the rest
 
-- [ ] `docs/peering.md`: the design, the config, what "experimental" means here, what is not covered
-- [ ] `docs/modes.md`: the peering row; `docs/configuration.md`: the section row
-- [ ] `docs/state.md`: the `peering/` directory
-- [ ] `docs/releases.md` / `development.md`: the epoch bump note
-- [ ] `run_clean` knows about `peering/`
-- [ ] Menu bar and `mi`: role shown on the group line
+- [x] `docs/peering.md`: the design, the config, what "experimental" means here, what is not covered
+- [x] `docs/modes.md`: the peering row and a section; `docs/configuration.md`: the section row; `docs/README.md`: the index row
+- [x] `docs/state.md`: the `peering/` directory
+- [x] The epoch bump is noted in `docs/peering.md` (`releases.md` and `development.md` are in flight elsewhere)
+- [x] `run_clean` leaves `peering/` alone — it never removes directories it does not own, so nothing to add; said in `state.md`
+- [ ] Menu bar and `mi`: role shown on the group line (`tray.rs` and `shop.rs` are in flight elsewhere; `status` shows it)
 - [ ] Remove this file once the feature ships, or move what is left into `TODO.md`
 
 ## Not in this build

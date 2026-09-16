@@ -9,6 +9,7 @@ when the two sides disagree about a file: it is reported as a
 |---|---|---|
 | **two-way** | `two-way-conflict` | `two-way-alpha` |
 | **one-way** | `one-way-conflict` | `one-way-alpha` |
+| **peering** (experimental) | `peering-conflict-experimental` | `peering-alpha-experimental` |
 
 Off the grid there is one more, `two-way-paranoid`: `two-way-conflict`
 that also refuses to trust a large directory going empty or missing on
@@ -23,6 +24,7 @@ defaults) must say which it wants.
 |---|---|
 | `two-way-conflict` | You edit on both sides and want nothing lost, ever. |
 | `two-way-paranoid` | As above, and a disk that unmounts mid-session must not empty the other side. |
+| `peering-conflict-experimental` | As `two-way-conflict`, and a beta takes the lead while the alpha is away. See [Peering](./peering.md). |
 | `two-way-alpha` | You edit on both sides but alpha is the truth when they collide. |
 | `one-way-conflict` | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
 | `one-way-alpha` | Backups, artifact distribution — beta should be *identical*. Also spelled `mirror`. |
@@ -91,6 +93,16 @@ Smaller directories, and directories the other side also changed, follow
 the ordinary rules. The other four modes have neither rule: an emptied
 directory is deletions, and they propagate.
 
+## Peering (experimental)
+
+The peering modes are the two-way modes plus failover: while the alpha
+is away for longer than a configured wait, the first beta that is up
+leads the others, and the alpha gets the lead back when it returns.
+Reconciliation is unchanged — `peering-conflict-experimental` reconciles
+as `two-way-conflict`, `peering-alpha-experimental` as `two-way-alpha`,
+with the configured alpha winning wherever it is involved whoever leads.
+The whole of it is in [Peering](./peering.md).
+
 ## Modes and fan-out
 
 When one alpha fans out to several betas, each destination is its own
@@ -107,3 +119,4 @@ suits a fan-out you push *from* rather than edit at both ends.
 - [Configuration](./configuration.md) — where `mode` goes
 - [Conflicts](./conflicts.md) — settling a disagreement once it is reported
 - [Safety](./safety.md) — the deletions that are refused in every mode
+- [Peering](./peering.md) — failover for the star, experimental

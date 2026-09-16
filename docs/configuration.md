@@ -52,7 +52,7 @@ notice. Sessions targeting the same host share one SSH connection.
 
 ## Top level
 
-Five keys. Unknown keys are refused at startup, not ignored — here and in
+Seven keys. Unknown keys are refused at startup, not ignored — here and in
 every section.
 
 | Key | Type | Default | What it is |
@@ -63,6 +63,7 @@ every section.
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
 | `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
+| `[advanced.peering-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
 
 Why `defaults` is a table and `log` is not: TOML requires bare keys to
 appear before the first table header. Every `defaults` key is *also* a
@@ -126,6 +127,7 @@ abandoned and redone.
 ## See also
 
 - [Modes](./modes.md) — which to pick, and what each does case by case
+- [Peering](./peering.md) — the peering modes, experimental
 - [Ignores](./ignores.md) — pattern semantics, ignore files, and negations
 - [Alerts](./alerts.md) — the one hook, and when it fires
 - [Overlapping and nested roots](./nesting.md) — what is refused and why

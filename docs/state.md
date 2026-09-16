@@ -23,6 +23,7 @@ command still override it.
 | `agents/` | the agent bundle — binaries for platforms other than this one |
 | `bin/autobahn-<version>` | on a *remote* host: the agent this controller streamed there |
 | `ignores/` | ignore files, named from the config — see [Ignores](./ignores.md) |
+| `peering/` | experimental: the lease, this host's name in the star, the pushed configuration, and the ancestor copies a leader keeps here — see [Peering](./peering.md). `clean` leaves it alone |
 | `service.log` | the supervisor's log — see [The log](./logging.md) |
 | `icon.png` | autobahn's icon, for notifiers |
 

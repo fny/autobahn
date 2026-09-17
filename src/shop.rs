@@ -979,7 +979,7 @@ impl Shop<'_> {
         const MARKER: usize = 2;
         const GROUP: usize = 9;
         const HOST: usize = 12;
-        const OUTCOME: usize = 14;
+        const OUTCOME: usize = 16;
         let loaf = 2 + 1 + BAGUETTE + 1;
         let room = width.saturating_sub(2 + MARKER + GROUP + 3 + HOST + 2 + loaf + 2 + OUTCOME + 1);
         format!(
@@ -1163,9 +1163,9 @@ fn outcome_word(state: &str) -> (&'static str, &'static str) {
     match state {
         "synchronized" => ("served", "\x1b[32m"),
         "conflicts" => ("disputed", "\x1b[33m"),
-        "blocked" => ("out of stock", "\x1b[33m"),
+        "blocked" => ("delivery blocked", "\x1b[33m"),
         "halted" => ("kitchen closed", "\x1b[31m"),
-        "unreachable" => ("supplier away", "\x1b[31m"),
+        "unreachable" => ("beta unreachable", "\x1b[31m"),
         "errored" => ("burnt", "\x1b[31m"),
         "paused" => ("on break", "\x1b[2m"),
         _ => ("not started", "\x1b[2m"),
@@ -1260,8 +1260,8 @@ fn baguette(session: &SessionReport, phase: Option<Phase>, frame: u64) -> String
 /// The help page: the words on the shop's screen, and what they mean.
 ///
 /// The vocabulary is the whole reason this exists. "checking the pantry"
-/// and "out of stock" are good jokes and poor documentation, and a reader
-/// who cannot map them back to scanning and unreadable files is reading
+/// and "kitchen closed" are good jokes and poor documentation, and a reader
+/// who cannot map them back to scanning and a halted session is reading
 /// decoration.
 fn help_page(width: usize) -> Vec<String> {
     let inner = width.saturating_sub(4);
@@ -1276,7 +1276,7 @@ fn help_page(width: usize) -> Vec<String> {
         ("served", "\x1b[32m", "both sides agree; nothing to do"),
         ("disputed", "\x1b[33m", "both sides changed the same thing"),
         (
-            "out of stock",
+            "delivery blocked",
             "\x1b[33m",
             "paths autobahn could not read or write",
         ),
@@ -1286,9 +1286,9 @@ fn help_page(width: usize) -> Vec<String> {
             "halted for safety; it will not act",
         ),
         (
-            "supplier away",
+            "beta unreachable",
             "\x1b[31m",
-            "the far side cannot be reached",
+            "the beta cannot be reached",
         ),
         ("burnt", "\x1b[31m", "the cycle failed"),
         ("on break", "\x1b[2m", "paused"),

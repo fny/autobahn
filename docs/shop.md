@@ -17,7 +17,7 @@ reads the same `status --json` document as everything else.
     voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s · 1 waiting
 ```
 
-An order is always *something* — served, disputed, out of stock — and
+An order is always *something* — served, disputed, delivery blocked — and
 sometimes also *doing* something. The first has the coloured word and
 never gives it up. The second has a column of its own, filled only once
 the work has gone on long enough to be worth mentioning: the same rule

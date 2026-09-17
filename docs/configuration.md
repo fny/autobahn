@@ -58,7 +58,7 @@ every section.
 | Key | Type | Default | What it is |
 |---|---|---|---|
 | `on_alert` | string | — | Shell command run when a session needs a person. The only hook. See [Alerts](./alerts.md). |
-| `disabled` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. |
+| `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. |
 | `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
@@ -69,17 +69,20 @@ Why `defaults` is a table and `log` is not: TOML requires bare keys to
 appear before the first table header. Every `defaults` key is *also* a
 valid group key, so a bare `mode = …` written after `[groups.x]` would
 silently become that group's mode — legal, so no error. `on_alert`,
-`disabled` and `log` are valid nowhere else, so the same slip is caught.
+`disabled_hosts` and `log` are valid nowhere else, so the same slip is
+caught. (`disabled` on its own is a *group* key, and means something else:
+that one group, off.)
 
 ## Session settings
 
 Thirteen keys live in both `[defaults]` and any group, with the group
-winning. Three exist only on a group.
+winning. Four exist only on a group.
 
 | Key | Where | Default | What it does |
 |---|---|---|---|
 | `alpha` | group | required | The source root: a local path, or `[user@]host:path`. |
 | `betas` | group | `[]` | Destinations: local paths and/or remote specs. A remote beta with no path inherits the alpha's path. |
+| `disabled` | group | `false` | Turns the group off: no sessions, and its settings are not checked. State is kept, so turning it back on resumes. Not to be confused with the top-level `disabled_hosts`. |
 | `mode` | both | required | Synchronization mode. See [Modes](./modes.md). No default — direction is never guessed. |
 | `ignores` | both | `[]` | Gitignore-style patterns. Defaults' patterns apply first, then the group's. See [Ignores](./ignores.md). |
 | `ignore_files` | both | `[]` | Files of patterns, by name or path. See [Ignores](./ignores.md). |

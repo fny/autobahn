@@ -396,7 +396,7 @@ fn disabled_hosts_are_excluded_from_supervision() {
 
     let plans = world.plans(&format!(
         r#"
-        disabled = ["down-host"]
+        disabled_hosts = ["down-host"]
 
         [groups.work]
         alpha = "{alpha}"

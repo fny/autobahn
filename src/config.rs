@@ -9,8 +9,8 @@
 //! A minimal configuration looks like:
 //!
 //! ```toml
-//! # Top-level keys (like `disabled`) must precede the first section header.
-//! disabled = ["flaky.example.com"]
+//! # Top-level keys (like `disabled_hosts`) must precede the first section header.
+//! disabled_hosts = ["flaky.example.com"]
 //!
 //! [defaults]
 //! mode = "two-way-safe"
@@ -99,6 +99,7 @@ interval = 5
 #   "/mnt/backup/project",               # a local path works too
 # ]
 # ignores = ["dist", "*.log"]            # added to the defaults' ignores
+# disabled = true                        # turns the whole group off
 "##;
 
 use std::collections::{BTreeMap, HashMap};
@@ -171,8 +172,14 @@ pub struct Config {
     pub on_alert: Option<String>,
     /// Hosts excluded from every group. A disabled beta host drops that
     /// beta; a disabled alpha host drops the whole group.
+    ///
+    /// Named for what it holds, because a group has a `disabled` of its
+    /// own that is a flag, not a list, and one word cannot be both.
     #[serde(default)]
-    pub disabled: Vec<String>,
+    pub disabled_hosts: Vec<String>,
+    /// Retired. Kept only so that a configuration written against the old
+    /// spelling is told what to write instead of "unknown field".
+    pub disabled: Option<toml::Value>,
     /// How much the supervisor writes to its log: "quiet", "normal" (the
     /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
     pub log: Option<String>,
@@ -408,6 +415,11 @@ pub struct Group {
     /// The group (name or `id:N`) for created entries, applied by each
     /// endpoint on its own host (falls back to the defaults).
     pub default_group: Option<String>,
+    /// Turns the whole group off: it plans no sessions at all, as though
+    /// it were not written. Its state and its status records stay where
+    /// they are, so turning it back on resumes rather than starts over.
+    #[serde(default)]
+    pub disabled: bool,
     /// Advanced: connect this group's remote endpoints through this command
     /// (whitespace split into argv) instead of SSH. Used for testing and
     /// custom transports; the endpoint's host is then informational only.
@@ -722,6 +734,14 @@ impl Config {
 
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
         let mut errors = Vec::new();
+        if self.disabled.is_some() {
+            errors.push(
+                "`disabled` at the top level is now `disabled_hosts`. A group has a \
+                 `disabled = true` of its own, and one word cannot be both a list of \
+                 hosts and a switch."
+                    .to_owned(),
+            );
+        }
         let peering = match self.peering_plan() {
             Ok(plan) => Some(plan),
             Err(error) => {
@@ -753,6 +773,13 @@ impl Config {
         let mut identities: HashMap<(String, String), String> = HashMap::new();
 
         for (name, group) in &self.groups {
+            // A group that is off plans nothing: not its sessions, and not
+            // the errors its settings would otherwise raise. Turning a
+            // group off is exactly how a reader silences a group whose
+            // host is gone, so it must not still be refused for it.
+            if group.disabled {
+                continue;
+            }
             let (mode, peers) = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
                 Some(mode) => match parse_mode_spec(mode) {
                     Ok((mode, peers)) => (Some(mode), peers),
@@ -837,7 +864,7 @@ impl Config {
             // A disabled alpha host takes the whole group with it: every
             // session of the group flows through that endpoint.
             if let Some(EndpointTarget::Remote { destination, .. }) = &alpha {
-                if self.disabled.iter().any(|d| d == host_of(destination)) {
+                if self.disabled_hosts.iter().any(|d| d == host_of(destination)) {
                     continue;
                 }
             }
@@ -1058,7 +1085,7 @@ impl Config {
                     EndpointTarget::Remote { destination, .. } => host_of(destination).to_owned(),
                 };
                 if let EndpointTarget::Remote { .. } = &target {
-                    if self.disabled.iter().any(|disabled| disabled == &host) {
+                    if self.disabled_hosts.iter().any(|disabled| disabled == &host) {
                         continue;
                     }
                 }
@@ -1666,7 +1693,7 @@ mod tests {
     fn a_disabled_alpha_host_drops_the_whole_group() {
         let config = parse(
             r#"
-            disabled = ["build.example.com"]
+            disabled_hosts = ["build.example.com"]
 
             [groups.pull]
             alpha = "build.example.com:/srv/artifacts"
@@ -1739,7 +1766,7 @@ mod tests {
     fn a_full_configuration_produces_the_expected_plans() {
         let config = parse(
             r#"
-            disabled = ["down.example.com"]
+            disabled_hosts = ["down.example.com"]
 
             [defaults]
             mode = "two-way-safe"
@@ -1896,6 +1923,70 @@ mod tests {
 
         // Unknown top-level keys fail as well.
         assert!(toml::from_str::<Config>("disable = [\"host\"]").is_err());
+    }
+
+    /// The old spelling parses, so that it can be answered with what to
+    /// write instead rather than with "unknown field `disabled`".
+    #[test]
+    fn the_old_top_level_disabled_says_what_to_write_instead() {
+        let error = parse(
+            r#"
+            disabled = ["down.example.com"]
+
+            [defaults]
+            mode = "two-way-conflict"
+
+            [groups.one]
+            alpha = "/tmp/alpha"
+            betas = ["host:/tmp/beta"]
+            "#,
+        )
+        .plans()
+        .expect_err("the retired key should be refused")
+        .to_string();
+        assert!(error.contains("disabled_hosts"), "{error}");
+    }
+
+    /// A group that is off contributes no sessions, and is not held to the
+    /// rules its settings would otherwise have to pass.
+    #[test]
+    fn a_disabled_group_plans_nothing() {
+        let config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-conflict"
+
+            [groups.off]
+            disabled = true
+            alpha = "/tmp/alpha"
+            betas = ["gone.example.com:/tmp/beta"]
+
+            [groups.on]
+            alpha = "/tmp/other"
+            betas = ["host.example.com:/tmp/beta"]
+            "#,
+        );
+        let plans = config.plans().expect("the configuration should be valid");
+        let groups: Vec<&str> = plans.iter().map(|plan| plan.group.as_str()).collect();
+        assert_eq!(groups, vec!["on"]);
+    }
+
+    /// Off is off even when the group could not have been planned at all:
+    /// silencing a broken group is the point.
+    #[test]
+    fn a_disabled_group_is_not_validated() {
+        let config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-conflict"
+
+            [groups.off]
+            disabled = true
+            alpha = "relative/path"
+            betas = []
+            "#,
+        );
+        assert!(config.plans().expect("no errors").is_empty());
     }
 
     #[test]

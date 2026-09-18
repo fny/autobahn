@@ -50,7 +50,13 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 # been away a while. It is the only hook — which state it is in is in the
 # message, not in which hook runs. Uncomment it and make it something your
 # desktop shows.
-# on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\" -execute \"$AUTOBAHN_OPEN\""
+# on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
+#
+# `autobahn init` writes an example hook beside this file — it notifies
+# with whatever the machine has, and a click opens the status. Point at it
+# instead of writing the command here, and every quote stops being escaped
+# twice. The script is experimental; the variables it reads are not.
+# on_alert = "~/.autobahn/on-alert.sh"
 
 # How much the supervisor writes to its log: quiet, normal, or debug.
 # Every line carries a timestamp whichever you pick.
@@ -100,6 +106,95 @@ interval = 5
 # ]
 # ignores = ["dist", "*.log"]            # added to the defaults' ignores
 # disabled = true                        # turns the whole group off
+"##;
+
+/// The example hook `autobahn init` writes beside the configuration, and
+/// the click target it names.
+///
+/// Experimental: what it notices and what it prints may change between
+/// releases. The hook interface it is written against — `on_alert` and the
+/// variables handed to it — does not.
+///
+/// A script rather than a line in the configuration, because a hook is a
+/// shell command inside a TOML string: every quote in it is escaped twice,
+/// and a notifier's arguments are mostly quotes. It also leaves somewhere
+/// to put a second thought later, such as a different notifier per state.
+pub const ON_ALERT_EXAMPLE: &str = r##"#!/bin/sh
+# autobahn — run when a session needs a person. EXPERIMENTAL: an example,
+# not a contract; edit it freely, and expect it to change between releases.
+#
+# Named by `on_alert` in config.toml. What it is handed:
+#
+#   $AUTOBAHN_SUMMARY      one line: the whole story, or a count
+#   $AUTOBAHN_DETAIL       one indented line per session that needs you
+#   $AUTOBAHN_ICON         autobahn's icon, as an absolute path
+#   $AUTOBAHN_STATES       the state names present, comma separated
+#   $AUTOBAHN_ALERT_COUNT  how many sessions are in the set
+#   $AUTOBAHN_EVENT        "alert" the first time, "repeat" after that
+#
+# The service runs with a sparse PATH and a sparse environment, which is
+# why commands are named in full and the bus address is worked out below.
+set -eu
+
+case "$(uname -s)" in
+Darwin)
+    # A click needs a terminal opened around the shop, which `open` does.
+    OPEN="open -a Terminal $HOME/.autobahn/open-status"
+
+    # terminal-notifier carries a subtitle and a click. Homebrew puts it
+    # in one of two places depending on the chip.
+    for notifier in \
+        /opt/homebrew/bin/terminal-notifier \
+        /usr/local/bin/terminal-notifier
+    do
+        [ -x "$notifier" ] || continue
+        exec "$notifier" \
+            -title autobahn -group autobahn \
+            -appIcon "$AUTOBAHN_ICON" \
+            -subtitle "$AUTOBAHN_DETAIL" \
+            -message "$AUTOBAHN_SUMMARY" \
+            -execute "$OPEN"
+    done
+
+    # Built in, and always there. It holds one line and no click.
+    exec /usr/bin/osascript \
+        -e "display notification \"$AUTOBAHN_SUMMARY\" with title \"autobahn\""
+    ;;
+Linux)
+    # notify-send talks to the desktop over the session bus. A service
+    # started by the user's own systemd inherits the address; one started
+    # by the system does not, so it is guessed from the user id.
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        # Urgency is normal, not critical: a conflict wants attention
+        # today, not a notification that refuses to go away.
+        exec notify-send \
+            --app-name autobahn \
+            --icon "$AUTOBAHN_ICON" \
+            "$AUTOBAHN_SUMMARY" \
+            "$AUTOBAHN_DETAIL"
+    fi
+    ;;
+esac
+
+# No notifier, or a headless host: the log is still the record, and
+# standard error goes to it.
+echo "autobahn: $AUTOBAHN_SUMMARY" >&2
+"##;
+
+/// What the example hook opens on a click: the shop, and then a pause,
+/// because a terminal closes its window as soon as the command exits.
+pub const OPEN_STATUS_EXAMPLE: &str = r##"#!/bin/sh
+# autobahn — opened from a notification. EXPERIMENTAL, like the hook that
+# names it.
+set -eu
+autobahn status || true
+echo
+printf '[any key to close] '
+read -r _
 "##;
 
 use std::collections::{BTreeMap, HashMap};
@@ -1923,6 +2018,31 @@ mod tests {
 
         // Unknown top-level keys fail as well.
         assert!(toml::from_str::<Config>("disable = [\"host\"]").is_err());
+    }
+
+    /// The examples are run by `sh`, so they have to parse as `sh`. A
+    /// broken one would only be discovered by the alert it failed to
+    /// deliver.
+    #[test]
+    fn the_example_scripts_are_valid_shell() {
+        for (name, contents) in [
+            ("on-alert.sh", ON_ALERT_EXAMPLE),
+            ("open-status", OPEN_STATUS_EXAMPLE),
+        ] {
+            let directory = tempfile::tempdir().expect("a temporary directory");
+            let script = directory.path().join(name);
+            std::fs::write(&script, contents).expect("the script should be writable");
+            let checked = std::process::Command::new("sh")
+                .arg("-n")
+                .arg(&script)
+                .output()
+                .expect("sh should run");
+            assert!(
+                checked.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&checked.stderr)
+            );
+        }
     }
 
     /// The old spelling parses, so that it can be answered with what to

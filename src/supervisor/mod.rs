@@ -2110,14 +2110,6 @@ fn watch_alerts(
                         .map(|path| path.display().to_string())
                         .unwrap_or_default(),
                 ),
-                // A command that opens the shop on the full detail. The
-                // notification carries a one-line summary because that is
-                // all a notification can hold; this is how a reader gets
-                // from it to the rest. Hooks that can run something on
-                // click — `terminal-notifier -execute`, most tray menus —
-                // want a ready command rather than a path they have to
-                // wrap themselves.
-                ("AUTOBAHN_OPEN".to_owned(), open_command()),
                 (
                     "AUTOBAHN_EVENT".to_owned(),
                     match fire {
@@ -2262,33 +2254,6 @@ pub fn read_status(state_root: &Path, identifier: &str) -> Result<Option<Session
     let status = serde_json::from_slice(&data)
         .with_context(|| format!("unable to decode status {}", path.display()))?;
     Ok(Some(status))
-}
-
-/// A shell command that opens the shop on the current detail.
-///
-/// A notification holds one line. This is the way from that line to the
-/// rest of it, handed to the hook as `$AUTOBAHN_OPEN` so a click can run
-/// it. The shop is a terminal program, so on macOS it needs a terminal
-/// opened around it; elsewhere the hook is assumed to already have one.
-fn open_command() -> String {
-    // The running binary, not the name: a hook runs under the login
-    // service with a sparse `PATH`, where a bare name may not resolve.
-    let binary = std::env::current_exe()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|_| "autobahn".to_owned());
-
-    if cfg!(target_os = "macos") {
-        // `open -a Terminal <file>` runs a script rather than a command,
-        // so the command becomes one: a temporary script would need
-        // cleaning up, and AppleScript takes the command directly.
-        let escaped = binary.replace('\\', r"\\").replace('"', r#"\""#);
-        format!(
-            "osascript -e 'tell application \"Terminal\" to do script \"{escaped} mi\"' \
-             -e 'tell application \"Terminal\" to activate'"
-        )
-    } else {
-        format!("{binary} mi")
-    }
 }
 
 #[cfg(test)]

@@ -16,7 +16,7 @@ autobahn is, how to install it, and the minimum to get a group syncing.
 | [Commands](./commands.md) | asking a running supervisor things; what the state words mean; one-off syncs |
 | [Conflicts](./conflicts.md) | `issues`, `conflicts`, `diff`, `resolve` — and how resolution actually works |
 | [The shop](./shop.md) | `autobahn mi`: watch it work, and clear the queue from a tree you can act on |
-| [The menu bar app](./macos-app.md) | the Autobahn sign in the menu bar; starting it; its icon; signing |
+| [The menu bar app](./macos-app.md) | *experimental*: the Autobahn sign in the menu bar; starting it; its icon; signing |
 | [The log](./logging.md) | levels, what `debug` adds, rotation |
 | [State](./state.md) | what lives in `~/.autobahn`, `clean`, agents and compatibility epochs |
 

@@ -6,8 +6,7 @@ nobody told. `on_alert` runs a command when that happens:
 
 ```toml
 on_alert = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
-            -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\" \\
-            -execute \"$AUTOBAHN_OPEN\""
+            -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\""
 ```
 
 That is the whole of it. It sits at the top level of the config because
@@ -28,7 +27,6 @@ give commands absolute paths — and on Linux, `notify-send` needs
 |---|---|
 | `$AUTOBAHN_SUMMARY` | One line. The whole story when one thing is wrong, a count when several — `voltai → fny: 1 conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you, 1 host away`. |
 | `$AUTOBAHN_DETAIL` | One indented line per thing, for a notifier that shows more than a headline. |
-| `$AUTOBAHN_OPEN` | A ready command that opens [the shop](./shop.md) on the full detail. For `terminal-notifier -execute` and tray items — a notification holds one line, and this is where it leads. |
 | `$AUTOBAHN_ICON` | Absolute path to autobahn's icon, written into the state directory so a notifier can point at it. |
 | `$AUTOBAHN_STATES` | Comma-separated state names present. |
 | `$AUTOBAHN_ALERT_COUNT` | How many sessions are in the set. |
@@ -38,6 +36,33 @@ give commands absolute paths — and on Linux, `notify-send` needs
 Hooks run off the cycle and cannot affect or delay synchronization: a
 hook is killed if it outstays its timeout, and is skipped while a
 previous one is still running.
+
+## The example hook (experimental)
+
+A hook is a shell command inside a TOML string, so every quote in it is
+escaped twice — and a notifier's arguments are mostly quotes. `autobahn
+init` therefore writes two scripts beside the configuration, and an
+install writes them the first time:
+
+| file | what it is |
+|---|---|
+| `~/.autobahn/on-alert.sh` | The hook, with a worked example per platform. On macOS: `terminal-notifier` if it is installed (a subtitle and a click), else the built-in notification. On Linux: `notify-send`, with the session bus address worked out when the service did not inherit one. On anything else, or a headless host, a line on standard error, which the log keeps. |
+| `~/.autobahn/open-status` | What a click opens: `autobahn status`, then a pause, because a terminal closes its window as soon as the command exits. |
+
+Point at the first one and the escaping problem goes away:
+
+```toml
+on_alert = "~/.autobahn/on-alert.sh"
+```
+
+**Experimental.** What the example notices, which notifier it picks, and
+what it prints may change between releases. `on_alert` itself and the
+variables it is handed do not: a hook written against the table below
+keeps working.
+
+Neither script is ever replaced once it exists, not even by `autobahn
+init --force`, because there is no way to tell one that was edited from
+one that was not. Delete a script to get a fresh copy.
 
 ## The five states, and how long each must hold
 
@@ -106,6 +131,6 @@ each key went rather than refused as an unknown field.
 ## See also
 
 - [Configuration](./configuration.md) — the top-level keys
-- [The shop](./shop.md) — what `$AUTOBAHN_OPEN` opens
+- [The shop](./shop.md) — `autobahn mi`, where a notification leads
 - [The menu bar app](./macos-app.md) — an icon in the colour of the worst session
 - [The log](./logging.md) — the evidence, for the alerts that clear themselves

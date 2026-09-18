@@ -82,12 +82,14 @@ view of the log there is.
 
 ## From a notification
 
-`$AUTOBAHN_OPEN`, handed to the alert hook, is a ready command that opens
-the shop on the full detail. A notification holds one line; this is the
-way from that line to the rest of it.
+A notification holds one line. `autobahn mi` is the rest of it, so a hook
+that can run something on click — `terminal-notifier -execute`, a tray
+item — is given that command. The shop is a terminal program, so on macOS
+the command must open a terminal around it, which is why autobahn no
+longer writes one: what that terminal is differs per reader.
 
 ## See also
 
 - [Conflicts](./conflicts.md) — the `resolve` the shop runs
-- [Alerts](./alerts.md) — `$AUTOBAHN_OPEN`
+- [Alerts](./alerts.md) — the hook a notification comes from
 - [Commands](./commands.md) — `status --json`, which the shop reads

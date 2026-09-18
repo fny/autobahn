@@ -1,5 +1,10 @@
 # The menu bar app
 
+**Experimental.** It works, and it is the app the release ships, but its
+menu, its icon and what it does on a click are still moving. The things
+it reads — `status --json` and `resolve` — are not, so nothing it shows
+can go stale behind autobahn's back.
+
 ```sh
 apps/macos/build.sh          # builds Autobahn.app
 open apps/macos/Autobahn.app # or drag it to /Applications

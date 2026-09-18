@@ -57,7 +57,7 @@ every section.
 
 | Key | Type | Default | What it is |
 |---|---|---|---|
-| `on_alert` | string | — | Shell command run when a session needs a person. The only hook. See [Alerts](./alerts.md). |
+| `on_alert` | string | — | Shell command run when a session needs a person. The only hook. `autobahn init` writes an experimental example at `~/.autobahn/on-alert.sh` to point it at. See [Alerts](./alerts.md). |
 | `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. |
 | `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |

@@ -217,7 +217,7 @@ enum Command {
     },
     /// Run the menu bar app: an icon whose colour is the state of every
     /// session, a menu with the detail, and the ways to settle each
-    /// conflict. Built with the `tray` feature.
+    /// conflict. Experimental. Built with the `tray` feature.
     Tray {
         /// The configuration file (defaults to ~/.autobahn/config.toml).
         #[arg(long)]
@@ -2561,9 +2561,49 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
         })?
         .len();
     println!("wrote {}", path.display());
+    for (name, contents) in [
+        ("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE),
+        ("open-status", autobahn::config::OPEN_STATUS_EXAMPLE),
+    ] {
+        match write_example_script(path.parent(), name, contents)? {
+            Some(written) => println!("wrote {}", written.display()),
+            // Never replaced, not even under `--force`: the configuration
+            // is autobahn's to rewrite, but a hook is a script its owner
+            // may have made their own, and there is no way to tell one
+            // that was edited from one that was not.
+            None => {}
+        }
+    }
     println!("  it describes {sessions} session(s): edit the example group to add one");
     println!("  then `autobahn watch`, or `autobahn install` to run it as a login service");
     Ok(())
+}
+
+/// Writes one of the example scripts beside the configuration, unless a
+/// file of that name is already there. Returns where it went, or nothing
+/// when one was already there.
+///
+/// Executable, because the hook runs it as a command. The alerting it does
+/// is experimental — an example to edit, not an interface — while
+/// `on_alert` and the variables it is handed are not.
+fn write_example_script(
+    directory: Option<&std::path::Path>,
+    name: &str,
+    contents: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let script = directory.join(name);
+    if script.exists() {
+        return Ok(None);
+    }
+    std::fs::write(&script, contents)
+        .with_context(|| format!("unable to write {}", script.display()))?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("unable to make {} executable", script.display()))?;
+    Ok(Some(script))
 }
 
 fn run_clean(

@@ -1,25 +1,17 @@
 # Alerts
 
-A supervisor running as a login service is invisible by design, which
-means a conflict or a permission that stopped working sits there with
-nobody told. `on_alert` runs a command when that happens:
+A supervisor running as a login service is invisible by design, which means a conflict or a permission that stopped working sits there with nobody told. `on_alert` runs a command when that happens:
 
 ```toml
 on_alert = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
             -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\""
 ```
 
-That is the whole of it. It sits at the top level of the config because
-it is the one thing about alerting anyone should have to write.
+That is the whole of it. It sits at the top level of the config because it is the one thing about alerting anyone should have to write.
 
-`on_alert` is the only hook. Which states are alerting is in the summary
-it is handed, not in which hook is chosen — a hook per state only moved
-the branching out of the command and into the config, and every state
-ends the same way, with someone opening a terminal.
+`on_alert` is the only hook. Which states are alerting is in the summary it is handed, not in which hook is chosen — a hook per state only moved the branching out of the command and into the config, and every state ends the same way, with someone opening a terminal.
 
-The service runs under launchd or systemd with a sparse environment, so
-give commands absolute paths — and on Linux, `notify-send` needs
-`DBUS_SESSION_BUS_ADDRESS`.
+The service runs under launchd or systemd with a sparse environment, so give commands absolute paths — and on Linux, `notify-send` needs `DBUS_SESSION_BUS_ADDRESS`.
 
 ## What the hook receives
 
@@ -33,16 +25,11 @@ give commands absolute paths — and on Linux, `notify-send` needs
 | `$AUTOBAHN_EVENT` | `alert` or `repeat`. |
 | stdin | The full `status --json` document. |
 
-Hooks run off the cycle and cannot affect or delay synchronization: a
-hook is killed if it outstays its timeout, and is skipped while a
-previous one is still running.
+Hooks run off the cycle and cannot affect or delay synchronization: a hook is killed if it outstays its timeout, and is skipped while a previous one is still running.
 
 ## The example hook (experimental)
 
-A hook is a shell command inside a TOML string, so every quote in it is
-escaped twice — and a notifier's arguments are mostly quotes. `autobahn
-init` therefore writes two scripts beside the configuration, and an
-install writes them the first time:
+A hook is a shell command inside a TOML string, so every quote in it is escaped twice — and a notifier's arguments are mostly quotes. `autobahn init` therefore writes two scripts beside the configuration, and an install writes them the first time:
 
 | file | what it is |
 |---|---|
@@ -55,20 +42,13 @@ Point at the first one and the escaping problem goes away:
 on_alert = "~/.autobahn/on-alert.sh"
 ```
 
-**Experimental.** What the example notices, which notifier it picks, and
-what it prints may change between releases. `on_alert` itself and the
-variables it is handed do not: a hook written against the table below
-keeps working.
+**Experimental.** What the example notices, which notifier it picks, and what it prints may change between releases. `on_alert` itself and the variables it is handed do not: a hook written against the table below keeps working.
 
-Neither script is ever replaced once it exists, not even by `autobahn
-init --force`, because there is no way to tell one that was edited from
-one that was not. Delete a script to get a fresh copy.
+Neither script is ever replaced once it exists, not even by `autobahn init --force`, because there is no way to tell one that was edited from one that was not. Delete a script to get a fresh copy.
 
 ## The five states, and how long each must hold
 
-A condition must hold before it counts, and how long is built in and
-tuned per state, because a sleeping laptop and a safety halt do not
-deserve the same patience:
+A condition must hold before it counts, and how long is built in and tuned per state, because a sleeping laptop and a safety halt do not deserve the same patience:
 
 | state | holds for | why |
 | --- | --- | --- |
@@ -83,38 +63,16 @@ What each state means is in [Commands](./commands.md#what-a-sessions-state-means
 
 Six rules make it usable rather than maddening:
 
-- **Nothing runs while everything is healthy.** Silence is the normal
-  state.
-- **Nothing runs when it clears, either.** An all-clear asks for no
-  action, and a stream of notifications that ask for nothing is what
-  teaches you to stop reading the ones that do.
-- **A condition must hold without a break.** A wifi handover that takes
-  every session unreachable for eight seconds is never mentioned — it
-  fixed itself. Lapse for one cycle and the clock restarts, so a host
-  flapping just under the threshold never crosses it.
-- **An alert fires when something *joins* the set of sessions in
-  trouble**, never on repetition, and never on recovery. A cascade
-  coming back one host at a time used to notify on the way up as loudly
-  as on the way down; a session that recovers and fails again inside the
-  same episode is the trouble already reported, not new trouble.
-- **A cascade is held and reported once.** A closing laptop does not take
-  its sessions together: each goes when its own connection times out,
-  seconds apart, so every arrival changed the set and every change was
-  news. The window (60 seconds) runs from the first arrival nobody has
-  been told about, not from the latest, so a steady trickle cannot hold
-  the notification back indefinitely.
-- **Trouble that comes and goes is reported once.** A conflict on a file
-  two machines are both editing appears, clears, and returns all day.
-  Everything must stay clear for 15 minutes before a return counts as
-  news rather than as the same trouble continuing — otherwise one
-  flapping session is a notification a minute.
+- **Nothing runs while everything is healthy.** Silence is the normal state.
+- **Nothing runs when it clears, either.** An all-clear asks for no action, and a stream of notifications that ask for nothing is what teaches you to stop reading the ones that do.
+- **A condition must hold without a break.** A wifi handover that takes every session unreachable for eight seconds is never mentioned — it fixed itself. Lapse for one cycle and the clock restarts, so a host flapping just under the threshold never crosses it.
+- **An alert fires when something *joins* the set of sessions in trouble**, never on repetition, and never on recovery. A cascade coming back one host at a time used to notify on the way up as loudly as on the way down; a session that recovers and fails again inside the same episode is the trouble already reported, not new trouble.
+- **A cascade is held and reported once.** A closing laptop does not take its sessions together: each goes when its own connection times out, seconds apart, so every arrival changed the set and every change was news. The window (60 seconds) runs from the first arrival nobody has been told about, not from the latest, so a steady trickle cannot hold the notification back indefinitely.
+- **Trouble that comes and goes is reported once.** A conflict on a file two machines are both editing appears, clears, and returns all day. Everything must stay clear for 15 minutes before a return counts as news rather than as the same trouble continuing — otherwise one flapping session is a notification a minute.
 
 ## `[advanced.alerts]`
 
-The alerter's timing. These are not preferences — they are the values
-that make it correct, and there is no second right answer a reader would
-discover by trying. The section exists so that finding yourself in it is
-itself the message.
+The alerter's timing. These are not preferences — they are the values that make it correct, and there is no second right answer a reader would discover by trying. The section exists so that finding yourself in it is itself the message.
 
 | Key | Default | What it governs |
 |---|---|---|
@@ -125,8 +83,7 @@ itself the message.
 | `repeat_after` | never | Re-fire an unchanged set. Off, and usually should be: a notification that returns while you are already working on it teaches you to ignore it. |
 | `timeout` | 30s | How long the hook may run before it is killed. |
 
-A configuration written against the old `[alerts]` section is told where
-each key went rather than refused as an unknown field.
+A configuration written against the old `[alerts]` section is told where each key went rather than refused as an unknown field.
 
 ## See also
 

@@ -1,21 +1,14 @@
 # Peering — experimental
 
-Failover for the star. The alpha leads; when it is gone for long enough,
-the first beta that is up takes the lead; when the alpha returns, it gets
-the lead back after one cycle as a follower. Nothing in reconciliation
-changes. The design is in `docs/peering.md` (written in phase 6).
+Failover for the star. The alpha leads; when it is gone for long enough, the first beta that is up takes the lead; when the alpha returns, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes. The design is in `docs/peering.md` (written in phase 6).
 
-One word everywhere: the mode is `peering-*-experimental`, the section is
-`[advanced.peering-experimental]`, the state lives in `~/.autobahn/peering/`,
-the verbs are `autobahn peering …`. "Peer" is prose for one member.
+One word everywhere: the mode is `peering-*-experimental`, the section is `[advanced.peering-experimental]`, the state lives in `~/.autobahn/peering/`, the verbs are `autobahn peering …`. "Peer" is prose for one member.
 
 Rules the build must keep:
 
 - The alpha is never dialed. It dials, as leader or as follower.
-- A host accepts writes from one controller: the one named in its lease,
-  or any controller when no lease was ever written (the mode is off).
-- The ancestor copy on a peer is written with ancestor durability, never
-  through the scan-cache writer.
+- A host accepts writes from one controller: the one named in its lease, or any controller when no lease was ever written (the mode is off).
+- The ancestor copy on a peer is written with ancestor durability, never through the scan-cache writer.
 - Every phase compiles, passes its tests, and is one commit on `peering`.
 
 ## Phase 1 — the mode and the section

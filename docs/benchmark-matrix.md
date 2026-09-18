@@ -9,28 +9,15 @@
 > Both changes buy correctness properties, and neither changes a
 > conclusion in these tables.
 
-Every cell, every percentile. The summary and the interpretation are in
-[the benchmark summary](./benchmarks.md). The method is in
-[bench/README.md](../bench/README.md).
+Every cell, every percentile. The summary and the interpretation are in [the benchmark summary](./benchmarks.md). The method is in [bench/README.md](../bench/README.md).
 
-**Setup.** Matched pairs of `c6i.4xlarge` instances, one AWS availability
-zone, 200 GB gp3 volumes. Chromium at 504,940 files with symbolic links
-removed and `.git` and `out` excluded. Fifteen cells, ten repeats each: 150
-jobs and 300 tool-runs. Both tools run in every job, back to back on the
-same pair, in an order randomized per job. mutagen used a 5-second poll
-interval, better than its 10-second default.
+**Setup.** Matched pairs of `c6i.4xlarge` instances, one AWS availability zone, 200 GB gp3 volumes. Chromium at 504,940 files with symbolic links removed and `.git` and `out` excluded. Fifteen cells, ten repeats each: 150 jobs and 300 tool-runs. Both tools run in every job, back to back on the same pair, in an order randomized per job. mutagen used a 5-second poll interval, better than its 10-second default.
 
-**Integrity.** 150 of 150 jobs completed. Zero censored samples. One run
-excluded, when a destination host became unreachable and the cleanliness
-check refused to certify it. Harness overhead measured 0.6 ms median across
-all 150 jobs, against results in the tens to thousands of milliseconds.
+**Integrity.** 150 of 150 jobs completed. Zero censored samples. One run excluded, when a destination host became unreachable and the cleanliness check refused to certify it. Harness overhead measured 0.6 ms median across all 150 jobs, against results in the tens to thousands of milliseconds.
 
 ## Propagation latency
 
-All figures are milliseconds. `⇄` marks a bidirectional cell, which runs a
-separate measuring agent in each direction. Ratio is mutagen's median over
-autobahn's. "Skipped" counts ticks where the measuring agent could not issue
-an edit, which records an offered-load shortfall.
+All figures are milliseconds. `⇄` marks a bidirectional cell, which runs a separate measuring agent in each direction. Ratio is mutagen's median over autobahn's. "Skipped" counts ticks where the measuring agent could not issue an edit, which records an offered-load shortfall.
 
 | corpus | agents | direction | ab p50 | ab p90 | ab p99 | mu p50 | mu p90 | mu p99 | ratio | samples | skipped |
 |---|---|---|---|---|---|---|---|---|---|---|---|
@@ -58,38 +45,17 @@ an edit, which records an offered-load shortfall.
 
 ### Reading the latency table
 
-**autobahn leads every cell**, from 1.5× on the smallest to 37.8× on
-Chromium with a single writer.
+**autobahn leads every cell**, from 1.5× on the smallest to 37.8× on Chromium with a single writer.
 
-**The two tools scale differently.** autobahn's median moves from 40 ms to
-782 ms across the whole matrix, a factor of about 20 spanning a 125× change
-in tree size and a 100× change in concurrency. mutagen's moves from 62 ms to
-11,600 ms, a factor of 187.
+**The two tools scale differently.** autobahn's median moves from 40 ms to 782 ms across the whole matrix, a factor of about 20 spanning a 125× change in tree size and a 100× change in concurrency. mutagen's moves from 62 ms to 11,600 ms, a factor of 187.
 
-**The 99th percentile carries a defect, not a scaling limit.** In several
-cells autobahn's 99th percentile sits far above its 90th. The cause is a
-self-inflicted session restart: under churn a file is rewritten between
-staging and application, the cycle reports missing staged content, and after
-six such cycles autobahn fails the whole attempt even though each cycle
-applied dozens of other changes. The supervisor then drops the session,
-backs off, reconnects and rescans, and nothing propagates meanwhile.
-Restarts number 30 across `chromium-100-bidir`, 8 across `4k-100`, and 2 in
-a single `chromium-1` run. Every cell with a multi-second outlier has them,
-and every cell without them has a clean tail. Details in
-[the summary](./benchmarks.md#where-autobahn-is-weakest). The defect has since
-been fixed; the summary says how.
+**The 99th percentile carries a defect, not a scaling limit.** In several cells autobahn's 99th percentile sits far above its 90th. The cause is a self-inflicted session restart: under churn a file is rewritten between staging and application, the cycle reports missing staged content, and after six such cycles autobahn fails the whole attempt even though each cycle applied dozens of other changes. The supervisor then drops the session, backs off, reconnects and rescans, and nothing propagates meanwhile. Restarts number 30 across `chromium-100-bidir`, 8 across `4k-100`, and 2 in a single `chromium-1` run. Every cell with a multi-second outlier has them, and every cell without them has a clean tail. Details in [the summary](./benchmarks.md#where-autobahn-is-weakest). The defect has since been fixed; the summary says how.
 
-**mutagen's ordering is not monotonic in agent count.** On the 40k corpus it
-is slower at 10 agents (1,854 ms) than at 100 (1,602 ms). Both are far above
-its single-agent figure of 286 ms. Under continuous churn its coalescing
-timers reset rather than expire, so latency tracks writer density in a way
-that is not simply proportional to it.
+**mutagen's ordering is not monotonic in agent count.** On the 40k corpus it is slower at 10 agents (1,854 ms) than at 100 (1,602 ms). Both are far above its single-agent figure of 286 ms. Under continuous churn its coalescing timers reset rather than expire, so latency tracks writer density in a way that is not simply proportional to it.
 
 ## Memory and CPU
 
-Peak resident memory and mean CPU, as a percentage of one core, median
-across repeats. "Source" is the editing host, "dest" the receiving one.
-Sampling covers each tool's whole process tree, including its remote agent.
+Peak resident memory and mean CPU, as a percentage of one core, median across repeats. "Source" is the editing host, "dest" the receiving one. Sampling covers each tool's whole process tree, including its remote agent.
 
 ### Workload
 
@@ -163,27 +129,17 @@ Sampling covers each tool's whole process tree, including its remote agent.
 
 ### Reading the resource tables
 
-**Memory scales with the tree, not with the agent count.** autobahn holds
-Chromium in 249 MB with one agent and 321 MB with a hundred. The ratio
-against mutagen grows with file count — 3.1× at 4,000 files, 8.2× at
-505,000 — which is the signature of a per-file cost rather than fixed
-overhead.
+**Memory scales with the tree, not with the agent count.** autobahn holds Chromium in 249 MB with one agent and 321 MB with a hundred. The ratio against mutagen grows with file count — 3.1× at 4,000 files, 8.2× at 505,000 — which is the signature of a per-file cost rather than fixed overhead.
 
-**Idle CPU is the starkest single number.** With the tree synchronized and
-nothing happening, mutagen uses half a core on Chromium. autobahn uses two
-tenths of one percent.
+**Idle CPU is the starkest single number.** With the tree synchronized and nothing happening, mutagen uses half a core on Chromium. autobahn uses two tenths of one percent.
 
-**The receiving host is not idle for mutagen.** In one-direction cells it
-does no editing, yet mutagen sustains more than a core there. It rescans and
-reserializes the whole tree on every cycle.
+**The receiving host is not idle for mutagen.** In one-direction cells it does no editing, yet mutagen sustains more than a core there. It rescans and reserializes the whole tree on every cycle.
 
-An implementation account of all three findings is in
-[Why mutagen is slower](./mutagen.md).
+An implementation account of all three findings is in [Why mutagen is slower](./mutagen.md).
 
 ## First synchronization
 
-Time to first digest-verified convergence, with the corpus faulted into the
-volume and the page cache dropped beforehand.
+Time to first digest-verified convergence, with the corpus faulted into the volume and the page cache dropped beforehand.
 
 | corpus | autobahn | mutagen |
 |---|---|---|
@@ -192,20 +148,13 @@ volume and the page cache dropped beforehand.
 | 2 × 40k files | 35.5 s / 38.5 s | 30.0 s / 38.1 s |
 | 4k files | 8.4 s | 5.8 s |
 
-The two land within about one percent on Chromium. Half a million small
-files is bound by device IOPS rather than by either tool, so this
-measurement has little power to separate them. mutagen is modestly ahead on
-the smaller trees.
+The two land within about one percent on Chromium. Half a million small files is bound by device IOPS rather than by either tool, so this measurement has little power to separate them. mutagen is modestly ahead on the smaller trees.
 
-Without the storage controls these numbers are meaningless: an uncontrolled
-run charged the first tool 434 s and the second 125 s for identical work,
-purely from snapshot block loading. See
-[bench/README.md](../bench/README.md#lessons-paid-for).
+Without the storage controls these numbers are meaningless: an uncontrolled run charged the first tool 434 s and the second 125 s for identical work, purely from snapshot block loading. See [bench/README.md](../bench/README.md#lessons-paid-for).
 
 ---
 
-Raw JSONL for all 150 jobs, the plan, and per-pair driver logs are in
-`bench/results-bench-1787811723/`.
+Raw JSONL for all 150 jobs, the plan, and per-pair driver logs are in `bench/results-bench-1787811723/`.
 
 ## See also
 

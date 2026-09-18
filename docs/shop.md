@@ -4,10 +4,7 @@
 autobahn mi
 ```
 
-An easter egg that turned useful. Every session is an order, an order
-fills as its transfer does, and the shop is open when a supervisor
-answers and shuttered when none does. Every number on it is real — it
-reads the same `status --json` document as everything else.
+An easter egg that turned useful. Every session is an order, an order fills as its transfer does, and the shop is open when a supervisor answers and shuttered when none does. Every number on it is real — it reads the same `status --json` document as everything else.
 
 ```
   ◉ OPEN   🥖 AUTOBÁNH MÌ   15 customers · 12,480 files · 3.4 GB · 1 filling · 2.1 MB/s
@@ -17,23 +14,13 @@ reads the same `status --json` document as everything else.
     voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s · 1 waiting
 ```
 
-An order is always *something* — served, disputed, delivery blocked — and
-sometimes also *doing* something. The first has the coloured word and
-never gives it up. The second has a column of its own, filled only once
-the work has gone on long enough to be worth mentioning: the same rule
-`status` applies, so a routine scan is never announced and one that
-drags names itself without displacing the outcome.
+An order is always *something* — served, disputed, delivery blocked — and sometimes also *doing* something. The first has the coloured word and never gives it up. The second has a column of its own, filled only once the work has gone on long enough to be worth mentioning: the same rule `status` applies, so a routine scan is never announced and one that drags names itself without displacing the outcome.
 
 Press `?` for a page that explains every word on the screen.
 
 ## The counter
 
-The useful half. `ret` opens any order — where it syncs from and to, its
-mode, how many cycles it has run and how much it has carried — and then
-its issues as a tree: cause, then place, then path. Every level of that
-tree can be acted on, so one keypress settles a whole directory or a
-single file. `spc` marks a level; mark as many as you like and one
-keypress settles all of them together.
+The useful half. `ret` opens any order — where it syncs from and to, its mode, how many cycles it has run and how much it has carried — and then its issues as a tree: cause, then place, then path. Every level of that tree can be acted on, so one keypress settles a whole directory or a single file. `spc` marks a level; mark as many as you like and one keypress settles all of them together.
 
 ```
   ┌──────────────────────────────────────────────────────────────┐
@@ -65,28 +52,13 @@ keypress settles all of them together.
 | `?` | help |
 | `q` | close the shop |
 
-Each of `o`, `t` and `b` asks before it acts, because resolution
-overwrites a file someone edited on every destination in the group. It
-then runs the same `resolve` you would type, on whichever paths the
-selected level covers — or on every marked level at once, as a single
-command. That is also the faster way round: resolution reads each losing
-side once per invocation, so twenty paths settled together cost one scan
-and twenty settled one by one cost twenty. Marking a folder and a file
-inside it is safe; the file is named once. The marks are forgotten once
-the settlement runs, and when you leave the counter. Blocked paths autobahn cannot clear itself, since
-the commands are `sudo` over ssh and a password prompt has nowhere to
-appear — so `c` copies the fix instead.
+Each of `o`, `t` and `b` asks before it acts, because resolution overwrites a file someone edited on every destination in the group. It then runs the same `resolve` you would type, on whichever paths the selected level covers — or on every marked level at once, as a single command. That is also the faster way round: resolution reads each losing side once per invocation, so twenty paths settled together cost one scan and twenty settled one by one cost twenty. Marking a folder and a file inside it is safe; the file is named once. The marks are forgotten once the settlement runs, and when you leave the counter. Blocked paths autobahn cannot clear itself, since the commands are `sudo` over ssh and a password prompt has nowhere to appear — so `c` copies the fix instead.
 
-Under the counter, the last few lines the supervisor wrote — the only
-view of the log there is.
+Under the counter, the last few lines the supervisor wrote — the only view of the log there is.
 
 ## From a notification
 
-A notification holds one line. `autobahn mi` is the rest of it, so a hook
-that can run something on click — `terminal-notifier -execute`, a tray
-item — is given that command. The shop is a terminal program, so on macOS
-the command must open a terminal around it, which is why autobahn no
-longer writes one: what that terminal is differs per reader.
+A notification holds one line. `autobahn mi` is the rest of it, so a hook that can run something on click — `terminal-notifier -execute`, a tray item — is given that command. The shop is a terminal program, so on macOS the command must open a terminal around it, which is why autobahn no longer writes one: what that terminal is differs per reader.
 
 ## See also
 

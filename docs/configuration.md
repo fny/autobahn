@@ -1,18 +1,12 @@
 # Configuration
 
-Everything autobahn does is described in one file, `~/.autobahn/config.toml`.
-There is no separate registry of sessions to drift out of date: what the
-file says is what runs.
+Everything autobahn does is described in one file, `~/.autobahn/config.toml`. There is no separate registry of sessions to drift out of date: what the file says is what runs.
 
-`autobahn init` writes that file for you: the defaults, every mode
-explained in a comment, and one example group to edit. The rest of this
-page is every key it can hold.
+`autobahn init` writes that file for you: the defaults, every mode explained in a comment, and one example group to edit. The rest of this page is every key it can hold.
 
 ## The shape
 
-Each **group** fans one source root (the *alpha*) out to any number of
-destinations (the *betas*). Each (alpha, beta) pair becomes its own
-session.
+Each **group** fans one source root (the *alpha*) out to any number of destinations (the *betas*). Each (alpha, beta) pair becomes its own session.
 
 ```toml
 # ~/.autobahn/config.toml
@@ -40,20 +34,13 @@ mode = "one-way-alpha"
 betas = ["build.example.com"]
 ```
 
-Remote endpoints use the scp-style `[user@]host:path` syntax, key-based
-SSH auth, and *either* side of a group may be remote — you can pull from
-a build server, or relay between two remote hosts through your machine.
-An endpoint spec is treated as remote unless it visibly looks like a
-local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
+Remote endpoints use the scp-style `[user@]host:path` syntax, key-based SSH auth, and *either* side of a group may be remote — you can pull from a build server, or relay between two remote hosts through your machine. An endpoint spec is treated as remote unless it visibly looks like a local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
 
-Sessions are independent: a host being down means its session retries
-with backoff and heals the moment the host answers — the others never
-notice. Sessions targeting the same host share one SSH connection.
+Sessions are independent: a host being down means its session retries with backoff and heals the moment the host answers — the others never notice. Sessions targeting the same host share one SSH connection.
 
 ## Top level
 
-Seven keys. Unknown keys are refused at startup, not ignored — here and in
-every section.
+Seven keys. Unknown keys are refused at startup, not ignored — here and in every section.
 
 | Key | Type | Default | What it is |
 |---|---|---|---|
@@ -65,18 +52,11 @@ every section.
 | `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
 | `[advanced.peering-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
 
-Why `defaults` is a table and `log` is not: TOML requires bare keys to
-appear before the first table header. Every `defaults` key is *also* a
-valid group key, so a bare `mode = …` written after `[groups.x]` would
-silently become that group's mode — legal, so no error. `on_alert`,
-`disabled_hosts` and `log` are valid nowhere else, so the same slip is
-caught. (`disabled` on its own is a *group* key, and means something else:
-that one group, off.)
+Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts` and `log` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
 ## Session settings
 
-Thirteen keys live in both `[defaults]` and any group, with the group
-winning. Four exist only on a group.
+Thirteen keys live in both `[defaults]` and any group, with the group winning. Four exist only on a group.
 
 | Key | Where | Default | What it does |
 |---|---|---|---|
@@ -102,9 +82,7 @@ winning. Four exist only on a group.
 autobahn watch              # every configured session, here, until Ctrl-C
 ```
 
-On a terminal, `watch` is a live `autobahn status` that repaints as
-sessions report; piped to a file it logs one line per event instead. To
-keep syncing when no terminal is:
+On a terminal, `watch` is a live `autobahn status` that repaints as sessions report; piped to a file it logs one line per event instead. To keep syncing when no terminal is:
 
 ```sh
 autobahn install            # register a login service, and start it
@@ -114,18 +92,9 @@ autobahn restart            # after editing the config, or upgrading
 autobahn uninstall          # stop it, and unregister it
 ```
 
-The service is launchd on macOS and a systemd user unit on Linux —
-inspect it with `launchctl` or `systemctl --user` like any other — and
-it logs to `~/.autobahn/service.log`. There is no daemon of autobahn's
-own and nothing backgrounds itself: `start` with no service installed
-says so and points at `install` or `watch`.
+The service is launchd on macOS and a systemd user unit on Linux — inspect it with `launchctl` or `systemctl --user` like any other — and it logs to `~/.autobahn/service.log`. There is no daemon of autobahn's own and nothing backgrounds itself: `start` with no service installed says so and points at `install` or `watch`.
 
-The supervisor holds the config in memory, so an edit takes effect on
-`restart`. A restart does not ask the supervisor to stop: the service
-manager kills it and starts it again. That is safe — writes are staged and
-published by rename, and the ancestor journal is built to survive a crash
-at any point (see [Safety](./safety.md)) — but a cycle in flight is
-abandoned and redone.
+The supervisor holds the config in memory, so an edit takes effect on `restart`. A restart does not ask the supervisor to stop: the service manager kills it and starts it again. That is safe — writes are staged and published by rename, and the ancestor journal is built to survive a crash at any point (see [Safety](./safety.md)) — but a cycle in flight is abandoned and redone.
 
 ## See also
 

@@ -37,6 +37,21 @@ autobahn mi                # the shop: watch it work, and clear the queue
 
 `reset` requires the group name. A reset is deliberate, never a default. `clean` is described in [State](./state.md); the conflict commands in [Conflicts](./conflicts.md).
 
+Running it as a service, and keeping it current:
+
+```sh
+autobahn install           # register the supervisor as a login service
+autobahn start             # start it, stop it, or do both after an edit
+autobahn stop
+autobahn restart
+autobahn uninstall         # stop it and unregister it
+
+autobahn update            # install the latest release over this one
+autobahn update --dry-run  # ...or just say what it would install
+```
+
+`install` is in [Configuration](./configuration.md); `update`, and what a release contains, in [Releases](./releases.md).
+
 ## What `status` shows
 
 When a session has been working long enough that its silence would look like death — a cold sync, a first scan, an unreachable host — `status` says what it is doing, how long it has been at it, and, where the numbers allow an honest one, an estimate:
@@ -108,3 +123,4 @@ One-shots share session state with the supervisor (same roots → same session),
 - [The shop](./shop.md) — `autobahn mi`
 - [State](./state.md) — `clean`, and what lives in `~/.autobahn`
 - [Alerts](./alerts.md) — being told without watching
+- [Releases](./releases.md) — `update`, and what ships with a release

@@ -113,4 +113,4 @@ autobahn peering attach                # what the alpha runs over ssh; not for t
 
 ## Under the hood
 
-`src/peering.rs` holds the lease, the pushed files and the ancestor copy; `src/supervisor/peer.rs` the follow/lead state machine of a peer and of the alpha; the protocol requests are `Lease`, `AncestorRecord`, `AncestorCheckpoint`, `PutPeeringFile` and `PeeringState`. The compatibility epoch moved to 12 with them. `PEERING-TODO.md` at the root is the build's checklist.
+`src/peering.rs` holds the lease, the pushed files and the ancestor copy; `src/supervisor/peer.rs` the follow/lead state machine of a peer and of the alpha; the protocol requests are `Lease`, `AncestorRecord`, `AncestorCheckpoint`, `PutPeeringFile` and `PeeringState`. The compatibility epoch moved to 12 with them.

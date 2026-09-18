@@ -1,6 +1,6 @@
 # Retained residuals
 
-The companion to NEXT.md: the risks that are deliberately *not* in the plan. Each entry records what the residual is, why it was retained, what would change that decision, and what the fix would be if the decision changed — so revisiting any of them starts from the reasoning, not from scratch. None of these are forgotten; all of them are chosen.
+The companion to [INVARIANTS.md](./INVARIANTS.md): the risks that are deliberately left open. Each entry records what the residual is, why it was retained, what would change that decision, and what the fix would be if the decision changed — so revisiting any of them starts from the reasoning, not from scratch. None of these are forgotten; all of them are chosen.
 
 ## 1. Single-huge-file mounts evade the emptied guard
 
@@ -20,7 +20,7 @@ The companion to NEXT.md: the risks that are deliberately *not* in the plan. Eac
 
 **What would change the decision.** Running autobahn with more privilege than the tree's writers (a root daemon syncing user-writable trees) — that converts the symlink race from a self-own into privilege escalation, and the refactor stops being optional. Also: the next time the transitioner is opened for substantial work anyway.
 
-**The fix if changed.** The dirfd refactor, plus explicit handling of `ENOSYS`/`EOPNOTSUPP` so unsupported-`renameat2` behavior is a known state rather than an accident. Sequencing note: do it *after* NEXT.md phase C2 exists, so the staging/transition fault harness can gate it.
+**The fix if changed.** The dirfd refactor, plus explicit handling of `ENOSYS`/`EOPNOTSUPP` so unsupported-`renameat2` behavior is a known state rather than an accident. Sequencing note: do it *after* the staging and transition fault harness exists, so the harness can gate it.
 
 ## 3. Network filesystems beyond warn-and-document
 
@@ -38,7 +38,7 @@ The companion to NEXT.md: the risks that are deliberately *not* in the plan. Eac
 
 **Why retained.** The full fix is endpoint read/write locks acquired on the host that owns each endpoint, including agent-side acquisition for remote roots — a protocol change with its own new failure modes (stale-lock recovery, lock ordering across sessions, deadlock between supervisors). Review round five judged the trigger topology — a *writable* overlap spanning processes — an exotic, deliberate configuration, and the mechanism heavier than the exposure.
 
-**What would change the decision.** The agent protocol being opened for other reasons (NEXT.md phase C3 touches its edges); or evidence that multi-machine sync into shared storage is a real deployment pattern. The intent records (phase A) also shrink the harm: overlapping writers produce conflicts more often and silent swaps less often.
+**What would change the decision.** The agent protocol being opened for other reasons; or evidence that multi-machine sync into shared storage is a real deployment pattern. The intent records also shrink the harm: overlapping writers produce conflicts more often and silent swaps less often.
 
 **The fix if changed.** Advisory endpoint locks keyed by resolved root identity in the endpoint host's default state root: shared for read-only participation (one-way alphas), exclusive for writable participation. The pair lock stays; this generalizes it.
 
@@ -46,7 +46,7 @@ The companion to NEXT.md: the risks that are deliberately *not* in the plan. Eac
 
 **The residual.** A rewrite with identical length, restored mtime, and a retained inode is invisible to metadata-based change detection — every scan, full scans included, reuses the recorded digest. The racy rule closed the *accidental* same-granule case; deliberate restoration (`touch -r`, reproducible-build tooling, an adversary) remains.
 
-**Why retained.** This is the founding trade of every scan-based synchronizer — rsync's quick check, git's index, mutagen — because the alternative is reading every byte of every file on every scan. NEXT.md phase B gives the escape hatch: an on-demand full-content verify that makes the invisible visible and logs each instance as evidence.
+**Why retained.** This is the founding trade of every scan-based synchronizer — rsync's quick check, git's index, mutagen — because the alternative is reading every byte of every file on every scan. `autobahn verify` is the escape hatch: an on-demand full-content re-read that makes the invisible visible and logs each instance as evidence.
 
 **What would change the decision.** Verify-verb logs actually catching divergence in real trees (evidence the case occurs in practice), or a deployment where the adversarial variant is in the threat model.
 

@@ -13,7 +13,7 @@
 //! disabled_hosts = ["flaky.example.com"]
 //!
 //! [defaults]
-//! mode = "two-way-safe"
+//! mode = "two-way-conflict"
 //! ignores = [".git"]
 //! interval = 5
 //!
@@ -23,7 +23,7 @@
 //!
 //! [groups.dotfiles]
 //! alpha = "~/.config/shell"
-//! mode = "one-way-replica"
+//! mode = "one-way-alpha"
 //! betas = ["build.example.com", "/mnt/backup/shell"]
 //! ```
 //!

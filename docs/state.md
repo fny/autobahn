@@ -16,7 +16,9 @@ Everything autobahn keeps lives under one directory, `~/.autobahn`, on every mac
 | `ignores/` | ignore files, named from the config — see [Ignores](./ignores.md) |
 | `peering/` | experimental: the lease, this host's name in the star, the pushed configuration, and the ancestor copies a leader keeps here — see [Peering](./peering.md). `clean` leaves it alone |
 | `service.log` | the supervisor's log — see [The log](./logging.md) |
+| `control.sock` | the running supervisor's control socket, through which `flush`, `reset`, `verify` and `pause` reach live sessions |
 | `icon.png` | autobahn's icon, for notifiers |
+| `on-alert.sh`, `open-status` | the example alert hook `init` writes, and what a click on its notification opens — see [Alerts](./alerts.md). Yours to edit; never replaced |
 
 ## Sessions outlive the config
 

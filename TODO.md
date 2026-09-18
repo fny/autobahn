@@ -1,6 +1,6 @@
 # TODO
 
-Running list. Untracked by git for now — say the word if it should be committed.
+Running list, kept in the repository.
 
 ## UX
 

@@ -1,6 +1,6 @@
 # Invariants
 
-Every invariant the system claims, stated precisely, with the code that enforces it and the tests that check it. This is the deliverable of NEXT.md phase D: an external reviewer should attack these *statements* — find a schedule, a crash point, a filesystem behavior, or an input that falsifies one — rather than reviewing diffs. Where an invariant has a deliberate boundary, the boundary is stated and cross-referenced to RETAINED.md, which records why it was retained and what would reopen it.
+Every invariant the system claims, stated precisely, with the code that enforces it and the tests that check it. It is written to be attacked: a reviewer should go after these *statements* — find a schedule, a crash point, a filesystem behavior, or an input that falsifies one — rather than reviewing diffs. Where an invariant has a deliberate boundary, the boundary is stated and cross-referenced to RETAINED.md, which records why it was retained and what would reopen it.
 
 Citations use file paths and function or test names rather than line numbers, so they survive drift. All cited tests exist in the tree; many are mutation-checked — the enforcing code was deliberately broken and the test confirmed red — and those say so.
 

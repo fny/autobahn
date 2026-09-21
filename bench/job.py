@@ -568,7 +568,14 @@ def start_tool(tool, corpora):
             # expands to internally, so the comparison stays fair.
             for index, host in enumerate(destinations()):
                 name = corpus if len(destinations()) == 1 else f"{corpus}-{index}"
-                run(f"{HOME}/mutagen sync create --name={name} --sync-mode=two-way-conflict "
+                # `two-way-safe` is *mutagen's* name for the mode autobahn
+                # now spells `two-way-conflict`. The two vocabularies are
+                # independent, and this line is not a place to apply
+                # autobahn's renames: a sweep that changed it here (fd1b0b2)
+                # made mutagen refuse every session with "unknown
+                # synchronization mode", which fails only the mutagen arm
+                # and leaves a run that looks complete.
+                run(f"{HOME}/mutagen sync create --name={name} --sync-mode=two-way-safe "
                     f"--ignore=/.git --ignore=/out --watch-polling-interval=5 "
                     f"{CORPUS}/{corpus} {host}:{DEST}/{corpus}", check=True)
     elif tool == "toysync":

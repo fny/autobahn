@@ -238,6 +238,13 @@ def main():
         if record.get("measurement") != "cold_sync":
             continue
         for corpus, timing in record.get("timings", {}).items():
+            # A pre-seeded cell starts converged, so there is no cold sync
+            # to time: it reports `verified` with no duration at all. The
+            # guard below used to read `verified` as proof that a duration
+            # was there, which was true until seeding existed and then
+            # crashed the whole report on the first latency cell.
+            if timing.get("pre_seeded") or "digest_verified_s" not in timing:
+                continue
             if timing.get("verified"):
                 key = (record["cell"], record["tool"], corpus)
                 cold[key]["verified"].append(timing["digest_verified_s"])

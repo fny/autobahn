@@ -40,6 +40,13 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# The subject under test, as a static binary for the hosts. Overridable so
+# that a before/after can stage two builds without editing this file.
+AUTOBAHN_BINARY = os.environ.get(
+    "BENCH_AUTOBAHN",
+    os.path.join(HERE, os.pardir, "target/x86_64-unknown-linux-musl/release/autobahn"))
+# How often a running pair's results are copied back while it works.
+COLLECT_INTERVAL = 120
 INSTANCE_TYPE = "c6i.4xlarge"
 BUILDER_TYPE = "c6i.2xlarge"
 VOLUME_GB = 200
@@ -114,7 +121,13 @@ CELLS = [
 # How long an instance may live without the orchestrator finishing. Long
 # enough for the slowest legitimate run, short enough that forgetting
 # costs one hour rather than a weekend.
-DEAD_MAN_MINUTES = 300
+#
+# Seven hours, not five: a full matrix at five repeats is 150 jobs of
+# around half an hour each, and the timer firing mid-run destroys the
+# whole run rather than saving anything — the machines are terminated
+# with their results still on them. Override for a short run if the
+# forgetting risk matters more than the completing one.
+DEAD_MAN_MINUTES = int(os.environ.get("BENCH_DEAD_MAN_MINUTES", "420"))
 
 
 def machines_for(cell):
@@ -362,7 +375,7 @@ def bake(options):
     for source, target in [
         (f"{HERE}/harness/target/x86_64-unknown-linux-musl/release/benchmark", "~/bench/benchmark"),
         (f"{HERE}/job.py", "~/bench/job.py"),
-        (os.path.expanduser("~/Workspace/autobahn/target/x86_64-unknown-linux-musl/release/autobahn"), "~/autobahn"),
+        (AUTOBAHN_BINARY, "~/autobahn"),
         (os.path.expanduser("~/Workspace/mutagen-bench/bin-stock/mutagen"), "~/mutagen"),
         # Mutagen requires its agent bundle beside the executable; without
         # it every SSH session creation fails outright.
@@ -378,6 +391,19 @@ def bake(options):
     print("baking (chromium clone + subsets + partitions; ~15 minutes)...")
     run(f"{ssh} 'echo {script} | base64 -d > ~/bake.sh && chmod +x ~/bake.sh && ~/bake.sh'",
         capture=False)
+
+    # The harness and the subject binary leave the image before it is
+    # snapshotted. They change far more often than the corpus does, and
+    # baking them means re-cloning a half-million-file repository every
+    # time one of them moves — which also changes the corpus underneath a
+    # comparison that was supposed to be about the binary. They are pushed
+    # to every member at run time instead, beside job.py.
+    #
+    # The partitions written above stay baked, and the harness that wrote
+    # them came from the same build tree the run will push from, so the
+    # two still agree. Only mutagen stays in the image: it is a stock
+    # release that does not move between runs.
+    run(f"{ssh} 'rm -f ~/bench/benchmark ~/autobahn ~/agents/autobahn-linux-x86_64'")
 
     print("creating image...")
     ami = aws(options.profile, options.region,
@@ -748,11 +774,40 @@ def _dispatch_body(options):
         # half-million-file repository. The harness binary stays baked,
         # because the partitions it wrote are baked with it and the two
         # have to agree.
+        # The driver, the harness and the subject binary, all pushed
+        # rather than baked (see bake()). Every member needs the harness:
+        # destinations run the observer from it. The source needs
+        # autobahn; the destinations get their agent streamed over SSH by
+        # the controller, but the copy under ~/agents is what a controller
+        # uses when it has to install one, so every member carries it and
+        # no member's role has to be guessed.
+        #
+        # Pushed to a group's members concurrently. Serially, seven
+        # megabytes to each of a hundred and fifty machines is an hour of
+        # the whole fleet sitting idle at full price before the first
+        # measurement — which is most of what the run costs to begin with.
+        def stage(host):
+            for source, target in [
+                (f"{HERE}/job.py", "~/bench/job.py"),
+                (f"{HERE}/harness/target/x86_64-unknown-linux-musl/release/benchmark",
+                 "~/bench/benchmark"),
+                (AUTOBAHN_BINARY, "~/autobahn"),
+            ]:
+                run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} "
+                    f"{source} ubuntu@{host}:{target}")
+            run(f"ssh -o StrictHostKeyChecking=accept-new -i {key_path(key)} ubuntu@{host} "
+                f"'chmod +x ~/bench/benchmark ~/autobahn && mkdir -p ~/agents && "
+                f"cp ~/autobahn ~/agents/autobahn-linux-x86_64'")
+
+        hosts = [addresses[member][0] for member in members]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+            for outcome in concurrent.futures.as_completed(
+                    [pool.submit(stage, host) for host in hosts]):
+                outcome.result()
+
         repairs = []
         for member in members:
             host = addresses[member][0]
-            run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} "
-                f"{HERE}/job.py ubuntu@{host}:~/bench/job.py")
             # Terminate regardless of what happens to the orchestrator.
             # Auto-destroy below covers the tidy paths; this covers the
             # untidy ones — a killed orchestrator, a lost laptop, a crash —
@@ -884,16 +939,51 @@ def _dispatch_body(options):
             ["ssh", "-n", "-i", key_path(key), f"ubuntu@{a_public}", script],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
 
-    for pair_index, a_public, process in processes:
-        process.wait()
-        # Per-job tool logs come back too. An intermittent failure that
-        # leaves no log is far more expensive to chase than the transfer
-        # of a few megabytes of text.
-        run(f"scp -r -i {key_path(key)} ubuntu@{a_public}:~/logs "
-            f"results-{run_id}/pair-{pair_index}-logs", check=False)
+    def collect_pair(pair_index, a_public, logs=False):
+        # A connect timeout, because this runs on a loop for hours: one
+        # host wedged in a half-open connection would otherwise stall the
+        # collection of every other pair behind it.
         for artifact in ("results.jsonl", "results.err", "driver.log"):
-            run(f"scp -i {key_path(key)} ubuntu@{a_public}:~/{artifact} "
+            run(f"scp -o ConnectTimeout=15 -i {key_path(key)} ubuntu@{a_public}:~/{artifact} "
                 f"results-{run_id}/pair-{pair_index}-{artifact}", check=False)
+        if logs:
+            # Per-job tool logs come back too, at the end. An intermittent
+            # failure that leaves no log is far more expensive to chase
+            # than the transfer of a few megabytes of text.
+            run(f"scp -r -i {key_path(key)} ubuntu@{a_public}:~/logs "
+                f"results-{run_id}/pair-{pair_index}-logs", check=False)
+
+    def samples_so_far():
+        total = 0
+        for name in os.listdir(f"results-{run_id}"):
+            if name.endswith("-results.jsonl"):
+                with open(f"results-{run_id}/{name}") as handle:
+                    total += sum(1 for _ in handle)
+        return total
+
+    # Results are copied back while the run proceeds, not only when it
+    # ends. `results.jsonl` is append-only on the host, so a copy taken
+    # mid-job is a prefix of the final one and the next copy supersedes
+    # it. A run that dies — the orchestrator killed, a host lost, the
+    # dead-man timer firing at five hours — then still leaves every
+    # completed job here instead of nothing at all. A full matrix is
+    # several hours and several hundred dollars; losing it to the last
+    # ten minutes is not a risk worth carrying for one scp per job.
+    pending = list(processes)
+    started = time.time()
+    while pending:
+        time.sleep(COLLECT_INTERVAL)
+        for entry in list(pending):
+            pair_index, a_public, process = entry
+            finished = process.poll() is not None
+            collect_pair(pair_index, a_public, logs=finished)
+            if finished:
+                pending.remove(entry)
+                print(f"  pair {pair_index} finished "
+                      f"({len(processes) - len(pending)}/{len(processes)} pairs done)")
+        print(f"  [{int(time.time() - started) // 60}m] "
+              f"{samples_so_far()} samples, {len(pending)} pair(s) running",
+              flush=True)
     print(f"collected into results-{run_id}/; aggregate with: "
           f"orchestrate.py aggregate results-{run_id}/; destroy with: "
           f"orchestrate.py destroy --profile {options.profile} "

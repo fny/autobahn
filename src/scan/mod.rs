@@ -9,6 +9,7 @@ use std::fs::{self, Metadata};
 use std::io::{ErrorKind, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -26,6 +27,26 @@ const DIGEST_BUFFER_SIZE: usize = 64 * 1024;
 /// that the atomic add disappears against the filesystem work, small
 /// enough that a reader watching a long scan sees a number that moves.
 const PROGRESS_BLOCK: u64 = 512;
+
+/// The most threads one scan spreads over, itself included.
+///
+/// A full walk is stat-bound on a warm cache and digest-bound on a cold
+/// one, and both parallelize by directory: every directory that must be
+/// walked is an independent unit whose result slots back into its
+/// parent by position, so the hierarchy that comes out is the same
+/// hierarchy, in the same order, with the same storage sharing. The cap
+/// keeps a wide host from being taken over by one scan; the budget is
+/// further cut to the cores actually present.
+const SCAN_THREADS_MAX: usize = 8;
+
+/// How many threads a scan may add beside the one it runs on.
+fn scan_helpers() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .min(SCAN_THREADS_MAX)
+        .saturating_sub(1)
+}
 
 /// The file type mask within a raw mode value (`S_IFMT`).
 const MODE_TYPE_MASK: u32 = 0o170000;
@@ -244,6 +265,10 @@ pub fn scan(
     if let Some(progress) = progress {
         progress.begin(dirty.is_none());
     }
+    // One budget of helper threads for the whole walk, taken and returned
+    // per directory as subtrees start and finish, so the walk spreads as
+    // wide as the tree allows and no wider than the machine does.
+    let helpers = AtomicUsize::new(scan_helpers());
     let mut scanner = Scanner::new(
         ignores,
         behavior,
@@ -253,6 +278,7 @@ pub fn scan(
         baseline.map(|snapshot| snapshot.scanned_at_seconds),
         rehash,
         progress,
+        &helpers,
     );
     let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
     scanner.publish();
@@ -362,6 +388,39 @@ struct Scanner<'a> {
     /// [`counted`](Scanner::counted).
     pending_entries: u64,
     pending_bytes: u64,
+    /// Helper threads not currently walking a subtree, shared by every
+    /// scanner of one scan. See [`scan_helpers`].
+    helpers: &'a AtomicUsize,
+}
+
+/// What probing a listed entry established.
+enum Probed {
+    /// Listed a moment ago, gone now.
+    Vanished,
+    /// Content that needs no further look.
+    Settled(Content),
+    /// A regular file, with the metadata the probe fetched.
+    File(Metadata),
+    /// A symbolic link.
+    Symlink,
+    /// A directory to walk, and whether it opens (or continues) an
+    /// ignored region.
+    Directory { region: bool },
+}
+
+/// One entry of a listing between the two passes of a directory scan.
+enum Pending<'n> {
+    /// Its node is known.
+    Done(Node),
+    /// A directory still to be walked, with everything the walk needs.
+    Walk {
+        name: String,
+        entry_path: PathBuf,
+        child_path: String,
+        baseline: Option<&'n Node>,
+        dirty: Option<&'n DirtyNode>,
+        region: bool,
+    },
 }
 
 impl<'a> Scanner<'a> {
@@ -376,6 +435,7 @@ impl<'a> Scanner<'a> {
         baseline_scanned_at: Option<i64>,
         rehash: bool,
         progress: Option<&'a crate::progress::SideProgress>,
+        helpers: &'a AtomicUsize,
     ) -> Scanner<'a> {
         Scanner {
             within_ignored: false,
@@ -394,7 +454,43 @@ impl<'a> Scanner<'a> {
             progress,
             pending_entries: 0,
             pending_bytes: 0,
+            helpers,
         }
+    }
+
+    /// A scanner for a subtree, to run on another thread: the same
+    /// configuration, its own counters and digest buffer, and the ignored
+    /// region the subtree's root is in.
+    fn fork(&self, within_ignored: bool) -> Scanner<'a> {
+        let mut forked = Scanner::new(
+            self.ignores,
+            self.behavior,
+            self.symlink_mode,
+            self.max_file_size,
+            self.incremental,
+            self.baseline_scanned_at,
+            self.rehash,
+            self.progress,
+            self.helpers,
+        );
+        forked.within_ignored = within_ignored;
+        forked
+    }
+
+    /// Folds a finished subtree scanner's counts into this one.
+    fn absorb(&mut self, mut forked: Scanner<'a>) {
+        forked.publish();
+        self.directories += forked.directories;
+        self.files += forked.files;
+        self.symlinks += forked.symlinks;
+        self.total_file_size += forked.total_file_size;
+    }
+
+    /// Claims a helper thread for a subtree, if one is free.
+    fn take_helper(&self) -> bool {
+        self.helpers
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| free.checked_sub(1))
+            .is_ok()
     }
 
     /// Counts one visited entry, and any bytes read for it.
@@ -430,12 +526,12 @@ impl<'a> Scanner<'a> {
     /// `dirty` carries the incremental scan's marks for this position:
     /// `None` means nothing beneath this directory changed, so the
     /// baseline's subtree is adopted whole without touching the filesystem.
-    fn scan_directory(
+    fn scan_directory<'n>(
         &mut self,
         disk_path: &Path,
         path: &str,
-        baseline: Option<&Node>,
-        dirty: Option<&DirtyNode>,
+        baseline: Option<&'n Node>,
+        dirty: Option<&'n DirtyNode>,
     ) -> Content {
         // Nothing marked beneath this directory: adopt the baseline whole.
         // This is what makes an incremental scan cost the size of the
@@ -501,7 +597,10 @@ impl<'a> Scanner<'a> {
         self.directories += 1;
         self.counted(0);
 
-        let mut children = Vec::with_capacity(entries.len());
+        // Pass one lists, adopts and probes. A directory that has to be
+        // walked is held back rather than walked on the spot, so that once
+        // their number is known the walks can be spread over threads.
+        let mut children: Vec<Pending<'n>> = Vec::with_capacity(entries.len());
         for (raw_name, entry_path) in entries {
             let lossy_name = raw_name.to_string_lossy();
 
@@ -512,7 +611,7 @@ impl<'a> Scanner<'a> {
                 if autobahn_temporary(&lossy_name) {
                     continue;
                 }
-                children.push(Node {
+                children.push(Pending::Done(Node {
                     name: lossy_name.into_owned(),
                     content: Content::Problematic {
                         message: format!(
@@ -520,7 +619,7 @@ impl<'a> Scanner<'a> {
                              autobahn temporaries; rename the entry to synchronize it"
                         ),
                     },
-                });
+                }));
                 continue;
             }
 
@@ -555,7 +654,7 @@ impl<'a> Scanner<'a> {
             if self.incremental && child_dirty.is_none() && !non_utf8 {
                 if let Some(baseline_child) = baseline_child {
                     if !matches!(baseline_child.content, Content::Problematic { .. }) {
-                        children.push(baseline_child.clone());
+                        children.push(Pending::Done(baseline_child.clone()));
                         continue;
                     }
                 }
@@ -567,23 +666,120 @@ impl<'a> Scanner<'a> {
                 let ignored = fs::symlink_metadata(&entry_path)
                     .map(|metadata| self.entry_ignored(&child_path, metadata.is_dir()))
                     .unwrap_or(false);
-                children.push(Node {
+                children.push(Pending::Done(Node {
                     name,
                     content: if ignored {
                         Content::Untracked
                     } else {
                         problematic("non-UTF-8 filename")
                     },
-                });
+                }));
                 continue;
             }
 
-            if let Some(node) =
-                self.scan_entry(name, &entry_path, &child_path, baseline_child, child_dirty)
-            {
-                children.push(node);
+            match self.probe_entry(&entry_path, &child_path) {
+                Probed::Vanished => {}
+                Probed::Settled(content) => children.push(Pending::Done(Node { name, content })),
+                Probed::File(metadata) => {
+                    let content = self.scan_file(&entry_path, &metadata, baseline_child);
+                    children.push(Pending::Done(Node { name, content }));
+                }
+                Probed::Symlink => {
+                    let content = self.scan_symlink(&entry_path, &child_path);
+                    children.push(Pending::Done(Node { name, content }));
+                }
+                Probed::Directory { region } => children.push(Pending::Walk {
+                    name,
+                    entry_path,
+                    child_path,
+                    baseline: baseline_child,
+                    dirty: child_dirty,
+                    region,
+                }),
             }
         }
+
+        // Pass two walks. With two or more subtrees to walk there is
+        // something to overlap, and each is handed to a helper thread while
+        // one is free, or walked here while none is. Results land by
+        // position, so the order of the hierarchy is the listing's, exactly
+        // as it would be from a walk on one thread.
+        let walks = children
+            .iter()
+            .filter(|pending| matches!(pending, Pending::Walk { .. }))
+            .count();
+        let spread = walks >= 2 && self.helpers.load(Ordering::Relaxed) > 0;
+        let mut children: Vec<Node> = if !spread {
+            children
+                .into_iter()
+                .map(|pending| match pending {
+                    Pending::Done(node) => node,
+                    Pending::Walk {
+                        name,
+                        entry_path,
+                        child_path,
+                        baseline,
+                        dirty,
+                        region,
+                    } => Node {
+                        name,
+                        content: self.walk(&entry_path, &child_path, baseline, dirty, region),
+                    },
+                })
+                .collect()
+        } else {
+            let mut nodes: Vec<Node> = Vec::with_capacity(children.len());
+            std::thread::scope(|scope| {
+                let mut handles = Vec::new();
+                for pending in children {
+                    match pending {
+                        Pending::Done(node) => nodes.push(node),
+                        Pending::Walk {
+                            name,
+                            entry_path,
+                            child_path,
+                            baseline,
+                            dirty,
+                            region,
+                        } => {
+                            if self.take_helper() {
+                                let mut forked = self.fork(region);
+                                handles.push((
+                                    nodes.len(),
+                                    scope.spawn(move || {
+                                        let content = forked.scan_directory(
+                                            &entry_path,
+                                            &child_path,
+                                            baseline,
+                                            dirty,
+                                        );
+                                        // The helper is free for the next
+                                        // subtree as soon as this one is
+                                        // walked, not once it is joined.
+                                        forked.helpers.fetch_add(1, Ordering::AcqRel);
+                                        (Node { name, content }, forked)
+                                    }),
+                                ));
+                                nodes.push(Node {
+                                    name: String::new(),
+                                    content: Content::Untracked,
+                                });
+                            } else {
+                                let content =
+                                    self.walk(&entry_path, &child_path, baseline, dirty, region);
+                                nodes.push(Node { name, content });
+                            }
+                        }
+                    }
+                }
+                for (index, handle) in handles {
+                    let (node, forked) = handle.join().expect("scan thread panicked");
+                    nodes[index] = node;
+                    self.absorb(forked);
+                }
+            });
+            nodes
+        };
 
         // Entries were processed in on-disk name order, which is also the
         // recorded name order except where lossy renaming intervened, so a
@@ -635,60 +831,80 @@ impl<'a> Scanner<'a> {
         baseline: Option<&Node>,
         dirty: Option<&DirtyNode>,
     ) -> Option<Node> {
+        let content = match self.probe_entry(entry_path, child_path) {
+            Probed::Vanished => return None,
+            Probed::Settled(content) => content,
+            Probed::File(metadata) => self.scan_file(entry_path, &metadata, baseline),
+            Probed::Symlink => self.scan_symlink(entry_path, child_path),
+            Probed::Directory { region } => {
+                self.walk(entry_path, child_path, baseline, dirty, region)
+            }
+        };
+        Some(Node { name, content })
+    }
+
+    /// Probes one directory entry: its type, and whether the ignore set
+    /// settles it. What comes back is either settled content, or the kind
+    /// of scan the entry still needs.
+    fn probe_entry(&mut self, entry_path: &Path, child_path: &str) -> Probed {
         // The entry's type is needed both to dispatch the scan and to
         // resolve directory-only ignore patterns, so it's fetched (without
         // following symbolic links) before anything else.
         let metadata = match fs::symlink_metadata(entry_path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == ErrorKind::NotFound => return None,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Probed::Vanished,
             Err(error) => {
                 // Without a type there's nothing to classify, not even for
                 // the purposes of the ignore set.
-                return Some(Node {
-                    name,
-                    content: problematic(format!("unable to probe entry: {error}")),
-                });
+                return Probed::Settled(problematic(format!("unable to probe entry: {error}")));
             }
         };
         let file_type = metadata.file_type();
 
-        // Ignores are consulted before any descent, which is what keeps
-        // ignored subtrees from costing anything at all.
-        let is_directory = file_type.is_dir();
         // Ignores are consulted before any descent, which is what keeps
         // ignored subtrees from costing anything at all. The exception is
         // a directory that a negation names something inside: pruning
         // there would mean nothing below is ever tested, so the negation
         // could never be consulted. Such a directory is walked instead,
         // as an ignored region, and its contents are decided one by one.
+        let is_directory = file_type.is_dir();
         let ignored = self.entry_ignored(child_path, is_directory);
         if ignored && !(is_directory && self.ignores.holds_a_re_inclusion(child_path)) {
-            return Some(Node {
-                name,
-                content: Content::Untracked,
-            });
+            return Probed::Settled(Content::Untracked);
         }
 
-        let content = if is_directory {
-            let outer = self.within_ignored;
+        if is_directory {
             // An ignored directory opens a region; a re-included one ends
             // it. Without the second half the negation would bring the
             // directory back but not what is in it, which is not what
             // anyone means by re-including.
-            self.within_ignored = ignored;
-            let content = self.scan_directory(entry_path, child_path, baseline, dirty);
-            self.within_ignored = outer;
-            content
+            Probed::Directory { region: ignored }
         } else if file_type.is_file() {
-            self.scan_file(entry_path, &metadata, baseline)
+            Probed::File(metadata)
         } else if file_type.is_symlink() {
-            self.scan_symlink(entry_path, child_path)
+            Probed::Symlink
         } else {
             // Sockets, FIFOs, and device nodes have no portable
             // representation and aren't synchronized.
-            Content::Untracked
-        };
-        Some(Node { name, content })
+            Probed::Settled(Content::Untracked)
+        }
+    }
+
+    /// Walks a subdirectory as part of the ignored region `region` says
+    /// it is in, restoring this scanner's own region afterwards.
+    fn walk(
+        &mut self,
+        entry_path: &Path,
+        child_path: &str,
+        baseline: Option<&Node>,
+        dirty: Option<&DirtyNode>,
+        region: bool,
+    ) -> Content {
+        let outer = self.within_ignored;
+        self.within_ignored = region;
+        let content = self.scan_directory(entry_path, child_path, baseline, dirty);
+        self.within_ignored = outer;
+        content
     }
 
     /// Scans the file at `disk_path`, whose (already fetched) metadata is

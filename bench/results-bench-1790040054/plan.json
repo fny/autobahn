@@ -1,0 +1,139 @@
+{
+  "run": "bench-1790040054",
+  "seed": true,
+  "ami": "ami-096a78f9bffc18f94",
+  "chromium_commit": "87d2dbeceeb6ee28744922bdcf7be799c065627e",
+  "groups": [
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ],
+    [
+      2,
+      "c6i.xlarge"
+    ]
+  ],
+  "repeats": 5,
+  "cells": [
+    "5k-1"
+  ],
+  "jobs": [
+    {
+      "run": "bench-1790040054",
+      "repeat": 0,
+      "job": "5k-1-r0",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-0"
+    },
+    {
+      "run": "bench-1790040054",
+      "repeat": 1,
+      "job": "5k-1-r1",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-1"
+    },
+    {
+      "run": "bench-1790040054",
+      "repeat": 2,
+      "job": "5k-1-r2",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-2"
+    },
+    {
+      "run": "bench-1790040054",
+      "repeat": 4,
+      "job": "5k-1-r4",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "autobahn",
+        "mutagen"
+      ],
+      "pair": "pair-3"
+    },
+    {
+      "run": "bench-1790040054",
+      "repeat": 3,
+      "job": "5k-1-r3",
+      "cell": {
+        "name": "5k-1",
+        "corpora": [
+          "sub5k"
+        ],
+        "agents": 1,
+        "bidirectional": false,
+        "betas": 1,
+        "mode": "replace",
+        "pre_seeded": true
+      },
+      "tools": [
+        "mutagen",
+        "autobahn"
+      ],
+      "pair": "pair-4"
+    }
+  ]
+}

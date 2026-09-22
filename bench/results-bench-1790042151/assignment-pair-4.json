@@ -1,0 +1,1 @@
+[{"run": "bench-1790042151", "repeat": 3, "job": "5k-1-r3", "cell": {"name": "5k-1", "corpora": ["sub5k"], "agents": 1, "bidirectional": false, "betas": 1, "mode": "replace", "pre_seeded": true}, "tools": ["mutagen", "autobahn"], "pair": "pair-4"}]

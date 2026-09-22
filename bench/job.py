@@ -51,6 +51,10 @@ WORKLOAD_SECONDS = int(os.environ.get("BENCH_WORKLOAD_SECONDS", "450"))
 # Names this job's logs. Set from the spec; only a bare invocation leaves it
 # at the default.
 JOB_LABEL = "job"
+# How many destinations this cell wants, of the ones the group offers. Set
+# from the spec in main(); None means "whatever the machine has", which is
+# only right for a bare invocation.
+WIDTH = None
 
 
 def job_label():
@@ -115,17 +119,33 @@ def run_argv(argv, check=False, timeout=None):
 
 
 def destinations():
-    """The SSH aliases of every destination, in order.
+    """The SSH aliases of this job's destinations, in order.
 
     A pairwise job has one, reached as `dest`. A fan-out job has several,
     reached as `dest1`..`destN`, and `dest` is an alias for the first, so
     every single-destination path in this file keeps working unchanged.
     The orchestrator writes these into the driver's ssh config.
+
+    A group is sized for the *widest* cell assigned to it, and the
+    orchestrator exports every alias in the group once, for the whole
+    pair script. Narrow cells therefore have to trim: `BENCH_DESTINATIONS`
+    says what the machine offers, `WIDTH` says what this cell asked for.
+    Without the trim a 1-beta cell landing on a fan-out-wide group
+    silently became a 10-beta fan-out — same cycle count, ten times the
+    changes, and a p90 inflated 6-15x. That is what produced the six
+    anomalous jobs in bench-1789947877.
     """
     if LOCAL:
         return ["dest"]
     listed = os.environ.get("BENCH_DESTINATIONS", "").strip()
-    return listed.split(",") if listed else ["dest"]
+    aliases = listed.split(",") if listed else ["dest"]
+    if WIDTH is None:
+        return aliases
+    if len(aliases) < WIDTH:
+        raise RuntimeError(
+            f"cell wants {WIDTH} destination(s), the group offers "
+            f"{len(aliases)}: {listed}")
+    return aliases[:WIDTH]
 
 
 def peer(command, timeout=None, host="dest"):
@@ -863,6 +883,12 @@ def main():
     arguments = parser.parse_args()
     spec = json.loads(arguments.spec)
 
+    # Set before anything reads destinations(), so the trim to this cell's
+    # width is in force for the whole job and lands in the record below.
+    global JOB_LABEL, WIDTH
+    JOB_LABEL = spec["job"]
+    WIDTH = spec["cell"]["betas"]
+
     identity = {key: spec[key] for key in ("run", "pair", "job", "repeat")}
     identity["cell"] = spec["cell"]["name"]
     emitter = Emitter(arguments.output, identity)
@@ -877,6 +903,9 @@ def main():
     emitter.emit({
         "measurement": "job_start", "spec": spec,
         "tool_versions": versions,
+        # Recorded so a width mismatch is visible in the results alone,
+        # without having to go back to the per-job tool logs.
+        "destinations": destinations(),
         "binaries_sha256": {
             "benchmark": digest_of(BINARY),
             "autobahn": digest_of(f"{HOME}/autobahn"),
@@ -890,8 +919,6 @@ def main():
     # from any earlier run can never satisfy this run's verification. It
     # is derived stably so the recorded value reproduces the streams.
     base_nonce = stable_nonce(f"{spec['run']}/{spec['job']}")
-    global JOB_LABEL
-    JOB_LABEL = spec["job"]
     os.makedirs(f"{HOME}/logs", exist_ok=True)
 
     measure_floor(emitter, base_nonce)

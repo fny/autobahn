@@ -29,7 +29,7 @@ use std::fs::{self, File, Metadata, Permissions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
@@ -1327,6 +1327,14 @@ impl Endpoint for LocalEndpoint {
                 count_staged_uses(node, &mut staged_uses);
             }
         }
+        // Publishing is spread over threads (see `apply_helpers`), and the
+        // count a publish decrements has to be the same count on every
+        // thread, so the tally becomes atomic before the first write.
+        let staged_uses: HashMap<Digest, AtomicUsize> = staged_uses
+            .into_iter()
+            .map(|(digest, uses)| (digest, AtomicUsize::new(uses)))
+            .collect();
+        let helpers = AtomicUsize::new(apply_helpers());
         // The observation is about to stop describing the tree, so it is
         // invalidated *before* the first write rather than after the last,
         // and the paths about to change ride along: the watcher's own
@@ -1356,7 +1364,8 @@ impl Endpoint for LocalEndpoint {
             directory_mode: self.directory_mode,
             owner: self.owner,
             group: self.group,
-            staged_uses,
+            staged_uses: &staged_uses,
+            helpers: &helpers,
             problems: Vec::new(),
             missing_staged_files: false,
             missing_staged: Vec::new(),
@@ -1370,15 +1379,44 @@ impl Endpoint for LocalEndpoint {
         // name for a cycle. Deleting first frees the folded name. Results
         // are still reported in input order: the controller matches them
         // to transitions by position.
-        let mut order: Vec<usize> = (0..transitions.len()).collect();
-        order.sort_by_key(|&index| transitions[index].new.is_some());
         let mut slots: Vec<Option<Option<Node>>> = vec![None; transitions.len()];
-        for index in order {
+        let (removals, arrivals): (Vec<usize>, Vec<usize>) =
+            (0..transitions.len()).partition(|&index| transitions[index].new.is_none());
+        for index in removals {
             // Each change is applied independently: a refusal at one path
             // must never abort the rest of the transition.
             slots[index] = Some(transitioner.apply(&transitions[index]));
             if let Some(progress) = &self.progress {
                 progress.change_applied();
+            }
+        }
+        // Creations and replacements are independent of each other — the
+        // reconciler never emits two changes with one inside the other —
+        // so they spread over threads. Not on a volume that folds names:
+        // there, two changes whose names fold together are ordered by the
+        // refusal the second one meets on disk, and that order is the
+        // input's.
+        let spread =
+            arrivals.len() >= APPLY_SPREAD_MINIMUM && !folds_names(&transitioner.behavior);
+        if !spread {
+            for index in arrivals {
+                slots[index] = Some(transitioner.apply(&transitions[index]));
+                if let Some(progress) = &self.progress {
+                    progress.change_applied();
+                }
+            }
+        } else {
+            let applied = transitioner.spread(arrivals.len(), |forked, range| {
+                arrivals[range]
+                    .iter()
+                    .map(|&index| (index, forked.apply(&transitions[index])))
+                    .collect()
+            });
+            for (index, result) in applied {
+                slots[index] = Some(result);
+                if let Some(progress) = &self.progress {
+                    progress.change_applied();
+                }
             }
         }
         let results: Vec<Option<Node>> = slots
@@ -1611,7 +1649,10 @@ struct Transitioner<'a> {
     /// it be moved into place rather than copied. Counts are upper bounds
     /// (a refusal skips publishes without decrementing), which only ever
     /// turns a move into a copy, never the reverse.
-    staged_uses: HashMap<Digest, usize>,
+    staged_uses: &'a HashMap<Digest, AtomicUsize>,
+    /// Threads not currently applying a slice of this transition, shared
+    /// by every transitioner of it. See [`apply_helpers`].
+    helpers: &'a AtomicUsize,
     /// The problems accumulated so far.
     problems: Vec<Problem>,
     /// Whether or not any staged content was found missing.
@@ -1620,7 +1661,91 @@ struct Transitioner<'a> {
     missing_staged: Vec<crate::endpoint::FileRequest>,
 }
 
-impl Transitioner<'_> {
+impl<'a> Transitioner<'a> {
+    /// A transitioner for a slice of the work, to run on another thread:
+    /// the same configuration and the same shared tallies, its own
+    /// problems to report.
+    fn fork(&self) -> Transitioner<'a> {
+        Transitioner {
+            root: self.root,
+            staging_root: self.staging_root,
+            scanned: self.scanned,
+            behavior: self.behavior,
+            symlink_mode: self.symlink_mode,
+            file_mode: self.file_mode,
+            directory_mode: self.directory_mode,
+            owner: self.owner,
+            group: self.group,
+            staged_uses: self.staged_uses,
+            helpers: self.helpers,
+            problems: Vec::new(),
+            missing_staged_files: false,
+            missing_staged: Vec::new(),
+        }
+    }
+
+    /// Folds what a forked transitioner found into this one.
+    fn absorb(&mut self, forked: Transitioner<'a>) {
+        self.problems.extend(forked.problems);
+        self.missing_staged_files |= forked.missing_staged_files;
+        self.missing_staged.extend(forked.missing_staged);
+    }
+
+    /// Runs `work` over `count` items in contiguous slices, one per thread
+    /// this transitioner can claim plus its own, and returns every slice's
+    /// results in item order. Problems are folded back in that order too,
+    /// so a report reads as it would from one thread. With no helper free
+    /// — or nothing to share — the whole range runs here.
+    fn spread<T: Send>(
+        &mut self,
+        count: usize,
+        work: impl Fn(&mut Transitioner<'a>, std::ops::Range<usize>) -> Vec<T> + Sync,
+    ) -> Vec<T> {
+        // Claim helpers one at a time; each claim is one more slice.
+        let mut claimed = 0;
+        while claimed + 1 < count
+            && self
+                .helpers
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| free.checked_sub(1))
+                .is_ok()
+        {
+            claimed += 1;
+        }
+        if claimed == 0 {
+            return work(self, 0..count);
+        }
+        let slices = claimed + 1;
+        let width = count.div_ceil(slices);
+        let ranges: Vec<std::ops::Range<usize>> = (0..slices)
+            .map(|slice| (slice * width).min(count)..((slice + 1) * width).min(count))
+            .collect();
+        let work = &work;
+        let mut results = Vec::with_capacity(count);
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = ranges[1..]
+                .iter()
+                .cloned()
+                .map(|range| {
+                    let mut forked = self.fork();
+                    scope.spawn(move || {
+                        let out = work(&mut forked, range);
+                        // Free for the next slice as soon as this one is
+                        // done, not once it is joined.
+                        forked.helpers.fetch_add(1, Ordering::AcqRel);
+                        (out, forked)
+                    })
+                })
+                .collect();
+            results.extend(work(self, ranges[0].clone()));
+            for handle in handles {
+                let (out, forked) = handle.join().expect("apply thread panicked");
+                results.extend(out);
+                self.absorb(forked);
+            }
+        });
+        results
+    }
+
     /// Records a problem at a root-relative path.
     ///
     /// Every problem here is a place where the filesystem did not match
@@ -1908,6 +2033,7 @@ impl Transitioner<'_> {
         let folds_names = folds_names(&behavior);
         let fold = move |name: &str| folded_name(name, &behavior);
         let mut folded: HashMap<String, ()> = HashMap::new();
+        let mut accepted: Vec<(&Node, String)> = Vec::with_capacity(children.len());
         for child in children {
             let child_path = path_join(path, &child.name);
             if let Err(message) = validate_name(&child.name) {
@@ -1925,10 +2051,34 @@ impl Transitioner<'_> {
                 );
                 continue;
             }
-            if let Some(node) = self.create_node(&child_path, directory, &child.name, child) {
-                created.push(node);
-            }
+            accepted.push((child, child_path));
         }
+        // The names are settled and distinct, so the entries are created
+        // independently — and, when there are enough to matter, on more
+        // than one thread. A subtree among them spreads again on its own
+        // once inside, so one large directory among small siblings still
+        // fills the machine.
+        let spread = accepted.len() >= APPLY_SPREAD_MINIMUM
+            || accepted
+                .iter()
+                .any(|(child, _)| matches!(child.content, Content::Directory(_)));
+        if !spread || accepted.len() < 2 {
+            for (child, child_path) in accepted {
+                if let Some(node) = self.create_node(&child_path, directory, &child.name, child) {
+                    created.push(node);
+                }
+            }
+            return created;
+        }
+        let accepted = &accepted;
+        created.extend(self.spread(accepted.len(), |forked, range| {
+            accepted[range]
+                .iter()
+                .filter_map(|(child, child_path)| {
+                    forked.create_node(child_path, directory, &child.name, child)
+                })
+                .collect()
+        }));
         created
     }
 
@@ -1950,10 +2100,16 @@ impl Transitioner<'_> {
     ) -> Option<FileMetadata> {
         let staged = staged_path(self.staging_root, digest);
         let mode = creation_mode(self.file_mode, executable);
-        let last_use = match self.staged_uses.get_mut(digest) {
+        let last_use = match self.staged_uses.get(digest) {
             Some(count) => {
-                *count = count.saturating_sub(1);
-                *count == 0
+                // Counted down atomically: the publish that takes the
+                // count to zero is the last use, whichever thread it is on.
+                let before = count
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |uses| {
+                        Some(uses.saturating_sub(1))
+                    })
+                    .unwrap_or(0);
+                before <= 1
             }
             None => false,
         };
@@ -2447,6 +2603,29 @@ fn creation_mode(file_mode: u32, executable: bool) -> u32 {
 /// Returns the staging path for content with the specified digest.
 /// Accumulates, per digest, how many file publishes the given hierarchy
 /// could at most require.
+/// The fewest independent changes, or entries of one directory, worth
+/// spreading over threads: below this, the threads cost more than they
+/// return.
+const APPLY_SPREAD_MINIMUM: usize = 8;
+
+/// The most threads one transition spreads over, itself included.
+///
+/// Publishing a file reads it back to verify its digest before the rename
+/// (see `publish_file`), so a large arrival — a cold sync, an unpacked
+/// archive — is bound by hashing as much as by the filesystem, and both
+/// spread by entry. The cap keeps a wide host from being taken over by one
+/// transition; the budget is further cut to the cores actually present.
+const APPLY_THREADS_MAX: usize = 8;
+
+/// How many threads a transition may add beside the one it runs on.
+fn apply_helpers() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(1)
+        .min(APPLY_THREADS_MAX)
+        .saturating_sub(1)
+}
+
 fn count_staged_uses(node: &Node, uses: &mut HashMap<Digest, usize>) {
     match &node.content {
         Content::File { digest, .. } => *uses.entry(*digest).or_insert(0) += 1,

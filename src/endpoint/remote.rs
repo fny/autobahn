@@ -310,6 +310,11 @@ impl RemoteEndpoint {
     /// error. The returned response is guaranteed not to be
     /// [`Response::Error`].
     fn exchange(&mut self, request: Request) -> Result<Response> {
+        // Acknowledgements still owed for pushes come first: the channel
+        // answers in order, so the next response on it is theirs, not this
+        // request's. (Only a transition sends before collecting them; see
+        // `transition`.)
+        self.drain_pushes_to(0)?;
         match self.channel.exchange(request)? {
             Response::Error(message) => Err(remote_error(message)),
             response => Ok(response),
@@ -548,13 +553,34 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn stage_finish(&mut self) -> Result<()> {
-        self.drain_pushes_to(0)
+        // The pushes' acknowledgements are left owed on the channel, for
+        // the transition that follows to collect: it then goes out right
+        // behind the last push, and the agent takes the pushes and the
+        // transition in one pass — one round trip for all of them, rather
+        // than one to learn the staging landed and another to use it. A
+        // push that failed still fails the cycle, at the transition, which
+        // collects the acknowledgements before reading its own answer; and
+        // any other request collects them first as well (see `exchange`),
+        // so nothing ever reads a push's answer as its own. A connection
+        // that died is refused at the next send regardless.
+        Ok(())
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+        // Sent before the owed push acknowledgements are collected, so the
+        // request is on the wire while they are in flight; the answers are
+        // then read in order, theirs and then this one. A failed push
+        // reports first, so a transition applied over incomplete staging
+        // is never taken for a clean one — the agent applies it regardless
+        // and reports what was missing, and the controller cycles again.
         // The transitions are cloned because the fold below needs them
         // after the request has consumed them.
-        match self.exchange(Request::Transition(transitions.clone()))? {
+        self.channel.send_only(Request::Transition(transitions.clone()))?;
+        let pushes = self.drain_pushes_to(0);
+        let response = self.channel.receive_response();
+        pushes?;
+        match response? {
+            Response::Error(message) => Err(remote_error(message)),
             Response::Transition(outcome) => {
                 // Model the agent's own fold of the achieved results, so the
                 // cached snapshot keeps describing what the agent holds. The
@@ -918,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn a_failed_push_surfaces_no_later_than_stage_finish() {
+    fn a_failed_push_surfaces_no_later_than_the_transition() {
         let (client, agent) = connected_pair();
         let agent = scripted_agent(
             agent,
@@ -926,12 +952,19 @@ mod tests {
                 Response::StagePushed,
                 Response::Error("disk full".into()),
                 Response::StagePushed,
+                Response::Transition(TransitionOutcome {
+                    results: Vec::new(),
+                    problems: Vec::new(),
+                    missing_staged_files: false,
+                    missing_staged: Vec::new(),
+                }),
             ],
         );
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
-        // The window lets these sends succeed before their acks arrive; the
-        // failure must surface by the time staging completes.
+        // The window lets these sends succeed before their acks arrive, and
+        // stage_finish leaves the acks owed for the transition to collect;
+        // the failure must surface by the time the transition answers.
         let mut failed = None;
         for _ in 0..3 {
             if let Err(error) = endpoint.stage_push_nowait(Vec::new()) {
@@ -941,9 +974,12 @@ mod tests {
         }
         let error = match failed {
             Some(error) => error,
-            None => endpoint
-                .stage_finish()
-                .expect_err("the failed push must surface"),
+            None => {
+                endpoint.stage_finish().expect("staging completes without waiting");
+                endpoint
+                    .transition(Vec::new())
+                    .expect_err("the failed push must surface at the transition")
+            }
         };
         assert!(
             format!("{error:#}").contains("disk full"),
@@ -951,6 +987,35 @@ mod tests {
         );
         // The failure must leave no acknowledgements queued on the channel:
         // a later request would otherwise consume a stale staging response.
+        assert_eq!(endpoint.pending_pushes, 0);
+        drop(endpoint);
+        let _ = agent.join();
+    }
+
+    #[test]
+    fn owed_push_acknowledgements_are_collected_before_any_other_request() {
+        let (client, agent) = connected_pair();
+        let snapshot = Snapshot {
+            files: 3,
+            ..Snapshot::default()
+        };
+        let agent = scripted_agent(
+            agent,
+            vec![
+                Response::StagePushed,
+                Response::StagePushed,
+                Response::Scan(snapshot),
+            ],
+        );
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        for _ in 0..2 {
+            endpoint.stage_push_nowait(Vec::new()).expect("push");
+        }
+        endpoint.stage_finish().expect("staging completes without waiting");
+        assert_eq!(endpoint.pending_pushes, 2);
+        // A scan's answer is the scan's, not a push's.
+        assert_eq!(endpoint.scan().expect("scan").files, 3);
         assert_eq!(endpoint.pending_pushes, 0);
         drop(endpoint);
         let _ = agent.join();

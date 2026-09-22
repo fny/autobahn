@@ -18,6 +18,13 @@
 # Usage:
 #   bench/ab.sh <binary-A> <binary-B> [--legs N] [--seconds S] [--agents A]
 #               [--corpus DIR] [--scale K] [--label-a NAME] [--label-b NAME]
+#               [--remote HOST]
+#
+# With --remote, the destination is reached over SSH to HOST (which may be
+# this machine: `localhost`, or an alias with latency shaped onto it) and
+# the leg's own binary serves as the agent there, by path, so a variant
+# under test is what runs on both sides and nothing is installed under
+# ~/.autobahn/bin — where a real controller's agent may already live.
 #
 # The corpus is generated on first use (bench/corpus.py, the `code` shape,
 # 40,000 files at scale 1) and reused. Needs python3, rsync, and a Rust
@@ -26,7 +33,7 @@
 #
 set -u
 
-A=""; B=""; LEGS=2; SECONDS_PER_LEG=60; AGENTS=10; SCALE=1
+A=""; B=""; LEGS=2; SECONDS_PER_LEG=60; AGENTS=10; SCALE=1; REMOTE=""
 LABEL_A="a"; LABEL_B="b"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${AB_WORK:-${TMPDIR:-/tmp}/autobahn-ab}"
@@ -43,6 +50,7 @@ while [ $# -gt 0 ]; do
         --scale) SCALE="$2"; shift 2 ;;
         --label-a) LABEL_A="$2"; shift 2 ;;
         --label-b) LABEL_B="$2"; shift 2 ;;
+        --remote) REMOTE="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         -*) echo "unknown option $1" >&2; usage >&2; exit 2 ;;
         *) if [ -z "$A" ]; then A="$1"; elif [ -z "$B" ]; then B="$1"; else echo "too many arguments" >&2; exit 2; fi; shift ;;
@@ -105,8 +113,13 @@ leg() {
     STARTED+=($!)
     sleep 1
 
-    printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s"]\n' \
-        "$CORPUS" "$dest" > "$WORK/$name.toml"
+    if [ -n "$REMOTE" ]; then
+        printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s:%s"]\nagent_command = "ssh %s %s agent"\n' \
+            "$CORPUS" "$REMOTE" "$dest" "$REMOTE" "$binary" > "$WORK/$name.toml"
+    else
+        printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s"]\n' \
+            "$CORPUS" "$dest" > "$WORK/$name.toml"
+    fi
     local t0 t1
     t0=$(python3 -c 'import time; print(time.time())')
     "$binary" watch --config "$WORK/$name.toml" --state-root "$state" > "$WORK/tool-$name.log" 2>&1 &
@@ -142,7 +155,7 @@ PY
 
 echo "A = $A"
 echo "B = $B"
-echo "corpus: $CORPUS  agents: $AGENTS  window: ${SECONDS_PER_LEG}s  legs: $LEGS each, interleaved"
+echo "corpus: $CORPUS  agents: $AGENTS  window: ${SECONDS_PER_LEG}s  legs: $LEGS each, interleaved${REMOTE:+  destination: over ssh to $REMOTE}"
 echo
 port=7400
 for i in $(seq 1 "$LEGS"); do

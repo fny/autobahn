@@ -118,6 +118,8 @@ pub struct Session {
     /// watching. A session with no observer announces into a handle nobody
     /// reads, which keeps the cycle free of conditionals.
     progress: Arc<crate::progress::Progress>,
+    /// Raised by either endpoint's watch; what `await_change` sleeps on.
+    wake: Arc<crate::endpoint::WakeSignal>,
     /// Whether the last cycle finished with the two sides synchronized and
     /// nothing outstanding — the precondition for skipping a cycle whose
     /// scans reproduce [`settled_alpha`](Self::settled_alpha) and
@@ -285,6 +287,7 @@ impl Session {
             ancestor_store,
             ancestor,
             progress: Arc::default(),
+            wake: Arc::default(),
             quiesced: false,
             settled_alpha: None,
             settled_beta: None,
@@ -390,12 +393,21 @@ impl Session {
     /// Blocks until either endpoint signals that content may have changed,
     /// or the timeout elapses; returns whether a change was signaled.
     ///
-    /// The wait is sliced between the endpoints rather than run in parallel:
-    /// each endpoint is asked to watch for half a slice at a time, so a
-    /// change on either side is noticed within one slice without any
-    /// cross-thread cancellation machinery. Remote endpoints answer each
-    /// slice with one lightweight round trip — far cheaper than the scan
-    /// that pure interval polling would run instead.
+    /// Both endpoints watch at once. Each is asked to begin a watch that
+    /// raises the session's one signal, the session sleeps on that signal,
+    /// and the first side to raise it ends the wait: a local endpoint
+    /// raises it from the filesystem watcher, a remote one from the thread
+    /// that holds its watch request open on the agent. Nothing is
+    /// cancelled — a watch the other side beat is left standing and polled
+    /// again next time, still meaning "nothing here since it began".
+    ///
+    /// (The wait used to be sliced between the endpoints, each asked in
+    /// turn for half of 250 ms. A change on one side then waited out the
+    /// other's half-slice, which put a 125 ms step in the tail of every
+    /// single-editor session: p90 of 124 ms against a p50 of 46.)
+    ///
+    /// The sleep is bounded by `SLICE` regardless, so an endpoint that
+    /// cannot watch at all still leaves the caller on a heartbeat.
     pub fn await_change(&mut self, timeout: std::time::Duration) -> Result<bool> {
         const SLICE: std::time::Duration = std::time::Duration::from_millis(250);
         let deadline = std::time::Instant::now() + timeout;
@@ -404,11 +416,13 @@ impl Session {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            let half = remaining.min(SLICE) / 2;
-            if self.alpha.await_change(half)? {
+            self.alpha.watch_begin(remaining, Arc::clone(&self.wake))?;
+            self.beta.watch_begin(remaining, Arc::clone(&self.wake))?;
+            if self.alpha.watch_poll()? == Some(true) || self.beta.watch_poll()? == Some(true) {
                 return Ok(true);
             }
-            if self.beta.await_change(half)? {
+            self.wake.wait(remaining.min(SLICE));
+            if self.alpha.watch_poll()? == Some(true) || self.beta.watch_poll()? == Some(true) {
                 return Ok(true);
             }
         }

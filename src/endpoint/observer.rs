@@ -86,6 +86,11 @@ struct EventSignal {
     generation: Mutex<u64>,
     /// Woken whenever the generation advances.
     wake: Condvar,
+    /// Sessions sleeping on this root through their own signal (see
+    /// [`RootObserver::subscribe`]), raised whenever the generation
+    /// advances. Held weakly: a session that has gone leaves nothing to
+    /// wake, and is dropped from the list at the next raise.
+    sleepers: Mutex<Vec<Weak<crate::endpoint::WakeSignal>>>,
 }
 
 impl EventSignal {
@@ -93,6 +98,15 @@ impl EventSignal {
         let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
         *generation += 1;
         self.wake.notify_all();
+        drop(generation);
+        let mut sleepers = self.sleepers.lock().unwrap_or_else(|e| e.into_inner());
+        sleepers.retain(|sleeper| match sleeper.upgrade() {
+            Some(sleeper) => {
+                sleeper.raise();
+                true
+            }
+            None => false,
+        });
     }
 
     fn current(&self) -> u64 {
@@ -161,6 +175,13 @@ impl RootObserver {
     /// Waits until the generation moves past `seen`, or the timeout expires.
     /// Returns whether it moved.
     pub fn await_change(&self, seen: u64, timeout: Duration) -> bool {
+        self.await_change_seen(seen, timeout).is_some()
+    }
+
+    /// Like [`await_change`](RootObserver::await_change), but says which
+    /// generation the wait observed, for a waiter that has no scan of its
+    /// own to measure the next wait from.
+    pub fn await_change_seen(&self, seen: u64, timeout: Duration) -> Option<u64> {
         self.ensure_watching();
         let deadline = Instant::now() + timeout;
         let mut generation = self
@@ -171,7 +192,7 @@ impl RootObserver {
         while *generation <= seen {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return false;
+                return None;
             }
             let (next, timed_out) = self
                 .signal
@@ -180,10 +201,25 @@ impl RootObserver {
                 .unwrap_or_else(|e| e.into_inner());
             generation = next;
             if timed_out.timed_out() && *generation <= seen {
-                return false;
+                return None;
             }
         }
-        true
+        Some(*generation)
+    }
+
+    /// Registers a signal to raise whenever the generation advances, and
+    /// makes sure the root is being watched. Registering twice is
+    /// harmless; the list is pruned of gone signals as it is raised.
+    pub fn subscribe(&self, signal: &Arc<crate::endpoint::WakeSignal>) {
+        self.ensure_watching();
+        let mut sleepers = self
+            .signal
+            .sleepers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !sleepers.iter().any(|sleeper| sleeper.ptr_eq(&Arc::downgrade(signal))) {
+            sleepers.push(Arc::downgrade(signal));
+        }
     }
 
     /// Establishes the watcher if it is absent and not in a backoff period.
@@ -550,6 +586,7 @@ pub fn observer_for(
         signal: Arc::new(EventSignal {
             generation: Mutex::new(0),
             wake: Condvar::new(),
+            sleepers: Mutex::new(Vec::new()),
         }),
         state: Mutex::new(State {
             behavior: None,

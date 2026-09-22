@@ -13,7 +13,7 @@ pub mod local;
 pub mod observer;
 pub mod remote;
 
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -239,6 +239,30 @@ pub trait Endpoint: Send {
         Ok(false)
     }
 
+    /// Starts watching for a change without blocking. `signal` is raised
+    /// when there is something to poll for: a change, or the end of the
+    /// watch. A watch already under way is left as it is — one is enough,
+    /// and it still stands for "nothing has changed since it began".
+    ///
+    /// This is how a session waits on both of its endpoints at once: each
+    /// is asked to watch, the session sleeps on the one signal, and the
+    /// first side to raise it ends the wait. The blocking
+    /// [`await_change`](Endpoint::await_change) stays for callers with a
+    /// single endpoint.
+    ///
+    /// The default implementation cannot watch and raises nothing;
+    /// [`watch_poll`](Endpoint::watch_poll) then reports the watch as
+    /// ended without a change, and the caller falls back to its heartbeat.
+    fn watch_begin(&mut self, _timeout: std::time::Duration, _signal: Arc<WakeSignal>) -> Result<()> {
+        Ok(())
+    }
+
+    /// Whether the watch has ended, and if so whether it observed a
+    /// change. `None` while it is still under way.
+    fn watch_poll(&mut self) -> Result<Option<bool>> {
+        Ok(Some(false))
+    }
+
     /// Reads one regular file's content by root-relative path, `None` when
     /// there is no regular file there. For looking at a conflict's sides;
     /// not a synchronization primitive.
@@ -307,4 +331,44 @@ pub struct ChangeActivity {
     /// Whether the record was abandoned in favour of a full rescan, which
     /// is itself a change in state worth noticing.
     pub incomplete: bool,
+}
+
+/// What a watching endpoint raises to wake the session sleeping on it.
+///
+/// One per session, shared by both of its endpoints and by whatever
+/// threads serve them, so that a change on either side — or the end of a
+/// remote watch — wakes the same sleeper. A raise that arrives between a
+/// poll and the sleep is not lost: it is held until the next wait
+/// consumes it, which then returns at once.
+#[derive(Default)]
+pub struct WakeSignal {
+    raised: Mutex<bool>,
+    wake: Condvar,
+}
+
+impl WakeSignal {
+    /// Wakes the sleeper, now or at its next wait.
+    pub fn raise(&self) {
+        let mut raised = self.raised.lock().unwrap_or_else(|e| e.into_inner());
+        *raised = true;
+        self.wake.notify_all();
+    }
+
+    /// Sleeps until raised or until `timeout` passes, consuming the raise.
+    pub fn wait(&self, timeout: std::time::Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut raised = self.raised.lock().unwrap_or_else(|e| e.into_inner());
+        while !*raised {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+            raised = self
+                .wake
+                .wait_timeout(raised, remaining)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        *raised = false;
+    }
 }

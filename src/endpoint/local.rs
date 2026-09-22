@@ -1263,7 +1263,33 @@ impl Endpoint for LocalEndpoint {
         // endpoint last scanned at means it wakes for changes it has not
         // seen — including ones that landed while it was busy elsewhere,
         // which a wake token could have lost.
-        Ok(self.observer.await_change(self.seen_generation, timeout))
+        let observed = self.observer.await_change_seen(self.seen_generation, timeout);
+        // An endpoint that has never scanned is a watcher on a controller's
+        // behalf (the agent's second channel for a session, whose scans go
+        // through the first), and has no scan to measure the next wait
+        // from. What it has is the last change it reported: the controller
+        // scanned for that one, so the next wait is for anything after it.
+        // An endpoint that scans measures from its scan, as before.
+        if let (Some(generation), None) = (observed, &self.last_snapshot) {
+            self.seen_generation = generation;
+        }
+        Ok(observed.is_some())
+    }
+
+    fn watch_begin(
+        &mut self,
+        _timeout: std::time::Duration,
+        signal: Arc<crate::endpoint::WakeSignal>,
+    ) -> Result<()> {
+        self.observer.subscribe(&signal);
+        Ok(())
+    }
+
+    fn watch_poll(&mut self) -> Result<Option<bool>> {
+        // Nothing is outstanding: the subscription raises the signal, and
+        // the verdict is one comparison against the generation last
+        // scanned at — the same test the blocking wait makes.
+        Ok(Some(self.observer.generation() > self.seen_generation))
     }
 
     fn change_activity(&mut self) -> Option<crate::endpoint::ChangeActivity> {

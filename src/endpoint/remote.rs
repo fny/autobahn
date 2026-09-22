@@ -9,7 +9,7 @@
 //! correspond to the request is a protocol error. Channels on the same
 //! connection interleave freely — see [`crate::transport::mux`].
 
-use std::sync::Arc;
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -47,6 +47,9 @@ const PUSH_WINDOW: usize = 4;
 pub struct RemoteEndpoint {
     /// The endpoint's channel.
     channel: AgentChannel,
+    /// The watch on the agent's side, when the connection could open a
+    /// second channel for it. See [`RemoteWatch`].
+    watch: Option<RemoteWatch>,
     /// The number of staging pushes sent but not yet acknowledged.
     pending_pushes: usize,
     /// The controller's model of the agent's snapshot: the last one
@@ -239,18 +242,28 @@ impl RemoteEndpoint {
     /// opens one channel with the session's root and policy.
     pub fn connect(connection: Connection, initialize: Initialize) -> Result<RemoteEndpoint> {
         let connection = AgentConnection::connect(connection)?;
-        let channel = connection.open(initialize)?;
-        Ok(RemoteEndpoint::from_channel(channel))
+        let channel = connection.open(initialize.clone())?;
+        let watch = connection.open(initialize)?;
+        Ok(RemoteEndpoint::from_channel(channel).with_watch(watch))
     }
 
     /// Wraps an already-open channel (the pooled path).
     pub(crate) fn from_channel(channel: AgentChannel) -> RemoteEndpoint {
         RemoteEndpoint {
             channel,
+            watch: None,
             pending_pushes: 0,
             last_snapshot: None,
             progress: None,
         }
+    }
+
+    /// Gives the endpoint a second channel to the same agent, over which
+    /// it watches for changes while the first is free for everything else.
+    /// Without one, watching degrades to the heartbeat.
+    pub(crate) fn with_watch(mut self, channel: AgentChannel) -> RemoteEndpoint {
+        self.watch = Some(RemoteWatch::start(channel));
+        self
     }
 
     /// Terminates the endpoint, reporting failures that the silent drop
@@ -315,8 +328,9 @@ impl RemoteEndpoint {
 /// untouched.
 pub fn connect_ssh(destination: &str, initialize: Initialize) -> Result<RemoteEndpoint> {
     let connection = establish_ssh(destination)?;
-    let channel = connection.open(initialize)?;
-    Ok(RemoteEndpoint::from_channel(channel))
+    let channel = connection.open(initialize.clone())?;
+    let watch = connection.open(initialize)?;
+    Ok(RemoteEndpoint::from_channel(channel).with_watch(watch))
 }
 
 /// Establishes a multiplexed connection to a remote SSH host, with the
@@ -391,14 +405,18 @@ pub fn connect_pooled(
     argv: &[String],
     initialize: Initialize,
 ) -> Result<RemoteEndpoint> {
-    let channel = pool.channel(argv, initialize, || match destination {
+    let establish = || match destination {
         // The SSH path installs the agent on first contact; under the
         // pool's per-key lock, concurrent sessions for one host wait for
         // this single bootstrap instead of racing their own.
         Some(destination) => establish_ssh(destination),
         None => AgentConnection::connect(Connection::spawn(argv)?),
-    })?;
-    Ok(RemoteEndpoint::from_channel(channel))
+    };
+    let channel = pool.channel(argv, initialize.clone(), establish)?;
+    // The watch rides the same pooled connection: the connection exists
+    // now, so this opens a channel on it rather than establishing again.
+    let watch = pool.channel(argv, initialize, establish)?;
+    Ok(RemoteEndpoint::from_channel(channel).with_watch(watch))
 }
 
 impl Endpoint for RemoteEndpoint {
@@ -562,6 +580,113 @@ impl Endpoint for RemoteEndpoint {
             response => Err(unexpected_response(&response, "await changes")),
         }
     }
+
+    fn watch_begin(
+        &mut self,
+        timeout: std::time::Duration,
+        signal: Arc<crate::endpoint::WakeSignal>,
+    ) -> Result<()> {
+        match &mut self.watch {
+            Some(watch) => watch.begin(timeout, signal),
+            None => Ok(()),
+        }
+    }
+
+    fn watch_poll(&mut self) -> Result<Option<bool>> {
+        match &mut self.watch {
+            Some(watch) => watch.poll(),
+            None => Ok(Some(false)),
+        }
+    }
+}
+
+/// The longest one watch request holds the agent's channel. A session's
+/// wait can be as long as its heartbeat; the request is kept shorter so
+/// that a watch outliving its endpoint — the thread below is joined by
+/// nobody — releases its channel soon after.
+const WATCH_REQUEST_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// A change watch on the agent's side, served over a channel of its own.
+///
+/// The controller's channel to an agent is strict request/response, so a
+/// wait that blocks it would block the session's next scan with it. The
+/// watch therefore has its own channel and its own thread: the thread
+/// sends the wait, blocks for the answer, records it, and raises the
+/// session's signal. Meanwhile the session sleeps on that signal with the
+/// other endpoint's watch under way too, and whichever raises it first is
+/// the one that ends the wait.
+///
+/// A watch left outstanding — the other side changed first — still means
+/// what it says: nothing had changed on this side when it was asked. It is
+/// simply polled again on the next wait rather than asked again. When it
+/// answers late with a change, the next wait ends at once and the cycle
+/// that follows finds whatever it was.
+struct RemoteWatch {
+    /// Waits to run, each with the signal to raise when it ends.
+    requests: mpsc::Sender<(std::time::Duration, Arc<crate::endpoint::WakeSignal>)>,
+    /// The last wait's answer, until it is polled.
+    verdict: Arc<Mutex<Option<Result<bool>>>>,
+    /// Whether a wait has been sent and not yet polled.
+    outstanding: bool,
+}
+
+impl RemoteWatch {
+    fn start(mut channel: AgentChannel) -> RemoteWatch {
+        let (requests, waits) =
+            mpsc::channel::<(std::time::Duration, Arc<crate::endpoint::WakeSignal>)>();
+        let verdict: Arc<Mutex<Option<Result<bool>>>> = Arc::default();
+        let recorded = Arc::clone(&verdict);
+        std::thread::Builder::new()
+            .name("autobahn-watch".into())
+            .spawn(move || {
+                // Ends when the endpoint is dropped: the sender goes with
+                // it, and the channel is closed by this drop.
+                while let Ok((timeout, signal)) = waits.recv() {
+                    let answer = channel
+                        .exchange(Request::AwaitChanges(timeout.as_millis() as u64))
+                        .and_then(|response| match response {
+                            Response::AwaitChanges(changed) => Ok(changed),
+                            Response::Error(message) => Err(remote_error(message)),
+                            response => Err(unexpected_response(&response, "await changes")),
+                        });
+                    *recorded.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
+                    signal.raise();
+                }
+            })
+            .expect("unable to spawn the watch thread");
+        RemoteWatch {
+            requests,
+            verdict,
+            outstanding: false,
+        }
+    }
+
+    fn begin(
+        &mut self,
+        timeout: std::time::Duration,
+        signal: Arc<crate::endpoint::WakeSignal>,
+    ) -> Result<()> {
+        if self.outstanding {
+            return Ok(());
+        }
+        *self.verdict.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.requests
+            .send((timeout.min(WATCH_REQUEST_MAX), signal))
+            .map_err(|_| anyhow!("the watch thread has ended"))?;
+        self.outstanding = true;
+        Ok(())
+    }
+
+    fn poll(&mut self) -> Result<Option<bool>> {
+        let answer = self.verdict.lock().unwrap_or_else(|e| e.into_inner()).take();
+        match answer {
+            Some(answer) => {
+                self.outstanding = false;
+                answer.map(Some)
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 /// Wraps a failure reported by the agent, marking it as having happened on
@@ -629,9 +754,13 @@ mod tests {
     }
 
     /// Runs a scripted agent over one end of a connected pair: the
-    /// handshake, a channel open, then one canned response per request, in
-    /// order. This exercises the protocol without a `LocalEndpoint` (or a
-    /// process).
+    /// handshake, then one canned response per request, in order, on
+    /// whichever channel the request arrives. Channel opens are answered
+    /// as they come — an endpoint opens two, one to work on and one to
+    /// watch on — and closes are taken in stride; neither consumes a
+    /// scripted response. This exercises the protocol without a
+    /// `LocalEndpoint` (or a process). The first open's initialization
+    /// is returned.
     fn scripted_agent(
         mut connection: Connection,
         responses: Vec<Response>,
@@ -640,24 +769,37 @@ mod tests {
             let peer: Handshake = connection.receive()?;
             transport::verify_handshake(&peer)?;
             connection.send(&transport::local_handshake())?;
-            let MuxRequest::Open {
-                channel,
-                initialize,
-            } = connection.receive()?
-            else {
-                anyhow::bail!("expected a channel open");
-            };
-            connection.send(&MuxResponse {
-                channel,
-                response: Response::Initialized,
-            })?;
-            for response in responses {
-                let MuxRequest::Request { channel, .. } = connection.receive()? else {
-                    anyhow::bail!("expected a channel request");
-                };
-                connection.send(&MuxResponse { channel, response })?;
+            let mut first: Option<Initialize> = None;
+            let mut responses = responses.into_iter();
+            loop {
+                match connection.receive()? {
+                    MuxRequest::Open {
+                        channel,
+                        initialize,
+                    } => {
+                        first.get_or_insert(initialize);
+                        connection.send(&MuxResponse {
+                            channel,
+                            response: Response::Initialized,
+                        })?;
+                        if responses.len() == 0 {
+                            break;
+                        }
+                    }
+                    MuxRequest::Request { channel, .. } => {
+                        let Some(response) = responses.next() else {
+                            anyhow::bail!("a request beyond the script");
+                        };
+                        connection.send(&MuxResponse { channel, response })?;
+                        if responses.len() == 0 {
+                            break;
+                        }
+                    }
+                    MuxRequest::Close { .. } => {}
+                    MuxRequest::Shutdown => break,
+                }
             }
-            Ok(initialize)
+            first.ok_or_else(|| anyhow::anyhow!("no channel was opened"))
         })
     }
 
@@ -810,6 +952,24 @@ mod tests {
         // The failure must leave no acknowledgements queued on the channel:
         // a later request would otherwise consume a stale staging response.
         assert_eq!(endpoint.pending_pushes, 0);
+        drop(endpoint);
+        let _ = agent.join();
+    }
+
+    #[test]
+    fn a_watch_answers_on_its_own_channel() {
+        let (client, agent) = connected_pair();
+        let agent = scripted_agent(agent, vec![Response::AwaitChanges(true)]);
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        let signal = Arc::new(crate::endpoint::WakeSignal::default());
+        endpoint
+            .watch_begin(std::time::Duration::from_secs(5), Arc::clone(&signal))
+            .expect("watch begins");
+        signal.wait(std::time::Duration::from_secs(5));
+        assert_eq!(endpoint.watch_poll().expect("watch polls"), Some(true));
+        // Ended and collected: the next poll has nothing outstanding.
+        assert_eq!(endpoint.watch_poll().expect("watch polls"), None);
         drop(endpoint);
         let _ = agent.join();
     }

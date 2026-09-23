@@ -1522,6 +1522,7 @@ pub fn open_endpoints(
                         max_entry_count: plan.max_entry_count,
                         default_owner: plan.default_owner.clone(),
                         default_group: plan.default_group.clone(),
+                        one_shot: false,
                     },
                 )?))
             }

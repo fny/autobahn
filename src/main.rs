@@ -860,6 +860,9 @@ fn run_sync(
             max_entry_count: None,
             default_owner: None,
             default_group: None,
+            // A one-shot never waits, so its roots are not watched;
+            // --watch turns this into a session that does.
+            one_shot: !watch,
         })
     };
     let initialize = |root: String, side: &str| Initialize {

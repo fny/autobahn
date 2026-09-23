@@ -100,6 +100,11 @@ pub struct EndpointOptions {
     /// The per-root entry limit: a scan exceeding it fails (`None` for
     /// unlimited).
     pub max_entry_count: Option<u64>,
+    /// Whether this endpoint will never wait for a change — a one-shot
+    /// `sync` — so no filesystem watcher is registered for its root.
+    /// Registering one walks the whole tree once more; on a large tree
+    /// that was a third of a one-shot's time, for nothing.
+    pub one_shot: bool,
     /// The owner (name or `id:N`) applied to created entries (`None` to
     /// leave ownership alone). Resolved on this endpoint's host.
     pub default_owner: Option<String>,
@@ -568,16 +573,22 @@ impl LocalEndpoint {
             max_entry_count: options.max_entry_count,
             owner,
             group,
-            observer: crate::endpoint::observer::observer_for(
-                crate::endpoint::observer::ObserverKey {
-                    root: crate::endpoint::observer::canonical_root(&observer_root),
-                    ignores: observer_ignores.key(),
-                    symlink_mode: options.symlink_mode,
-                    max_file_size: options.max_file_size,
-                },
-                observer_ignores,
-                cache_path,
-            ),
+            observer: {
+                let observer = crate::endpoint::observer::observer_for(
+                    crate::endpoint::observer::ObserverKey {
+                        root: crate::endpoint::observer::canonical_root(&observer_root),
+                        ignores: observer_ignores.key(),
+                        symlink_mode: options.symlink_mode,
+                        max_file_size: options.max_file_size,
+                    },
+                    observer_ignores,
+                    cache_path,
+                );
+                if !options.one_shot {
+                    observer.want_watching();
+                }
+                observer
+            },
             progress: None,
             #[cfg(test)]
             between_announce_and_writes: None,

@@ -886,6 +886,8 @@ fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
         max_entry_count: initialize.max_entry_count,
         default_owner: initialize.default_owner.clone(),
         default_group: initialize.default_group.clone(),
+        // An agent serves sessions that wait, so its roots are watched.
+        one_shot: false,
     };
     LocalEndpoint::new(root, staging_root, options)
         .with_context(|| format!("unable to create an endpoint for {}", initialize.root))

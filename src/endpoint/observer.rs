@@ -145,6 +145,10 @@ pub struct RootObserver {
     /// The compiled ignore set the key renders.
     ignores: IgnoreSet,
     signal: Arc<EventSignal>,
+    /// Whether any endpoint over this root will ever wait for a change.
+    /// Until one says so, no watcher is registered: a one-shot never
+    /// waits, and registering walks the whole tree.
+    watch_wanted: std::sync::atomic::AtomicBool,
     state: Mutex<State>,
     /// Woken when a scan completes, so callers waiting on one can proceed.
     scanned: Condvar,
@@ -235,7 +239,17 @@ impl RootObserver {
     /// A failed attempt is not retried immediately: registering a recursive
     /// watch walks the whole root, and the usual cause of failure is a host
     /// already at its watch limit.
+    /// Says that an endpoint over this root will wait for changes, so
+    /// the root is to be watched from now on.
+    pub fn want_watching(&self) {
+        self.watch_wanted
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     fn ensure_watching(&self) {
+        if !self.watch_wanted.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         #[cfg(test)]
         if self
             .suppress_watching
@@ -591,6 +605,7 @@ pub fn observer_for(
     let observer = Arc::new(RootObserver {
         key: key.clone(),
         ignores,
+        watch_wanted: std::sync::atomic::AtomicBool::new(false),
         signal: Arc::new(EventSignal {
             generation: Mutex::new(0),
             wake: Condvar::new(),

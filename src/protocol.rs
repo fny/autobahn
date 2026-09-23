@@ -88,8 +88,10 @@ pub enum Request {
     /// Apply transitions.
     Transition(Vec<Change>),
     /// Block until content may have changed or the specified number of
-    /// milliseconds elapses.
-    AwaitChanges(u64),
+    /// milliseconds elapses. `since` names the generation the controller
+    /// last saw (from a scan or a transition), so the wait is for anything
+    /// after it; `None` waits from the endpoint's own last scan.
+    AwaitChanges { milliseconds: u64, since: Option<u64> },
     /// Pull the next batch of snapshot delta operations, after a
     /// `ScanDelta` response. An empty batch ends the stream.
     ScanPull,
@@ -163,6 +165,8 @@ pub struct ScanDelta {
     /// The block size the baseline's signature used, which the controller
     /// needs to build the matching signature over its own copy.
     pub block_size: u32,
+    /// The generation of the root's observer the snapshot was taken at.
+    pub generation: u64,
 }
 
 /// A response from the agent to the controller. Every response variant
@@ -182,8 +186,10 @@ pub enum Response {
     SupplyPull(Vec<TransferFrame>),
     /// Acknowledgement of StagePush.
     StagePushed,
-    /// The outcome of Transition.
-    Transition(TransitionOutcome),
+    /// The outcome of Transition, and the generation the root's observer
+    /// stands at after it: any change past this one is not the
+    /// transition's own writes.
+    Transition { outcome: TransitionOutcome, generation: u64 },
     /// The scan produced exactly the snapshot this channel last sent, so
     /// the snapshot itself is not repeated. Answering an unchanged root
     /// this way is what keeps a heartbeat from costing a full snapshot
@@ -194,9 +200,12 @@ pub enum Response {
     /// requires a version bump. Version equality is enforced by the
     /// handshake, which is what keeps two builds that disagree about this
     /// enum from ever exchanging a frame.
-    ScanUnchanged,
-    /// Whether AwaitChanges observed a change.
-    AwaitChanges(bool),
+    /// ...which stands at this generation of the root's observer.
+    ScanUnchanged { generation: u64 },
+    /// Whether AwaitChanges observed a change — and whether the agent was
+    /// watching the root at all. `watching` false means the root is on
+    /// interval polling, so a quiet wait proves nothing.
+    AwaitChanges { changed: bool, watching: bool },
     /// A request-level failure.
     Error(String),
     /// A scan result, sent as a delta: this header, then `ScanOps` batches
@@ -267,7 +276,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 12;
+pub const COMPATIBILITY_EPOCH: u32 = 13;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

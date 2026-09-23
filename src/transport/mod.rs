@@ -640,16 +640,18 @@ fn serve_channel<W: Write>(
                         && sent.preserves_executability == snapshot.preserves_executability
                 });
                 if unchanged {
-                    return Ok(Response::ScanUnchanged);
+                    return Ok(Response::ScanUnchanged {
+                        generation: endpoint.generation().unwrap_or(0),
+                    });
                 }
-                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending)?;
+                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending, endpoint.generation().unwrap_or(0))?;
                 anchor = Anchor::To(Some(snapshot));
                 Ok(Response::ScanDelta(header))
             }),
             Request::ScanVerified => endpoint.scan_verified().and_then(|snapshot| {
                 // Never elided: the entire point is a full re-read whose
                 // result the controller sees in full.
-                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending)?;
+                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending, endpoint.generation().unwrap_or(0))?;
                 anchor = Anchor::To(Some(snapshot));
                 Ok(Response::ScanDelta(header))
             }),
@@ -658,7 +660,7 @@ fn serve_channel<W: Write>(
                 // delta named. The snapshot it wants is the one this channel
                 // just anchored; it goes again against nothing.
                 Some(snapshot) => {
-                    snapshot_delta(snapshot, None, &mut pending).map(Response::ScanDelta)
+                    snapshot_delta(snapshot, None, &mut pending, endpoint.generation().unwrap_or(0)).map(Response::ScanDelta)
                 }
                 None => Err(anyhow!("a full scan was requested before any scan")),
             },
@@ -693,11 +695,18 @@ fn serve_channel<W: Write>(
                         endpoint.snapshot(),
                     ));
                 }
-                outcome.map(Response::Transition)
+                let generation = endpoint.generation().unwrap_or(0);
+                outcome.map(|outcome| Response::Transition {
+                    outcome,
+                    generation,
+                })
             }
-            Request::AwaitChanges(milliseconds) => endpoint
-                .await_change(std::time::Duration::from_millis(milliseconds))
-                .map(Response::AwaitChanges),
+            Request::AwaitChanges {
+                milliseconds,
+                since,
+            } => endpoint
+                .await_change_since(since, std::time::Duration::from_millis(milliseconds))
+                .map(|(changed, watching)| Response::AwaitChanges { changed, watching }),
         };
         let response = result.unwrap_or_else(|error| Response::Error(format!("{error:#}")));
         // A response can be unsendable for its own reasons (most notably an
@@ -767,6 +776,7 @@ fn snapshot_delta(
     snapshot: &Snapshot,
     baseline: Option<&Snapshot>,
     pending: &mut std::collections::VecDeque<crate::rsync::Op>,
+    generation: u64,
 ) -> Result<protocol::ScanDelta> {
     let target = encode_snapshot(snapshot)?;
     let digest = *blake3::hash(&target).as_bytes();
@@ -787,6 +797,7 @@ fn snapshot_delta(
     })
     .context("unable to compute the snapshot delta")?;
     Ok(protocol::ScanDelta {
+        generation,
         baseline: baseline_digest,
         digest,
         length: target.len() as u64,
@@ -1966,7 +1977,7 @@ pub(crate) mod tests {
 
         // Full stream: against nothing.
         let mut pending = std::collections::VecDeque::new();
-        let header = snapshot_delta(&first, None, &mut pending).expect("delta");
+        let header = snapshot_delta(&first, None, &mut pending, 0).expect("delta");
         assert!(header.baseline.is_none());
         let mut output = Vec::new();
         let mut base = std::io::Cursor::new(Vec::new());
@@ -1995,7 +2006,7 @@ pub(crate) mod tests {
         // stream must reproduce the second snapshot, and carry far less
         // data than the encoding — that is the point of the delta.
         let second = snapshot_with(2);
-        let header = snapshot_delta(&second, Some(&first), &mut pending).expect("delta");
+        let header = snapshot_delta(&second, Some(&first), &mut pending, 0).expect("delta");
         assert_eq!(header.baseline, Some(*blake3::hash(&encoded).as_bytes()));
         let signature =
             crate::rsync::signature(std::io::Cursor::new(&encoded), header.block_size).unwrap();

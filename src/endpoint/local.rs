@@ -1276,6 +1276,29 @@ impl Endpoint for LocalEndpoint {
         Ok(observed.is_some())
     }
 
+    fn await_change_since(
+        &mut self,
+        since: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> Result<(bool, bool)> {
+        // An unwatched root answers at once: waiting would only delay the
+        // news that a quiet wait means nothing here.
+        if !self.observer.is_watching() {
+            return Ok((false, false));
+        }
+        match since {
+            Some(since) => Ok((
+                self.observer.await_change_seen(since, timeout).is_some(),
+                true,
+            )),
+            None => Ok((self.await_change(timeout)?, true)),
+        }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        Some(self.seen_generation)
+    }
+
     fn watch_begin(
         &mut self,
         _timeout: std::time::Duration,
@@ -1456,7 +1479,11 @@ impl Endpoint for LocalEndpoint {
             missing_staged: transitioner.missing_staged,
         };
 
-        // The paths are announced *again* now that the writes are done.
+        // The paths are announced *again* now that the writes are done —
+        // and the generation that leaves is the one this endpoint has seen:
+        // a wait from here wakes for the next change, not for the writes
+        // just made. (The next scan still re-reads these paths: the
+        // announcement marks them, and marks are not generations.)
         // The pre-write announcement keeps a racing scan from adopting its
         // baseline; but such a scan consumes the announced dirty marks and
         // can still read the old bytes before they change, publishing them
@@ -1466,6 +1493,7 @@ impl Endpoint for LocalEndpoint {
         // and never arrive at all under the polling fallback.
         self.observer
             .invalidate(transitions.iter().map(|change| change.path.as_str()));
+        self.seen_generation = self.observer.generation();
 
         // A disagreement means the filesystem differed from the snapshot the
         // transition was validated against, so the snapshot is known to be

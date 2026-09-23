@@ -50,6 +50,15 @@ pub struct RemoteEndpoint {
     /// The watch on the agent's side, when the connection could open a
     /// second channel for it. See [`RemoteWatch`].
     watch: Option<RemoteWatch>,
+    /// The generation of the agent's root the last scan or transition
+    /// left `last_snapshot` describing, as the agent reported it.
+    seen: Option<u64>,
+    /// When the last real scan was answered; a cached snapshot is trusted
+    /// only for so long, so the agent's periodic full walk still happens.
+    scanned_at: Option<std::time::Instant>,
+    /// Whether the agent said it was watching its root, the last time it
+    /// answered a wait.
+    watching: bool,
     /// The number of staging pushes sent but not yet acknowledged.
     pending_pushes: usize,
     /// The controller's model of the agent's snapshot: the last one
@@ -117,20 +126,27 @@ impl RemoteEndpoint {
     /// Asks the agent for a scan and receives the snapshot, however it
     /// chose to send it.
     fn request_scan(&mut self, request: Request, what: &'static str) -> Result<Snapshot> {
+        self.scanned_at = Some(std::time::Instant::now());
         match self.exchange(request)? {
             Response::Scan(snapshot) => {
+                self.seen = None;
                 self.last_snapshot = Some(snapshot.clone());
                 Ok(snapshot)
             }
-            Response::ScanDelta(header) => self.receive_snapshot(header, what),
+            Response::ScanDelta(header) => {
+                self.seen = Some(header.generation);
+                self.receive_snapshot(header, what)
+            }
             // The agent reports "unchanged" only against a snapshot it has
             // actually sent, so having nothing to reproduce means the two
             // sides disagree about what was transmitted. That is a protocol
             // defect, and silently rescanning would paper over it.
-            Response::ScanUnchanged => self
-                .last_snapshot
-                .clone()
-                .ok_or_else(|| anyhow!("the agent reported an unchanged scan before sending one")),
+            Response::ScanUnchanged { generation } => {
+                self.seen = Some(generation);
+                self.last_snapshot
+                    .clone()
+                    .ok_or_else(|| anyhow!("the agent reported an unchanged scan before sending one"))
+            }
             response => Err(unexpected_response(&response, what)),
         }
     }
@@ -252,6 +268,9 @@ impl RemoteEndpoint {
         RemoteEndpoint {
             channel,
             watch: None,
+            seen: None,
+            scanned_at: None,
+            watching: false,
             pending_pushes: 0,
             last_snapshot: None,
             progress: None,
@@ -581,7 +600,11 @@ impl Endpoint for RemoteEndpoint {
         pushes?;
         match response? {
             Response::Error(message) => Err(remote_error(message)),
-            Response::Transition(outcome) => {
+            Response::Transition {
+                outcome,
+                generation,
+            } => {
+                self.seen = Some(generation);
                 // Model the agent's own fold of the achieved results, so the
                 // cached snapshot keeps describing what the agent holds. The
                 // two sides run the same fold over the same inputs; a fold
@@ -601,10 +624,44 @@ impl Endpoint for RemoteEndpoint {
         // The agent blocks this channel for up to the requested timeout
         // before answering (other channels proceed), so callers keep
         // individual awaits short and loop.
-        match self.exchange(Request::AwaitChanges(timeout.as_millis() as u64))? {
-            Response::AwaitChanges(changed) => Ok(changed),
+        let request = Request::AwaitChanges {
+            milliseconds: timeout.as_millis() as u64,
+            since: self.seen,
+        };
+        match self.exchange(request)? {
+            Response::AwaitChanges { changed, watching } => {
+                self.watching = watching;
+                Ok(changed)
+            }
             response => Err(unexpected_response(&response, "await changes")),
         }
+    }
+
+    fn generation(&self) -> Option<u64> {
+        self.seen
+    }
+
+    fn unchanged_since_scan(&mut self) -> bool {
+        // A watch begun from the generation the last scan (or transition)
+        // left, still standing with no answer, on a root the agent said it
+        // was watching, within the time a cached snapshot is trusted.
+        let Some(seen) = self.seen else {
+            return false;
+        };
+        let fresh = self
+            .scanned_at
+            .is_some_and(|at| at.elapsed() < CACHED_SNAPSHOT_MAX_AGE);
+        self.watching
+            && fresh
+            && self.last_snapshot.is_some()
+            && self
+                .watch
+                .as_ref()
+                .is_some_and(|watch| watch.standing_since() == Some(seen))
+    }
+
+    fn cached_snapshot(&self) -> Option<Snapshot> {
+        self.last_snapshot.clone()
     }
 
     fn watch_begin(
@@ -612,19 +669,32 @@ impl Endpoint for RemoteEndpoint {
         timeout: std::time::Duration,
         signal: Arc<crate::endpoint::WakeSignal>,
     ) -> Result<()> {
+        let since = self.seen;
         match &mut self.watch {
-            Some(watch) => watch.begin(timeout, signal),
+            Some(watch) => watch.begin(timeout, signal, since),
             None => Ok(()),
         }
     }
 
     fn watch_poll(&mut self) -> Result<Option<bool>> {
         match &mut self.watch {
-            Some(watch) => watch.poll(),
+            Some(watch) => match watch.poll()? {
+                Some((changed, watching)) => {
+                    self.watching = watching;
+                    Ok(Some(changed))
+                }
+                None => Ok(None),
+            },
             None => Ok(Some(false)),
         }
     }
 }
+
+/// How long a cycle may reuse the last scan's snapshot on the strength of
+/// a standing watch. The agent's observer walks the whole root every so
+/// often to catch what a watcher can miss; a scan is what runs that walk,
+/// so scans are not skipped for longer than this.
+const CACHED_SNAPSHOT_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The longest one watch request holds the agent's channel. A session's
 /// wait can be as long as its heartbeat; the request is kept shorter so
@@ -648,33 +718,40 @@ const WATCH_REQUEST_MAX: std::time::Duration = std::time::Duration::from_secs(2)
 /// answers late with a change, the next wait ends at once and the cycle
 /// that follows finds whatever it was.
 struct RemoteWatch {
-    /// Waits to run, each with the signal to raise when it ends.
-    requests: mpsc::Sender<(std::time::Duration, Arc<crate::endpoint::WakeSignal>)>,
-    /// The last wait's answer, until it is polled.
-    verdict: Arc<Mutex<Option<Result<bool>>>>,
-    /// Whether a wait has been sent and not yet polled.
-    outstanding: bool,
+    /// Waits to run: the timeout, the signal to raise when the wait ends,
+    /// and the generation to wait from.
+    requests: mpsc::Sender<(std::time::Duration, Arc<crate::endpoint::WakeSignal>, Option<u64>)>,
+    /// The last wait's answer — changed, watching — until it is polled.
+    verdict: Arc<Mutex<Option<Result<(bool, bool)>>>>,
+    /// The generation the outstanding wait was begun from, while one is
+    /// sent and not yet polled.
+    outstanding: Option<Option<u64>>,
 }
 
 impl RemoteWatch {
     fn start(mut channel: AgentChannel) -> RemoteWatch {
-        let (requests, waits) =
-            mpsc::channel::<(std::time::Duration, Arc<crate::endpoint::WakeSignal>)>();
-        let verdict: Arc<Mutex<Option<Result<bool>>>> = Arc::default();
+        let (requests, waits) = mpsc::channel::<(
+            std::time::Duration,
+            Arc<crate::endpoint::WakeSignal>,
+            Option<u64>,
+        )>();
+        let verdict: Arc<Mutex<Option<Result<(bool, bool)>>>> = Arc::default();
         let recorded = Arc::clone(&verdict);
         std::thread::Builder::new()
             .name("autobahn-watch".into())
             .spawn(move || {
                 // Ends when the endpoint is dropped: the sender goes with
                 // it, and the channel is closed by this drop.
-                while let Ok((timeout, signal)) = waits.recv() {
-                    let answer = channel
-                        .exchange(Request::AwaitChanges(timeout.as_millis() as u64))
-                        .and_then(|response| match response {
-                            Response::AwaitChanges(changed) => Ok(changed),
-                            Response::Error(message) => Err(remote_error(message)),
-                            response => Err(unexpected_response(&response, "await changes")),
-                        });
+                while let Ok((timeout, signal, since)) = waits.recv() {
+                    let request = Request::AwaitChanges {
+                        milliseconds: timeout.as_millis() as u64,
+                        since,
+                    };
+                    let answer = channel.exchange(request).and_then(|response| match response {
+                        Response::AwaitChanges { changed, watching } => Ok((changed, watching)),
+                        Response::Error(message) => Err(remote_error(message)),
+                        response => Err(unexpected_response(&response, "await changes")),
+                    });
                     *recorded.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
                     signal.raise();
                 }
@@ -683,7 +760,7 @@ impl RemoteWatch {
         RemoteWatch {
             requests,
             verdict,
-            outstanding: false,
+            outstanding: None,
         }
     }
 
@@ -691,26 +768,42 @@ impl RemoteWatch {
         &mut self,
         timeout: std::time::Duration,
         signal: Arc<crate::endpoint::WakeSignal>,
+        since: Option<u64>,
     ) -> Result<()> {
-        if self.outstanding {
+        if self.outstanding.is_some() {
             return Ok(());
         }
         *self.verdict.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.requests
-            .send((timeout.min(WATCH_REQUEST_MAX), signal))
+            .send((timeout.min(WATCH_REQUEST_MAX), signal, since))
             .map_err(|_| anyhow!("the watch thread has ended"))?;
-        self.outstanding = true;
+        self.outstanding = Some(since);
         Ok(())
     }
 
-    fn poll(&mut self) -> Result<Option<bool>> {
+    fn poll(&mut self) -> Result<Option<(bool, bool)>> {
         let answer = self.verdict.lock().unwrap_or_else(|e| e.into_inner()).take();
         match answer {
             Some(answer) => {
-                self.outstanding = false;
+                self.outstanding = None;
                 answer.map(Some)
             }
             None => Ok(None),
+        }
+    }
+
+    /// The generation the outstanding wait was begun from, if one is out
+    /// and has not answered — that is, nothing has changed on the agent's
+    /// side since that generation, as far as the agent has said.
+    fn standing_since(&self) -> Option<u64> {
+        let answered = self
+            .verdict
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some();
+        match self.outstanding {
+            Some(Some(since)) if !answered => Some(since),
+            _ => None,
         }
     }
 }
@@ -735,13 +828,13 @@ fn response_kind(response: &Response) -> &'static str {
     match response {
         Response::Initialized => "initialized",
         Response::Scan(_) => "scan",
-        Response::ScanUnchanged => "scan (unchanged)",
+        Response::ScanUnchanged { .. } => "scan (unchanged)",
         Response::StageBegin(_) => "stage begin",
         Response::SupplyOpened => "supply opened",
         Response::SupplyPull(_) => "supply pull",
         Response::StagePushed => "stage pushed",
-        Response::Transition(_) => "transition",
-        Response::AwaitChanges(_) => "await changes",
+        Response::Transition { .. } => "transition",
+        Response::AwaitChanges { .. } => "await changes",
         Response::Error(_) => "error",
         Response::ScanDelta(_) => "scan delta",
         Response::ScanOps(_) => "scan operations",
@@ -894,8 +987,8 @@ mod tests {
             agent,
             vec![
                 Response::Scan(snapshot.clone()),
-                Response::ScanUnchanged,
-                Response::ScanUnchanged,
+                Response::ScanUnchanged { generation: 1 },
+                Response::ScanUnchanged { generation: 1 },
             ],
         );
         let mut endpoint =
@@ -914,7 +1007,7 @@ mod tests {
     #[test]
     fn an_unchanged_report_without_a_cached_snapshot_is_an_error() {
         let (client, agent) = connected_pair();
-        let agent = scripted_agent(agent, vec![Response::ScanUnchanged]);
+        let agent = scripted_agent(agent, vec![Response::ScanUnchanged { generation: 1 }]);
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
         // Reporting "unchanged" before anything was sent means the two
@@ -952,12 +1045,15 @@ mod tests {
                 Response::StagePushed,
                 Response::Error("disk full".into()),
                 Response::StagePushed,
-                Response::Transition(TransitionOutcome {
-                    results: Vec::new(),
-                    problems: Vec::new(),
-                    missing_staged_files: false,
-                    missing_staged: Vec::new(),
-                }),
+                Response::Transition {
+                    outcome: TransitionOutcome {
+                        results: Vec::new(),
+                        problems: Vec::new(),
+                        missing_staged_files: false,
+                        missing_staged: Vec::new(),
+                    },
+                    generation: 2,
+                },
             ],
         );
         let mut endpoint =
@@ -1024,7 +1120,13 @@ mod tests {
     #[test]
     fn a_watch_answers_on_its_own_channel() {
         let (client, agent) = connected_pair();
-        let agent = scripted_agent(agent, vec![Response::AwaitChanges(true)]);
+        let agent = scripted_agent(
+            agent,
+            vec![Response::AwaitChanges {
+                changed: true,
+                watching: true,
+            }],
+        );
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
         let signal = Arc::new(crate::endpoint::WakeSignal::default());

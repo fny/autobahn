@@ -172,6 +172,14 @@ impl RootObserver {
         self.signal.current()
     }
 
+    /// Whether the root is being watched, as opposed to polled: only then
+    /// does a generation that did not move mean nothing changed.
+    pub fn is_watching(&self) -> bool {
+        self.ensure_watching();
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.watcher.is_some()
+    }
+
     /// Waits until the generation moves past `seen`, or the timeout expires.
     /// Returns whether it moved.
     pub fn await_change(&self, seen: u64, timeout: Duration) -> bool {

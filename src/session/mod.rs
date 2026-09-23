@@ -66,6 +66,10 @@ pub struct CycleReport {
     /// and digest, across both endpoints. A follow-up that reports the same
     /// pair again is not looking at a changing file.
     pub missing_staged: Vec<crate::endpoint::FileRequest>,
+    /// Whether a side's scan was skipped on the strength of a standing
+    /// watch, its last snapshot standing in.
+    pub alpha_scan_skipped: bool,
+    pub beta_scan_skipped: bool,
 }
 
 impl CycleReport {
@@ -533,24 +537,34 @@ impl Session {
         // cycle before a single byte moves.
         self.present_lease()?;
 
-        // Scan both endpoints in parallel.
+        // Scan both endpoints in parallel — unless a side's watch, begun
+        // from the generation its last scan or transition left, is still
+        // standing unanswered: nothing has changed there, so its last
+        // snapshot is the truth and the round trip is saved. A verifying
+        // scan is never skipped; that is its point.
         self.progress.enter(crate::progress::Phase::Scanning);
         let verify = std::mem::take(&mut self.verify_next);
+        let alpha_cached = (!verify && self.alpha.unchanged_since_scan())
+            .then(|| self.alpha.cached_snapshot())
+            .flatten();
+        let beta_cached = (!verify && self.beta.unchanged_since_scan())
+            .then(|| self.beta.cached_snapshot())
+            .flatten();
+        report.alpha_scan_skipped = alpha_cached.is_some();
+        report.beta_scan_skipped = beta_cached.is_some();
         let (alpha_snapshot, beta_snapshot) = {
             let alpha = &mut self.alpha;
             let beta = &mut self.beta;
             std::thread::scope(|scope| {
-                let alpha_scan = scope.spawn(move || {
-                    if verify {
-                        alpha.scan_verified()
-                    } else {
-                        alpha.scan()
-                    }
+                let alpha_scan = scope.spawn(move || match alpha_cached {
+                    Some(snapshot) => Ok(snapshot),
+                    None if verify => alpha.scan_verified(),
+                    None => alpha.scan(),
                 });
-                let beta_result = if verify {
-                    beta.scan_verified()
-                } else {
-                    beta.scan()
+                let beta_result = match beta_cached {
+                    Some(snapshot) => Ok(snapshot),
+                    None if verify => beta.scan_verified(),
+                    None => beta.scan(),
                 };
                 let alpha_result = alpha_scan.join().expect("scan thread panicked");
                 (alpha_result, beta_result)

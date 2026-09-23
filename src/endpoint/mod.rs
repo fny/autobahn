@@ -239,6 +239,39 @@ pub trait Endpoint: Send {
         Ok(false)
     }
 
+    /// Like [`await_change`](Endpoint::await_change), waiting for anything
+    /// after generation `since` of the root (or after the endpoint's own
+    /// last scan when `None`), and saying whether the root was being
+    /// watched at all — a quiet wait on an unwatched root proves nothing.
+    fn await_change_since(
+        &mut self,
+        _since: Option<u64>,
+        timeout: std::time::Duration,
+    ) -> Result<(bool, bool)> {
+        Ok((self.await_change(timeout)?, false))
+    }
+
+    /// The generation of the root's observer that this endpoint's last
+    /// scan or transition left it at, when it has one to name.
+    fn generation(&self) -> Option<u64> {
+        None
+    }
+
+    /// Whether a watch begun after the last scan is still standing —
+    /// nothing changed on this side since — so the last scan's snapshot
+    /// is still the truth and a cycle can use it without asking again.
+    /// Conservative: `false` whenever that cannot be known.
+    fn unchanged_since_scan(&mut self) -> bool {
+        false
+    }
+
+    /// The last scan's snapshot, for a cycle that
+    /// [`unchanged_since_scan`](Endpoint::unchanged_since_scan) let skip
+    /// the scan.
+    fn cached_snapshot(&self) -> Option<Snapshot> {
+        None
+    }
+
     /// Starts watching for a change without blocking. `signal` is raised
     /// when there is something to poll for: a change, or the end of the
     /// watch. A watch already under way is left as it is — one is enough,

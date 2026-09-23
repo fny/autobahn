@@ -1576,3 +1576,60 @@ mod collisions {
         }
     }
 }
+
+/// A watch begun after a cycle and still standing when the next cycle
+/// runs means nothing changed on that side, so the cycle reuses the last
+/// snapshot instead of asking the agent again. Over the agent transport,
+/// where the skipped scan is a round trip.
+#[test]
+fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
+    let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
+    build_tree(&harness.alpha);
+    let mut session = harness.session().expect("session");
+    let report = session.run_cycle().expect("initial cycle");
+    assert!(!report.beta_scan_skipped, "the first cycle has nothing to reuse");
+    // Quiet: a wait that returns false. Late watcher events for the trees
+    // just built can wake the first waits; each wake is a cycle that finds
+    // nothing. A false answer also means the agent has answered a watch
+    // request, which is when the controller learns the root is watched.
+    let mut quiet = false;
+    for _ in 0..6 {
+        if !session.await_change(std::time::Duration::from_secs(3)).expect("wait") {
+            quiet = true;
+            break;
+        }
+        session.run_cycle().expect("settling cycle");
+    }
+    assert!(quiet, "the pair never went quiet");
+
+    fs::write(harness.alpha.join("dir0/nested/file0.txt"), "edited on alpha").unwrap();
+    assert!(session.await_change(std::time::Duration::from_secs(5)).expect("wait"), "alpha's edit wakes the wait");
+    let report = session.run_cycle().expect("cycle");
+    assert!(report.beta_scan_skipped, "beta's watch was standing: its scan is skipped");
+    assert!(!report.alpha_scan_skipped, "alpha changed: it is scanned");
+    assert_eq!(report.beta_transitions, 1);
+    harness.assert_trees_equal("after the skipped scan");
+
+    // Beta changes: its watch answers, and a cycle scans it. Not always
+    // the very next one — a wake from alpha's side can land before beta's
+    // watch has fired for the edit, and that cycle still reuses beta's
+    // snapshot; the watch fires moments later and the cycle after scans.
+    // Never lost, at most one cycle later.
+    fs::write(harness.beta.join("dir1/nested/file1.txt"), "edited on beta").unwrap();
+    let mut scanned = false;
+    for _ in 0..4 {
+        assert!(session.await_change(std::time::Duration::from_secs(5)).expect("wait"));
+        let report = session.run_cycle().expect("cycle");
+        if !report.beta_scan_skipped {
+            scanned = true;
+            break;
+        }
+    }
+    assert!(scanned, "beta's edit never brought a scan");
+    assert_eq!(
+        fs::read_to_string(harness.alpha.join("dir1/nested/file1.txt")).unwrap(),
+        "edited on beta"
+    );
+    drop(session);
+    harness.assert_trees_equal("after beta's edit");
+}

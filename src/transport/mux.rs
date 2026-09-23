@@ -700,9 +700,9 @@ mod tests {
             .expect("the settling scan exchanges");
         for _ in 0..20 {
             let response = channel_b
-                .exchange(Request::AwaitChanges(100))
+                .exchange(Request::AwaitChanges { milliseconds: 100, since: None })
                 .expect("the settling wait exchanges");
-            if matches!(response, Response::AwaitChanges(false)) {
+            if matches!(response, Response::AwaitChanges { changed: false, .. }) {
                 break;
             }
             channel_b
@@ -717,9 +717,9 @@ mod tests {
             let waiter = scope.spawn(move || {
                 let started = std::time::Instant::now();
                 let response = channel_b
-                    .exchange(Request::AwaitChanges(2_000))
+                    .exchange(Request::AwaitChanges { milliseconds: 2_000, since: None })
                     .expect("await should exchange");
-                assert!(matches!(response, Response::AwaitChanges(false)));
+                assert!(matches!(response, Response::AwaitChanges { changed: false, .. }));
                 (started.elapsed(), channel_b)
             });
             // Give the wait a moment to actually start.

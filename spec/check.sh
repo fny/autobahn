@@ -21,7 +21,7 @@ if [ "${1:-}" = "--traces" ]; then
     dir="$2"; failed=0
     for t in "$dir"/Trace*.tla; do
         [ -f "$t" ] || continue
-        cp "$HERE/Autobahn.tla" "$HERE/Reconcile.tla" "$dir/"
+        cp "$HERE/Autobahn.tla" "$HERE/Reconcile.tla" "$HERE/Peering.tla" "$dir/"
         if ! (cd "$dir" && tlc -config "$(basename "${t%.tla}").cfg" "$(basename "$t")" > "${t%.tla}.log" 2>&1); then
             echo "REJECTED $(basename "$t") — see ${t%.tla}.log"; failed=1
         fi

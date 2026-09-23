@@ -96,8 +96,11 @@ impl Harness {
     /// fetch again; this is what the supervisor would do about it.
     fn settle(&mut self, context: &str) -> usize {
         for cycles in 1..=5 {
-            let report = self.cycle().unwrap_or_else(|e| panic!("{context}: cycle {cycles}: {e:#}"));
-            if !report.changed() && report.beta_transition_problems.is_empty()
+            let report = self
+                .cycle()
+                .unwrap_or_else(|e| panic!("{context}: cycle {cycles}: {e:#}"));
+            if !report.changed()
+                && report.beta_transition_problems.is_empty()
                 && report.alpha_transition_problems.is_empty()
                 && !report.missing_staged_files
             {
@@ -175,7 +178,12 @@ impl Harness {
                 )
             }
         };
-        Session::new(alpha_endpoint, beta_endpoint, self.mode, state.to_path_buf())
+        Session::new(
+            alpha_endpoint,
+            beta_endpoint,
+            self.mode,
+            state.to_path_buf(),
+        )
     }
 
     fn cycle_ok(&mut self) -> CycleReport {
@@ -1086,14 +1094,19 @@ mod collisions {
                     fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
                     let beta = harness.beta.clone();
                     let report = harness
-                        .cycle_at(point, move || fs::write(beta.join(PATH), "beta late").unwrap())
+                        .cycle_at(point, move || {
+                            fs::write(beta.join(PATH), "beta late").unwrap()
+                        })
                         .unwrap_or_else(|e| panic!("{context}: {e:#}"));
 
                     // The late write survived the cycle that raced it.
                     assert_eq!(read(&harness.beta), "beta late", "{context}: overwritten");
                     assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
                     assert!(
-                        report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                        report
+                            .beta_transition_problems
+                            .iter()
+                            .any(|p| p.path == PATH),
                         "{context}: the refusal was not reported: {:?}",
                         report.beta_transition_problems
                     );
@@ -1144,7 +1157,10 @@ mod collisions {
                 assert_eq!(read(&harness.alpha), "alpha late", "{context}: overwritten");
                 assert_eq!(read(&harness.beta), "beta v2", "{context}");
                 assert!(
-                    report.alpha_transition_problems.iter().any(|p| p.path == PATH),
+                    report
+                        .alpha_transition_problems
+                        .iter()
+                        .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
@@ -1204,7 +1220,11 @@ mod collisions {
             assert_eq!(read(&harness.beta), "alpha v3, longer", "{context}");
             harness.assert_trees_equal(&context);
             let report = harness.cycle_ok();
-            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+            assert!(
+                report.conflicts.is_empty(),
+                "{context}: {:?}",
+                report.conflicts
+            );
         }
     }
 
@@ -1234,15 +1254,25 @@ mod collisions {
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 // Refused in every mode: the racing cycle never deletes
                 // what it did not validate. The mode decides next cycle.
-                assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
+                assert_eq!(
+                    read(&harness.beta),
+                    "beta edit",
+                    "{context}: the edit was deleted"
+                );
                 assert!(
-                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    report
+                        .beta_transition_problems
+                        .iter()
+                        .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
                 harness.settle(&context);
                 if strict {
-                    assert!(!exists(&harness.alpha, PATH), "{context}: the deletion was undone");
+                    assert!(
+                        !exists(&harness.alpha, PATH),
+                        "{context}: the deletion was undone"
+                    );
                     assert!(!exists(&harness.beta, PATH), "{context}: the edit survived");
                 } else {
                     assert_eq!(read(&harness.alpha), "beta edit", "{context}");
@@ -1287,7 +1317,10 @@ mod collisions {
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 assert_eq!(read(&harness.beta), "beta late", "{context}: overwritten");
                 assert!(
-                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    report
+                        .beta_transition_problems
+                        .iter()
+                        .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
@@ -1335,9 +1368,15 @@ mod collisions {
                         fs::write(beta.join(PATH).join("inner.txt"), "beta inner").unwrap();
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-                assert!(harness.beta.join(PATH).is_dir(), "{context}: the directory was replaced");
                 assert!(
-                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    harness.beta.join(PATH).is_dir(),
+                    "{context}: the directory was replaced"
+                );
+                assert!(
+                    report
+                        .beta_transition_problems
+                        .iter()
+                        .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
@@ -1385,9 +1424,15 @@ mod collisions {
                         fs::write(beta.join(NEW), "beta file").unwrap()
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-                assert!(harness.beta.join(NEW).is_file(), "{context}: the file was replaced");
                 assert!(
-                    report.beta_transition_problems.iter().any(|p| p.path == NEW),
+                    harness.beta.join(NEW).is_file(),
+                    "{context}: the file was replaced"
+                );
+                assert!(
+                    report
+                        .beta_transition_problems
+                        .iter()
+                        .any(|p| p.path == NEW),
                     "{context}: the refusal was not reported: {:?}",
                     report.beta_transition_problems
                 );
@@ -1439,14 +1484,21 @@ mod collisions {
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 // The racing cycle refuses in every mode: the edit is not
                 // the file the deletion was validated against.
-                assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
+                assert_eq!(
+                    read(&harness.beta),
+                    "beta edit",
+                    "{context}: the edit was deleted"
+                );
                 assert_eq!(
                     fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
                     "content 1/1",
                     "{context}: the new name did not arrive"
                 );
                 assert!(
-                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    report
+                        .beta_transition_problems
+                        .iter()
+                        .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
@@ -1454,7 +1506,10 @@ mod collisions {
                 if strict {
                     // Alpha's deletion is final: the rename stands, the
                     // edit is gone.
-                    assert!(!exists(&harness.alpha, PATH), "{context}: the rename was undone");
+                    assert!(
+                        !exists(&harness.alpha, PATH),
+                        "{context}: the rename was undone"
+                    );
                     assert!(!exists(&harness.beta, PATH), "{context}: the edit survived");
                 } else {
                     // The edit beats the deletion: the rename is undone.
@@ -1510,7 +1565,11 @@ mod collisions {
             );
             harness.assert_trees_equal(&context);
             let report = harness.cycle_ok();
-            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+            assert!(
+                report.conflicts.is_empty(),
+                "{context}: {:?}",
+                report.conflicts
+            );
         }
     }
 
@@ -1555,7 +1614,11 @@ mod collisions {
             assert!(exists(&harness.alpha, RENAMED), "{context}");
             harness.assert_trees_equal(&context);
             let report = harness.cycle_ok();
-            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+            assert!(
+                report.conflicts.is_empty(),
+                "{context}: {:?}",
+                report.conflicts
+            );
         }
     }
 
@@ -1583,7 +1646,11 @@ mod collisions {
             assert_eq!(read(&harness.beta), "beta after", "{context}");
 
             let report = harness.cycle_ok();
-            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+            assert!(
+                report.conflicts.is_empty(),
+                "{context}: {:?}",
+                report.conflicts
+            );
             assert_eq!(read(&harness.alpha), "beta after", "{context}: not carried");
             harness.assert_trees_equal(&context);
         }
@@ -1600,14 +1667,20 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     build_tree(&harness.alpha);
     let mut session = harness.session().expect("session");
     let report = session.run_cycle().expect("initial cycle");
-    assert!(!report.beta_scan_skipped, "the first cycle has nothing to reuse");
+    assert!(
+        !report.beta_scan_skipped,
+        "the first cycle has nothing to reuse"
+    );
     // Quiet: a wait that returns false. Late watcher events for the trees
     // just built can wake the first waits; each wake is a cycle that finds
     // nothing. A false answer also means the agent has answered a watch
     // request, which is when the controller learns the root is watched.
     let mut quiet = false;
     for _ in 0..6 {
-        if !session.await_change(std::time::Duration::from_secs(3)).expect("wait") {
+        if !session
+            .await_change(std::time::Duration::from_secs(3))
+            .expect("wait")
+        {
             quiet = true;
             break;
         }
@@ -1615,10 +1688,22 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     }
     assert!(quiet, "the pair never went quiet");
 
-    fs::write(harness.alpha.join("dir0/nested/file0.txt"), "edited on alpha").unwrap();
-    assert!(session.await_change(std::time::Duration::from_secs(5)).expect("wait"), "alpha's edit wakes the wait");
+    fs::write(
+        harness.alpha.join("dir0/nested/file0.txt"),
+        "edited on alpha",
+    )
+    .unwrap();
+    assert!(
+        session
+            .await_change(std::time::Duration::from_secs(5))
+            .expect("wait"),
+        "alpha's edit wakes the wait"
+    );
     let report = session.run_cycle().expect("cycle");
-    assert!(report.beta_scan_skipped, "beta's watch was standing: its scan is skipped");
+    assert!(
+        report.beta_scan_skipped,
+        "beta's watch was standing: its scan is skipped"
+    );
     assert!(!report.alpha_scan_skipped, "alpha changed: it is scanned");
     assert_eq!(report.beta_transitions, 1);
     harness.assert_trees_equal("after the skipped scan");
@@ -1631,7 +1716,9 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     fs::write(harness.beta.join("dir1/nested/file1.txt"), "edited on beta").unwrap();
     let mut scanned = false;
     for _ in 0..4 {
-        assert!(session.await_change(std::time::Duration::from_secs(5)).expect("wait"));
+        assert!(session
+            .await_change(std::time::Duration::from_secs(5))
+            .expect("wait"));
         let report = session.run_cycle().expect("cycle");
         if !report.beta_scan_skipped {
             scanned = true;
@@ -1723,10 +1810,17 @@ mod fan_out_races {
             })
             .unwrap_or_else(|e| panic!("{context}: {e:#}"));
 
-            assert_eq!(read(&harness.alpha, PATH), "from beta2", "{context}: overwritten");
+            assert_eq!(
+                read(&harness.alpha, PATH),
+                "from beta2",
+                "{context}: overwritten"
+            );
             assert_eq!(read(&harness.beta, PATH), "from beta1", "{context}");
             assert!(
-                report1.alpha_transition_problems.iter().any(|p| p.path == PATH),
+                report1
+                    .alpha_transition_problems
+                    .iter()
+                    .any(|p| p.path == PATH),
                 "{context}: the refusal was not reported: {:?}",
                 report1.alpha_transition_problems
             );
@@ -1763,7 +1857,11 @@ mod fan_out_races {
                 s2.run_cycle().expect("session 2's cycle");
             })
             .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-            assert!(report1.alpha_transition_problems.is_empty(), "{context}: {:?}", report1.alpha_transition_problems);
+            assert!(
+                report1.alpha_transition_problems.is_empty(),
+                "{context}: {:?}",
+                report1.alpha_transition_problems
+            );
             assert_eq!(read(&harness.alpha, PATH), "from beta1", "{context}");
             assert_eq!(read(&harness.alpha, OTHER), "from beta2", "{context}");
 
@@ -1773,13 +1871,27 @@ mod fan_out_races {
                 s2.run_cycle().expect("2");
             }
             for root in [&harness.alpha, &harness.beta, &beta2] {
-                assert_eq!(read(root, PATH), "from beta1", "{context}: {}", root.display());
-                assert_eq!(read(root, OTHER), "from beta2", "{context}: {}", root.display());
+                assert_eq!(
+                    read(root, PATH),
+                    "from beta1",
+                    "{context}: {}",
+                    root.display()
+                );
+                assert_eq!(
+                    read(root, OTHER),
+                    "from beta2",
+                    "{context}: {}",
+                    root.display()
+                );
             }
             drop(s1);
             drop(s2);
             harness.assert_trees_equal(&context);
-            assert_eq!(hash_tree(&harness.alpha), hash_tree(&beta2), "{context}: beta2 differs");
+            assert_eq!(
+                hash_tree(&harness.alpha),
+                hash_tree(&beta2),
+                "{context}: beta2 differs"
+            );
         }
     }
 
@@ -1809,12 +1921,24 @@ mod fan_out_races {
                 s2.run_cycle().expect("session 2's cycle");
             })
             .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-            assert!(report1.conflicts.is_empty(), "{context}: {:?}", report1.conflicts);
+            assert!(
+                report1.conflicts.is_empty(),
+                "{context}: {:?}",
+                report1.conflicts
+            );
             assert_eq!(read(&harness.beta, PATH), "alpha edit", "{context}");
 
             let report1 = s1.run_cycle().expect("session 1 again");
-            assert!(report1.conflicts.is_empty(), "{context}: {:?}", report1.conflicts);
-            assert_eq!(read(&harness.beta, OTHER), "from beta2", "{context}: not carried");
+            assert!(
+                report1.conflicts.is_empty(),
+                "{context}: {:?}",
+                report1.conflicts
+            );
+            assert_eq!(
+                read(&harness.beta, OTHER),
+                "from beta2",
+                "{context}: not carried"
+            );
             for _ in 0..2 {
                 s2.run_cycle().expect("2");
             }

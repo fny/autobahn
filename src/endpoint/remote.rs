@@ -148,9 +148,9 @@ impl RemoteEndpoint {
             // defect, and silently rescanning would paper over it.
             Response::ScanUnchanged { generation } => {
                 self.seen = Some(generation);
-                self.last_snapshot
-                    .clone()
-                    .ok_or_else(|| anyhow!("the agent reported an unchanged scan before sending one"))
+                self.last_snapshot.clone().ok_or_else(|| {
+                    anyhow!("the agent reported an unchanged scan before sending one")
+                })
             }
             response => Err(unexpected_response(&response, what)),
         }
@@ -637,7 +637,8 @@ impl Endpoint for RemoteEndpoint {
         // and reports what was missing, and the controller cycles again.
         // The transitions are cloned because the fold below needs them
         // after the request has consumed them.
-        self.channel.send_only(Request::Transition(transitions.clone()))?;
+        self.channel
+            .send_only(Request::Transition(transitions.clone()))?;
         let pushes = self.drain_pushes_to(0);
         let response = self.channel.receive_response();
         pushes?;
@@ -763,7 +764,11 @@ const WATCH_REQUEST_MAX: std::time::Duration = std::time::Duration::from_secs(2)
 struct RemoteWatch {
     /// Waits to run: the timeout, the signal to raise when the wait ends,
     /// and the generation to wait from.
-    requests: mpsc::Sender<(std::time::Duration, Arc<crate::endpoint::WakeSignal>, Option<u64>)>,
+    requests: mpsc::Sender<(
+        std::time::Duration,
+        Arc<crate::endpoint::WakeSignal>,
+        Option<u64>,
+    )>,
     /// The last wait's answer — changed, watching — until it is polled.
     verdict: Arc<Mutex<Option<Result<(bool, bool)>>>>,
     /// The generation the outstanding wait was begun from, while one is
@@ -790,11 +795,13 @@ impl RemoteWatch {
                         milliseconds: timeout.as_millis() as u64,
                         since,
                     };
-                    let answer = channel.exchange(request).and_then(|response| match response {
-                        Response::AwaitChanges { changed, watching } => Ok((changed, watching)),
-                        Response::Error(message) => Err(remote_error(message)),
-                        response => Err(unexpected_response(&response, "await changes")),
-                    });
+                    let answer = channel
+                        .exchange(request)
+                        .and_then(|response| match response {
+                            Response::AwaitChanges { changed, watching } => Ok((changed, watching)),
+                            Response::Error(message) => Err(remote_error(message)),
+                            response => Err(unexpected_response(&response, "await changes")),
+                        });
                     *recorded.lock().unwrap_or_else(|e| e.into_inner()) = Some(answer);
                     signal.raise();
                 }
@@ -825,7 +832,11 @@ impl RemoteWatch {
     }
 
     fn poll(&mut self) -> Result<Option<(bool, bool)>> {
-        let answer = self.verdict.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let answer = self
+            .verdict
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
         match answer {
             Some(answer) => {
                 self.outstanding = None;
@@ -1114,7 +1125,9 @@ mod tests {
         let error = match failed {
             Some(error) => error,
             None => {
-                endpoint.stage_finish().expect("staging completes without waiting");
+                endpoint
+                    .stage_finish()
+                    .expect("staging completes without waiting");
                 endpoint
                     .transition(Vec::new())
                     .expect_err("the failed push must surface at the transition")
@@ -1151,7 +1164,9 @@ mod tests {
         for _ in 0..2 {
             endpoint.stage_push_nowait(Vec::new()).expect("push");
         }
-        endpoint.stage_finish().expect("staging completes without waiting");
+        endpoint
+            .stage_finish()
+            .expect("staging completes without waiting");
         assert_eq!(endpoint.pending_pushes, 2);
         // A scan's answer is the scan's, not a push's.
         assert_eq!(endpoint.scan().expect("scan").files, 3);
@@ -1181,7 +1196,10 @@ mod tests {
         );
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
-        assert!(endpoint.stage_begin_nowait(Vec::new()).expect("sent").is_none());
+        assert!(endpoint
+            .stage_begin_nowait(Vec::new())
+            .expect("sent")
+            .is_none());
         // Five pushes overflow the window, so a drain meets the answer.
         for _ in 0..5 {
             endpoint.stage_push_nowait(Vec::new()).expect("push");
@@ -1190,7 +1208,10 @@ mod tests {
         assert!(needs.is_empty());
         endpoint.stage_finish().expect("finish");
         // Everything owed is collected by the next exchange.
-        assert!(endpoint.stage_begin_finish().is_err(), "nothing is pending now");
+        assert!(
+            endpoint.stage_begin_finish().is_err(),
+            "nothing is pending now"
+        );
         drop(endpoint);
         let _ = agent.join();
     }

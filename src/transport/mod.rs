@@ -644,14 +644,24 @@ fn serve_channel<W: Write>(
                         generation: endpoint.generation().unwrap_or(0),
                     });
                 }
-                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending, endpoint.generation().unwrap_or(0))?;
+                let header = snapshot_delta(
+                    &snapshot,
+                    last_sent.as_ref(),
+                    &mut pending,
+                    endpoint.generation().unwrap_or(0),
+                )?;
                 anchor = Anchor::To(Some(snapshot));
                 Ok(Response::ScanDelta(header))
             }),
             Request::ScanVerified => endpoint.scan_verified().and_then(|snapshot| {
                 // Never elided: the entire point is a full re-read whose
                 // result the controller sees in full.
-                let header = snapshot_delta(&snapshot, last_sent.as_ref(), &mut pending, endpoint.generation().unwrap_or(0))?;
+                let header = snapshot_delta(
+                    &snapshot,
+                    last_sent.as_ref(),
+                    &mut pending,
+                    endpoint.generation().unwrap_or(0),
+                )?;
                 anchor = Anchor::To(Some(snapshot));
                 Ok(Response::ScanDelta(header))
             }),
@@ -659,9 +669,13 @@ fn serve_channel<W: Write>(
                 // The controller could not reproduce the baseline the last
                 // delta named. The snapshot it wants is the one this channel
                 // just anchored; it goes again against nothing.
-                Some(snapshot) => {
-                    snapshot_delta(snapshot, None, &mut pending, endpoint.generation().unwrap_or(0)).map(Response::ScanDelta)
-                }
+                Some(snapshot) => snapshot_delta(
+                    snapshot,
+                    None,
+                    &mut pending,
+                    endpoint.generation().unwrap_or(0),
+                )
+                .map(Response::ScanDelta),
                 None => Err(anyhow!("a full scan was requested before any scan")),
             },
             Request::ScanPull => Ok(Response::ScanOps(next_scan_batch(&mut pending))),

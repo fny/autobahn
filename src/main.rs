@@ -2698,8 +2698,7 @@ fn run_availability(
                     known.join(", ")
                 );
             }
-            let (updated, changed) =
-                autobahn::config::set_host_disabled(&text, host, !enable)?;
+            let (updated, changed) = autobahn::config::set_host_disabled(&text, host, !enable)?;
             (updated, changed, format!("host {host}"))
         }
         (None, Some(group)) => {
@@ -2714,8 +2713,7 @@ fn run_availability(
                         .join(", ")
                 );
             }
-            let (updated, changed) =
-                autobahn::config::set_group_disabled(&text, group, !enable)?;
+            let (updated, changed) = autobahn::config::set_group_disabled(&text, group, !enable)?;
             (updated, changed, format!("group {group}"))
         }
         _ => bail!("name one of --host or --group"),
@@ -2737,9 +2735,8 @@ fn run_availability(
     // start, which is the worst moment to find out.
     if let Err(error) = autobahn::config::Config::load(&temporary).and_then(|c| c.plans()) {
         let _ = std::fs::remove_file(&temporary);
-        return Err(error).with_context(|| {
-            format!("the edit would leave {} unloadable", path.display())
-        });
+        return Err(error)
+            .with_context(|| format!("the edit would leave {} unloadable", path.display()));
     }
     std::fs::rename(&temporary, &path)
         .with_context(|| format!("unable to move {} into place", temporary.display()))?;
@@ -2753,11 +2750,7 @@ fn run_availability(
         .map(|plans| plans.len())
         .unwrap_or_default();
     println!("{verb} {what} in {}", path.display());
-    println!(
-        "  {} session(s) now, {} before",
-        now,
-        sessions
-    );
+    println!("  {} session(s) now, {} before", now, sessions);
     if let Some(host) = &host {
         let led = configuration.groups_led_by(host);
         if !led.is_empty() {
@@ -3588,11 +3581,18 @@ mod tests {
         assert!(super::check_startable(Some(good)).is_ok());
 
         let bad = keep.path().join("bad.toml");
-        std::fs::write(&bad, "[groups.g]\nmode = \"sideways\"\nalpha = \"/tmp/a\"\n").unwrap();
+        std::fs::write(
+            &bad,
+            "[groups.g]\nmode = \"sideways\"\nalpha = \"/tmp/a\"\n",
+        )
+        .unwrap();
         let error = super::check_startable(Some(bad)).expect_err("a bad configuration is refused");
         let message = format!("{error:#}");
         assert!(message.contains("would stop the supervisor"), "{message}");
-        assert!(message.contains("sideways") || message.contains("mode"), "{message}");
+        assert!(
+            message.contains("sideways") || message.contains("mode"),
+            "{message}"
+        );
 
         let empty = keep.path().join("empty.toml");
         std::fs::write(&empty, "[defaults]\nmode = \"two-way-conflict\"\n").unwrap();

@@ -310,7 +310,11 @@ pub trait Endpoint: Send {
     /// The default implementation cannot watch and raises nothing;
     /// [`watch_poll`](Endpoint::watch_poll) then reports the watch as
     /// ended without a change, and the caller falls back to its heartbeat.
-    fn watch_begin(&mut self, _timeout: std::time::Duration, _signal: Arc<WakeSignal>) -> Result<()> {
+    fn watch_begin(
+        &mut self,
+        _timeout: std::time::Duration,
+        _signal: Arc<WakeSignal>,
+    ) -> Result<()> {
         Ok(())
     }
 

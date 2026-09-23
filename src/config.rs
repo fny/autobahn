@@ -712,7 +712,7 @@ impl Config {
             .with_context(|| format!("unable to parse configuration {}", path.display()))
     }
 
-/// Every host this configuration names, in configuration order: each
+    /// Every host this configuration names, in configuration order: each
     /// group's alpha when it is remote, and every remote beta. What `disable`
     /// checks a name against, so a typo is refused rather than written into
     /// the file and quietly ignored.
@@ -732,7 +732,7 @@ impl Config {
         }
         hosts
     }
-    
+
     /// The groups whose alpha is this host. Disabling one of these takes the
     /// whole group with it, which is worth saying out loud before it happens.
     pub fn groups_led_by(&self, host: &str) -> Vec<String> {
@@ -1000,7 +1000,11 @@ impl Config {
             // A disabled alpha host takes the whole group with it: every
             // session of the group flows through that endpoint.
             if let Some(EndpointTarget::Remote { destination, .. }) = &alpha {
-                if self.disabled_hosts.iter().any(|d| d == host_of(destination)) {
+                if self
+                    .disabled_hosts
+                    .iter()
+                    .any(|d| d == host_of(destination))
+                {
                     continue;
                 }
             }
@@ -1624,7 +1628,6 @@ fn parse_endpoint(
     })
 }
 
-
 /// Adds or removes a host in the top-level `disabled_hosts` list, editing
 /// the text rather than rewriting the file: a configuration is mostly
 /// comments, and a parse-and-serialize round trip would drop every one of
@@ -1645,9 +1648,7 @@ pub fn set_host_disabled(text: &str, host: &str, disabled: bool) -> Result<(Stri
     let list = document[DISABLED_HOSTS]
         .as_array_mut()
         .ok_or_else(|| anyhow!("{DISABLED_HOSTS} is not a list of hosts"))?;
-    let at = list
-        .iter()
-        .position(|entry| entry.as_str() == Some(host));
+    let at = list.iter().position(|entry| entry.as_str() == Some(host));
     let changed = match (disabled, at) {
         (true, None) => {
             list.push(host);
@@ -2263,10 +2264,17 @@ betas = ["build.example.com:/tmp/beta"]
             vec![
                 "lead.example.com".to_owned(),
                 "build.example.com".to_owned(),
-                "user@lab.example.com".rsplit('@').next().unwrap().to_owned(),
+                "user@lab.example.com"
+                    .rsplit('@')
+                    .next()
+                    .unwrap()
+                    .to_owned(),
             ]
         );
-        assert_eq!(config.groups_led_by("lead.example.com"), vec!["remote".to_owned()]);
+        assert_eq!(
+            config.groups_led_by("lead.example.com"),
+            vec!["remote".to_owned()]
+        );
         assert!(config.groups_led_by("build.example.com").is_empty());
     }
 

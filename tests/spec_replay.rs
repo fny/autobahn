@@ -70,7 +70,9 @@ impl Board {
     }
 
     fn subtree(&self, q: usize) -> Vec<usize> {
-        (0..self.paths.len()).filter(|&p| self.is_prefix(q, p)).collect()
+        (0..self.paths.len())
+            .filter(|&p| self.is_prefix(q, p))
+            .collect()
     }
 
     fn joined(&self, p: usize) -> String {
@@ -279,7 +281,8 @@ impl Game {
         self.clear(side, p, Cell::File(value), board);
         self.written.insert((side, p, value));
         self.edits += 1;
-        self.steps.push(format!("write {side:?} {} {value}", board.joined(p)));
+        self.steps
+            .push(format!("write {side:?} {} {value}", board.joined(p)));
         true
     }
 
@@ -290,7 +293,8 @@ impl Game {
         }
         self.clear(side, p, Cell::Dir, board);
         self.edits += 1;
-        self.steps.push(format!("mkdir {side:?} {}", board.joined(p)));
+        self.steps
+            .push(format!("mkdir {side:?} {}", board.joined(p)));
         true
     }
 
@@ -301,7 +305,8 @@ impl Game {
         }
         self.clear(side, p, Cell::NoFile, board);
         self.edits += 1;
-        self.steps.push(format!("remove {side:?} {}", board.joined(p)));
+        self.steps
+            .push(format!("remove {side:?} {}", board.joined(p)));
         true
     }
 
@@ -422,9 +427,18 @@ impl Game {
                 t[p] == Cell::NoFile || board.parent(p).is_none_or(|parent| t[parent] == Cell::Dir)
             })
         };
-        assert!(formed(&self.alpha), "alpha malformed\n{}", self.report(board));
+        assert!(
+            formed(&self.alpha),
+            "alpha malformed\n{}",
+            self.report(board)
+        );
         for i in 0..board.betas {
-            assert!(formed(&self.beta[i]), "beta {} malformed\n{}", i + 1, self.report(board));
+            assert!(
+                formed(&self.beta[i]),
+                "beta {} malformed\n{}",
+                i + 1,
+                self.report(board)
+            );
             assert!(
                 formed(&self.ancestor[i]),
                 "ancestor {} malformed\n{}",
@@ -506,7 +520,11 @@ impl Game {
         let conflicts = |i: usize| -> String {
             format!(
                 "{{{}}}",
-                self.conflicts[i].iter().map(|&q| board.tla_path(q)).collect::<Vec<_>>().join(", ")
+                self.conflicts[i]
+                    .iter()
+                    .map(|&q| board.tla_path(q))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         };
         self.trace.push(format!(
@@ -606,7 +624,11 @@ fn play(seed: u64, mode: SyncMode, board: &Board, moves: usize) -> Game {
     game
 }
 
-const MODES: [SyncMode; 3] = [SyncMode::TwoWaySafe, SyncMode::TwoWayResolved, SyncMode::TwoWayStrict];
+const MODES: [SyncMode; 3] = [
+    SyncMode::TwoWaySafe,
+    SyncMode::TwoWayResolved,
+    SyncMode::TwoWayStrict,
+];
 
 #[test]
 fn random_runs_keep_the_invariants() {
@@ -643,7 +665,8 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, board: &Board, 
         // The logged trees and conflicts must be what the spec's own step
         // produces; the bookkeeping variables are the spec's to choose.
         "Match == /\\ alpha' = Trace[i + 1].alpha /\\ beta' = Trace[i + 1].beta".to_string(),
-        "         /\\ ancestor' = Trace[i + 1].ancestor /\\ conflicts' = Trace[i + 1].conflicts".to_string(),
+        "         /\\ ancestor' = Trace[i + 1].ancestor /\\ conflicts' = Trace[i + 1].conflicts"
+            .to_string(),
         "TInit == Init /\\ i = 1".to_string(),
         // A step the spec does not allow leaves no successor: a deadlock,
         // which the configuration turns into a rejection. The end of the
@@ -701,5 +724,9 @@ fn traces_are_behaviors_of_the_spec() {
     } else {
         dir.path().to_path_buf()
     };
-    assert!(status.success(), "TLC rejected a trace; see the logs in {}", path.display());
+    assert!(
+        status.success(),
+        "TLC rejected a trace; see the logs in {}",
+        path.display()
+    );
 }

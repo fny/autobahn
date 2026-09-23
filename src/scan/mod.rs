@@ -489,7 +489,9 @@ impl<'a> Scanner<'a> {
     /// Claims a helper thread for a subtree, if one is free.
     fn take_helper(&self) -> bool {
         self.helpers
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| free.checked_sub(1))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                free.checked_sub(1)
+            })
             .is_ok()
     }
 

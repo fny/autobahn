@@ -229,7 +229,10 @@ impl RootObserver {
             .sleepers
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if !sleepers.iter().any(|sleeper| sleeper.ptr_eq(&Arc::downgrade(signal))) {
+        if !sleepers
+            .iter()
+            .any(|sleeper| sleeper.ptr_eq(&Arc::downgrade(signal)))
+        {
             sleepers.push(Arc::downgrade(signal));
         }
     }

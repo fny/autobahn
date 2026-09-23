@@ -1273,7 +1273,9 @@ impl Endpoint for LocalEndpoint {
         // endpoint last scanned at means it wakes for changes it has not
         // seen — including ones that landed while it was busy elsewhere,
         // which a wake token could have lost.
-        let observed = self.observer.await_change_seen(self.seen_generation, timeout);
+        let observed = self
+            .observer
+            .await_change_seen(self.seen_generation, timeout);
         // An endpoint that has never scanned is a watcher on a controller's
         // behalf (the agent's second channel for a session, whose scans go
         // through the first), and has no scan to measure the next wait
@@ -1455,8 +1457,7 @@ impl Endpoint for LocalEndpoint {
         // there, two changes whose names fold together are ordered by the
         // refusal the second one meets on disk, and that order is the
         // input's.
-        let spread =
-            arrivals.len() >= APPLY_SPREAD_MINIMUM && !folds_names(&transitioner.behavior);
+        let spread = arrivals.len() >= APPLY_SPREAD_MINIMUM && !folds_names(&transitioner.behavior);
         if !spread {
             for index in arrivals {
                 slots[index] = Some(transitioner.apply(&transitions[index]));
@@ -1586,7 +1587,10 @@ struct ReceiveState {
 /// Where the frames of the current file go.
 enum Receiving {
     /// A file this endpoint asked for.
-    File { need: StagingNeed, file: ReceiveFile },
+    File {
+        need: StagingNeed,
+        file: ReceiveFile,
+    },
     /// Content this endpoint did not ask for: read to the end and dropped.
     Sink,
 }
@@ -1778,7 +1782,9 @@ impl<'a> Transitioner<'a> {
         while claimed + 1 < count
             && self
                 .helpers
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| free.checked_sub(1))
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                    free.checked_sub(1)
+                })
                 .is_ok()
         {
             claimed += 1;
@@ -4702,9 +4708,16 @@ mod tests {
             digest,
         };
         let needs = beta
-            .stage_begin(vec![request("wanted.txt", wanted), request("held.txt", held)])
+            .stage_begin(vec![
+                request("wanted.txt", wanted),
+                request("held.txt", held),
+            ])
             .unwrap();
-        assert_eq!(needs.len(), 1, "held content is staged locally, not needed: {needs:?}");
+        assert_eq!(
+            needs.len(),
+            1,
+            "held content is staged locally, not needed: {needs:?}"
+        );
         assert_eq!(needs[0].request.digest, wanted);
 
         // Supply both anyway, in full, as a sender that did not wait would.
@@ -4738,12 +4751,20 @@ mod tests {
             .transition(vec![Change {
                 path: "wanted.txt".into(),
                 old: None,
-                new: alpha.snapshot().and_then(|s| s.root.as_ref()?.child("wanted.txt").cloned()),
+                new: alpha
+                    .snapshot()
+                    .and_then(|s| s.root.as_ref()?.child("wanted.txt").cloned()),
             }])
             .unwrap();
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert_eq!(fs::read(fixture.beta_root.join("wanted.txt")).unwrap(), b"wanted");
-        assert_eq!(fs::read(fixture.beta_root.join("held.txt")).unwrap(), b"held");
+        assert_eq!(
+            fs::read(fixture.beta_root.join("wanted.txt")).unwrap(),
+            b"wanted"
+        );
+        assert_eq!(
+            fs::read(fixture.beta_root.join("held.txt")).unwrap(),
+            b"held"
+        );
     }
 
     #[test]

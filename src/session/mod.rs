@@ -949,8 +949,7 @@ fn stage(
             let speculative: Vec<StagingNeed> = requests
                 .iter()
                 .filter(|request| {
-                    sizes.get(&request.digest).copied().unwrap_or(u64::MAX)
-                        <= SPECULATIVE_MAX_BYTES
+                    sizes.get(&request.digest).copied().unwrap_or(u64::MAX) <= SPECULATIVE_MAX_BYTES
                 })
                 .filter(|request| speculated.insert(request.digest))
                 .map(|request| StagingNeed {

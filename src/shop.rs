@@ -1307,11 +1307,7 @@ fn help_page(width: usize) -> Vec<String> {
             "\x1b[31m",
             "halted for safety; it will not act",
         ),
-        (
-            "beta unreachable",
-            "\x1b[31m",
-            "the beta cannot be reached",
-        ),
+        ("beta unreachable", "\x1b[31m", "the beta cannot be reached"),
         ("burnt", "\x1b[31m", "the cycle failed"),
         ("on break", "\x1b[2m", "paused"),
         (
@@ -1956,7 +1952,10 @@ mod tests {
         assert!(rail("follower").contains("following"));
         // A group with no role says nothing about one.
         let plain = rail("");
-        assert!(!plain.contains("leading") && !plain.contains("following"), "{plain:?}");
+        assert!(
+            !plain.contains("leading") && !plain.contains("following"),
+            "{plain:?}"
+        );
     }
 
     #[test]

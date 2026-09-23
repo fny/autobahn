@@ -108,8 +108,14 @@ fn from_node(node: Option<&Node>) -> Tree {
     if let Some(root) = node {
         for child in root.children() {
             if let Content::File { digest, .. } = &child.content {
-                let value = VALUES.iter().find(|v| digest_of(v) == *digest).expect("known digest");
-                let path = PATHS.iter().find(|p| **p == child.name).expect("known path");
+                let value = VALUES
+                    .iter()
+                    .find(|v| digest_of(v) == *digest)
+                    .expect("known digest");
+                let path = PATHS
+                    .iter()
+                    .find(|p| **p == child.name)
+                    .expect("known path");
                 tree.insert(path, value);
             }
         }
@@ -185,7 +191,9 @@ impl Game {
         write_lease(&self.dirs[h], lease).expect("lease written");
     }
     fn lease(&self, h: usize) -> Lease {
-        read_lease(&self.dirs[h]).expect("lease read").expect("every host holds a lease")
+        read_lease(&self.dirs[h])
+            .expect("lease read")
+            .expect("every host holds a lease")
     }
     fn leader_of(&self, h: usize) -> Host {
         let lease = self.lease(h);
@@ -222,7 +230,8 @@ impl Game {
         self.tree[h].insert(path, value);
         self.written.insert((host, path, value));
         self.edits += 1;
-        self.steps.push(format!("write {} {path} {value}", host.name()));
+        self.steps
+            .push(format!("write {} {path} {value}", host.name()));
         true
     }
 
@@ -349,7 +358,11 @@ impl Game {
         let presented = self.lease_of(Self::host(c), self.myterm[c]);
         if !self.present(h, &presented) {
             self.leading[c] = false;
-            self.steps.push(format!("cycle {}→{}: fenced, steps down", Self::host(c).name(), Self::host(h).name()));
+            self.steps.push(format!(
+                "cycle {}→{}: fenced, steps down",
+                Self::host(c).name(),
+                Self::host(h).name()
+            ));
             return true;
         }
         let (alpha_side, beta_side) = if h == 0 { (0, c) } else { (c, h) };
@@ -373,12 +386,24 @@ impl Game {
             };
             achieved_changes(t, &outcome)
         };
-        let x2 = from_node(apply(x.as_ref(), &r.alpha_transitions).expect("alpha applies").as_ref());
-        let y2 = from_node(apply(y.as_ref(), &r.beta_transitions).expect("beta applies").as_ref());
+        let x2 = from_node(
+            apply(x.as_ref(), &r.alpha_transitions)
+                .expect("alpha applies")
+                .as_ref(),
+        );
+        let y2 = from_node(
+            apply(y.as_ref(), &r.beta_transitions)
+                .expect("beta applies")
+                .as_ref(),
+        );
         let mut anc_changes = r.ancestor_changes.clone();
         anc_changes.extend(achieved(&r.beta_transitions));
         anc_changes.extend(achieved(&r.alpha_transitions));
-        let a2 = from_node(apply(a.as_ref(), &anc_changes).expect("ancestor applies").as_ref());
+        let a2 = from_node(
+            apply(a.as_ref(), &anc_changes)
+                .expect("ancestor applies")
+                .as_ref(),
+        );
 
         let x_before = self.tree[alpha_side].clone();
         let y_before = self.tree[beta_side].clone();
@@ -416,7 +441,11 @@ impl Game {
                 }
             }
         }
-        self.steps.push(format!("cycle {}→{}", Self::host(c).name(), Self::host(h).name()));
+        self.steps.push(format!(
+            "cycle {}→{}",
+            Self::host(c).name(),
+            Self::host(h).name()
+        ));
         true
     }
 
@@ -431,7 +460,11 @@ impl Game {
         }
         let b = if h == 0 { c - 1 } else { h - 1 };
         self.copy[h][b] = self.own[c][b].clone();
-        self.steps.push(format!("replicate {}→{}", Self::host(c).name(), Self::host(h).name()));
+        self.steps.push(format!(
+            "replicate {}→{}",
+            Self::host(c).name(),
+            Self::host(h).name()
+        ));
         true
     }
 
@@ -448,7 +481,8 @@ impl Game {
             for (leader, term) in writers {
                 if let Some(other) = by_term.insert(*term, leader) {
                     assert_eq!(
-                        other, leader,
+                        other,
+                        leader,
                         "{context}: host {} written by two controllers at term {term}\n{}",
                         Self::host(h).name(),
                         self.report()
@@ -461,13 +495,29 @@ impl Game {
             let ok = self.present_anywhere(p, v)
                 || self.superseded.contains(&(p, v))
                 || self.discarded.iter().any(|d| d.1 == p && d.2 == v);
-            assert!(ok, "{context}: {v} written on {} at {p} is gone and unaccounted for\n{}", host.name(), self.report());
+            assert!(
+                ok,
+                "{context}: {v} written on {} at {p} is gone and unaccounted for\n{}",
+                host.name(),
+                self.report()
+            );
         }
         if self.mode == SyncMode::TwoWaySafe {
-            assert!(self.discarded.is_empty(), "{context}: conflict mode discarded {:?}\n{}", self.discarded, self.report());
+            assert!(
+                self.discarded.is_empty(),
+                "{context}: conflict mode discarded {:?}\n{}",
+                self.discarded,
+                self.report()
+            );
         }
         for d in &self.discarded {
-            assert!(d.0 != Host::Alpha, "{context}: alpha lost {} at {}\n{}", d.2, d.1, self.report());
+            assert!(
+                d.0 != Host::Alpha,
+                "{context}: alpha lost {} at {}\n{}",
+                d.2,
+                d.1,
+                self.report()
+            );
         }
     }
 
@@ -479,7 +529,12 @@ impl Game {
             self.tree,
             self.up,
             self.leading,
-            (0..self.tree.len()).map(|h| { let l = self.lease(h); format!("{}@{}", l.leader, l.term) }).collect::<Vec<_>>()
+            (0..self.tree.len())
+                .map(|h| {
+                    let l = self.lease(h);
+                    format!("{}@{}", l.leader, l.term)
+                })
+                .collect::<Vec<_>>()
         )
     }
 
@@ -504,15 +559,27 @@ impl Game {
         };
         let leases: Vec<Lease> = (0..self.tree.len()).map(|h| self.lease(h)).collect();
         let lease_tla = |l: &Lease| -> String {
-            let leader = if l.leader == "alpha" { "\"alpha\"".to_string() } else { l.leader.clone() };
+            let leader = if l.leader == "alpha" {
+                "\"alpha\"".to_string()
+            } else {
+                l.leader.clone()
+            };
             format!("[leader |-> {leader}, term |-> {}]", l.term)
         };
         self.trace.push(format!(
             "[tree |-> ({}), up |-> ({}), lease |-> ({}), role |-> ({})]",
             per_host(&|h| format!("({})", tree(&self.tree[h]))),
-            per_host(&|h| if self.up[h] { "TRUE".into() } else { "FALSE".into() }),
+            per_host(&|h| if self.up[h] {
+                "TRUE".into()
+            } else {
+                "FALSE".into()
+            }),
             per_host(&|h| lease_tla(&leases[h])),
-            per_host(&|h| if self.leading[h] { "\"leading\"".into() } else { "\"following\"".into() }),
+            per_host(&|h| if self.leading[h] {
+                "\"leading\"".into()
+            } else {
+                "\"following\"".into()
+            }),
         ));
     }
 }
@@ -533,7 +600,13 @@ impl Rng {
 /// Plays one random game: user edits, crashes and recoveries, ticks of
 /// the clock that let leases go stale, takeovers and handoffs, cycles and
 /// replication, all within the spec's budgets; checked after every step.
-fn play(seed: u64, mode: SyncMode, betas: usize, budgets: (usize, usize, usize), steps: usize) -> Game {
+fn play(
+    seed: u64,
+    mode: SyncMode,
+    betas: usize,
+    budgets: (usize, usize, usize),
+    steps: usize,
+) -> Game {
     let keep = tempfile::tempdir().unwrap();
     let mut rng = Rng(seed | 1);
     let mut game = Game::new(mode, betas, &keep);
@@ -545,7 +618,9 @@ fn play(seed: u64, mode: SyncMode, betas: usize, budgets: (usize, usize, usize),
                 let host = Game::host(rng.below(hosts));
                 game.write(host, PATHS[rng.below(2)], VALUES[rng.below(2)])
             }
-            2 if game.edits < max_edits => game.remove(Game::host(rng.below(hosts)), PATHS[rng.below(2)]),
+            2 if game.edits < max_edits => {
+                game.remove(Game::host(rng.below(hosts)), PATHS[rng.below(2)])
+            }
             3 if game.failures < max_failures => game.crash(rng.below(hosts)),
             4 => game.recover(rng.below(hosts)),
             5 => {
@@ -587,7 +662,9 @@ fn takeover_waits_grow_with_position() {
         ttl: Duration::from_secs(30),
         failover_after: Duration::from_secs(120),
     };
-    let waits: Vec<Duration> = (1..=4).map(|position| autobahn::peering::takeover_wait(position, &timing)).collect();
+    let waits: Vec<Duration> = (1..=4)
+        .map(|position| autobahn::peering::takeover_wait(position, &timing))
+        .collect();
     assert!(waits.windows(2).all(|w| w[0] < w[1]), "{waits:?}");
     assert_eq!(waits[0], Duration::from_secs(120));
     assert_eq!(waits[1], Duration::from_secs(150));
@@ -605,7 +682,14 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
         format!("---- MODULE {name} ----"),
         "EXTENDS Peering, Sequences, TLC".to_string(),
         format!("CONSTANTS {}, v1, v2", betas.join(", ")),
-        format!("TPaths == {{{}}}", PATHS.iter().map(|p| format!("<<\"{p}\">>")).collect::<Vec<_>>().join(", ")),
+        format!(
+            "TPaths == {{{}}}",
+            PATHS
+                .iter()
+                .map(|p| format!("<<\"{p}\">>"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
         format!("TOrder == <<{}>>", betas.join(", ")),
         format!("Trace == <<\n  {}\n>>", game.trace.join(",\n  ")),
         "VARIABLE i".to_string(),
@@ -639,7 +723,10 @@ fn traces_are_behaviors_of_the_peering_spec() {
         return;
     }
     let dir = tempfile::tempdir().unwrap();
-    let per_mode: usize = std::env::var("AUTOBAHN_TLC_TRACES").ok().and_then(|n| n.parse().ok()).unwrap_or(4);
+    let per_mode: usize = std::env::var("AUTOBAHN_TLC_TRACES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(4);
     let mut index = 0;
     for mode in [SyncMode::TwoWaySafe, SyncMode::TwoWayResolved] {
         for seed in 1..=per_mode as u64 {
@@ -649,7 +736,11 @@ fn traces_are_behaviors_of_the_peering_spec() {
         }
     }
     let check = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("spec/check.sh");
-    let status = std::process::Command::new(check).arg("--traces").arg(dir.path()).status().expect("spec/check.sh runs");
+    let status = std::process::Command::new(check)
+        .arg("--traces")
+        .arg(dir.path())
+        .status()
+        .expect("spec/check.sh runs");
     let path = if std::env::var("AUTOBAHN_TLC_KEEP").is_ok() || !status.success() {
         let kept = dir.keep();
         eprintln!("traces kept in {}", kept.display());
@@ -657,5 +748,9 @@ fn traces_are_behaviors_of_the_peering_spec() {
     } else {
         dir.path().to_path_buf()
     };
-    assert!(status.success(), "TLC rejected a trace; see the logs in {}", path.display());
+    assert!(
+        status.success(),
+        "TLC rejected a trace; see the logs in {}",
+        path.display()
+    );
 }

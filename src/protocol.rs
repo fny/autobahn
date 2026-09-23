@@ -91,7 +91,10 @@ pub enum Request {
     /// milliseconds elapses. `since` names the generation the controller
     /// last saw (from a scan or a transition), so the wait is for anything
     /// after it; `None` waits from the endpoint's own last scan.
-    AwaitChanges { milliseconds: u64, since: Option<u64> },
+    AwaitChanges {
+        milliseconds: u64,
+        since: Option<u64>,
+    },
     /// Pull the next batch of snapshot delta operations, after a
     /// `ScanDelta` response. An empty batch ends the stream.
     ScanPull,
@@ -189,7 +192,10 @@ pub enum Response {
     /// The outcome of Transition, and the generation the root's observer
     /// stands at after it: any change past this one is not the
     /// transition's own writes.
-    Transition { outcome: TransitionOutcome, generation: u64 },
+    Transition {
+        outcome: TransitionOutcome,
+        generation: u64,
+    },
     /// The scan produced exactly the snapshot this channel last sent, so
     /// the snapshot itself is not repeated. Answering an unchanged root
     /// this way is what keeps a heartbeat from costing a full snapshot

@@ -50,12 +50,6 @@ impl Host {
 
 type Tree = BTreeMap<&'static str, &'static str>;
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Store {
-    tree_index: usize,
-    gen: u64,
-}
-
 /// The game's state: the spec's variables, with every host's lease on disk.
 struct Game {
     mode: SyncMode,
@@ -315,9 +309,9 @@ impl Game {
             return false;
         }
         let leader = self.leader_of(0);
-        let Host::Beta(l) = leader else {
+        if !matches!(leader, Host::Beta(_)) {
             return false;
-        };
+        }
         let lh = Self::index(leader);
         if !self.up[lh] || !self.leading[lh] || self.tree[0] != self.tree[lh] {
             return false;

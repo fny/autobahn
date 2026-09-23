@@ -1220,6 +1220,293 @@ mod collisions {
         }
     }
 
+    const DIR: &str = "dir2/nested";
+
+    fn exists(root: &Path, path: &str) -> bool {
+        root.join(path).exists()
+    }
+
+    /// Alpha turned the file into a directory; beta edits the file before
+    /// the replacement lands. The replacement is refused — the file is not
+    /// the one validated against — and the next cycle sees a file edited
+    /// on one side and replaced by a directory on the other: a conflict in
+    /// safe mode, the directory in resolved mode.
+    #[test]
+    fn a_file_edited_on_beta_while_alpha_replaces_it_with_a_directory() {
+        for transport in BOTH {
+            for (mode, alpha_wins) in [
+                (SyncMode::TwoWaySafe, false),
+                (SyncMode::TwoWayResolved, true),
+            ] {
+                let context = format!("{transport:?}/{mode:?}");
+                let mut harness = Harness::new(mode, transport);
+                build_tree(&harness.alpha);
+                harness.cycle_ok();
+
+                fs::remove_file(harness.alpha.join(PATH)).unwrap();
+                fs::create_dir(harness.alpha.join(PATH)).unwrap();
+                fs::write(harness.alpha.join(PATH).join("inner.txt"), "inner").unwrap();
+                let beta = harness.beta.clone();
+                let report = harness
+                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                        fs::write(beta.join(PATH), "beta late").unwrap()
+                    })
+                    .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+                assert_eq!(read(&harness.beta), "beta late", "{context}: overwritten");
+                assert!(
+                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    "{context}: the refusal was not reported"
+                );
+
+                let report = harness.cycle_ok();
+                if alpha_wins {
+                    assert!(report.conflicts.is_empty(), "{context}");
+                    harness.settle(&context);
+                    assert!(harness.beta.join(PATH).is_dir(), "{context}");
+                    harness.assert_trees_equal(&context);
+                } else {
+                    assert!(
+                        report.conflicts.iter().any(|c| c.root == PATH),
+                        "{context}: expected a conflict, got {:?}",
+                        report.conflicts
+                    );
+                    assert!(harness.alpha.join(PATH).is_dir(), "{context}");
+                    assert_eq!(read(&harness.beta), "beta late", "{context}");
+                }
+            }
+        }
+    }
+
+    /// The other way round: alpha's edit is on its way, and beta turns the
+    /// file into a directory before it lands. The edit is refused — there
+    /// is no file to replace — and the next cycle sees the same two-sided
+    /// change: a conflict, or alpha's file back in place of the directory.
+    #[test]
+    fn a_file_replaced_by_a_directory_on_beta_while_alpha_edits_it() {
+        for transport in BOTH {
+            for (mode, alpha_wins) in [
+                (SyncMode::TwoWaySafe, false),
+                (SyncMode::TwoWayResolved, true),
+            ] {
+                let context = format!("{transport:?}/{mode:?}");
+                let mut harness = Harness::new(mode, transport);
+                build_tree(&harness.alpha);
+                harness.cycle_ok();
+
+                fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
+                let beta = harness.beta.clone();
+                let report = harness
+                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                        fs::remove_file(beta.join(PATH)).unwrap();
+                        fs::create_dir(beta.join(PATH)).unwrap();
+                        fs::write(beta.join(PATH).join("inner.txt"), "beta inner").unwrap();
+                    })
+                    .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+                assert!(harness.beta.join(PATH).is_dir(), "{context}: the directory was replaced");
+                assert!(
+                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    "{context}: the refusal was not reported"
+                );
+
+                let report = harness.cycle_ok();
+                if alpha_wins {
+                    assert!(report.conflicts.is_empty(), "{context}");
+                    harness.settle(&context);
+                    assert_eq!(read(&harness.beta), "alpha v2", "{context}");
+                    harness.assert_trees_equal(&context);
+                } else {
+                    assert!(
+                        report.conflicts.iter().any(|c| c.root == PATH),
+                        "{context}: expected a conflict, got {:?}",
+                        report.conflicts
+                    );
+                    assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
+                    assert!(harness.beta.join(PATH).is_dir(), "{context}");
+                }
+            }
+        }
+    }
+
+    /// Both sides create the same new name, alpha as a directory and beta
+    /// as a file, beta's landing while alpha's is on its way. The creation
+    /// is refused — something is already there — and the next cycle sees
+    /// two creations: a conflict, or alpha's directory.
+    #[test]
+    fn a_name_created_as_a_file_on_beta_while_alpha_creates_a_directory() {
+        const NEW: &str = "dir0/nested/fresh";
+        for transport in BOTH {
+            for (mode, alpha_wins) in [
+                (SyncMode::TwoWaySafe, false),
+                (SyncMode::TwoWayResolved, true),
+            ] {
+                let context = format!("{transport:?}/{mode:?}");
+                let mut harness = Harness::new(mode, transport);
+                build_tree(&harness.alpha);
+                harness.cycle_ok();
+
+                fs::create_dir(harness.alpha.join(NEW)).unwrap();
+                fs::write(harness.alpha.join(NEW).join("inner.txt"), "inner").unwrap();
+                let beta = harness.beta.clone();
+                let report = harness
+                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                        fs::write(beta.join(NEW), "beta file").unwrap()
+                    })
+                    .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+                assert!(harness.beta.join(NEW).is_file(), "{context}: the file was replaced");
+                assert!(
+                    report.beta_transition_problems.iter().any(|p| p.path == NEW),
+                    "{context}: the refusal was not reported: {:?}",
+                    report.beta_transition_problems
+                );
+
+                let report = harness.cycle_ok();
+                if alpha_wins {
+                    assert!(report.conflicts.is_empty(), "{context}");
+                    harness.settle(&context);
+                    assert!(harness.beta.join(NEW).is_dir(), "{context}");
+                    harness.assert_trees_equal(&context);
+                } else {
+                    assert!(
+                        report.conflicts.iter().any(|c| c.root == NEW),
+                        "{context}: expected a conflict, got {:?}",
+                        report.conflicts
+                    );
+                    assert!(harness.alpha.join(NEW).is_dir(), "{context}");
+                    assert!(harness.beta.join(NEW).is_file(), "{context}");
+                }
+            }
+        }
+    }
+
+    /// Alpha renamed the file — a deletion at the old name and a creation
+    /// at the new one — and beta edits the old name before the deletion
+    /// lands. The deletion is refused, the creation goes through, and the
+    /// next cycle carries the edit back to alpha: an edit against a
+    /// deletion keeps the edit. Both names end up on both sides.
+    #[test]
+    fn a_file_edited_on_beta_while_alpha_renames_it() {
+        const RENAMED: &str = "dir1/nested/file1-renamed.txt";
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            harness.cycle_ok();
+
+            fs::rename(harness.alpha.join(PATH), harness.alpha.join(RENAMED)).unwrap();
+            let beta = harness.beta.clone();
+            let report = harness
+                .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                    fs::write(beta.join(PATH), "beta edit").unwrap()
+                })
+                .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+            assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
+            assert_eq!(
+                fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
+                "content 1/1",
+                "{context}: the new name did not arrive"
+            );
+            assert!(
+                report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                "{context}: the refusal was not reported"
+            );
+
+            harness.settle(&context);
+            assert_eq!(read(&harness.alpha), "beta edit", "{context}");
+            assert!(exists(&harness.alpha, RENAMED) && exists(&harness.beta, RENAMED), "{context}");
+            harness.assert_trees_equal(&context);
+        }
+    }
+
+    /// Alpha's edit is on its way, and beta renames the file away before
+    /// it lands. Whatever the racing cycle makes of a replacement with
+    /// nothing to replace, the edit must end up under the old name on both
+    /// sides and the renamed copy under the new one — no version of the
+    /// file is lost, and nothing conflicts.
+    #[test]
+    fn a_file_renamed_on_beta_while_alpha_edits_it() {
+        const RENAMED: &str = "dir1/nested/file1-moved.txt";
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            harness.cycle_ok();
+
+            fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
+            let beta = harness.beta.clone();
+            let outcome = harness.cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                fs::rename(beta.join(PATH), beta.join(RENAMED)).unwrap()
+            });
+            if let Err(error) = &outcome {
+                assert!(
+                    error.downcast_ref::<SafetyHalt>().is_none(),
+                    "{context}: halted: {error:#}"
+                );
+            }
+            assert_eq!(
+                fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
+                "content 1/1",
+                "{context}: the renamed copy was touched"
+            );
+
+            harness.settle(&context);
+            assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
+            assert_eq!(read(&harness.beta), "alpha v2", "{context}");
+            assert_eq!(
+                fs::read_to_string(harness.alpha.join(RENAMED)).unwrap(),
+                "content 1/1",
+                "{context}: the renamed copy did not arrive"
+            );
+            harness.assert_trees_equal(&context);
+            let report = harness.cycle_ok();
+            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+        }
+    }
+
+    /// Alpha renamed a whole directory, and beta writes a new file into the
+    /// old one before its removal lands. The removal is refused (the
+    /// directory no longer holds what was validated), the new name arrives
+    /// beside it, and the next cycle keeps the new file: a creation inside
+    /// a directory the other side deleted wins over the deletion, which —
+    /// by the reconciler's rule — brings the whole directory back to alpha.
+    /// Nothing is lost; the rename is undone rather than the file.
+    #[test]
+    fn a_file_added_on_beta_inside_a_directory_alpha_renames() {
+        const RENAMED: &str = "dir2/nested-renamed";
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            harness.cycle_ok();
+
+            fs::rename(harness.alpha.join(DIR), harness.alpha.join(RENAMED)).unwrap();
+            let beta = harness.beta.clone();
+            let report = harness
+                .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                    fs::write(beta.join(DIR).join("added.txt"), "added on beta").unwrap()
+                })
+                .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+            assert!(
+                exists(&harness.beta, "dir2/nested/added.txt"),
+                "{context}: the added file was deleted"
+            );
+            assert!(
+                exists(&harness.beta, RENAMED),
+                "{context}: the renamed directory did not arrive"
+            );
+            assert!(
+                !report.beta_transition_problems.is_empty(),
+                "{context}: the refusal was not reported"
+            );
+
+            harness.settle(&context);
+            assert!(exists(&harness.alpha, "dir2/nested/added.txt"), "{context}");
+            assert!(exists(&harness.alpha, RENAMED), "{context}");
+            harness.assert_trees_equal(&context);
+            let report = harness.cycle_ok();
+            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+        }
+    }
+
     /// A write on beta right after alpha's edit was published there. The
     /// cycle completes as a clean propagation; the write is a fresh beta
     /// edit that the next cycle carries to alpha — which is only true if

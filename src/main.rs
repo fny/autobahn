@@ -592,8 +592,10 @@ fn main() {
         Command::Uninstall => autobahn::service::uninstall().map(|()| {
             println!("stopped and unregistered the login service");
         }),
-        Command::Start => autobahn::service::start().map(|()| {
-            println!("started the login service");
+        Command::Start => check_startable(None).and_then(|()| {
+            autobahn::service::start().map(|()| {
+                println!("started the login service");
+            })
         }),
         Command::Stop => autobahn::service::stop().map(|()| {
             println!(
@@ -601,8 +603,10 @@ fn main() {
                  removes it)"
             );
         }),
-        Command::Restart => autobahn::service::restart().map(|()| {
-            println!("restarted the login service");
+        Command::Restart => check_startable(None).and_then(|()| {
+            autobahn::service::restart().map(|()| {
+                println!("restarted the login service");
+            })
         }),
         Command::Status {
             config,
@@ -1101,6 +1105,33 @@ fn run_peering(verb: PeeringVerb) -> Result<()> {
             }
         }
     }
+}
+
+/// What the supervisor would refuse at startup, checked before the
+/// service is started or restarted: a configuration that does not load,
+/// or describes no sessions. `start` and `restart` ask the service manager
+/// to run the supervisor and report success as soon as it has been asked,
+/// while a supervisor that then finds a bad configuration exits into the
+/// service log, unseen — and a `restart` over an edit with a typo takes
+/// the running service down for it. So the same checks run here, and a
+/// refusal is the same message the supervisor would have logged, with the
+/// service left as it was. A peer runs a pushed configuration instead of
+/// its own, and is not checked.
+fn check_startable(config: Option<PathBuf>) -> Result<()> {
+    if config.is_none() {
+        let directory = autobahn::peering::directory()?;
+        if autobahn::supervisor::peer::is_peer(&directory) {
+            return Ok(());
+        }
+    }
+    let plans = load_config(config)
+        .context("the configuration would stop the supervisor at startup")?
+        .plans()
+        .context("the configuration would stop the supervisor at startup")?;
+    if plans.is_empty() {
+        bail!("the configuration describes no sessions, so the supervisor would stop at startup");
+    }
+    Ok(())
 }
 
 fn load_config(path: Option<PathBuf>) -> Result<Config> {
@@ -3542,6 +3573,32 @@ fn print_report(report: &CycleReport) {
 
 #[cfg(test)]
 mod tests {
+
+    /// `start` and `restart` refuse a configuration the supervisor would
+    /// refuse, before touching the service, and say why.
+    #[test]
+    fn start_and_restart_check_the_configuration_first() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let good = keep.path().join("good.toml");
+        std::fs::write(
+            &good,
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n",
+        )
+        .unwrap();
+        assert!(super::check_startable(Some(good)).is_ok());
+
+        let bad = keep.path().join("bad.toml");
+        std::fs::write(&bad, "[groups.g]\nmode = \"sideways\"\nalpha = \"/tmp/a\"\n").unwrap();
+        let error = super::check_startable(Some(bad)).expect_err("a bad configuration is refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("would stop the supervisor"), "{message}");
+        assert!(message.contains("sideways") || message.contains("mode"), "{message}");
+
+        let empty = keep.path().join("empty.toml");
+        std::fs::write(&empty, "[defaults]\nmode = \"two-way-conflict\"\n").unwrap();
+        let error = super::check_startable(Some(empty)).expect_err("no sessions is refused");
+        assert!(format!("{error:#}").contains("no sessions"));
+    }
     use super::{
         blocked_fix, blocked_parts, blocked_path, clusters, common_prefix, conflict_filter,
         format_estimate, parse_remote, render_status_entry, roll_up,

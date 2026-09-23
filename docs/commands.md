@@ -56,6 +56,11 @@ autobahn start             # start it, stop it, or do both after an edit
 autobahn stop
 autobahn restart
 autobahn uninstall         # stop it and unregister it
+```
+
+`start` and `restart` read the configuration first and refuse one the supervisor would refuse — a key it does not know, a mode it does not have, a group with no sessions — with the same message, and the service left as it was. Without that check the service manager reports the restart done, and the supervisor exits into `~/.autobahn/service.log` a moment later, unseen.
+
+```sh
 
 autobahn update            # install the latest release over this one
 autobahn update --dry-run  # ...or just say what it would install

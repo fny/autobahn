@@ -18,8 +18,8 @@ Numbers are from 2026-09-22 on an 8-core c6i-class box unless a cell name says o
 An edit cost ~2.5 round trips to a remote beta: the beta scan, `StageBegin`, and push + transition. Measured slope on base was 7 ms of p50 per ms of one-way delay; each round trip is 2 ms/ms.
 
 - [x] A standing watch stands in for the beta scan (`17715e9`). Scan and transition answers carry the agent's generation, the watch waits from it and says whether the root is watched, and a cycle reuses the last snapshot while the watch stands. 1 editor at 10 ms one-way: p50 101.8 → 82.2, one round trip. A watcher in backoff answers "not watching" and is never skipped; a snapshot older than a minute is not reused, so the periodic full walk still runs. Epoch 13.
-- [ ] `StageBegin` before the push — the last round trip that could go. Not a small change: the receive side is positional (frames are consumed against the destination's own need list, with the destination's rsync signature), so content cannot be pushed before the needs are known without a frame that names its digest, an agent that accepts named frames for any requested digest and drops the rest, and a session that pushes small files speculatively and the rest after the answer. A protocol change in the transfer path, for one round trip (−20 ms at 10 ms one-way). Worth doing deliberately, with the collision tests extended to the new framing; not worth doing quickly.
-- [ ] An edit to a remote beta is now ~1.5 round trips: on a 40 ms link ~80 ms. The item above would make it ~1.
+- [x] Small files go before the destination answers (`ad613e0`). Files are named in the transfer rather than positional, the receiver drops what it did not ask for, and when everything was sent the transition follows the content without waiting for the staging answer. 1 editor at 10 ms one-way: p50 56.0 → 34.8, one round trip; LAN within the spread. Files over 64 KB still wait for the answer, which may carry a delta signature or a "no".
+- [x] An edit to a remote beta is now one round trip plus the work: at 0.4.0 it was ~3.5. On a 40 ms link, ~180 → ~60 ms.
 
 ## Cold sync — the second hash
 

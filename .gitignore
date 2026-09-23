@@ -4,3 +4,6 @@ apps/macos/Autobahn.app/
 
 # TLC scratch (spec/check.sh)
 spec/states/
+
+# A/B, burst and matrix runs made here; the published ones are committed deliberately
+bench/results-bench-*/

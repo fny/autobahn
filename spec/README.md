@@ -23,4 +23,17 @@ AUTOBAHN_TLC=1 AUTOBAHN_TLC_TRACES=50 AUTOBAHN_TLC_KEEP=1 cargo test --test spec
 spec/check.sh --traces DIR                                                                  # validate kept traces again
 ```
 
+## Peering
+
+`Peering.tla` is the star with failover: the same reconciliation (`Reconcile.tla` holds the rules both specs share), plus leases and terms, the fence, takeover in the configured order, the alpha's handoff, replication of each session's ancestor with any lag, and hosts that crash and recover. Two betas, two files, two values, two edits, one crash, two changes of leadership; takeovers may happen at any moment (`Flaky`), standing for a clock that misjudged staleness, since the fence, not the clock, is the guarantee. About 36 million distinct states and half an hour per mode for the safety properties: no host is ever written by two controllers at one term, the term a host is written at never falls, a value a user removed never comes back on its own, and Reconcile's properties still hold across a failover and a handoff. The liveness configurations (`Flaky = FALSE`) check that once users and failures stop, a leader stands and every host it reaches is level with it.
+
+```sh
+spec/check.sh peering_conflict_safety peering_alpha_safety
+spec/check.sh peering_conflict_liveness peering_alpha_liveness
+```
+
+Leadership changes are budgeted like edits and crashes: every change bumps the term, so without a bound the state space is infinite — the first attempt ran seven hours and filled 73 GB before that was clear. `Autobahn_quick.cfg` is the star spec at three edits, half a minute, for checking a change to the shared rules before the full runs.
+
+What is not in the peering model: the clock (staleness is a nondeterministic judgement), partitions as distinct from crashes, `yield`, and the one-off commands the fence does not cover. The replay harness does not yet drive the peering state machine; the code-level coupling for peering is the state-machine tests in `tests/supervisor.rs` and `src/supervisor/peer.rs`.
+
 What is not in the model: renames (a removal and a creation, which the model can express as two moves), `two-way-paranoid`'s large-directory rule, untracked and problematic content, and the transfer and transition machinery, whose contract — a transition writes only what it validated against its own scan — is pinned by the collision tests in `tests/e2e.rs`. Peering is not modelled.

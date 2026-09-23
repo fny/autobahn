@@ -4,6 +4,7 @@
 #   spec/check.sh              all three modes, two betas, every property
 #   spec/check.sh strict       one mode
 #   spec/check.sh strict_n3    three betas under symmetry: invariants only
+#   spec/check.sh peering_conflict_safety   the failover protocol (Peering.tla)
 #   spec/check.sh --traces DIR validate replay traces (see tests/spec_replay.rs)
 #
 # Needs Java 11+ and tla2tools.jar: set TLA2TOOLS, or it is fetched into
@@ -20,7 +21,7 @@ if [ "${1:-}" = "--traces" ]; then
     dir="$2"; failed=0
     for t in "$dir"/Trace*.tla; do
         [ -f "$t" ] || continue
-        cp "$HERE/Autobahn.tla" "$dir/"
+        cp "$HERE/Autobahn.tla" "$HERE/Reconcile.tla" "$dir/"
         if ! (cd "$dir" && tlc -config "$(basename "${t%.tla}").cfg" "$(basename "$t")" > "${t%.tla}.log" 2>&1); then
             echo "REJECTED $(basename "$t") — see ${t%.tla}.log"; failed=1
         fi
@@ -32,6 +33,10 @@ modes="${*:-conflict alpha strict}"
 status=0
 for mode in $modes; do
     echo "== $mode"
-    (cd "$HERE" && tlc -config "Autobahn_$mode.cfg" MC.tla) | grep -E "Error|violated|states generated|distinct states|Finished|Deadlock|Temporal" || status=1
+    case "$mode" in
+        peering_*) cfg="Peering_${mode#peering_}.cfg"; module=MCPeering.tla ;;
+        *) cfg="Autobahn_$mode.cfg"; module=MC.tla ;;
+    esac
+    (cd "$HERE" && tlc -config "$cfg" "$module") | grep -E "Error|violated|states generated|distinct states|Finished|Deadlock|Temporal" || status=1
 done
 exit $status

@@ -39,3 +39,4 @@ pub mod transport;
 #[cfg(feature = "tray")]
 pub mod tray;
 pub mod tree;
+pub mod update;

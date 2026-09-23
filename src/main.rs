@@ -692,6 +692,17 @@ fn main() {
             config,
         } => run_availability(config, host, group, true),
         Command::Init { config, force } => run_init(config, force),
+        Command::Update {
+            version,
+            bin_dir,
+            no_agents,
+            dry_run,
+        } => autobahn::update::run(autobahn::update::Options {
+            version,
+            bin_dir,
+            no_agents,
+            dry_run,
+        }),
         Command::Clean {
             config,
             state_root,

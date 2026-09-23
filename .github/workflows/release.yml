@@ -21,7 +21,33 @@ permissions:
   contents: write
 
 jobs:
+  # The tag is what names the agent on every remote host: the controller
+  # runs ~/.autobahn/bin/autobahn-<package version>+e<epoch> and uploads an
+  # agent only when that path is missing. A tag that disagrees with
+  # Cargo.toml therefore publishes binaries whose agents are named for a
+  # different version than the release everybody quotes, and no handshake
+  # ever catches it because both ends of a session agree with each other.
+  # Nothing checked this before, so it is checked here, before a runner
+  # spends half an hour building the wrong thing.
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag must match the package version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          package=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "$tag" != "$package" ]; then
+            echo "tag $GITHUB_REF_NAME is version '$tag'," \
+                 "but Cargo.toml says '$package'." >&2
+            echo "The package version names the agent on every remote host." \
+                 "Fix one of them and tag again." >&2
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches Cargo.toml ($package)"
+
   linux:
+    needs: version
     strategy:
       matrix:
         include:
@@ -65,6 +91,7 @@ jobs:
     # and Gatekeeper refuses a quarantined executable it cannot attribute.
     # Secrets reach this job only after approval, and never reach pull
     # requests from forks.
+    needs: version
     runs-on: macos-15
     environment: release
     steps:
@@ -156,10 +183,21 @@ jobs:
           tar czf autobahn-agents.tar.gz agents
           sha256sum autobahn-* Autobahn-macos-aarch64.zip > SHA256SUMS
       - name: Publish release
+        # A tag with a hyphen in it is a prerelease, which is what
+        # semantic versioning means by v0.5.0-dev.1. Marking it as one
+        # keeps GitHub's "latest" pointing at the last stable release, and
+        # "latest" is what scripts/install.sh and `autobahn update` both
+        # resolve when no tag is asked for. Without the mark, publishing a
+        # dev build would install it on every machine that ran the
+        # installer that day. Testers opt in by tag instead.
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          case "$GITHUB_REF_NAME" in
+            *-*) prerelease=--prerelease ;;
+            *)   prerelease= ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" $prerelease \
             --repo "$GITHUB_REPOSITORY" \
             --title "autobahn $GITHUB_REF_NAME" \
             --generate-notes \

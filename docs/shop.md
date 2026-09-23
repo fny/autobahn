@@ -18,6 +18,8 @@ An order is always *something* — served, disputed, delivery blocked — and so
 
 Press `?` for a page that explains every word on the screen.
 
+A line under the sign reading `⚠ configuration refused …` means the supervisor read an edit to `config.toml` it would not start from. The orders below it are still being filled, under the last configuration that loaded; the line goes when the file loads again. See [Editing it while it runs](./configuration.md#editing-it-while-it-runs).
+
 ## The counter
 
 The useful half. `ret` opens any order — where it syncs from and to, its mode, how many cycles it has run and how much it has carried — and then its issues as a tree: cause, then place, then path. Every level of that tree can be acted on, so one keypress settles a whole directory or a single file. `spc` marks a level; mark as many as you like and one keypress settles all of them together.

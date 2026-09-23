@@ -35,7 +35,7 @@ The payoff is not one optimization. It is the same optimization appearing at fou
 | Must the scan cache be rewritten? | Not if it already describes this tree | `src/endpoint/local.rs` |
 | Must the agent send a tree over the wire? | No — send one byte | `src/transport/mod.rs` |
 
-The last row matters most in practice. An idle remote endpoint answers a scan request with a single enum tag. No serialization, no transfer, no decode. A heartbeat over a half-million-file tree costs one round trip.
+The last row matters most in practice. An idle remote endpoint answers a scan request with a single enum tag. No serialization, no transfer, no decode. A heartbeat over a half-million-file tree costs one round trip — and while the agent's watcher stands, not even that. Every answer from the agent carries its change generation, a wait for changes counts from the generation the controller last saw, and a cycle that follows a quiet wait reuses the last snapshot rather than asking again (`src/endpoint/remote.rs`). A watcher in backoff says so and is never skipped, and a snapshot older than a minute is not reused, so the periodic full walk still runs.
 
 This idea has a sharp edge, and the code states it as a contract (`src/tree/mod.rs`). Shared storage tells you how a tree was *built*, not what it *holds*. A tree read from disk shares nothing with an identical tree in memory. So two equal trees can answer `false`. **Callers can use the answer to prove agreement. They must never use it to prove difference.** Every use above is safe in that direction only.
 
@@ -100,6 +100,8 @@ The decisions above produce the shape.
 
 **A cycle is the unit of work** (`src/session/mod.rs`). Scan both sides in parallel, return early if nothing moved, reconcile, stage, apply, fold the results, write the ancestor. Everything above is a property of one of those steps.
 
+Inside a step, the work is spread where it pays. A cold scan walks subtrees on up to eight threads (`src/scan/mod.rs`); a large transition applies on up to eight (`src/endpoint/local.rs`), each capped at the host's cores. Across the wire, files under 64 KB are sent before the destination has said what it needs — the receiver names what it asked for and drops the rest — and the transition follows the last push without waiting for an acknowledgement. An edit to a remote beta costs one round trip plus the work; at 0.4.0 it cost about three and a half. Every one of these was measured before it shipped (`TODO-SPEED.md` holds the numbers), because the estimate was wrong each time it was tried.
+
 **Sessions are independent.** The supervisor runs a thread for each (`src/supervisor/mod.rs`). A failure backs off with jitter applied after the cap, so sessions that all fail do not synchronize their retries (`src/supervisor/mod.rs`). One SSH process carries many sessions as channels, so a channel waiting for changes never blocks another channel's scan.
 
 ### Why the cycle can return early, safely
@@ -114,7 +116,9 @@ The design has one more habit worth showing, because it was recently wrong.
 
 When a change arrives, cycling immediately would fragment a burst of writes across many cycles. So autobahn waits. Until 0.3.0 that wait was a fixed 100 ms, which meant every isolated edit paid the full window whether or not a burst followed. Measured against a 0.7 ms floor, a median latency of 100.7 ms was almost entirely waiting.
 
-The fix keeps the ceiling and removes the floor. The session samples how much change each endpoint has recorded, sleeps a short slice, then samples again (`src/session/mod.rs`). Growth means writes continue. Two equal samples mean the burst ended. An isolated edit now waits 20 ms. A sustained burst still stops at 100 ms, so the worst case does not move.
+The first fix kept the ceiling and removed the floor. The session samples how much change each endpoint has recorded, sleeps a short slice, then samples again (`src/supervisor/mod.rs`, `SETTLE` and `QUIET`). Growth means writes continue. Two equal samples mean the burst ended. That made an isolated edit wait one slice, 20 ms, with a sustained burst stopping at 100 ms.
+
+The second fix was to measure the reading behind those numbers, which said an isolated edit did not wait the window out. It did: every change pays one slice, and with several editors the tree is never quiet, so the ceiling is what they pay. At 5 ms and 25 ms, one editor's median went from 47 to 25 ms, ten editors' from 48 to 22, and a hundred editors' from 114 to 53, while a thousand-file burst still converged in the same wall time — two cycles instead of one. With no window at all it takes three and half again the work, which is why there is still one.
 
 It samples counts rather than waiting for another event, because the watcher's signal is standing state rather than a stream of edges. The wake channel holds one token, so it cannot count arrivals, and the token may already be consumed. The path count is the only value that grows for each event.
 

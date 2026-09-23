@@ -20,10 +20,10 @@ The service runs under launchd or systemd with a sparse environment, so give com
 | `$AUTOBAHN_SUMMARY` | One line. The whole story when one thing is wrong, a count when several — `voltai → fny: 1 conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you, 1 host away`. |
 | `$AUTOBAHN_DETAIL` | One indented line per thing, for a notifier that shows more than a headline. |
 | `$AUTOBAHN_ICON` | Absolute path to autobahn's icon, written into the state directory so a notifier can point at it. |
-| `$AUTOBAHN_STATES` | Comma-separated state names present. |
+| `$AUTOBAHN_STATES` | Comma-separated state names present; `config` when the running supervisor refused an edit to the configuration. |
 | `$AUTOBAHN_ALERT_COUNT` | How many sessions are in the set. |
-| `$AUTOBAHN_EVENT` | `alert` or `repeat`. |
-| stdin | The full `status --json` document. |
+| `$AUTOBAHN_EVENT` | `alert`, `repeat`, or `config` — the last for a refused edit to the configuration, fired once per edit, straight from the file rather than through the confirmation below. See [Editing it while it runs](./configuration.md#editing-it-while-it-runs). |
+| stdin | The full `status --json` document — or, for `config`, the notice itself: `{"at": <epoch seconds>, "message": "..."}`. |
 
 Hooks run off the cycle and cannot affect or delay synchronization: a hook is killed if it outstays its timeout, and is skipped while a previous one is still running.
 

@@ -66,8 +66,9 @@ lands on both. A difference smaller than the leg-to-leg spread is noise;
 a difference that reverses sign between runs is certainly noise. Three
 legs cannot tell a small effect from chance — use five.
 
-`bench/README.md` covers the rest of the harness, and
-[Benchmarks](./benchmarks.md) the published comparison against mutagen.
+`--remote HOST` puts the destination on another machine over ssh, running each leg's own binary as the agent there, for a change to the wire. `bench/netem.sh` adds delay to a loopback alias with `tc netem`, for a change to the number of round trips — a LAN cannot show one, and a 10 ms link shows every one as 20 ms of median. The `50k-burst` and `chromium-burst` cells copy a module in five times a job and time each burst to convergence, for a change to a cycle's cost rather than its latency.
+
+`bench/README.md` covers the rest of the harness, and [Benchmarks](./benchmarks.md) the published comparison against mutagen.
 
 ## Compatibility epochs
 
@@ -78,6 +79,10 @@ disagree about a tree — a scan rule, an ignore rule — must bump
 bump, the agents bundle must be rebuilt before the supervisor is
 restarted, or the stale bundle is uploaded under the new name and every
 session fails its handshake.
+
+## The specification
+
+The reconciliation rules, for files and directories across one alpha and any number of betas, and the peering protocol are written in TLA+ under `spec/` and checked exhaustively by TLC. CI's `spec` job runs `spec/check.sh quick` — the small configurations, safety only — and then `AUTOBAHN_TLC=1 cargo test --release --test spec_replay --test spec_peering_replay`, which drives the real `reconcile()` and the real lease code through TLC's own traces and holds them to the spec's `Match`. The full set, with liveness and three betas, is `spec/check.sh` with no argument, or the dispatch-only `spec-full.yml` workflow; the peering liveness configurations take hours and want a large machine. `spec/README.md` has the modes, the sizes, and what TLC taught us about writing them.
 
 ## Correctness
 

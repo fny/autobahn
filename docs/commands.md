@@ -110,11 +110,11 @@ Conflicts and blocked paths co-occur, so both counts are reported rather than on
 
 ## `--json`
 
-`autobahn status --json` and `autobahn conflicts --json` print everything as one versioned document, for scripts and user interfaces. Each session carries a `progress` object while a supervisor is running. `--filter` applies to the JSON too, while `--depth`, being a way of reading a list, does not. The alert hook receives this same document on standard input, and [the shop](./shop.md) and [the menu bar app](./macos-app.md) read nothing else.
+`autobahn status --json` and `autobahn conflicts --json` print everything as one versioned document, for scripts and user interfaces. The `version` is 3: it went from 2 with `config_notice`, present only while the running supervisor is refusing an edit to the configuration (see [Editing it while it runs](./configuration.md#editing-it-while-it-runs)). Each session carries a `progress` object while a supervisor is running. `--filter` applies to the JSON too, while `--depth`, being a way of reading a list, does not. The alert hook receives this same document on standard input, and [the shop](./shop.md) and [the menu bar app](./macos-app.md) read nothing else.
 
 ## One-off syncs and scripting
 
-Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code:
+Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code. A one-off pass registers no filesystem watchers — it never waits for anything — so on a large tree it starts in a fraction of the time a `watch` does (a 160,000-file pair, already in sync: under a second):
 
 ```sh
 # One bidirectional pass, then exit:

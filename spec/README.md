@@ -7,6 +7,12 @@ spec/check.sh            # every mode
 spec/check.sh strict     # one
 ```
 
+The `_n3` configurations check the invariants for three betas, with the betas' symmetry folding permuted states into one — about 900,000 distinct states and two minutes per mode. Liveness stays with the two-beta runs, since TLC's symmetry reduction is not sound for it:
+
+```sh
+spec/check.sh strict_n3 alpha_n3 conflict_n3
+```
+
 It needs Java 11+; `tla2tools.jar` is fetched into `~/.local/lib` on first use, or set `TLA2TOOLS`.
 
 The implementation is held to the spec by `tests/spec_replay.rs`. It plays the same game with the real `reconcile()` making every cycle's move, asserts the same properties in Rust on thousands of random games (always on), and writes games out as traces that TLC validates against the spec — a step the spec does not allow is a deadlock, and a rejection:

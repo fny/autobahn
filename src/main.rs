@@ -342,6 +342,32 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Turn a host or a group off in the configuration. A disabled host
+    /// drops from every group it appears in; a disabled group runs
+    /// nothing at all. Neither loses its state: enabling resumes.
+    Disable {
+        /// The host to disable everywhere.
+        #[arg(long, group = "target")]
+        host: Option<String>,
+        /// The group to disable.
+        #[arg(long, group = "target")]
+        group: Option<String>,
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
+    /// Turn a host or a group back on: the counterpart of `disable`.
+    Enable {
+        /// The host to enable.
+        #[arg(long, group = "target")]
+        host: Option<String>,
+        /// The group to enable.
+        #[arg(long, group = "target")]
+        group: Option<String>,
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+    },
     /// Write a starting configuration: the defaults, every mode explained,
     /// and one example group to edit. Refuses to replace one that exists.
     Init {
@@ -651,6 +677,16 @@ fn main() {
         Command::Tray { .. } => Err(anyhow::anyhow!(
             "this build has no menu bar app; build one with `cargo build --release --features tray`"
         )),
+        Command::Disable {
+            host,
+            group,
+            config,
+        } => run_availability(config, host, group, false),
+        Command::Enable {
+            host,
+            group,
+            config,
+        } => run_availability(config, host, group, true),
         Command::Init { config, force } => run_init(config, force),
         Command::Clean {
             config,
@@ -2576,6 +2612,118 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
     }
     println!("  it describes {sessions} session(s): edit the example group to add one");
     println!("  then `autobahn watch`, or `autobahn install` to run it as a login service");
+    Ok(())
+}
+
+/// `autobahn disable` and `autobahn enable`: one word in the
+/// configuration, written back with every comment around it intact.
+///
+/// The name is checked against the configuration first. A host that no
+/// group mentions, or a group that does not exist, is a typo — and a typo
+/// written into the file would be a line that reads as done and does
+/// nothing, which is the failure this command exists to prevent.
+fn run_availability(
+    config: Option<PathBuf>,
+    host: Option<String>,
+    group: Option<String>,
+    enable: bool,
+) -> Result<()> {
+    let path = match config {
+        Some(path) => path,
+        None => paths::default_config_path()?,
+    };
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("unable to read {}", path.display()))?;
+    let configuration = autobahn::config::Config::load(&path)?;
+    let verb = match enable {
+        true => "enabled",
+        false => "disabled",
+    };
+
+    let (updated, changed, what) = match (&host, &group) {
+        (Some(host), None) => {
+            let known = configuration.known_hosts();
+            if !known.iter().any(|candidate| candidate == host) {
+                bail!(
+                    "no group mentions the host {host:?}. The configuration names: {}",
+                    known.join(", ")
+                );
+            }
+            let (updated, changed) =
+                autobahn::config::set_host_disabled(&text, host, !enable)?;
+            (updated, changed, format!("host {host}"))
+        }
+        (None, Some(group)) => {
+            if !configuration.groups.contains_key(group) {
+                bail!(
+                    "no group named {group:?}. The configuration names: {}",
+                    configuration
+                        .groups
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            let (updated, changed) =
+                autobahn::config::set_group_disabled(&text, group, !enable)?;
+            (updated, changed, format!("group {group}"))
+        }
+        _ => bail!("name one of --host or --group"),
+    };
+
+    if !changed {
+        println!("{what} is already {verb}; {} is unchanged", path.display());
+        return Ok(());
+    }
+
+    // Written beside and renamed, so an interrupted write never leaves a
+    // half-written configuration where a whole one used to be — the same
+    // rule `init` follows.
+    let temporary = path.with_extension("toml.new");
+    std::fs::write(&temporary, &updated)
+        .with_context(|| format!("unable to write {}", temporary.display()))?;
+    // Read back before it is moved into place: a configuration this
+    // command cannot load is one the supervisor would refuse at its next
+    // start, which is the worst moment to find out.
+    if let Err(error) = autobahn::config::Config::load(&temporary).and_then(|c| c.plans()) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| {
+            format!("the edit would leave {} unloadable", path.display())
+        });
+    }
+    std::fs::rename(&temporary, &path)
+        .with_context(|| format!("unable to move {} into place", temporary.display()))?;
+
+    let sessions = configuration
+        .plans()
+        .map(|plans| plans.len())
+        .unwrap_or_default();
+    let now = autobahn::config::Config::load(&path)
+        .and_then(|c| c.plans())
+        .map(|plans| plans.len())
+        .unwrap_or_default();
+    println!("{verb} {what} in {}", path.display());
+    println!(
+        "  {} session(s) now, {} before",
+        now,
+        sessions
+    );
+    if let Some(host) = &host {
+        let led = configuration.groups_led_by(host);
+        if !led.is_empty() {
+            println!(
+                "  note: it is the alpha of {}, so {} group(s) {} with it",
+                led.join(", "),
+                led.len(),
+                match enable {
+                    true => "return",
+                    false => "go",
+                }
+            );
+        }
+    }
+    println!("  the supervisor reads the configuration at startup: `autobahn restart`");
     Ok(())
 }
 

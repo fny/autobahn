@@ -33,6 +33,7 @@ notify-rust = { version = "4", optional = true }
 # tray-icon, so its NSStatusItem is the same type as ours.
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSAppearance", "NSResponder", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView"] }
+toml_edit = "0.25.15"
 
 [features]
 tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit"]

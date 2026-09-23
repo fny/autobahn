@@ -37,6 +37,17 @@ autobahn mi                # the shop: watch it work, and clear the queue
 
 `reset` requires the group name. A reset is deliberate, never a default. `clean` is described in [State](./state.md); the conflict commands in [Conflicts](./conflicts.md).
 
+Turning things off and on, without opening the file:
+
+```sh
+autobahn disable --host boite    # off everywhere it appears
+autobahn enable  --host boite
+autobahn disable --group vibe    # the whole group, sessions and all
+autobahn enable  --group vibe
+```
+
+`disable` edits `~/.autobahn/config.toml` in place, keeping every comment: a host goes in and out of the top-level `disabled_hosts` list, a group gets `disabled = true` and loses it again. A name no group mentions is refused with the list of names that would work, so a typo cannot become a line that reads as done and does nothing. Nothing is deleted either way — session state stays, so enabling resumes rather than starts over — and the supervisor reads the configuration at startup, so the change lands on `autobahn restart`.
+
 Running it as a service, and keeping it current:
 
 ```sh

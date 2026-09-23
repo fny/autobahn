@@ -240,6 +240,9 @@ const DEFAULT_ALERT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The synchronization interval used when neither a group nor the defaults
 /// specify one.
+/// The top-level key naming hosts that are off everywhere.
+pub const DISABLED_HOSTS: &str = "disabled_hosts";
+
 pub const DEFAULT_INTERVAL_SECONDS: u64 = 5;
 
 /// How long a grown alerting set is held before it is reported. Long
@@ -705,6 +708,42 @@ impl Config {
             .with_context(|| format!("unable to read configuration {}", path.display()))?;
         toml::from_str(&text)
             .with_context(|| format!("unable to parse configuration {}", path.display()))
+    }
+
+/// Every host this configuration names, in configuration order: each
+    /// group's alpha when it is remote, and every remote beta. What `disable`
+    /// checks a name against, so a typo is refused rather than written into
+    /// the file and quietly ignored.
+    pub fn known_hosts(&self) -> Vec<String> {
+        let mut hosts: Vec<String> = Vec::new();
+        for group in self.groups.values() {
+            for spec in std::iter::once(&group.alpha).chain(group.betas.iter()) {
+                let destination = spec.split(':').next().unwrap_or(spec);
+                if destination.starts_with('/') || destination.starts_with('~') {
+                    continue;
+                }
+                let host = host_of(destination).to_owned();
+                if !host.is_empty() && !hosts.contains(&host) {
+                    hosts.push(host);
+                }
+            }
+        }
+        hosts
+    }
+    
+    /// The groups whose alpha is this host. Disabling one of these takes the
+    /// whole group with it, which is worth saying out loud before it happens.
+    pub fn groups_led_by(&self, host: &str) -> Vec<String> {
+        self.groups
+            .iter()
+            .filter(|(_, group)| {
+                let destination = group.alpha.split(':').next().unwrap_or(&group.alpha);
+                !destination.starts_with('/')
+                    && !destination.starts_with('~')
+                    && host_of(destination) == host
+            })
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     /// Derives the session plans this configuration describes, excluding
@@ -1576,6 +1615,76 @@ fn parse_endpoint(
     })
 }
 
+
+/// Adds or removes a host in the top-level `disabled_hosts` list, editing
+/// the text rather than rewriting the file: a configuration is mostly
+/// comments, and a parse-and-serialize round trip would drop every one of
+/// them. Returns the new text and whether anything changed.
+///
+/// The list is created when it is missing, before the first section
+/// header — where TOML requires a bare key to be.
+pub fn set_host_disabled(text: &str, host: &str, disabled: bool) -> Result<(String, bool)> {
+    let mut document: toml_edit::DocumentMut = text
+        .parse()
+        .context("unable to parse the configuration for editing")?;
+    if !document.contains_key(DISABLED_HOSTS) {
+        if !disabled {
+            return Ok((text.to_owned(), false));
+        }
+        document[DISABLED_HOSTS] = toml_edit::value(toml_edit::Array::new());
+    }
+    let list = document[DISABLED_HOSTS]
+        .as_array_mut()
+        .ok_or_else(|| anyhow!("{DISABLED_HOSTS} is not a list of hosts"))?;
+    let at = list
+        .iter()
+        .position(|entry| entry.as_str() == Some(host));
+    let changed = match (disabled, at) {
+        (true, None) => {
+            list.push(host);
+            true
+        }
+        (false, Some(at)) => {
+            list.remove(at);
+            true
+        }
+        _ => false,
+    };
+    Ok((document.to_string(), changed))
+}
+
+/// Sets or clears `disabled` on one group, the same way. Turning a group
+/// back on removes the key rather than writing `disabled = false`: the
+/// absence is the default, and a file full of explicit defaults is a file
+/// nobody reads.
+pub fn set_group_disabled(text: &str, group: &str, disabled: bool) -> Result<(String, bool)> {
+    let mut document: toml_edit::DocumentMut = text
+        .parse()
+        .context("unable to parse the configuration for editing")?;
+    let table = document
+        .get_mut("groups")
+        .and_then(|groups| groups.as_table_like_mut())
+        .and_then(|groups| groups.get_mut(group))
+        .and_then(|group| group.as_table_like_mut())
+        .ok_or_else(|| anyhow!("no group named {group:?} in the configuration"))?;
+    let was = table
+        .get("disabled")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if was == disabled {
+        return Ok((text.to_owned(), false));
+    }
+    match disabled {
+        true => {
+            table.insert("disabled", toml_edit::value(true));
+        }
+        false => {
+            table.remove("disabled");
+        }
+    }
+    Ok((document.to_string(), true))
+}
+
 /// Extracts the host from an SSH destination (`host` or `user@host`).
 fn host_of(destination: &str) -> &str {
     match destination.rfind('@') {
@@ -2043,6 +2152,113 @@ mod tests {
                 String::from_utf8_lossy(&checked.stderr)
             );
         }
+    }
+
+    /// `disable` edits the file people wrote, so what they wrote has to
+    /// survive it: the comments, the key order, and everything the edit
+    /// did not name.
+    #[test]
+    fn disabling_a_host_keeps_the_rest_of_the_file() {
+        let original = r#"# why this file looks like this
+disabled_hosts = ["soros"]
+
+[defaults]
+mode = "two-way-conflict"
+
+# the work group
+[groups.work]
+alpha = "/tmp/alpha"        # the source
+betas = ["build.example.com:/tmp/beta"]
+"#;
+        let (text, changed) =
+            set_host_disabled(original, "build.example.com", true).expect("the edit applies");
+        assert!(changed);
+        assert!(text.contains("# why this file looks like this"));
+        assert!(text.contains("# the work group"));
+        assert!(text.contains("# the source"));
+        assert!(text.contains(r#"["soros", "build.example.com"]"#), "{text}");
+
+        // Enabling it again leaves the file as it was found.
+        let (back, changed) =
+            set_host_disabled(&text, "build.example.com", false).expect("the edit applies");
+        assert!(changed);
+        assert_eq!(back, original);
+
+        // And a second enable is not an error, it is a no-op.
+        let (again, changed) =
+            set_host_disabled(&back, "build.example.com", false).expect("the edit applies");
+        assert!(!changed);
+        assert_eq!(again, back);
+    }
+
+    /// A file that never named the key gets it, before the first section
+    /// header — the only place TOML allows a bare key.
+    #[test]
+    fn disabling_a_host_writes_the_list_when_it_is_missing() {
+        let original = "[groups.work]\nalpha = \"/tmp/alpha\"\nbetas = [\"host:/tmp/beta\"]\n";
+        let (text, changed) = set_host_disabled(original, "host", true).expect("the edit applies");
+        assert!(changed);
+        let parsed = parse(&text);
+        assert_eq!(parsed.disabled_hosts, vec!["host".to_owned()]);
+        assert!(
+            text.find("disabled_hosts").unwrap() < text.find("[groups.work]").unwrap(),
+            "{text}"
+        );
+    }
+
+    /// Turning a group back on removes the key rather than writing the
+    /// default out: a file full of explicit defaults is a file nobody
+    /// reads.
+    #[test]
+    fn enabling_a_group_removes_the_key_it_added() {
+        let original = "[defaults]\nmode = \"two-way-conflict\"\n\n[groups.work]\nalpha = \"/tmp/alpha\"\nbetas = [\"host:/tmp/beta\"]\n";
+        let (off, changed) = set_group_disabled(original, "work", true).expect("the edit applies");
+        assert!(changed);
+        assert!(off.contains("disabled = true"), "{off}");
+        assert!(parse(&off).plans().expect("it still loads").is_empty());
+
+        let (on, changed) = set_group_disabled(&off, "work", false).expect("the edit applies");
+        assert!(changed);
+        assert!(!on.contains("disabled"), "{on}");
+        assert_eq!(on, original);
+    }
+
+    /// A group that does not exist is a typo, and a typo is refused rather
+    /// than written into the file as a line that does nothing.
+    #[test]
+    fn disabling_an_unknown_group_is_refused() {
+        let original = "[groups.work]\nalpha = \"/tmp/alpha\"\nbetas = [\"host:/tmp/beta\"]\n";
+        assert!(set_group_disabled(original, "nope", true).is_err());
+    }
+
+    /// The names `disable --host` accepts: every host the file mentions,
+    /// and no local path.
+    #[test]
+    fn known_hosts_are_the_ones_the_groups_name() {
+        let config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-conflict"
+
+            [groups.work]
+            alpha = "/tmp/alpha"
+            betas = ["build.example.com:/tmp/beta", "/mnt/backup", "user@lab.example.com"]
+
+            [groups.remote]
+            alpha = "ubuntu@lead.example.com:/srv/tree"
+            betas = ["build.example.com:/srv/tree"]
+            "#,
+        );
+        assert_eq!(
+            config.known_hosts(),
+            vec![
+                "lead.example.com".to_owned(),
+                "build.example.com".to_owned(),
+                "user@lab.example.com".rsplit('@').next().unwrap().to_owned(),
+            ]
+        );
+        assert_eq!(config.groups_led_by("lead.example.com"), vec!["remote".to_owned()]);
+        assert!(config.groups_led_by("build.example.com").is_empty());
     }
 
     /// The old spelling parses, so that it can be answered with what to

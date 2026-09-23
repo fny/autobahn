@@ -1065,8 +1065,17 @@ impl<'a> Worker<'a> {
     ) {
         // The ceiling on coalescing a burst, and the slice of quiet that
         // ends it early. An isolated write now costs QUIET, not SETTLE.
-        const SETTLE: Duration = Duration::from_millis(100);
-        const QUIET: Duration = Duration::from_millis(20);
+        // Every change pays one QUIET before its cycle starts, and a burst
+        // keeps paying them, up to SETTLE, while it keeps landing. QUIET
+        // is therefore a floor under every edit's latency: at 20 ms it was
+        // nearly half of a single editor's p50 (47 ms; 25 ms at 5), and
+        // with ten editors the tree is never quiet, so every edit paid it
+        // (p50 48 → 22 ms). Shorter still buys little: with no window at
+        // all, a 1,000-file burst that one cycle used to absorb takes
+        // three, and half again as much cycle work, for the same wall time
+        // to convergence; at 25/5 it takes two. Measured 2026-09-23.
+        const SETTLE: Duration = Duration::from_millis(25);
+        const QUIET: Duration = Duration::from_millis(5);
         let deadline = std::time::Instant::now() + interval;
         while !stop.load(Ordering::Relaxed) {
             if flags.wake.swap(false, Ordering::Relaxed)

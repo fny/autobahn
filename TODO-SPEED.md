@@ -58,7 +58,7 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 
 ## The harness — so the above can be measured honestly
 
-- [ ] A burst cell in the AWS matrix (an unpacked archive, a `git checkout`), timed from the tool's own debug log. The manifest-polling measurement has ~100 ms of resolution and misread a 45 ms improvement as a regression on 2026-09-22.
-- [ ] `aggregate.py` refuses a job whose recorded `destinations` do not match its cell's `betas`. The field is recorded since `6b67b4a`; nothing checks it. This is the guard that would have caught the six 10× jobs in `bench-1789947877` in the results alone.
+- [x] Burst cells `50k-burst` and `chromium-burst`: a module copied in, five times a job, wall time by manifest and autobahn's cycle seconds beside it. Smoke-tested locally; not yet run on AWS.
+- [x] `aggregate.py` taints and reports a job whose recorded `destinations` do not match its cell's `betas`.
 - [ ] A scan test that walks one tree serially and in parallel and asserts identical hierarchies and identical storage sharing. The parallel path is exercised by the existing tests on an 8-core box and by nothing at all on a 1-core CI runner.
 - [ ] Re-run the five cells the width leak contaminated (`50k-10`, `chromium-1-bidir`, `chromium-1-patch`, `chromium-10`, `chromium-10-bidir`) with the fixed harness, and correct `docs/benchmarks.md` and `docs/benchmark-matrix.md`. Corrected pooled p90s from the clean repeats, for reference: `chromium-10` 4,264 → 425 ms; `chromium-1-bidir` 9,273 → 1,616; `chromium-10-bidir` 8,226 → 1,944; `chromium-1-patch` 3,038 → 292; `50k-10` 636 → 96.

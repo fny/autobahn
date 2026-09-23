@@ -121,3 +121,7 @@ This document was independently attacked (2026-08-30, an external model lineage,
 ## How to attack this document
 
 The highest-value falsifications, in order: a schedule of two sessions over one shared root that serves a stale snapshot as current (I1); a crash point or power-loss state that leaves the ancestor claiming an agreement that never completed (I2, I10); a byte sequence from a hostile agent that lands unverified content in a tree (I3, I9); an interleaving of a slow transition with a concurrent writer that bypasses lease validation (I4); a configuration or process topology that acquires two writers over one region without tripping I6. The harnesses named above are the existing search machinery; extending their op alphabets is usually cheaper than writing new ones.
+
+## The specification
+
+The rules the invariants above describe, for files across one alpha and any number of betas, are written as `spec/Autobahn.tla` and checked exhaustively by TLC; `tests/spec_replay.rs` holds the implementation to them. See `spec/README.md`.

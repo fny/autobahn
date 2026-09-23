@@ -1,3 +1,6 @@
 /target
 bench/verify/hosts-*.json
 apps/macos/Autobahn.app/
+
+# TLC scratch (spec/check.sh)
+spec/states/

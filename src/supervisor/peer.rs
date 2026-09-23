@@ -231,6 +231,7 @@ fn accept_attachment(
 /// attach to whoever leads until the lease names the alpha again, and
 /// lead again. The configured alpha is never dialed, so while a beta
 /// leads the alpha makes itself an endpoint by dialing the beta.
+#[allow(clippy::too_many_arguments)]
 pub fn run_alpha(
     config_path: &Path,
     directory: &Path,
@@ -239,6 +240,7 @@ pub fn run_alpha(
     state_root: &Path,
     verbose: bool,
     stop: &AtomicBool,
+    reloader: Option<&std::sync::Arc<super::reload::Reloader>>,
 ) -> Result<()> {
     let interval = plans
         .iter()
@@ -259,7 +261,8 @@ pub fn run_alpha(
                 let supervisor =
                     super::Supervisor::new(plans.to_vec(), state_root.to_path_buf(), verbose)
                         .with_alerts(alerts.clone())
-                        .with_peering(context);
+                        .with_peering(context)
+                        .with_reload(reloader.cloned());
                 let inner_stop = AtomicBool::new(false);
                 std::thread::scope(|scope| -> Result<()> {
                     let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
@@ -279,6 +282,11 @@ pub fn run_alpha(
                         Err(_) => anyhow::bail!("the supervisor panicked"),
                     }
                 })?;
+                // An edit loaded: the caller runs it, with this loop
+                // entered again under the new plans.
+                if reloader.is_some_and(|reloader| reloader.is_pending()) {
+                    return Ok(());
+                }
             }
             Role::Follower { leader, .. } => {
                 // Attach, and serve as an agent until the leader lets go

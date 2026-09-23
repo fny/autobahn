@@ -838,6 +838,16 @@ impl Shop<'_> {
         lines.extend(self.sign(width));
         lines.push(String::new());
 
+        // The supervisor refused an edit to the configuration: said under
+        // the sign, where the orders it still fills can be read against it.
+        if let Some(notice) = &self.report.config_notice {
+            lines.push(format!(
+                "  \x1b[33m⚠ configuration refused\x1b[0m {}",
+                shorten(&notice.message, width.saturating_sub(28))
+            ));
+            lines.push(String::new());
+        }
+
         if self.help {
             lines.extend(help_page(width));
             return grid(lines, height, width, self.footer());
@@ -1922,10 +1932,11 @@ mod tests {
             sessions: vec![session.clone()],
         };
         let report = |role: &str| StatusReport {
-            version: 1,
+            version: 3,
             supervisor_running: true,
             service: "running".into(),
             groups: vec![group(role)],
+            config_notice: None,
         };
 
         let rail = |role: &str| {

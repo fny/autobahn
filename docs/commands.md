@@ -46,7 +46,7 @@ autobahn disable --group vibe    # the whole group, sessions and all
 autobahn enable  --group vibe
 ```
 
-`disable` edits `~/.autobahn/config.toml` in place, keeping every comment: a host goes in and out of the top-level `disabled_hosts` list, a group gets `disabled = true` and loses it again. A name no group mentions is refused with the list of names that would work, so a typo cannot become a line that reads as done and does nothing. Nothing is deleted either way — session state stays, so enabling resumes rather than starts over — and the supervisor reads the configuration at startup, so the change lands on `autobahn restart`.
+`disable` edits `~/.autobahn/config.toml` in place, keeping every comment: a host goes in and out of the top-level `disabled_hosts` list, a group gets `disabled = true` and loses it again. A name no group mentions is refused with the list of names that would work, so a typo cannot become a line that reads as done and does nothing. Nothing is deleted either way — session state stays, so enabling resumes rather than starts over — and the running supervisor picks the edit up within a few seconds, like any other (see [Editing it while it runs](./configuration.md#editing-it-while-it-runs)).
 
 Running it as a service, and keeping it current:
 
@@ -58,7 +58,7 @@ autobahn restart
 autobahn uninstall         # stop it and unregister it
 ```
 
-`start` and `restart` read the configuration first and refuse one the supervisor would refuse — a key it does not know, a mode it does not have, a group with no sessions — with the same message, and the service left as it was. Without that check the service manager reports the restart done, and the supervisor exits into `~/.autobahn/service.log` a moment later, unseen.
+`start` and `restart` read the configuration first and refuse one the supervisor would refuse — a key it does not know, a mode it does not have, a group with no sessions — with the same message, and the service left as it was. Without that check the service manager reports the restart done, and the supervisor exits into `~/.autobahn/service.log` a moment later, unseen. A running supervisor makes the same checks on every edit to the file, so a `restart` is for an upgrade, not an edit: see [Editing it while it runs](./configuration.md#editing-it-while-it-runs).
 
 ```sh
 

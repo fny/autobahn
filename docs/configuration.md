@@ -40,19 +40,20 @@ Sessions are independent: a host being down means its session retries with backo
 
 ## Top level
 
-Seven keys. Unknown keys are refused at startup, not ignored — here and in every section.
+Eight keys. Unknown keys are refused at startup, not ignored — here and in every section.
 
 | Key | Type | Default | What it is |
 |---|---|---|---|
 | `on_alert` | string | — | Shell command run when a session needs a person. The only hook. `autobahn init` writes an experimental example at `~/.autobahn/on-alert.sh` to point it at. See [Alerts](./alerts.md). |
 | `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. `autobahn disable --host <host>` edits it for you. |
 | `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
+| `reload` | bool | `true` | Whether the running supervisor re-reads this file and applies an edit in place. See [Editing it while it runs](#editing-it-while-it-runs). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
 | `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
 | `[advanced.peering-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
 
-Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts` and `log` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
+Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
 ## Session settings
 
@@ -88,13 +89,22 @@ On a terminal, `watch` is a live `autobahn status` that repaints as sessions rep
 autobahn install            # register a login service, and start it
 autobahn stop               # stop it (it returns at the next login)
 autobahn start
-autobahn restart            # after editing the config, or upgrading
+autobahn restart            # after upgrading
 autobahn uninstall          # stop it, and unregister it
 ```
 
 The service is launchd on macOS and a systemd user unit on Linux — inspect it with `launchctl` or `systemctl --user` like any other — and it logs to `~/.autobahn/service.log`. There is no daemon of autobahn's own and nothing backgrounds itself: `start` with no service installed says so and points at `install` or `watch`.
 
-The supervisor holds the config in memory, so an edit takes effect on `restart`. A restart does not ask the supervisor to stop: the service manager kills it and starts it again. That is safe — writes are staged and published by rename, and the ancestor journal is built to survive a crash at any point (see [Safety](./safety.md)) — but a cycle in flight is abandoned and redone.
+A restart does not ask the supervisor to stop: the service manager kills it and starts it again. That is safe — writes are staged and published by rename, and the ancestor journal is built to survive a crash at any point (see [Safety](./safety.md)) — but a cycle in flight is abandoned and redone. An upgrade needs one; an edit to the configuration does not.
+
+## Editing it while it runs
+
+The running supervisor reads the file every two seconds and acts on an edit once it has read the same bytes twice, so a file caught half-written is read again rather than refused. The edit gets the checks `start` makes — a key it does not know, a mode it does not have, a group with no sessions — and one of two things happens:
+
+- **It loads.** The sessions wind down between cycles and start again under the new configuration, in the same process: groups added start, groups removed stop, and a group whose settings changed starts over from its kept state. `status` and `mi` show the new sessions; `autobahn watch` on a terminal repaints with them.
+- **It is refused.** The sessions keep running under the configuration that last loaded, and the refusal is said everywhere the supervisor speaks: the log, `status` (a line above the sessions), `mi` (a line under the sign), the tray (a line in the menu, and a notification), and `on_alert` (one firing, `AUTOBAHN_STATES=config`, `AUTOBAHN_EVENT=config`). The line stands until the file loads again. Nothing is retried in the meantime, and the next edit is judged on its own.
+
+`reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
 
 ## See also
 

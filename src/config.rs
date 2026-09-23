@@ -262,6 +262,11 @@ const DEFAULT_SETTLE_AFTER: Duration = Duration::from_secs(15 * 60);
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
+    /// Whether the running supervisor re-reads this file and applies an
+    /// edit in place. On unless said otherwise; off, an edit lands on
+    /// `restart` as it used to.
+    #[serde(default = "default_reload")]
+    pub reload: bool,
     /// Run when a session needs a person. The only hook — which states are
     /// alerting is in the message it is handed, not in which hook fires.
     ///
@@ -701,6 +706,10 @@ fn overlap(alpha: &str, beta: &str) -> Option<&'static str> {
         return Some("a tree containing the alpha");
     }
     None
+}
+
+fn default_reload() -> bool {
+    true
 }
 
 impl Config {

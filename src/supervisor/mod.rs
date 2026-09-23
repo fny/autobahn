@@ -28,6 +28,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::{EndpointTarget, SessionPlan};
 
 pub mod peer;
+pub mod reload;
 use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::scan::IgnoreSet;
@@ -201,6 +202,10 @@ pub struct Supervisor {
     /// What to run when sessions need attention. Nothing is observed or
     /// timed when nothing is configured to run.
     alerts: crate::alerts::AlertPlan,
+    /// The configuration file, watched for edits while the sessions run.
+    /// None when there is no file — `sync`, a peer, a test — or the file
+    /// says not to.
+    reloader: Option<Arc<reload::Reloader>>,
     /// Peering, when any plan is in a peering mode: the role this
     /// supervisor holds, shared by its workers.
     peering: Option<PeeringContext>,
@@ -463,8 +468,17 @@ impl Supervisor {
             verbose,
             pool: AgentPool::default(),
             alerts: crate::alerts::AlertPlan::default(),
+            reloader: None,
             peering: None,
         }
+    }
+
+    /// Watches the configuration file the plans came from. `run_watch`
+    /// then returns when an edit loads, with the new configuration in the
+    /// reloader for the caller to run.
+    pub fn with_reload(mut self, reloader: Option<Arc<reload::Reloader>>) -> Supervisor {
+        self.reloader = reloader;
+        self
     }
 
     /// Adopts an alert plan, so that sessions needing attention are
@@ -572,6 +586,20 @@ impl Supervisor {
         // non-zero — a refused supervisor is a failure, not a quiet no-op).
         let _supervisor_lock = SessionLock::acquire(self.state_root.join("supervisor"))
             .context("unable to supervise")?;
+        // A loaded edit winds the workers down through a flag of its own,
+        // mirrored from the caller's: the caller's `stop` still means
+        // stop, and the caller learns which it was from the reloader.
+        let halt = AtomicBool::new(false);
+        let caller_stop = stop;
+        let stop: &AtomicBool = match self.reloader {
+            Some(_) => &halt,
+            None => caller_stop,
+        };
+        // This supervisor started from a configuration that passed, so a
+        // refusal an earlier one left behind is over.
+        if self.reloader.is_some() {
+            reload::clear_notice(&self.state_root);
+        }
 
         // Every session gets a control-flag block; the registry shares them
         // with the control socket's server thread.
@@ -657,6 +685,18 @@ impl Supervisor {
                 let state_root = self.state_root.as_path();
                 let alerts = self.alerts.clone();
                 scope.spawn(move || watch_alerts(plans, published, state_root, alerts, stop));
+            }
+
+            if let Some(reloader) = &self.reloader {
+                let state_root = self.state_root.as_path();
+                let alerts = &self.alerts;
+                let halt = &halt;
+                scope.spawn(move || {
+                    // The watch answers to the caller's stop; the workers
+                    // answer to `halt`, which it raises either way.
+                    reloader.watch(state_root, alerts, caller_stop, halt);
+                    halt.store(true, Ordering::Relaxed);
+                });
             }
 
             for (index, plan) in self.plans.iter().enumerate() {
@@ -1611,6 +1651,10 @@ pub struct StatusReport {
     pub service: String,
     /// The configured groups, in configuration order.
     pub groups: Vec<GroupReport>,
+    /// An edit to the configuration the running supervisor refused: the
+    /// sessions run on under the last good one until it is fixed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_notice: Option<reload::Notice>,
 }
 
 /// One group's report.
@@ -1797,8 +1841,11 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         }
     }
     StatusReport {
-        version: 2,
+        version: 3,
         supervisor_running: live.is_some(),
+        // Only a running supervisor's refusal is news: the one that wrote
+        // it is gone otherwise, and `start` checks the file itself.
+        config_notice: live.as_ref().and(reload::read_notice(state_root)),
         service: match crate::service::state() {
             Ok(crate::service::ServiceState::NotInstalled) => "not-installed",
             Ok(crate::service::ServiceState::Stopped) => "stopped",

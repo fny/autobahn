@@ -204,6 +204,7 @@ fn run_loop(
         health: Health::Idle,
         report: None,
         last_error: None,
+        last_notice: None,
         model: None,
     };
     event_loop
@@ -245,6 +246,9 @@ struct App {
     /// The last action's failure, shown at the top of the menu until an
     /// action succeeds — a notification can be missed.
     last_error: Option<String>,
+    /// The refused configuration edit last announced, so each is
+    /// announced once.
+    last_notice: Option<crate::supervisor::reload::Notice>,
     /// The live menu.
     model: Option<MenuModel>,
 }
@@ -461,6 +465,9 @@ impl App {
                 .to_owned(),
             );
         }
+        if report.config_notice.is_some() {
+            parts.push("configuration refused".to_owned());
+        }
         parts.push(format!("{} synchronized", count("synchronized")));
         for (state, word) in [
             ("conflicts", "in conflict"),
@@ -476,7 +483,18 @@ impl App {
         }
         let summary = parts.join(", ");
         model.summary.set_text(&summary);
-        let error_text = self.last_error.as_deref().map(|e| format!("⚠ {e}"));
+        // The refused edit takes the same line, under an action's failure
+        // when there is one: both are things the person did.
+        let error_text = self
+            .last_error
+            .as_deref()
+            .map(|e| format!("⚠ {e}"))
+            .or_else(|| {
+                report
+                    .config_notice
+                    .as_ref()
+                    .map(|notice| format!("⚠ configuration refused: {}", notice.message))
+            });
         set_optional(&model.menu, &model.summary, &mut model.error, error_text);
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
@@ -624,6 +642,18 @@ impl App {
     fn notify(&mut self, report: &StatusReport) {
         if self.hook_configured {
             return;
+        }
+        // A refused edit is one event, announced once; the line in the
+        // menu stays until the file loads again.
+        if report.config_notice != self.last_notice {
+            if let Some(notice) = &report.config_notice {
+                notify_with(
+                    "autobahn",
+                    &format!("configuration refused: {}", notice.message),
+                    crate::icon::ensure(&self.state_root),
+                );
+            }
+            self.last_notice = report.config_notice.clone();
         }
         let sessions: Vec<crate::alerts::SessionAlerts> = report
             .groups

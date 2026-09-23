@@ -787,6 +787,118 @@ fn watch_mode_synchronizes_continuously_until_stopped() {
 }
 
 #[test]
+fn an_edited_configuration_is_applied_without_a_restart() {
+    use autobahn::supervisor::reload::{read_notice, Reloader};
+    use std::sync::Arc;
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let notes = world.directory("notes");
+    let notes_mirror = world.path("notes-mirror");
+    write(&alpha, "first.txt", "first");
+    write(&notes, "todo.txt", "everything");
+
+    let path = world.path("config.toml");
+    let one_group = format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    );
+    let plans = world.plans(&one_group);
+    let reloader = Arc::new(Reloader::new(path.clone()).with_interval(Duration::from_millis(20)));
+
+    // What `watch` does: run the configuration, and then each edit that
+    // loads, until stopped.
+    let stop = AtomicBool::new(false);
+    let mut loaded_plans = plans;
+    let mut rounds = 0;
+    std::thread::scope(|scope| {
+        let stop = &stop;
+        let reloader = &reloader;
+        let _guard = StopGuard(stop);
+        loop {
+            rounds += 1;
+            let mut plans = loaded_plans.clone();
+            for plan in &mut plans {
+                plan.interval = Duration::from_millis(30);
+            }
+            let supervisor = Supervisor::new(plans, world.state_root(), false)
+                .with_reload(Some(reloader.clone()));
+            let watcher = scope.spawn(move || supervisor.run_watch(stop));
+            match rounds {
+                1 => {
+                    assert!(
+                        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+                        "the first configuration synchronizes"
+                    );
+                    // A broken edit is refused and recorded; the session
+                    // runs on.
+                    fs::write(&path, format!("{one_group}\n[groups.notes]\nmdoe = 1\n"))
+                        .expect("configuration should be writable");
+                    assert!(
+                        wait_until(Duration::from_secs(15), || {
+                            read_notice(&world.state_root()).is_some()
+                        }),
+                        "the refusal is recorded"
+                    );
+                    assert!(!watcher.is_finished(), "the workers keep running");
+                    write(&alpha, "second.txt", "second");
+                    assert!(
+                        wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+                        "the session runs on under the refused edit"
+                    );
+                    // A good one loads, and the supervisor winds down for
+                    // the caller to run it.
+                    fs::write(
+                        &path,
+                        format!(
+                            "{one_group}\n[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                            notes.display(),
+                            notes_mirror.display()
+                        ),
+                    )
+                    .expect("configuration should be writable");
+                }
+                2 => {
+                    assert!(
+                        wait_until(Duration::from_secs(15), || {
+                            notes_mirror.join("todo.txt").exists()
+                        }),
+                        "the added group synchronizes"
+                    );
+                    write(&alpha, "third.txt", "third");
+                    assert!(
+                        wait_until(Duration::from_secs(15), || beta.join("third.txt").exists()),
+                        "the kept group runs on"
+                    );
+                    assert_eq!(
+                        read_notice(&world.state_root()),
+                        None,
+                        "the refusal is over"
+                    );
+                    stop.store(true, Ordering::Relaxed);
+                }
+                _ => unreachable!("two rounds"),
+            }
+            watcher
+                .join()
+                .expect("the watcher should stop cleanly")
+                .expect("supervision should succeed");
+            match reloader.take() {
+                Some(next) => loaded_plans = next.plans,
+                None => break,
+            }
+        }
+    });
+    assert_eq!(rounds, 2);
+}
+
+#[test]
 fn watch_mode_heals_after_a_destination_recovers() {
     let world = World::new();
     let alpha = world.directory("alpha");
@@ -2285,6 +2397,7 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
                 &alpha_state,
                 true,
                 &stop,
+                None,
             )
         });
 

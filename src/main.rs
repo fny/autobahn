@@ -1124,13 +1124,14 @@ fn check_startable(config: Option<PathBuf>) -> Result<()> {
             return Ok(());
         }
     }
-    let plans = load_config(config)
-        .context("the configuration would stop the supervisor at startup")?
-        .plans()
+    let path = match config {
+        Some(path) => path,
+        None => paths::default_config_path()?,
+    };
+    // The same checks the supervisor makes: at startup, and again on
+    // every edit while it runs.
+    autobahn::supervisor::reload::load(&path)
         .context("the configuration would stop the supervisor at startup")?;
-    if plans.is_empty() {
-        bail!("the configuration describes no sessions, so the supervisor would stop at startup");
-    }
     Ok(())
 }
 
@@ -1230,64 +1231,104 @@ fn run_watch(
             return autobahn::supervisor::peer::run(&directory, &state_root, !log, &stop);
         }
     }
-    let configuration = load_config(config)?;
-    let plans = configuration.plans()?;
-    if plans.is_empty() {
-        bail!("the configuration describes no sessions");
-    }
-    // Validated here so a misspelled state or an unreadable duration is a
-    // startup failure, not a silent no-op discovered on the night the
-    // alert was meant to fire.
-    let alerts = configuration.alert_plan()?;
-    // Peering, when any group asks for it. This machine is the configured
-    // alpha of every such group (the configuration says so), so it leads
-    // — unless its own lease file says a beta led while it was away.
-    let peering = plans.iter().any(|plan| plan.peering.is_some());
+    let mut loaded = autobahn::supervisor::reload::load(&config_path)?;
+    // The file is watched while the sessions run, unless it says not to.
+    let mut reloader = loaded.reload.then(|| {
+        Arc::new(autobahn::supervisor::reload::Reloader::new(
+            config_path.clone(),
+        ))
+    });
 
     // The level is settled before the first line is written. `--debug`
     // beats the file, and `AUTOBAHN_LOG` beats both, so a level can be
     // turned up for one run without editing anything.
     autobahn::logging::set_level(match debug {
         true => Some(autobahn::logging::Level::Debug),
-        false => configuration.log_level()?,
+        false => loaded.log_level,
     });
     let state_root = resolve_state_root(state_root)?;
 
     // Said before the first cycle, while someone is still looking at the
     // terminal. These sessions will stop on their own anyway; the point is
     // that the reader learns it now rather than from a status page later.
-    for (session, problem) in autobahn::supervisor::unreadable_ancestors(&plans, &state_root) {
+    for (session, problem) in autobahn::supervisor::unreadable_ancestors(&loaded.plans, &state_root)
+    {
         eprintln!("[{session}] {problem}");
     }
     let live_display = !log && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
 
-    if !live_display {
-        println!(
-            "supervising {} session(s); status is available via `autobahn status`",
-            plans.len()
-        );
-        // Runs until the process is terminated: agent processes exit when
-        // their connection streams close, so no explicit cleanup is needed.
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        if peering {
-            return autobahn::supervisor::peer::run_alpha(
-                &config_path,
-                &autobahn::peering::directory()?,
-                &plans,
-                &alerts,
-                &state_root,
-                true,
-                &stop,
-            );
+    // What the display draws: replaced when an edit to the configuration
+    // is applied, so the sessions it shows are the ones running.
+    let shown: Arc<Mutex<Vec<autobahn::config::SessionPlan>>> =
+        Arc::new(Mutex::new(loaded.plans.clone()));
+
+    // Runs the configuration, and then every edit that loads, until the
+    // process is terminated: agent processes exit when their connection
+    // streams close, so no explicit cleanup is needed.
+    let sessions = loaded.plans.len();
+    let mut supervise = {
+        let shown = shown.clone();
+        let state_root = state_root.clone();
+        move |verbose: bool| -> Result<()> {
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            loop {
+                // Peering, when any group asks for it. This machine is the
+                // configured alpha of every such group (the configuration
+                // says so), so it leads — unless its own lease file says a
+                // beta led while it was away.
+                let peering = loaded.plans.iter().any(|plan| plan.peering.is_some());
+                if peering {
+                    autobahn::supervisor::peer::run_alpha(
+                        &config_path,
+                        &autobahn::peering::directory()?,
+                        &loaded.plans,
+                        &loaded.alerts,
+                        &state_root,
+                        verbose,
+                        &stop,
+                        reloader.as_ref(),
+                    )?;
+                } else {
+                    Supervisor::new(loaded.plans.clone(), state_root.clone(), verbose)
+                        .with_alerts(loaded.alerts.clone())
+                        .with_reload(reloader.clone())
+                        .run_watch(&stop)?;
+                }
+                let Some(next) = reloader.as_ref().and_then(|reloader| reloader.take()) else {
+                    return Ok(());
+                };
+                autobahn::logging::set_level(match debug {
+                    true => Some(autobahn::logging::Level::Debug),
+                    false => next.log_level,
+                });
+                for (session, problem) in
+                    autobahn::supervisor::unreadable_ancestors(&next.plans, &state_root)
+                {
+                    autobahn::complain!("[{session}] {problem}");
+                }
+                autobahn::note!(
+                    "supervising {} session(s) under the edited configuration",
+                    next.plans.len()
+                );
+                // An edit that turns the watch off is the last one applied
+                // in place; turning it back on lands on `restart`.
+                if !next.reload {
+                    reloader = None;
+                }
+                *shown.lock().unwrap_or_else(|error| error.into_inner()) = next.plans.clone();
+                loaded = next;
+            }
         }
-        let supervisor = Supervisor::new(plans, state_root, true).with_alerts(alerts);
-        return supervisor.run_watch(&stop);
+    };
+
+    if !live_display {
+        println!("supervising {sessions} session(s); status is available via `autobahn status`");
+        return supervise(true);
     }
 
     // The supervisor runs on its own thread and writes status records as
     // it goes; this thread reads them back and repaints. The records are
     // the same ones `autobahn status` reads, so the two never disagree.
-    let display_plans = plans.clone();
     let display_root = state_root.clone();
     // A supervisor that fails has nothing left to display, so it asks the
     // display to leave and hands its failure back here to be reported —
@@ -1296,32 +1337,20 @@ fn run_watch(
     let failure: Arc<Mutex<Option<String>>> = Arc::default();
     let reported = failure.clone();
     std::thread::spawn(move || {
-        let stop = std::sync::atomic::AtomicBool::new(false);
-        let outcome = match peering {
-            true => autobahn::peering::directory().and_then(|directory| {
-                autobahn::supervisor::peer::run_alpha(
-                    &config_path,
-                    &directory,
-                    &plans,
-                    &alerts,
-                    &state_root,
-                    false,
-                    &stop,
-                )
-            }),
-            false => Supervisor::new(plans, state_root, false)
-                .with_alerts(alerts)
-                .run_watch(&stop),
-        };
-        if let Err(error) = outcome {
+        if let Err(error) = supervise(false) {
             *reported.lock().unwrap_or_else(|error| error.into_inner()) =
                 Some(format!("{error:#}"));
             pager::leave();
         }
     });
 
-    let selected: Vec<&autobahn::config::SessionPlan> = display_plans.iter().collect();
-    run_live_display(&selected, &display_root, expand_conflicts, "watching")?;
+    pager::display("watching", || {
+        let plans = shown.lock().unwrap_or_else(|error| error.into_inner());
+        let selected: Vec<&autobahn::config::SessionPlan> = plans.iter().collect();
+        let mut frame = String::new();
+        render_status(&selected, &display_root, expand_conflicts, true, &mut frame);
+        frame
+    })?;
     // Taken into a binding of its own, so the lock is released before the
     // match rather than held across it.
     let failure = failure
@@ -3164,6 +3193,19 @@ fn render_status(
             out,
             "\x1b[33mno supervisor is running\x1b[0m; what follows is the state \
              last recorded, not what is happening now\n{remedy}\n"
+        );
+    }
+    // The supervisor's own word on the file, when it refused an edit: the
+    // sessions below run on under the configuration that last loaded.
+    if let Some(notice) = reported
+        .as_ref()
+        .and(autobahn::supervisor::reload::read_notice(state_root))
+    {
+        let _ = writeln!(
+            out,
+            "\x1b[33mthe configuration was refused\x1b[0m; the sessions run on under \
+             the last one that loaded\n{}\n",
+            notice.message
         );
     }
 

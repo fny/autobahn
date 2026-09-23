@@ -75,6 +75,17 @@ def find_tainted(records):
             # The offered load was not what the report claims; every
             # latency sample this tool-run produced is suspect.
             tainted.setdefault(key, "background_load_failure")
+        elif kind == "job_start" and "destinations" in record:
+            # A job that ran with more destinations than its cell asked
+            # for was a different cell — a fan-out under a pairwise name.
+            # This is what turned six jobs of bench-1789947877 into 10x
+            # anomalies before the record existed to say so.
+            wanted = record.get("spec", {}).get("cell", {}).get("betas")
+            got = len(record["destinations"])
+            if wanted is not None and got != wanted:
+                for tool in record.get("spec", {}).get("tools", []):
+                    tainted[(record.get("job"), tool)] = (
+                        f"destination_width_mismatch:{got}_of_{wanted}")
         elif kind == "job_complete":
             # The driver's verdict covers the whole tool-run: a workload
             # error in either direction taints every latency sample that
@@ -149,6 +160,14 @@ def main():
         kind = record.get("measurement")
         if kind in ("tool_error", "hygiene_failure", "abort", "corrupt_line"):
             problems.append(record)
+        elif kind == "job_start" and "destinations" in record and (
+            len(record["destinations"])
+            != record.get("spec", {}).get("cell", {}).get("betas")
+        ):
+            problems.append({"measurement": "destination_width_mismatch",
+                             "cell": record.get("cell"), "job": record.get("job"),
+                             "destinations": record["destinations"],
+                             "betas": record.get("spec", {}).get("cell", {}).get("betas")})
         elif kind == "workload" and (
             "error" in record or record.get("censored")
             or record.get("background_write_errors")
@@ -272,6 +291,21 @@ def main():
                     resources[key]["peak_rss_kb"].append(sliced["peak_rss_kb"])
                     resources[key]["cpu"].append(sliced["cpu_percent_of_core"])
 
+    # Bursts: the wall time until a module copied in has landed, per run
+    # the median of its bursts, and autobahn's own cycle seconds beside it.
+    bursts = defaultdict(lambda: {"wall": [], "cycle": [], "files": 0})
+    for record in records:
+        if record.get("measurement") != "burst" or run_key(record) in tainted:
+            continue
+        walls = [w for w in record.get("walls_s", []) if isinstance(w, (int, float))]
+        key = (record["cell"], record["tool"])
+        if walls:
+            bursts[key]["wall"].append(statistics.median(walls))
+        cycles = record.get("cycle_seconds") or []
+        if cycles:
+            bursts[key]["cycle"].append(statistics.median(cycles))
+        bursts[key]["files"] = record.get("files_per_burst", 0)
+
     floors = [r for r in records
               if r.get("measurement") == "floor" and isinstance(r.get("p50_ms"), (int, float))]
 
@@ -287,6 +321,14 @@ def main():
                 "count_matched": median_spread(values["count_matched"]),
             }
             for (cell, tool, corpus), values in sorted(cold.items())
+        },
+        "burst_s": {
+            f"{cell}/{tool}": {
+                "files": values["files"],
+                "wall": median_spread(values["wall"]),
+                "cycle_seconds": median_spread(values["cycle"]) if values["cycle"] else None,
+            }
+            for (cell, tool), values in sorted(bursts.items())
         },
         "resources": {
             f"{cell}/{tool}/{phase}/{host}": {

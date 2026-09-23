@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -578,7 +579,10 @@ def start_tool(tool, corpora):
         # used to leave nothing to diagnose: chromium-1-bidir collapsed on
         # one repeat in four, and by the time it was noticed the next job
         # on that pair had overwritten the only log that could explain it.
-        run(f"setsid nohup {HOME}/autobahn watch --config {HOME}/ab.toml "
+        # --debug, for the cycle timings a burst cell reads back; the level
+        # logs only cycles that moved something or took long, so the log
+        # stays small for every other cell.
+        run(f"setsid nohup {HOME}/autobahn watch --debug --config {HOME}/ab.toml "
             f"> {HOME}/logs/{job_label()}-autobahn.log 2>&1 < /dev/null &")
     elif tool == "mutagen":
         run(f"{HOME}/mutagen daemon start", check=True)
@@ -634,6 +638,57 @@ def verify_partitions(corpora):
         verify = peer(f"{BINARY} verify-partitions {partitions}")
         if verify.returncode != 0:
             raise RuntimeError(f"peer partition verification failed: {verify.stdout[-300:]}")
+
+
+BURST_REPEATS = 5
+BURST_TIMEOUT_SECONDS = 600
+
+
+def run_burst(cell, emitter, tool):
+    """A burst of new files, several times: one top-level module of each
+    corpus copied in beside the others, and the wall time until every
+    destination holds it, by manifest. Coarse — a manifest pass is on the
+    order of a tenth of a second on a large tree — so autobahn's own cycle
+    timings from its debug log are recorded too, when the log has them."""
+    corpora = cell["corpora"]
+    walls, cycle_seconds, files = [], [], 0
+    log = f"{HOME}/logs/{job_label()}-autobahn.log"
+    for repeat in range(BURST_REPEATS):
+        before = 0
+        if tool == "autobahn" and os.path.exists(log):
+            with open(log) as handle:
+                before = sum(1 for _ in handle)
+        for corpus in corpora:
+            source = f"{CORPUS}/{corpus}"
+            module = sorted(
+                name for name in os.listdir(source)
+                if os.path.isdir(os.path.join(source, name)) and not name.startswith(".")
+            )[0]
+            if repeat == 0:
+                files += sum(len(f) for _, _, f in os.walk(os.path.join(source, module)))
+            run(f"cp -r {source}/{module} {source}/burst-{repeat}", check=True)
+        started = time.time()
+        expected = {corpus: summary("cheap", f"{CORPUS}/{corpus}", remote=False)
+                    for corpus in corpora}
+        landed = False
+        while time.time() - started < BURST_TIMEOUT_SECONDS:
+            if all(summary("cheap", f"{DEST}/{corpus}", remote=True) == expected[corpus]
+                   for corpus in corpora):
+                landed = True
+                break
+            time.sleep(0.05)
+        walls.append(round(time.time() - started, 3) if landed else None)
+        if tool == "autobahn" and os.path.exists(log):
+            time.sleep(1)
+            with open(log) as handle:
+                lines = handle.readlines()[before:]
+            seconds = [float(m.group(1)) for m in
+                       (re.search(r"cycle finished in ([0-9.]+)s", line) for line in lines)
+                       if m]
+            cycle_seconds.append(round(sum(seconds), 3))
+        time.sleep(2)
+    emitter.emit({"measurement": "burst", "tool": tool, "files_per_burst": files,
+                  "walls_s": walls, "cycle_seconds": cycle_seconds or None})
 
 
 def run_workload(cell, emitter, tool, nonce):
@@ -803,7 +858,12 @@ def run_tool(tool, cell, emitter, nonce):
         # A cell with no agents is measuring the first synchronization and
         # nothing else: there is no workload to run, and running one would
         # only add churn to a number that is about transfer.
-        if cell["agents"] == 0:
+        if cell.get("mode") == "burst":
+            phase("workload")
+            run_burst(cell, emitter, tool)
+            phase_end("workload")
+            clean, reports, outputs = True, [], []
+        elif cell["agents"] == 0:
             emitter.emit({"measurement": "workload", "tool": tool,
                           "direction": "none", "skipped": "cold sync only"})
             # No workload ran, so there is nothing to have gone wrong with
@@ -887,7 +947,7 @@ def main():
     # width is in force for the whole job and lands in the record below.
     global JOB_LABEL, WIDTH
     JOB_LABEL = spec["job"]
-    WIDTH = spec["cell"]["betas"]
+    WIDTH = spec["cell"].get("betas")
 
     identity = {key: spec[key] for key in ("run", "pair", "job", "repeat")}
     identity["cell"] = spec["cell"]["name"]

@@ -75,6 +75,13 @@ CELLS = [
     ("chromium-1-bidir", ["chromium"], 1, True, 1, True),
     ("chromium-10-bidir", ["chromium"], 10, True, 1, True),
     ("chromium-100-bidir", ["chromium"], 100, True, 1, True),
+    # A burst: one module of the corpus copied in beside the others, the
+    # time until it has landed, five times per job. What an unpacked
+    # archive or a checkout feels like — and where the manifest-polling
+    # measurement is too coarse (~100 ms), so the tool's own timing is
+    # recorded beside it. No editors.
+    ("50k-burst", ["sub50k"], 0, False, 1, True, "burst"),
+    ("chromium-burst", ["chromium"], 0, False, 1, True, "burst"),
     ("50k-1", ["sub50k"], 1, False, 1, True),
     ("50k-10", ["sub50k"], 10, False, 1, True),
     ("50k-100", ["sub50k"], 100, False, 1, True),

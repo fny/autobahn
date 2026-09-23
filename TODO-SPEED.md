@@ -41,18 +41,19 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 
 ## Coalescing and the cycle's own overhead
 
-- [ ] `await_activity`: `SETTLE = 100 ms`, `QUIET = 20 ms`. Examined once (2026-09-22); the settle is only paid by a burst, an isolated edit does not wait it out. Re-measure only if a cell's p50 moves toward 100 ms.
-- [ ] `MAXIMUM_FOLLOW_UP_CYCLES = 5`: a busy tree can spend five inner cycles before the outer cycle reports. Not a latency cost for the edit that started it; a throughput cost under a sustained burst. Measure with the 100-agent cells before changing.
+- [x] `SETTLE`/`QUIET` 100/20 → 25/5 ms. The earlier reading — "an isolated edit does not wait it out" — was wrong: every change pays one QUIET, and with several editors the tree is never quiet. Measured 2026-09-23: one editor p50 47 → 25 ms; ten editors 48 → 22; a hundred 114 → 53. A 1,000-file burst converges in the same wall time (0.4 s) in two cycles instead of one; with no window at all it takes three and half again the cycle work, and a hundred editors go to 41 ms — a possible further step if throughput under bursts is measured and found fine.
+- [x] `MAXIMUM_FOLLOW_UP_CYCLES = 5` stays. Measured at a hundred editors: 1 is slower (p50 +13 ms, p99 worse), 10 is within the spread. 
 - [ ] The extra cycle after every transition: the beta's own writes bump its generation, the watch fires, the next cycle scans and finds nothing. Cheap (an incremental scan of the paths just written), but it is one full round of endpoint requests per edit. The observer could record the generation its own transition produced and let the endpoint measure from there. Decide with idle-CPU and cycles-per-edit counts from the debug log, not latency.
 
 ## Fan-out
 
-- [ ] Ten sessions to ten betas share one alpha scan (the root observer) but each stages and transfers the same content ten times from the alpha. `two50k-10-fan` and `chromium-10-fan` are the cells; the supply side could serve one read to N pushes. Big change (the design notes in memory call it tiered alpha-sharing); measure the fan cells' cold sync and p50 first to see how much of the 10× is the alpha's read.
-- [ ] Two scans per cycle each take a thread budget of 8; a fan-out group's N sessions on an 8-core alpha can start 8N walk threads on a cold start. The budget should probably be per process, not per scan. Measure `chromium-10-fan` cold sync with a process-wide budget of 8 vs today.
+- [x] Measured 2026-09-23. On the 0.4.0 matrix (separate machines), ten destinations cost 1.3× (Chromium, 420 → 564 s) to 1.5× (50k, 49 → 75 s) the single-destination first sync, and 2.8× on the 5k tree where per-session startup dominates (6.8 → 19 s; mutagen 9 s). Not superlinear; not worth a shared-supply redesign. Ten betas on *one* box take 35× — one disk and eight cores — and that is the same with the 0.4.0 binary and with the thread caps forced to 1, so it is not the parallel walk or apply either.
+- [ ] Per-session startup on small trees is where a fan-out is behind mutagen (5k-fan). Measure what the first cycle of each session spends on first contact before guessing.
+- [ ] The scan and apply thread budgets are per call, not per process, so N sessions can start 8N threads; the local 10-beta run says it does not matter on 8 cores, since capping at 1 changed nothing. Leave it until a measurement says otherwise.
 
 ## Idle
 
-- [ ] Idle is now one watch request every 2 s per remote session (`WATCH_REQUEST_MAX`), against four a second before. The cap is there so a watch outliving its endpoint releases its channel; a close on the watch channel from the endpoint's drop would let the request run the whole heartbeat. Measure idle CPU on both ends with 10 sessions before and after; the README's "0.2% of a core" is the number to hold.
+- [x] Idle measured 2026-09-23, one session with a remote beta over ssh, 60 s: controller 0.33% → 0.30% of a core, agent 0.03% → 0.02% (old alternating wait → standing watch). Unchanged, and consistent with the README's figure.
 - [ ] The 120 s full walk on the beta host is now an 8-thread burst every two minutes. Fine on a build box, worth a look on a laptop on battery: measure with `powermetrics` on the Mac.
 
 ## The harness — so the above can be measured honestly

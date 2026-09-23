@@ -227,10 +227,11 @@ fn build_tree(root: &Path) {
 }
 
 /// All four synchronization modes.
-const ALL_MODES: [SyncMode; 5] = [
+const ALL_MODES: [SyncMode; 6] = [
     SyncMode::TwoWaySafe,
     SyncMode::TwoWayParanoid,
     SyncMode::TwoWayResolved,
+    SyncMode::TwoWayStrict,
     SyncMode::OneWaySafe,
     SyncMode::OneWayReplica,
 ];
@@ -295,7 +296,10 @@ fn beta_addition_semantics_by_mode() {
         harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved => {
+            SyncMode::TwoWaySafe
+            | SyncMode::TwoWayParanoid
+            | SyncMode::TwoWayResolved
+            | SyncMode::TwoWayStrict => {
                 assert!(alpha_added.exists(), "{mode:?}: addition should propagate");
                 harness.assert_trees_equal("beta addition");
             }
@@ -329,7 +333,10 @@ fn beta_modification_semantics_by_mode() {
         let report = harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved => {
+            SyncMode::TwoWaySafe
+            | SyncMode::TwoWayParanoid
+            | SyncMode::TwoWayResolved
+            | SyncMode::TwoWayStrict => {
                 let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
                 assert_eq!(alpha_content, "modified on beta", "{mode:?}");
                 harness.assert_trees_equal("beta modification");
@@ -1195,28 +1202,41 @@ mod collisions {
     #[test]
     fn a_write_on_beta_racing_a_deletion_keeps_the_edit() {
         for transport in BOTH {
-            let context = format!("{transport:?}");
-            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
-            harness.cycle_ok();
+            for (mode, strict) in [
+                (SyncMode::TwoWaySafe, false),
+                (SyncMode::TwoWayResolved, false),
+                (SyncMode::TwoWayStrict, true),
+            ] {
+                let context = format!("{transport:?}/{mode:?}");
+                let mut harness = Harness::new(mode, transport);
+                build_tree(&harness.alpha);
+                harness.cycle_ok();
 
-            fs::remove_file(harness.alpha.join(PATH)).unwrap();
-            let beta = harness.beta.clone();
-            let report = harness
-                .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                    fs::write(beta.join(PATH), "beta edit").unwrap()
-                })
-                .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-            assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
-            assert!(
-                report.beta_transition_problems.iter().any(|p| p.path == PATH),
-                "{context}: the refusal was not reported"
-            );
+                fs::remove_file(harness.alpha.join(PATH)).unwrap();
+                let beta = harness.beta.clone();
+                let report = harness
+                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                        fs::write(beta.join(PATH), "beta edit").unwrap()
+                    })
+                    .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+                // Refused in every mode: the racing cycle never deletes
+                // what it did not validate. The mode decides next cycle.
+                assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
+                assert!(
+                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    "{context}: the refusal was not reported"
+                );
 
-            harness.settle(&context);
-            assert_eq!(read(&harness.alpha), "beta edit", "{context}");
-            assert_eq!(read(&harness.beta), "beta edit", "{context}");
-            harness.assert_trees_equal(&context);
+                harness.settle(&context);
+                if strict {
+                    assert!(!exists(&harness.alpha, PATH), "{context}: the deletion was undone");
+                    assert!(!exists(&harness.beta, PATH), "{context}: the edit survived");
+                } else {
+                    assert_eq!(read(&harness.alpha), "beta edit", "{context}");
+                    assert_eq!(read(&harness.beta), "beta edit", "{context}");
+                }
+                harness.assert_trees_equal(&context);
+            }
         }
     }
 
@@ -1387,33 +1407,52 @@ mod collisions {
     fn a_file_edited_on_beta_while_alpha_renames_it() {
         const RENAMED: &str = "dir1/nested/file1-renamed.txt";
         for transport in BOTH {
-            let context = format!("{transport:?}");
-            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
-            harness.cycle_ok();
+            for (mode, strict) in [
+                (SyncMode::TwoWaySafe, false),
+                (SyncMode::TwoWayResolved, false),
+                (SyncMode::TwoWayStrict, true),
+            ] {
+                let context = format!("{transport:?}/{mode:?}");
+                let mut harness = Harness::new(mode, transport);
+                build_tree(&harness.alpha);
+                harness.cycle_ok();
 
-            fs::rename(harness.alpha.join(PATH), harness.alpha.join(RENAMED)).unwrap();
-            let beta = harness.beta.clone();
-            let report = harness
-                .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                    fs::write(beta.join(PATH), "beta edit").unwrap()
-                })
-                .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-            assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
-            assert_eq!(
-                fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
-                "content 1/1",
-                "{context}: the new name did not arrive"
-            );
-            assert!(
-                report.beta_transition_problems.iter().any(|p| p.path == PATH),
-                "{context}: the refusal was not reported"
-            );
+                fs::rename(harness.alpha.join(PATH), harness.alpha.join(RENAMED)).unwrap();
+                let beta = harness.beta.clone();
+                let report = harness
+                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                        fs::write(beta.join(PATH), "beta edit").unwrap()
+                    })
+                    .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+                // The racing cycle refuses in every mode: the edit is not
+                // the file the deletion was validated against.
+                assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
+                assert_eq!(
+                    fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
+                    "content 1/1",
+                    "{context}: the new name did not arrive"
+                );
+                assert!(
+                    report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                    "{context}: the refusal was not reported"
+                );
 
-            harness.settle(&context);
-            assert_eq!(read(&harness.alpha), "beta edit", "{context}");
-            assert!(exists(&harness.alpha, RENAMED) && exists(&harness.beta, RENAMED), "{context}");
-            harness.assert_trees_equal(&context);
+                harness.settle(&context);
+                if strict {
+                    // Alpha's deletion is final: the rename stands, the
+                    // edit is gone.
+                    assert!(!exists(&harness.alpha, PATH), "{context}: the rename was undone");
+                    assert!(!exists(&harness.beta, PATH), "{context}: the edit survived");
+                } else {
+                    // The edit beats the deletion: the rename is undone.
+                    assert_eq!(read(&harness.alpha), "beta edit", "{context}");
+                }
+                assert!(
+                    exists(&harness.alpha, RENAMED) && exists(&harness.beta, RENAMED),
+                    "{context}"
+                );
+                harness.assert_trees_equal(&context);
+            }
         }
     }
 

@@ -296,7 +296,10 @@ impl Reconciler {
 
         // Alpha and beta disagree at this path; dispatch by mode.
         match self.mode {
-            SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved => {
+            SyncMode::TwoWaySafe
+            | SyncMode::TwoWayParanoid
+            | SyncMode::TwoWayResolved
+            | SyncMode::TwoWayStrict => {
                 self.handle_disagreement_bidirectional(path, ancestor, alpha, beta)
             }
             SyncMode::OneWaySafe => {
@@ -465,6 +468,28 @@ impl Reconciler {
             }
             return;
         } else if alpha_non_deletion.is_empty() {
+            // Alpha only deleted here, and beta edited or added. The edit
+            // wins: a deletion carries nothing to weigh against it, and
+            // letting it win would destroy the only copy. In the strict
+            // mode alpha's deletion is final, and beta is made to match.
+            if self.mode == SyncMode::TwoWayStrict {
+                let beta_unsynchronizable =
+                    blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
+                if !beta_unsynchronizable.is_empty() {
+                    self.result.conflicts.push(Conflict {
+                        root: path.to_owned(),
+                        alpha_changes: alpha_diff,
+                        beta_changes: beta_unsynchronizable,
+                    });
+                } else {
+                    self.result.beta_transitions.push(Change {
+                        path: path.to_owned(),
+                        old: beta_sync,
+                        new: alpha_sync,
+                    });
+                }
+                return;
+            }
             let alpha_unsynchronizable = blocking(
                 beta_sync.as_ref(),
                 diff_at(path, alpha_sync.as_ref(), alpha),
@@ -1059,6 +1084,42 @@ mod tests {
             .as_ref()
             .unwrap()
             .content_equal(alpha.child("a").unwrap(), true));
+    }
+
+    #[test]
+    fn strict_lets_an_alpha_deletion_beat_a_beta_edit() {
+        let ancestor = dir("", vec![file("a", 1, false), file("b", 1, false)]);
+        let alpha = dir("", vec![file("b", 1, false)]);
+        let beta = dir("", vec![file("a", 2, false), file("b", 1, false)]);
+        // Every other two-way mode brings the edit back to alpha.
+        for mode in [SyncMode::TwoWaySafe, SyncMode::TwoWayResolved] {
+            let result = reconcile(Some(&ancestor), Some(&alpha), Some(&beta), mode);
+            assert!(result.conflicts.is_empty(), "{mode:?}");
+            assert_eq!(result.alpha_transitions.len(), 1, "{mode:?}");
+            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+        }
+        // Strict removes it from beta.
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&alpha),
+            Some(&beta),
+            SyncMode::TwoWayStrict,
+        );
+        assert!(result.conflicts.is_empty());
+        assert!(result.alpha_transitions.is_empty());
+        assert_eq!(result.beta_transitions.len(), 1);
+        assert_eq!(result.beta_transitions[0].path, "a");
+        assert!(result.beta_transitions[0].new.is_none());
+        // And still carries a beta addition to alpha, as any two-way mode.
+        let beta = dir("", vec![file("b", 1, false), file("c", 5, false)]);
+        let result = reconcile(
+            Some(&ancestor),
+            Some(&alpha),
+            Some(&beta),
+            SyncMode::TwoWayStrict,
+        );
+        assert_eq!(result.alpha_transitions.len(), 1);
+        assert_eq!(result.alpha_transitions[0].path, "c");
     }
 
     #[test]

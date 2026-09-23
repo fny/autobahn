@@ -85,6 +85,9 @@ enum ModeArgument {
     /// version, silently.
     #[value(name = "two-way-alpha", alias = "two-way-resolved")]
     TwoWayResolved,
+    /// two-way-alpha, and alpha's deletion of a file beta edited wins too.
+    #[value(name = "two-way-alpha-strict")]
+    TwoWayStrict,
     /// Alpha to beta; a change beta made itself is kept and reported as a
     /// conflict.
     #[value(name = "one-way-conflict", alias = "one-way-safe")]
@@ -101,6 +104,7 @@ impl From<ModeArgument> for SyncMode {
             ModeArgument::TwoWaySafe => SyncMode::TwoWaySafe,
             ModeArgument::TwoWayParanoid => SyncMode::TwoWayParanoid,
             ModeArgument::TwoWayResolved => SyncMode::TwoWayResolved,
+            ModeArgument::TwoWayStrict => SyncMode::TwoWayStrict,
             ModeArgument::OneWaySafe => SyncMode::OneWaySafe,
             ModeArgument::OneWayReplica => SyncMode::OneWayReplica,
         }

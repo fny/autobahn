@@ -72,6 +72,8 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 #   two-way-paranoid   as above, and a large directory that turns up empty
 #                      on one side is a conflict, not a deletion to copy
 #   two-way-alpha      both ways; alpha's version wins a clash, silently
+#   two-way-alpha-strict  as above, and alpha's deletion of a file beta
+#                      edited wins too (in two-way-alpha the edit survives)
 #   one-way-conflict   alpha to beta; an edit on beta is reported, not overwritten
 #   one-way-alpha      alpha to beta; beta is made identical (also spelled "mirror")
 #
@@ -1311,7 +1313,10 @@ impl Config {
             if alpha {
                 matches!(
                     plan.mode,
-                    SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid | SyncMode::TwoWayResolved
+                    SyncMode::TwoWaySafe
+                        | SyncMode::TwoWayParanoid
+                        | SyncMode::TwoWayResolved
+                        | SyncMode::TwoWayStrict
                 )
             } else {
                 true
@@ -1533,6 +1538,9 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
         // large directory going empty or missing on one side.
         "two-way-paranoid" => Ok((SyncMode::TwoWayParanoid, false)),
         "two-way-alpha" | "two-way-resolved" => Ok((SyncMode::TwoWayResolved, false)),
+        // Off the grid: two-way-alpha with its one exception removed —
+        // alpha's deletion beats beta's edit, instead of yielding to it.
+        "two-way-alpha-strict" => Ok((SyncMode::TwoWayStrict, false)),
         "one-way-conflict" | "one-way-safe" => Ok((SyncMode::OneWaySafe, false)),
         // "mirror" is what everyone calls this shape (rsync --delete), so
         // it is accepted too.
@@ -1543,8 +1551,8 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
         "peering-alpha-experimental" => Ok((SyncMode::TwoWayResolved, true)),
         other => Err(format!(
             "unknown mode '{other}' (expected one of: two-way-conflict, two-way-paranoid, \
-             two-way-alpha, one-way-conflict, one-way-alpha, peering-conflict-experimental, \
-             peering-alpha-experimental)"
+             two-way-alpha, two-way-alpha-strict, one-way-conflict, one-way-alpha, \
+             peering-conflict-experimental, peering-alpha-experimental)"
         )),
     }
 }
@@ -1555,6 +1563,7 @@ pub fn mode_name(mode: SyncMode) -> &'static str {
         SyncMode::TwoWaySafe => "two-way-conflict",
         SyncMode::TwoWayParanoid => "two-way-paranoid",
         SyncMode::TwoWayResolved => "two-way-alpha",
+        SyncMode::TwoWayStrict => "two-way-alpha-strict",
         SyncMode::OneWaySafe => "one-way-conflict",
         SyncMode::OneWayReplica => "one-way-alpha",
     }

@@ -104,6 +104,14 @@ pub enum SyncMode {
     /// Bidirectional synchronization that resolves conflicts in alpha's
     /// favor.
     TwoWayResolved,
+    /// `TwoWayResolved` without its one exception: alpha wins every
+    /// collision, including one where alpha's side of it is a deletion.
+    /// In `TwoWayResolved` a deletion never beats an edit, since it
+    /// carries no content to weigh against one; here alpha's word is
+    /// final, and what beta edited under a name alpha removed is removed
+    /// on beta too. Beta's own additions still flow to alpha, which is
+    /// what keeps this two-way.
+    TwoWayStrict,
     /// Unidirectional (alpha to beta) synchronization that refuses to
     /// overwrite or reverse-propagate beta-side changes.
     OneWaySafe,

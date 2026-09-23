@@ -8,7 +8,7 @@ A mode is a direction and a policy. The direction is whether changes flow both w
 | **one-way** | `one-way-conflict` | `one-way-alpha` |
 | **peering** (experimental) | `peering-conflict-experimental` | `peering-alpha-experimental` |
 
-Off the grid there is one more, `two-way-paranoid`: `two-way-conflict` that also refuses to trust a large directory going empty or missing on one side. See [Large directories](#large-directories) below.
+Off the grid there are two more. `two-way-paranoid` is `two-way-conflict` that also refuses to trust a large directory going empty or missing on one side; see [Large directories](#large-directories) below. `two-way-alpha-strict` is `two-way-alpha` with its one exception removed: alpha wins every collision, including when alpha's side of it is a deletion; see [Deletions against edits](#deletions-against-edits) below.
 
 There is no default. Direction is never guessed, so a group (or the defaults) must say which it wants.
 
@@ -20,21 +20,23 @@ There is no default. Direction is never guessed, so a group (or the defaults) mu
 | `two-way-paranoid` | As above, and a disk that unmounts mid-session must not empty the other side. |
 | `peering-conflict-experimental` | As `two-way-conflict`, and a beta takes the lead while the alpha is away. See [Peering](./peering.md). |
 | `two-way-alpha` | You edit on both sides but alpha is the truth when they collide. |
+| `two-way-alpha-strict` | As above, and when alpha deletes something beta was editing, it stays deleted. |
 | `one-way-conflict` | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
 | `one-way-alpha` | Backups, artifact distribution — beta should be *identical*. Also spelled `mirror`. |
 
 ## What each mode actually does
 
-The modes differ only in six situations. Everything else — an unchanged file, a new file on alpha, a rename — behaves identically in all four.
+The modes differ only in seven situations. Everything else — an unchanged file, a new file on alpha, a rename — behaves identically in all of them.
 
-| | `two-way-conflict` | `two-way-alpha` | `one-way-conflict` | `one-way-alpha` |
-|---|---|---|---|---|
-| Alpha edits a file | → beta | → beta | → beta | → beta |
-| Beta edits a file | → alpha | → alpha | stays on beta, **reported as a conflict** | **overwritten** from alpha |
-| Both edit the same file | **conflict**; both sides keep their own | alpha's version wins, silently | **conflict**; both sides keep their own | alpha's version wins, silently |
-| Alpha deletes a file | → beta | → beta | → beta | → beta |
-| Beta creates a new file | kept | kept | kept | **deleted** |
-| Beta deletes a file | → alpha | → alpha | restored from alpha | restored from alpha |
+| | `two-way-conflict` | `two-way-alpha` | `two-way-alpha-strict` | `one-way-conflict` | `one-way-alpha` |
+|---|---|---|---|---|---|
+| Alpha edits a file | → beta | → beta | → beta | → beta | → beta |
+| Beta edits a file | → alpha | → alpha | → alpha | stays on beta, **reported as a conflict** | **overwritten** from alpha |
+| Both edit the same file | **conflict**; both sides keep their own | alpha's version wins, silently | alpha's version wins, silently | **conflict**; both sides keep their own | alpha's version wins, silently |
+| Alpha deletes a file | → beta | → beta | → beta | → beta | → beta |
+| Alpha deletes a file beta edited | beta's edit comes back to alpha | beta's edit comes back to alpha | **deleted on beta too** | beta's edit comes back to alpha | **deleted on beta too** |
+| Beta creates a new file | kept | kept | kept | kept | **deleted** |
+| Beta deletes a file | → alpha | → alpha | → alpha | restored from alpha | restored from alpha |
 
 Three things in that table surprise people:
 
@@ -43,6 +45,12 @@ Three things in that table surprise people:
 **`one-way-alpha` deletes files it has never seen.** Beta is made *identical* to alpha, so logs, caches, and anything else generated on beta are removed. Never point it at a directory the far side also writes to.
 
 **Deletions propagate in every mode**, including the one-way ones — deleting on alpha deletes on beta. What varies is only the reverse direction. (A sync root that empties or vanishes on one side halts the session instead, in every mode; see the [safety rules](./safety.md).)
+
+## Deletions against edits
+
+A deletion carries no content, so when one side deletes a file the other side edited, there is nothing to weigh alpha's version against — and letting the deletion win destroys the only copy of the edit. So in `two-way-alpha`, as in `two-way-conflict`, the edit wins: it comes back to the side that deleted. This is the one collision `two-way-alpha` does not hand to alpha, and it shows up most often as a rename: alpha renames a file (a deletion plus a creation) while beta is editing it, and the old name reappears on alpha with beta's edit.
+
+`two-way-alpha-strict` removes the exception. Alpha's deletion is final, and beta's edit under that name is removed with it; a rename on alpha stands. Beta's own additions still flow to alpha, which is what separates it from `one-way-alpha`. Reach for it when alpha is the one place edits are meant to happen and beta's are mistakes to be corrected, not work to be kept.
 
 The earlier spellings — `two-way-safe`, `two-way-resolved`, `one-way-safe`, `one-way-replica` — are still accepted, so existing configurations keep working.
 

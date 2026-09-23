@@ -17,13 +17,13 @@ use autobahn::endpoint::remote::RemoteEndpoint;
 use autobahn::endpoint::Endpoint;
 use autobahn::protocol::Initialize;
 use autobahn::scan::{IgnoreSet, SymlinkMode};
-use autobahn::session::{CycleReport, SafetyHalt, Session};
+use autobahn::session::{CyclePoint, CycleReport, SafetyHalt, Session};
 use autobahn::transport::Connection;
 use autobahn::tree::SyncMode;
 mod common;
 
 /// The transports a scenario can run over.
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Transport {
     /// Both endpoints in-process.
     Local,
@@ -72,6 +72,42 @@ impl Harness {
     /// Runs one synchronization cycle through a freshly constructed session
     /// (proving that all cross-cycle state lives in persisted form).
     fn cycle(&mut self) -> anyhow::Result<CycleReport> {
+        self.session()?.run_cycle()
+    }
+
+    /// Runs one cycle with `action` performed at `point` of it — the seam
+    /// through which a collision is placed exactly where it is dangerous.
+    fn cycle_at(
+        &mut self,
+        point: CyclePoint,
+        mut action: impl FnMut() + Send + 'static,
+    ) -> anyhow::Result<CycleReport> {
+        let mut session = self.session()?;
+        session.set_cycle_hook(Box::new(move |at| {
+            if at == point {
+                action();
+            }
+        }));
+        session.run_cycle()
+    }
+
+    /// Cycles until a cycle changes nothing, and returns how many it took.
+    /// A collision can leave a cycle with a refusal to redo, or content to
+    /// fetch again; this is what the supervisor would do about it.
+    fn settle(&mut self, context: &str) -> usize {
+        for cycles in 1..=5 {
+            let report = self.cycle().unwrap_or_else(|e| panic!("{context}: cycle {cycles}: {e:#}"));
+            if !report.changed() && report.beta_transition_problems.is_empty()
+                && report.alpha_transition_problems.is_empty()
+                && !report.missing_staged_files
+            {
+                return cycles;
+            }
+        }
+        panic!("{context}: not settled after five cycles");
+    }
+
+    fn session(&mut self) -> anyhow::Result<Session> {
         self.session_counter += 1;
         let alpha_endpoint: Box<dyn Endpoint + Send> = Box::new(
             LocalEndpoint::new(
@@ -126,9 +162,7 @@ impl Harness {
                 )
             }
         };
-        let mut session =
-            Session::new(alpha_endpoint, beta_endpoint, self.mode, self.state.clone())?;
-        session.run_cycle()
+        Session::new(alpha_endpoint, beta_endpoint, self.mode, self.state.clone())
     }
 
     fn cycle_ok(&mut self) -> CycleReport {
@@ -994,4 +1028,225 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
         format!("{error:#}").contains("not a file peering pushes"),
         "{error:#}"
     );
+}
+
+/// Collisions: a write landing on one side while a cycle is part-way
+/// through moving content there. Every scenario places the write at an
+/// exact point of the cycle through the session's hook, over both
+/// transports, and asserts the contract — the late write is never
+/// silently overwritten; what happens to it next is the mode's rule.
+mod collisions {
+    use super::*;
+
+    const BOTH: [Transport; 2] = [Transport::Local, Transport::Agent];
+    const PATH: &str = "dir1/nested/file1.txt";
+
+    fn read(root: &Path) -> String {
+        fs::read_to_string(root.join(PATH)).unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+    }
+
+    /// Alpha's edit is on its way to beta; beta is edited after its scan
+    /// and before the publish. The publish must refuse — the file on disk
+    /// is not the one the transition was validated against — and the
+    /// next cycle sees two edits of one file: a conflict in safe mode,
+    /// alpha's version in resolved mode.
+    #[test]
+    fn a_write_on_beta_before_its_publish_is_refused_not_overwritten() {
+        for transport in BOTH {
+            for point in [CyclePoint::AfterScans, CyclePoint::BeforeBetaTransition] {
+                for (mode, alpha_wins) in [
+                    (SyncMode::TwoWaySafe, false),
+                    (SyncMode::TwoWayResolved, true),
+                ] {
+                    let context = format!("{transport:?}/{point:?}/{mode:?}");
+                    let mut harness = Harness::new(mode, transport);
+                    build_tree(&harness.alpha);
+                    harness.cycle_ok();
+
+                    fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
+                    let beta = harness.beta.clone();
+                    let report = harness
+                        .cycle_at(point, move || fs::write(beta.join(PATH), "beta late").unwrap())
+                        .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+
+                    // The late write survived the cycle that raced it.
+                    assert_eq!(read(&harness.beta), "beta late", "{context}: overwritten");
+                    assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
+                    assert!(
+                        report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                        "{context}: the refusal was not reported: {:?}",
+                        report.beta_transition_problems
+                    );
+
+                    // Then the mode decides.
+                    let report = harness.cycle_ok();
+                    if alpha_wins {
+                        assert!(report.conflicts.is_empty(), "{context}");
+                        harness.settle(&context);
+                        assert_eq!(read(&harness.beta), "alpha v2", "{context}");
+                        harness.assert_trees_equal(&context);
+                    } else {
+                        assert!(
+                            report.conflicts.iter().any(|c| c.root == PATH),
+                            "{context}: expected a conflict at {PATH}, got {:?}",
+                            report.conflicts
+                        );
+                        assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
+                        assert_eq!(read(&harness.beta), "beta late", "{context}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// The mirror image: beta's edit is on its way to alpha, and alpha is
+    /// edited before the publish.
+    #[test]
+    fn a_write_on_alpha_before_its_publish_is_refused_not_overwritten() {
+        for transport in BOTH {
+            for (mode, alpha_wins) in [
+                (SyncMode::TwoWaySafe, false),
+                (SyncMode::TwoWayResolved, true),
+            ] {
+                let context = format!("{transport:?}/{mode:?}");
+                let mut harness = Harness::new(mode, transport);
+                build_tree(&harness.alpha);
+                harness.cycle_ok();
+
+                fs::write(harness.beta.join(PATH), "beta v2").unwrap();
+                let alpha = harness.alpha.clone();
+                let report = harness
+                    .cycle_at(CyclePoint::BeforeAlphaTransition, move || {
+                        fs::write(alpha.join(PATH), "alpha late").unwrap()
+                    })
+                    .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+
+                assert_eq!(read(&harness.alpha), "alpha late", "{context}: overwritten");
+                assert_eq!(read(&harness.beta), "beta v2", "{context}");
+                assert!(
+                    report.alpha_transition_problems.iter().any(|p| p.path == PATH),
+                    "{context}: the refusal was not reported"
+                );
+
+                let report = harness.cycle_ok();
+                if alpha_wins {
+                    assert!(report.conflicts.is_empty(), "{context}");
+                    harness.settle(&context);
+                    assert_eq!(read(&harness.beta), "alpha late", "{context}");
+                    harness.assert_trees_equal(&context);
+                } else {
+                    assert!(
+                        report.conflicts.iter().any(|c| c.root == PATH),
+                        "{context}: expected a conflict, got {:?}",
+                        report.conflicts
+                    );
+                    assert_eq!(read(&harness.alpha), "alpha late", "{context}");
+                    assert_eq!(read(&harness.beta), "beta v2", "{context}");
+                }
+            }
+        }
+    }
+
+    /// Alpha is edited again after its scan, while the cycle is carrying
+    /// the earlier edit. The bytes pulled are the newer ones and the
+    /// transition names the older digest; the two must never be paired.
+    /// Whatever the cycle does with that, the next cycles carry the newer
+    /// edit and the sides end equal.
+    #[test]
+    fn a_second_write_on_alpha_after_its_scan_is_carried_not_mislabeled() {
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            harness.cycle_ok();
+
+            fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
+            let alpha = harness.alpha.clone();
+            let outcome = harness.cycle_at(CyclePoint::AfterScans, move || {
+                fs::write(alpha.join(PATH), "alpha v3, longer").unwrap()
+            });
+            // A refused or re-fetched transfer is fine; a halt is not.
+            if let Err(error) = &outcome {
+                assert!(
+                    error.downcast_ref::<SafetyHalt>().is_none(),
+                    "{context}: halted: {error:#}"
+                );
+            }
+            // Beta never holds content the ancestor would misdescribe:
+            // either the old version, or the new one, never a mix.
+            let now = read(&harness.beta);
+            assert!(
+                now == "content 1/1" || now == "alpha v3, longer",
+                "{context}: beta holds {now:?}"
+            );
+
+            harness.settle(&context);
+            assert_eq!(read(&harness.beta), "alpha v3, longer", "{context}");
+            harness.assert_trees_equal(&context);
+            let report = harness.cycle_ok();
+            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+        }
+    }
+
+    /// Alpha deleted the file; beta edits it before the deletion is
+    /// applied. The deletion must be refused, and the edit then wins over
+    /// the deletion — the reconciler's rule for a modification against a
+    /// deletion — landing back on alpha.
+    #[test]
+    fn a_write_on_beta_racing_a_deletion_keeps_the_edit() {
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            harness.cycle_ok();
+
+            fs::remove_file(harness.alpha.join(PATH)).unwrap();
+            let beta = harness.beta.clone();
+            let report = harness
+                .cycle_at(CyclePoint::BeforeBetaTransition, move || {
+                    fs::write(beta.join(PATH), "beta edit").unwrap()
+                })
+                .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+            assert_eq!(read(&harness.beta), "beta edit", "{context}: the edit was deleted");
+            assert!(
+                report.beta_transition_problems.iter().any(|p| p.path == PATH),
+                "{context}: the refusal was not reported"
+            );
+
+            harness.settle(&context);
+            assert_eq!(read(&harness.alpha), "beta edit", "{context}");
+            assert_eq!(read(&harness.beta), "beta edit", "{context}");
+            harness.assert_trees_equal(&context);
+        }
+    }
+
+    /// A write on beta right after alpha's edit was published there. The
+    /// cycle completes as a clean propagation; the write is a fresh beta
+    /// edit that the next cycle carries to alpha — which is only true if
+    /// the endpoint re-announces the paths it just wrote, so the scan
+    /// after does not adopt the tree it published.
+    #[test]
+    fn a_write_on_beta_right_after_the_publish_is_seen_next_cycle() {
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            harness.cycle_ok();
+
+            fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
+            let beta = harness.beta.clone();
+            let report = harness
+                .cycle_at(CyclePoint::AfterBetaTransition, move || {
+                    fs::write(beta.join(PATH), "beta after").unwrap()
+                })
+                .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+            assert!(report.beta_transition_problems.is_empty(), "{context}");
+            assert_eq!(read(&harness.beta), "beta after", "{context}");
+
+            let report = harness.cycle_ok();
+            assert!(report.conflicts.is_empty(), "{context}: {:?}", report.conflicts);
+            assert_eq!(read(&harness.alpha), "beta after", "{context}: not carried");
+            harness.assert_trees_equal(&context);
+        }
+    }
 }

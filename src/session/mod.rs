@@ -90,6 +90,31 @@ impl CycleReport {
 }
 
 /// A synchronization session between two endpoints.
+/// A point in a cycle at which a test may act. See
+/// [`Session::set_cycle_hook`].
+///
+/// The transition points fire only when that side has transitions to
+/// apply; the others fire on every cycle that gets that far. A cycle that
+/// took the "nothing changed" shortcut fires none of them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CyclePoint {
+    /// Both scans are in hand; nothing has been reconciled or moved.
+    AfterScans,
+    /// Beta's content is staged; its transition is about to be sent.
+    BeforeBetaTransition,
+    /// Beta's transition has answered.
+    AfterBetaTransition,
+    /// Alpha's content is staged; its transition is about to be sent.
+    BeforeAlphaTransition,
+    /// Alpha's transition has answered.
+    AfterAlphaTransition,
+    /// Every transition has answered; the ancestor is about to be recorded.
+    BeforeRecord,
+}
+
+/// What [`Session::set_cycle_hook`] installs.
+pub type CycleHook = Box<dyn FnMut(CyclePoint) + Send>;
+
 pub struct Session {
     /// The alpha endpoint.
     alpha: Box<dyn Endpoint + Send>,
@@ -120,6 +145,8 @@ pub struct Session {
     progress: Arc<crate::progress::Progress>,
     /// Raised by either endpoint's watch; what `await_change` sleeps on.
     wake: Arc<crate::endpoint::WakeSignal>,
+    /// A test's hand in the cycle, if it asked for one. See [`CyclePoint`].
+    hook: Option<CycleHook>,
     /// Whether the last cycle finished with the two sides synchronized and
     /// nothing outstanding — the precondition for skipping a cycle whose
     /// scans reproduce [`settled_alpha`](Self::settled_alpha) and
@@ -288,6 +315,7 @@ impl Session {
             ancestor,
             progress: Arc::default(),
             wake: Arc::default(),
+            hook: None,
             quiesced: false,
             settled_alpha: None,
             settled_beta: None,
@@ -378,6 +406,24 @@ impl Session {
         };
         if let Err(error) = outcome {
             crate::complain!("unable to replicate the ancestor to the beta: {error:#}");
+        }
+    }
+
+    /// Installs a hook the cycle calls at each [`CyclePoint`] it passes.
+    ///
+    /// A test seam, and nothing else uses it: this is how a test lands a
+    /// write on either root at an exact point of a cycle — between a
+    /// side's scan and its publish, say — which no amount of real editing
+    /// reaches on purpose. The hook runs on the cycle's own thread, so the
+    /// cycle is stopped for exactly as long as it takes.
+    pub fn set_cycle_hook(&mut self, hook: CycleHook) {
+        self.hook = Some(hook);
+    }
+
+    /// Passes a point of the cycle to the hook, if there is one.
+    fn at(&mut self, point: CyclePoint) {
+        if let Some(hook) = &mut self.hook {
+            hook(point);
         }
     }
 
@@ -533,6 +579,8 @@ impl Session {
             return Ok(report);
         }
 
+        self.at(CyclePoint::AfterScans);
+
         if let Some(root) = &alpha_snapshot.root {
             report.alpha_scan_problems = root.problems();
         }
@@ -632,10 +680,12 @@ impl Session {
             }
             self.progress
                 .begin_applying(reconciliation.beta_transitions.len() as u64);
+            self.at(CyclePoint::BeforeBetaTransition);
             let outcome = self
                 .beta
                 .transition(reconciliation.beta_transitions.clone())
                 .context("beta transition failed")?;
+            self.at(CyclePoint::AfterBetaTransition);
             self.progress
                 .applied_reached(reconciliation.beta_transitions.len() as u64);
             Some(outcome)
@@ -656,15 +706,18 @@ impl Session {
             }
             self.progress
                 .begin_applying(reconciliation.alpha_transitions.len() as u64);
+            self.at(CyclePoint::BeforeAlphaTransition);
             let outcome = self
                 .alpha
                 .transition(reconciliation.alpha_transitions.clone())
                 .context("alpha transition failed")?;
+            self.at(CyclePoint::AfterAlphaTransition);
             self.progress
                 .applied_reached(reconciliation.alpha_transitions.len() as u64);
             Some(outcome)
         };
         let _ = intent_recorded;
+        self.at(CyclePoint::BeforeRecord);
 
         #[cfg(test)]
         if self.fail_before_record {

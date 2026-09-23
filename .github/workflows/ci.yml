@@ -59,6 +59,31 @@ jobs:
       - name: Tests
         run: cargo test --release
 
+  spec:
+    # The specification, checked at its quick bound, and the implementation
+    # replayed against it: the real reconciler and the real fence play the
+    # spec's games, and every game must be a behavior TLC accepts. The full
+    # bounds take hours on a runner; those are spec-full.yml, by hand.
+    needs: linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: TLC
+        run: |
+          mkdir -p ~/.local/lib
+          curl -fsSL -o ~/.local/lib/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+      - name: The star spec, quick bound
+        run: spec/check.sh quick
+      - name: The implementation against the spec
+        run: AUTOBAHN_TLC=1 cargo test --release --test spec_replay --test spec_peering_replay
+
   mac:
     # A job with `needs` runs only if what it needs succeeded, and that
     # still holds with an `if` of its own: this adds the skip marker to it.

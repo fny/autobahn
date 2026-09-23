@@ -1,0 +1,30 @@
+# The specification at its full bounds: every mode of the star with two
+# betas and liveness, three betas under symmetry, and the peering protocol
+# in safety and liveness. Half an hour to an hour per configuration on
+# eight cores; hours on a runner. So it runs only by hand:
+#   gh workflow run spec-full.yml
+name: Spec (full)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  tlc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: TLC
+        run: |
+          mkdir -p ~/.local/lib
+          curl -fsSL -o ~/.local/lib/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+      - name: The star, two betas, every property
+        run: spec/check.sh conflict alpha strict
+      - name: The star, three betas, invariants
+        run: spec/check.sh conflict_n3 alpha_n3 strict_n3
+      - name: Peering
+        run: spec/check.sh peering_conflict_safety peering_alpha_safety peering_conflict_liveness peering_alpha_liveness

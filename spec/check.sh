@@ -3,6 +3,7 @@
 #
 #   spec/check.sh              all three modes, two betas, every property
 #   spec/check.sh strict       one mode
+#   spec/check.sh quick        the star at three edits, half a minute: CI's check
 #   spec/check.sh strict_n3    three betas under symmetry: invariants only
 #   spec/check.sh peering_conflict_safety   the failover protocol (Peering.tla)
 #   spec/check.sh --traces DIR validate replay traces (see tests/spec_replay.rs)

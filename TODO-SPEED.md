@@ -36,7 +36,7 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 - ~10% thread wake-ups of the parallel walk (`futex`, `eventfd`, `schedule`): the helper budget spawns a thread per subtree.
 - 2% deserializing the scan cache; reconcile 0.2%.
 
-- [ ] The one-shot verbs (`sync`, `verify`) should not establish watchers. Bounded win for those verbs only: ~30% of their runtime on a large tree, several seconds on Chromium. Nothing changes for `watch`, which registers once at start.
+- [x] A one-shot `sync` no longer registers watchers (`verify` runs inside the supervisor, so it was never affected). Measured on the 160k pair, warm: 2.4–2.7 s → 0.7–0.9 s — more than the profile's 30%, since the registration walk was also most of the system time and the thread wake-ups.
 - [ ] The parallel walk could pool its helpers rather than spawn per subtree; ~10% of a cold scan's CPU, no wall-clock evidence yet. Measure the cold scan on the 160k pair before bothering.
 
 ## Coalescing and the cycle's own overhead

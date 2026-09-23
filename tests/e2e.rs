@@ -108,11 +108,24 @@ impl Harness {
     }
 
     fn session(&mut self) -> anyhow::Result<Session> {
+        let (beta, state) = (self.beta.clone(), self.state.clone());
+        self.session_to(&beta, &state)
+    }
+
+    /// A second destination beside the first, sharing the alpha — another
+    /// session of a fan-out — with state of its own.
+    fn second_beta(&self) -> (PathBuf, PathBuf) {
+        let beta = self._keep.path().join("beta2");
+        fs::create_dir_all(&beta).unwrap();
+        (beta, self.state.join("second"))
+    }
+
+    fn session_to(&mut self, beta_root: &Path, state: &Path) -> anyhow::Result<Session> {
         self.session_counter += 1;
         let alpha_endpoint: Box<dyn Endpoint + Send> = Box::new(
             LocalEndpoint::new(
                 self.alpha.clone(),
-                self.state.join("staging-alpha"),
+                state.join("staging-alpha"),
                 EndpointOptions {
                     ignores: IgnoreSet::new(&self.ignores)?,
                     ..EndpointOptions::default()
@@ -123,8 +136,8 @@ impl Harness {
         let beta_endpoint: Box<dyn Endpoint + Send> = match self.transport {
             Transport::Local => Box::new(
                 LocalEndpoint::new(
-                    self.beta.clone(),
-                    self.state.join("staging-beta"),
+                    beta_root.to_path_buf(),
+                    state.join("staging-beta"),
                     EndpointOptions {
                         ignores: IgnoreSet::new(&self.ignores)?,
                         ..EndpointOptions::default()
@@ -140,11 +153,11 @@ impl Harness {
                     RemoteEndpoint::connect(
                         connection,
                         Initialize {
-                            root: self.beta.to_string_lossy().into_owned(),
+                            root: beta_root.to_string_lossy().into_owned(),
                             session: format!(
                                 "e2e-{}-{}",
-                                self.state.to_string_lossy().len(),
-                                blake3::hash(self.state.to_string_lossy().as_bytes()).to_hex()
+                                state.to_string_lossy().len(),
+                                blake3::hash(state.to_string_lossy().as_bytes()).to_hex()
                             ),
                             ignores: self.ignores.clone(),
                             symlink_mode: SymlinkMode::Raw,
@@ -162,7 +175,7 @@ impl Harness {
                 )
             }
         };
-        Session::new(alpha_endpoint, beta_endpoint, self.mode, self.state.clone())
+        Session::new(alpha_endpoint, beta_endpoint, self.mode, state.to_path_buf())
     }
 
     fn cycle_ok(&mut self) -> CycleReport {
@@ -1632,4 +1645,180 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     );
     drop(session);
     harness.assert_trees_equal("after beta's edit");
+}
+
+/// Two sessions of a fan-out, over one alpha, running at the same time.
+/// One is held by the cycle hook at the point where it is about to write
+/// alpha while the other runs a whole cycle through the same alpha, then
+/// released. Its write must be refused — alpha is no longer what it was
+/// validated against — never landed over the other's. Over both
+/// transports; the alpha is always local and shared in-process, which is
+/// the observer's shared-root path under real contention.
+mod fan_out_races {
+    use super::*;
+    use std::sync::mpsc;
+
+    const BOTH: [Transport; 2] = [Transport::Local, Transport::Agent];
+    const PATH: &str = "dir1/nested/file1.txt";
+    const OTHER: &str = "dir2/nested/file2.txt";
+
+    fn read(root: &Path, path: &str) -> String {
+        fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{}: {e}", root.display()))
+    }
+
+    /// Lets the watchers deliver the events for writes just made. A cycle
+    /// run straight after a write can precede its event, and an
+    /// incremental scan then rightly finds nothing marked; the supervisor
+    /// catches such an edit on the next wake, but these tests interleave
+    /// one particular cycle and need the marks in place before it. Marks
+    /// wait for a scan, so a pause is all it takes.
+    fn events_delivered() {
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+
+    /// Runs `held`'s cycle on a thread, stopped at `point` until `run`
+    /// has been called on the main thread; returns the held cycle's report.
+    fn interleave(
+        held: &mut Session,
+        point: CyclePoint,
+        run: impl FnOnce(),
+    ) -> anyhow::Result<CycleReport> {
+        let (reached, at_point) = mpsc::channel::<()>();
+        let (release, released) = mpsc::channel::<()>();
+        held.set_cycle_hook(Box::new(move |at| {
+            if at == point {
+                let _ = reached.send(());
+                let _ = released.recv();
+            }
+        }));
+        std::thread::scope(|scope| {
+            let cycle = scope.spawn(|| held.run_cycle());
+            at_point.recv().expect("the held cycle reaches the point");
+            run();
+            release.send(()).expect("the held cycle is waiting");
+            cycle.join().expect("the held cycle does not panic")
+        })
+    }
+
+    /// Both betas edit the same file. The second session to reach alpha
+    /// finds it already changed by the first and is refused; nothing is
+    /// overwritten, and the pair is a conflict on its next cycle.
+    #[test]
+    fn two_betas_edit_one_file_and_the_later_write_is_refused() {
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            let (beta2, state2) = harness.second_beta();
+            let mut s1 = harness.session().expect("session 1");
+            let mut s2 = harness.session_to(&beta2, &state2).expect("session 2");
+            s1.run_cycle().expect("initial 1");
+            s2.run_cycle().expect("initial 2");
+
+            fs::write(harness.beta.join(PATH), "from beta1").unwrap();
+            fs::write(beta2.join(PATH), "from beta2").unwrap();
+            events_delivered();
+            let report1 = interleave(&mut s1, CyclePoint::BeforeAlphaTransition, || {
+                s2.run_cycle().expect("session 2's cycle");
+            })
+            .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+
+            assert_eq!(read(&harness.alpha, PATH), "from beta2", "{context}: overwritten");
+            assert_eq!(read(&harness.beta, PATH), "from beta1", "{context}");
+            assert!(
+                report1.alpha_transition_problems.iter().any(|p| p.path == PATH),
+                "{context}: the refusal was not reported: {:?}",
+                report1.alpha_transition_problems
+            );
+            let report1 = s1.run_cycle().expect("session 1 again");
+            assert!(
+                report1.conflicts.iter().any(|c| c.root == PATH),
+                "{context}: expected a conflict, got {:?}",
+                report1.conflicts
+            );
+            assert_eq!(read(&harness.alpha, PATH), "from beta2", "{context}");
+            assert_eq!(read(&harness.beta, PATH), "from beta1", "{context}");
+            assert_eq!(read(&beta2, PATH), "from beta2", "{context}");
+        }
+    }
+
+    /// The betas edit different files. Both land on alpha, in either
+    /// order, and each beta then gets the other's through alpha.
+    #[test]
+    fn two_betas_edit_different_files_and_both_land() {
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            let (beta2, state2) = harness.second_beta();
+            let mut s1 = harness.session().expect("session 1");
+            let mut s2 = harness.session_to(&beta2, &state2).expect("session 2");
+            s1.run_cycle().expect("initial 1");
+            s2.run_cycle().expect("initial 2");
+
+            fs::write(harness.beta.join(PATH), "from beta1").unwrap();
+            fs::write(beta2.join(OTHER), "from beta2").unwrap();
+            events_delivered();
+            let report1 = interleave(&mut s1, CyclePoint::BeforeAlphaTransition, || {
+                s2.run_cycle().expect("session 2's cycle");
+            })
+            .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+            assert!(report1.alpha_transition_problems.is_empty(), "{context}: {:?}", report1.alpha_transition_problems);
+            assert_eq!(read(&harness.alpha, PATH), "from beta1", "{context}");
+            assert_eq!(read(&harness.alpha, OTHER), "from beta2", "{context}");
+
+            // Each pair levels on its next cycles.
+            for _ in 0..3 {
+                s1.run_cycle().expect("1");
+                s2.run_cycle().expect("2");
+            }
+            for root in [&harness.alpha, &harness.beta, &beta2] {
+                assert_eq!(read(root, PATH), "from beta1", "{context}: {}", root.display());
+                assert_eq!(read(root, OTHER), "from beta2", "{context}: {}", root.display());
+            }
+            drop(s1);
+            drop(s2);
+            harness.assert_trees_equal(&context);
+            assert_eq!(hash_tree(&harness.alpha), hash_tree(&beta2), "{context}: beta2 differs");
+        }
+    }
+
+    /// Alpha changes under a session between its scan and its transitions
+    /// — another session lands an edit there — and the held session's own
+    /// beta-bound transition is unaffected; the next cycle carries the
+    /// other's edit on, with no conflict.
+    #[test]
+    fn an_edit_landing_on_alpha_between_a_scan_and_its_transition_is_carried_next_cycle() {
+        for transport in BOTH {
+            let context = format!("{transport:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            build_tree(&harness.alpha);
+            let (beta2, state2) = harness.second_beta();
+            let mut s1 = harness.session().expect("session 1");
+            let mut s2 = harness.session_to(&beta2, &state2).expect("session 2");
+            s1.run_cycle().expect("initial 1");
+            s2.run_cycle().expect("initial 2");
+
+            // Session 1 carries an alpha edit to beta1; while its scans are
+            // done and before it moves anything, session 2 lands beta2's
+            // edit of another file on alpha.
+            fs::write(harness.alpha.join(PATH), "alpha edit").unwrap();
+            fs::write(beta2.join(OTHER), "from beta2").unwrap();
+            events_delivered();
+            let report1 = interleave(&mut s1, CyclePoint::AfterScans, || {
+                s2.run_cycle().expect("session 2's cycle");
+            })
+            .unwrap_or_else(|e| panic!("{context}: {e:#}"));
+            assert!(report1.conflicts.is_empty(), "{context}: {:?}", report1.conflicts);
+            assert_eq!(read(&harness.beta, PATH), "alpha edit", "{context}");
+
+            let report1 = s1.run_cycle().expect("session 1 again");
+            assert!(report1.conflicts.is_empty(), "{context}: {:?}", report1.conflicts);
+            assert_eq!(read(&harness.beta, OTHER), "from beta2", "{context}: not carried");
+            for _ in 0..2 {
+                s2.run_cycle().expect("2");
+            }
+            assert_eq!(read(&beta2, PATH), "alpha edit", "{context}");
+        }
+    }
 }

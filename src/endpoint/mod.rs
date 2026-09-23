@@ -61,11 +61,19 @@ pub struct StagingNeed {
     pub signature: Signature,
 }
 
-/// One frame of a file transfer stream. Frames for the needed files flow in
-/// need-list order; each file's frames are its delta operations followed by
-/// a single end-of-file frame.
+/// One frame of a file transfer stream. Each file's frames are a begin
+/// frame naming its digest, its delta operations, and a single end-of-file
+/// frame. Files are named rather than positional so that content can be
+/// sent before the destination has said which files it needs: a file it
+/// did not ask for is simply not kept.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum TransferFrame {
+    /// The start of one file's stream: the digest of the content it
+    /// carries, which is what the destination asked for it by.
+    Begin {
+        /// The digest of the file about to be streamed.
+        digest: Digest,
+    },
     /// A delta operation for the current file.
     Op(crate::rsync::Op),
     /// The end of the current file's stream. If an error message is carried,
@@ -188,6 +196,22 @@ pub trait Endpoint: Send {
     /// from an interrupted cycle, or identical content elsewhere in the
     /// root) are staged immediately and omitted from the result.
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>>;
+
+    /// Like [`stage_begin`](Endpoint::stage_begin), for an endpoint whose
+    /// answer costs a round trip: the request is sent and `None` comes back
+    /// at once, so the caller can push what it is sure the endpoint needs
+    /// while the answer is in flight, and collect the answer with
+    /// [`stage_begin_finish`](Endpoint::stage_begin_finish) afterwards.
+    /// The default answers on the spot.
+    fn stage_begin_nowait(&mut self, files: Vec<FileRequest>) -> Result<Option<Vec<StagingNeed>>> {
+        self.stage_begin(files).map(Some)
+    }
+
+    /// The answer to a [`stage_begin_nowait`](Endpoint::stage_begin_nowait)
+    /// that returned `None`.
+    fn stage_begin_finish(&mut self) -> Result<Vec<StagingNeed>> {
+        Err(anyhow::anyhow!("no staging request is awaiting an answer"))
+    }
 
     /// Opens a supply stream on this (source) endpoint for the specified
     /// needs.

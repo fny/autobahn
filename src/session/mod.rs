@@ -876,6 +876,25 @@ pub fn transition_dependencies(transitions: &[Change]) -> Vec<FileRequest> {
 /// on the nodes the transitions carry, so they are collected from there and
 /// matched by digest — which is what a need is addressed by.
 fn staged_bytes(transitions: &[Change], needs: &[StagingNeed]) -> u64 {
+    let sizes = file_sizes(transitions);
+    needs
+        .iter()
+        .map(|need| sizes.get(&need.request.digest).copied().unwrap_or(0))
+        .sum()
+}
+
+/// Files no larger than this are sent to a remote destination before it
+/// has said whether it needs them. An edit's content is new by
+/// construction, so the answer is nearly always yes, and waiting for it
+/// was a round trip on every edit; the waste when it is no — a small file
+/// the destination already held under another name — is the file's own
+/// size, once. Larger files wait for the answer, which for them may be a
+/// signature that turns a transfer into a delta, or a "no" that saves the
+/// whole thing.
+const SPECULATIVE_MAX_BYTES: u64 = 64 * 1024;
+
+/// Sizes of the files the transitions introduce, by digest.
+fn file_sizes(transitions: &[Change]) -> std::collections::HashMap<Digest, u64> {
     fn collect(node: &Node, sizes: &mut std::collections::HashMap<Digest, u64>) {
         match &node.content {
             Content::File {
@@ -897,12 +916,18 @@ fn staged_bytes(transitions: &[Change], needs: &[StagingNeed]) -> u64 {
             collect(node, &mut sizes);
         }
     }
-    needs
-        .iter()
-        .map(|need| sizes.get(&need.request.digest).copied().unwrap_or(0))
-        .sum()
+    sizes
 }
 
+/// Stages on `destination` the content its transitions need, from
+/// `source`.
+///
+/// A destination that answers "what do you need?" on the spot — one in
+/// this process — is asked and then supplied. One whose answer is a round
+/// trip away is asked, and while the answer is in flight the small files
+/// go anyway, in full; when the answer comes, whatever it still names is
+/// supplied as it asked, deltas included. Content it turned out not to
+/// need is read to the end on its side and dropped.
 fn stage(
     source: &mut dyn Endpoint,
     destination: &mut dyn Endpoint,
@@ -913,17 +938,75 @@ fn stage(
     if requests.is_empty() {
         return Ok(());
     }
-    let needs = destination
-        .stage_begin(requests)
-        .context("unable to begin staging")?;
-    if needs.is_empty() {
-        return Ok(());
+    let sizes = file_sizes(transitions);
+    let needs = match destination
+        .stage_begin_nowait(requests.clone())
+        .context("unable to begin staging")?
+    {
+        Some(needs) => needs,
+        None => {
+            let mut speculated = std::collections::HashSet::new();
+            let speculative: Vec<StagingNeed> = requests
+                .iter()
+                .filter(|request| {
+                    sizes.get(&request.digest).copied().unwrap_or(u64::MAX)
+                        <= SPECULATIVE_MAX_BYTES
+                })
+                .filter(|request| speculated.insert(request.digest))
+                .map(|request| StagingNeed {
+                    request: request.clone(),
+                    signature: crate::rsync::Signature::default(),
+                })
+                .collect();
+            if !speculative.is_empty() {
+                progress.begin_staging(
+                    speculative.len() as u64,
+                    staged_bytes(transitions, &speculative),
+                );
+                pump(source, destination, speculative, progress)?;
+            }
+            // When everything was sent, the answer cannot name anything
+            // more to send, so there is nothing to wait for: the transition
+            // goes out right behind the content, and the answer is read
+            // along with the pushes' acknowledgements when the transition's
+            // own answer is. That is the one round trip an edit costs.
+            if requests
+                .iter()
+                .all(|request| speculated.contains(&request.digest))
+            {
+                return destination
+                    .stage_finish()
+                    .context("unable to complete staging");
+            }
+            let needs = destination
+                .stage_begin_finish()
+                .context("unable to begin staging")?;
+            needs
+                .into_iter()
+                .filter(|need| !speculated.contains(&need.request.digest))
+                .collect()
+        }
+    };
+    if !needs.is_empty() {
+        // What this transfer will move, announced before it starts so that
+        // its progress can be read as a fraction rather than as a total
+        // that only grows. The sizes come from the transitions themselves:
+        // a need names a path and a digest, not a length.
+        progress.begin_staging(needs.len() as u64, staged_bytes(transitions, &needs));
+        pump(source, destination, needs, progress)?;
     }
-    // What this transfer will move, announced before it starts so that its
-    // progress can be read as a fraction rather than as a total that only
-    // grows. The sizes come from the transitions themselves: a need names
-    // a path and a digest, not a length.
-    progress.begin_staging(needs.len() as u64, staged_bytes(transitions, &needs));
+    destination
+        .stage_finish()
+        .context("unable to complete staging")
+}
+
+/// Supplies `needs` from `source` and pushes them into `destination`.
+fn pump(
+    source: &mut dyn Endpoint,
+    destination: &mut dyn Endpoint,
+    needs: Vec<StagingNeed>,
+    progress: &crate::progress::Progress,
+) -> Result<()> {
     source
         .supply_open(needs)
         .context("unable to open supply stream")?;
@@ -951,7 +1034,7 @@ fn stage(
                         TransferFrame::Op(crate::rsync::Op::Data(data)) => {
                             bytes += data.len() as u64
                         }
-                        TransferFrame::Op(_) => {}
+                        TransferFrame::Op(_) | TransferFrame::Begin { .. } => {}
                     }
                 }
                 destination
@@ -959,9 +1042,7 @@ fn stage(
                     .context("unable to push file content")?;
                 progress.staged(files, bytes);
             }
-            destination
-                .stage_finish()
-                .context("unable to complete staging")
+            Ok(())
         });
         let mut pull_error = None;
         loop {

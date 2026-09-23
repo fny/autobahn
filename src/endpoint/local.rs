@@ -68,6 +68,7 @@ pub const SUPPLY_TARGET_BYTES: usize = 8 * 1024 * 1024;
 /// Estimates the wire weight of a transfer frame.
 fn frame_weight(frame: &TransferFrame) -> usize {
     match frame {
+        TransferFrame::Begin { .. } => 40,
         TransferFrame::Op(crate::rsync::Op::Data(data)) => data.len() + 16,
         // Supply error messages embed paths and OS error text of unbounded
         // length, so they must count toward the byte budget too.
@@ -779,6 +780,9 @@ impl LocalEndpoint {
         // so one bad path never starves the paths that share its content.
         // (The receiver verifies the digest regardless, so a stale
         // candidate merely fails staging as it would have anyway.)
+        pending.push_back(TransferFrame::Begin {
+            digest: need.request.digest,
+        });
         let error = match self.try_supply(&need.request.path, &need.signature, pending) {
             Ok(()) => None,
             Err(primary_error) => {
@@ -889,60 +893,53 @@ impl LocalEndpoint {
     /// Applies a batch of transfer frames to the receive state.
     fn push_frames(&self, state: &mut ReceiveState, frames: Vec<TransferFrame>) -> Result<()> {
         for frame in frames {
-            let Some(need) = state.needs.get(state.current) else {
-                bail!("received transfer frames beyond the end of the staging need list");
-            };
             match frame {
-                TransferFrame::Op(op) => {
-                    if state.file.is_none() {
-                        state.file = Some(self.open_receive_file(need)?);
+                TransferFrame::Begin { digest } => {
+                    // A file whose stream ended without its end-of-file is
+                    // not kept; the begin frame of the next one says so.
+                    if let Some(Receiving::File { file, .. }) = state.current.take() {
+                        file.discard();
                     }
-                    let file = state
-                        .file
-                        .as_mut()
-                        .expect("the receive file was just opened");
-                    if let Err(error) =
-                        rsync::patch(&mut file.base, &need.signature, &op, &mut file.writer)
-                    {
-                        // Patching only fails on a malformed delta or on real
-                        // I/O trouble (a full or failing disk), neither of
-                        // which the next operation would survive either.
-                        if let Some(file) = state.file.take() {
-                            file.discard();
-                        }
-                        return Err(error)
-                            .with_context(|| format!("unable to stage {}", need.request.path));
-                    }
+                    state.current = Some(match state.needs.get(&digest) {
+                        Some(need) => Receiving::File {
+                            file: self.open_receive_file(need)?,
+                            need: need.clone(),
+                        },
+                        None => Receiving::Sink,
+                    });
                 }
-                TransferFrame::EndOfFile { error } => {
-                    let file = state.file.take();
-                    if error.is_some() {
-                        // The source couldn't supply this file. That isn't a
-                        // failure of this cycle: the file simply isn't staged,
-                        // so the transition reports it missing and the next
-                        // cycle retries it.
-                        if let Some(file) = file {
-                            file.discard();
+                TransferFrame::Op(op) => match state.current.as_mut() {
+                    Some(Receiving::File { need, file }) => {
+                        if let Err(error) =
+                            rsync::patch(&mut file.base, &need.signature, &op, &mut file.writer)
+                        {
+                            let path = need.request.path.clone();
+                            if let Some(Receiving::File { file, .. }) = state.current.take() {
+                                file.discard();
+                            }
+                            return Err(error).with_context(|| format!("unable to stage {path}"));
                         }
-                    } else {
-                        // An empty file arrives as an end-of-file frame with
-                        // no preceding operations, and still has to be staged.
-                        let file = match file {
-                            Some(file) => file,
-                            None => self.open_receive_file(need)?,
-                        };
-                        self.finish_receive(file, need)?;
                     }
-                    state.current += 1;
-                }
+                    Some(Receiving::Sink) => {}
+                    None => bail!("received a transfer frame outside a file"),
+                },
+                TransferFrame::EndOfFile { error } => match state.current.take() {
+                    Some(Receiving::File { need, file }) => {
+                        if error.is_some() {
+                            file.discard();
+                        } else {
+                            self.finish_receive(file, &need)?;
+                            state.needs.remove(&need.request.digest);
+                        }
+                    }
+                    Some(Receiving::Sink) => {}
+                    None => bail!("received an end of file outside a file"),
+                },
             }
         }
         Ok(())
     }
 
-    /// Opens a temporary receive file for a need, along with the base content
-    /// its delta operations apply against (the current content at the need's
-    /// path, or an empty base when there is nothing usable there).
     fn open_receive_file(&self, need: &StagingNeed) -> Result<ReceiveFile> {
         let temporary = self.staging_root.join(temporary_name("recv"));
         let output = File::create(&temporary)
@@ -1192,9 +1189,11 @@ impl Endpoint for LocalEndpoint {
         }
 
         self.receive = Some(ReceiveState {
-            needs: needs.clone(),
-            current: 0,
-            file: None,
+            needs: needs
+                .iter()
+                .map(|need| (need.request.digest, need.clone()))
+                .collect(),
+            current: None,
         });
         Ok(needs)
     }
@@ -1564,19 +1563,27 @@ struct SupplyState {
 /// exactly the frames the source pulls, in need order, so the current index
 /// alone identifies the file each frame belongs to.
 struct ReceiveState {
-    /// The needs reported to the controller, in order.
-    needs: Vec<StagingNeed>,
-    /// The index of the need currently being received.
-    current: usize,
-    /// The file currently being written, if any operations have arrived for
-    /// the current need.
-    file: Option<ReceiveFile>,
+    /// What this endpoint asked for, by digest. A file leaves the map as
+    /// it lands; frames for a digest not in it — content the sender chose
+    /// to send before asking, that turned out not to be needed, or a file
+    /// sent twice — are not kept.
+    needs: HashMap<Digest, StagingNeed>,
+    /// The file frames are landing in, if one is open.
+    current: Option<Receiving>,
+}
+
+/// Where the frames of the current file go.
+enum Receiving {
+    /// A file this endpoint asked for.
+    File { need: StagingNeed, file: ReceiveFile },
+    /// Content this endpoint did not ask for: read to the end and dropped.
+    Sink,
 }
 
 impl ReceiveState {
     /// Discards any partially received content.
     fn discard(self) {
-        if let Some(file) = self.file {
+        if let Some(Receiving::File { file, .. }) = self.current {
             file.discard();
         }
     }
@@ -3717,6 +3724,7 @@ mod tests {
             assert!(frames.len() <= 3);
             for frame in &frames {
                 match frame {
+                    TransferFrame::Begin { .. } => {}
                     TransferFrame::Op(Op::Blocks { count, .. }) => blocks += count,
                     TransferFrame::Op(Op::Data(bytes)) => data += bytes.len(),
                     TransferFrame::EndOfFile { error } => assert!(error.is_none()),
@@ -4660,6 +4668,71 @@ mod tests {
         );
         assert!(recovered.root.is_some());
         let _ = snapshot;
+    }
+
+    /// Content the destination did not ask for — sent before its answer,
+    /// and declined — is read to the end and dropped, and what it did ask
+    /// for lands beside it.
+    #[test]
+    fn unrequested_content_is_dropped_and_requested_content_lands() {
+        let fixture = Fixture::new();
+        fs::write(fixture.alpha_root.join("wanted.txt"), b"wanted").unwrap();
+        fs::write(fixture.alpha_root.join("held.txt"), b"held").unwrap();
+        // Beta already holds `held`, so it will decline that digest.
+        fs::write(fixture.beta_root.join("held.txt"), b"held").unwrap();
+        let mut alpha = fixture.alpha;
+        let mut beta = fixture.beta;
+        alpha.scan().unwrap();
+        beta.scan().unwrap();
+        let wanted = *blake3::hash(b"wanted").as_bytes();
+        let held = *blake3::hash(b"held").as_bytes();
+        let request = |path: &str, digest| FileRequest {
+            path: path.into(),
+            digest,
+        };
+        let needs = beta
+            .stage_begin(vec![request("wanted.txt", wanted), request("held.txt", held)])
+            .unwrap();
+        assert_eq!(needs.len(), 1, "held content is staged locally, not needed: {needs:?}");
+        assert_eq!(needs[0].request.digest, wanted);
+
+        // Supply both anyway, in full, as a sender that did not wait would.
+        alpha
+            .supply_open(vec![
+                StagingNeed {
+                    request: request("held.txt", held),
+                    signature: Signature::default(),
+                },
+                StagingNeed {
+                    request: request("wanted.txt", wanted),
+                    signature: Signature::default(),
+                },
+            ])
+            .unwrap();
+        let mut frames = Vec::new();
+        loop {
+            let batch = alpha.supply_pull(64).unwrap();
+            if batch.is_empty() {
+                break;
+            }
+            frames.extend(batch);
+        }
+        assert!(matches!(frames[0], TransferFrame::Begin { digest } if digest == held));
+        beta.stage_push(frames).unwrap();
+        beta.stage_finish().unwrap();
+
+        // `wanted` landed from the stream; `held` was never needed and its
+        // unrequested copy went nowhere — beta's own is untouched.
+        let outcome = beta
+            .transition(vec![Change {
+                path: "wanted.txt".into(),
+                old: None,
+                new: alpha.snapshot().and_then(|s| s.root.as_ref()?.child("wanted.txt").cloned()),
+            }])
+            .unwrap();
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert_eq!(fs::read(fixture.beta_root.join("wanted.txt")).unwrap(), b"wanted");
+        assert_eq!(fs::read(fixture.beta_root.join("held.txt")).unwrap(), b"held");
     }
 
     #[test]

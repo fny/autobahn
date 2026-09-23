@@ -59,6 +59,11 @@ pub struct RemoteEndpoint {
     /// Whether the agent said it was watching its root, the last time it
     /// answered a wait.
     watching: bool,
+    /// A staging request sent without waiting for its answer, and the
+    /// answer once it arrives — which may be while push acknowledgements
+    /// are being collected, since it comes first on the channel.
+    stage_begin_pending: bool,
+    stage_begin_answer: Option<Vec<StagingNeed>>,
     /// The number of staging pushes sent but not yet acknowledged.
     pending_pushes: usize,
     /// The controller's model of the agent's snapshot: the last one
@@ -271,6 +276,8 @@ impl RemoteEndpoint {
             seen: None,
             scanned_at: None,
             watching: false,
+            stage_begin_pending: false,
+            stage_begin_answer: None,
             pending_pushes: 0,
             last_snapshot: None,
             progress: None,
@@ -297,6 +304,16 @@ impl RemoteEndpoint {
     /// channel itself failed (in which case nothing further will arrive).
     fn drain_push_ack(&mut self) -> Result<()> {
         let response = self.channel.receive_response();
+        // A staging request sent ahead of the pushes answers ahead of their
+        // acknowledgements: its answer is kept for `stage_begin_finish` and
+        // is not a push's.
+        if self.stage_begin_pending {
+            if let Ok(Response::StageBegin(needs)) = &response {
+                self.stage_begin_answer = Some(needs.clone());
+                self.stage_begin_pending = false;
+                return self.drain_push_ack();
+            }
+        }
         self.pending_pushes -= 1;
         match response? {
             Response::StagePushed => Ok(()),
@@ -530,6 +547,32 @@ impl Endpoint for RemoteEndpoint {
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {
         match self.exchange(Request::StageBegin(files))? {
             Response::StageBegin(needs) => Ok(needs),
+            response => Err(unexpected_response(&response, "stage begin")),
+        }
+    }
+
+    fn stage_begin_nowait(&mut self, files: Vec<FileRequest>) -> Result<Option<Vec<StagingNeed>>> {
+        // Owed acknowledgements first, so the request's answer is the
+        // next response on the channel after them.
+        self.drain_pushes_to(0)?;
+        self.channel.send_only(Request::StageBegin(files))?;
+        self.stage_begin_pending = true;
+        self.stage_begin_answer = None;
+        Ok(None)
+    }
+
+    fn stage_begin_finish(&mut self) -> Result<Vec<StagingNeed>> {
+        if let Some(needs) = self.stage_begin_answer.take() {
+            return Ok(needs);
+        }
+        if !self.stage_begin_pending {
+            bail!("no staging request is awaiting an answer");
+        }
+        // Sent before any push, so answered before any acknowledgement.
+        self.stage_begin_pending = false;
+        match self.channel.receive_response()? {
+            Response::StageBegin(needs) => Ok(needs),
+            Response::Error(message) => Err(remote_error(message)),
             response => Err(unexpected_response(&response, "stage begin")),
         }
     }
@@ -1113,6 +1156,41 @@ mod tests {
         // A scan's answer is the scan's, not a push's.
         assert_eq!(endpoint.scan().expect("scan").files, 3);
         assert_eq!(endpoint.pending_pushes, 0);
+        drop(endpoint);
+        let _ = agent.join();
+    }
+
+    /// A staging request sent without waiting answers first on the channel,
+    /// ahead of the acknowledgements of the pushes sent behind it. Whether
+    /// the answer is met by the push window's drain or by
+    /// `stage_begin_finish`, it is the request's, and every push is still
+    /// acknowledged.
+    #[test]
+    fn a_staging_answer_is_kept_apart_from_push_acknowledgements() {
+        let (client, agent) = connected_pair();
+        let agent = scripted_agent(
+            agent,
+            vec![
+                Response::StageBegin(Vec::new()),
+                Response::StagePushed,
+                Response::StagePushed,
+                Response::StagePushed,
+                Response::StagePushed,
+                Response::StagePushed,
+            ],
+        );
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        assert!(endpoint.stage_begin_nowait(Vec::new()).expect("sent").is_none());
+        // Five pushes overflow the window, so a drain meets the answer.
+        for _ in 0..5 {
+            endpoint.stage_push_nowait(Vec::new()).expect("push");
+        }
+        let needs = endpoint.stage_begin_finish().expect("the answer");
+        assert!(needs.is_empty());
+        endpoint.stage_finish().expect("finish");
+        // Everything owed is collected by the next exchange.
+        assert!(endpoint.stage_begin_finish().is_err(), "nothing is pending now");
         drop(endpoint);
         let _ = agent.join();
     }

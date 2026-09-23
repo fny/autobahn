@@ -1,4 +1,4 @@
-# Alerts
+# Alerts (Experimental)
 
 A supervisor running as a login service is invisible by design, which means a conflict or a permission that stopped working sits there with nobody told. `on_alert` runs a command when that happens:
 

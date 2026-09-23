@@ -385,7 +385,7 @@ impl App {
 
         let mut groups = Vec::new();
         for group in &report.groups {
-            let submenu = Submenu::new(format!("{}  ({})", group.alpha, group.name), true);
+            let submenu = Submenu::new(group_label(group), true);
             let mut sessions = Vec::new();
             for _ in &group.sessions {
                 let line = MenuItem::new("", false, None);
@@ -495,6 +495,7 @@ impl App {
         for (group, items) in report.groups.iter().zip(model.groups.iter_mut()) {
             // The row carries its own state, so the group that needs a
             // person is visible in the menu without opening its submenu.
+            items.submenu.set_text(group_label(group));
             let health = group_health(group, report.supervisor_running);
             if items.health != Some(health) {
                 items.submenu.set_icon(Some(status_dot(health)));
@@ -966,6 +967,19 @@ fn troubled_groups(report: &StatusReport) -> Vec<String> {
 ///
 /// The same states `health_of` treats as trouble, so a group's dot and the
 /// icon's colour can never disagree.
+/// How a group is named in the menu: its root, its name, and — when it is
+/// peering — which side is doing the work. A group that is not peering
+/// says nothing about roles, which is every group until someone asks for
+/// one.
+fn group_label(group: &crate::supervisor::GroupReport) -> String {
+    let role = match group.role.as_str() {
+        "leader" => ", leading",
+        "follower" => ", following",
+        _ => "",
+    };
+    format!("{}  ({}{role})", group.alpha, group.name)
+}
+
 fn group_health(group: &crate::supervisor::GroupReport, supervisor_running: bool) -> Health {
     if !supervisor_running {
         return Health::Idle;

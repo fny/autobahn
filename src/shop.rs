@@ -226,6 +226,23 @@ impl Shop<'_> {
             .collect()
     }
 
+    /// The peering role of the group an order belongs to, as the rail says
+    /// it: who is doing the synchronizing right now. Empty for a group that
+    /// is not peering, which is every group until someone asks for one.
+    fn role(&self, group: &str) -> &'static str {
+        match self
+            .report
+            .groups
+            .iter()
+            .find(|candidate| candidate.name == group)
+            .map(|group| group.role.as_str())
+        {
+            Some("leader") => "leading",
+            Some("follower") => "following",
+            _ => "",
+        }
+    }
+
     /// Bytes moved so far by every transfer in flight.
     fn transferred(&self) -> u64 {
         self.orders()
@@ -967,6 +984,10 @@ impl Shop<'_> {
         if !activity.is_empty() {
             tail.push(activity);
         }
+        let role = self.role(group);
+        if !role.is_empty() {
+            tail.push(role.to_owned());
+        }
         let waiting = session.conflicts.len() + session.blocked.len();
         if waiting > 0 {
             tail.push(format!("{waiting} waiting"));
@@ -1167,6 +1188,7 @@ fn outcome_word(state: &str) -> (&'static str, &'static str) {
         "halted" => ("kitchen closed", "\x1b[31m"),
         "unreachable" => ("beta unreachable", "\x1b[31m"),
         "errored" => ("burnt", "\x1b[31m"),
+        "following" => ("another branch", "\x1b[2m"),
         "paused" => ("on break", "\x1b[2m"),
         _ => ("not started", "\x1b[2m"),
     }
@@ -1292,6 +1314,11 @@ fn help_page(width: usize) -> Vec<String> {
         ),
         ("burnt", "\x1b[31m", "the cycle failed"),
         ("on break", "\x1b[2m", "paused"),
+        (
+            "another branch",
+            "\x1b[2m",
+            "peering: another host holds the lead and is doing the work",
+        ),
     ];
     for (word, colour, what) in pairs {
         lines.push(format!(
@@ -1857,6 +1884,9 @@ mod tests {
             remaining_seconds: None,
         };
         assert_eq!(outcome_word("conflicts"), ("disputed", "\x1b[33m"));
+        // A session whose group is led elsewhere is not one that never
+        // ran: it is fine, and someone else is doing the work.
+        assert_eq!(outcome_word("following"), ("another branch", "\x1b[2m"));
         // A routine scan says nothing.
         assert_eq!(activity_column(Some(&scanning(2))), "");
         // One that drags says what and how long.
@@ -1866,6 +1896,67 @@ mod tests {
         );
         // And an order at rest has no activity at all.
         assert_eq!(activity_column(None), "");
+    }
+
+    /// Peering: which host is doing the work belongs on the rail, not only
+    /// in `status`. A group that is not peering says nothing about roles.
+    #[test]
+    fn a_peering_group_says_which_side_holds_the_lead() {
+        use autobahn::supervisor::{GroupReport, SessionReport, StatusReport};
+
+        let session = SessionReport {
+            host: "fny".into(),
+            beta: "ubuntu@fny:~/w".into(),
+            mode: "peering-alpha-experimental".into(),
+            state: "synchronized".into(),
+            cycles: 3,
+            age_seconds: Some(1),
+            conflicts: Vec::new(),
+            blocked: Vec::new(),
+            error: None,
+            progress: None,
+            alerts: Vec::new(),
+            alert_summary: String::new(),
+        };
+        let group = |role: &str| GroupReport {
+            role: role.to_owned(),
+            term: 1,
+            name: "voltai".into(),
+            alpha: "~/Workspace/Voltai".into(),
+            sessions: vec![session.clone()],
+        };
+        let report = |role: &str| StatusReport {
+            version: 1,
+            supervisor_running: true,
+            service: "running".into(),
+            groups: vec![group(role)],
+        };
+
+        let rail = |role: &str| {
+            let shop = Shop {
+                plans: Vec::new(),
+                state_root: std::path::PathBuf::new(),
+                config: None,
+                report: report(role),
+                cursor: 0,
+                counter: None,
+                expanded: BTreeSet::new(),
+                marked: BTreeSet::new(),
+                working: Arc::default(),
+                rate: Rate::default(),
+                ticker: Vec::new(),
+                pending: None,
+                help: false,
+                frame: 0,
+            };
+            let session = shop.report.groups[0].sessions[0].clone();
+            shop.order(0, "voltai", &session, 120)
+        };
+        assert!(rail("leader").contains("leading"), "{:?}", rail("leader"));
+        assert!(rail("follower").contains("following"));
+        // A group with no role says nothing about one.
+        let plain = rail("");
+        assert!(!plain.contains("leading") && !plain.contains("following"), "{plain:?}");
     }
 
     #[test]

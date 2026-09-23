@@ -74,7 +74,7 @@ Rules the build must keep:
 - [x] `docs/state.md`: the `peering/` directory
 - [x] The epoch bump is noted in `docs/peering.md` (`releases.md` and `development.md` are in flight elsewhere)
 - [x] `run_clean` leaves `peering/` alone — it never removes directories it does not own, so nothing to add; said in `state.md`
-- [ ] Menu bar and `mi`: role shown on the group line (`tray.rs` and `shop.rs` are in flight elsewhere; `status` shows it)
+- [x] Menu bar and `mi`: the role rides on the rail's tail and in the submenu title; `following` is a word of its own in the shop
 - [ ] Remove this file once the feature ships, or move what is left into `TODO.md`
 
 ## Not in this build

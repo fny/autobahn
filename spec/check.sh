@@ -1,8 +1,9 @@
 #!/bin/bash
 # check.sh — model-check spec/Autobahn.tla in every mode, with TLC.
 #
-#   spec/check.sh              all three modes
+#   spec/check.sh              all three modes, two betas, every property
 #   spec/check.sh strict       one mode
+#   spec/check.sh strict_n3    three betas under symmetry: invariants only
 #   spec/check.sh --traces DIR validate replay traces (see tests/spec_replay.rs)
 #
 # Needs Java 11+ and tla2tools.jar: set TLA2TOOLS, or it is fetched into
@@ -31,6 +32,6 @@ modes="${*:-conflict alpha strict}"
 status=0
 for mode in $modes; do
     echo "== $mode"
-    (cd "$HERE" && tlc -config "Autobahn_$mode.cfg" Autobahn.tla) | grep -E "Error|violated|states generated|distinct states|Finished|Deadlock|Temporal" || status=1
+    (cd "$HERE" && tlc -config "Autobahn_$mode.cfg" MC.tla) | grep -E "Error|violated|states generated|distinct states|Finished|Deadlock|Temporal" || status=1
 done
 exit $status

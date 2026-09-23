@@ -1,6 +1,6 @@
 # The specification
 
-`Autobahn.tla` is the reconciler's rules for files, played by one alpha and any number of betas, and the properties the design promises: nothing a user wrote vanishes without its fate on record, `two-way-conflict` discards nothing, alpha never loses to a beta in the alpha modes, a pair that reported no conflict is levelled, and once the users stop everything converges except at reported conflicts. TLC checks all of it exhaustively, per mode, in about a minute each:
+`Autobahn.tla` is the reconciler's rules over a hierarchy of paths — files, directories, and the unit rule that decides a subtree at the shallowest path where the sides disagree — played by one alpha and any number of betas, and the properties the design promises: trees stay well-formed, nothing a user wrote vanishes without its fate on record, `two-way-conflict` discards nothing, alpha never loses to a beta in the alpha modes, a pair that reported no conflict is levelled, and once the users stop everything converges except at reported conflicts. TLC checks all of it exhaustively, per mode — two betas, a directory of two files beside a file, two values, four user actions: about half a million states and ten minutes per mode (`MC.tla` holds the path hierarchy, which the configuration format cannot spell):
 
 ```sh
 spec/check.sh            # every mode
@@ -17,4 +17,4 @@ AUTOBAHN_TLC=1 AUTOBAHN_TLC_TRACES=50 AUTOBAHN_TLC_KEEP=1 cargo test --test spec
 spec/check.sh --traces DIR                                                                  # validate kept traces again
 ```
 
-What is not in the model: directories (a subtree is one unit to the reconciler, and the rules above apply at the unit), renames (a deletion and a creation, which the model can express as two moves), and the transfer and transition machinery, whose contract — a transition writes only what it validated against its own scan — is pinned by the collision tests in `tests/e2e.rs`. Peering is not modelled.
+What is not in the model: renames (a removal and a creation, which the model can express as two moves), `two-way-paranoid`'s large-directory rule, untracked and problematic content, and the transfer and transition machinery, whose contract — a transition writes only what it validated against its own scan — is pinned by the collision tests in `tests/e2e.rs`. Peering is not modelled.

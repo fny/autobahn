@@ -172,6 +172,37 @@ pub(crate) struct WorkerControl {
     pub reset: AtomicBool,
     /// Re-read every file's content on the next cycle.
     pub verify: AtomicBool,
+    /// Rung whenever a flag above is set, so a worker asleep in a backoff
+    /// or a pause hears it at once rather than on its next poll.
+    pub bell: Doorbell,
+}
+
+/// A wake-up that can be waited for: rung by one thread, heard by another,
+/// immediately — where polling a flag costs a wake-up per slice whether or
+/// not anything happened. Thirty sessions backing off from an unreachable
+/// host polled 1,300 times a second.
+#[derive(Debug, Default)]
+pub(crate) struct Doorbell {
+    rung: std::sync::Mutex<bool>,
+    ringing: std::sync::Condvar,
+}
+
+impl Doorbell {
+    /// Rings: the next (or a current) `wait` returns.
+    pub fn ring(&self) {
+        *self.rung.lock().unwrap_or_else(|error| error.into_inner()) = true;
+        self.ringing.notify_all();
+    }
+
+    /// Waits until rung, or `timeout`; a ring since the last wait counts.
+    pub fn wait(&self, timeout: std::time::Duration) {
+        let rung = self.rung.lock().unwrap_or_else(|error| error.into_inner());
+        let (mut rung, _) = self
+            .ringing
+            .wait_timeout_while(rung, timeout, |rung| !*rung)
+            .unwrap_or_else(|error| error.into_inner());
+        *rung = false;
+    }
 }
 
 /// One registry entry: a session, its control flags, and its live
@@ -216,6 +247,7 @@ impl Registry {
                     // next attempt; woken, that is now.
                     for entry in &self.entries {
                         entry.control.wake.store(true, Ordering::Relaxed);
+                        entry.control.bell.ring();
                     }
                     ControlResponse::Applied {
                         sessions: self.entries.len(),
@@ -254,22 +286,27 @@ impl Registry {
         let (selector, action): (&Selector, fn(&WorkerControl)) = match request {
             ControlRequest::Flush(selector) => (selector, |control| {
                 control.wake.store(true, Ordering::Relaxed);
+                control.bell.ring();
             }),
             ControlRequest::Pause(selector) => (selector, |control| {
                 control.paused.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
+                control.bell.ring();
             }),
             ControlRequest::Resume(selector) => (selector, |control| {
                 control.paused.store(false, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
+                control.bell.ring();
             }),
             ControlRequest::Reset(selector) => (selector, |control| {
                 control.reset.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
+                control.bell.ring();
             }),
             ControlRequest::Verify(selector) => (selector, |control| {
                 control.verify.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
+                control.bell.ring();
             }),
             ControlRequest::Progress
             | ControlRequest::Yield { .. }
@@ -370,16 +407,27 @@ pub(crate) fn bind(state_root: &Path) -> Result<UnixListener> {
 
 /// Serves control requests until `stop` becomes true.
 pub(crate) fn serve(listener: UnixListener, registry: &Registry, stop: &AtomicBool) {
+    use std::os::unix::io::AsRawFd;
     while !stop.load(Ordering::Relaxed) {
+        // Waits in poll(2) for a connection, up to the stop-check interval,
+        // rather than trying and sleeping 50 ms: a request is answered the
+        // moment it arrives, and an idle supervisor is not woken twenty
+        // times a second to find nobody there.
+        let mut ready = libc::pollfd {
+            fd: listener.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut ready, 1, 250) } <= 0 {
+            continue;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Err(error) = handle(stream, registry) {
                     eprintln!("control request failed: {error:#}");
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(error) => {
                 eprintln!("control socket failed: {error:#}");
                 return;

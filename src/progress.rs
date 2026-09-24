@@ -126,6 +126,11 @@ pub struct SideProgress {
     /// Only one side transitions at a time, so the cycle's count is the sum
     /// of the two.
     applied: AtomicU64,
+    /// Units of work done on this side that the counters above do not
+    /// see: blocks hashed, signed, delta-encoded or patched, and changes
+    /// applied on a helper thread. Never reset; only its movement means
+    /// anything (see [`activity`](SideProgress::activity)).
+    work: AtomicU64,
 }
 
 impl SideProgress {
@@ -173,6 +178,27 @@ impl SideProgress {
     #[inline]
     pub fn change_applied(&self) {
         self.applied.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one unit of work — a block read, hashed, or written — so a
+    /// long operation that crosses no entry or change boundary still shows
+    /// that it is moving. A relaxed add, cheap enough for a per-block loop.
+    #[inline]
+    pub fn pulse(&self) {
+        self.work.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A number that moves whenever this side does any counted work:
+    /// entries visited, bytes hashed, changes applied, or a pulse. Its
+    /// value means nothing; a change in it means the work is moving. An
+    /// agent reports it for each channel so the controller can tell a slow
+    /// request from a stuck one.
+    pub fn activity(&self) -> u64 {
+        self.entries
+            .load(Ordering::Relaxed)
+            .wrapping_add(self.bytes.load(Ordering::Relaxed))
+            .wrapping_add(self.applied.load(Ordering::Relaxed))
+            .wrapping_add(self.work.load(Ordering::Relaxed))
     }
 
     /// Marks the end of a scan. `entries` is the completed scan's own total,
@@ -237,6 +263,57 @@ impl SideProgress {
                 _ => None,
             },
         }
+    }
+}
+
+/// A reader or writer that pulses a side's progress on every read, write
+/// or seek that moves, so work done through it — hashing a large file,
+/// computing or applying its delta — keeps the side's activity moving.
+pub struct Pulsing<T> {
+    inner: T,
+    progress: Option<Arc<SideProgress>>,
+}
+
+impl<T> Pulsing<T> {
+    /// Wraps `inner`, pulsing `progress` (when there is one) as it is used.
+    pub fn new(inner: T, progress: Option<Arc<SideProgress>>) -> Pulsing<T> {
+        Pulsing { inner, progress }
+    }
+
+    fn pulse(&self) {
+        if let Some(progress) = &self.progress {
+            progress.pulse();
+        }
+    }
+}
+
+impl<T: std::io::Read> std::io::Read for Pulsing<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.pulse();
+        }
+        Ok(read)
+    }
+}
+
+impl<T: std::io::Write> std::io::Write for Pulsing<T> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(data)?;
+        if written > 0 {
+            self.pulse();
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+impl<T: std::io::Seek> std::io::Seek for Pulsing<T> {
+    fn seek(&mut self, position: std::io::SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(position)
     }
 }
 

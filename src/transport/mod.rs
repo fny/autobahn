@@ -511,9 +511,19 @@ fn serve_agent_with<R: Read, W: Write + Send>(
     // wait (or a slow transfer) never stalls its siblings. The dispatch
     // below is the only reader; responses interleave through the shared
     // writer, one whole frame at a time.
+    //
+    // Each channel's work counter is reported beside its responses, so the
+    // controller can tell a request that is being worked on from one that
+    // never will be answered.
+    let counters: std::sync::Mutex<ChannelCounters> = Default::default();
     std::thread::scope(|scope| -> Result<()> {
         let mut channels: std::collections::HashMap<u32, std::sync::mpsc::Sender<Request>> =
             std::collections::HashMap::new();
+        let (stop_reporting, stopped) = std::sync::mpsc::channel::<()>();
+        {
+            let (output, counters) = (&output, &counters);
+            scope.spawn(move || report_progress(output, counters, stopped));
+        }
         let result = (|| -> Result<()> {
             loop {
                 let frame: protocol::MuxRequest = match read_frame(&mut input)? {
@@ -547,9 +557,16 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                         // Initialized or with the creation failure.
                         let (sender, receiver) = std::sync::mpsc::channel::<Request>();
                         channels.insert(channel, sender);
+                        let counted = std::sync::Arc::new(crate::progress::SideProgress::default());
+                        counters
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(channel, counted.clone());
                         let output = &output;
                         crate::threads::spawn_deep_scoped(scope, move || {
-                            serve_channel(channel, initialize, state_root, receiver, output)
+                            serve_channel(
+                                channel, initialize, state_root, receiver, output, counted,
+                            )
                         });
                     }
                     protocol::MuxRequest::Request { channel, request } => {
@@ -583,6 +600,10 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                         // Dropping the sender ends the channel thread after any
                         // in-flight request completes.
                         channels.remove(&channel);
+                        counters
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .remove(&channel);
                     }
                     protocol::MuxRequest::Shutdown => return Ok(()),
                 }
@@ -593,9 +614,74 @@ fn serve_agent_with<R: Read, W: Write + Send>(
         // threads blocked on their (still-live) request queues whenever the
         // controller disappears abruptly.
         channels.clear();
+        drop(stop_reporting);
         result
     })
 }
+
+/// Each open channel's work counter, by channel: what its scans, hashing,
+/// transfers and transitions advance as they go.
+type ChannelCounters =
+    std::collections::HashMap<u32, std::sync::Arc<crate::progress::SideProgress>>;
+
+/// How often an agent reports the channels whose work moved. Well inside
+/// the controller's silence limit, so a working channel is never taken for
+/// a stuck one; short in tests, so their real agents exercise the reports.
+const PROGRESS_INTERVAL: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(100)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// Reports, every `PROGRESS_INTERVAL` until `stop` is dropped, each
+/// channel whose work counter moved since the last report. A channel whose
+/// work has stopped — wedged on a filesystem, or its thread gone — is
+/// never reported, however healthy the rest of the agent is; that silence
+/// is what the controller detects.
+fn report_progress<W: Write>(
+    output: &std::sync::Mutex<W>,
+    counters: &std::sync::Mutex<ChannelCounters>,
+    stop: std::sync::mpsc::Receiver<()>,
+) {
+    let mut reported = std::collections::HashMap::new();
+    while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(PROGRESS_INTERVAL)
+    {
+        for (channel, counter) in moved_counters(counters, &mut reported) {
+            let mut output = output.lock().expect("the output lock is never poisoned");
+            let frame = protocol::MuxResponse::Progress { channel, counter };
+            if send_frame(&mut *output, &frame).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// The channels whose counter moved since `reported` last recorded it,
+/// with their counters, recording the new values. A channel starts from
+/// zero, so one that has done nothing yet is not reported.
+fn moved_counters(
+    counters: &std::sync::Mutex<ChannelCounters>,
+    reported: &mut std::collections::HashMap<u32, u64>,
+) -> Vec<(u32, u64)> {
+    let counters = counters.lock().unwrap_or_else(|error| error.into_inner());
+    reported.retain(|channel, _| counters.contains_key(channel));
+    let mut moved: Vec<(u32, u64)> = counters
+        .iter()
+        .filter_map(|(&channel, progress)| {
+            let counter = progress.activity();
+            let before = reported.insert(channel, counter).unwrap_or(0);
+            (before != counter).then_some((channel, counter))
+        })
+        .collect();
+    moved.sort_unstable();
+    moved
+}
+
+/// Sessions whose channel threads panic on their first request: the test
+/// hook for a channel that dies without answering.
+#[cfg(test)]
+pub(crate) static PANICKING_SESSIONS: std::sync::Mutex<Vec<String>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Serves one channel: the endpoint is created here (answering the open),
 /// then requests are served in order, each answered on the shared writer.
@@ -642,12 +728,13 @@ fn serve_channel<W: Write + Send>(
     state_root: &Result<PathBuf>,
     requests: std::sync::mpsc::Receiver<Request>,
     output: &std::sync::Mutex<W>,
+    counted: std::sync::Arc<crate::progress::SideProgress>,
 ) {
     // Endpoint creation failures answer on the channel (the controller
     // would otherwise see only silence) without affecting the connection's
     // other channels.
-    // What a scan has counted so far, for the reports a long one sends.
-    let counted = std::sync::Arc::new(crate::progress::SideProgress::default());
+    // `counted` is what a scan has counted so far, for the reports a long
+    // one sends, and the channel's work counter besides.
     let created = crate::root::check_agent(crate::root::Identity::current(), &initialize)
         .and_then(|()| create_endpoint(&initialize, state_root));
     let mut endpoint = match created {
@@ -692,6 +779,14 @@ fn serve_channel<W: Write + Send>(
     let mut fence: Option<crate::peering::Lease> = None;
     let mut copy: Option<crate::peering::AncestorCopy> = None;
     while let Ok(request) = requests.recv() {
+        #[cfg(test)]
+        if PANICKING_SESSIONS
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(&initialize.session)
+        {
+            panic!("the test hook panics this channel");
+        }
         // What becomes of the record of what this channel has transmitted,
         // *if* this response reaches the controller. It is applied only
         // after a successful send: a response that fails to encode or
@@ -1011,8 +1106,11 @@ fn serve_send<W: Write>(
     response: Response,
 ) -> Result<()> {
     let mut output = output.lock().expect("the output lock is never poisoned");
-    send_frame(&mut *output, &protocol::MuxResponse { channel, response })
-        .context("unable to send response")
+    send_frame(
+        &mut *output,
+        &protocol::MuxResponse::Response { channel, response },
+    )
+    .context("unable to send response")
 }
 
 /// What a delivered response implies about the snapshot a channel has
@@ -2358,6 +2456,104 @@ pub(crate) mod tests {
         );
     }
 
+    /// An agent reports a channel only when its work counter moved: never
+    /// one that has done nothing, never the same count twice, and never a
+    /// channel that has closed.
+    #[test]
+    fn only_channels_whose_work_moved_are_reported() {
+        let busy = std::sync::Arc::new(crate::progress::SideProgress::default());
+        let idle = std::sync::Arc::new(crate::progress::SideProgress::default());
+        let counters = std::sync::Mutex::new(ChannelCounters::from([
+            (1, busy.clone()),
+            (2, idle.clone()),
+        ]));
+        let mut reported = std::collections::HashMap::new();
+        assert!(moved_counters(&counters, &mut reported).is_empty());
+
+        busy.pulse();
+        let moved = moved_counters(&counters, &mut reported);
+        assert_eq!(moved, vec![(1, busy.activity())]);
+        assert!(moved_counters(&counters, &mut reported).is_empty());
+
+        // Every kind of counted work moves it.
+        for work in [
+            &|progress: &crate::progress::SideProgress| progress.advance(1, 0),
+            &|progress: &crate::progress::SideProgress| progress.advance(0, 4096),
+            &|progress: &crate::progress::SideProgress| progress.change_applied(),
+        ] as [&dyn Fn(&crate::progress::SideProgress); 3]
+        {
+            work(&idle);
+            assert_eq!(moved_counters(&counters, &mut reported).len(), 1);
+        }
+
+        counters.lock().unwrap().remove(&1);
+        busy.pulse();
+        assert!(moved_counters(&counters, &mut reported).is_empty());
+        assert!(!reported.contains_key(&1));
+    }
+
+    /// Through a real agent: a scan that hashes a file counts as work on
+    /// its channel, and the agent reports it.
+    #[test]
+    fn an_agent_reports_the_work_of_a_running_request() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        std::fs::write(root.join("file"), vec![1u8; 1 << 20]).expect("file should be writable");
+        let (mut client, agent) = connected_pair();
+        let (agent_reader, agent_writer, _) = agent.into_parts();
+        let state = keep.path().join("state");
+        let served = std::thread::spawn(move || serve_agent_in(agent_reader, agent_writer, &state));
+        client.send(&local_handshake()).expect("handshake");
+        let _: Handshake = client.receive().expect("handshake");
+        let root_text = root.to_string_lossy().into_owned();
+        client
+            .send(&protocol::MuxRequest::Open {
+                channel: 3,
+                initialize: Initialize {
+                    session: crate::session::session_identifier(&root_text, "progress-test"),
+                    root: root_text,
+                    ignores: Vec::new(),
+                    symlink_mode: crate::scan::SymlinkMode::Raw,
+                    file_mode: None,
+                    directory_mode: None,
+                    side: "beta".into(),
+                    staging: Default::default(),
+                    max_file_size: None,
+                    max_entry_count: None,
+                    ignore_mounts: true,
+                    default_owner: None,
+                    default_group: None,
+                },
+            })
+            .expect("open");
+        client
+            .send(&protocol::MuxRequest::Request {
+                channel: 3,
+                request: Request::Scan,
+            })
+            .expect("scan");
+        // The open's answer, the scan's, and then — within a report
+        // interval or two — the channel's progress.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut progress = None;
+        while progress.is_none() && std::time::Instant::now() < deadline {
+            match client.receive::<protocol::MuxResponse>().expect("a frame") {
+                protocol::MuxResponse::Progress { channel, counter } => {
+                    progress = Some((channel, counter))
+                }
+                protocol::MuxResponse::Response { .. } => {}
+            }
+        }
+        let (channel, counter) = progress.expect("the scan's work is reported");
+        assert_eq!(channel, 3);
+        assert!(counter > 0);
+        client
+            .send(&protocol::MuxRequest::Shutdown)
+            .expect("shutdown");
+        served.join().expect("the agent thread").expect("the agent");
+    }
+
     #[test]
     fn a_long_scan_reports_its_count_and_a_short_one_says_nothing_extra() {
         let decode = |bytes: &[u8]| -> Vec<Response> {
@@ -2365,8 +2561,11 @@ pub(crate) mod tests {
             let mut responses = Vec::new();
             while (cursor.position() as usize) < bytes.len() {
                 let frame: protocol::MuxResponse = receive_frame(&mut cursor).expect("a frame");
-                assert_eq!(frame.channel, 7);
-                responses.push(frame.response);
+                let protocol::MuxResponse::Response { channel, response } = frame else {
+                    panic!("only responses: {frame:?}");
+                };
+                assert_eq!(channel, 7);
+                responses.push(response);
             }
             responses
         };

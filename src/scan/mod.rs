@@ -1305,6 +1305,9 @@ impl<'a> Scanner<'a> {
                 break;
             }
             hasher.update(&self.buffer[..count]);
+            if let Some(progress) = self.progress {
+                progress.pulse();
+            }
             read += count as u64;
             if read > limit {
                 return Ok(None);

@@ -302,11 +302,26 @@ pub enum MuxRequest {
 
 /// An agent-to-controller frame on a multiplexed connection.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MuxResponse {
-    /// The channel the response belongs to.
-    pub channel: u32,
-    /// The response itself.
-    pub response: Response,
+pub enum MuxResponse {
+    /// A response on a channel: the answer to its oldest outstanding
+    /// request, or a scan's progress report ahead of that answer.
+    Response {
+        /// The channel the response belongs to.
+        channel: u32,
+        /// The response itself.
+        response: Response,
+    },
+    /// The channel's work counter has moved since the last report: the
+    /// request it is serving is still being worked on. Sent every few
+    /// seconds, and only when the counter moved, so a channel whose work
+    /// has stopped falls silent even while the agent's other threads keep
+    /// running. It answers nothing; the controller only notes the time.
+    Progress {
+        /// The channel whose work moved.
+        channel: u32,
+        /// The channel's work counter.
+        counter: u64,
+    },
 }
 
 /// The compatibility epoch: bumped whenever safety-relevant behavior

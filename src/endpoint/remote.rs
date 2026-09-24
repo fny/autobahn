@@ -1040,7 +1040,7 @@ mod tests {
                         initialize,
                     } => {
                         first.get_or_insert(initialize);
-                        connection.send(&MuxResponse {
+                        connection.send(&MuxResponse::Response {
                             channel,
                             response: Response::Initialized,
                         })?;
@@ -1052,7 +1052,7 @@ mod tests {
                         let Some(response) = responses.next() else {
                             anyhow::bail!("a request beyond the script");
                         };
-                        connection.send(&MuxResponse { channel, response })?;
+                        connection.send(&MuxResponse::Response { channel, response })?;
                         if responses.len() == 0 {
                             break;
                         }
@@ -1546,7 +1546,7 @@ mod tests {
             let MuxRequest::Open { channel, .. } = agent.receive()? else {
                 anyhow::bail!("expected a channel open");
             };
-            agent.send(&MuxResponse {
+            agent.send(&MuxResponse::Response {
                 channel,
                 response: Response::Error("no such directory".into()),
             })?;

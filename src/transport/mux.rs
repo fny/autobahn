@@ -23,12 +23,18 @@
 //! last of both is gone. A transport failure marks the connection dead,
 //! unblocks every waiting channel with the failure, and reaps; pooled
 //! callers observe the death and build a fresh connection.
+//!
+//! Silence is a failure too. The agent reports each channel's work counter
+//! every few seconds while it moves, and a watchdog fails the connection
+//! when a request goes [`SILENCE_LIMIT`] with neither its answer nor any
+//! movement: slow work keeps a request alive, a stuck agent does not.
 
-use std::collections::HashMap;
-use std::io::Write;
+use std::collections::{HashMap, VecDeque};
+use std::io::{Read, Write};
 use std::process::Child;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -46,6 +52,18 @@ const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// agent that is alive but wedged, otherwise holds every session to that
 /// host forever without an error, so nothing retries and nothing alerts.
 pub const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a request may go with neither its answer nor any sign of work
+/// on it before its connection is failed. A slow request is not a stuck
+/// one: a scan of a huge tree or the hash of a huge file takes as long as
+/// it takes, and the agent shows it is moving with a progress report every
+/// few seconds (see [`MuxResponse::Progress`]). What this catches is an
+/// agent that is alive and says nothing — a wedged process, a filesystem
+/// that never returns, a channel thread that died — which otherwise holds
+/// its sessions forever without an error.
+///
+/// [`MuxResponse::Progress`]: crate::protocol::MuxResponse::Progress
+pub const SILENCE_LIMIT: Duration = Duration::from_secs(60);
 
 /// How long a session waits for another session's connection to the same
 /// host to be established. Establishment is itself bounded (each ssh step
@@ -90,21 +108,149 @@ struct Shared {
     _stderr: Option<super::StderrRelay>,
     /// How long a channel open may wait for its answer.
     setup_timeout: std::time::Duration,
+    /// How long an owed answer may go unheard of before the connection is
+    /// failed (see [`SILENCE_LIMIT`]).
+    silence_limit: Duration,
+    /// When bytes last moved on the stream, and whether a frame is part
+    /// way across it.
+    wire: Arc<WireClock>,
+}
+
+/// When bytes last moved on a connection's stream, either way, and whether
+/// a frame is part way across it. A frame of several megabytes on a slow
+/// link takes a while to cross, and nothing else can be heard meanwhile —
+/// the agent writes whole frames, one at a time — so while one is moving,
+/// no channel's silence is held against it.
+struct WireClock {
+    /// What `moved` counts from.
+    epoch: Instant,
+    /// When bytes last moved, in milliseconds since `epoch`.
+    moved: AtomicU64,
+    /// Whether a received frame has begun to arrive and not yet ended.
+    reading: AtomicBool,
+    /// Whether a frame is being sent.
+    writing: AtomicBool,
+}
+
+impl WireClock {
+    fn new() -> WireClock {
+        WireClock {
+            epoch: Instant::now(),
+            moved: AtomicU64::new(0),
+            reading: AtomicBool::new(false),
+            writing: AtomicBool::new(false),
+        }
+    }
+
+    fn moved(&self) {
+        let now = self.epoch.elapsed().as_millis() as u64;
+        self.moved.store(now, Ordering::Relaxed);
+    }
+
+    /// Whether a frame is part way across and bytes of it moved within
+    /// `limit`. A frame whose bytes stopped moving excuses nothing.
+    fn busy_within(&self, limit: Duration) -> bool {
+        let crossing = self.reading.load(Ordering::Relaxed) || self.writing.load(Ordering::Relaxed);
+        let since = self
+            .epoch
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.moved.load(Ordering::Relaxed)));
+        crossing && since < limit
+    }
+}
+
+/// A stream end that records on its connection's [`WireClock`] whenever
+/// bytes move through it.
+struct Clocked<T> {
+    inner: T,
+    wire: Arc<WireClock>,
+}
+
+impl<T: Read> Read for Clocked<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            self.wire.moved();
+            self.wire.reading.store(true, Ordering::Relaxed);
+        }
+        Ok(read)
+    }
+}
+
+impl<T: Write> Write for Clocked<T> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        let written = self.inner.write(data)?;
+        if written > 0 {
+            self.wire.moved();
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// One channel's routing slot.
 struct Slot {
     /// The response queue.
     sender: mpsc::Sender<Response>,
-    /// The number of outstanding requests (a response arriving with none
-    /// is a protocol violation). Ordinary exchanges keep this at most one;
+    /// The outstanding requests, oldest first (a response arriving with
+    /// none is a protocol violation). Ordinary exchanges keep at most one;
     /// windowed staging pushes keep several acknowledgements in flight.
-    /// The counter bounds, rather than eliminates, duplicate damage: a
+    /// The count bounds, rather than eliminates, duplicate damage: a
     /// duplicate landing while a request is outstanding is delivered as an
     /// answer — which surfaces as a typed protocol error at the caller —
     /// and the genuine answer that follows then fails the connection.
     /// Nothing desynchronizes silently.
-    outstanding: u32,
+    owed: VecDeque<Owed>,
+    /// When the channel last showed life while owed an answer: an answer,
+    /// a progress report that moved, or the request that made it owed.
+    heard: Instant,
+    /// The last work counter the agent reported, so a report that repeats
+    /// it is not taken for movement.
+    counter: Option<u64>,
+    /// The counts of the running scan's last report, likewise.
+    scanned: Option<(u64, u64)>,
+}
+
+/// A request owed an answer.
+struct Owed {
+    /// What the request is, as a death reason names it.
+    what: &'static str,
+    /// How much longer than the silence limit its answer may take with no
+    /// sign of work: the wait itself, for a change wait, which is silent
+    /// by design.
+    grace: Duration,
+}
+
+impl Owed {
+    fn for_request(request: &Request) -> Owed {
+        let what = match request {
+            Request::Scan => "a scan",
+            Request::ScanVerified => "a verified scan",
+            Request::StageBegin(_) => "a staging begin",
+            Request::SupplyOpen(_) => "a supply open",
+            Request::SupplyPull(_) => "a supply pull",
+            Request::StagePush(_) => "a staging push",
+            Request::Transition(_) => "a transition",
+            Request::AwaitChanges { .. } => "a change wait",
+            Request::ScanPull => "a scan pull",
+            Request::ScanFull => "a full scan resend",
+            Request::ReadFile(_) => "a file read",
+            Request::Rename(..) => "a rename",
+            Request::Lease(_) => "a lease",
+            Request::AncestorRecord { .. } => "an ancestor record",
+            Request::AncestorCheckpoint { .. } => "an ancestor checkpoint",
+            Request::PutPeeringFile { .. } => "a peering file",
+            Request::PeeringState => "a peering state query",
+        };
+        let grace = match request {
+            Request::AwaitChanges { milliseconds, .. } => Duration::from_millis(*milliseconds),
+            _ => Duration::ZERO,
+        };
+        Owed { what, grace }
+    }
 }
 
 /// The routing table and lifecycle flags.
@@ -134,8 +280,19 @@ impl AgentConnection {
     /// open. A missed deadline fails the connection as
     /// [`ConnectionFailed`], so its sessions back off and reconnect.
     pub fn connect_within(
+        connection: Connection,
+        setup_timeout: std::time::Duration,
+    ) -> Result<AgentConnection> {
+        AgentConnection::connect_watched(connection, setup_timeout, SILENCE_LIMIT)
+    }
+
+    /// Establishes a multiplexed connection as
+    /// [`connect_within`](Self::connect_within) does, failing it when a
+    /// request goes `silence_limit` with neither its answer nor progress.
+    pub(crate) fn connect_watched(
         mut connection: Connection,
         setup_timeout: std::time::Duration,
+        silence_limit: Duration,
     ) -> Result<AgentConnection> {
         // Held until the handshake proves the far side is an agent. After
         // that it is the agent's own voice, and everything it says about
@@ -173,7 +330,7 @@ impl AgentConnection {
                 super::verify_handshake(&peer)?;
                 Ok(reader)
             });
-        let mut reader = match handshake {
+        let reader = match handshake {
             Ok(reader) => reader,
             Err(error) => {
                 if let Some(mut child) = child {
@@ -197,6 +354,15 @@ impl AgentConnection {
             relay.release();
         }
 
+        let wire = Arc::new(WireClock::new());
+        let mut reader = Clocked {
+            inner: reader,
+            wire: wire.clone(),
+        };
+        let writer: Box<dyn Write + Send> = Box::new(Clocked {
+            inner: writer,
+            wire: wire.clone(),
+        });
         let shared = Arc::new(Shared {
             writer: Mutex::new(writer),
             child: Mutex::new(child),
@@ -210,6 +376,8 @@ impl AgentConnection {
             }),
             next_channel: AtomicU32::new(1),
             setup_timeout,
+            silence_limit,
+            wire,
         });
 
         // The router: the connection's only reader. It ends when the stream
@@ -218,23 +386,52 @@ impl AgentConnection {
         let router = shared.clone();
         crate::threads::spawn_deep(move || {
             let failure = loop {
-                match super::receive_frame::<_, MuxResponse>(&mut reader) {
-                    Ok(MuxResponse { channel, response }) => {
+                let frame = super::receive_frame::<_, MuxResponse>(&mut reader);
+                router.wire.reading.store(false, Ordering::Relaxed);
+                match frame {
+                    // Work moving on a channel: noted, never delivered. A
+                    // report for a channel owed nothing is the benign race
+                    // of a report crossing its answer.
+                    Ok(MuxResponse::Progress { channel, counter }) => {
+                        let mut state = router
+                            .state
+                            .lock()
+                            .expect("the state lock is never poisoned");
+                        if let Some(slot) = state.channels.get_mut(&channel) {
+                            if !slot.owed.is_empty() && slot.counter != Some(counter) {
+                                slot.heard = Instant::now();
+                            }
+                            slot.counter = Some(counter);
+                        }
+                    }
+                    Ok(MuxResponse::Response { channel, response }) => {
                         let mut state = router
                             .state
                             .lock()
                             .expect("the state lock is never poisoned");
                         match state.channels.get_mut(&channel) {
-                            Some(slot) if slot.outstanding > 0 => {
+                            Some(slot) if !slot.owed.is_empty() => {
                                 // A scan's progress report comes ahead of
                                 // its answer and does not answer it: the
                                 // request stays owed until the answer does.
                                 // Counted as an answer, the real one that
                                 // follows read as unsolicited and failed the
                                 // connection — every remote scan longer
-                                // than the report interval.
-                                if !matches!(response, Response::ScanProgress { .. }) {
-                                    slot.outstanding -= 1;
+                                // than the report interval. It is sent on a
+                                // timer, so only one whose counts moved is
+                                // a sign of work.
+                                match &response {
+                                    Response::ScanProgress { entries, bytes } => {
+                                        if slot.scanned != Some((*entries, *bytes)) {
+                                            slot.heard = Instant::now();
+                                        }
+                                        slot.scanned = Some((*entries, *bytes));
+                                    }
+                                    _ => {
+                                        slot.owed.pop_front();
+                                        slot.heard = Instant::now();
+                                        slot.scanned = None;
+                                    }
                                 }
                                 // A failed send means the channel handle is
                                 // being dropped; its close is on the way.
@@ -261,6 +458,15 @@ impl AgentConnection {
             };
             router.fail(failure);
         });
+
+        // The watchdog: fails the connection when a channel owed an answer
+        // hears nothing for the silence limit. It holds the connection
+        // weakly, so it never keeps one alive, and ends with it.
+        let watched = Arc::downgrade(&shared);
+        std::thread::Builder::new()
+            .name("autobahn-watchdog".into())
+            .spawn(move || watch_for_silence(watched, silence_limit))
+            .context("unable to start the connection's watchdog")?;
 
         Ok(AgentConnection { shared })
     }
@@ -294,7 +500,15 @@ impl AgentConnection {
                 channel,
                 Slot {
                     sender,
-                    outstanding: 1,
+                    // The open has a deadline of its own, which this grace
+                    // leaves to report it.
+                    owed: VecDeque::from([Owed {
+                        what: "a channel open",
+                        grace: self.shared.setup_timeout,
+                    }]),
+                    heard: Instant::now(),
+                    counter: None,
+                    scanned: None,
                 },
             );
             state.open += 1;
@@ -385,6 +599,7 @@ impl AgentChannel {
     /// This is what lets bulk staging keep a window of pushes in flight
     /// instead of paying one round trip per batch.
     pub fn send_only(&mut self, request: Request) -> Result<()> {
+        let owed = Owed::for_request(&request);
         {
             let mut state = self
                 .shared
@@ -398,7 +613,12 @@ impl AgentChannel {
                 .channels
                 .get_mut(&self.channel)
                 .ok_or_else(|| anyhow!("the channel has been closed"))?;
-            slot.outstanding += 1;
+            // A channel starts owing now: its silence is counted from the
+            // request, not from whenever it was last heard.
+            if slot.owed.is_empty() {
+                slot.heard = Instant::now();
+            }
+            slot.owed.push_back(owed);
         }
         if let Err(error) = self.shared.send(&MuxRequest::Request {
             channel: self.channel,
@@ -409,7 +629,7 @@ impl AgentChannel {
             // an answer).
             if let Ok(mut state) = self.shared.state.lock() {
                 if let Some(slot) = state.channels.get_mut(&self.channel) {
-                    slot.outstanding = slot.outstanding.saturating_sub(1);
+                    slot.owed.pop_back();
                 }
             }
             // A write that fails is a connection that has failed, whatever
@@ -460,7 +680,47 @@ impl Shared {
             .writer
             .lock()
             .expect("the writer lock is never poisoned");
-        super::send_frame(&mut *writer, frame)
+        self.wire.writing.store(true, Ordering::Relaxed);
+        let sent = super::send_frame(&mut *writer, frame);
+        self.wire.writing.store(false, Ordering::Relaxed);
+        sent
+    }
+
+    /// The death reason for the first channel that has been owed an answer
+    /// and heard nothing for longer than the silence limit allows, if any.
+    /// `None` too while a frame is crossing the stream: nothing else can be
+    /// heard meanwhile, so every owed channel's silence starts over.
+    fn silence(&self) -> Option<String> {
+        let mut state = self.state.lock().expect("the state lock is never poisoned");
+        let now = Instant::now();
+        if self.wire.busy_within(self.silence_limit) {
+            for slot in state.channels.values_mut() {
+                slot.heard = now;
+            }
+            return None;
+        }
+        let mut silent: Vec<(u32, &'static str, Duration)> = state
+            .channels
+            .iter()
+            .filter_map(|(&channel, slot)| {
+                let owed = slot.owed.front()?;
+                let quiet = now.saturating_duration_since(slot.heard);
+                (quiet > self.silence_limit + owed.grace).then_some((channel, owed.what, quiet))
+            })
+            .collect();
+        silent.sort_unstable_by_key(|(channel, ..)| *channel);
+        let (channel, what, quiet) = silent.into_iter().next()?;
+        Some(format!(
+            "the agent went silent: channel {channel} heard neither the answer to {what} nor \
+             any progress on it for {}",
+            describe_timeout(quiet)
+        ))
+    }
+
+    /// Whether the connection is finished with, dead or shut down.
+    fn finished(&self) -> bool {
+        let state = self.state.lock().expect("the state lock is never poisoned");
+        state.dead.is_some() || state.shutdown
     }
 
     /// Returns the recorded death reason (or a generic disconnection).
@@ -807,6 +1067,26 @@ impl AgentPool {
         AgentPool {
             wait_timeout: Some(wait),
             ..AgentPool::default()
+        }
+    }
+}
+
+/// The connection watchdog's loop: looks for a silent channel a few times
+/// per silence limit, and fails the connection on finding one. Ends when
+/// the connection is gone, dead, or shut down.
+fn watch_for_silence(connection: Weak<Shared>, silence_limit: Duration) {
+    let interval = (silence_limit / 6).clamp(Duration::from_millis(10), Duration::from_secs(10));
+    loop {
+        std::thread::sleep(interval);
+        let Some(shared) = connection.upgrade() else {
+            return;
+        };
+        if shared.finished() {
+            return;
+        }
+        if let Some(reason) = shared.silence() {
+            shared.fail(reason);
+            return;
         }
     }
 }
@@ -1296,6 +1576,306 @@ mod tests {
         assert!(ConnectionFailed::is_in(&error), "{error:#}");
     }
 
+    /// A scripted agent: completes the handshake, answers the open, and
+    /// then hands each request to `serve` with the connection, until
+    /// `serve` returns false or the stream ends.
+    fn scripted_agent(
+        connection: Connection,
+        mut serve: impl FnMut(&mut Connection, u32, Request) -> Result<bool> + Send + 'static,
+    ) -> std::thread::JoinHandle<Result<()>> {
+        std::thread::spawn(move || -> Result<()> {
+            let mut connection = connection;
+            let _: Handshake = connection.receive()?;
+            connection.send(&crate::transport::local_handshake())?;
+            loop {
+                match connection.receive::<MuxRequest>()? {
+                    MuxRequest::Open { channel, .. } => {
+                        connection.send(&MuxResponse::Response {
+                            channel,
+                            response: Response::Initialized,
+                        })?
+                    }
+                    MuxRequest::Request { channel, request } => {
+                        if !serve(&mut connection, channel, request)? {
+                            // Silent from here on, with the stream kept
+                            // open, until the controller goes away.
+                            while connection.receive::<MuxRequest>().is_ok() {}
+                            return Ok(());
+                        }
+                    }
+                    MuxRequest::Close { .. } => {}
+                    MuxRequest::Shutdown => return Ok(()),
+                }
+            }
+        })
+    }
+
+    /// A far side that accepts a request and never answers it or reports
+    /// any progress fails its connection after the silence limit, with a
+    /// reason naming the channel, the request and the silence; the next
+    /// session on the host establishes a fresh connection.
+    #[test]
+    fn a_silent_agent_fails_its_connection_naming_the_channel_and_request() {
+        let pool = AgentPool::default();
+        let key = vec!["silent-host".to_owned()];
+        let (client, scripted) = connected_pair();
+        let _agent = scripted_agent(scripted, |_, _, _| Ok(false));
+        let mut channel = pool
+            .channel(&key, initialize(std::path::Path::new("/unused")), || {
+                AgentConnection::connect_watched(
+                    client,
+                    Duration::from_secs(5),
+                    Duration::from_millis(300),
+                )
+            })
+            .expect("the channel opens");
+        let started = Instant::now();
+        let error = channel
+            .exchange(Request::Scan)
+            .expect_err("a silent request must fail");
+        let waited = started.elapsed();
+        assert!(ConnectionFailed::is_in(&error), "{error:#}");
+        assert!(
+            waited >= Duration::from_millis(300),
+            "failed after {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(5), "failed after {waited:?}");
+        let message = format!("{error:#}");
+        for part in ["went silent", "channel 1", "a scan", "ms"] {
+            assert!(message.contains(part), "{part:?} missing from: {message}");
+        }
+        drop(channel);
+
+        // The session reconnects: the pool establishes afresh.
+        let (client, scripted) = connected_pair();
+        let _agent = scripted_agent(scripted, |connection, channel, _| {
+            connection.send(&MuxResponse::Response {
+                channel,
+                response: Response::StagePushed,
+            })?;
+            Ok(true)
+        });
+        let mut established = false;
+        let mut channel = pool
+            .channel(&key, initialize(std::path::Path::new("/unused")), || {
+                established = true;
+                AgentConnection::connect(client)
+            })
+            .expect("a fresh connection opens");
+        assert!(established, "the failed connection was reused");
+        assert!(matches!(
+            channel.exchange(Request::StagePush(Vec::new())),
+            Ok(Response::StagePushed)
+        ));
+    }
+
+    /// An agent that works slowly but steadily — here for ten silence
+    /// limits, reporting its moving counter well inside each — is not
+    /// failed, and its answer arrives.
+    #[test]
+    fn a_slow_agent_that_reports_progress_is_not_failed() {
+        let (client, scripted) = connected_pair();
+        let _agent = scripted_agent(scripted, |connection, channel, _| {
+            let started = Instant::now();
+            let mut counter = 0;
+            while started.elapsed() < Duration::from_secs(3) {
+                std::thread::sleep(Duration::from_millis(60));
+                counter += 1;
+                connection.send(&MuxResponse::Progress { channel, counter })?;
+            }
+            connection.send(&MuxResponse::Response {
+                channel,
+                response: Response::StagePushed,
+            })?;
+            Ok(true)
+        });
+        let connection = AgentConnection::connect_watched(
+            client,
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .expect("unable to connect");
+        let mut channel = connection
+            .open(initialize(std::path::Path::new("/unused")))
+            .expect("open");
+        let started = Instant::now();
+        let response = channel
+            .exchange(Request::StagePush(Vec::new()))
+            .expect("a slow but working request is answered");
+        assert!(matches!(response, Response::StagePushed), "{response:?}");
+        assert!(started.elapsed() >= Duration::from_secs(3));
+        assert!(connection.usable());
+    }
+
+    /// A report that repeats the last counter — a heartbeat, not work — is
+    /// no sign of life, and neither is a scan report whose counts stand
+    /// still.
+    #[test]
+    fn a_counter_that_stands_still_is_silence() {
+        for scan in [false, true] {
+            let (client, scripted) = connected_pair();
+            let _agent = scripted_agent(scripted, move |connection, channel, _| {
+                for _ in 0..100 {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let frame = match scan {
+                        false => MuxResponse::Progress {
+                            channel,
+                            counter: 7,
+                        },
+                        true => MuxResponse::Response {
+                            channel,
+                            response: Response::ScanProgress {
+                                entries: 7,
+                                bytes: 0,
+                            },
+                        },
+                    };
+                    if connection.send(&frame).is_err() {
+                        break;
+                    }
+                }
+                Ok(false)
+            });
+            let connection = AgentConnection::connect_watched(
+                client,
+                Duration::from_secs(5),
+                Duration::from_millis(300),
+            )
+            .expect("unable to connect");
+            let mut channel = connection
+                .open(initialize(std::path::Path::new("/unused")))
+                .expect("open");
+            let started = Instant::now();
+            let mut response = channel.exchange(Request::Scan);
+            while let Ok(Response::ScanProgress { .. }) = response {
+                response = channel.receive_response();
+            }
+            let error = response.expect_err("a standing counter must not keep it alive");
+            assert!(format!("{error:#}").contains("went silent"), "{error:#}");
+            assert!(started.elapsed() < Duration::from_secs(4), "scan {scan}");
+        }
+    }
+
+    /// A change wait is silent by design for as long as it was asked to
+    /// wait; only silence beyond that counts.
+    #[test]
+    fn a_change_wait_may_be_silent_for_its_own_length() {
+        let (client, scripted) = connected_pair();
+        let _agent = scripted_agent(scripted, |connection, channel, request| {
+            let Request::AwaitChanges { milliseconds, .. } = request else {
+                anyhow::bail!("expected a change wait");
+            };
+            std::thread::sleep(Duration::from_millis(milliseconds));
+            connection.send(&MuxResponse::Response {
+                channel,
+                response: Response::AwaitChanges {
+                    changed: false,
+                    watching: true,
+                },
+            })?;
+            Ok(true)
+        });
+        let connection = AgentConnection::connect_watched(
+            client,
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .expect("unable to connect");
+        let mut channel = connection
+            .open(initialize(std::path::Path::new("/unused")))
+            .expect("open");
+        let response = channel
+            .exchange(Request::AwaitChanges {
+                milliseconds: 1_200,
+                since: None,
+            })
+            .expect("a change wait is answered");
+        assert!(matches!(response, Response::AwaitChanges { .. }));
+    }
+
+    /// A frame that takes longer than the silence limit to cross a slow
+    /// link is not silence while its bytes keep moving.
+    #[test]
+    fn a_frame_crossing_a_slow_link_is_not_silence() {
+        let (client, scripted) = connected_pair();
+        let agent = std::thread::spawn(move || -> Result<()> {
+            let mut connection = scripted;
+            let _: Handshake = connection.receive()?;
+            connection.send(&crate::transport::local_handshake())?;
+            let MuxRequest::Open { channel, .. } = connection.receive()? else {
+                anyhow::bail!("expected an open");
+            };
+            connection.send(&MuxResponse::Response {
+                channel,
+                response: Response::Initialized,
+            })?;
+            let _: MuxRequest = connection.receive()?;
+            let (mut reader, mut writer, _) = connection.into_parts();
+            // The answer, a trickle of bytes over well over the limit.
+            let mut frame = Vec::new();
+            crate::transport::send_frame(
+                &mut frame,
+                &MuxResponse::Response {
+                    channel,
+                    response: Response::File(Some(vec![7u8; 4096])),
+                },
+            )?;
+            for piece in frame.chunks(frame.len().div_ceil(30)) {
+                std::thread::sleep(Duration::from_millis(50));
+                writer.write_all(piece)?;
+                writer.flush()?;
+            }
+            let _ = std::io::copy(&mut reader, &mut std::io::sink());
+            Ok(())
+        });
+        let connection = AgentConnection::connect_watched(
+            client,
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+        )
+        .expect("unable to connect");
+        let mut channel = connection
+            .open(initialize(std::path::Path::new("/unused")))
+            .expect("open");
+        let response = channel
+            .exchange(Request::ReadFile("slow".into()))
+            .expect("a frame still crossing is not silence");
+        assert!(matches!(response, Response::File(Some(_))));
+        drop(channel);
+        drop(connection);
+        agent.join().expect("the agent thread").expect("the agent");
+    }
+
+    /// A real agent whose channel thread panics never answers; the
+    /// connection is failed within the silence limit instead of hanging.
+    #[test]
+    fn a_panicking_agent_channel_fails_its_connection_within_the_limit() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        let (client, _finished) = spawned_agent(&keep.path().join("state"));
+        let connection = AgentConnection::connect_watched(
+            client,
+            Duration::from_secs(5),
+            Duration::from_millis(600),
+        )
+        .expect("unable to connect");
+        let doomed = initialize(&root);
+        crate::transport::PANICKING_SESSIONS
+            .lock()
+            .unwrap()
+            .push(doomed.session.clone());
+        let mut channel = connection.open(doomed).expect("open");
+        let started = Instant::now();
+        let error = channel
+            .exchange(Request::Scan)
+            .expect_err("the panicked channel never answers");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(ConnectionFailed::is_in(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("went silent"), "{error:#}");
+        assert!(!connection.usable());
+    }
+
     #[test]
     fn a_scan_reports_progress_before_its_answer_on_a_healthy_channel() {
         let (scripted, agent_side) = connected_pair();
@@ -1306,7 +1886,7 @@ mod tests {
             let MuxRequest::Open { channel, .. } = connection.receive()? else {
                 anyhow::bail!("expected an open");
             };
-            connection.send(&MuxResponse {
+            connection.send(&MuxResponse::Response {
                 channel,
                 response: Response::Initialized,
             })?;
@@ -1315,18 +1895,18 @@ mod tests {
             for _ in 0..2 {
                 let _: MuxRequest = connection.receive()?;
                 for entries in [1_000, 2_000, 3_000] {
-                    connection.send(&MuxResponse {
+                    connection.send(&MuxResponse::Response {
                         channel,
                         response: Response::ScanProgress { entries, bytes: 0 },
                     })?;
                 }
-                connection.send(&MuxResponse {
+                connection.send(&MuxResponse::Response {
                     channel,
                     response: Response::ScanUnchanged { generation: 7 },
                 })?;
             }
             let _: MuxRequest = connection.receive()?;
-            connection.send(&MuxResponse {
+            connection.send(&MuxResponse::Response {
                 channel,
                 response: Response::StagePushed,
             })?;
@@ -1370,7 +1950,7 @@ mod tests {
             let MuxRequest::Open { channel, .. } = connection.receive()? else {
                 anyhow::bail!("expected an open");
             };
-            connection.send(&MuxResponse {
+            connection.send(&MuxResponse::Response {
                 channel,
                 response: Response::Initialized,
             })?;
@@ -1378,11 +1958,11 @@ mod tests {
             // the connection rather than poisoning the channel's next
             // exchange.
             let _: MuxRequest = connection.receive()?;
-            connection.send(&MuxResponse {
+            connection.send(&MuxResponse::Response {
                 channel,
                 response: Response::StagePushed,
             })?;
-            connection.send(&MuxResponse {
+            connection.send(&MuxResponse::Response {
                 channel,
                 response: Response::StagePushed,
             })?;

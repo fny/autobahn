@@ -1046,6 +1046,7 @@ impl LocalEndpoint {
         // channel holds a few batches' worth and ends when it is dropped.
         let (sender, operations) = mpsc::sync_channel(SUPPLY_CHANNEL_DEPTH);
         let failed_path = path.clone();
+        let file = crate::progress::Pulsing::new(file, self.progress.clone());
         std::thread::Builder::new()
             .name("autobahn-supply".into())
             .spawn(move || {
@@ -1166,8 +1167,9 @@ impl LocalEndpoint {
                         // needed, so the transition reports it missing and
                         // the next cycle transfers it again. Only a framing
                         // error ends the stream.
-                        if rsync::patch(&mut file.base, &need.signature, &op, &mut file.writer)
-                            .is_err()
+                        let mut base =
+                            crate::progress::Pulsing::new(&mut file.base, self.progress.clone());
+                        if rsync::patch(&mut base, &need.signature, &op, &mut file.writer).is_err()
                         {
                             if let Some(Receiving::File { file, .. }) =
                                 state.current.replace(Receiving::Sink)
@@ -1453,7 +1455,7 @@ impl Endpoint for LocalEndpoint {
                 // Rehash before trusting it; the read is paid only on
                 // reuse hits. A mismatch discards the file and transfers.
                 let survivor = staged_path(&self.staging_root, &request.digest);
-                if staged_content_matches(&survivor, &request.digest) {
+                if staged_content_matches(&survivor, &request.digest, self.progress.as_deref()) {
                     continue;
                 }
                 let _ = fs::remove_file(&survivor);
@@ -1483,7 +1485,7 @@ impl Endpoint for LocalEndpoint {
             // destination).
             let signature = if self.snapshot_records_file(&request.path) {
                 open_base(&self.root, &request.path)
-                    .map(base_signature)
+                    .map(|file| base_signature(file, self.progress.clone()))
                     .unwrap_or_default()
             } else {
                 Signature::default()
@@ -1748,6 +1750,7 @@ impl Endpoint for LocalEndpoint {
             problems: Vec::new(),
             missing_staged_files: false,
             missing_staged: Vec::new(),
+            progress: self.progress.as_deref(),
         };
         // Deletions apply before creations and replacements. On a volume
         // with name equivalence rules, a rename that only changes case
@@ -1787,7 +1790,13 @@ impl Endpoint for LocalEndpoint {
             let applied = transitioner.spread(arrivals.len(), |forked, range| {
                 arrivals[range]
                     .iter()
-                    .map(|&index| (index, forked.apply(&transitions[index])))
+                    .map(|&index| {
+                        let result = forked.apply(&transitions[index]);
+                        if let Some(progress) = forked.progress {
+                            progress.pulse();
+                        }
+                        (index, result)
+                    })
                     .collect()
             });
             for (index, result) in applied {
@@ -2188,6 +2197,8 @@ struct Transitioner<'a> {
     missing_staged_files: bool,
     /// The content confirmed absent from staging, by path and digest.
     missing_staged: Vec<crate::endpoint::FileRequest>,
+    /// The side's progress, pulsed as large files are hashed and copied.
+    progress: Option<&'a crate::progress::SideProgress>,
 }
 
 impl<'a> Transitioner<'a> {
@@ -2214,6 +2225,7 @@ impl<'a> Transitioner<'a> {
             problems: Vec::new(),
             missing_staged_files: false,
             missing_staged: Vec::new(),
+            progress: self.progress,
         }
     }
 
@@ -2726,7 +2738,7 @@ impl<'a> Transitioner<'a> {
             && match input.metadata() {
                 Ok(opened) if opened.file_type().is_file() => {
                     published = Some(file_metadata(&opened));
-                    content_matches(&mut input, digest)
+                    content_matches(&mut input, digest, self.progress)
                         && fs::symlink_metadata(&staged).is_ok_and(|named| {
                             (named.dev(), named.ino()) == (opened.dev(), opened.ino())
                         })
@@ -2745,8 +2757,9 @@ impl<'a> Transitioner<'a> {
             let copied = match input
                 .seek(SeekFrom::Start(0))
                 .with_context(|| format!("unable to read {}", staged.display()))
-                .and_then(|_| copy_into_private(&mut input, &staged, &temporary, digest))
-            {
+                .and_then(|_| {
+                    copy_into_private(&mut input, &staged, &temporary, digest, self.progress)
+                }) {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     let _ = fs::remove_file(&temporary);
@@ -3234,7 +3247,7 @@ impl<'a> Transitioner<'a> {
         }
 
         let temporary = parent.join(temporary_name("apply"));
-        match copy_into_private(&mut file, target, &temporary, digest) {
+        match copy_into_private(&mut file, target, &temporary, digest, self.progress) {
             Ok(true) => {}
             Ok(false) => {
                 let _ = fs::remove_file(&temporary);
@@ -3695,7 +3708,11 @@ fn create_confined_parents(root: &Path, path: &str, directory_mode: u32) -> Resu
 /// Whether a staged file's bytes hash to the digest its name claims. Used
 /// before trusting content that survived from an earlier run; a fresh
 /// transfer is verified as it is received and never needs this.
-fn staged_content_matches(path: &Path, digest: &Digest) -> bool {
+fn staged_content_matches(
+    path: &Path,
+    digest: &Digest,
+    progress: Option<&crate::progress::SideProgress>,
+) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
@@ -3706,6 +3723,9 @@ fn staged_content_matches(path: &Path, digest: &Digest) -> bool {
             Ok(0) => break,
             Ok(count) => {
                 hasher.update(&buffer[..count]);
+                if let Some(progress) = progress {
+                    progress.pulse();
+                }
             }
             Err(_) => return false,
         }
@@ -3791,7 +3811,11 @@ fn process_running(pid: libc::pid_t) -> bool {
 }
 
 /// Whether an open file's bytes, read from its start, hash to `digest`.
-fn content_matches(file: &mut File, digest: &Digest) -> bool {
+fn content_matches(
+    file: &mut File,
+    digest: &Digest,
+    progress: Option<&crate::progress::SideProgress>,
+) -> bool {
     if file.seek(SeekFrom::Start(0)).is_err() {
         return false;
     }
@@ -3802,6 +3826,9 @@ fn content_matches(file: &mut File, digest: &Digest) -> bool {
             Ok(0) => break,
             Ok(count) => {
                 hasher.update(&buffer[..count]);
+                if let Some(progress) = progress {
+                    progress.pulse();
+                }
             }
             Err(_) => return false,
         }
@@ -3893,6 +3920,7 @@ fn copy_into_private(
     source: &Path,
     temporary: &Path,
     digest: &Digest,
+    progress: Option<&crate::progress::SideProgress>,
 ) -> Result<bool> {
     let output = crate::fsutil::private_file(temporary)?;
     copy_verifying(input, output, digest).map_err(|failure| match failure {
@@ -3929,6 +3957,9 @@ fn copy_verifying(
             break;
         }
         hasher.update(&buffer[..count]);
+        if let Some(progress) = progress {
+            progress.pulse();
+        }
         output
             .write_all(&buffer[..count])
             .map_err(CopyFailure::Write)?;
@@ -3973,11 +4004,12 @@ fn open_base(root: &Path, path: &str) -> Option<File> {
 /// exactly right: with no usable base, delta generation degenerates to
 /// streaming the content, and correctness never depends on the base being
 /// what the destination expected.
-fn base_signature(file: File) -> Signature {
+fn base_signature(file: File, progress: Option<Arc<crate::progress::SideProgress>>) -> Signature {
     let Ok(metadata) = file.metadata() else {
         return Signature::default();
     };
-    rsync::signature(file, rsync::optimal_block_size(metadata.len())).unwrap_or_default()
+    let block_size = rsync::optimal_block_size(metadata.len());
+    rsync::signature(crate::progress::Pulsing::new(file, progress), block_size).unwrap_or_default()
 }
 
 /// Verifies that a path is a real directory, without following symbolic
@@ -6717,13 +6749,13 @@ mod apply_path_tests {
         let planted = keep.path().join("planted");
         symlink(&victim, &planted).expect("planted");
         let mut input = File::open(&source).expect("open");
-        copy_into_private(&mut input, &source, &planted, &digest)
+        copy_into_private(&mut input, &source, &planted, &digest, None)
             .expect_err("a planted link must be refused");
         assert_eq!(fs::read(&victim).unwrap(), b"untouched");
 
         let temporary = keep.path().join("temporary");
         let mut input = File::open(&source).expect("open");
-        assert!(copy_into_private(&mut input, &source, &temporary, &digest).expect("copy"));
+        assert!(copy_into_private(&mut input, &source, &temporary, &digest, None).expect("copy"));
         assert_eq!(
             fs::metadata(&temporary).expect("temporary").mode() & 0o777,
             0o600
@@ -6866,6 +6898,7 @@ mod apply_path_tests {
             problems: Vec::new(),
             missing_staged_files: false,
             missing_staged: Vec::new(),
+            progress: None,
         };
         let published =
             transitioner.publish_file("a", &root, &root.join("a"), &digest, false, false);

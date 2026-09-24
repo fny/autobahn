@@ -122,6 +122,16 @@ jobs:
           xcodebuild -version
       - name: Tests
         run: cargo test --release --locked
+      - name: The tray's lints and tests
+        # The tray compiles only with --features tray, which neither the
+        # suite above nor the Linux job's clippy turns on: without this its
+        # tests never ran and no lint ever read it. Into target/tray, where
+        # build.sh builds, so the app build below reuses what it can.
+        env:
+          CARGO_TARGET_DIR: target/tray
+        run: |
+          cargo clippy --release --locked --features tray --all-targets -- -D warnings
+          cargo test --release --locked --features tray --lib tray::
       - name: Build the app
         # Signed ad-hoc: this job holds no certificate and needs none to
         # prove the app still compiles, bundles its icon, and signs. Real

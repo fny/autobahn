@@ -1,0 +1,33 @@
+# cargo-deny's configuration, for `cargo deny check advisories`: run weekly,
+# whenever Cargo.lock changes, and by hand, by .github/workflows/audit.yml.
+#
+# The graph is every shipped build: the command line on Linux and macOS,
+# and the menu bar app (--features tray) on macOS. cargo-deny can't say
+# "the tray on macOS only", so it takes every feature on every one of these
+# targets, and so also reads the tray's Linux path (GTK, Wayland), which
+# nothing ships.
+[graph]
+all-features = true
+targets = [
+    "x86_64-unknown-linux-musl",
+    "aarch64-unknown-linux-musl",
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+]
+
+[advisories]
+version = 2
+# Accepted advisories: each with why, and a date to look again by. A new
+# advisory fails the audit until it is fixed or recorded here.
+ignore = [
+    # bincode 1.3 encodes the protocol and the state files. Unmaintained,
+    # with no known vulnerability; replacing it changes the wire and the
+    # on-disk formats, which is a compatibility-epoch decision.
+    { id = "RUSTSEC-2025-0141", reason = "bincode is unmaintained, not vulnerable; replacing it is a wire-format change. Review by 2027-03-24." },
+    # proc-macro-error, a build-time dependency of glib-macros: the tray's
+    # GTK path on Linux, which is not shipped.
+    { id = "RUSTSEC-2024-0370", reason = "unmaintained proc macro, only on the unshipped Linux tray path (gtk via tray-icon and muda). Review by 2027-03-24." },
+    # ttf-parser, through winit's Wayland decorations (sctk-adwaita): the
+    # tray on Linux again, not shipped.
+    { id = "RUSTSEC-2026-0192", reason = "unmaintained, only on the unshipped Linux tray path (winit's Wayland decorations). Review by 2027-03-24." },
+]

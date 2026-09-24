@@ -1,0 +1,52 @@
+# Known advisories against the dependencies, from the RustSec database:
+# `cargo deny check advisories`, configured by deny.toml, which also lists
+# the accepted ones. Weekly, on any change to Cargo.lock or deny.toml, and
+# by hand:
+#   gh workflow run audit.yml
+# Not part of the per-push CI, so an advisory published today doesn't
+# block unrelated work; the weekly run is what reports it.
+name: Audit
+
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  push:
+    branches: [main]
+    paths:
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  pull_request:
+    paths:
+      - 'Cargo.lock'
+      - 'deny.toml'
+      - '.github/workflows/audit.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # cargo-deny's release binary, checked against its SHA-256 before it runs.
+  # To upgrade, change both, from the release's .sha256 asset.
+  CARGO_DENY_VERSION: '0.20.2'
+  CARGO_DENY_SHA256: 9f12ed4c49936e09b48bf862b595cde2fe64fcbd9d74dfacac6131ca824c8d5f
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: cargo-deny
+        run: |
+          name="cargo-deny-$CARGO_DENY_VERSION-x86_64-unknown-linux-musl"
+          curl -fsSL -o "$RUNNER_TEMP/deny.tar.gz" \
+            "https://github.com/EmbarkStudios/cargo-deny/releases/download/$CARGO_DENY_VERSION/$name.tar.gz"
+          echo "$CARGO_DENY_SHA256  $RUNNER_TEMP/deny.tar.gz" | sha256sum -c -
+          tar xzf "$RUNNER_TEMP/deny.tar.gz" -C "$RUNNER_TEMP"
+          install "$RUNNER_TEMP/$name/cargo-deny" ~/.cargo/bin/cargo-deny
+      - name: Advisories
+        run: cargo deny --locked check advisories

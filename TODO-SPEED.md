@@ -37,7 +37,7 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 - 2% deserializing the scan cache; reconcile 0.2%.
 
 - [x] A one-shot `sync` no longer registers watchers (`verify` runs inside the supervisor, so it was never affected). Measured on the 160k pair, warm: 2.4–2.7 s → 0.7–0.9 s — more than the profile's 30%, since the registration walk was also most of the system time and the thread wake-ups.
-- [ ] The parallel walk could pool its helpers rather than spawn per subtree; ~10% of a cold scan's CPU, no wall-clock evidence yet. Measure the cold scan on the 160k pair before bothering.
+- [x] ~~The parallel walk could pool its helpers rather than spawn per subtree.~~ Measured 2026-09-24 and closed: a cold scan of the 160k tree hands only 600–1,400 of its 16,161 directories to a helper (the rest are walked inline while every helper is busy), and a scoped spawn and join costs 65 µs here — 40–90 ms of CPU spread over the helpers, about 10 ms of a 0.5 s warm-cache scan, and nothing against a disk-cold one (53 s). A pool could save at most ~2%.
 
 ## Coalescing and the cycle's own overhead
 

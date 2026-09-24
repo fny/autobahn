@@ -78,7 +78,7 @@ If those four derive that answer independently, they will eventually disagree, a
 
 So they do not. A transition returns one result for each request, in order, describing what is on disk after the attempt — the new content on success, the surviving old content on refusal, a partial tree where a directory was only partly created (`src/endpoint/mod.rs`). All four parties consume that single rendering (`src/endpoint/mod.rs`).
 
-It does not, today, spare the next scan a read. The results carry the metadata of files as they were created, but the folded snapshot keeps the start time of the scan it was grafted onto, and every file just written is newer than that. The racy-timestamp rule (`src/scan/mod.rs`) refuses to trust a digest for a file modified that close to its scan, so the next scan re-reads everything the transition wrote, once. On a cold sync larger than memory that is a second read of the whole tree; making the fold save it is recorded as performance finding P-3.
+It does not, today, spare the next scan a read. The results carry the metadata of files as they were created, but the folded snapshot keeps the start time of the scan it was grafted onto, and every file just written is newer than that. The racy-timestamp rule (`src/scan/mod.rs`) refuses to trust a digest for a file modified that close to its scan, so the next scan re-reads everything the transition wrote, once. On a cold sync larger than memory that is a second read of the whole tree; making the fold save it is an open performance item.
 
 ## Decision 5: refuse rather than guess
 

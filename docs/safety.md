@@ -65,7 +65,7 @@ The controller and the remote agent must report exactly the same version, includ
 
 ### The network is not trusted (I9)
 
-Lengths, flags and compressed sizes arriving over the connection are checked before anything is allocated. Each frame's length is checked against the 64 MiB frame cap before its buffer exists; decompression bombs are refused, and unknown flags are errors. Large messages travel as a sequence of 16 MiB frames and may reassemble to at most 4 GiB, a cap checked as each frame arrives, so memory follows the bytes actually received rather than a size the peer declared. A remote scan's delta is held to the same rule: its declared length is capped at 4 GiB and never trusted to size a buffer, its block size must be one autobahn itself would choose, and each operation is refused before it is applied if it would outgrow the declared length.
+Lengths, flags and compressed sizes arriving over the connection are checked before anything is allocated. Each frame's length is checked against the 64 MiB frame cap before its buffer exists; decompression bombs are refused, and unknown flags are errors. Large messages travel as a sequence of 16 MiB frames and may reassemble to at most 4 GiB, a cap checked as each frame arrives, so memory follows the bytes actually received rather than a size the peer declared. A remote scan's delta is held to the same rule: its declared length is capped at 4 GiB and sizes at most 8 MiB of buffer up front, its block size must be one autobahn itself would choose, and each operation is refused before it is applied if it would outgrow the declared length.
 
 ### Saved state is whole or absent (I10)
 
@@ -83,12 +83,13 @@ A configuration mistake is refused at startup with the problem named, not half-a
 - two sessions that would write one tree region
 - a session whose two sides are one tree, or one inside the other — from a configuration or from `autobahn sync ALPHA BETA`
 - a local root that is, or holds, autobahn's own state or the directory the configuration lives in, unless its ignores keep that out
-- running as root, unless `--allow-root` or `advanced.allow_root` says root is meant — and never as root under another user's home
 - an ignore negation that can never take effect, because a later pattern ignores it again
 - an `ignore_files` entry that is missing, or a relative path
 - an unknown mode, log level, or alert state
 
 A root that holds credentials — `.ssh`, `.aws` and the like — is not refused, since someone may mean to synchronize them, but `sync` and `watch` warn about it when they start, until the group sets `acknowledge_secrets` or ignores them. See [What is refused](./configuration.md#what-is-refused).
+
+And the commands that act refuse to run as root, unless `--allow-root` or `advanced.allow_root` says root is meant — and never as root under another user's home.
 
 ## When you act
 

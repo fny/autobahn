@@ -88,9 +88,10 @@ Beyond keys and values it does not know, a configuration is refused at startup, 
 
 - **a session's two sides are one tree, or one is inside the other.** The session would consume its own output — in a mirroring mode, delete the alpha through the beta path. Roots are compared as resolved, so a symbolic link alias or a trailing `/.` is the same tree. The same check guards `autobahn sync ALPHA BETA`. One session's beta feeding another's alpha (a relay) stays legal; two sessions writing nested roots do not — see [Overlapping and nested roots](./nesting.md).
 - **a local root is, or holds, autobahn's own directories**: the state root (`~/.autobahn`, or `--state-root`), the default state root when another is in use, or the directory the configuration file lives in. Synchronized, they would change under the session using them, and a peer that edits its copy of `config.toml` or `on-alert.sh` would choose what runs here next. A root that holds one is accepted when its ignores keep it out — `ignores = [".autobahn"]` for a root of `~`. `watch` checks each edit the same way and keeps the last configuration if one fails.
-- **the command is running as root** without `--allow-root` or `advanced.allow_root`, or as root under someone else's home (`sudo`), which is refused regardless.
 
 A root that holds credentials is warned about, not refused: see `acknowledge_secrets` above.
+
+Separately, `watch`, `sync`, `resolve`, `install` and `start` refuse to run as root, before any session is planned, unless `--allow-root` or `advanced.allow_root` says root is meant; root under someone else's home (`sudo`) is refused regardless.
 
 ### Symbolic links
 

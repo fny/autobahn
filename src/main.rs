@@ -1795,9 +1795,14 @@ fn run_live_display(
 /// path *inside* a synchronized root — the root-relative remainder.
 struct Selection<'a> {
     plans: Vec<&'a autobahn::config::SessionPlan>,
-    /// The path's remainder below the alpha root, when the selector was a
-    /// path deeper than the root itself. `Some("")` never occurs; the root
-    /// itself yields `None`.
+    /// Per plan, in the order of `plans`: the path's remainder below that
+    /// plan's alpha root, when the selector was a path deeper than the
+    /// root itself. `Some("")` never occurs; the root itself yields `None`.
+    /// Nested groups have different roots, so each keeps its own.
+    relatives: Vec<Option<String>>,
+    /// The remainder every selected plan agrees on — always, within one
+    /// group, which has one alpha. Plans in nested groups disagree, and
+    /// then this is `None` rather than any one of them.
     relative: Option<String>,
 }
 
@@ -1830,23 +1835,21 @@ fn select<'a>(
         let expanded = paths::expand_tilde(selector).ok()?;
         Some(paths::resolve_for_identity(&expanded))
     });
-    let mut relative = None;
-    let selected: Vec<&autobahn::config::SessionPlan> = plans
+    let selected: Vec<(&autobahn::config::SessionPlan, Option<String>)> = plans
         .iter()
-        .filter(|plan| match (&folder, selector) {
+        .filter_map(|plan| match (&folder, selector) {
             (Some(folder), _) => {
                 let alpha = std::path::Path::new(&plan.alpha_identity);
                 if folder == alpha {
-                    true
+                    Some((plan, None))
                 } else if let Ok(rest) = folder.strip_prefix(alpha) {
-                    relative = Some(rest.to_string_lossy().into_owned());
-                    true
+                    Some((plan, Some(rest.to_string_lossy().into_owned())))
                 } else {
-                    false
+                    None
                 }
             }
-            (None, Some(group)) => plan.group == group,
-            (None, None) => true,
+            (None, Some(group)) => (plan.group == group).then_some((plan, None)),
+            (None, None) => Some((plan, None)),
         })
         .collect();
     let before_host = selected.len();
@@ -1866,16 +1869,17 @@ fn select<'a>(
                 .into_owned(),
         )
     });
-    let selected: Vec<&autobahn::config::SessionPlan> = selected
-        .into_iter()
-        .filter(|plan| {
-            host.is_none_or(|host| {
-                plan.host == host
-                    || plan.beta_spec() == host
-                    || host_identity.as_deref() == Some(plan.beta_identity.as_str())
+    let (selected, relatives): (Vec<&autobahn::config::SessionPlan>, Vec<Option<String>>) =
+        selected
+            .into_iter()
+            .filter(|(plan, _)| {
+                host.is_none_or(|host| {
+                    plan.host == host
+                        || plan.beta_spec() == host
+                        || host_identity.as_deref() == Some(plan.beta_identity.as_str())
+                })
             })
-        })
-        .collect();
+            .unzip();
     if selected.is_empty() {
         match (&folder, selector, host) {
             (_, _, Some(host)) if before_host > 0 => bail!(
@@ -1893,21 +1897,45 @@ fn select<'a>(
             _ => bail!("the configuration describes no sessions"),
         }
     }
+    let relative = match relatives.split_first() {
+        Some((first, rest)) if rest.iter().all(|other| other == first) => first.clone(),
+        _ => None,
+    };
     Ok(Selection {
         plans: selected,
+        relatives,
         relative,
     })
 }
 
 /// The root-relative path a command was given: explicitly, or as the
-/// remainder of a path selector.
+/// remainder of a path selector. One path for every selected plan, so a
+/// path selector that lies in nested groups — a different remainder under
+/// each root — is refused here; see [`relative_in`].
 fn relative_path(selection: &Selection, explicit: Option<String>) -> Result<String> {
-    match (explicit, &selection.relative) {
+    // Plans with remainders but no common one disagree about the path.
+    if explicit.is_none()
+        && selection.relative.is_none()
+        && selection.relatives.iter().any(Option::is_some)
+    {
+        bail!(
+            "that path lies in more than one group, nested one inside another; name the \
+             group and give the path relative to its root"
+        );
+    }
+    relative_in(selection, 0, explicit)
+}
+
+/// The root-relative path a command was given, for the selected plan at
+/// `index`: explicitly, or as the remainder of a path selector under that
+/// plan's own root.
+fn relative_in(selection: &Selection, index: usize, explicit: Option<String>) -> Result<String> {
+    match (explicit, selection.relatives.get(index).cloned().flatten()) {
         (Some(path), _) => Ok(path
             .trim_start_matches("./")
             .trim_end_matches('/')
             .to_owned()),
-        (None, Some(rest)) => Ok(rest.clone()),
+        (None, Some(rest)) => Ok(rest),
         (None, None) => bail!(
             "name the file: a root-relative path after the group, or a path to the file itself"
         ),
@@ -2464,7 +2492,9 @@ fn run_diff(
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
     let selection = select(&plans, Some(&selector), host.as_deref())?;
-    let path = relative_path(&selection, path)?;
+    // Checked up front, so a missing path is refused before any scratch;
+    // each session then reads it under its own root.
+    relative_in(&selection, 0, path.clone())?;
     let pool = autobahn::transport::mux::AgentPool::default();
 
     // A scratch directory of our own, removed on exit; the dev-dependency
@@ -2479,7 +2509,8 @@ fn run_diff(
     }
     let scratch = Scratch(scratch);
     let mut shown = 0;
-    for plan in &selection.plans {
+    for (index, plan) in selection.plans.iter().enumerate() {
+        let path = relative_in(&selection, index, path.clone())?;
         let (mut alpha, mut beta) = autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
         let a = alpha.read_file(&path)?;
         let b = beta.read_file(&path)?;
@@ -4211,6 +4242,47 @@ fn print_report(report: &CycleReport) {
 #[cfg(test)]
 mod tests {
 
+    /// A path inside two nested groups is named relative to each group's
+    /// own root, not to whichever matched last.
+    #[test]
+    fn a_path_in_nested_groups_is_relative_to_each_root() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let outer = keep.path().join("outer");
+        let inner = outer.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("file.txt"), "content").unwrap();
+        let config = keep.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[groups.outer]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
+                 [groups.inner]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                outer.display(),
+                keep.path().join("b1").display(),
+                inner.display(),
+                keep.path().join("b2").display()
+            ),
+        )
+        .unwrap();
+        let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
+        let file = inner.join("file.txt").to_string_lossy().into_owned();
+        let selection = super::select(&plans, Some(&file), None).unwrap();
+        assert_eq!(selection.plans.len(), 2);
+        for (index, plan) in selection.plans.iter().enumerate() {
+            let expected = match plan.group.as_str() {
+                "outer" => "inner/file.txt",
+                "inner" => "file.txt",
+                other => panic!("unexpected group {other}"),
+            };
+            assert_eq!(
+                super::relative_in(&selection, index, None).unwrap(),
+                expected
+            );
+        }
+        // The two disagree, so no single remainder stands for both.
+        assert_eq!(selection.relative, None);
+        assert!(super::relative_path(&selection, None).is_err());
+    }
     /// `start` and `restart` refuse a configuration the supervisor would
     /// refuse, before touching the service, and say why.
     #[test]

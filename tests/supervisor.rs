@@ -1621,6 +1621,38 @@ fn a_wildcard_negation_under_an_ignored_directory_is_warned_about() {
     );
     assert!(!beta.join("vendor").exists(), "{text}");
 }
+
+/// `diff` on a file inside two nested groups reads it under each group's
+/// own root, so both sessions show their difference.
+#[test]
+fn diff_of_a_path_in_nested_groups_reads_it_under_each_root() {
+    let world = World::new();
+    let outer = world.directory("outer");
+    let inner = outer.join("inner");
+    let b1 = world.directory("b1");
+    let b2 = world.directory("b2");
+    write(&inner, "file.txt", "old");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.outer]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
+             [groups.inner]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            outer.display(),
+            b1.display(),
+            inner.display(),
+            b2.display()
+        ),
+    )
+    .unwrap();
+    let (ok, text) = cli(&world, &config, &["sync"]);
+    assert!(ok, "{text}");
+    write(&inner, "file.txt", "new");
+    let file = inner.join("file.txt").to_string_lossy().to_string();
+    let (_, text) = cli(&world, &config, &["diff", &file]);
+    assert_eq!(text.matches("+old").count(), 2, "{text}");
+    assert!(!text.contains("identical"), "{text}");
+}
 // ── clean and disabled sessions ──────────────────────────────────────
 
 /// Turns a group off or on through the CLI.

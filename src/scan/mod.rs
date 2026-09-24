@@ -342,6 +342,17 @@ pub fn scan(
     // (untracked), or, when mounts are followed, the very subtree the
     // baseline held. One probed again and found not to be a mount any more
     // is neither.
+    // The racy-timestamp rule judges a digest by when it was recorded. An
+    // incremental scan hands on digests it adopted from the baseline, which
+    // earlier scans recorded, so its snapshot claims the baseline's start
+    // rather than its own: claiming its own let the next scan trust a digest
+    // taken while its file was still recently written. Digests this scan
+    // did compute are judged more strictly than they need be, which costs
+    // at most one re-read of files written since the baseline's scan.
+    let recorded_at = match (dirty, baseline) {
+        (Some(_), Some(baseline)) => scanned_at_seconds.min(baseline.scanned_at_seconds),
+        _ => scanned_at_seconds,
+    };
     let mut mount_points = std::mem::take(&mut scanner.mount_points);
     if let Some(baseline) = baseline {
         for point in &baseline.mount_points {
@@ -369,7 +380,7 @@ pub fn scan(
         files: scanner.files,
         symlinks: scanner.symlinks,
         total_file_size: scanner.total_file_size,
-        scanned_at_seconds,
+        scanned_at_seconds: recorded_at,
     };
     // An incremental scan only counts what it visited, so the statistics
     // are recomputed from the assembled hierarchy (a pointer walk, with no
@@ -1493,6 +1504,71 @@ mod tests {
             file_content(rescan.root.as_ref().expect("root"), "racy.txt").0,
             digest_of("version-TWO"),
             "a same-granule rewrite went unobserved"
+        );
+    }
+
+    /// An incremental scan hands on digests it adopted, which earlier
+    /// scans recorded; the racy-timestamp rule must go on judging them by
+    /// when they were recorded. Reproduced before the fix: the incremental
+    /// snapshot claimed its own start, a later full scan trusted a digest
+    /// recorded while the file's mtime was still recent, and a same-second
+    /// rewrite was never seen.
+    #[test]
+    fn an_adopted_digest_keeps_the_recent_write_rule_of_its_scan() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let root = directory.path();
+        let now_seconds = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_secs()
+        };
+        let moment = std::time::SystemTime::now() - std::time::Duration::from_secs(1);
+        let set_mtime = |path: &str| {
+            fs::File::options()
+                .write(true)
+                .open(root.join(path))
+                .expect("file should open")
+                .set_modified(moment)
+                .expect("mtime should be settable");
+        };
+        write(root, "racy.txt", "version-one");
+        set_mtime("racy.txt");
+        let full = scan_fixture(root, None);
+
+        // Same length, same mtime: metadata cannot tell the versions apart.
+        write(root, "racy.txt", "version-TWO");
+        set_mtime("racy.txt");
+
+        // Late enough that the file's mtime is no longer recent by the
+        // clock, so only the recording scan's time protects it.
+        let moment_seconds = moment
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_secs();
+        while now_seconds() < moment_seconds + 2 + RACY_MTIME_MARGIN_SECONDS as u64 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("elsewhere.txt");
+        let incremental = scan(
+            root,
+            Some(&full),
+            &ignores(&["excluded/"]),
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            Some(&dirty),
+            false,
+            None,
+            true,
+        )
+        .expect("incremental scan should succeed");
+        let rescan = scan_fixture(root, Some(&incremental));
+        assert_eq!(
+            file_content(rescan.root.as_ref().expect("root"), "racy.txt").0,
+            digest_of("version-TWO"),
+            "the full scan trusted a digest recorded while its file was recent"
         );
     }
 

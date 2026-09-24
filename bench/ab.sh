@@ -39,12 +39,18 @@
 # python3, rsync, and a Rust toolchain for the harness. Runs on macOS and
 # Linux; a leg is roughly two minutes at the defaults.
 #
-set -u
+# Each run works in a fresh private directory (mktemp -d), removed when it
+# ends. The generated corpus is kept between runs in a private cache,
+# $AB_CACHE (default ~/.cache/autobahn-ab), which must belong to you; the
+# reports and logs of each run are kept in a private directory of their
+# own, named at the end.
+#
+set -euo pipefail
 
 A=""; B=""; LEGS=2; SECONDS_PER_LEG=60; AGENTS=10; SCALE=1; REMOTE=""
 LABEL_A="a"; LABEL_B="b"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-WORK="${AB_WORK:-${TMPDIR:-/tmp}/autobahn-ab}"
+CACHE="${AB_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/autobahn-ab}"
 SOURCE=""
 
 usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; }
@@ -70,8 +76,13 @@ if [ -z "$A" ] || [ -z "$B" ]; then usage >&2; exit 2; fi
 A="$(cd "$(dirname "$A")" && pwd)/$(basename "$A")"
 B="$(cd "$(dirname "$B")" && pwd)/$(basename "$B")"
 
-mkdir -p "$WORK"
+# The run's scratch space: private, fresh, and gone when the run ends. A
+# fixed path under /tmp could have been made by someone else first, and
+# the tool's configuration — agent_command included — is written here.
+WORK="$(mktemp -d "${TMPDIR:-/tmp}/autobahn-ab.XXXXXX")"
 WORK="$(cd "$WORK" && pwd)"
+RESULTS="$(mktemp -d "${TMPDIR:-/tmp}/autobahn-ab-reports.XXXXXX")"
+trap 'rm -rf "$WORK"' EXIT
 # The working corpus the legs edit. It is always under $WORK, whatever
 # --corpus says: a leg deletes and refills it.
 CORPUS="$WORK/corpus"
@@ -85,10 +96,15 @@ if [ -n "$SOURCE" ]; then
         echo "the work directory $WORK is inside --corpus $SOURCE, which is only read" >&2; exit 2 ;;
     esac
     PARTITIONS="$WORK/partitions-given.json"
-    rm -f "$PARTITIONS"
 else
-    PRISTINE="$WORK/pristine-code-$SCALE"
-    PARTITIONS="$WORK/partitions-$SCALE.json"
+    # The cache holds only what this user generated: refuse one made by
+    # anyone else, and keep it private.
+    mkdir -p "$CACHE"
+    [ -O "$CACHE" ] || { echo "the corpus cache $CACHE is not yours; set AB_CACHE" >&2; exit 2; }
+    chmod 700 "$CACHE"
+    CACHE="$(cd "$CACHE" && pwd)"
+    PRISTINE="$CACHE/pristine-code-$SCALE"
+    PARTITIONS="$CACHE/partitions-$SCALE.json"
 fi
 
 # Deletes scratch paths, and refuses anything not strictly inside $WORK:
@@ -126,7 +142,7 @@ fi
 if [ -n "$REMOTE" ]; then
     token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
     printf '%s\n' "$token" > "$WORK/remote-check"
-    seen="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" cat "$(printf %q "$WORK/remote-check")" 2>/dev/null)"
+    seen="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" cat "$(printf %q "$WORK/remote-check")" 2>/dev/null || true)"
     rm -f "$WORK/remote-check"
     if [ "$seen" != "$token" ]; then
         echo "--remote $REMOTE: that host does not see this machine's files (or ssh failed)." >&2
@@ -139,12 +155,18 @@ fi
 
 # The corpus, generated once and kept pristine; every leg restores it, so
 # the agents' edits from one leg never leak into the next.
+# Generated inside the cache and renamed into place, so a run that is
+# interrupted never leaves a half-written corpus to be reused.
 if [ ! -d "$PRISTINE" ]; then
     echo "generating the corpus (code shape, scale $SCALE)..."
-    python3 "$HERE/corpus.py" code "$PRISTINE" --scale "$SCALE" >/dev/null || exit 1
+    generating="$(mktemp -d "$CACHE/.generating.XXXXXX")"
+    python3 "$HERE/corpus.py" code "$generating/corpus" --scale "$SCALE" >/dev/null
+    mv "$generating/corpus" "$PRISTINE"
+    rmdir "$generating"
 fi
 if [ ! -f "$PARTITIONS" ]; then
-    "$BM" partitions "$PRISTINE" "$PARTITIONS" >/dev/null || exit 1
+    "$BM" partitions "$PRISTINE" "$PARTITIONS.tmp" >/dev/null
+    mv "$PARTITIONS.tmp" "$PARTITIONS"
 fi
 
 # Every autobahn this script started, and nothing else. A leg's binaries
@@ -155,15 +177,16 @@ fi
 STARTED=()
 cleanup() {
     for pid in "${STARTED[@]:-}"; do
-        [ -n "$pid" ] && kill "$pid" 2>/dev/null
+        if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
     done
+    rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
 
 # Ends the run with a failed leg. The EXIT trap stops what it started.
 fail_leg() {
     local leg="$1" why="$2" log="${3:-}"
-    echo "FAIL: leg $leg: $why" >&2
+    echo "FAIL: leg $leg: $why (logs in $RESULTS)" >&2
     if [ -n "$log" ] && [ -f "$log" ]; then
         echo "--- last lines of $log ---" >&2
         tail -n 20 "$log" >&2
@@ -180,12 +203,12 @@ leg() {
     local expected
     expected=$("$BM" manifest cheap "$CORPUS")
 
-    "$BM" observer "$port" --root "$dest" > "$WORK/observer-$name.log" 2>&1 &
+    "$BM" observer "$port" --root "$dest" > "$RESULTS/observer-$name.log" 2>&1 &
     local observer=$!
     STARTED+=("$observer")
     sleep 1
     kill -0 "$observer" 2>/dev/null \
-        || fail_leg "$name" "the observer exited at start" "$WORK/observer-$name.log"
+        || fail_leg "$name" "the observer exited at start" "$RESULTS/observer-$name.log"
 
     if [ -n "$REMOTE" ]; then
         printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s:%s"]\nagent_command = "ssh %s %s agent"\n' \
@@ -196,7 +219,7 @@ leg() {
     fi
     local t0 t1
     t0=$(python3 -c 'import time; print(time.time())')
-    "$binary" watch --config "$WORK/$name.toml" --state-root "$state" > "$WORK/tool-$name.log" 2>&1 &
+    "$binary" watch --config "$WORK/$name.toml" --state-root "$state" > "$RESULTS/tool-$name.log" 2>&1 &
     local tool=$!
     STARTED+=("$tool")
     # Cold sync: until the destination's manifest matches the source's.
@@ -210,11 +233,11 @@ leg() {
             break
         fi
         kill -0 "$tool" 2>/dev/null \
-            || fail_leg "$name" "$binary exited during the cold sync" "$WORK/tool-$name.log"
+            || fail_leg "$name" "$binary exited during the cold sync" "$RESULTS/tool-$name.log"
         sleep 0.5
     done
     [ -n "$converged" ] \
-        || fail_leg "$name" "the cold sync did not converge within 600s" "$WORK/tool-$name.log"
+        || fail_leg "$name" "the cold sync did not converge within 600s" "$RESULTS/tool-$name.log"
     t1=$(python3 -c 'import time; print(time.time())')
     local cold
     cold=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
@@ -223,16 +246,16 @@ leg() {
     report=$("$BM" agents --root "$CORPUS" --peer-root "$dest" \
         --observer "127.0.0.1:$port" --partitions "$PARTITIONS" \
         --side a --agents "$AGENTS" --seconds "$SECONDS_PER_LEG" \
-        --label "$name" --nonce $((RANDOM * 7919 + $$)) 2> "$WORK/agents-$name.err") \
-        || fail_leg "$name" "the agents failed" "$WORK/agents-$name.err"
+        --label "$name" --nonce $((RANDOM * 7919 + $$)) 2> "$RESULTS/agents-$name.err") \
+        || fail_leg "$name" "the agents failed" "$RESULTS/agents-$name.err"
     kill -0 "$tool" 2>/dev/null \
-        || fail_leg "$name" "$binary exited during the latency window" "$WORK/tool-$name.log"
+        || fail_leg "$name" "$binary exited during the latency window" "$RESULTS/tool-$name.log"
 
-    for pid in "${STARTED[@]}"; do kill "$pid" 2>/dev/null; done
-    wait 2>/dev/null
+    for pid in "${STARTED[@]}"; do kill "$pid" 2>/dev/null || true; done
+    wait 2>/dev/null || true
     STARTED=()
-    echo "$report" > "$WORK/report-$name.json"
-    python3 - "$name" "$cold" "$WORK/report-$name.json" <<'PY'
+    echo "$report" > "$RESULTS/report-$name.json"
+    python3 - "$name" "$cold" "$RESULTS/report-$name.json" <<'PY'
 import json, sys
 name, cold, path = sys.argv[1:4]
 d = json.load(open(path))
@@ -252,7 +275,7 @@ for i in $(seq 1 "$LEGS"); do
 done
 
 echo
-python3 - "$WORK" "$LABEL_A" "$LABEL_B" "$LEGS" <<'PY'
+python3 - "$RESULTS" "$LABEL_A" "$LABEL_B" "$LEGS" <<'PY'
 import json, statistics, sys
 work, a, b, legs = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 def series(label):

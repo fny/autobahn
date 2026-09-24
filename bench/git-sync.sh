@@ -10,10 +10,22 @@
 # happened: halts, conflicts by path, fsck failures, status disagreement.
 #
 #   bench/git-sync.sh [autobahn-binary]
-set -u
+#
+# It works in a fresh private directory (mktemp -d), removed when it ends;
+# GIT_SYNC_KEEP=1 keeps it for a look afterwards.
+set -euo pipefail
 BIN="$(realpath "${1:-$(cd "$(dirname "$0")/.." && pwd)/target/release/autobahn}")"
-W="${GIT_SYNC_WORK:-/tmp/autobahn-git-sync}"
-rm -rf "$W"; mkdir -p "$W"
+"$BIN" --version > /dev/null 2>&1 || { echo "autobahn at $BIN does not run" >&2; exit 1; }
+# Private and fresh: a fixed path under /tmp could have been made by
+# someone else first, and the configuration written here names the
+# command that runs the agent.
+W="$(mktemp -d "${TMPDIR:-/tmp}/autobahn-git-sync.XXXXXX")"
+PID=""
+finish() {
+    if [ -n "$PID" ]; then kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; fi
+    if [ "${GIT_SYNC_KEEP:-}" = 1 ]; then echo "work dir kept at $W"; else rm -rf "$W"; fi
+}
+trap finish EXIT
 A="$W/a"; B="$W/b"; ST="$W/state"; LOG="$W/autobahn.log"
 mkdir -p "$ST"
 
@@ -39,26 +51,33 @@ ignores = [".git/index", ".git/*.lock", ".git/**/*.lock", ".git/logs", ".git/gc.
 TOML
 "$BIN" watch --debug --config "$W/config.toml" --state-root "$ST" > "$LOG" 2>&1 &
 PID=$!
-trap 'kill $PID 2>/dev/null' EXIT
+sleep 1
+if ! kill -0 "$PID" 2>/dev/null; then
+    PID=""
+    echo "autobahn watch did not start; the end of its log:" >&2
+    tail -n 20 "$LOG" >&2
+    exit 1
+fi
 
-BM="$(cd "$(dirname "$0")" && pwd)/harness/target/release/benchmark"
 # The working trees agree, and so do HEAD and every ref: what the sync is
 # supposed to carry. (.git/index and the other ignored files differ by
 # design, so the whole tree cannot simply be compared.)
 sight() {
-    ( cd "$1" && { find . -path ./.git -prune -o -type f -print0 | sort -z | xargs -0 md5sum; git show-ref 2>/dev/null; git rev-parse HEAD 2>/dev/null; cat .git/HEAD 2>/dev/null; } | md5sum )
+    ( cd "$1" && { find . -path ./.git -prune -o -type f -print0 | sort -z | xargs -0 md5sum; git show-ref 2>/dev/null || true; git rev-parse HEAD 2>/dev/null || true; cat .git/HEAD 2>/dev/null || true; } | md5sum )
 }
 converged() { [ "$(sight "$A")" = "$(sight "$B")" ]; }
 settle() { for _ in $(seq 1 40); do converged && return 0; sleep 0.5; done; return 1; }
 
 step() {
     local name="$1"; shift
-    ( "$@" ) > "$W/step.out" 2>&1
+    # A step's own failure is part of what the table reports, not a
+    # reason to stop: the checks below say what it left behind.
+    ( "$@" ) > "$W/step.out" 2>&1 || true
     local ok="converged"; settle || ok="NOT converged"
-    local fa fb; fa=$(cd "$A" && git fsck --no-progress 2>&1 | grep -vc "^$" ); fb=$(cd "$B" && git fsck --no-progress 2>&1 | grep -vc "^$")
+    local fa fb; fa=$(git -C "$A" fsck --no-progress 2>&1 | grep -vc "^$" || true); fb=$(git -C "$B" fsck --no-progress 2>&1 | grep -vc "^$" || true)
     local sa sb; sa=$(cd "$A" && git status --porcelain=v1 2>/dev/null | sort | md5sum | cut -c1-8); sb=$(cd "$B" && git status --porcelain=v1 2>/dev/null | sort | md5sum | cut -c1-8)
-    local ha hb; ha=$(cd "$A" && git rev-parse --short HEAD 2>/dev/null); hb=$(cd "$B" && git rev-parse --short HEAD 2>/dev/null)
-    local conflicts halts; conflicts=$(grep -oE "[0-9]+ conflict" "$LOG" | awk '{s+=$1} END {print s+0}'); halts=$(grep -ci "halt" "$LOG")
+    local ha hb; ha=$(git -C "$A" rev-parse --short HEAD 2>/dev/null || true); hb=$(git -C "$B" rev-parse --short HEAD 2>/dev/null || true)
+    local conflicts halts; conflicts=$({ grep -oE "[0-9]+ conflict" "$LOG" || true; } | awk '{s+=$1} END {print s+0}'); halts=$(grep -ci "halt" "$LOG" || true)
     printf "%-28s %-14s fsck a/b %s/%s  HEAD a/b %s/%s  status %s  conflicts-so-far %s halts %s\n" "$name" "$ok" "$fa" "$fb" "$ha" "$hb" "$([ "$sa" = "$sb" ] && echo same || echo DIFFER)" "$conflicts" "$halts"
 }
 
@@ -77,6 +96,5 @@ step "fetch on b" bash -c "cd '$B' && git fetch -q origin"
 step "reset on b" bash -c "cd '$B' && git reset -q --mixed HEAD"
 echo
 echo "cycles that reported conflicts or blocked paths:"
-grep -E "cycle finished" "$LOG" | grep -vE " 0 conflict\(s\), 0 blocked" | head -8
-echo; echo "cycle count: $(grep -c 'cycle finished' "$LOG"); errors: $(grep -ci 'error' "$LOG")"
-echo "work dir kept at $W"
+{ grep -E "cycle finished" "$LOG" || true; } | { grep -vE " 0 conflict\(s\), 0 blocked" || true; } | head -8
+echo; echo "cycle count: $(grep -c 'cycle finished' "$LOG" || true); errors: $(grep -ci 'error' "$LOG" || true)"

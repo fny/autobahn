@@ -91,7 +91,9 @@ impl StateWriter {
         let encodes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         #[cfg(test)]
         let worker_encodes = Arc::clone(&encodes);
-        let thread = std::thread::spawn(move || {
+        // A deep stack: encoding a scan cache recurses once per directory
+        // level of the tree it records (see `crate::threads`).
+        let thread = crate::threads::spawn_deep(move || {
             // Marks the writer finished however the loop is left — a
             // return, or an unwinding panic from an encoder — and releases
             // anyone waiting on it.
@@ -277,6 +279,37 @@ pub fn write_beside(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
         return Err(error);
     }
     Ok(temporary)
+}
+
+#[cfg(test)]
+mod deep {
+    use super::*;
+    use crate::tree::{Content, Node};
+
+    /// Finding H-5: the writer encodes whole scan caches, and encoding
+    /// recurses once per directory level, so a deep tree has to encode on
+    /// a deep stack. On the default one this depth is a stack overflow,
+    /// which aborts the whole process.
+    #[test]
+    fn a_deep_tree_encodes_on_the_writer_thread() {
+        let mut node = Node {
+            name: "leaf".into(),
+            content: Content::Directory(Arc::new(Vec::new())),
+        };
+        for _ in 0..100_000 {
+            node = Node {
+                name: "d".into(),
+                content: Content::Directory(Arc::new(vec![node])),
+            };
+        }
+        let directory = tempfile::tempdir().expect("temporary directory should be creatable");
+        let path = directory.path().join("state");
+        let writer = StateWriter::new();
+        writer.store(path.clone(), move || bincode::serialize(&node).ok());
+        writer.flush();
+        let written = std::fs::read(&path).expect("the deep tree should have been written");
+        assert!(!written.is_empty());
+    }
 }
 
 #[cfg(test)]

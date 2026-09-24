@@ -372,6 +372,12 @@ pub(crate) struct ChangeWatcher {
     /// fail, as the kernel's watch limit would.
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fail_extension: Arc<std::sync::atomic::AtomicBool>,
+    /// A test seam that holds back the backend's events: while a test
+    /// holds this lock, nothing is recorded and nothing notified, so an
+    /// event can be made to arrive late — after a scan it would otherwise
+    /// have preceded — on the test's schedule rather than the kernel's.
+    #[cfg(test)]
+    pub(crate) hold_events: Arc<Mutex<()>>,
 }
 
 impl PendingChanges {
@@ -414,8 +420,14 @@ impl ChangeWatcher {
         let root_identity = directory_identity(root);
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
+        #[cfg(test)]
+        let hold_events = Arc::new(Mutex::new(()));
+        #[cfg(test)]
+        let holding = Arc::clone(&hold_events);
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                #[cfg(test)]
+                let _held = holding.lock().unwrap_or_else(|e| e.into_inner());
                 recorder
                     .lock()
                     .expect("the pending lock is never poisoned")
@@ -434,6 +446,8 @@ impl ChangeWatcher {
             root: root.to_path_buf(),
             root_identity,
             incomplete: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            hold_events,
         })
     }
 
@@ -479,12 +493,18 @@ impl ChangeWatcher {
         let fail_extension = Arc::new(std::sync::atomic::AtomicBool::new(false));
         #[cfg(test)]
         let failing = Arc::clone(&fail_extension);
+        #[cfg(test)]
+        let hold_events = Arc::new(Mutex::new(()));
+        #[cfg(test)]
+        let holding = Arc::clone(&hold_events);
         let watched_root = root.to_path_buf();
         let root = root.to_path_buf();
         std::thread::Builder::new()
             .name("autobahn-watch".into())
             .spawn(move || {
                 while let Ok(event) = events.recv() {
+                    #[cfg(test)]
+                    let _held = holding.lock().unwrap_or_else(|e| e.into_inner());
                     // Ends with the watcher: dropping the `ChangeWatcher`
                     // drops the last strong reference, the backend and its
                     // sender with it, and the receive above then fails.
@@ -546,6 +566,8 @@ impl ChangeWatcher {
             incomplete,
             #[cfg(test)]
             fail_extension,
+            #[cfg(test)]
+            hold_events,
         })
     }
 

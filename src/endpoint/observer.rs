@@ -1018,6 +1018,90 @@ mod tests {
         }
     }
 
+    /// The watcher's event hold (see `ChangeWatcher::hold_events`): while
+    /// its lock is held, no kernel event reaches the observer.
+    fn event_hold(observer: &RootObserver) -> Arc<Mutex<()>> {
+        let state = observer.state.lock().unwrap();
+        let watcher = state.watcher.as_ref().expect("watching");
+        Arc::clone(&watcher.hold_events)
+    }
+
+    /// Finding M-46: the kernel can report a write after a cycle has
+    /// already scanned. That cycle missing the write is allowed; the late
+    /// event must then move the generation and mark the path, so the very
+    /// next scan reads it. The event is held back by a seam rather than
+    /// raced against a sleep, so the first scan provably precedes it.
+    #[test]
+    fn a_late_event_reaches_the_scan_after_the_one_it_missed() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        let first = settle(&observer);
+
+        let hold = event_hold(&observer);
+        let held = hold.lock().unwrap();
+        let before = observer.generation();
+        std::fs::write(root.join("file.txt"), b"after!").expect("writes");
+        let (missed, generation) = observer.scan(None, None).expect("scans");
+        assert_eq!(generation, before, "an event got past the hold");
+        assert_eq!(
+            digest_at(&missed, "file.txt"),
+            digest_at(&first, "file.txt"),
+            "the scan the event was late for already knew of the write"
+        );
+
+        drop(held);
+        assert!(
+            observer.await_change(generation, Duration::from_secs(10)),
+            "the late event was never delivered"
+        );
+        let (fresh, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&fresh, "file.txt"),
+            Some(*blake3::hash(b"after!").as_bytes()),
+            "a late event did not reach the next scan"
+        );
+    }
+
+    /// Finding M-46, the polling half: a root whose watch is lost falls
+    /// back to polling, and there a write no event ever announces must
+    /// still reach the next scan — although the generation stands where
+    /// it stood when a whole watch published the last snapshot, and no
+    /// full walk is due.
+    #[test]
+    fn the_polling_fallback_reads_a_write_no_event_announced() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        // The watch goes, and is not rebuilt, as while the host stays at
+        // its watch limit. Events still in flight are held, so none of
+        // them can announce the write either.
+        let hold = event_hold(&observer);
+        let held = hold.lock().unwrap();
+        observer
+            .suppress_watching
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        observer.state.lock().unwrap().watcher = None;
+        assert!(!observer.is_watching());
+
+        let before = observer.generation();
+        std::fs::write(root.join("file.txt"), b"after!").expect("writes");
+        let (fresh, generation) = observer.scan(None, None).expect("scans");
+        assert_eq!(generation, before, "an event announced the write");
+        assert_eq!(
+            digest_at(&fresh, "file.txt"),
+            Some(*blake3::hash(b"after!").as_bytes()),
+            "the polling fallback served a snapshot from before the write"
+        );
+        drop(held);
+    }
+
     /// Finding M-23: the observer is shared across sessions with
     /// different entry limits, so a snapshot a generous session warmed
     /// must still be refused to a strict one — in either order.

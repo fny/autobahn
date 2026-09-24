@@ -7,6 +7,8 @@ apps/macos/build.sh          # builds Autobahn.app
 open apps/macos/Autobahn.app # or drag it to /Applications
 ```
 
+`build.sh` signs the bundle with the best identity in your keychain. `build.sh --unsigned` stops at the assembled bundle and touches no keychain; `build.sh [--unsigned] path/to/Autobahn.app` builds somewhere else, the path taken from where you run it. The version the app reports is `Cargo.toml`'s, written into `Info.plist` at build time: build the bundle with `build.sh`, never by copying the template.
+
 The app is a way to launch `autobahn tray`, not a second implementation of it: the same binary, the same `resolve` a terminal would run. What the bundle adds is an *identity*. macOS attaches a notification's icon to the bundle that sent it, and a bare executable has none — which is why `-appIcon` is ignored from the command line and every alert wears the icon of whatever ran it. Inside the bundle the icon is autobahn's.
 
 ## What it shows
@@ -78,8 +80,11 @@ A downloaded app has to be signed with a Developer ID certificate and notarised 
 `apps/macos/release.sh` does the whole thing, on a laptop or in CI:
 
 ```sh
-apps/macos/release.sh     # build, sign, notarise, staple
+apps/macos/release.sh                                    # build, sign, notarise, staple
+apps/macos/release.sh --sign-only apps/macos/Autobahn.app  # sign, notarise, staple a built app
 ```
+
+`--sign-only` compiles nothing: it takes a bundle `build.sh --unsigned` made, and signs it. That split is what CI uses, so that every build happens before the signing identity exists.
 
 On a laptop it signs with the Developer ID certificate in your keychain and notarises with credentials stored once:
 
@@ -90,7 +95,7 @@ xcrun notarytool store-credentials autobahn \
 
 ### In CI
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job builds and signs everything macOS on one runner: the two command-line binaries, signed and notarised by `apps/macos/notarize-cli.sh`, and the app, by the same `release.sh` as above, attached to the release as `Autobahn-macos-aarch64.zip`. It is the only job holding the certificate, and it uses the protected `release` environment, which must hold five secrets:
+Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job builds and signs everything macOS on one runner: the two command-line binaries, signed and notarised by `apps/macos/notarize-cli.sh`, and the app, attached to the release as `Autobahn-macos-aarch64.zip`. The job builds everything first — the binaries, and the app with `build.sh --unsigned` — and checks that the app's `Info.plist` reports the tag's version. Only then does it import the certificate, and it signs the app with `release.sh --sign-only`, so no dependency's build script or proc macro ever runs while the identity is usable. It is the only job holding the certificate, and it uses the protected `release` environment, which must hold five secrets:
 
 | secret | what it is |
 |---|---|

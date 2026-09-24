@@ -4,11 +4,11 @@ Autobahn ships three things. They ship independently. A build that refreshes one
 
 | what | where it comes from | where it lands |
 |---|---|---|
-| the controller command | `cargo build --release`, or a release asset | `~/.local/bin/autobahn` |
+| the controller command | `cargo build --release --locked`, or a release asset | `~/.local/bin/autobahn` |
 | the macOS menu bar app | `apps/macos/build.sh`, into `target/tray` | `/Applications/Autobahn.app` |
 | the agents | the `autobahn-agents.tar.gz` asset | `~/.autobahn/agents`, then each remote host |
 
-A plain `cargo build --release` gives you a new controller only. The menu bar app keeps the binary it was built with. The agent bundle in `~/.autobahn/agents` keeps the binaries the installer put there.
+A plain `cargo build --release --locked` gives you a new controller only. The menu bar app keeps the binary it was built with. The agent bundle in `~/.autobahn/agents` keeps the binaries the installer put there.
 
 Remote hosts are different again. The controller runs the agent at `~/.autobahn/bin/autobahn-<version>-<digest>` on the host, and uploads one only if that path fails to run. `<version>` is the package version plus the compatibility epoch, which `protocol::version()` writes as `0.4.0+e15`; `<digest>` is the first twelve hex digits of the binary's blake3. So a host takes a new agent whenever the bytes the controller would send change — a new release, or a rebuild at the same version — and never the same bytes twice.
 
@@ -16,13 +16,13 @@ Remote hosts are different again. The controller runs the agent at `~/.autobahn/
 
 A tag that starts with `v` starts `.github/workflows/release.yml`.
 
-1. A guard job compares the tag with the `version` key in `Cargo.toml`. If they disagree, the run stops before any build starts.
+1. A guard job compares the tag with the `version` key in `Cargo.toml`, and asks the Actions API whether CI's `linux`, `linux-arm`, `mac` and `spec` jobs have all succeeded on the tagged commit, in some push or manually started run of `ci.yml`. If the versions disagree, or any of those jobs has not passed there, the run stops before any build starts.
 2. The Linux job builds static musl binaries for x86-64 and arm64.
-3. The macOS job builds both macOS binaries and the menu bar app. It signs them with the Developer ID certificate. Apple notarises them. This job waits for approval, because it holds the secrets.
+3. The macOS job builds both macOS binaries and the menu bar app, the app with `apps/macos/build.sh --unsigned`, and checks that the app reports the tag's version. Only then does it import the Developer ID certificate and sign them — the app with `apps/macos/release.sh --sign-only` — and Apple notarises them. This job waits for approval, because it holds the secrets.
 4. The release job collects every `autobahn-<os>-<arch>` binary into `autobahn-agents.tar.gz`. It writes `SHA256SUMS` over every asset.
 5. `gh release create` publishes the binaries, the bundle, the app archive, the checksums and `scripts/install.sh`.
 
-The guard job exists because nothing checked the tag before. The package version names the agent on every remote host. If the tag and the package version disagree, the release publishes binaries whose agents carry a different version than the tag. No handshake catches this, because both ends of a session still agree with each other.
+The guard job exists because nothing checked the tag before, nor that the tagged commit was tested: CI skips commits that touch only docs and, on request, the macOS job, and a red run never stopped a tag. The package version names the agent on every remote host. If the tag and the package version disagree, the release publishes binaries whose agents carry a different version than the tag. No handshake catches this, because both ends of a session still agree with each other.
 
 `scripts/install.sh` installs from a published release, and the release publishes it too, so the one-liner runs the installer that matches the release it installs. It maps the platform the same way the controller does. It downloads the binary and the agent bundle, and verifies both against `SHA256SUMS` before it installs either. It refuses a bundle member that would land outside `agents/`. It writes to a temporary file and renames the file into place. It puts the command on your PATH and the agent bundle in `~/.autobahn/agents`.
 

@@ -1,12 +1,12 @@
 # Development
 
 ```sh
-cargo build --release         # Rust stable, Unix only
-cargo test --release          # unit + end-to-end suites (e2e spawns real agents)
-cargo clippy --all-targets
-scripts/mi                    # a guided tour of every command and state
-scripts/build-agents.sh       # cross-build the agents bundle
-gh workflow run ci.yml        # Linux, ARM Linux and macOS
+cargo build --release --locked  # Rust stable, Unix only
+cargo test --release --locked   # unit + end-to-end suites (e2e spawns real agents)
+cargo clippy --release --locked --all-targets -- -D warnings   # as CI runs it
+scripts/mi                      # a guided tour of every command and state
+scripts/build-agents.sh         # cross-build the agents bundle
+gh workflow run ci.yml          # Linux, ARM Linux and macOS
 ```
 
 CI runs on every push to `main` and every pull request, except changes that cannot affect a build — Markdown, `docs/`, `bench/`, the README artwork, and the release workflow. There is one macOS job, which runs the suite and then builds the app, signed ad-hoc; the certificate belongs to the release alone. A newer push cancels an older run of the same branch.
@@ -30,7 +30,7 @@ The integration suites run with a private `HOME` (`tests/common::isolate_home`).
 Build the tray feature into its own target directory:
 
 ```sh
-CARGO_TARGET_DIR=target/tray cargo build --release --features tray
+CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
 ```
 
 That is what `apps/macos/build.sh` does. The login service runs `target/release/autobahn`, and a feature build there replaces it.
@@ -55,7 +55,7 @@ A change that breaks the wire protocol, or that makes two versions disagree abou
 
 ## The specification
 
-The reconciliation rules, for files and directories across one alpha and any number of betas, and the peering protocol are written in TLA+ under `spec/` and checked exhaustively by TLC. CI's `spec` job runs `spec/check.sh quick` — the small configurations, safety only — and then `AUTOBAHN_TLC=1 cargo test --release --test spec_replay --test spec_peering_replay -- --include-ignored` (the TLC tests are `#[ignore]`d, so a run without TLC lists them as ignored), which drives the real `reconcile()` and the real lease code through TLC's own traces and holds them to the spec's `Match`. The full set, with liveness and three betas, is `spec/check.sh` with no argument, or the dispatch-only `spec-full.yml` workflow; the peering liveness configurations take hours and want a large machine. `spec/README.md` has the modes, the sizes, and what TLC taught us about writing them.
+The reconciliation rules, for files and directories across one alpha and any number of betas, and the peering protocol are written in TLA+ under `spec/` and checked exhaustively by TLC. CI's `spec` job runs `spec/check.sh quick`, with the `tla2tools.jar` that `spec/tla2tools.version` pins, — the small configurations, safety only — and then `AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_peering_replay -- --include-ignored` (the TLC tests are `#[ignore]`d, so a run without TLC lists them as ignored), which drives the real `reconcile()` and the real lease code through TLC's own traces and holds them to the spec's `Match`. The full set, with liveness and three betas, is `spec/check.sh` with no argument, or the dispatch-only `spec-full.yml` workflow; the peering liveness configurations take hours and want a large machine. `spec/README.md` has the modes, the sizes, and what TLC taught us about writing them.
 
 ## Correctness
 

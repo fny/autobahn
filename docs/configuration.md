@@ -60,7 +60,7 @@ Why `defaults` is a table and `log` is not: TOML requires bare keys to appear be
 
 ## Session settings
 
-Fourteen keys live in both `[defaults]` and any group, with the group winning. Four exist only on a group.
+Fourteen keys live in both `[defaults]` and any group, with the group winning. Five exist only on a group.
 
 | Key | Where | Default | What it does |
 |---|---|---|---|
@@ -79,7 +79,18 @@ Fourteen keys live in both `[defaults]` and any group, with the group winning. F
 | `staging` | both | `"state"` | Where in-flight content lives: `state`, `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
 | `default_owner` / `default_group` | both | — | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights, which in practice means an agent running as root — the one case an agent accepts root. That turns the scanner and transition races in [RETAINED §2](./correctness/RETAINED.md) into privilege escalation, so set it only where root is really meant. |
 | `durability` | both | `"process"` | `process` survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
+| `acknowledge_secrets` | group | `false` | Silences the warning that a local root holds credentials — `.ssh`, `.aws`, `.gnupg`, `.config/gcloud` or `.kube` that its ignores leave in, or any of them when the root is your home directory. `sync` and `watch` print that warning once per root when they start, because every destination would receive those files. Set it on a group that means to synchronize them; otherwise add them to `ignores`. |
 | `agent_command` | group | ssh | Advanced: reach remote endpoints through this command (whitespace-split argv) instead of SSH. Testing and custom transports. |
+
+### What is refused
+
+Beyond keys and values it does not know, a configuration is refused at startup, with the session named, when:
+
+- **a session's two sides are one tree, or one is inside the other.** The session would consume its own output — in a mirroring mode, delete the alpha through the beta path. Roots are compared as resolved, so a symbolic link alias or a trailing `/.` is the same tree. The same check guards `autobahn sync ALPHA BETA`. One session's beta feeding another's alpha (a relay) stays legal; two sessions writing nested roots do not — see [Overlapping and nested roots](./nesting.md).
+- **a local root is, or holds, autobahn's own directories**: the state root (`~/.autobahn`, or `--state-root`), the default state root when another is in use, or the directory the configuration file lives in. Synchronized, they would change under the session using them, and a peer that edits its copy of `config.toml` or `on-alert.sh` would choose what runs here next. A root that holds one is accepted when its ignores keep it out — `ignores = [".autobahn"]` for a root of `~`. `watch` checks each edit the same way and keeps the last configuration if one fails.
+- **the command is running as root** without `--allow-root` or `advanced.allow_root`, or as root under someone else's home (`sudo`), which is refused regardless.
+
+A root that holds credentials is warned about, not refused: see `acknowledge_secrets` above.
 
 ### Symbolic links
 

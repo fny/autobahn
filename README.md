@@ -116,7 +116,7 @@ install -m 755 autobahn-linux-x86_64 ~/.local/bin/autobahn
 mkdir -p ~/.autobahn && tar xzf autobahn-agents.tar.gz -C ~/.autobahn   # if your fleet spans platforms
 ```
 
-Or build from source with `cargo build --release` (Rust stable, Unix only).
+Or build from source with `cargo build --release --locked` (Rust stable, Unix only).
 
 ## Documentation
 
@@ -302,7 +302,7 @@ mkdir -p ~/.autobahn
 tar xzf autobahn-agents.tar.gz -C ~/.autobahn    # creates ~/.autobahn/agents/
 ```
 
-Or build from source with `cargo build --release` (Rust stable, Unix only).
+Or build from source with `cargo build --release --locked` (Rust stable, Unix only).
 
 ## Expiremntal Features
 

@@ -13,7 +13,7 @@ The `_n3` configurations check the invariants for three betas, with the betas' s
 spec/check.sh strict_n3 alpha_n3 conflict_n3
 ```
 
-It needs Java 11+; `tla2tools.jar` is fetched into `~/.local/lib` on first use, or set `TLA2TOOLS`.
+It needs Java 11+ and the `tla2tools.jar` that `spec/tla2tools.version` pins by version, URL and SHA-256. It is fetched into `~/.local/lib` on first use and checked against that digest, and `spec/check.sh --fetch` fetches it without running anything. `TLA2TOOLS` names another copy, which must match the same digest: a jar that does not — named or cached — is refused, and `TLA2TOOLS_TRUST=1` runs the one `TLA2TOOLS` names regardless. To move to a newer TLC, change the pin, not the check.
 
 The implementation is held to the spec by `tests/spec_replay.rs`. It plays the same game with the real `reconcile()` making every cycle's move, asserts the same properties in Rust on thousands of random games (always on), and writes games out as traces that TLC validates against the spec — a step the spec does not allow is a deadlock, and a rejection:
 

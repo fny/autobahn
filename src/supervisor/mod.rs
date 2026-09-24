@@ -2351,6 +2351,10 @@ pub fn recorded_statuses(state_root: &Path) -> Vec<SessionStatus> {
 /// Everything `status` knows, as one document — the seam any user
 /// interface builds on. `status --json` prints it; `autobahn tray` reads
 /// it directly. The `version` field moves when the shape does.
+/// The schema version every `--json` report carries, including the one
+/// printed when the configuration will not load.
+pub const REPORT_VERSION: u32 = 4;
+
 #[derive(Clone, Debug, Serialize)]
 pub struct StatusReport {
     /// The schema version of this document.
@@ -2609,7 +2613,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         }
     }
     StatusReport {
-        version: 4,
+        version: REPORT_VERSION,
         supervisor_running: running,
         supervisor_mismatch: mismatch,
         supervisor_unresponsive: unresponsive,

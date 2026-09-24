@@ -69,6 +69,22 @@ pub fn display_safe(s: &str) -> Cow<'_, str> {
     Cow::Owned(out)
 }
 
+/// Like [`display_safe`], but for a message meant to be read as a block:
+/// a parse error with a caret line under it, say. Newlines survive so the
+/// shape is kept; every other control character is escaped as before, and
+/// each line after the first is indented, so text from elsewhere cannot
+/// forge a line that looks like autobahn's own.
+pub fn display_block(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 8);
+    for (index, line) in s.split('\n').enumerate() {
+        if index > 0 {
+            out.push_str("\n  ");
+        }
+        out.push_str(&display_safe(line));
+    }
+    out
+}
+
 /// The marker [`cap_line`] puts where it cut.
 const ELLIPSIS: &str = "…";
 
@@ -124,6 +140,22 @@ mod tests {
         "-n",
         "ünï\u{1b}[31mcode",
     ];
+
+    /// A block keeps its shape and loses its weapons: the newlines that
+    /// make a parse error readable survive, the escape that would move a
+    /// cursor does not, and a continuation line cannot pass for a first
+    /// one.
+    #[test]
+    fn display_block_keeps_newlines_and_escapes_the_rest() {
+        let shown = display_block("unable to parse\n  |\n1 | mdoe = \"x\"\n  | ^^^^");
+        assert!(shown.contains('\n'), "{shown:?}");
+        assert!(shown.contains("\n    |"), "continuation lines are indented: {shown:?}");
+        assert!(!shown.contains("\\n"), "a newline is not escaped away: {shown:?}");
+
+        let hostile = display_block("first\n\x1b]52;c;cHduZWQ=\x07second");
+        assert!(!hostile.contains('\x1b'), "{hostile:?}");
+        assert!(hostile.contains("\\x1b"), "{hostile:?}");
+    }
 
     #[test]
     fn a_quoted_word_reaches_the_shell_unchanged() {

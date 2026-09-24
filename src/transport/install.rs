@@ -1113,7 +1113,12 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             "picked agent"
         );
-        // Missing, it fails the way a missing agent always has.
+        // Missing, it fails the way a missing agent always has: nothing is
+        // picked, and the shell reports a failure. Which number it reports
+        // is the shell's business and differs by platform — a missing file
+        // under `exec` is 127 on Linux and 126 on macOS, where 126 also
+        // means "found but not executable" — so the test asserts what the
+        // controller acts on rather than the number.
         fs::remove_file(&stand_in).unwrap();
         let output = Command::new("sh")
             .arg("-c")
@@ -1121,7 +1126,16 @@ mod tests {
             .env("HOME", home.path())
             .output()
             .expect("sh runs");
-        assert_eq!(output.status.code(), Some(127));
+        assert!(
+            !output.status.success(),
+            "a missing agent must fail: {:?}",
+            output.status
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).trim().is_empty(),
+            "nothing may be picked when the agent is missing: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 
     #[test]

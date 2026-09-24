@@ -4464,11 +4464,33 @@ fn format_size(bytes: u64) -> String {
 /// What `status` shows when no supervisor answers and the configuration
 /// does not load: the fault, and every session's state as last recorded,
 /// rather than the fault alone.
+/// The `--json` answer when the configuration will not load: the refusal
+/// and every session's last recorded state, in the shape `status --json`
+/// otherwise prints. Fails afterwards, so a script's exit check still
+/// catches it.
+fn recorded_json(state_root: &Path, error: &anyhow::Error) -> Result<()> {
+    let document = refused_document(state_root, &format!("{error:#}"));
+    println!("{}", serde_json::to_string_pretty(&document)?);
+    bail!("the configuration does not load; the document above is what was last recorded")
+}
+
+/// Builds that document. Separate so its shape can be tested without a
+/// configuration, a state root or a terminal.
+fn refused_document(state_root: &Path, error: &str) -> serde_json::Value {
+    let statuses = autobahn::supervisor::recorded_statuses(state_root);
+    serde_json::json!({
+        "version": autobahn::supervisor::REPORT_VERSION,
+        "configuration_error": error,
+        "supervisor_running": false,
+        "recorded": statuses,
+    })
+}
+
 fn show_recorded(state_root: &Path, error: &anyhow::Error) -> Result<()> {
     style::emit(&format!(
         "\x1b[33mthe configuration does not load\x1b[0m, so what follows is every \
-         session's state as last recorded\n{}\n\n",
-        autobahn::text::display_safe(&format!("{error:#}"))
+         session's state as last recorded\n  {}\n\n",
+        autobahn::text::display_block(&format!("{error:#}"))
     ));
     let statuses = autobahn::supervisor::recorded_statuses(state_root);
     if statuses.is_empty() {
@@ -4538,7 +4560,12 @@ fn run_status(
                     shown.plans
                 }
                 Err(error) if !json => return show_recorded(&state_root, &error),
-                Err(error) => return Err(error),
+                // JSON is this command's standard output, and a reader
+                // parsing it is the one least able to cope with a message
+                // on standard error instead. So the refusal becomes part
+                // of the document, beside the states last recorded, and
+                // the exit status still says something is wrong.
+                Err(error) => return recorded_json(&state_root, &error),
             }
         }
     };
@@ -5203,6 +5230,33 @@ fn problem_line(side: &str, problem: &autobahn::tree::Problem) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// A reader parsing `--json` is the one least able to cope with a
+    /// message on standard error, so a refused configuration has to reach
+    /// it inside the document: the refusal itself, and whatever the
+    /// sessions last recorded.
+    #[test]
+    fn a_refused_configuration_is_reported_inside_the_json_document() {
+        let state_root = tempfile::tempdir().expect("a temporary directory");
+        let document = crate::refused_document(
+            state_root.path(),
+            "unable to parse configuration /x/config.toml: unknown field `mdoe`",
+        );
+        assert_eq!(document["version"], autobahn::supervisor::REPORT_VERSION);
+        assert_eq!(document["supervisor_running"], false);
+        assert!(document["configuration_error"]
+            .as_str()
+            .expect("the refusal is a string")
+            .contains("mdoe"));
+        assert!(
+            document["recorded"].as_array().expect("an array").is_empty(),
+            "a state root with no status files records nothing"
+        );
+        // It has to survive a round trip: this is what a script reads.
+        let text = serde_json::to_string(&document).expect("it serializes");
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("it parses");
+        assert_eq!(parsed["configuration_error"], document["configuration_error"]);
+    }
+
 
     /// A resolve flushes the sessions it touched, not the whole group: a
     /// destination that already agreed with the winner has nothing new to

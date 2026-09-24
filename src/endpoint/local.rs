@@ -805,7 +805,12 @@ impl LocalEndpoint {
     /// The buffer therefore holds one file's operations (whose total size is
     /// the size of that file's *delta*, not the file), never more: the next
     /// file is only deltified once the previous one has been fully drained.
-    fn buffer_delta(&self, need: &StagingNeed, pending: &mut VecDeque<TransferFrame>) {
+    fn buffer_delta(
+        &self,
+        need: &StagingNeed,
+        pending: &mut VecDeque<TransferFrame>,
+        alternatives: &mut Option<std::collections::HashMap<Digest, Vec<String>>>,
+    ) {
         // The requested path supplies first; if it can't (vanished, become
         // unreadable, or changed), any other scanned path recording the
         // same digest holds identical content and is tried in its place —
@@ -819,7 +824,7 @@ impl LocalEndpoint {
             Ok(()) => None,
             Err(primary_error) => {
                 let recovered = self
-                    .digest_paths(&need.request.digest, &need.request.path)
+                    .digest_paths(alternatives, &need.request.digest, &need.request.path)
                     .into_iter()
                     .any(|candidate| {
                         self.try_supply(&candidate, &need.signature, pending)
@@ -892,34 +897,56 @@ impl LocalEndpoint {
         }
     }
 
-    /// Collects every root-relative path (other than the excluded one) whose
-    /// scanned content records the given digest. Only consulted when a
-    /// supply attempt fails, so the walk stays off the hot path.
-    fn digest_paths(&self, digest: &Digest, exclude: &str) -> Vec<String> {
+    /// Every root-relative path (other than the excluded one) whose scanned
+    /// content records the given digest. Only consulted when a supply
+    /// attempt fails.
+    ///
+    /// The paths are indexed by digest on the stream's first failure and
+    /// answered from the index after that. Walking the snapshot per failure
+    /// was 48 ms at 500k entries, so a burst of failures — a tree being
+    /// deleted while it is supplied — cost minutes: 10,000 of them, eight.
+    /// The index lives only as long as the stream, so an endpoint does not
+    /// hold every path twice while idle.
+    fn digest_paths(
+        &self,
+        alternatives: &mut Option<std::collections::HashMap<Digest, Vec<String>>>,
+        digest: &Digest,
+        exclude: &str,
+    ) -> Vec<String> {
         fn collect(
             node: &Node,
             path: &str,
-            digest: &Digest,
-            exclude: &str,
-            paths: &mut Vec<String>,
+            index: &mut std::collections::HashMap<Digest, Vec<String>>,
         ) {
             match &node.content {
-                Content::File {
-                    digest: recorded, ..
-                } if recorded == digest && path != exclude => paths.push(path.to_owned()),
+                Content::File { digest, .. } => {
+                    index.entry(*digest).or_default().push(path.to_owned())
+                }
                 Content::Directory(children) => {
                     for child in children.iter() {
-                        collect(child, &path_join(path, &child.name), digest, exclude, paths);
+                        collect(child, &path_join(path, &child.name), index);
                     }
                 }
                 _ => {}
             }
         }
-        let mut paths = Vec::new();
-        if let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
-            collect(root, "", digest, exclude, &mut paths);
-        }
-        paths
+        let index = alternatives.get_or_insert_with(|| {
+            let mut index = std::collections::HashMap::new();
+            if let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
+                collect(root, "", &mut index);
+            }
+            index
+        });
+        index
+            .get(digest)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter(|path| *path != exclude)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Applies a batch of transfer frames to the receive state.
@@ -1235,6 +1262,7 @@ impl Endpoint for LocalEndpoint {
             needs,
             current: 0,
             pending: VecDeque::new(),
+            alternatives: None,
         });
         Ok(())
     }
@@ -1257,7 +1285,7 @@ impl Endpoint for LocalEndpoint {
                 // Split the borrow: the delta for one need is buffered into
                 // the pending queue, and only then is the cursor advanced.
                 let need = &state.needs[state.current];
-                self.buffer_delta(need, &mut state.pending);
+                self.buffer_delta(need, &mut state.pending, &mut state.alternatives);
                 state.current += 1;
             }
             while frames.len() < limit && bytes < SUPPLY_TARGET_BYTES {
@@ -1589,6 +1617,10 @@ struct SupplyState {
     current: usize,
     /// The frames buffered for the current need.
     pending: VecDeque<TransferFrame>,
+    /// Every scanned path by the digest it records, built on the stream's
+    /// first failed supply and kept for the rest of it: see
+    /// [`LocalEndpoint::digest_paths`].
+    alternatives: Option<std::collections::HashMap<Digest, Vec<String>>>,
 }
 
 /// The state of an in-progress staging operation, running in parallel with

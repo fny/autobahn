@@ -2848,6 +2848,14 @@ fn free_name(root: Option<&autobahn::tree::Node>, path: &str, side: &str) -> Str
     unreachable!("the counter is unbounded")
 }
 
+// The flushes `run_resolve` asked for, whether or not a supervisor was
+// there to receive them.
+#[cfg(test)]
+thread_local! {
+    static RESOLVE_FLUSHES: std::cell::RefCell<Vec<ControlRequest>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Resolves conflicts by putting the winner's version on every other side.
 #[allow(clippy::too_many_arguments)] // one parameter per command-line flag
 fn run_resolve(
@@ -3513,7 +3521,13 @@ fn run_resolve(
     // so content that appeared while this command was running is never
     // destroyed by it. That validation is the whole reason to route through
     // the engine here rather than call `remove_dir_all`.
+    // The sessions whose trees this command changes, and so the ones
+    // whose next cycle carries the result.
+    let mut touched: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
     for loser in losers {
+        if !loser.actions.is_empty() {
+            touched.insert(loser.index);
+        }
         let endpoint = match loser.alpha {
             true => &mut endpoints[loser.index].0,
             false => &mut endpoints[loser.index].1,
@@ -3629,14 +3643,25 @@ fn run_resolve(
     // losing one. The cycle carries the winner across, which is what makes
     // a directory work at all — so the flush is part of the resolution
     // here, not a courtesy to make `status` catch up sooner.
+    //
+    // Only the sessions touched are flushed. One that agreed already has
+    // nothing to carry; and where alpha was retired, the winning session
+    // is among the touched, and its cycle's write to alpha wakes every
+    // other session over that alpha as any change there does.
+    let flushes: Vec<ControlRequest> = touched
+        .iter()
+        .map(|&index| {
+            ControlRequest::Flush(Selector::session(
+                autobahn::supervisor::control::SessionKey::of(group_plans[index]),
+            ))
+        })
+        .collect();
+    #[cfg(test)]
+    RESOLVE_FLUSHES.with(|sent| sent.borrow_mut().extend(flushes.iter().cloned()));
     if autobahn::supervisor::control::supervisor_is_running(&state_root) {
-        let _ = autobahn::supervisor::control::send(
-            &state_root,
-            &ControlRequest::Flush(Selector {
-                group: Some(group),
-                ..Selector::default()
-            }),
-        );
+        for flush in &flushes {
+            let _ = autobahn::supervisor::control::send(&state_root, flush);
+        }
         if settled > 0 {
             println!("copying the kept version across now");
         }
@@ -4982,6 +5007,78 @@ fn problem_line(side: &str, problem: &autobahn::tree::Problem) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A resolve flushes the sessions it touched, not the whole group: a
+    /// destination that already agreed with the winner has nothing new to
+    /// carry, and waking it costs that session a cycle for nothing.
+    #[test]
+    fn resolve_flushes_only_the_sessions_it_touched() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let (alpha, differs, agrees) = (
+            keep.path().join("alpha"),
+            keep.path().join("differs"),
+            keep.path().join("agrees"),
+        );
+        for (root, content) in [(&alpha, "alpha"), (&differs, "beta"), (&agrees, "alpha")] {
+            std::fs::create_dir_all(root).unwrap();
+            std::fs::write(root.join("file.txt"), content).unwrap();
+        }
+        let config = keep.path().join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[groups.g]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
+                alpha.display(),
+                differs.display(),
+                agrees.display()
+            ),
+        )
+        .unwrap();
+        let plans = super::load_config(Some(config.clone()))
+            .unwrap()
+            .plans()
+            .unwrap();
+        let touched = plans
+            .iter()
+            .find(|plan| plan.beta_spec() == differs.display().to_string())
+            .expect("the differing destination's plan");
+
+        super::RESOLVE_FLUSHES.with(|sent| sent.borrow_mut().clear());
+        super::run_resolve(
+            Some(config),
+            Some(keep.path().join("state")),
+            "g".into(),
+            vec!["file.txt".into()],
+            "alpha".into(),
+            false,
+            true,
+            None,
+        )
+        .expect("resolves");
+        assert_eq!(
+            std::fs::read_to_string(agrees.join("file.txt")).unwrap(),
+            "alpha",
+            "the agreeing destination was left alone"
+        );
+        assert!(
+            !differs.join("file.txt").exists(),
+            "the losing copy was retired"
+        );
+
+        let flushed: Vec<String> = super::RESOLVE_FLUSHES.with(|sent| {
+            sent.borrow()
+                .iter()
+                .map(|flush| format!("{flush:?}"))
+                .collect()
+        });
+        let expected = format!(
+            "{:?}",
+            super::ControlRequest::Flush(super::Selector::session(
+                autobahn::supervisor::control::SessionKey::of(touched)
+            ))
+        );
+        assert_eq!(flushed, vec![expected]);
+    }
 
     /// A path inside two nested groups is named relative to each group's
     /// own root, not to whichever matched last.

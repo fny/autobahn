@@ -799,13 +799,31 @@ impl LocalEndpoint {
     /// since the scan that indexed it) is an ordinary negative result, not an
     /// error, and leaves the request to be transferred normally.
     fn stage_locally(&self, source: &str, digest: &Digest) -> Result<bool> {
-        let source_path = self.root.join(source);
-        let temporary = self.staging_root.join(temporary_name("copy"));
-        let copied = match copy_verifying(&source_path, &temporary, digest) {
+        // The source came from this side's own scan, but it passes the same
+        // gate as a peer's request: a regular file still holding the scanned
+        // inode and size, never a link swapped in since.
+        let mut input = self
+            .open_scanned(source, digest)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        let (temporary, output) = self.staging_temporary("copy")?;
+        let mut output = DigestingWriter::new(output);
+        let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+        let copied = loop {
+            let count = match input.read(&mut buffer) {
+                Ok(0) => break output.flush().map(|()| output.digest() == *digest),
+                Ok(count) => count,
+                Err(error) => break Err(error),
+            };
+            if let Err(error) = output.write_all(&buffer[..count]) {
+                break Err(error);
+            }
+        };
+        drop(output);
+        let copied = match copied {
             Ok(copied) => copied,
             Err(error) => {
                 let _ = fs::remove_file(&temporary);
-                return Err(error);
+                return Err(error).with_context(|| format!("unable to copy {source} into staging"));
             }
         };
         if !copied {
@@ -815,8 +833,7 @@ impl LocalEndpoint {
         let staged = self.staged_path(digest);
         if let Err(error) = fs::rename(&temporary, &staged) {
             let _ = fs::remove_file(&temporary);
-            return Err(error)
-                .with_context(|| format!("unable to publish staged content {}", staged.display()));
+            return Err(error).context("unable to publish staged content");
         }
         Ok(true)
     }
@@ -1040,10 +1057,38 @@ impl LocalEndpoint {
         Ok(())
     }
 
+    /// Creates a new staging temporary for `purpose`, readable only by
+    /// this user, returning its path and the file open for writing.
+    ///
+    /// It opens through [`private_file`](crate::fsutil::private_file), so
+    /// an existing name — a symbolic link planted at a predicted one
+    /// included — is refused rather than followed or reused, and the next
+    /// name is tried. The error names no path: it can cross the wire to
+    /// the peer, which has no business learning where staging lives.
+    fn staging_temporary(&self, purpose: &str) -> Result<(PathBuf, File)> {
+        /// How many taken names are passed over before giving up.
+        const ATTEMPTS: usize = 8;
+        let mut attempts = 0;
+        loop {
+            let temporary = self.staging_root.join(temporary_name(purpose));
+            match crate::fsutil::private_file(&temporary) {
+                Ok(file) => return Ok((temporary, file)),
+                Err(error) => {
+                    let cause = error.root_cause();
+                    let taken = cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|cause| cause.kind() == ErrorKind::AlreadyExists);
+                    attempts += 1;
+                    if !taken || attempts == ATTEMPTS {
+                        bail!("unable to create a staging file: {cause}");
+                    }
+                }
+            }
+        }
+    }
+
     fn open_receive_file(&self, need: &StagingNeed) -> Result<ReceiveFile> {
-        let temporary = self.staging_root.join(temporary_name("recv"));
-        let output = File::create(&temporary)
-            .with_context(|| format!("unable to create {}", temporary.display()))?;
+        let (temporary, output) = self.staging_temporary("recv")?;
         // An empty signature means the delta can only carry literal data —
         // no block operation can reference a base — so the target needn't
         // be probed or opened at all (the common case on a cold
@@ -1076,7 +1121,7 @@ impl LocalEndpoint {
         } = file;
         if let Err(error) = writer.flush() {
             let _ = fs::remove_file(&temporary);
-            return Err(error).with_context(|| format!("unable to flush {}", temporary.display()));
+            return Err(error).context("unable to flush a staging file");
         }
         let digest = writer.digest();
         drop(writer);
@@ -1087,8 +1132,7 @@ impl LocalEndpoint {
         let staged = self.staged_path(&digest);
         if let Err(error) = fs::rename(&temporary, &staged) {
             let _ = fs::remove_file(&temporary);
-            return Err(error)
-                .with_context(|| format!("unable to publish staged content {}", staged.display()));
+            return Err(error).context("unable to publish staged content");
         }
         Ok(())
     }
@@ -3230,6 +3274,12 @@ fn staged_path(staging_root: &Path, digest: &Digest) -> PathBuf {
 /// local user who can see the process identifier still cannot predict the
 /// next name to plant something there.
 fn temporary_name(purpose: &str) -> String {
+    temporary_name_at(purpose, TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+/// The name [`temporary_name`] gives `purpose` when the counter stands at
+/// `count`: tests use it to plant something at a name about to be used.
+fn temporary_name_at(purpose: &str, count: u64) -> String {
     static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
     let key = KEY.get_or_init(|| {
         let seed = crate::fsutil::random_hex(16).unwrap_or_else(|_| {
@@ -3242,7 +3292,6 @@ fn temporary_name(purpose: &str) -> String {
         });
         *blake3::hash(seed.as_bytes()).as_bytes()
     });
-    let count = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
     let token = blake3::keyed_hash(key, &count.to_le_bytes());
     format!(
         "{TEMPORARY_PREFIX}-{purpose}-{}-{count}-{}",
@@ -3547,34 +3596,6 @@ fn publish_rename(source: &Path, target: &Path, replace: bool) -> io::Result<()>
     }
     let _ = replace;
     fs::rename(source, target)
-}
-
-/// Streams a file into a temporary while digesting it, returning whether the
-/// content matched the expected digest. A mismatch means the file changed
-/// since the scan that indexed its content.
-fn copy_verifying(source: &Path, temporary: &Path, digest: &Digest) -> Result<bool> {
-    let mut input =
-        File::open(source).with_context(|| format!("unable to open {}", source.display()))?;
-    let mut output = File::create(temporary)
-        .with_context(|| format!("unable to create {}", temporary.display()))?;
-    let mut hasher = blake3::Hasher::new();
-    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-    loop {
-        let count = input
-            .read(&mut buffer)
-            .with_context(|| format!("unable to read {}", source.display()))?;
-        if count == 0 {
-            break;
-        }
-        hasher.update(&buffer[..count]);
-        output
-            .write_all(&buffer[..count])
-            .with_context(|| format!("unable to write {}", temporary.display()))?;
-    }
-    output
-        .flush()
-        .with_context(|| format!("unable to flush {}", temporary.display()))?;
-    Ok(hasher.finalize().as_bytes() == digest)
 }
 
 /// Streams already-open content into a new private temporary while
@@ -6469,10 +6490,11 @@ mod apply_path_tests {
     }
 }
 
-/// What a peer may name in a supply or staging request: only content this
-/// side's own scan recorded, inside its root (T1-1, T1-5).
+/// Supply and the staging receive: a peer may name only content this
+/// side's own scan recorded, inside its root (T1-1, T1-5); staging
+/// temporaries are private (LOCAL-03).
 #[cfg(test)]
-mod confinement_tests {
+mod supply_receive_tests {
     use super::*;
 
     use std::os::unix::fs::symlink;
@@ -6800,5 +6822,173 @@ mod confinement_tests {
             }
         }
         assert_refused(&frames);
+    }
+
+    /// Two scanned endpoints: `alpha` supplies, `beta` receives.
+    struct Pair {
+        keep: TempDir,
+        alpha: LocalEndpoint,
+        beta: LocalEndpoint,
+        alpha_root: PathBuf,
+        beta_root: PathBuf,
+        beta_staging: PathBuf,
+    }
+
+    fn pair() -> Pair {
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let alpha_root = keep.path().join("alpha");
+        let beta_root = keep.path().join("beta");
+        let beta_staging = keep.path().join("staging-beta");
+        fs::create_dir_all(&alpha_root).expect("root should be creatable");
+        fs::create_dir_all(&beta_root).expect("root should be creatable");
+        let alpha = LocalEndpoint::new(
+            alpha_root.clone(),
+            keep.path().join("staging-alpha"),
+            EndpointOptions::default(),
+        )
+        .expect("endpoint should be creatable");
+        let beta = LocalEndpoint::new(
+            beta_root.clone(),
+            beta_staging.clone(),
+            EndpointOptions::default(),
+        )
+        .expect("endpoint should be creatable");
+        Pair {
+            keep,
+            alpha,
+            beta,
+            alpha_root,
+            beta_root,
+            beta_staging,
+        }
+    }
+
+    impl Pair {
+        /// Scans both sides and begins staging beta's requests for every
+        /// file alpha holds, opening alpha's supply of what beta needs.
+        fn begin(&mut self) -> Vec<StagingNeed> {
+            let alpha = self.alpha.scan().expect("scan should succeed");
+            let beta = self.beta.scan().expect("scan should succeed");
+            let changes = crate::tree::diff(beta.root.as_ref(), alpha.root.as_ref());
+            let requests = crate::session::transition_dependencies(&changes);
+            let needs = self
+                .beta
+                .stage_begin(requests)
+                .expect("staging should begin");
+            self.alpha
+                .supply_open(needs.clone())
+                .expect("supply should open");
+            needs
+        }
+
+        /// Pulls and pushes until the supply is exhausted.
+        fn drain(&mut self) {
+            loop {
+                let frames = self.alpha.supply_pull(4).expect("supply should pull");
+                if frames.is_empty() {
+                    return;
+                }
+                self.beta.stage_push(frames).expect("staging should accept");
+            }
+        }
+    }
+
+    fn receive_temporaries(staging: &Path) -> Vec<PathBuf> {
+        fs::read_dir(staging)
+            .expect("staging should be readable")
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with(TEMPORARY_PREFIX))
+            })
+            .collect()
+    }
+
+    /// A transfer interrupted after its first operation leaves content
+    /// only its owner can read.
+    #[test]
+    fn an_interrupted_receive_leaves_a_private_temporary() {
+        let mut pair = pair();
+        fs::write(pair.alpha_root.join("big.bin"), vec![3u8; 1 << 20])
+            .expect("file should be writable");
+        pair.begin();
+        let frames = pair.alpha.supply_pull(2).expect("supply should pull");
+        assert!(matches!(
+            frames.as_slice(),
+            [TransferFrame::Begin { .. }, TransferFrame::Op(_)]
+        ));
+        pair.beta.stage_push(frames).expect("staging should accept");
+        let temporaries = receive_temporaries(&pair.beta_staging);
+        assert_eq!(temporaries.len(), 1, "{temporaries:?}");
+        let mode = fs::symlink_metadata(&temporaries[0])
+            .expect("temporary should exist")
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "mode {mode:o}");
+    }
+
+    /// Symbolic links planted at the next temporary names are neither
+    /// followed nor written through, for a received file or a local copy.
+    #[test]
+    fn a_planted_symlink_at_a_temporary_name_is_not_followed() {
+        let plant = |staging: &Path, purpose: &str, target: &Path| {
+            // Tests running alongside draw from the same counter, so the
+            // plant covers the next few names, not just the next one: fewer
+            // than `staging_temporary` passes over before giving up.
+            let next = TEMPORARY_COUNTER.load(Ordering::Relaxed);
+            for count in next..next + 4 {
+                symlink(target, staging.join(temporary_name_at(purpose, count)))
+                    .expect("symlink should be creatable");
+            }
+        };
+
+        // Received content.
+        let mut pair = pair();
+        fs::write(pair.alpha_root.join("a.txt"), b"received").expect("file should be writable");
+        let needs = pair.begin();
+        let target = pair.keep.path().join("received-target");
+        plant(&pair.beta_staging, "recv", &target);
+        pair.drain();
+        assert!(!target.exists(), "a receive wrote through a planted link");
+        assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
+
+        // A local copy.
+        let mut pair = self::pair();
+        fs::write(pair.alpha_root.join("copy.txt"), b"shared").expect("file should be writable");
+        fs::write(pair.alpha_root.join("original.txt"), b"shared")
+            .expect("file should be writable");
+        fs::write(pair.beta_root.join("original.txt"), b"shared").expect("file should be writable");
+        fs::create_dir_all(&pair.beta_staging).expect("staging should be creatable");
+        let target = pair.keep.path().join("copy-target");
+        plant(&pair.beta_staging, "copy", &target);
+        let needs = pair.begin();
+        assert!(needs.is_empty(), "{needs:?}");
+        assert!(
+            !target.exists(),
+            "a local copy wrote through a planted link"
+        );
+        assert!(pair.beta.staged_path(&digest_of(b"shared")).is_file());
+    }
+
+    /// A staging failure's error, which crosses the wire to the peer,
+    /// names no staging path.
+    #[test]
+    fn a_staging_failure_names_no_staging_path() {
+        let mut pair = pair();
+        fs::write(pair.alpha_root.join("a.txt"), b"content").expect("file should be writable");
+        pair.begin();
+        fs::remove_dir_all(&pair.beta_staging).expect("staging should be removable");
+        let frames = pair.alpha.supply_pull(4).expect("supply should pull");
+        let error = pair
+            .beta
+            .stage_push(frames)
+            .expect_err("staging without a staging directory must fail");
+        let text = format!("{error:#}");
+        assert!(
+            !text.contains(&*pair.beta_staging.to_string_lossy()),
+            "{text}"
+        );
+        assert!(!text.contains(TEMPORARY_PREFIX), "{text}");
     }
 }

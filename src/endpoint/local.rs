@@ -258,18 +258,24 @@ fn beneath_a_pruned_directory(root: &Path, ignores: &crate::scan::IgnoreSet, pat
         let Some(name) = name.to_str() else {
             return false;
         };
-        // Patterns match the hierarchy's names, which are NFC; FSEvents
-        // reports a decomposing volume's NFD ones.
-        names.push(scan::recompose(name));
+        names.push(name.to_owned());
     }
-    let mut region = false;
-    for depth in 1..names.len() {
-        match directory_region(ignores, &names[..depth].join("/"), region) {
-            Some(inner) => region = inner,
-            None => return true,
+    let pruned = |names: &[String]| {
+        let mut region = false;
+        for depth in 1..names.len() {
+            match directory_region(ignores, &names[..depth].join("/"), region) {
+                Some(inner) => region = inner,
+                None => return true,
+            }
         }
-    }
-    false
+        false
+    };
+    // The scanner matches names as reported, or composed (NFC) on a volume
+    // that decomposes them. Which one this volume does is not known here,
+    // so a path is left out only if it is pruned under both: whichever the
+    // scanner uses, it would never read it.
+    let composed: Vec<String> = names.iter().map(|name| scan::recompose(name)).collect();
+    pruned(&names) && (composed == names || pruned(&composed))
 }
 
 /// Watches `start` and every directory beneath it that the scanner would
@@ -5370,6 +5376,16 @@ mod change_record_tests {
         assert!(!beneath("/r/node_modules/other"));
         assert!(beneath("/r/node_modules/other/x"));
         assert!(!beneath("/elsewhere/target/x"));
+
+        // A name ignored in one Unicode form and not the other is walked by
+        // a scanner using the other, so it is kept either way.
+        let composed = IgnoreSet::new(&["caf\u{e9}".to_string()]).unwrap();
+        let beneath = |path: &str| beneath_a_pruned_directory(root, &composed, Path::new(path));
+        assert!(beneath("/r/caf\u{e9}/x"));
+        assert!(!beneath("/r/cafe\u{301}/x"));
+        let decomposed = IgnoreSet::new(&["cafe\u{301}".to_string()]).unwrap();
+        let beneath = |path: &str| beneath_a_pruned_directory(root, &decomposed, Path::new(path));
+        assert!(!beneath("/r/cafe\u{301}/x"));
     }
 
     /// A path reported many times takes one place, so a file written in a

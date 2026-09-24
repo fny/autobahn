@@ -52,6 +52,34 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// The block layout `signature` would give a base of `length` bytes,
+    /// without reading it: the block size, the final block's size, and one
+    /// placeholder hash per block. Enough to *apply* a delta — `patch`
+    /// consults only the layout — and useless for computing one.
+    pub fn layout(length: u64, block_size: u32) -> Signature {
+        let block_size = if block_size == 0 {
+            DEFAULT_BLOCK_SIZE
+        } else {
+            block_size
+        };
+        if length == 0 {
+            return Signature::default();
+        }
+        let blocks = length.div_ceil(u64::from(block_size));
+        let last_block_size = (length - (blocks - 1) * u64::from(block_size)) as u32;
+        Signature {
+            block_size,
+            last_block_size,
+            hashes: vec![
+                BlockHash {
+                    weak: 0,
+                    strong: [0; 32],
+                };
+                blocks as usize
+            ],
+        }
+    }
+
     /// Indicates whether or not this signature describes an empty base.
     pub fn is_empty(&self) -> bool {
         self.block_size == 0
@@ -867,5 +895,41 @@ mod tests {
         )
         .is_ok());
         assert_eq!(output, base);
+    }
+
+    #[test]
+    fn a_layout_matches_the_signature_it_stands_in_for() {
+        for length in [0usize, 1, 7, 64, 65, 1000, 4096, 4097, 100_000] {
+            for block_size in [0u32, 1, 7, 64, 4096] {
+                let base: Vec<u8> = (0..length).map(|i| (i * 31 % 251) as u8).collect();
+                let signed = signature(std::io::Cursor::new(&base), block_size).unwrap();
+                let laid = Signature::layout(length as u64, block_size);
+                assert_eq!(signed.block_size, laid.block_size, "{length} {block_size}");
+                assert_eq!(
+                    signed.last_block_size, laid.last_block_size,
+                    "{length} {block_size}"
+                );
+                assert_eq!(
+                    signed.hashes.len(),
+                    laid.hashes.len(),
+                    "{length} {block_size}"
+                );
+                // And a delta computed against the real signature applies
+                // against the layout alone.
+                let target: Vec<u8> = base.iter().rev().chain(base.iter()).copied().collect();
+                let mut ops = Vec::new();
+                deltify(std::io::Cursor::new(&target), &signed, &mut |op| {
+                    ops.push(op);
+                    Ok(())
+                })
+                .unwrap();
+                let mut output = Vec::new();
+                let mut cursor = std::io::Cursor::new(&base);
+                for op in &ops {
+                    patch(&mut cursor, &laid, op, &mut output).unwrap();
+                }
+                assert_eq!(output, target, "{length} {block_size}");
+            }
+        }
     }
 }

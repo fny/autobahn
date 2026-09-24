@@ -566,6 +566,11 @@ fn serve_channel<W: Write + Send>(
     // because transitions fold their achieved results into the latter —
     // leaving the endpoint holding a tree the controller has never seen.
     let mut last_sent: Option<Snapshot> = None;
+    // The encoding of `last_sent`, and its digest, when a scan produced it:
+    // the next delta's baseline, kept rather than re-encoded. It changes
+    // only with `last_sent` — a transition's fold or a failed send clears
+    // it — so it always describes exactly that snapshot.
+    let mut last_sent_encoding: Option<(Vec<u8>, crate::tree::Digest)> = None;
     // The operations of a snapshot delta in flight, drained by ScanPull.
     let mut pending: std::collections::VecDeque<crate::rsync::Op> = Default::default();
     // Peering. The fence is the lease this channel was refused against:
@@ -584,6 +589,9 @@ fn serve_channel<W: Write + Send>(
         // previous model, and recording the new one here would make the
         // next rescan report "unchanged" against a tree it never received.
         let mut anchor = Anchor::Keep;
+        // The encoding of the snapshot an `Anchor::To` names, when a scan
+        // just produced it.
+        let mut anchor_encoding: Option<(Vec<u8>, crate::tree::Digest)> = None;
         // The fence refuses every write. Reads still answer, so a fenced
         // controller can see the tree it is no longer allowed to change,
         // and its scans keep the session's model honest for when it is
@@ -684,13 +692,15 @@ fn serve_channel<W: Write + Send>(
                             generation: endpoint.generation().unwrap_or(0),
                         });
                     }
-                    let header = snapshot_delta(
+                    let (header, encoding) = snapshot_delta(
                         &snapshot,
                         last_sent.as_ref(),
+                        last_sent_encoding.as_ref(),
                         &mut pending,
                         endpoint.generation().unwrap_or(0),
                     )?;
                     anchor = Anchor::To(Some(snapshot));
+                    anchor_encoding = Some(encoding);
                     Ok(Response::ScanDelta(header))
                 }),
             Request::ScanVerified => {
@@ -698,13 +708,15 @@ fn serve_channel<W: Write + Send>(
                     |snapshot| {
                         // Never elided: the entire point is a full re-read whose
                         // result the controller sees in full.
-                        let header = snapshot_delta(
+                        let (header, encoding) = snapshot_delta(
                             &snapshot,
                             last_sent.as_ref(),
+                            last_sent_encoding.as_ref(),
                             &mut pending,
                             endpoint.generation().unwrap_or(0),
                         )?;
                         anchor = Anchor::To(Some(snapshot));
+                        anchor_encoding = Some(encoding);
                         Ok(Response::ScanDelta(header))
                     },
                 )
@@ -716,10 +728,11 @@ fn serve_channel<W: Write + Send>(
                 Some(snapshot) => snapshot_delta(
                     snapshot,
                     None,
+                    None,
                     &mut pending,
                     endpoint.generation().unwrap_or(0),
                 )
-                .map(Response::ScanDelta),
+                .map(|(header, _)| Response::ScanDelta(header)),
                 None => Err(anyhow!("a full scan was requested before any scan")),
             },
             Request::ScanPull => Ok(Response::ScanOps(next_scan_batch(&mut pending))),
@@ -774,14 +787,20 @@ fn serve_channel<W: Write + Send>(
         // dispatcher is failing with it.
         let delivered = serve_send(output, channel, response);
         match (&delivered, anchor) {
-            (Ok(()), Anchor::To(snapshot)) => last_sent = snapshot,
+            (Ok(()), Anchor::To(snapshot)) => {
+                last_sent = snapshot;
+                last_sent_encoding = anchor_encoding;
+            }
             (Ok(()), Anchor::Keep) => {}
             // Forgetting everything costs one full resend and avoids having
             // to reason about which send failures leave the controller's
             // model intact and which do not. Claiming otherwise is the
             // expensive mistake: it would let a later scan report
             // "unchanged" against a tree that never arrived.
-            (Err(_), _) => last_sent = None,
+            (Err(_), _) => {
+                last_sent = None;
+                last_sent_encoding = None;
+            }
         }
         if let Err(error) = delivered {
             let fallback = Response::Error(format!("unable to send the response: {error:#}"));
@@ -823,28 +842,41 @@ fn anchor_after_transition(sent: Option<&Snapshot>, folded: Option<&Snapshot>) -
 /// snapshot this channel last sent, or `None` for a full stream), leaving
 /// the operations queued for `ScanPull` and returning the header.
 ///
-/// The baseline is never held as bytes between scans: it is re-encoded
-/// here when needed, which costs one serialization on a changed scan and
-/// no memory in between. The header carries the digest of the *new*
-/// encoding, so if the controller's re-encoding of its copy of the
-/// baseline were ever to differ from this one, the reassembly would fail
-/// to verify and be redone in full — determinism of the encoding is a
+/// The baseline's encoding is the one the scan that produced it made, when
+/// the caller kept it (`baseline_encoding`), and is re-encoded otherwise —
+/// after a transition's fold. The new snapshot's encoding comes back for
+/// the caller to keep for the next delta. Keeping them holds one encoding
+/// per channel (45 MB at 420k files) in exchange for not encoding and
+/// hashing the baseline again on every changed scan, which was 65 ms of the
+/// 224 ms the agent spent per edit at that size. The header carries the
+/// digest of the *new* encoding, so if the controller's copy of the
+/// baseline were ever to differ from this one, the reassembly would fail to
+/// verify and be redone in full — determinism of the encoding is a
 /// performance assumption, not a correctness one.
 fn snapshot_delta(
     snapshot: &Snapshot,
     baseline: Option<&Snapshot>,
+    baseline_encoding: Option<&(Vec<u8>, crate::tree::Digest)>,
     pending: &mut std::collections::VecDeque<crate::rsync::Op>,
     generation: u64,
-) -> Result<protocol::ScanDelta> {
+) -> Result<(protocol::ScanDelta, (Vec<u8>, crate::tree::Digest))> {
     let target = encode_snapshot(snapshot)?;
     let digest = *blake3::hash(&target).as_bytes();
     let (baseline_digest, signature) = match baseline {
         Some(baseline) => {
-            let base = encode_snapshot(baseline)?;
+            let encoded;
+            let (base, base_digest) = match baseline_encoding {
+                Some((bytes, digest)) => (bytes.as_slice(), *digest),
+                None => {
+                    encoded = encode_snapshot(baseline)?;
+                    let digest = *blake3::hash(&encoded).as_bytes();
+                    (encoded.as_slice(), digest)
+                }
+            };
             let block_size = crate::rsync::optimal_block_size(base.len() as u64);
-            let signature = crate::rsync::signature(std::io::Cursor::new(&base), block_size)
+            let signature = crate::rsync::signature(std::io::Cursor::new(base), block_size)
                 .context("unable to sign the baseline snapshot")?;
-            (Some(*blake3::hash(&base).as_bytes()), signature)
+            (Some(base_digest), signature)
         }
         None => (None, crate::rsync::Signature::default()),
     };
@@ -854,13 +886,14 @@ fn snapshot_delta(
         Ok(())
     })
     .context("unable to compute the snapshot delta")?;
-    Ok(protocol::ScanDelta {
+    let header = protocol::ScanDelta {
         generation,
         baseline: baseline_digest,
         digest,
         length: target.len() as u64,
         block_size: signature.block_size,
-    })
+    };
+    Ok((header, (target, digest)))
 }
 
 /// The content bound on one batch of snapshot delta operations. Batches
@@ -2040,7 +2073,8 @@ pub(crate) mod tests {
 
         // Full stream: against nothing.
         let mut pending = std::collections::VecDeque::new();
-        let header = snapshot_delta(&first, None, &mut pending, 0).expect("delta");
+        let (header, first_encoding) =
+            snapshot_delta(&first, None, None, &mut pending, 0).expect("delta");
         assert!(header.baseline.is_none());
         let mut output = Vec::new();
         let mut base = std::io::Cursor::new(Vec::new());
@@ -2069,7 +2103,22 @@ pub(crate) mod tests {
         // stream must reproduce the second snapshot, and carry far less
         // data than the encoding — that is the point of the delta.
         let second = snapshot_with(2);
-        let header = snapshot_delta(&second, Some(&first), &mut pending, 0).expect("delta");
+        // Against the first's encoding as kept from its own delta, and as
+        // re-encoded: the same delta either way, which is what lets the
+        // agent keep it.
+        let (header, _) =
+            snapshot_delta(&second, Some(&first), None, &mut pending, 0).expect("delta");
+        let reencoded: Vec<crate::rsync::Op> = pending.iter().cloned().collect();
+        let (kept, _) = snapshot_delta(
+            &second,
+            Some(&first),
+            Some(&first_encoding),
+            &mut pending,
+            0,
+        )
+        .expect("delta");
+        assert_eq!(format!("{kept:?}"), format!("{header:?}"));
+        assert_eq!(format!("{reencoded:?}"), format!("{:?}", pending));
         assert_eq!(header.baseline, Some(*blake3::hash(&encoded).as_bytes()));
         let signature =
             crate::rsync::signature(std::io::Cursor::new(&encoded), header.block_size).unwrap();

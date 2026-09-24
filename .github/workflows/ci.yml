@@ -13,6 +13,11 @@
 # spends a runner on stale code. For a change that cannot touch macOS,
 # put [skip mac] in the head commit's message (or a pull request's title)
 # and the macOS job is skipped; everything else still runs.
+#
+# A release requires every job here — linux, linux-arm, mac and spec — to
+# have succeeded on the tagged commit (release.yml's version job), so
+# renaming one means changing that list too. For a commit CI skipped:
+#   gh workflow run ci.yml --ref <tag>
 name: CI
 
 on:

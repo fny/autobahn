@@ -32,8 +32,18 @@ jobs:
   # ever catches it because both ends of a session agree with each other.
   # Nothing checked this before, so it is checked here, before a runner
   # spends half an hour building the wrong thing.
+  #
+  # Nor did anything require the tagged commit to have been tested: CI
+  # skips doc-only commits and, on request, the macOS job, and a red run
+  # never stopped anyone pushing a tag. So this job also requires every
+  # CI job to have succeeded on that very commit, in some run of ci.yml.
+  # It asks the Actions API, not the check runs, because this workflow's
+  # own jobs are called linux and mac too.
   version:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
@@ -50,6 +60,32 @@ jobs:
             exit 1
           fi
           echo "tag $GITHUB_REF_NAME matches Cargo.toml ($package)"
+      - name: CI must have passed on the tagged commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          sha=$(git rev-parse HEAD)
+          runs=$(gh api --paginate \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=100" \
+            --jq '.workflow_runs[].id') || exit 1
+          # The jobs that succeeded in the latest attempt of each run.
+          passed=$(for run in $runs; do
+            gh api --paginate \
+              "repos/$GITHUB_REPOSITORY/actions/runs/$run/jobs?filter=latest&per_page=100" \
+              --jq '.jobs[] | select(.conclusion == "success") | .name' || exit 1
+          done) || exit 1
+          missing=
+          for job in linux linux-arm mac spec; do
+            printf '%s\n' "$passed" | grep -qx -- "$job" || missing="$missing $job"
+          done
+          if [ -n "$missing" ]; then
+            echo "CI has not passed on $sha, the commit $GITHUB_REF_NAME names:" \
+                 "no successful run of$missing." >&2
+            echo "Run CI on it with: gh workflow run ci.yml --ref $GITHUB_REF_NAME" >&2
+            echo "and, once it is green, re-run this workflow or push the tag again." >&2
+            exit 1
+          fi
+          echo "CI passed on $sha: linux, linux-arm, mac and spec"
 
   linux:
     needs: version

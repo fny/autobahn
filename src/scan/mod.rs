@@ -202,6 +202,48 @@ impl DirtyPaths {
     }
 }
 
+/// State roots registered by this process beyond the default one. See
+/// [`exclude_state_root`].
+static STATE_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Registers a directory holding autobahn's own state — configuration,
+/// hooks, journals, locks, installed agents — so that no scan in this
+/// process ever descends into it.
+///
+/// This is the backstop behind planning's refusal of a root that contains
+/// the state root. A directory registered here, and always the default
+/// state root (`$AUTOBAHN_HOME`, or `~/.autobahn`, which is also an agent's
+/// own), scans as untracked wherever it appears inside a root, whatever
+/// the ignores say: so it is never synchronized, and never deleted.
+/// Synchronizing it would let a peer rewrite this side's configuration or
+/// alert hook, and would have a session sync its own journal underneath
+/// itself. Matched by device and inode, so an alias or a symbolic link on
+/// the way to it makes no difference.
+pub fn exclude_state_root(state_root: &Path) {
+    let mut roots = STATE_ROOTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if !roots.iter().any(|root| root == state_root) {
+        roots.push(state_root.to_path_buf());
+    }
+}
+
+/// The device and inode of every state root that exists now.
+fn state_root_identities() -> Vec<(u64, u64)> {
+    let registered = STATE_ROOTS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone();
+    crate::paths::default_state_root()
+        .ok()
+        .into_iter()
+        .chain(registered)
+        .filter_map(|root| fs::metadata(root).ok())
+        .filter(|metadata| metadata.is_dir())
+        .map(|metadata| (metadata.dev(), metadata.ino()))
+        .collect()
+}
+
 /// The treatment of symbolic links during scanning and transitioning.
 #[derive(
     Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize, Hash,
@@ -316,6 +358,7 @@ pub fn scan(
     // per directory as subtrees start and finish, so the walk spreads as
     // wide as the tree allows and no wider than the machine does.
     let helpers = AtomicUsize::new(scan_helpers());
+    let state_roots = state_root_identities();
     let mut scanner = Scanner::new(
         ignores,
         behavior,
@@ -326,6 +369,7 @@ pub fn scan(
         rehash,
         progress,
         &helpers,
+        &state_roots,
     );
     scanner.device = metadata.dev();
     scanner.ignore_mounts = ignore_mounts;
@@ -486,6 +530,9 @@ struct Scanner<'a> {
     ignore_mounts: bool,
     /// The mount points this scanner visited, root-relative.
     mount_points: Vec<String>,
+    /// The device and inode of every state root, never scanned. See
+    /// [`exclude_state_root`].
+    state_roots: &'a [(u64, u64)],
 }
 
 /// What probing a listed entry established.
@@ -532,6 +579,7 @@ impl<'a> Scanner<'a> {
         rehash: bool,
         progress: Option<&'a crate::progress::SideProgress>,
         helpers: &'a AtomicUsize,
+        state_roots: &'a [(u64, u64)],
     ) -> Scanner<'a> {
         Scanner {
             within_ignored: false,
@@ -554,6 +602,7 @@ impl<'a> Scanner<'a> {
             device: 0,
             ignore_mounts: false,
             mount_points: Vec::new(),
+            state_roots,
         }
     }
 
@@ -571,6 +620,7 @@ impl<'a> Scanner<'a> {
             self.rehash,
             self.progress,
             self.helpers,
+            self.state_roots,
         );
         forked.within_ignored = within_ignored;
         forked.device = self.device;
@@ -1000,6 +1050,11 @@ impl<'a> Scanner<'a> {
         // could never be consulted. Such a directory is walked instead,
         // as an ignored region, and its contents are decided one by one.
         let is_directory = file_type.is_dir();
+        // Autobahn's own state is never scanned, and no negation brings it
+        // back.
+        if is_directory && self.state_roots.contains(&(metadata.dev(), metadata.ino())) {
+            return Probed::Settled(Content::Untracked);
+        }
         let ignored = self.entry_ignored(child_path, is_directory);
         if ignored && !(is_directory && self.ignores.holds_a_re_inclusion(child_path)) {
             return Probed::Settled(Content::Untracked);
@@ -1897,6 +1952,57 @@ mod tests {
             ),
             other => panic!("expected a changed-during-scan entry, found {other:?}"),
         }
+    }
+
+    /// The backstop behind planning's refusal: a state root inside a
+    /// synchronization root is never scanned, whatever the ignores say,
+    /// so it is never synchronized and never deleted.
+    #[test]
+    fn a_state_root_inside_the_root_is_untracked() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path().join("root");
+        write(&root, "file.txt", "synchronized");
+        write(&root, "nested/state/config.toml", "agent_command = 'evil'");
+        write(&root, "nested/state/sessions/journal", "journal");
+        exclude_state_root(&root.join("nested/state"));
+
+        // A negation naming something inside does not bring it back.
+        let snapshot = scan(
+            &root,
+            None,
+            &ignores(&["nested/state", "!nested/state/config.toml"]),
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            None,
+            false,
+            None,
+            true,
+        )
+        .expect("scan should succeed");
+        let root_node = snapshot.root.as_ref().expect("root");
+        assert!(matches!(
+            child(root_node, "file.txt").content,
+            Content::File { .. }
+        ));
+        assert!(
+            matches!(child(root_node, "nested/state").content, Content::Untracked),
+            "the state root was scanned: {:?}",
+            child(root_node, "nested/state").content
+        );
+
+        // Nor does an alias: identity is the directory, not its spelling.
+        let other = directory.path().join("other");
+        write(&other, "file.txt", "x");
+        write(&other, "state/config.toml", "x");
+        let alias = directory.path().join("alias");
+        symlink(other.join("state"), &alias).expect("symlink");
+        exclude_state_root(&alias);
+        let snapshot = scan_fixture(&other, None);
+        assert!(matches!(
+            child(snapshot.root.as_ref().expect("root"), "state").content,
+            Content::Untracked
+        ));
     }
 
     #[test]

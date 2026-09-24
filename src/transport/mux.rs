@@ -727,6 +727,54 @@ mod tests {
         assert_clean_exit(&finished);
     }
 
+    /// An agent whose root holds its own state area — a remote root of
+    /// `~`, say — never scans that area, so it is never synchronized.
+    #[test]
+    fn an_agent_never_scans_its_own_state_area() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("home");
+        let state = root.join(".autobahn");
+        std::fs::create_dir_all(state.join("staging")).expect("staging should be creatable");
+        std::fs::write(state.join("config.toml"), b"secret").expect("config should be writable");
+        std::fs::write(root.join("file.txt"), b"content").expect("file should be writable");
+
+        let (client, finished) = spawned_agent(&state);
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        let mut channel = connection.open(initialize(&root)).expect("open");
+        let Response::ScanDelta(header) = channel.exchange(Request::Scan).expect("scan") else {
+            panic!("expected a scan delta response");
+        };
+        assert!(header.baseline.is_none(), "a first scan has no baseline");
+        // Against no baseline, the delta is the whole encoding as data.
+        let (mut base, signature) = (std::io::Cursor::new(Vec::new()), Default::default());
+        let mut encoded = Vec::new();
+        loop {
+            match channel.exchange(Request::ScanPull).expect("pull") {
+                Response::ScanOps(ops) if ops.is_empty() => break,
+                Response::ScanOps(ops) => {
+                    for op in &ops {
+                        crate::rsync::patch(&mut base, &signature, op, &mut encoded)
+                            .expect("patch");
+                    }
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        let snapshot: crate::tree::Snapshot = bincode::deserialize(&encoded).expect("decode");
+        let root_node = snapshot.root.as_ref().expect("root");
+        assert!(root_node.child("file.txt").is_some());
+        assert!(
+            matches!(
+                root_node.child(".autobahn").map(|node| &node.content),
+                Some(crate::tree::Content::Untracked)
+            ),
+            "the agent scanned its own state area"
+        );
+        drop(channel);
+        drop(connection);
+        assert_clean_exit(&finished);
+    }
+
     /// Through the wire: a channel opened with a traversal session fails
     /// its open, leaves the agent's state area alone, and leaves the
     /// connection serving.

@@ -410,6 +410,9 @@ fn serve_agent_with<R: Read, W: Write + Send>(
     output: W,
     state_root: Result<PathBuf>,
 ) -> Result<()> {
+    if let Ok(root) = &state_root {
+        crate::scan::exclude_state_root(root);
+    }
     let state_root = &state_root;
     let mut input = input;
     let output = std::sync::Mutex::new(output);

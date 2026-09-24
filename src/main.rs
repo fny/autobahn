@@ -1430,10 +1430,12 @@ fn load_config(path: Option<PathBuf>) -> Result<Config> {
 
 /// Resolves the state root from an explicit override or the default.
 fn resolve_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
-    match state_root {
-        Some(root) => Ok(root),
-        None => paths::default_state_root(),
-    }
+    let root = match state_root {
+        Some(root) => root,
+        None => paths::default_state_root()?,
+    };
+    autobahn::scan::exclude_state_root(&root);
+    Ok(root)
 }
 
 /// Runs the supervisor over the configured sessions.

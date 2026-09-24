@@ -13,6 +13,8 @@ That is the whole of it. It sits at the top level of the config because it is th
 
 The service runs under launchd or systemd with a sparse environment, so give commands absolute paths — and on Linux, `notify-send` needs `DBUS_SESSION_BUS_ADDRESS`.
 
+A hook inherits the environment of the supervisor that runs it, plus the variables below. Under `autobahn watch` in a terminal, that is every variable of that terminal — credentials and tokens exported there included — so a hook you did not write should not run from a shell that holds secrets. Under the login service it is far less: on macOS, launchd's few basics (`HOME`, `USER`, `TMPDIR` and the like), a fixed `PATH` (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), and `AUTOBAHN_HOME` if one was set at install; on Linux, the systemd user manager's environment — `HOME`, a default `PATH`, `XDG_RUNTIME_DIR`, and whatever was imported into it — plus `AUTOBAHN_HOME` likewise.
+
 ## What the hook receives
 
 | Variable | What it holds |

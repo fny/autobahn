@@ -81,6 +81,10 @@ Fourteen keys live in both `[defaults]` and any group, with the group winning. F
 | `durability` | both | `"process"` | `process` survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
 | `agent_command` | group | ssh | Advanced: reach remote endpoints through this command (whitespace-split argv) instead of SSH. Testing and custom transports. |
 
+### Symbolic links
+
+In the default `raw` mode a symbolic link is synchronized as what it is — a link — with its target copied verbatim, even when the target is absolute or points outside the root. Autobahn never follows a link, neither when it scans nor when it writes, so a link aimed outside the root cannot make autobahn read or write there. Other tools that walk the synchronized tree may follow it, though: a backup, an indexer, or a build on the other machine will see whatever that target names *there*. For trees other tools will walk, set `symlink_mode = "portable"`: a link must then be relative and stay inside the root, and one that is not is reported as a problem and left out rather than copied. `ignore` leaves every link out.
+
 ## Running it
 
 ```sh

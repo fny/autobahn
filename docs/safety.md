@@ -106,7 +106,7 @@ These are deliberate boundaries, each with its reasoning in [`correctness/RETAIN
 - **Both endpoints must run genuine autobahn binaries.** A hostile agent that speaks the protocol correctly could fabricate results. Defending against the machine you synchronize with is a different product.
 - **Exclusion is per machine, per user, per state root.** The same pair of trees driven from two machines is not detected (§4).
 - **Network filesystems** may never deliver change events and may cache attributes (§3). If a root must live on one, treat this client as its only writer.
-- **A same-length rewrite that restores the modification time** evades change detection. `autobahn verify` re-reads every byte (§5).
+- **A same-length rewrite that restores the modification time** evades change detection. Unchanged-file detection compares modification time, size, inode and file type; the change time (ctime) is not consulted, so restoring the modification time is enough. `autobahn verify` re-reads every byte (§5).
 - **A vanished mount holding fewer than eight entries** — one huge file — evades the mass-disappearance guard (§1), but only with `ignore_mounts = false`. By default a mount inside a root is not synchronized at all, and one that goes away is remembered and left out while its mount point is empty; followed, a mount point that was one and is now empty where the ancestor held content halts.
 - **A power loss** can expose unsynced bytes under a renamed name. The durable ancestor and re-verification restore the tree on the cycles that follow.
 

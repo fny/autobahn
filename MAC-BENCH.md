@@ -130,3 +130,14 @@ The first run uploads the Linux agent from `~/.autobahn/agents` (the release bun
 **A stale bundle:** in a copy of the bundle, edit `MANIFEST` so the Linux line names `0.3.9+e12`. Point `AUTOBAHN_AGENTS_DIR` at it, and delete the remote's agent so an upload is needed. The sync is refused before anything is sent, with *the agent bundle in … is for 0.3.9+e12*.
 
 **Record:** the `ls` listings, and the refusal message.
+
+## 7. Does a build in an ignored directory force full walks?
+
+On Linux the watcher never watches an ignored directory, and the kernel merges repeated events for one file, so neither a build in an ignored `target/` nor a file written thousands of times fills the change record (measured: no full walk). FSEvents watches the whole tree and reports what the ignore set would have kept out, so on macOS a `cargo build` inside an ignored `target/` of a synced tree may fill the 8,192-path record and make the next cycle walk everything (TODO-SPEED, "The change record fills with noise").
+
+1. A synced Rust project with `target` in its ignores, and `autobahn watch --debug`.
+2. `cargo build` (a clean one, so it writes thousands of files), and count cycles in the log whose `cycle finished in` is as long as a full walk of the tree.
+3. If they appear: the fix is to filter each FSEvents path through the ignore set before recording it, and to deduplicate, in `PendingChanges::record` (`src/endpoint/local.rs`).
+
+**Record:** full walks during the build, and the tree's size.
+

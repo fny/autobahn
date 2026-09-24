@@ -1189,13 +1189,23 @@ fn run_doctor(
     host: Option<&str>,
 ) -> Result<()> {
     use autobahn::tree::reconcile;
+    // Every line goes out through the one decision about styling, so a
+    // pipe or `NO_COLOR` gets the same words without the colour.
+    macro_rules! say {
+        () => {
+            style::emit("\n")
+        };
+        ($($argument:tt)*) => {
+            style::emit(&format!("{}\n", format_args!($($argument)*)))
+        };
+    }
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
     let selection = select(&plans, Some(group), host)?;
     let pool = autobahn::transport::mux::AgentPool::default();
     let mut failures = 0usize;
     for plan in selection.plans {
-        println!(
+        say!(
             "\x1b[1m{}\x1b[0m → {}  \x1b[2m{} · {}\x1b[0m",
             plan.alpha_spec,
             plan.beta_spec(),
@@ -1212,20 +1222,23 @@ fn run_doctor(
         let (alpha, beta) = match scanned {
             Ok(scanned) => scanned,
             Err(error) => {
-                println!("  \x1b[31mcannot look\x1b[0m: {error:#}\n");
+                say!(
+                    "  \x1b[31mcannot look\x1b[0m: {}\n",
+                    display_safe(&format!("{error:#}"))
+                );
                 failures += 1;
                 continue;
             }
         };
         for (side, snapshot) in [("alpha", &alpha), ("beta", &beta)] {
             match &snapshot.root {
-                None => println!("  {side}: \x1b[33mmissing\x1b[0m"),
+                None => say!("  {side}: \x1b[33mmissing\x1b[0m"),
                 Some(_) => {
                     let count = |value: u64, word: &str| {
                         let plural = if value == 1 { "" } else { "s" };
                         format!("{} {word}{plural}", thousands(value))
                     };
-                    println!(
+                    say!(
                         "  {side}: {}, {}, {}, {}",
                         count(snapshot.files, "file"),
                         count(snapshot.directories, "folder"),
@@ -1243,14 +1256,17 @@ fn run_doctor(
             .join("ancestor");
         let ancestor = autobahn::session::ancestor::peek(&checkpoint);
         match &ancestor {
-            Ok((None, _)) => println!("  baseline: none yet — no cycle has completed"),
+            Ok((None, _)) => say!("  baseline: none yet — no cycle has completed"),
             Ok((Some(_), generation)) => {
-                println!(
+                say!(
                     "  baseline: readable, generation {}",
                     thousands(*generation)
                 )
             }
-            Err(error) => println!("  baseline: \x1b[31munreadable\x1b[0m — {error:#}"),
+            Err(error) => say!(
+                "  baseline: \x1b[31munreadable\x1b[0m — {}",
+                display_safe(&format!("{error:#}"))
+            ),
         }
 
         let describe = |reconciliation: &autobahn::tree::Reconciliation| -> Vec<String> {
@@ -1289,12 +1305,13 @@ fn run_doctor(
             lines
         };
         let show = |heading: &str, lines: &[String]| {
-            println!("  {heading}");
+            say!("  {heading}");
+            // Each line names paths the other side chose: shown escaped.
             for line in lines.iter().take(8) {
-                println!("    {line}");
+                say!("    {}", display_safe(line));
             }
             if lines.len() > 8 {
-                println!("    … {} more", thousands((lines.len() - 8) as u64));
+                say!("    … {} more", thousands((lines.len() - 8) as u64));
             }
         };
 
@@ -1308,7 +1325,7 @@ fn run_doctor(
                 mode,
             ));
             if next.is_empty() {
-                println!("  the next cycle: nothing to do — in sync");
+                say!("  the next cycle: nothing to do — in sync");
             } else {
                 show(&format!("the next cycle would ({}):", next.len()), &next);
             }
@@ -1322,7 +1339,7 @@ fn run_doctor(
             mode,
         ));
         if reset.is_empty() {
-            println!("  a reset: \x1b[32mfree\x1b[0m — the two sides match");
+            say!("  a reset: \x1b[32mfree\x1b[0m — the two sides match");
         } else {
             show(
                 &format!(
@@ -1339,14 +1356,14 @@ fn run_doctor(
         let mut lopsided = Vec::new();
         lopsided_folders(alpha.root.as_ref(), beta.root.as_ref(), "", &mut lopsided);
         if lopsided.is_empty() {
-            println!("  folders full on one side and empty on the other: none");
+            say!("  folders full on one side and empty on the other: none");
         } else {
             show(
                 "folders full on one side and empty on the other:",
                 &lopsided,
             );
         }
-        println!();
+        say!();
     }
     if failures > 0 {
         bail!("{failures} session(s) could not be looked at");
@@ -1723,7 +1740,9 @@ fn run_watch(
     {
         eprintln!("[{session}] {problem}");
     }
-    let live_display = !log && unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1;
+    // A terminal that can take a repainted display: not a pipe, and not
+    // `TERM=dumb`, by the same rule that decides styling.
+    let live_display = !log && style::stdout_level() != style::Level::Plain;
 
     // What the display draws: replaced when an edit to the configuration
     // is applied, so the sessions it shows are the ones running.
@@ -4901,15 +4920,26 @@ fn print_report(report: &CycleReport) {
         .iter()
         .chain(&report.alpha_transition_problems)
     {
-        eprintln!("alpha problem at {:?}: {}", problem.path, problem.message);
+        eprintln!("{}", problem_line("alpha", problem));
     }
     for problem in report
         .beta_scan_problems
         .iter()
         .chain(&report.beta_transition_problems)
     {
-        eprintln!("beta problem at {:?}: {}", problem.path, problem.message);
+        eprintln!("{}", problem_line("beta", problem));
     }
+}
+
+/// One problem a cycle reported, as `sync` prints it. The path is quoted
+/// by `{:?}`; the message carries text from the other side — an error
+/// naming its files, or the peer's own words — and is escaped.
+fn problem_line(side: &str, problem: &autobahn::tree::Problem) -> String {
+    format!(
+        "{side} problem at {:?}: {}",
+        problem.path,
+        display_safe(&problem.message)
+    )
 }
 
 #[cfg(test)]
@@ -5245,6 +5275,20 @@ mod tests {
         assert!(!out.contains("another build"), "{out}");
         assert!(!out.contains("no supervisor is running"), "{out}");
         assert!(out.contains("host:/tree"), "{out}");
+    }
+
+    /// A problem's message carries the other side's text, and is printed
+    /// escaped.
+    #[test]
+    fn a_problem_message_is_printed_escaped() {
+        let problem = autobahn::tree::Problem {
+            path: "a".into(),
+            message: "unable to open evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jname".into(),
+            disagreement: false,
+        };
+        let line = super::problem_line("beta", &problem);
+        assert!(line.starts_with("beta problem at \"a\": unable to open evil"));
+        assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
     fn side() -> autobahn::progress::SideSnapshot {

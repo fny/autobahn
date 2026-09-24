@@ -230,18 +230,42 @@ fn watch_tree(
         }
         Some(parts.join("/"))
     };
-    let mut stack = vec![start.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        // Ignores are consulted on the way in, as the scanner does. A name
-        // that cannot be expressed cannot be matched, and is watched — the
-        // safe direction.
-        if dir != root {
-            if let Some(relative) = relative(&dir) {
-                if ignores.ignored(&relative, true) {
-                    continue;
-                }
+    // Ignores are consulted on the way in, as the scanner does
+    // (`probe_entry` in src/scan/mod.rs): a directory is pruned where it is
+    // ignored, unless a negation names something inside it, in which case
+    // it is walked as an ignored region, where only what a negation
+    // re-includes counts. Returns the directory's region, or `None` where it
+    // is pruned. A name that cannot be expressed cannot be matched, and is
+    // watched — the safe direction.
+    let enter = |relative: Option<&str>, within_ignored: bool| -> Option<bool> {
+        let Some(relative) = relative else {
+            return Some(within_ignored);
+        };
+        let ignored = match within_ignored {
+            true => !ignores.re_included(relative, true),
+            false => ignores.ignored(relative, true),
+        };
+        match ignored && !ignores.holds_a_re_inclusion(relative) {
+            true => None,
+            false => Some(ignored),
+        }
+    };
+    // A start below the root is in whatever region its ancestors make.
+    let mut region = false;
+    if start != root {
+        let Some(path) = relative(start) else {
+            return Ok(());
+        };
+        let parts: Vec<&str> = path.split('/').collect();
+        for depth in 1..=parts.len() {
+            match enter(Some(&parts[..depth].join("/")), region) {
+                Some(inner) => region = inner,
+                None => return Ok(()),
             }
         }
+    }
+    let mut stack = vec![(start.to_path_buf(), region)];
+    while let Some((dir, region)) = stack.pop() {
         if let Err(error) = watcher
             .lock()
             .expect("the watcher lock is never poisoned")
@@ -271,7 +295,9 @@ fn watch_tree(
             if fs::symlink_metadata(&path).is_ok_and(|metadata| {
                 metadata.is_dir() && device.is_none_or(|device| metadata.dev() == device)
             }) {
-                stack.push(path);
+                if let Some(inner) = enter(relative(&path).as_deref(), region) {
+                    stack.push((path, inner));
+                }
             }
         }
     }
@@ -5148,6 +5174,54 @@ mod watch_tests {
             recorded.iter().all(|path| !path.starts_with(&ignored)),
             "a write beneath an ignored directory was recorded: {recorded:?}"
         );
+    }
+
+    /// An ignored directory that a negation reaches into is watched as the
+    /// scanner walks it: what the negation re-includes is seen, and the rest
+    /// of the ignored directory is not — at the start and for directories
+    /// that appear later. Pruning it outright left edits to re-included
+    /// files unseen until the periodic full walk.
+    #[test]
+    fn a_re_inclusion_under_an_ignored_directory_is_watched() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("node_modules/keep")).unwrap();
+        std::fs::create_dir_all(root.path().join("node_modules/other")).unwrap();
+        let ignores =
+            IgnoreSet::new(&["node_modules".to_string(), "!node_modules/keep".to_string()])
+                .expect("ignores");
+        let watcher = ChangeWatcher::new(root.path(), ignores, true, || {}).expect("watch");
+
+        std::fs::write(root.path().join("node_modules/other/x"), b"x").unwrap();
+        std::fs::write(root.path().join("node_modules/keep/a"), b"a").unwrap();
+        assert!(
+            recorded_within(
+                &watcher,
+                &root.path().join("node_modules/keep/a"),
+                Duration::from_secs(3)
+            ),
+            "a write to a re-included file was not seen"
+        );
+        std::fs::create_dir(root.path().join("node_modules/keep/sub")).unwrap();
+        std::fs::create_dir(root.path().join("node_modules/later")).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(root.path().join("node_modules/keep/sub/b"), b"b").unwrap();
+        std::fs::write(root.path().join("node_modules/later/y"), b"y").unwrap();
+        assert!(
+            recorded_within(
+                &watcher,
+                &root.path().join("node_modules/keep/sub/b"),
+                Duration::from_secs(3)
+            ),
+            "a write beneath a re-included directory that appeared later was not seen"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let recorded = watcher.recorded();
+        for unwatched in ["node_modules/other/x", "node_modules/later/y"] {
+            assert!(
+                !recorded.contains(&root.path().join(unwatched)),
+                "{unwatched} was recorded: {recorded:?}"
+            );
+        }
     }
 
     /// A directory that appears after the watch was built is watched

@@ -32,6 +32,16 @@ Write results under each section's **Record** as you go, with the commit you tes
 
 **Record:** did it build; screenshots of both lines; anything that read as *Not running* or *errored* when it shouldn't.
 
+**Result — d7c2e21 (epoch 14), macOS 26.5.1, Apple M4, 2026-09-24.** Partly done; the two menu lines still need a person.
+
+- **It builds.** `apps/macos/build.sh` succeeded and signed the bundle as *Developer ID Application: Faraz Yashar (9R9RTH4HE6)*. So `src/tray.rs` compiles with both changes in it.
+- **Refused configuration, from the outside:** tested under `watch --log` in a throwaway `AUTOBAHN_HOME`, because the real service could not be restarted (see the note at the end of this file). Adding `mdoe = "two-way-conflict"` produced one log line, six seconds later — *configuration refused; the sessions keep running as before: … unknown field `mdoe`, expected one of `reload`, `on_alert`, `disabled_hosts`, `disabled`, `log`, `defaults`, `groups`, `advanced`, `alerts`*. A file written afterwards still reached the beta. After 90 seconds there was still exactly one refusal line. Removing the key logged *configuration reloaded from …* and the session went on.
+- **Gap: `autobahn status` cannot be used while the configuration is refused.** It parses the file itself and exits with the TOML error, so the one moment a person most wants to see their sessions, the CLI shows nothing at all — while the supervisor is fine and the app is expected to show a line. Worth its own item: `status` should fall back to the recorded status files, as the supervisor falls back to the last good configuration.
+- **Not done:** the notification and the two menu lines (a person has to see them), and the *another build* half — it needs the app watching the default state root, which is blocked below.
+
+**Filed as** [`MAC-2`](REVIEWS/fixes/MAC-2-status-during-refused-config.md) (L-41) for the `status` gap.
+
+
 ## 2. What the two-minute full walk costs on battery
 
 A running session walks both trees in full every 120 seconds (`FULL_SCAN_INTERVAL`, `src/endpoint/observer.rs`), because events can be lost. Since the walk went parallel, each one is a short burst on up to eight threads. On a build box nobody cares; on a laptop on battery it may matter. It isn't configurable, so this compares two builds.
@@ -46,6 +56,9 @@ A running session walks both trees in full every 120 seconds (`FULL_SCAN_INTERVA
 **Decides:** if the 120-second build's energy impact is well above the 600-second build's, and high enough to show up among the Mac's usual top consumers (Activity Monitor → Energy, 12-hour column), make the full walk longer on battery. If the two are close, the walk isn't the idle cost and the item closes.
 
 **Record:** both averages, the macOS version, and the machine.
+
+**Not run.** It needs the charger out for two 30-minute idle windows and `sudo powermetrics`; the machine was on AC at 25%. Left for a person.
+
 
 ## 3. The Linux wins, measured on macOS
 
@@ -69,6 +82,19 @@ The first two are local on the Mac; the third puts the destination on the Linux 
 **Decides:** if B's p50 and p90 are not clearly below A's locally on macOS, FSEvents' own latency is the floor there, and the settle window may be worth tuning per platform. If B wins as on Linux, nothing to do.
 
 **Record:** the three summary blocks as printed.
+
+**A side:** there is no 0.4.0 release binary to download — the only release with assets is v0.1.0, since the v0.4.0 run failed before its release job. A was built from the `v0.4.0` tag instead, which is the same code the release would have carried.
+
+**Not run, and here is the obstacle.** `bench/ab.sh` drives each binary with `autobahn watch --config … --state-root …` (`bench/ab.sh:125`), so the A side has to be a build that has `watch`. Three candidates all failed:
+
+- **A published 0.4.0 binary** does not exist. The only release carrying assets is `v0.1.0`; the `v0.4.0` run failed before its release job.
+- **The `v0.4.0` tag** builds, but that code has no `watch` subcommand at all — `error: unrecognized subcommand 'watch'`.
+- **The commits just before the watch work** (`51f4325^` = `f68b0a8`, and `c4e4109`) do not compile: *error[E0004]: non-exhaustive patterns: `Command::Update { .. }` not covered*, `src/main.rs:547`. The `Update` variant was added to the enum before the arm that handles it, so several commits in that range have never built. Worth knowing on its own, separately from this bench.
+
+Picking an A therefore needs a walk back through that range for the first commit that both builds and has `watch`. Left undone rather than done against an invalid baseline.
+
+**Filed as** [`MAC-4`](REVIEWS/fixes/MAC-4-non-building-commits.md) (I-6) for the commits that do not build.
+
 
 ## 4. `ignore_mounts` with a real volume
 
@@ -98,6 +124,26 @@ Also mount a volume *under* a `/Volumes/...` alpha, if there's a real external d
 
 **Record:** each step's outcome, and the log lines around steps 2, 4 and 6.
 
+**Result — d7c2e21 (epoch 14), macOS 26.5.1, Apple M4, 2026-09-24.** Steps 1 to 5 as written. Step 6 does not halt.
+
+A 50 MB APFS image attached at `~/mb-synced/a/mnt`, group `~/mb-synced/a` → `~/mb-synced/b`, `two-way-conflict`, under `watch --log`.
+
+1. **Mounted:** `secret.txt` never reached `b`; `b/mnt/own.txt` stayed; `plain.txt` synced normally. `mounts` read `{"alpha":["mnt"],"beta":[]}`. ✓
+2. **Write inside the mount:** nothing carried, no conflict, and no log line at all for it. ✓
+3. **Edit elsewhere:** `plain2.txt` arrived; `mounts` still listed `mnt`. ✓
+4. **Detach:** nothing moved, `b/mnt/own.txt` stayed, no conflict, `mounts` still listed `mnt`. ✓
+5. **Replug:** nothing moved. ✓
+6. **`ignore_mounts = false`:**
+   - The running supervisor picked the edit up by itself — *configuration reloaded from …* — and then synced `secret.txt` to `b`. ✓
+   - **Detach: no halt.** `status` stayed *synchronized*, 22 cycles after a forced flush, `error: null`, no conflicts, no blocked paths — while `a/mnt` was empty and `b/mnt` still held `own.txt` and `secret.txt`. Nothing was deleted, which is the important half, but the state word says the two sides agree when they do not, and no message names the mount. Expected here: *mnt on alpha was a mount point and is now empty or gone*.
+   - **Reattach:** resumed, and the volume was repopulated from `b` (`own.txt` and `secret.txt` on both sides). ✓
+   - Likely cause of the non-halt: the `mounts` record still lists `mnt` under alpha after the flag is turned off, so the boundary protection still applies while the state word comes from somewhere that no longer knows about it.
+
+**Filed as** [`MAC-1`](REVIEWS/fixes/MAC-1-detached-mount-not-halted.md) (M-59).
+
+No external drive was available, so the `/Volumes/...` variant was not tried.
+
+
 ## 5. A missing alpha on wake
 
 A group whose alpha is on an external drive, or a disk image attached at `/Volumes/…`. A missing alpha folder now reports `halted`, with a message saying why, and alerts only after two minutes, since a drive often comes back with the wake.
@@ -109,6 +155,18 @@ A group whose alpha is on an external drive, or a disk image attached at `/Volum
 5. Close the lid with the drive attached and reopen it after ten minutes: nothing, or at most the `halted` line in status for a moment and no notification.
 
 **Record:** what notified, and when.
+
+**Result — d7c2e21 (epoch 14), macOS 26.5.1, Apple M4, 2026-09-24.** Halts and self-clears as described; the two-minute claim does not hold.
+
+A 20 MB image attached at `~/mb5/vol` as the alpha, `on_alert` writing a timestamped line to a file.
+
+2. **Detach at 00:08:55:** within one cycle, `status` showed **halted** — *one side's synchronization root was emptied; propagate the deletion manually or restore the content, then run again*. No notification. Note the wording: `hdiutil detach` leaves the mount point behind as an empty directory, so this is the emptied-root halt, not the *alpha folder is missing* one the section describes.
+3. **Reattach at 00:09:28 (33 s later):** no notification, and the session resumed by itself — *synchronized*, both sides holding `file.txt`. Worth knowing that this contradicts `docs/safety.md:58`, which says a halt needs a person and retrying never clears it.
+4. **Detach again at 00:10:04:** exactly one notification, at **00:11:05 — 61 seconds later**, not two minutes. `built_in_after` in `src/config.rs:233` still reads `Alert::Halted => Duration::ZERO`; the minute that passed is `DEFAULT_COALESCE_AFTER`, not a hold. So a drive that goes away pages about a minute later, and the "often comes back with the wake" reasoning is not implemented.
+5. **Lid closed for ten minutes:** not done, needs a person.
+
+**Filed as** [`MAC-3`](REVIEWS/fixes/MAC-3-halted-alert-timing.md) (L-42), covering both the alert timing and the `docs/safety.md` contradiction.
+
 
 ## 6. Agent names across platforms
 
@@ -130,3 +188,158 @@ The first run uploads the Linux agent from `~/.autobahn/agents` (the release bun
 **A stale bundle:** in a copy of the bundle, edit `MANIFEST` so the Linux line names `0.3.9+e12`. Point `AUTOBAHN_AGENTS_DIR` at it, and delete the remote's agent so an upload is needed. The sync is refused before anything is sent, with *the agent bundle in … is for 0.3.9+e12*.
 
 **Record:** the `ls` listings, and the refusal message.
+
+**Result — d7c2e21 (epoch 14), macOS 26.5.1, Apple M4, 2026-09-24.** Mac → Linux (fny.voltai.party, x86-64) as written.
+
+- **First sync** uploaded `~/.autobahn/bin/autobahn-0.4.0+e14-363a5902eae7`, 6,643,928 bytes. The digest in the name is the first 12 hex of the bundle binary's blake3, which I computed independently: `363a5902eae7ca03a99fd50eac6ff7411d565464f01d3f59d291e4f2632680e2`. The file synced, and `/tmp/x/a.txt` read back on the far side.
+- **Second sync** added nothing: still exactly one `e14` agent on the host. ✓
+- **Stale bundle, with a manifest:** `MANIFEST` edited to say `0.3.9+e12`, the remote agent deleted. Refused before anything was sent — *the agent bundle in /Users/faraz/mb6-home/agents is for 0.3.9+e12, and this is 0.4.0+e14; `autobahn update` installs the matching bundle* — and the host received nothing. ✓
+- **Stale bundle, without a manifest** (a hand cross-build, which is what `~/.autobahn/agents` holds today): not caught up front, as designed, and the handshake caught it with a message that names the bundle and its age rather than blaming the host: *the agent just installed on ubuntu@fny.voltai.party does not match this build. The linux-x86_64 bundle it was copied from is stale: … Rebuild it, or remove it so a matching one is used.* ✓
+- **Linux → Mac:** not run. The bundle on fny has no darwin agent, so it would test the missing-agent path rather than the launcher.
+
+
+## 7. Checks for the review tickets
+
+The 2026-09-23 reviews produced tickets in `REVIEWS/fixes/`. These are the parts only a Mac can check, because FSEvents, APFS, `osascript`, the menu bar app, signing, or macOS's handling of `sudo` and hard links differ from Linux. Run each one after its ticket lands. Items marked **Before the fix** can also be run today, to confirm the bug on macOS. Use throwaway folders and a throwaway state root (`--state-root ~/mb7/state`) for all of them.
+
+**Filing a ticket from a result.** When a check fails, or finds something new, file a ticket so it isn't lost in this file:
+
+- **Where.** A new Markdown file in `REVIEWS/fixes/`.
+  - If the check belongs to an existing ticket, which each heading here names, add the result to that ticket instead of starting a new one.
+  - Otherwise name the file with a new ID and a short slug. Use `MAC-<n>-<slug>.md` for something only the Mac found, and `F-<review ID>-<slug>.md` for a review item that has no ticket yet.
+- **What goes in it.** Use the shape the existing tickets use:
+  - a title saying what should be true, such as "An emptied root with a `.DS_Store` still halts";
+  - **Findings**, the review IDs it covers or "new, from MAC-BENCH 7x", and **Status**, usually "proposed", with a severity;
+  - **Problem**, with file and line references where you have them. Paste this section's **Record** text in as the evidence, with the commit, the macOS version and the machine;
+  - **Proposed resolution**, which can be a sentence if the fix isn't clear yet;
+  - **Tests**, including the steps from here that reproduce it.
+- **Link it.**
+  - In `REVIEWS/FINAL.md`, add a dated resolution line to the matching entry, pointing to the ticket.
+  - A new finding gets a new entry in its severity section, numbered after the last one there. Raise that section's count in the table at the top.
+  - Back here, add "Filed as `<ticket>`" under the check's **Record**.
+
+### 7a. An emptied root with a `.DS_Store` left in it — F-C1
+
+Section 5 found that detaching a volume leaves an empty mount point, and the emptied-root halt catches it. Finder often leaves a `.DS_Store` in that folder, and C-1 says the halt then misses.
+
+1. Attach a small disk image as the alpha, as in section 5, with 20 files, and sync it to a local beta.
+2. Detach it, then `touch <mount point>/.DS_Store`.
+3. Run one cycle.
+
+**Expected after the fix:** `halted`, and the beta keeps all 20 files. **Before the fix:** the beta loses all 20 files, in every mode, including `two-way-paranoid`.
+
+**Note (2026-09-24, from reading the code):** being *ignored* does not protect a leftover. `one_side_emptied_root` (`src/session/mod.rs:1335`) judges a side gone by `children().is_empty()`, and `src/scan/mod.rs:730` records an ignored entry as an `Untracked` child — so the shipped default ignore of `.DS_Store` still leaves the root non-empty. The check is really "any leftover entry, ignored or not". Recorded on the C-1 entry in `FINAL.md`.
+
+**Record:** the status line, and the beta's file count.
+
+### 7b. A directory swapped by rename, under FSEvents — F-H4
+
+1. Sync `a/live/f1` and `a/staging/f1` (different contents) to a beta, under `watch`.
+2. On the alpha: `mv a/live a/old && mv a/staging a/live`.
+
+**Expected:** within one cycle, the beta has the new `live/f1` and `old/f1`, and no `staging`. **Before the fix, on Linux:** the old `live` content stayed for up to two minutes. Record whether FSEvents' per-directory events already hide this on macOS.
+
+**Record:** the beta's tree after one cycle, and after 30 seconds.
+
+### 7c. A deep tree — F-H5
+
+macOS limits a path to 1,024 bytes, not Linux's 4,096, so a `d/d/d/…` chain stops at about 510 levels by path length.
+
+1. Build the deepest chain the shell allows: `for i in $(seq 600); do mkdir d; cd d; done`, noting where it fails.
+2. Run `autobahn sync` on it to a local beta.
+
+**Expected:** no abort. Either it syncs, or the too-deep part is reported as a problem.
+
+**Record:** the depth reached, and the outcome. This tells us whether the stack overflow can happen on macOS at all.
+
+### 7d. The example alert hook with a hostile summary — F-H27
+
+1. Point `on_alert` at the example `~/.autobahn/on-alert.sh`, with `terminal-notifier` not installed.
+2. In the beta, create a file whose name makes a blocked-path alert. Use a directory without read permission, containing `x" & (do shell script "touch /tmp/mb7-pwned") & "`.
+3. Wait for the alert. If the summary turns out not to include the file name, record that. The same test then needs a halted session whose error text carries the name, and GLM's report names that as the other route.
+
+**Expected after the fix:** a notification showing the name as plain text, and no `/tmp/mb7-pwned`. **Before the fix:** `/tmp/mb7-pwned` appears. That is a harmless `touch`, but delete it after.
+
+Also check that a pre-fix `on-alert.sh` is rewritten at startup, and that an edited one is left alone with a warning.
+
+**Record:** the notification text, and whether the file appeared.
+
+### 7e. A replaced root under FSEvents — F-M-OBS (M-27)
+
+1. `watch` a pair.
+2. `mv alpha alpha.old && cp -a alpha.old alpha`.
+3. Edit a file in the new `alpha`.
+
+**Expected:** the edit reaches the beta within a cycle, not after the two-minute walk. Also check that edits in `alpha.old` are ignored.
+
+**Record:** the delay, for both.
+
+### 7f. Chmod through a hard link — LOCAL-11
+
+macOS has no `fs.protected_hardlinks`.
+
+1. Create `~/mb7/outside/tool.sh`, mode `0644`, and hard link it into the alpha as `alpha/tool.sh`.
+2. On the beta, make `tool.sh` executable.
+3. Run a cycle.
+
+**Expected after the fix:** `alpha/tool.sh` becomes executable, and `~/mb7/outside/tool.sh` stays `0644`, because the link was broken. **Before the fix:** both become executable.
+
+**Record:** both modes, and `ls -li` to show whether the link still exists.
+
+### 7g. Running under `sudo` — LOCAL-08
+
+`sudo` on macOS keeps the caller's `$HOME`.
+
+1. `sudo autobahn watch --state-root ~/mb7/state`, with any config.
+
+**Expected after the fix:** refused, with a message naming the root and home mismatch, and `~/mb7/state` still owned by you. **Before the fix:** root-owned files appear under it. Check with `ls -la`, and clean up with `sudo rm -rf ~/mb7/state`.
+
+**Record:** the message, and the ownership.
+
+### 7h. The control socket with a long state root — LOCAL-05
+
+1. Use a state root deep enough that its path passes 100 bytes, and start `watch`.
+2. Find the socket: `lsof -U | grep autobahn`.
+
+**Expected:** the socket is under macOS's per-user `$TMPDIR` or another private directory, owned by you, with the directory at `0700`. `autobahn status` works.
+
+**Record:** the socket path and its directory's mode.
+
+### 7i. The menu bar app — CI-09, LOCAL-04, F-H30
+
+1. `cargo test --release --features tray` passes locally. This is what CI-09 adds to CI.
+2. **Show diff** on a conflict writes its file under `~/.autobahn/tmp/`, not the shared temp directory, and the file opens.
+3. Create conflicts on two top-level files, one named `--all`. Settle `--all` from the menu. **Expected:** only that conflict is settled. **Before the fix:** both are.
+
+**Record:** the test output, the diff file's path, and which conflicts were settled.
+
+### 7j. Escape sequences in file names — F-M-OUT
+
+1. In `bash`, create a conflict on a file whose name carries an OSC 52 clipboard write: `printf -v n 'x\033]52;c;%s\a' "$(printf pwned | base64)"; touch "$n"`, on both sides with different contents.
+2. Copy some known text to the clipboard.
+3. Run `autobahn status`, `autobahn issues`, and open the shop, in Terminal.app and in iTerm2. For iTerm2, enable "Applications in terminal may access clipboard" for the test.
+
+**Expected after the fix:** the name shows with a visible `\x1b`, and the clipboard is unchanged. **Before the fix:** the clipboard holds `pwned`, in terminals that honour OSC 52.
+
+**Record:** each terminal's result.
+
+### 7k. The app build and signing — HYG-1, CI-05
+
+1. `apps/macos/build.sh`, then `plutil -p apps/macos/Autobahn.app/Contents/Info.plist | grep -i version`. **Expected:** it matches `Cargo.toml`'s version.
+2. After CI-05 splits building from signing, `apps/macos/release.sh` with no arguments still builds, signs, notarises and staples in one go on a laptop.
+
+**Record:** the plist versions, and whether `spctl -a -vv` accepts the app.
+
+### 7l. The Intel build under Rosetta — optional, from the wishlist
+
+1. `rustup target add x86_64-apple-darwin && cargo test --release --target x86_64-apple-darwin`. It runs under Rosetta 2.
+2. `arch -x86_64 target/x86_64-apple-darwin/release/autobahn sync` on a small pair.
+
+**Record:** pass or fail, and the time against the native run. This is the cheapest evidence for or against keeping the Intel build published.
+
+
+## Notes from the run of 2026-09-24
+
+**The login service could not be moved onto this build.** `autobahn restart` refused, correctly: *group 'shared': mode 'peering-alpha-experimental' was renamed to 'peering-alpha-dangerously-experimental'*. The live `~/.autobahn/config.toml` still uses the old spelling, and until it is changed the service keeps running its 2026-09-22 binary. That is why sections 1 and 5 were done in throwaway state roots under `watch`, and why the *another build* check and the app's own lines are still open.
+
+**Everything above ran against a clean build of `d7c2e21`** (`cargo build --release`, plus `apps/macos/build.sh` for the app), on macOS 26.5.1, Apple M4, on AC power.

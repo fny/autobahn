@@ -1238,6 +1238,58 @@ mod tests {
         assert_eq!(result.alpha_transitions[0].path, "c");
     }
 
+    /// The row of `docs/modes.md`'s table for "alpha deletes a file beta
+    /// edited", one assertion per cell. The one-way modes never write to
+    /// alpha, so in `one-way-conflict` beta's edit stays on beta and
+    /// synchronization forgets the file, as if beta had created it; it is
+    /// not reported, since there is nothing of alpha's to overwrite it.
+    #[test]
+    fn alpha_deleting_a_file_beta_edited_matches_the_modes_table() {
+        let ancestor = dir("", vec![file("a", 1, false), file("b", 1, false)]);
+        let alpha = dir("", vec![file("b", 1, false)]);
+        let beta = dir("", vec![file("a", 2, false), file("b", 1, false)]);
+        let run = |mode| reconcile(Some(&ancestor), Some(&alpha), Some(&beta), mode);
+        let restores_to_alpha = |result: &Reconciliation| {
+            result.conflicts.is_empty()
+                && result.beta_transitions.is_empty()
+                && result.alpha_transitions.len() == 1
+                && result.alpha_transitions[0].path == "a"
+                && result.alpha_transitions[0]
+                    .new
+                    .as_ref()
+                    .is_some_and(|n| n.content_equal(beta.child("a").unwrap(), true))
+        };
+        let deletes_on_beta = |result: &Reconciliation| {
+            result.conflicts.is_empty()
+                && result.alpha_transitions.is_empty()
+                && result.beta_transitions.len() == 1
+                && result.beta_transitions[0].path == "a"
+                && result.beta_transitions[0].new.is_none()
+        };
+
+        // two-way-conflict: beta's edit comes back to alpha.
+        let result = run(SyncMode::TwoWaySafe);
+        assert!(restores_to_alpha(&result), "{result:?}");
+        // two-way-alpha: beta's edit comes back to alpha.
+        let result = run(SyncMode::TwoWayResolved);
+        assert!(restores_to_alpha(&result), "{result:?}");
+        // two-way-alpha-strict: deleted on beta too.
+        let result = run(SyncMode::TwoWayStrict);
+        assert!(deletes_on_beta(&result), "{result:?}");
+        // one-way-conflict: beta's edit stays on beta, unreported, and the
+        // ancestor forgets the file.
+        let result = run(SyncMode::OneWaySafe);
+        assert!(result.conflicts.is_empty(), "{result:?}");
+        assert!(result.alpha_transitions.is_empty(), "{result:?}");
+        assert!(result.beta_transitions.is_empty(), "{result:?}");
+        assert_eq!(result.ancestor_changes.len(), 1, "{result:?}");
+        assert_eq!(result.ancestor_changes[0].path, "a");
+        assert!(result.ancestor_changes[0].new.is_none());
+        // one-way-alpha: deleted on beta too.
+        let result = run(SyncMode::OneWayReplica);
+        assert!(deletes_on_beta(&result), "{result:?}");
+    }
+
     #[test]
     fn deletion_versus_modification_repropagates_content() {
         // Alpha deleted a file; beta modified it: the modification wins on

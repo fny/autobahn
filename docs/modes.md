@@ -34,13 +34,13 @@ The modes differ only in seven situations. Everything else — an unchanged file
 | Beta edits a file | → alpha | → alpha | → alpha | stays on beta, **reported as a conflict** | **overwritten** from alpha |
 | Both edit the same file | **conflict**; both sides keep their own | alpha's version wins, silently | alpha's version wins, silently | **conflict**; both sides keep their own | alpha's version wins, silently |
 | Alpha deletes a file | → beta | → beta | → beta | → beta | → beta |
-| Alpha deletes a file beta edited | beta's edit comes back to alpha | beta's edit comes back to alpha | **deleted on beta too** | beta's edit comes back to alpha | **deleted on beta too** |
+| Alpha deletes a file beta edited | beta's edit comes back to alpha | beta's edit comes back to alpha | **deleted on beta too** | stays on beta, as if beta had created it | **deleted on beta too** |
 | Beta creates a new file | kept | kept | kept | kept | **deleted** |
 | Beta deletes a file | → alpha | → alpha | → alpha | restored from alpha | restored from alpha |
 
 Three things in that table surprise people:
 
-**`one-way-conflict` is not "ignore beta".** It refuses to overwrite anything beta changed, and *tells you* — a file edited on beta is reported as a conflict every cycle until you resolve it. That is the mode's whole point: alpha pushes outward, but never destroys work that appeared on the far side. If you want beta's edits silently discarded, you want `one-way-alpha`.
+**`one-way-conflict` is not "ignore beta".** It refuses to overwrite anything beta changed, and *tells you* — a file edited on beta is reported as a conflict every cycle until you resolve it. That is the mode's whole point: alpha pushes outward, but never destroys work that appeared on the far side. If you want beta's edits silently discarded, you want `one-way-alpha`. Nothing ever flows back to alpha, either: when alpha deletes a file beta edited, the edit stays on beta, unreported, and synchronization stops tracking it, like a file beta created.
 
 **`one-way-alpha` deletes files it has never seen.** Beta is made *identical* to alpha, so logs, caches, and anything else generated on beta are removed. Never point it at a directory the far side also writes to.
 

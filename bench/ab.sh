@@ -20,11 +20,17 @@
 #               [--corpus DIR] [--scale K] [--label-a NAME] [--label-b NAME]
 #               [--remote HOST]
 #
-# With --remote, the destination is reached over SSH to HOST (which may be
-# this machine: `localhost`, or an alias with latency shaped onto it) and
-# the leg's own binary serves as the agent there, by path, so a variant
-# under test is what runs on both sides and nothing is installed under
-# ~/.autobahn/bin — where a real controller's agent may already live.
+# With --remote, the destination is reached over SSH to HOST and the leg's
+# own binary serves as the agent there, by path, so a variant under test is
+# what runs on both sides and nothing is installed under ~/.autobahn/bin —
+# where a real controller's agent may already live. HOST must be this
+# machine (`localhost`, or an alias with latency shaped onto it): the
+# destination, its manifests and the observer stay local, so the script
+# checks that HOST sees this machine's files and refuses it otherwise.
+# Separate hosts are the orchestrator's job (bench/orchestrate.py).
+#
+# A leg fails, and the script exits nonzero, if the subject or the
+# observer exits early or the cold sync does not converge in ten minutes.
 #
 # The corpus is generated on first use (bench/corpus.py, the `code` shape,
 # 40,000 files at scale 1) and reused. `--corpus DIR` uses DIR instead, as
@@ -110,7 +116,25 @@ scrub() {
 BM="$HERE/harness/target/release/benchmark"
 if ! "$BM" manifest cheap "$HERE" >/dev/null 2>&1; then
     echo "building the harness..."
-    (cd "$HERE/harness" && cargo build --release >/dev/null 2>&1) || { echo "harness build failed" >&2; exit 1; }
+    (cd "$HERE/harness" && CARGO_TARGET_DIR="$HERE/harness/target" cargo build --release >/dev/null 2>&1) \
+        || { echo "harness build failed" >&2; exit 1; }
+fi
+
+# --remote runs the tool's agent over SSH but keeps everything else here,
+# so HOST has to see this machine's filesystem. Proven, not assumed: HOST
+# must read back a token written here a moment ago.
+if [ -n "$REMOTE" ]; then
+    token="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '%s\n' "$token" > "$WORK/remote-check"
+    seen="$(ssh -o BatchMode=yes -o ConnectTimeout=10 "$REMOTE" cat "$(printf %q "$WORK/remote-check")" 2>/dev/null)"
+    rm -f "$WORK/remote-check"
+    if [ "$seen" != "$token" ]; then
+        echo "--remote $REMOTE: that host does not see this machine's files (or ssh failed)." >&2
+        echo "ab.sh keeps the destination, its checks and the observer local, so --remote" >&2
+        echo "only supports this machine under another name; bench/orchestrate.py covers" >&2
+        echo "separate hosts." >&2
+        exit 2
+    fi
 fi
 
 # The corpus, generated once and kept pristine; every leg restores it, so
@@ -136,6 +160,17 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Ends the run with a failed leg. The EXIT trap stops what it started.
+fail_leg() {
+    local leg="$1" why="$2" log="${3:-}"
+    echo "FAIL: leg $leg: $why" >&2
+    if [ -n "$log" ] && [ -f "$log" ]; then
+        echo "--- last lines of $log ---" >&2
+        tail -n 20 "$log" >&2
+    fi
+    exit 1
+}
+
 leg() {
     local name="$1" binary="$2" port="$3"
     local dest="$WORK/dest-$name" state="$WORK/state-$name"
@@ -146,8 +181,11 @@ leg() {
     expected=$("$BM" manifest cheap "$CORPUS")
 
     "$BM" observer "$port" --root "$dest" > "$WORK/observer-$name.log" 2>&1 &
-    STARTED+=($!)
+    local observer=$!
+    STARTED+=("$observer")
     sleep 1
+    kill -0 "$observer" 2>/dev/null \
+        || fail_leg "$name" "the observer exited at start" "$WORK/observer-$name.log"
 
     if [ -n "$REMOTE" ]; then
         printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s:%s"]\nagent_command = "ssh %s %s agent"\n' \
@@ -162,10 +200,21 @@ leg() {
     local tool=$!
     STARTED+=("$tool")
     # Cold sync: until the destination's manifest matches the source's.
+    # A subject that exits has failed the leg now, not in ten minutes, and
+    # a cold sync that never converges fails it too: the latency window
+    # after it would measure a destination that was never in sync.
+    local converged=""
     for _ in $(seq 1 1200); do
-        [ "$("$BM" manifest cheap "$dest" 2>/dev/null)" = "$expected" ] && break
+        if [ "$("$BM" manifest cheap "$dest" 2>/dev/null)" = "$expected" ]; then
+            converged=1
+            break
+        fi
+        kill -0 "$tool" 2>/dev/null \
+            || fail_leg "$name" "$binary exited during the cold sync" "$WORK/tool-$name.log"
         sleep 0.5
     done
+    [ -n "$converged" ] \
+        || fail_leg "$name" "the cold sync did not converge within 600s" "$WORK/tool-$name.log"
     t1=$(python3 -c 'import time; print(time.time())')
     local cold
     cold=$(python3 -c "print(f'{$t1 - $t0:.1f}')")
@@ -174,7 +223,10 @@ leg() {
     report=$("$BM" agents --root "$CORPUS" --peer-root "$dest" \
         --observer "127.0.0.1:$port" --partitions "$PARTITIONS" \
         --side a --agents "$AGENTS" --seconds "$SECONDS_PER_LEG" \
-        --label "$name" --nonce $((RANDOM * 7919 + $$)) 2> "$WORK/agents-$name.err")
+        --label "$name" --nonce $((RANDOM * 7919 + $$)) 2> "$WORK/agents-$name.err") \
+        || fail_leg "$name" "the agents failed" "$WORK/agents-$name.err"
+    kill -0 "$tool" 2>/dev/null \
+        || fail_leg "$name" "$binary exited during the latency window" "$WORK/tool-$name.log"
 
     for pid in "${STARTED[@]}"; do kill "$pid" 2>/dev/null; done
     wait 2>/dev/null

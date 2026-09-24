@@ -650,6 +650,7 @@ mod tests {
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
+            ignore_mounts: true,
             default_owner: None,
             default_group: None,
         }

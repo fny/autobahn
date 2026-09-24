@@ -60,6 +60,9 @@ pub struct Initialize {
     pub max_file_size: Option<u64>,
     /// The per-root entry limit (`None` for unlimited).
     pub max_entry_count: Option<u64>,
+    /// Whether mount points inside the root are left alone rather than
+    /// walked.
+    pub ignore_mounts: bool,
     /// The owner (name or `id:N`) for created entries, resolved on the
     /// agent's host (`None` to leave ownership alone).
     pub default_owner: Option<String>,
@@ -230,6 +233,10 @@ pub enum Response {
     Recorded { generation: u64 },
     /// What the host holds for the channel's session.
     PeeringState(crate::peering::State),
+    /// How far a scan still running has got: sent every half second or
+    /// so, only once it has run that long, and always before the scan's
+    /// own answer. The controller counts it and keeps reading.
+    ScanProgress { entries: u64, bytes: u64 },
 }
 
 /// A controller-to-agent frame on a multiplexed connection.
@@ -282,7 +289,7 @@ pub struct MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 13;
+pub const COMPATIBILITY_EPOCH: u32 = 14;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

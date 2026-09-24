@@ -114,12 +114,10 @@ impl RemoteEndpoint {
     /// Marks this side as scanning for as long as the returned guard
     /// lives.
     ///
-    /// A remote scan happens inside a single request on the far side, so
-    /// there is nothing to count while it runs: the guard reports that the
-    /// side is scanning and how long it has been, and the completed
-    /// snapshot's own total is left behind for the next scan to be
-    /// measured against. Live counts would need the agent to report them
-    /// mid-request, which the protocol does not carry.
+    /// A remote scan happens inside a single request on the far side; one
+    /// that runs long reports its count as it goes (`ScanProgress`), which
+    /// `request_scan` folds in. The completed snapshot's own total is left
+    /// behind for the next scan to be measured against.
     fn scanning(&self) -> Option<ScanGuard> {
         let progress = self.progress.clone()?;
         progress.begin(false);
@@ -132,7 +130,18 @@ impl RemoteEndpoint {
     /// chose to send it.
     fn request_scan(&mut self, request: Request, what: &'static str) -> Result<Snapshot> {
         self.scanned_at = Some(std::time::Instant::now());
-        match self.exchange(request)? {
+        let mut response = self.exchange(request)?;
+        // A long scan reports its count as it goes, ahead of its answer.
+        while let Response::ScanProgress { entries, bytes } = response {
+            if let Some(progress) = &self.progress {
+                progress.report(entries, bytes);
+            }
+            response = match self.channel.receive_response()? {
+                Response::Error(message) => return Err(remote_error(message)),
+                response => response,
+            };
+        }
+        match response {
             Response::Scan(snapshot) => {
                 self.seen = None;
                 self.last_snapshot = Some(snapshot.clone());
@@ -897,6 +906,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Lease(_) => "lease",
         Response::Recorded { .. } => "recorded",
         Response::PeeringState(_) => "peering state",
+        Response::ScanProgress { .. } => "scan progress",
     }
 }
 
@@ -921,6 +931,7 @@ mod tests {
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
+            ignore_mounts: true,
             default_owner: None,
             default_group: None,
         }

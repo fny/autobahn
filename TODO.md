@@ -8,7 +8,7 @@ Open work is sorted by what a v1 needs. Everything settled is below, with the me
 
 Each of these is either a way to lose data, a version mismatch that has already cost an outage, or a shape that is cheap to change now and expensive to change after a v1.
 
-- [ ] **`one_file_system = true`, and probably first.** Do not walk into a directory that sits on a different filesystem. `rsync -x`, `tar --one-file-system`, `find -xdev` and `du -x` all do this. It uses the same device number as the item that follows, but needs it only during the walk. It never has to remember one, so it needs no new field, no ancestor change, no carry-forward, and no epoch bump. It also removes the problem in both directions: a mount that appears copies nothing, and a mount that goes away deletes nothing. The mount guard is then only needed for people who turn this off. Decide the default. `true` matches every other tool. The agent needs the option too, so it goes in `Initialize`.
+- [x] **`one_file_system = true`, and probably first.** Do not walk into a directory that sits on a different filesystem. `rsync -x`, `tar --one-file-system`, `find -xdev` and `du -x` all do this. It uses the same device number as the item that follows, but needs it only during the walk. It never has to remember one, so it needs no new field, no ancestor change, no carry-forward, and no epoch bump. It also removes the problem in both directions: a mount that appears copies nothing, and a mount that goes away deletes nothing. The mount guard is then only needed for people who turn this off. Decide the default. `true` matches every other tool. The agent needs the option too, so it goes in `Initialize`.
 
   **Decided 2026-09-23:** named `ignore_mounts`, default `true`. The scan reports the mount points it skipped and the session excludes those paths on both sides, so a real directory on the other side is never copied into the mount. That list is also item 9's; one epoch bump covers both.
 
@@ -62,7 +62,7 @@ Each of these is either a way to lose data, a version mismatch that has already 
 
 Real work, none of it load-bearing for a first release.
 
-- [ ] **Record mount boundaries by device number.** The proper fix for the hole reopened by dropping I7-A: a mountpoint removed on eject (macOS `/Volumes`, automounts, or any mount whose parent was on the vanished filesystem) presents as *absent*, which now propagates. Compare each directory's `dev()` with its parent's during the scan — the stat already happens, so the device number is free — carry the boundaries in the snapshot and the session state, and halt when a recorded boundary is empty or absent. That makes the trigger a fact rather than a shape, and lets the size threshold go entirely. Costs: `Snapshot` gains a field, so the compatibility epoch bumps and every agent reinstalls; the mount list must survive incremental scans (which adopt subtrees without visiting them) or it silently empties; A/B the scan hot path before commit.
+- [x] **Record mount boundaries by device number.** The proper fix for the hole reopened by dropping I7-A: a mountpoint removed on eject (macOS `/Volumes`, automounts, or any mount whose parent was on the vanished filesystem) presents as *absent*, which now propagates. Compare each directory's `dev()` with its parent's during the scan — the stat already happens, so the device number is free — carry the boundaries in the snapshot and the session state, and halt when a recorded boundary is empty or absent. That makes the trigger a fact rather than a shape, and lets the size threshold go entirely. Costs: `Snapshot` gains a field, so the compatibility epoch bumps and every agent reinstalls; the mount list must survive incremental scans (which adopt subtrees without visiting them) or it silently empties; A/B the scan hot path before commit.
 
   **Decided 2026-09-23:** built with `ignore_mounts` (item 1), from the same list of skipped mount points, under the same epoch bump.
 
@@ -92,7 +92,7 @@ Real work, none of it load-bearing for a first release.
 
   *Why here:* same, with the order to do it in
 
-- [ ] Remote scans report no progress counts: the agent scans inside one request and the protocol carries no frame for progress. Needs a new response variant and a compatibility-epoch bump.
+- [x] Remote scans report no progress counts: the agent scans inside one request and the protocol carries no frame for progress. Needs a new response variant and a compatibility-epoch bump.
 
   **Decided 2026-09-24:** bundled into the `ignore_mounts` epoch bump. The agent sends a count only while a scan is still running after ~500 ms, from a side thread that stops before the reply; A/B a cold scan and the 1-editor cell before committing.
 

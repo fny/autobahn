@@ -1488,6 +1488,7 @@ fn connect(
     let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);
+    session.set_ignore_mounts(plan.ignore_mounts);
     Ok(session)
 }
 
@@ -1577,6 +1578,7 @@ pub fn open_endpoints(
                         default_owner: plan.default_owner.clone(),
                         default_group: plan.default_group.clone(),
                         one_shot: false,
+                        ignore_mounts: plan.ignore_mounts,
                     },
                 )?))
             }
@@ -1598,6 +1600,7 @@ pub fn open_endpoints(
                     max_entry_count: plan.max_entry_count,
                     default_owner: plan.default_owner.clone(),
                     default_group: plan.default_group.clone(),
+                    ignore_mounts: plan.ignore_mounts,
                 };
                 // Peering: an endpoint reached by attachment is a
                 // connection the peer opened to this supervisor. None

@@ -57,7 +57,7 @@ Why `defaults` is a table and `log` is not: TOML requires bare keys to appear be
 
 ## Session settings
 
-Thirteen keys live in both `[defaults]` and any group, with the group winning. Four exist only on a group.
+Fourteen keys live in both `[defaults]` and any group, with the group winning. Four exist only on a group.
 
 | Key | Where | Default | What it does |
 |---|---|---|---|
@@ -72,6 +72,7 @@ Thirteen keys live in both `[defaults]` and any group, with the group winning. F
 | `file_mode` / `directory_mode` | both | `600` / `700` | Octal permissions for created files and directories. |
 | `max_file_size` | both | unlimited | Files larger than this (`"100MB"`, `"2GiB"`) stay on disk but are left out of syncing — never mistaken for deletions. |
 | `max_entry_count` | both | unlimited | If a scan finds more entries than this, the cycle fails — a guard against pointing a session at the wrong directory. |
+| `ignore_mounts` | both | `true` | Leave alone any directory mounted inside a root — another disk, a network share, a `tmpfs` — as `rsync -x` and `du -x` do. It is left out on *both* sides, so a real directory at the same path on the other side is neither filled from the mount nor emptied to match it; and when the mount goes away (a drive unplugged) its empty mount point stays left out, so nothing moves. `false` synchronizes what is mounted as part of the tree, and halts rather than deletes when a mount that held content comes back empty. |
 | `staging` | both | `"state"` | Where in-flight content lives: `state`, `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
 | `default_owner` / `default_group` | both | — | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights. |
 | `durability` | both | `"process"` | `process` survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |

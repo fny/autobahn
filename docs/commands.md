@@ -85,7 +85,7 @@ When a session has been working long enough that its silence would look like dea
 
 Routine cycles say nothing. They finish in well under a second, and a line that flickered into "scanning" every few seconds would report nothing while hiding what the reader came for — so a phase earns the line only after the session has been working for five seconds, counted across the whole run rather than restarted at each step.
 
-The estimate is withheld unless the phase has been running long enough to have a rate and has a total to measure against — a first scan of a tree nothing has ever counted reports its progress and its elapsed time, and no estimate. A remote scan happens inside one request on the far side, so it reports that it is running and for how long, without counts.
+The estimate is withheld unless the phase has been running long enough to have a rate and has a total to measure against — a first scan of a tree nothing has ever counted reports its progress and its elapsed time, and no estimate. A remote scan happens inside one request on the far side; once it has run half a second it reports its count every half second, so a long one shows entries as they are found — with no estimate, since the far side's total is not known here.
 
 A session between cycles is described by how its last cycle ended; so is a paused one, and one backing off from an error, both of which the recorded status names.
 

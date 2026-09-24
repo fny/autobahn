@@ -154,6 +154,21 @@ impl SideProgress {
         }
     }
 
+    /// Sets the running counts outright, from a scan counted elsewhere —
+    /// an agent's, reported over the wire.
+    pub fn report(&self, entries: u64, bytes: u64) {
+        self.entries.store(entries, Ordering::Relaxed);
+        self.bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    /// The running counts: entries visited, and bytes read.
+    pub fn counts(&self) -> (u64, u64) {
+        (
+            self.entries.load(Ordering::Relaxed),
+            self.bytes.load(Ordering::Relaxed),
+        )
+    }
+
     /// Counts one applied change, as the transition applies it.
     #[inline]
     pub fn change_applied(&self) {

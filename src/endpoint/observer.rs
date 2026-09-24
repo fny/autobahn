@@ -74,6 +74,8 @@ pub struct ObserverKey {
     pub symlink_mode: SymlinkMode,
     /// The per-file size limit, above which content is untracked.
     pub max_file_size: Option<u64>,
+    /// Whether mount points inside the root are left alone.
+    pub ignore_mounts: bool,
 }
 
 /// The signal a filesystem event raises.
@@ -273,6 +275,7 @@ impl RootObserver {
         match crate::endpoint::local::ChangeWatcher::new(
             &self.key.root,
             self.ignores.clone(),
+            self.key.ignore_mounts,
             move || signal.advance(),
         ) {
             Ok(watcher) => {
@@ -472,6 +475,7 @@ impl RootObserver {
             dirty.as_ref(),
             rehash,
             progress,
+            self.key.ignore_mounts,
         )
         .with_context(|| format!("unable to scan {}", self.key.root.display()))?;
         Ok((snapshot, taken_at, dirty.is_none()))
@@ -737,6 +741,7 @@ mod tests {
                 ignores: String::new(),
                 symlink_mode: crate::scan::SymlinkMode::default(),
                 max_file_size: None,
+                ignore_mounts: true,
             },
             IgnoreSet::new(&[]).expect("ignores"),
             cache,

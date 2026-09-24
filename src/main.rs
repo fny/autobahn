@@ -921,6 +921,7 @@ fn run_sync(
             // A one-shot never waits, so its roots are not watched;
             // --watch turns this into a session that does.
             one_shot: !watch,
+            ignore_mounts: true,
         })
     };
     let initialize = |root: String, side: &str| Initialize {
@@ -936,6 +937,7 @@ fn run_sync(
         max_entry_count: None,
         default_owner: None,
         default_group: None,
+        ignore_mounts: true,
     };
     let endpoint = |spec: &str,
                     agent: Option<String>,

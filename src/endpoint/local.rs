@@ -105,6 +105,10 @@ pub struct EndpointOptions {
     /// Registering one walks the whole tree once more; on a large tree
     /// that was a third of a one-shot's time, for nothing.
     pub one_shot: bool,
+    /// Whether directories on another device than the root — mount
+    /// points — are left alone rather than walked. On unless configured
+    /// otherwise; see `scan::scan`.
+    pub ignore_mounts: bool,
     /// The owner (name or `id:N`) applied to created entries (`None` to
     /// leave ownership alone). Resolved on this endpoint's host.
     pub default_owner: Option<String>,
@@ -213,6 +217,7 @@ fn watch_tree(
     root: &Path,
     start: &Path,
     ignores: &crate::scan::IgnoreSet,
+    device: Option<u64>,
 ) -> Result<()> {
     use notify::Watcher;
     let relative = |path: &Path| -> Option<String> {
@@ -263,7 +268,9 @@ fn watch_tree(
             let path = entry.path();
             // `symlink_metadata`, so a link to a directory is not a
             // directory here: the watch never follows links.
-            if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_dir()) {
+            if fs::symlink_metadata(&path).is_ok_and(|metadata| {
+                metadata.is_dir() && device.is_none_or(|device| metadata.dev() == device)
+            }) {
                 stack.push(path);
             }
         }
@@ -329,6 +336,7 @@ impl ChangeWatcher {
     pub(crate) fn new(
         root: &Path,
         _ignores: crate::scan::IgnoreSet,
+        _ignore_mounts: bool,
         notify: impl Fn() + Send + 'static,
     ) -> Result<ChangeWatcher> {
         use notify::Watcher;
@@ -360,8 +368,20 @@ impl ChangeWatcher {
     pub(crate) fn new(
         root: &Path,
         ignores: crate::scan::IgnoreSet,
+        ignore_mounts: bool,
         notify: impl Fn() + Send + 'static,
     ) -> Result<ChangeWatcher> {
+        // Mounts inside the root are not scanned, so they are not watched:
+        // a mounted network share would otherwise take a kernel watch per
+        // directory for content nothing reads.
+        let device = match ignore_mounts {
+            true => Some(
+                fs::metadata(root)
+                    .with_context(|| format!("unable to probe {}", root.display()))?
+                    .dev(),
+            ),
+            false => None,
+        };
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         // Events cross a channel to a thread that owns the watcher.
         // Extending the watch to a directory that just appeared needs the
@@ -372,7 +392,7 @@ impl ChangeWatcher {
         })
         .context("unable to create a filesystem watcher")?;
         let watcher = Arc::new(Mutex::new(watcher));
-        watch_tree(&watcher, root, root, &ignores)?;
+        watch_tree(&watcher, root, root, &ignores, device)?;
 
         let recorder = Arc::clone(&pending);
         let extender = Arc::downgrade(&watcher);
@@ -403,7 +423,7 @@ impl ChangeWatcher {
                                     .map(|metadata| metadata.is_dir())
                                     .unwrap_or(false);
                                 if is_directory {
-                                    let _ = watch_tree(&watcher, &root, path, &ignores);
+                                    let _ = watch_tree(&watcher, &root, path, &ignores, device);
                                 }
                             }
                         }
@@ -580,6 +600,7 @@ impl LocalEndpoint {
                         ignores: observer_ignores.key(),
                         symlink_mode: options.symlink_mode,
                         max_file_size: options.max_file_size,
+                        ignore_mounts: options.ignore_mounts,
                     },
                     observer_ignores,
                     cache_path,
@@ -5062,7 +5083,7 @@ mod watch_tests {
         std::fs::create_dir_all(root.path().join("kept")).unwrap();
         std::fs::create_dir_all(root.path().join("node_modules/pkg")).unwrap();
         let ignores = IgnoreSet::new(&["node_modules".to_string()]).expect("ignores");
-        let watcher = ChangeWatcher::new(root.path(), ignores, || {}).expect("watch");
+        let watcher = ChangeWatcher::new(root.path(), ignores, true, || {}).expect("watch");
 
         std::fs::write(root.path().join("kept/a"), b"a").unwrap();
         std::fs::write(root.path().join("node_modules/pkg/b"), b"b").unwrap();
@@ -5088,7 +5109,7 @@ mod watch_tests {
     fn a_directory_that_appears_later_is_watched_unless_ignored() {
         let root = tempfile::tempdir().expect("tempdir");
         let ignores = IgnoreSet::new(&["target".to_string()]).expect("ignores");
-        let watcher = ChangeWatcher::new(root.path(), ignores, || {}).expect("watch");
+        let watcher = ChangeWatcher::new(root.path(), ignores, true, || {}).expect("watch");
 
         std::fs::create_dir(root.path().join("fresh")).unwrap();
         assert!(recorded_within(

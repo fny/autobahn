@@ -464,6 +464,18 @@ impl Node {
     }
 }
 
+/// The node at a root-relative path (`""` is the root itself), if any.
+pub fn node_at<'a>(root: Option<&'a Node>, path: &str) -> Option<&'a Node> {
+    let mut node = root?;
+    if path.is_empty() {
+        return Some(node);
+    }
+    for part in path.split('/') {
+        node = node.child(part)?;
+    }
+    Some(node)
+}
+
 /// Reports whether two optional nodes are backed by the *same storage* —
 /// the pointer check that copy-on-write sharing makes meaningful.
 ///
@@ -520,6 +532,12 @@ pub struct Snapshot {
     /// reusable, which downgrades an old cache to one full re-read.
     #[serde(default)]
     pub scanned_at_seconds: i64,
+    /// Directories found on another device than the one holding them —
+    /// mount points — root-relative and sorted. Left out of the hierarchy
+    /// (as untracked content) when the scan ignores mounts, walked when it
+    /// does not; recorded either way.
+    #[serde(default)]
+    pub mount_points: Vec<String>,
 }
 
 impl Snapshot {

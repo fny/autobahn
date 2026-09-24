@@ -225,6 +225,7 @@ pub fn scan(
     dirty: Option<&DirtyPaths>,
     rehash: bool,
     progress: Option<&crate::progress::SideProgress>,
+    ignore_mounts: bool,
 ) -> Result<Snapshot> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
@@ -280,13 +281,43 @@ pub fn scan(
         progress,
         &helpers,
     );
+    scanner.device = metadata.dev();
+    scanner.ignore_mounts = ignore_mounts;
     let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
     scanner.publish();
+    let root_node = Node {
+        name: String::new(),
+        content,
+    };
+    // An incremental scan adopts what it did not revisit — whole subtrees,
+    // and single unchanged entries of a directory it did relist — so a
+    // mount point it did not probe again is not found again. It is carried
+    // from the baseline when its own node was adopted: still left alone
+    // (untracked), or, when mounts are followed, the very subtree the
+    // baseline held. One probed again and found not to be a mount any more
+    // is neither.
+    let mut mount_points = std::mem::take(&mut scanner.mount_points);
+    if let Some(baseline) = baseline {
+        for point in &baseline.mount_points {
+            if mount_points.contains(point) {
+                continue;
+            }
+            let now = crate::tree::node_at(Some(&root_node), point);
+            let untracked = matches!(now, Some(node) if matches!(node.content, Content::Untracked));
+            let shared = crate::tree::nodes_share_storage(
+                now,
+                crate::tree::node_at(baseline.root.as_ref(), point),
+            );
+            if now.is_some() && (untracked || shared) {
+                mount_points.push(point.clone());
+            }
+        }
+    }
+    mount_points.sort();
+    mount_points.dedup();
     let mut snapshot = Snapshot {
-        root: Some(Node {
-            name: String::new(),
-            content,
-        }),
+        root: Some(root_node),
+        mount_points,
         preserves_executability: behavior.preserves_executability,
         directories: scanner.directories,
         files: scanner.files,
@@ -391,6 +422,13 @@ struct Scanner<'a> {
     /// Helper threads not currently walking a subtree, shared by every
     /// scanner of one scan. See [`scan_helpers`].
     helpers: &'a AtomicUsize,
+    /// The device of the directory being scanned: an entry directory on
+    /// another is a mount point.
+    device: u64,
+    /// Whether a mount point is left alone rather than walked.
+    ignore_mounts: bool,
+    /// The mount points this scanner visited, root-relative.
+    mount_points: Vec<String>,
 }
 
 /// What probing a listed entry established.
@@ -403,9 +441,9 @@ enum Probed {
     File(Metadata),
     /// A symbolic link.
     Symlink,
-    /// A directory to walk, and whether it opens (or continues) an
-    /// ignored region.
-    Directory { region: bool },
+    /// A directory to walk, whether it opens (or continues) an ignored
+    /// region, and the device it is on.
+    Directory { region: bool, device: u64 },
 }
 
 /// One entry of a listing between the two passes of a directory scan.
@@ -420,6 +458,7 @@ enum Pending<'n> {
         baseline: Option<&'n Node>,
         dirty: Option<&'n DirtyNode>,
         region: bool,
+        device: u64,
     },
 }
 
@@ -455,6 +494,9 @@ impl<'a> Scanner<'a> {
             pending_entries: 0,
             pending_bytes: 0,
             helpers,
+            device: 0,
+            ignore_mounts: false,
+            mount_points: Vec::new(),
         }
     }
 
@@ -474,6 +516,8 @@ impl<'a> Scanner<'a> {
             self.helpers,
         );
         forked.within_ignored = within_ignored;
+        forked.device = self.device;
+        forked.ignore_mounts = self.ignore_mounts;
         forked
     }
 
@@ -484,6 +528,7 @@ impl<'a> Scanner<'a> {
         self.files += forked.files;
         self.symlinks += forked.symlinks;
         self.total_file_size += forked.total_file_size;
+        self.mount_points.append(&mut forked.mount_points);
     }
 
     /// Claims a helper thread for a subtree, if one is free.
@@ -690,13 +735,14 @@ impl<'a> Scanner<'a> {
                     let content = self.scan_symlink(&entry_path, &child_path);
                     children.push(Pending::Done(Node { name, content }));
                 }
-                Probed::Directory { region } => children.push(Pending::Walk {
+                Probed::Directory { region, device } => children.push(Pending::Walk {
                     name,
                     entry_path,
                     child_path,
                     baseline: baseline_child,
                     dirty: child_dirty,
                     region,
+                    device,
                 }),
             }
         }
@@ -723,9 +769,17 @@ impl<'a> Scanner<'a> {
                         baseline,
                         dirty,
                         region,
+                        device,
                     } => Node {
                         name,
-                        content: self.walk(&entry_path, &child_path, baseline, dirty, region),
+                        content: self.walk(
+                            &entry_path,
+                            &child_path,
+                            baseline,
+                            dirty,
+                            region,
+                            device,
+                        ),
                     },
                 })
                 .collect()
@@ -743,9 +797,11 @@ impl<'a> Scanner<'a> {
                             baseline,
                             dirty,
                             region,
+                            device,
                         } => {
                             if self.take_helper() {
                                 let mut forked = self.fork(region);
+                                forked.device = device;
                                 handles.push((
                                     nodes.len(),
                                     scope.spawn(move || {
@@ -767,8 +823,14 @@ impl<'a> Scanner<'a> {
                                     content: Content::Untracked,
                                 });
                             } else {
-                                let content =
-                                    self.walk(&entry_path, &child_path, baseline, dirty, region);
+                                let content = self.walk(
+                                    &entry_path,
+                                    &child_path,
+                                    baseline,
+                                    dirty,
+                                    region,
+                                    device,
+                                );
                                 nodes.push(Node { name, content });
                             }
                         }
@@ -838,8 +900,8 @@ impl<'a> Scanner<'a> {
             Probed::Settled(content) => content,
             Probed::File(metadata) => self.scan_file(entry_path, &metadata, baseline),
             Probed::Symlink => self.scan_symlink(entry_path, child_path),
-            Probed::Directory { region } => {
-                self.walk(entry_path, child_path, baseline, dirty, region)
+            Probed::Directory { region, device } => {
+                self.walk(entry_path, child_path, baseline, dirty, region, device)
             }
         };
         Some(Node { name, content })
@@ -876,11 +938,27 @@ impl<'a> Scanner<'a> {
         }
 
         if is_directory {
+            // A directory on another device than the one holding it is a
+            // mount point: something mounted into the tree, not part of it.
+            // Recorded either way, so the session can exclude it on both
+            // sides and notice when it goes; with `ignore_mounts` it is
+            // left alone like an ignored entry, which is what `rsync -x`,
+            // `tar --one-file-system` and `du -x` all do.
+            let device = metadata.dev();
+            if device != self.device {
+                self.mount_points.push(child_path.to_owned());
+                if self.ignore_mounts {
+                    return Probed::Settled(Content::Untracked);
+                }
+            }
             // An ignored directory opens a region; a re-included one ends
             // it. Without the second half the negation would bring the
             // directory back but not what is in it, which is not what
             // anyone means by re-including.
-            Probed::Directory { region: ignored }
+            Probed::Directory {
+                region: ignored,
+                device,
+            }
         } else if file_type.is_file() {
             Probed::File(metadata)
         } else if file_type.is_symlink() {
@@ -901,11 +979,14 @@ impl<'a> Scanner<'a> {
         baseline: Option<&Node>,
         dirty: Option<&DirtyNode>,
         region: bool,
+        device: u64,
     ) -> Content {
-        let outer = self.within_ignored;
+        let (outer, outer_device) = (self.within_ignored, self.device);
         self.within_ignored = region;
+        self.device = device;
         let content = self.scan_directory(entry_path, child_path, baseline, dirty);
         self.within_ignored = outer;
+        self.device = outer_device;
         content
     }
 
@@ -1334,6 +1415,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed")
     }
@@ -1357,6 +1439,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("full scan should succeed");
         let incremental = scan(
@@ -1369,6 +1452,7 @@ mod tests {
             Some(&dirty),
             false,
             None,
+            true,
         )
         .expect("incremental scan should succeed");
         assert!(
@@ -1474,6 +1558,7 @@ mod tests {
             Some(&dirty),
             false,
             None,
+            true,
         )
         .expect("incremental scan should succeed");
         assert!(incremental.content_equal(&baseline));
@@ -1509,6 +1594,7 @@ mod tests {
                 None,
                 false,
                 None,
+                true,
             )
             .expect("scan should succeed")
         };
@@ -1576,6 +1662,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -1593,6 +1680,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.expect("root should exist");
@@ -1612,6 +1700,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("a missing root is not an error");
         assert!(snapshot.root.is_none());
@@ -1636,6 +1725,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .is_err());
     }
@@ -1825,6 +1915,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1866,6 +1957,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1906,6 +1998,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1939,6 +2032,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -1978,6 +2072,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -2016,6 +2111,7 @@ mod tests {
             None,
             false,
             None,
+            true,
         )
         .expect("scan should succeed");
         let root = snapshot.root.as_ref().expect("root should exist");
@@ -2028,5 +2124,97 @@ mod tests {
         }
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755))
             .expect("permissions should be restorable");
+    }
+
+    /// `/dev` holds mounts of its own on Linux (`pts`, `shm`, `mqueue`):
+    /// real mount points, with no need for privilege to make one.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_directory_on_another_device_is_recorded_and_left_alone() {
+        let mounted: Vec<String> = std::fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_whitespace().nth(4))
+            .filter_map(|point| point.strip_prefix("/dev/"))
+            .filter(|rest| !rest.is_empty() && !rest.contains('/'))
+            .map(str::to_owned)
+            .collect();
+        if mounted.is_empty() {
+            return;
+        }
+        let scan_dev = |ignore_mounts: bool| {
+            scan(
+                Path::new("/dev"),
+                None,
+                &IgnoreSet::new(&[]).unwrap(),
+                &FilesystemBehavior::default(),
+                SymlinkMode::default(),
+                None,
+                None,
+                false,
+                None,
+                ignore_mounts,
+            )
+            .expect("/dev scans")
+        };
+        let left_alone = scan_dev(true);
+        for point in &mounted {
+            assert!(
+                left_alone.mount_points.contains(point),
+                "{point} in {:?}",
+                left_alone.mount_points
+            );
+            let node = left_alone
+                .root
+                .as_ref()
+                .unwrap()
+                .child(point)
+                .expect("listed");
+            assert!(
+                matches!(node.content, Content::Untracked),
+                "{point} left alone"
+            );
+        }
+        // An incremental scan that relists `/dev` adopts the mount points
+        // it does not probe again, and must still report them: a watch
+        // session scans this way on nearly every cycle.
+        let mut dirty = DirtyPaths::default();
+        dirty.mark("null");
+        let again = scan(
+            Path::new("/dev"),
+            Some(&left_alone),
+            &IgnoreSet::new(&[]).unwrap(),
+            &FilesystemBehavior::default(),
+            SymlinkMode::default(),
+            None,
+            Some(&dirty),
+            false,
+            None,
+            true,
+        )
+        .expect("/dev rescans");
+        for point in &mounted {
+            assert!(
+                again.mount_points.contains(point),
+                "{point} carried: {:?}",
+                again.mount_points
+            );
+        }
+
+        // Followed, they are still recorded, and walked.
+        let followed = scan_dev(false);
+        for point in &mounted {
+            assert!(followed.mount_points.contains(point), "{point}");
+            let node = followed
+                .root
+                .as_ref()
+                .unwrap()
+                .child(point)
+                .expect("listed");
+            assert!(
+                matches!(node.content, Content::Directory(_)),
+                "{point} walked"
+            );
+        }
     }
 }

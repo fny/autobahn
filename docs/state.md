@@ -9,6 +9,7 @@ Everything autobahn keeps lives under one directory, `~/.autobahn`, on every mac
 | `config.toml` | the configuration — the source of truth |
 | `sessions/<id>/` | each session's ancestor and journal: what was last agreed between its two roots |
 | `status/<id>.json` | what each session is doing, or last did; what `status` reads |
+| `sessions/<id>/mounts` | the mount points each side's scans last found inside the roots, so one that goes away is known to have been one — see `ignore_mounts` in [Configuration](./configuration.md#session-settings) |
 | `staging/` | in-flight content, held aside until verified, then renamed into place; swept at the end of every cycle, so a version that changed while in flight does not linger |
 | `endpoint-locks/` | one lock per pair of roots, so two sessions never write one tree from independent ancestors |
 | `agents/` | the agent bundle — binaries for platforms other than this one |

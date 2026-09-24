@@ -447,6 +447,9 @@ pub struct Defaults {
     /// The default limit on entries (files, directories, symlinks) per
     /// root. A scan exceeding it fails the session's cycle.
     pub max_entry_count: Option<u64>,
+    /// Whether directories mounted inside a root are left alone (the
+    /// default) rather than synchronized as part of it.
+    pub ignore_mounts: Option<bool>,
     /// The default staging placement (`state`, `beside-root`, or
     /// `inside-root`).
     pub staging: Option<String>,
@@ -507,6 +510,9 @@ pub struct Group {
     /// The limit on entries per root (falls back to the defaults). A scan
     /// exceeding it fails the session's cycle.
     pub max_entry_count: Option<u64>,
+    /// Whether mounts inside the roots are left alone (falls back to the
+    /// defaults, then to `true`).
+    pub ignore_mounts: Option<bool>,
     /// The staging placement: `state` (the session state directory),
     /// `beside-root` (a sibling of the synchronization root, guaranteeing
     /// same-filesystem renames), or `inside-root` (within the root itself,
@@ -575,6 +581,9 @@ pub struct SessionPlan {
     pub max_file_size: Option<u64>,
     /// The per-root entry limit (`None` for unlimited).
     pub max_entry_count: Option<u64>,
+    /// Whether directories on another device than their root — mount
+    /// points — are left alone rather than synchronized.
+    pub ignore_mounts: bool,
     /// The staging placement for both endpoints.
     pub staging: StagingMode,
     /// The owner for created entries (`None` to leave ownership alone).
@@ -1158,6 +1167,10 @@ impl Config {
                 },
             };
             let max_entry_count = group.max_entry_count.or(self.defaults.max_entry_count);
+            let ignore_mounts = group
+                .ignore_mounts
+                .or(self.defaults.ignore_mounts)
+                .unwrap_or(true);
             let staging = match group
                 .staging
                 .as_deref()
@@ -1261,6 +1274,7 @@ impl Config {
                     directory_mode,
                     max_file_size,
                     max_entry_count,
+                    ignore_mounts,
                     staging,
                     default_owner: default_owner.clone(),
                     default_group: default_group.clone(),

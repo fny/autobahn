@@ -53,6 +53,13 @@ pub enum SafetyHalt {
     AncestorUnreadable(String),
     /// The ancestor is damaged again after being rebuilt once. A disk that
     /// damages one will damage another; it is not rebuilt twice.
+    /// A directory that was a mount point, synchronized as part of the tree
+    /// because mounts are not ignored, is now empty or gone where the
+    /// ancestor says it held content: the signature of a filesystem that
+    /// went away, which would otherwise propagate as deleting everything
+    /// that was on it.
+    #[error("halted: {1} on {0} was a mount point and is now empty or gone, so its content was not deleted on the other side to match; remount it, or delete the content on the other side yourself if it really is gone")]
+    MountVanished(&'static str, String),
     #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and it was rebuilt once already after the same kind of damage; a disk that damages one will damage another, so it is not rebuilt again. Check the disk, then `autobahn reset <group>`")]
     AncestorDamagedAgain(String),
 }
@@ -67,7 +74,8 @@ impl SafetyHalt {
             SafetyHalt::RootDeletion
             | SafetyHalt::RootEmptied
             | SafetyHalt::AncestorUnreadable(_)
-            | SafetyHalt::AncestorDamagedAgain(_) => None,
+            | SafetyHalt::AncestorDamagedAgain(_)
+            | SafetyHalt::MountVanished(..) => None,
         }
     }
 }
@@ -216,6 +224,20 @@ pub struct Session {
     /// Whether appends sync before acknowledging, remembered so a rebuilt
     /// store keeps what the configuration asked for.
     power_durability: bool,
+    /// Whether mount points inside the roots are left alone (the default)
+    /// or synchronized as part of the tree.
+    ignore_mounts: bool,
+    /// The mount points each side reported, remembered across cycles (and
+    /// runs, in the state directory) so a mount that goes away is known to
+    /// have been one: see [`Session::account_for_mounts`].
+    mounts: MountRecord,
+}
+
+/// The mount points last seen on each side, root-relative.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+struct MountRecord {
+    alpha: Vec<String>,
+    beta: Vec<String>,
 }
 
 /// The error raised when a session's state directory is locked by another
@@ -269,6 +291,14 @@ impl Session {
 
     /// Opts the ancestor store into power-loss durability: every journal
     /// append syncs before the cycle is acknowledged.
+    /// Whether mount points inside the roots are left alone (the default)
+    /// or synchronized, as the configuration says. The endpoints scan
+    /// accordingly; the session needs to know which to treat a vanished
+    /// mount as.
+    pub fn set_ignore_mounts(&mut self, ignore: bool) {
+        self.ignore_mounts = ignore;
+    }
+
     pub fn set_power_durability(&mut self, enabled: bool) {
         self.power_durability = enabled;
         self.ancestor_store.set_power_durability(enabled);
@@ -364,6 +394,10 @@ impl Session {
             }
         }
         let remote_involved = alpha.is_remote() || beta.is_remote();
+        let mounts = std::fs::read(lock.state_directory().join("mounts"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
         Ok(Session {
             held: Vec::new(),
             #[cfg(test)]
@@ -385,10 +419,115 @@ impl Session {
             peer_side: crate::peering::PeerSide::Beta,
             copy_checked: false,
             _lock: lock,
+            mounts,
             ancestor_path,
             unreadable,
             power_durability: false,
+            ignore_mounts: true,
         })
+    }
+
+    /// Squares the two scans with the mount points they found.
+    ///
+    /// Ignoring mounts (the default), a mount point is left alone on *both*
+    /// sides: the scan already left it out where it is mounted, and here the
+    /// same path is left out on the other side too, so a real directory
+    /// there is neither copied into the mount nor deleted to match it. A
+    /// mount point remembered from an earlier cycle whose folder is now
+    /// empty or gone — a drive unplugged — stays left out until it holds
+    /// something again, so unplugging moves nothing.
+    ///
+    /// Following mounts, the content is synchronized like any other; but a
+    /// mount point that is now empty or gone where the ancestor says it held
+    /// content halts, rather than carry the deletion of everything that was
+    /// on it.
+    fn account_for_mounts(
+        &mut self,
+        alpha_root: Option<Node>,
+        beta_root: Option<Node>,
+        alpha_found: &[String],
+        beta_found: &[String],
+    ) -> Result<(Option<Node>, Option<Node>)> {
+        let hollow = |root: Option<&Node>, path: &str| match crate::tree::node_at(root, path) {
+            None => true,
+            Some(node) => {
+                matches!(&node.content, Content::Directory(children) if children.is_empty())
+            }
+        };
+        let mut record = MountRecord::default();
+        for (side, found, root, remembered, kept) in [
+            (
+                "alpha",
+                alpha_found,
+                alpha_root.as_ref(),
+                &self.mounts.alpha,
+                &mut record.alpha,
+            ),
+            (
+                "beta",
+                beta_found,
+                beta_root.as_ref(),
+                &self.mounts.beta,
+                &mut record.beta,
+            ),
+        ] {
+            kept.extend(found.iter().cloned());
+            for path in remembered {
+                if found.contains(path) || !hollow(root, path) {
+                    continue;
+                }
+                if self.ignore_mounts {
+                    kept.push(path.clone());
+                } else if crate::tree::node_at(self.ancestor.as_ref(), path)
+                    .is_some_and(|node| !node.children().is_empty())
+                {
+                    bail!(SafetyHalt::MountVanished(side, path.clone()));
+                }
+            }
+            kept.sort();
+            kept.dedup();
+        }
+        if record != self.mounts {
+            let path = self.ancestor_path.with_file_name("mounts");
+            if let Ok(bytes) = serde_json::to_vec(&record) {
+                if let Err(error) = std::fs::write(&path, bytes) {
+                    crate::complain!(
+                        "unable to record mount points in {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            self.mounts = record;
+        }
+        if !self.ignore_mounts {
+            return Ok((alpha_root, beta_root));
+        }
+        let mut excluded: Vec<&String> =
+            self.mounts.alpha.iter().chain(&self.mounts.beta).collect();
+        excluded.sort();
+        excluded.dedup();
+        let leave_out = |root: Option<Node>| -> Result<Option<Node>> {
+            let changes: Vec<Change> = excluded
+                .iter()
+                .filter_map(|path| {
+                    let node = crate::tree::node_at(root.as_ref(), path)?;
+                    (!matches!(node.content, Content::Untracked)).then(|| Change {
+                        path: (*path).clone(),
+                        old: Some(node.clone()),
+                        new: Some(Node {
+                            name: node.name.clone(),
+                            content: Content::Untracked,
+                        }),
+                    })
+                })
+                .collect();
+            if changes.is_empty() {
+                return Ok(root);
+            }
+            apply(root.as_ref(), &changes)
+                .map_err(|message| anyhow::anyhow!("unable to leave mount points out: {message}"))
+        };
+        Ok((leave_out(alpha_root)?, leave_out(beta_root)?))
     }
 
     /// Answers an ancestor that could not be read, with both sides scanned.
@@ -736,6 +875,13 @@ impl Session {
                 .flatten();
             propagate_executability(self.ancestor.as_ref(), peer, beta_snapshot.root.as_ref())
         };
+
+        let (alpha_root, beta_root) = self.account_for_mounts(
+            alpha_root,
+            beta_root,
+            &alpha_snapshot.mount_points,
+            &beta_snapshot.mount_points,
+        )?;
 
         if let Some((problem, format)) = self.unreadable.take() {
             self.rebuild_or_halt(problem, format, alpha_root.as_ref(), beta_root.as_ref())?;
@@ -2350,5 +2496,100 @@ mod tests {
         };
         assert_eq!(cycle_syncs(true), 1, "a remote session syncs its intent");
         assert_eq!(cycle_syncs(false), 0, "a local session does not");
+    }
+
+    /// A snapshot whose scan reported mount points.
+    fn mounted(root: Node, mounts: &[&str]) -> crate::tree::Snapshot {
+        crate::tree::Snapshot {
+            mount_points: mounts.iter().map(|path| path.to_string()).collect(),
+            ..scripted(root)
+        }
+    }
+
+    fn untracked(name: &str) -> Node {
+        Node {
+            name: name.into(),
+            content: Content::Untracked,
+        }
+    }
+
+    #[test]
+    fn a_mount_is_left_alone_on_both_sides_and_unplugging_it_moves_nothing() {
+        // Alpha has something mounted at `mnt`, which its scan left out;
+        // beta has a real directory there with its own file in it.
+        let alpha_first = mounted(
+            Node::directory("", vec![file("a", 1), untracked("mnt")]),
+            &["mnt"],
+        );
+        // Unplugged: the mount point is an empty directory again.
+        let alpha_unplugged = scripted(Node::directory(
+            "",
+            vec![file("a", 1), Node::directory("mnt", Vec::new())],
+        ));
+        let beta = scripted(Node::directory(
+            "",
+            vec![file("a", 1), Node::directory("mnt", vec![file("own", 2)])],
+        ));
+        let applied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            Box::new(ScriptedEndpoint::new(vec![alpha_first, alpha_unplugged])),
+            Box::new(CountingEndpoint {
+                inner: ScriptedEndpoint::new(vec![beta]),
+                transitions: std::sync::Arc::clone(&applied),
+            }),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .unwrap();
+        let report = session.run_cycle().expect("mounted");
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(
+            report.alpha_transitions + report.beta_transitions,
+            0,
+            "{report:?}"
+        );
+        let report = session.run_cycle().expect("unplugged");
+        assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
+        assert_eq!(
+            report.alpha_transitions + report.beta_transitions,
+            0,
+            "an unplugged mount copies nothing into its empty mount point: {report:?}"
+        );
+        assert_eq!(applied.load(std::sync::atomic::Ordering::Relaxed), 0);
+        // Remembered where the next run will find it.
+        let recorded = std::fs::read_to_string(state.path().join("mounts")).unwrap();
+        assert!(recorded.contains("mnt"), "{recorded}");
+    }
+
+    #[test]
+    fn a_followed_mount_that_vanishes_halts_instead_of_deleting_its_content() {
+        let full = Node::directory("mnt", vec![file("data", 3)]);
+        let alpha_mounted = mounted(Node::directory("", vec![full.clone()]), &["mnt"]);
+        let alpha_gone = scripted(Node::directory(
+            "",
+            vec![Node::directory("mnt", Vec::new())],
+        ));
+        let beta = scripted(Node::directory("", vec![full]));
+        let state = tempfile::tempdir().unwrap();
+        let mut session = Session::new(
+            Box::new(ScriptedEndpoint::new(vec![alpha_mounted, alpha_gone])),
+            Box::new(ScriptedEndpoint::new(vec![beta])),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .unwrap();
+        session.set_ignore_mounts(false);
+        session
+            .run_cycle()
+            .expect("the mounted content syncs like any other");
+        let error = session.run_cycle().expect_err("a vanished mount halts");
+        assert!(
+            matches!(
+                error.downcast_ref::<SafetyHalt>(),
+                Some(SafetyHalt::MountVanished("alpha", path)) if path == "mnt"
+            ),
+            "{error:#}"
+        );
     }
 }

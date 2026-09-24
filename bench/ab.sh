@@ -27,7 +27,8 @@
 # ~/.autobahn/bin — where a real controller's agent may already live.
 #
 # The corpus is generated on first use (bench/corpus.py, the `code` shape,
-# 40,000 files at scale 1) and reused. Needs python3, rsync, and a Rust
+# 40,000 files at scale 1) and reused, unless --corpus names one; either
+# way it is only read, and each leg edits a copy. Needs python3, rsync, and a Rust
 # toolchain for the harness. Runs on macOS and Linux; a leg is roughly two
 # minutes at the defaults.
 #
@@ -37,7 +38,7 @@ A=""; B=""; LEGS=2; SECONDS_PER_LEG=60; AGENTS=10; SCALE=1; REMOTE=""
 LABEL_A="a"; LABEL_B="b"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${AB_WORK:-${TMPDIR:-/tmp}/autobahn-ab}"
-CORPUS=""
+SOURCE=""
 
 usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
@@ -46,7 +47,7 @@ while [ $# -gt 0 ]; do
         --legs) LEGS="$2"; shift 2 ;;
         --seconds) SECONDS_PER_LEG="$2"; shift 2 ;;
         --agents) AGENTS="$2"; shift 2 ;;
-        --corpus) CORPUS="$2"; shift 2 ;;
+        --corpus) SOURCE="$2"; shift 2 ;;
         --scale) SCALE="$2"; shift 2 ;;
         --label-a) LABEL_A="$2"; shift 2 ;;
         --label-b) LABEL_B="$2"; shift 2 ;;
@@ -63,8 +64,22 @@ A="$(cd "$(dirname "$A")" && pwd)/$(basename "$A")"
 B="$(cd "$(dirname "$B")" && pwd)/$(basename "$B")"
 
 mkdir -p "$WORK"
-CORPUS="${CORPUS:-$WORK/corpus-code-$SCALE}"
-PRISTINE="$WORK/pristine-code-$SCALE"
+# --corpus names a pristine source, which is only ever read: every leg
+# copies it to a working copy under $WORK, which the agents edit and the
+# next leg deletes. (It once named the working copy itself, and a real
+# corpus given that way was deleted by the first leg.)
+if [ -n "$SOURCE" ]; then
+    [ -d "$SOURCE" ] || { echo "not a directory: $SOURCE" >&2; exit 2; }
+    PRISTINE="$(cd "$SOURCE" && pwd)"
+    KEY="given-$(printf '%s' "$PRISTINE" | cksum | cut -d' ' -f1)"
+else
+    PRISTINE="$WORK/pristine-code-$SCALE"
+    KEY="code-$SCALE"
+fi
+CORPUS="$WORK/corpus-$KEY"
+case "$PRISTINE/" in
+    "$CORPUS/"*|"$WORK/dest-"*|"$WORK/state-"*) echo "the corpus cannot live where the legs write: $PRISTINE" >&2; exit 2 ;;
+esac
 
 # The harness: the measurement plane, compiled so its own overhead is
 # small and measured rather than large and guessed.
@@ -83,8 +98,8 @@ if [ ! -d "$PRISTINE" ]; then
     echo "generating the corpus (code shape, scale $SCALE)..."
     python3 "$HERE/corpus.py" code "$PRISTINE" --scale "$SCALE" >/dev/null || exit 1
 fi
-if [ ! -f "$WORK/partitions-$SCALE.json" ]; then
-    "$BM" partitions "$PRISTINE" "$WORK/partitions-$SCALE.json" >/dev/null || exit 1
+if [ ! -f "$WORK/partitions-$KEY.json" ]; then
+    "$BM" partitions "$PRISTINE" "$WORK/partitions-$KEY.json" >/dev/null || exit 1
 fi
 
 # Every autobahn this script started, and nothing else. A leg's binaries
@@ -136,7 +151,7 @@ leg() {
 
     local report
     report=$("$BM" agents --root "$CORPUS" --peer-root "$dest" \
-        --observer "127.0.0.1:$port" --partitions "$WORK/partitions-$SCALE.json" \
+        --observer "127.0.0.1:$port" --partitions "$WORK/partitions-$KEY.json" \
         --side a --agents "$AGENTS" --seconds "$SECONDS_PER_LEG" \
         --label "$name" --nonce $((RANDOM * 7919 + $$)) 2> "$WORK/agents-$name.err")
 

@@ -338,6 +338,14 @@ enum Command {
         /// The version in use is always kept and does not count.
         #[arg(long, value_name = "N", default_value_t = 1)]
         keep_agents: usize,
+        /// Also remove the state of sessions the configuration describes
+        /// but has turned off. Kept by default, so enabling a group or a
+        /// host resumes where it left off rather than re-merging.
+        #[arg(long)]
+        include_disabled: bool,
+        /// Remove disabled sessions' state without asking.
+        #[arg(long, requires = "include_disabled")]
+        yes: bool,
     },
     /// Wake configured sessions in a running supervisor for an immediate
     /// synchronization cycle.
@@ -757,6 +765,8 @@ fn main() {
             agent_staging_older_than,
             agents,
             keep_agents,
+            include_disabled,
+            yes,
         } => run_clean(
             config,
             state_root,
@@ -764,6 +774,8 @@ fn main() {
             agent_staging_older_than,
             agents,
             keep_agents,
+            include_disabled,
+            yes,
         ),
         Command::Sync {
             alpha: None,
@@ -3215,6 +3227,7 @@ fn write_example_script(
     Ok(Some(script))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_clean(
     config: Option<PathBuf>,
     state_root: Option<PathBuf>,
@@ -3222,17 +3235,70 @@ fn run_clean(
     agent_staging_older_than: Option<u64>,
     agents: bool,
     keep_agents: usize,
+    include_disabled: bool,
+    yes: bool,
 ) -> Result<()> {
     use autobahn::session::{EndpointPairLock, SessionLock};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
-    let plans = load_config(config)?.plans()?;
+    let config = match config {
+        Some(path) => path,
+        None => paths::default_config_path()?,
+    };
+    let plans = Config::load(&config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
-    let live_sessions: HashSet<String> = plans.iter().map(|plan| plan.identifier()).collect();
-    let live_locks: HashSet<String> = plans
+    let (disabled, unclear) = disabled_plans(&config, &plans)?;
+
+    // What a disabled session's state is called when it goes, so a purge
+    // names the sessions it lets go of.
+    let disabled_labels: HashMap<String, String> = disabled
+        .iter()
+        .map(|plan| (plan.identifier(), format!("({}, disabled)", plan.display())))
+        .collect();
+    if include_disabled && !dry_run && !yes && !(disabled.is_empty() && unclear.is_empty()) {
+        println!("about to remove the state of these disabled sessions:");
+        for plan in &disabled {
+            println!("  {}", plan.display());
+        }
+        for group in &unclear {
+            println!("  whatever belongs to group '{group}', whose settings do not validate");
+        }
+        if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+            bail!("nothing to answer the prompt; pass --yes to remove it without asking");
+        }
+        print!("proceed? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+        let mut answer = String::new();
+        std::io::stdin().read_line(&mut answer).ok();
+        if !matches!(answer.trim(), "y" | "Y" | "yes") {
+            bail!("nothing removed");
+        }
+    }
+
+    // Kept: every session the configuration describes, on or off. A
+    // disabled session's ancestor is what lets enabling it resume, so it
+    // goes only when asked for.
+    let kept_plans: Vec<&autobahn::config::SessionPlan> = match include_disabled {
+        true => plans.iter().collect(),
+        false => plans.iter().chain(&disabled).collect(),
+    };
+    let live_sessions: HashSet<String> = kept_plans.iter().map(|plan| plan.identifier()).collect();
+    let live_locks: HashSet<String> = kept_plans
         .iter()
         .map(|plan| EndpointPairLock::key(&plan.alpha_identity, &plan.beta_identity))
         .collect();
+    // A disabled group whose settings no longer validate cannot say which
+    // sessions were its own, so nothing that might be is removed.
+    let unattributable = !include_disabled && !unclear.is_empty();
+    let keep_unattributed = |path: &Path, what: &str| {
+        println!(
+            "kept {what} {}: could not tell what it belongs to (disabled group(s) {} do not \
+             validate)",
+            path.display(),
+            unclear.join(", ")
+        );
+    };
 
     let verb = if dry_run { "would remove" } else { "removed" };
     let mut removed = 0usize;
@@ -3267,9 +3333,17 @@ fn run_clean(
             continue;
         }
         let path = entry.path();
+        if unattributable {
+            keep_unattributed(&path, "session");
+            continue;
+        }
+        let what = match disabled_labels.get(&name) {
+            Some(label) => format!("session {label}"),
+            None => "session".to_owned(),
+        };
         match SessionLock::acquire(path.clone()) {
             Ok(_lock) => {
-                remove(&path, "session")?;
+                remove(&path, &what)?;
                 retired.insert(name);
             }
             Err(_) => {
@@ -3286,9 +3360,14 @@ fn run_clean(
         let Some(identifier) = name.strip_suffix(".json") else {
             continue;
         };
-        if !live_sessions.contains(identifier) {
-            remove(&entry.path(), "status record")?;
+        if live_sessions.contains(identifier) {
+            continue;
         }
+        if unattributable {
+            keep_unattributed(&entry.path(), "status record");
+            continue;
+        }
+        remove(&entry.path(), "status record")?;
     }
 
     // Endpoint locks live in the *default* state root regardless of any
@@ -3302,6 +3381,10 @@ fn run_clean(
             continue;
         }
         let path = entry.path();
+        if unattributable {
+            keep_unattributed(&path, "endpoint lock");
+            continue;
+        }
         match SessionLock::acquire(path.clone()) {
             Ok(_lock) => remove(&path, "endpoint lock")?,
             Err(_) => {
@@ -3437,6 +3520,40 @@ fn run_clean(
         );
     }
     Ok(())
+}
+
+/// The sessions a configuration describes but has turned off — by a
+/// group's `disabled`, or by `disabled_hosts` — and the disabled groups
+/// whose settings no longer validate, which cannot say what they would
+/// describe.
+///
+/// Each group is planned alone, with every host enabled, so one broken
+/// group costs only its own sessions.
+fn disabled_plans(
+    config: &Path,
+    active: &[autobahn::config::SessionPlan],
+) -> Result<(Vec<autobahn::config::SessionPlan>, Vec<String>)> {
+    let active: std::collections::HashSet<String> =
+        active.iter().map(|plan| plan.identifier()).collect();
+    let names: Vec<String> = Config::load(config)?.groups.into_keys().collect();
+    let mut disabled = Vec::new();
+    let mut unclear = Vec::new();
+    for name in names {
+        let mut alone = Config::load(config)?;
+        alone.disabled_hosts.clear();
+        for (other, group) in alone.groups.iter_mut() {
+            group.disabled = *other != name;
+        }
+        match alone.plans() {
+            Ok(plans) => disabled.extend(
+                plans
+                    .into_iter()
+                    .filter(|plan| !active.contains(&plan.identifier())),
+            ),
+            Err(_) => unclear.push(name),
+        }
+    }
+    Ok((disabled, unclear))
 }
 
 /// Lists a directory's entries, treating a missing directory as empty.

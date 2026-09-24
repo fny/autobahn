@@ -33,6 +33,8 @@ autobahn clean             # remove it
 
 It removes ancestors, status records, staged content, and endpoint locks for any session the config no longer describes. Anything a running session holds is skipped, and the files in the synchronized trees are never touched.
 
+A session that is only turned off — its group `disabled = true`, or its host in `disabled_hosts` — is still described by the config, so `clean` keeps its state and enabling it resumes where it left off. `clean --include-disabled` lets that state go too, after asking (`--yes` skips the question). A disabled group whose settings no longer validate cannot say which state was its own, so while one is present `clean` keeps anything it cannot attribute and says so.
+
 Staged content this machine holds *as an agent* for sessions driven from other machines cannot be attributed from here, so it is left alone unless `--agent-staging-older-than DAYS` asks for it by age.
 
 ## Agents

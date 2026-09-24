@@ -1571,6 +1571,125 @@ fn a_manual_sync_exits_two_when_a_conflict_remains() {
     let (code, text) = run();
     assert_eq!(code, Some(2), "{text}");
 }
+
+// ── clean and disabled sessions ──────────────────────────────────────
+
+/// Turns a group off or on through the CLI.
+fn set_group_enabled(config: &Path, group: &str, enabled: bool) {
+    let output = std::process::Command::new(agent_binary())
+        .arg(if enabled { "enable" } else { "disable" })
+        .arg("--group")
+        .arg(group)
+        .arg("--config")
+        .arg(config)
+        .output()
+        .expect("the CLI runs");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A group whose session has state, with a second, active group beside it
+/// so the configuration still describes a session once the first is off.
+fn two_groups(world: &World, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let other_alpha = world.directory("other-alpha");
+    let other_beta = world.directory("other-beta");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.g]\nmode = \"{mode}\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
+             [groups.other]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display(),
+            other_alpha.display(),
+            other_beta.display()
+        ),
+    )
+    .unwrap();
+    (config, alpha, beta)
+}
+
+#[test]
+fn clean_keeps_a_disabled_sessions_state_so_enabling_resumes() {
+    let world = World::new();
+    let (config, alpha, beta) = two_groups(&world, "two-way-conflict");
+    write(&alpha, "gone.txt", "content");
+    assert!(cli(&world, &config, &["sync"]).0);
+    assert_eq!(read(&beta, "gone.txt"), "content");
+
+    // Deleted, then turned off before the deletion was carried.
+    fs::remove_file(alpha.join("gone.txt")).unwrap();
+    set_group_enabled(&config, "g", false);
+    let (ok, text) = cli(&world, &config, &["clean"]);
+    assert!(ok, "{text}");
+    assert!(!text.contains("removed session"), "{text}");
+
+    set_group_enabled(&config, "g", true);
+    let (ok, text) = cli(&world, &config, &["sync"]);
+    assert!(ok, "{text}");
+    // The ancestor survived, so the deletion is carried, not undone.
+    assert!(!alpha.join("gone.txt").exists(), "{text}");
+    assert!(!beta.join("gone.txt").exists(), "{text}");
+}
+
+#[test]
+fn clean_include_disabled_lists_the_disabled_session_and_plain_clean_does_not() {
+    let world = World::new();
+    let (config, alpha, _) = two_groups(&world, "two-way-conflict");
+    write(&alpha, "file.txt", "content");
+    assert!(cli(&world, &config, &["sync"]).0);
+    set_group_enabled(&config, "g", false);
+
+    let (ok, plain) = cli(&world, &config, &["clean", "--dry-run"]);
+    assert!(ok, "{plain}");
+    assert!(!plain.contains("would remove session"), "{plain}");
+
+    let (ok, purge) = cli(
+        &world,
+        &config,
+        &["clean", "--include-disabled", "--dry-run"],
+    );
+    assert!(ok, "{purge}");
+    assert!(purge.contains("would remove session"), "{purge}");
+    assert!(purge.contains("g@"), "{purge}");
+
+    // Without a terminal to confirm on, the purge asks for --yes.
+    let (ok, refused) = cli(&world, &config, &["clean", "--include-disabled"]);
+    assert!(!ok, "{refused}");
+    assert!(refused.contains("--yes"), "{refused}");
+    let (ok, done) = cli(&world, &config, &["clean", "--include-disabled", "--yes"]);
+    assert!(ok, "{done}");
+    assert!(done.contains("removed session"), "{done}");
+}
+
+/// A disabled group whose settings no longer validate cannot be matched to
+/// its state, so the state it may own is kept, and said to be.
+#[test]
+fn clean_keeps_state_it_cannot_attribute_to_a_broken_disabled_group() {
+    let world = World::new();
+    let (config, alpha, _) = two_groups(&world, "two-way-conflict");
+    write(&alpha, "file.txt", "content");
+    assert!(cli(&world, &config, &["sync"]).0);
+    let text = fs::read_to_string(&config).unwrap().replacen(
+        "mode = \"two-way-conflict\"",
+        "disabled = true\nmode = \"no-such-mode\"",
+        1,
+    );
+    fs::write(&config, text).unwrap();
+
+    let (ok, output) = cli(&world, &config, &["clean", "--dry-run"]);
+    assert!(ok, "{output}");
+    assert!(!output.contains("would remove session"), "{output}");
+    assert!(
+        output.contains("could not tell what it belongs to"),
+        "{output}"
+    );
+}
 // ── conflicts, diff, resolve ─────────────────────────────────────────
 
 /// Runs the CLI against a world's configuration file and state root.

@@ -1012,14 +1012,22 @@ impl LocalEndpoint {
                 }
                 TransferFrame::Op(op) => match state.current.as_mut() {
                     Some(Receiving::File { need, file }) => {
-                        if let Err(error) =
-                            rsync::patch(&mut file.base, &need.signature, &op, &mut file.writer)
+                        // A patch that fails — most often because the base
+                        // changed or went short since its signature was
+                        // taken — fails this file alone, as a failed supply
+                        // does: its partial content is discarded, the rest
+                        // of its frames are read and dropped, and it stays
+                        // needed, so the transition reports it missing and
+                        // the next cycle transfers it again. Only a framing
+                        // error ends the stream.
+                        if rsync::patch(&mut file.base, &need.signature, &op, &mut file.writer)
+                            .is_err()
                         {
-                            let path = need.request.path.clone();
-                            if let Some(Receiving::File { file, .. }) = state.current.take() {
+                            if let Some(Receiving::File { file, .. }) =
+                                state.current.replace(Receiving::Sink)
+                            {
                                 file.discard();
                             }
-                            return Err(error).with_context(|| format!("unable to stage {path}"));
                         }
                     }
                     Some(Receiving::Sink) => {}
@@ -6911,6 +6919,8 @@ mod supply_receive_tests {
         alpha_root: PathBuf,
         beta_root: PathBuf,
         beta_staging: PathBuf,
+        /// The changes the last [`Pair::begin`] staged for.
+        changes: Vec<Change>,
     }
 
     fn pair() -> Pair {
@@ -6939,6 +6949,7 @@ mod supply_receive_tests {
             alpha_root,
             beta_root,
             beta_staging,
+            changes: Vec::new(),
         }
     }
 
@@ -6950,6 +6961,7 @@ mod supply_receive_tests {
             let beta = self.beta.scan().expect("scan should succeed");
             let changes = crate::tree::diff(beta.root.as_ref(), alpha.root.as_ref());
             let requests = crate::session::transition_dependencies(&changes);
+            self.changes = changes;
             let needs = self
                 .beta
                 .stage_begin(requests)
@@ -7136,5 +7148,95 @@ mod supply_receive_tests {
             .expect("file should grow");
         assert_eq!(drain_counting_errors(&mut pair), 0);
         assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
+    }
+
+    /// A destination base that shrinks between staging and the push fails
+    /// that file alone: the other files of the stream land and publish, and
+    /// the next cycle transfers the one that failed.
+    #[test]
+    fn a_base_changed_mid_stream_fails_only_its_own_file() {
+        let mut pair = pair();
+        let names = ["one.bin", "two.bin", "three.bin"];
+        for (seed, name) in names.iter().enumerate() {
+            let base = pseudo_random(256 * 1024, seed as u64);
+            fs::write(pair.beta_root.join(name), &base).expect("file should be writable");
+            let mut changed = base;
+            changed.extend_from_slice(b"appended on alpha");
+            fs::write(pair.alpha_root.join(name), &changed).expect("file should be writable");
+        }
+        let needs = pair.begin();
+        assert_eq!(needs.len(), 3);
+        assert!(needs.iter().all(|need| !need.signature.is_empty()));
+        // Beta's base for two.bin goes short after its signature was taken.
+        File::options()
+            .write(true)
+            .open(pair.beta_root.join("two.bin"))
+            .and_then(|file| file.set_len(1024))
+            .expect("file should be truncatable");
+        pair.drain();
+        for need in &needs {
+            let staged = pair.beta.staged_path(&need.request.digest).is_file();
+            assert_eq!(
+                staged,
+                need.request.path != "two.bin",
+                "{}",
+                need.request.path
+            );
+        }
+        assert!(receive_temporaries(&pair.beta_staging).is_empty());
+
+        let changes = std::mem::take(&mut pair.changes);
+        let outcome = pair
+            .beta
+            .transition(changes)
+            .expect("transition should succeed");
+        // two.bin is not published: its content is missing, and its base
+        // changed since the scan besides.
+        assert!(outcome.missing_staged_files || !outcome.problems.is_empty());
+        assert_eq!(
+            fs::metadata(pair.beta_root.join("two.bin"))
+                .expect("file should exist")
+                .len(),
+            1024
+        );
+        for name in ["one.bin", "three.bin"] {
+            assert_eq!(
+                fs::read(pair.beta_root.join(name)).expect("file should be readable"),
+                fs::read(pair.alpha_root.join(name)).expect("file should be readable"),
+                "{name}"
+            );
+        }
+
+        // The next cycle converges.
+        let needs = pair.begin();
+        assert_eq!(needs.len(), 1);
+        pair.drain();
+        let changes = std::mem::take(&mut pair.changes);
+        let outcome = pair
+            .beta
+            .transition(changes)
+            .expect("transition should succeed");
+        assert!(!outcome.missing_staged_files, "{:?}", outcome.problems);
+        for name in names {
+            assert_eq!(
+                fs::read(pair.beta_root.join(name)).expect("file should be readable"),
+                fs::read(pair.alpha_root.join(name)).expect("file should be readable"),
+                "{name}"
+            );
+        }
+    }
+
+    /// Deterministic content that no block of another seed matches.
+    fn pseudo_random(length: usize, seed: u64) -> Vec<u8> {
+        let mut state = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut data = Vec::with_capacity(length + 8);
+        while data.len() < length {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            data.extend_from_slice(&state.to_le_bytes());
+        }
+        data.truncate(length);
+        data
     }
 }

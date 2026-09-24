@@ -190,7 +190,8 @@ fn diff_compares_private_copies_outside_the_shared_temporary_directory() {
     let shared = scratch.path().join("shared-tmp");
     std::fs::create_dir(&shared).unwrap();
     std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o500)).unwrap();
-    // A stand-in diff tool that records what it was handed.
+    // A stand-in diff tool that records what it was handed. `stat` is GNU on
+    // Linux (`-c %a`) and BSD on macOS (`-f %Lp`).
     let bin = scratch.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
     let record = scratch.path().join("record");
@@ -200,7 +201,8 @@ fn diff_compares_private_copies_outside_the_shared_temporary_directory() {
         "#!/bin/sh\n\
          shift 5\n\
          for file in \"$1\" \"$2\" \"$(dirname \"$1\")\"; do\n\
-         printf '%s %s\\n' \"$(stat -c %a \"$file\")\" \"$file\" >> \"$RECORD\"\n\
+         mode=$(stat -c %a \"$file\" 2>/dev/null || stat -f %Lp \"$file\")\n\
+         printf '%s %s\\n' \"$mode\" \"$file\" >> \"$RECORD\"\n\
          done\n\
          exit 1\n",
     )

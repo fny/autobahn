@@ -7480,7 +7480,16 @@ mod supply_receive_tests {
         changes: Vec<Change>,
     }
 
+    /// Both endpoints are one-shot: every scan walks the disk. These tests
+    /// change files behind the endpoints' backs and scan again at once, and
+    /// a watcher's report of such a change arrives on its own schedule
+    /// (macOS's FSEvents noticeably later), which would let a scan serve the
+    /// snapshot from before the change.
     fn pair() -> Pair {
+        let options = || EndpointOptions {
+            one_shot: true,
+            ..EndpointOptions::default()
+        };
         let keep = tempdir().expect("temporary directory should be creatable");
         let alpha_root = keep.path().join("alpha");
         let beta_root = keep.path().join("beta");
@@ -7490,15 +7499,11 @@ mod supply_receive_tests {
         let alpha = LocalEndpoint::new(
             alpha_root.clone(),
             keep.path().join("staging-alpha"),
-            EndpointOptions::default(),
+            options(),
         )
         .expect("endpoint should be creatable");
-        let beta = LocalEndpoint::new(
-            beta_root.clone(),
-            beta_staging.clone(),
-            EndpointOptions::default(),
-        )
-        .expect("endpoint should be creatable");
+        let beta = LocalEndpoint::new(beta_root.clone(), beta_staging.clone(), options())
+            .expect("endpoint should be creatable");
         Pair {
             keep,
             alpha,

@@ -888,8 +888,8 @@ impl Session {
         }
 
         // Safety: if the ancestor root was a directory with non-trivial
-        // content and exactly one side now presents an empty (or absent)
-        // root, then halt rather than propagate what is more likely an
+        // content and exactly one side now presents an absent root, or one
+        // holding nothing synchronizable, then halt rather than propagate what is more likely an
         // unmounted or wiped filesystem than an intentional mass deletion.
         if one_side_emptied_root(
             self.ancestor.as_ref(),
@@ -1331,8 +1331,10 @@ fn pump(
 }
 
 /// Detects the emptied-root condition at the root itself: the ancestor was
-/// non-trivial, and exactly one side now presents an absent or childless
-/// root while the other retains content. Emptied directories *below* the
+/// non-trivial, and exactly one side now presents an absent root, or one
+/// holding nothing synchronizable, while the other retains content. An
+/// ignored entry left behind (the `.DS_Store` of a bare mount point, the
+/// `.git` of a wiped checkout) does not make a root any less emptied. Emptied directories *below* the
 /// root are reconciliation's concern, and only in the paranoid mode (see
 /// `tree::reconcile::PARANOID_MINIMUM`); a separate whole-tree pass here
 /// measured at twenty milliseconds per cycle on a sixty-thousand-entry
@@ -1350,7 +1352,7 @@ fn one_side_emptied_root(
     };
     let gone = |side: Option<&Node>| match side {
         None => true,
-        Some(node) => node.children().is_empty(),
+        Some(node) => !node.holds_synchronizable(),
     };
     if gone(alpha) == gone(beta) {
         return false;
@@ -1596,6 +1598,93 @@ mod tests {
             Some(&empty),
             Some(&trivial)
         ));
+
+        // Emptiness is judged by what synchronizes. A bare mount point
+        // keeps its `.DS_Store`, a wipe leaves the `.git`: the root has
+        // lost everything that syncs, and an ignored entry left in it
+        // must not make it read as a root that merely lost files.
+        let untracked = |name: &str| Node {
+            name: name.into(),
+            content: Content::Untracked,
+        };
+        let ds_store = Node::directory("", vec![untracked(".DS_Store")]);
+        assert!(one_side_emptied_root(
+            Some(&ancestor),
+            Some(&ds_store),
+            Some(&ancestor)
+        ));
+        let git = Node::directory("", vec![untracked(".git")]);
+        assert!(one_side_emptied_root(
+            Some(&ancestor),
+            Some(&ancestor),
+            Some(&git)
+        ));
+        // One real file beside the ignored entry is a root that lost
+        // files, not an emptied one.
+        let kept = Node::directory("", vec![file("a", 1), untracked(".DS_Store")]);
+        assert!(!one_side_emptied_root(
+            Some(&ancestor),
+            Some(&kept),
+            Some(&ancestor)
+        ));
+    }
+
+    /// Reproduced before the fix: an ancestor of twenty files, alpha down
+    /// to one untracked `.DS_Store`, beta untouched. The halt did not fire,
+    /// because alpha's root had a child, and reconciliation deleted all
+    /// twenty files from beta — in every mode, the paranoid one included.
+    #[test]
+    fn a_root_emptied_down_to_an_ignored_entry_halts_in_every_mode() {
+        let full = || Node::directory("", (1..=20).map(|i| file(&format!("f{i}"), i)).collect());
+        let emptied = || {
+            Node::directory(
+                "",
+                vec![Node {
+                    name: ".DS_Store".into(),
+                    content: Content::Untracked,
+                }],
+            )
+        };
+        for mode in [
+            SyncMode::TwoWaySafe,
+            SyncMode::TwoWayParanoid,
+            SyncMode::TwoWayResolved,
+            SyncMode::TwoWayStrict,
+            SyncMode::OneWaySafe,
+            SyncMode::OneWayReplica,
+        ] {
+            let state = tempfile::tempdir().unwrap();
+            let transitions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let alpha = ScriptedEndpoint::new(vec![scripted(full()), scripted(emptied())]);
+            let beta = CountingEndpoint {
+                inner: ScriptedEndpoint::new(vec![scripted(full())]),
+                transitions: std::sync::Arc::clone(&transitions),
+            };
+            let mut session = Session::new(
+                Box::new(alpha),
+                Box::new(beta),
+                mode,
+                state.path().to_path_buf(),
+            )
+            .unwrap();
+            session.run_cycle().expect("the first cycle converges");
+            let settled = transitions.load(std::sync::atomic::Ordering::SeqCst);
+            let error = session
+                .run_cycle()
+                .expect_err("a root emptied down to an ignored entry must halt");
+            assert!(
+                matches!(
+                    error.downcast_ref::<SafetyHalt>(),
+                    Some(SafetyHalt::RootEmptied)
+                ),
+                "{mode:?}: {error:#}"
+            );
+            assert_eq!(
+                transitions.load(std::sync::atomic::Ordering::SeqCst),
+                settled,
+                "{mode:?}: beta must not be transitioned"
+            );
+        }
     }
 
     /// `clean` decides which lock directories are live by recomputing their

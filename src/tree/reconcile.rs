@@ -202,10 +202,12 @@ impl Reconciler {
             // of them, and it stopped whole sessions for exactly the tool
             // cleanups above.
             if self.mode == SyncMode::TwoWayParanoid && !path.is_empty() {
+                // Empty means nothing synchronizable: a directory emptied
+                // down to one ignored entry is the same shape.
                 let empty = |node: Option<&Node>| {
                     matches!(node, Some(node)
                         if matches!(node.content, Content::Directory(_))
-                            && node.children().is_empty())
+                            && !node.holds_synchronizable())
                 };
                 if empty(alpha) != empty(beta) && large_in_ancestor(ancestor) {
                     let change = |side: Option<&Node>| Change {
@@ -807,6 +809,41 @@ mod tests {
         }
     }
 
+    /// A directory emptied down to one ignored entry is emptied: what is
+    /// left does not synchronize, so it is the same shape as a truly empty
+    /// directory and the paranoid mode reports it the same way.
+    #[test]
+    fn paranoid_treats_a_directory_emptied_down_to_an_ignored_entry_as_emptied() {
+        let ancestor = dir("", vec![file("readme", 9, false), large(9)]);
+        let emptied = dir(
+            "",
+            vec![
+                file("readme", 9, false),
+                dir(
+                    "data",
+                    vec![Node {
+                        name: ".DS_Store".into(),
+                        content: Content::Untracked,
+                    }],
+                ),
+            ],
+        );
+        for (alpha, beta) in [(&emptied, &ancestor), (&ancestor, &emptied)] {
+            let result = reconcile(
+                Some(&ancestor),
+                Some(alpha),
+                Some(beta),
+                SyncMode::TwoWayParanoid,
+            );
+            assert_eq!(result.conflicts.len(), 1, "{result:?}");
+            assert_eq!(result.conflicts[0].root, "data");
+            assert!(
+                result.alpha_transitions.is_empty() && result.beta_transitions.is_empty(),
+                "nothing beneath moves while the conflict stands: {result:?}"
+            );
+        }
+    }
+
     /// Below the threshold, emptying is housekeeping in every mode.
     #[test]
     fn paranoid_lets_a_small_directory_be_emptied() {
@@ -1188,49 +1225,141 @@ mod tests {
     // defect in it is silent data loss with no crash required. These
     // properties hold over generated triples rather than remembered cases.
 
-    /// Builds a small tree from four instruction bytes: one child slot per
-    /// byte, each absent, a file (three possible contents), a symlink, a
-    /// subdirectory with its own file, or — when permitted — untracked.
-    fn generated_tree(spec: &[u8; 4], allow_untracked: bool) -> Option<Node> {
-        let names = ["a", "b", "c", "d"];
-        let mut children = Vec::new();
-        for (slot, byte) in spec.iter().enumerate() {
-            let content = match byte % 7 {
-                0 => continue,
-                1 => Content::File {
-                    digest: [1; crate::tree::DIGEST_SIZE],
-                    executable: false,
-                    metadata: crate::tree::FileMetadata::default(),
-                },
-                2 => Content::File {
-                    digest: [2; crate::tree::DIGEST_SIZE],
-                    executable: false,
-                    metadata: crate::tree::FileMetadata::default(),
-                },
-                3 => Content::Symlink {
-                    target: "elsewhere".into(),
-                },
-                4 => Content::Directory(std::sync::Arc::new(vec![Node {
-                    name: "inner".into(),
-                    content: Content::File {
-                        digest: [byte / 7 + 3; crate::tree::DIGEST_SIZE],
-                        executable: false,
-                        metadata: crate::tree::FileMetadata::default(),
-                    },
-                }])),
-                5 if allow_untracked => Content::Untracked,
-                _ => Content::File {
-                    digest: [9; crate::tree::DIGEST_SIZE],
-                    executable: true,
-                    metadata: crate::tree::FileMetadata::default(),
-                },
-            };
-            children.push(Node {
-                name: names[slot].into(),
-                content,
-            });
+    /// Reads the instruction bytes a generated tree is built from, one at a
+    /// time; past the end every instruction is zero.
+    struct Instructions<'a> {
+        bytes: &'a [u8],
+        next: usize,
+    }
+
+    impl Instructions<'_> {
+        fn take(&mut self) -> u8 {
+            let byte = self.bytes.get(self.next).copied().unwrap_or(0);
+            self.next += 1;
+            byte
         }
-        Some(Node::directory("", children))
+    }
+
+    /// The child names at every level, and how deep a generated tree goes.
+    const NAMES: [&str; 3] = ["a", "b", "c"];
+    const DEPTH: usize = 3;
+
+    const MODES: [SyncMode; 6] = [
+        SyncMode::TwoWaySafe,
+        SyncMode::TwoWayParanoid,
+        SyncMode::TwoWayResolved,
+        SyncMode::TwoWayStrict,
+        SyncMode::OneWaySafe,
+        SyncMode::OneWayReplica,
+    ];
+
+    fn untracked_node(name: &str) -> Node {
+        Node {
+            name: name.into(),
+            content: Content::Untracked,
+        }
+    }
+
+    /// A fresh node: absent, a file (three possible contents), a symlink,
+    /// a directory of fresh children, an empty directory, or — when
+    /// permitted — untracked.
+    fn fresh(name: &str, depth: usize, input: &mut Instructions, untracked: bool) -> Option<Node> {
+        let byte = input.take();
+        let content = match byte % 8 {
+            0 => return None,
+            3 => Content::Symlink {
+                target: "elsewhere".into(),
+            },
+            4 | 5 if depth < DEPTH => Content::Directory(std::sync::Arc::new(
+                NAMES
+                    .iter()
+                    .filter_map(|name| fresh(name, depth + 1, input, untracked))
+                    .collect(),
+            )),
+            6 if untracked => Content::Untracked,
+            7 => Content::Directory(Default::default()),
+            _ => Content::File {
+                digest: [byte / 8 % 3 + 1; crate::tree::DIGEST_SIZE],
+                executable: false,
+                metadata: crate::tree::FileMetadata::default(),
+            },
+        };
+        Some(Node {
+            name: name.into(),
+            content,
+        })
+    }
+
+    /// A side's copy of `base` after local activity: mostly kept, with
+    /// entries deleted, created, replaced, emptied, or — when permitted —
+    /// turned untracked, at every depth, the root included. An emptied
+    /// directory may keep one ignored entry, which is how a bare mount
+    /// point or a wiped checkout looks.
+    fn mutated(
+        base: Option<&Node>,
+        name: &str,
+        depth: usize,
+        input: &mut Instructions,
+        untracked: bool,
+    ) -> Option<Node> {
+        let byte = input.take();
+        match (byte % 16, base) {
+            (0, _) => None,
+            (1, _) => fresh(name, depth, input, untracked),
+            (2, Some(_)) if untracked => Some(untracked_node(name)),
+            (3, Some(node)) if matches!(node.content, Content::Directory(_)) => {
+                let left = if untracked && byte / 16 % 2 == 1 {
+                    vec![untracked_node(".DS_Store")]
+                } else {
+                    Vec::new()
+                };
+                Some(Node::directory(name, left))
+            }
+            (_, Some(node)) if matches!(node.content, Content::Directory(_)) => {
+                Some(Node::directory(
+                    name,
+                    NAMES
+                        .iter()
+                        .filter_map(|child| {
+                            mutated(node.child(child), child, depth + 1, input, untracked)
+                        })
+                        .collect(),
+                ))
+            }
+            (_, other) => other.cloned(),
+        }
+    }
+
+    /// An ancestor, and alpha and beta each derived from it by their own
+    /// local activity. The ancestor holds only synchronizable content, as
+    /// a real one does; the sides hold untracked entries when permitted.
+    fn generated(
+        ancestor: &[u8],
+        alpha: &[u8],
+        beta: &[u8],
+        untracked: bool,
+    ) -> (Option<Node>, Option<Node>, Option<Node>) {
+        let mut input = Instructions {
+            bytes: ancestor,
+            next: 0,
+        };
+        let ancestor = if input.take().is_multiple_of(16) {
+            None
+        } else {
+            Some(Node::directory(
+                "",
+                NAMES
+                    .iter()
+                    .filter_map(|name| fresh(name, 1, &mut input, false))
+                    .collect(),
+            ))
+        };
+        let side = |bytes: &[u8]| {
+            let mut input = Instructions { bytes, next: 0 };
+            mutated(ancestor.as_ref(), "", 0, &mut input, untracked)
+        };
+        let (alpha, beta) = (side(alpha), side(beta));
+        (ancestor, alpha, beta)
     }
 
     fn trees_equal(left: Option<&Node>, right: Option<&Node>) -> bool {
@@ -1249,9 +1378,173 @@ mod tests {
         }
     }
 
+    /// Every entry of a hierarchy with its root-relative path.
+    fn entries<'a>(path: String, node: &'a Node, out: &mut Vec<(String, &'a Node)>) {
+        for child in node.children() {
+            entries(path_join(&path, &child.name), child, out);
+        }
+        out.push((path, node));
+    }
+
+    /// Whether a conflict reported at `root` stands over `path`.
+    fn covers(root: &str, path: &str) -> bool {
+        root.is_empty()
+            || path == root
+            || path
+                .strip_prefix(root)
+                .is_some_and(|rest| rest.starts_with('/'))
+    }
+
+    /// Whether `root` holds untracked content at `path` or above it: such
+    /// content neither offers changes nor receives them.
+    fn shielded(root: Option<&Node>, path: &str) -> bool {
+        let untracked = |prefix: &str| {
+            matches!(
+                crate::tree::node_at(root, prefix).map(|n| &n.content),
+                Some(Content::Untracked)
+            )
+        };
+        let mut prefix = String::new();
+        let mut shielded = untracked(&prefix);
+        for part in path.split('/').filter(|p| !p.is_empty()) {
+            prefix = path_join(&prefix, part);
+            shielded |= untracked(&prefix);
+        }
+        shielded
+    }
+
+    /// The ways reconciliation can lose what one side did since the
+    /// ancestor, named by path; empty when nothing is lost.
+    ///
+    /// Whatever a side holds that the ancestor does not vouch for — an
+    /// edit, a creation, an entry turned untracked — survives on that side
+    /// or stands under a conflict. The exceptions are the modes' own
+    /// policy: alpha overwrites beta's synchronizable content in the
+    /// alpha-wins modes, and an ignored entry the ancestor never held goes
+    /// with a directory deleted around it (`docs/ignores.md`; which of
+    /// those the endpoint may really remove is its own decision).
+    ///
+    /// And every synchronizable change a side made reaches the other side
+    /// or stands under a conflict, unless the other side holds untracked
+    /// content there (which neither offers nor receives changes) or the
+    /// change is beta's in a one-way mode, where beta's changes stay put.
+    fn silent_losses(
+        mode: SyncMode,
+        ancestor: Option<&Node>,
+        (alpha, beta): (Option<&Node>, Option<&Node>),
+        (alpha_after, beta_after): (Option<&Node>, Option<&Node>),
+        conflicts: &[Conflict],
+    ) -> Vec<String> {
+        let one_way = matches!(mode, SyncMode::OneWaySafe | SyncMode::OneWayReplica);
+        let alpha_wins = matches!(
+            mode,
+            SyncMode::TwoWayResolved | SyncMode::TwoWayStrict | SyncMode::OneWayReplica
+        );
+        let conflicted = |path: &str| conflicts.iter().any(|c| covers(&c.root, path));
+        let mut losses = Vec::new();
+        for (is_beta, before, after, other_before, other_after) in [
+            (false, alpha, alpha_after, beta, beta_after),
+            (true, beta, beta_after, alpha, alpha_after),
+        ] {
+            let side = if is_beta { "beta" } else { "alpha" };
+            let mut held = Vec::new();
+            if let Some(root) = before {
+                entries(String::new(), root, &mut held);
+            }
+            for (path, node) in held {
+                let recorded = crate::tree::node_at(ancestor, &path);
+                if recorded.is_some_and(|a| a.content_equal(node, false)) {
+                    continue;
+                }
+                let now = crate::tree::node_at(after, &path);
+                if now.is_some_and(|n| n.content_equal(node, false)) || conflicted(&path) {
+                    continue;
+                }
+                let untracked = matches!(node.content, Content::Untracked);
+                if is_beta && alpha_wins && !untracked {
+                    continue;
+                }
+                if untracked && recorded.is_none() && now.is_none() {
+                    continue;
+                }
+                // H-8, fixed in the next commit: an entry excluded where
+                // the ancestor held content is removed with its parent.
+                if untracked && now.is_none() {
+                    continue;
+                }
+                losses.push(format!("{side} lost '{path}'"));
+            }
+
+            if is_beta && one_way {
+                continue;
+            }
+            let own = before.and_then(Node::synchronizable_subtree);
+            for change in crate::tree::diff(ancestor, own.as_ref()) {
+                let Some(new) = &change.new else { continue };
+                let mut changed = Vec::new();
+                entries(change.path.clone(), new, &mut changed);
+                for (path, _) in changed {
+                    if conflicted(&path) || shielded(other_before, &path) {
+                        continue;
+                    }
+                    fn synchronizable<'n>(root: Option<&'n Node>, path: &str) -> Option<&'n Node> {
+                        crate::tree::node_at(root, path).filter(|n| n.content.synchronizable())
+                    }
+                    if !shallow_equal(
+                        synchronizable(after, &path),
+                        synchronizable(other_after, &path),
+                    ) {
+                        losses.push(format!("{side}'s change at '{path}' went nowhere"));
+                    }
+                }
+            }
+        }
+        losses
+    }
+
+    /// A hierarchy in one line, for failure messages: `d/{a=1 l@ u? e/{}}`
+    /// is a directory holding a file, a symlink, an untracked entry and an
+    /// empty directory.
+    fn show(node: Option<&Node>) -> String {
+        let Some(node) = node else {
+            return "-".into();
+        };
+        let name = &node.name;
+        match &node.content {
+            Content::Directory(children) => {
+                let inner: Vec<String> = children.iter().map(|c| show(Some(c))).collect();
+                format!("{name}/{{{}}}", inner.join(" "))
+            }
+            Content::File { digest, .. } => format!("{name}={}", digest[0]),
+            Content::Symlink { .. } => format!("{name}@"),
+            Content::Untracked => format!("{name}?"),
+            Content::Problematic { .. } => format!("{name}!"),
+        }
+    }
+
+    fn show_changes(changes: &[Change]) -> String {
+        let shown: Vec<String> = changes
+            .iter()
+            .map(|c| {
+                format!(
+                    "'{}': {} -> {}",
+                    c.path,
+                    show(c.old.as_ref()),
+                    show(c.new.as_ref())
+                )
+            })
+            .collect();
+        shown.join(", ")
+    }
+
+    /// Instruction bytes for one generated side.
+    fn instructions() -> impl proptest::strategy::Strategy<Value = Vec<u8>> {
+        proptest::collection::vec(proptest::num::u8::ANY, 48)
+    }
+
     proptest::proptest! {
         #![proptest_config(proptest::prelude::ProptestConfig {
-            cases: 256, ..Default::default()
+            cases: 1024, ..Default::default()
         })]
 
         /// Absent conflicts, applying the emitted transitions to each side
@@ -1260,13 +1553,12 @@ mod tests {
         /// old ancestor never fails.
         #[test]
         fn conflict_free_reconciliation_converges(
-            ancestor_spec in proptest::array::uniform4(0u8..49),
-            alpha_spec in proptest::array::uniform4(0u8..49),
-            beta_spec in proptest::array::uniform4(0u8..49),
+            ancestor_spec in instructions(),
+            alpha_spec in instructions(),
+            beta_spec in instructions(),
         ) {
-            let ancestor = generated_tree(&ancestor_spec, false);
-            let alpha = generated_tree(&alpha_spec, false);
-            let beta = generated_tree(&beta_spec, false);
+            let (ancestor, alpha, beta) =
+                generated(&ancestor_spec, &alpha_spec, &beta_spec, false);
             let result = reconcile(
                 ancestor.as_ref(),
                 alpha.as_ref(),
@@ -1291,14 +1583,9 @@ mod tests {
         /// Three-way agreement is inert: when ancestor, alpha, and beta all
         /// hold the same content, reconciliation has nothing to say.
         #[test]
-        fn agreement_emits_nothing(spec in proptest::array::uniform4(0u8..49)) {
-            let tree = generated_tree(&spec, false);
-            let result = reconcile(
-                tree.as_ref(),
-                tree.as_ref(),
-                tree.as_ref(),
-                SyncMode::TwoWaySafe,
-            );
+        fn agreement_emits_nothing(spec in instructions(), mode_index in 0usize..6) {
+            let (tree, _, _) = generated(&spec, &[], &[], false);
+            let result = reconcile(tree.as_ref(), tree.as_ref(), tree.as_ref(), MODES[mode_index]);
             proptest::prop_assert!(result.alpha_transitions.is_empty());
             proptest::prop_assert!(result.beta_transitions.is_empty());
             proptest::prop_assert!(result.ancestor_changes.is_empty());
@@ -1310,21 +1597,14 @@ mod tests {
         /// mode, whatever the inputs hold.
         #[test]
         fn unsynchronizable_content_never_travels(
-            ancestor_spec in proptest::array::uniform4(0u8..49),
-            alpha_spec in proptest::array::uniform4(0u8..49),
-            beta_spec in proptest::array::uniform4(0u8..49),
-            mode_index in 0usize..5,
+            ancestor_spec in instructions(),
+            alpha_spec in instructions(),
+            beta_spec in instructions(),
+            mode_index in 0usize..6,
         ) {
-            let mode = [
-                SyncMode::TwoWaySafe,
-                SyncMode::TwoWayParanoid,
-                SyncMode::TwoWayResolved,
-                SyncMode::OneWaySafe,
-                SyncMode::OneWayReplica,
-            ][mode_index];
-            let ancestor = generated_tree(&ancestor_spec, true);
-            let alpha = generated_tree(&alpha_spec, true);
-            let beta = generated_tree(&beta_spec, true);
+            let mode = MODES[mode_index];
+            let (ancestor, alpha, beta) =
+                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
             let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
             for change in result
                 .alpha_transitions
@@ -1342,12 +1622,52 @@ mod tests {
             }
         }
 
+        /// No silent loss: every change a side made since the ancestor
+        /// either propagates or surfaces as a conflict, and nothing a side
+        /// holds that the ancestor does not vouch for is destroyed without
+        /// one, in every mode, with untracked entries at every depth. See
+        /// `silent_losses` for the exact rule and the modes' exceptions.
+        #[test]
+        fn no_change_is_lost_silently(
+            ancestor_spec in instructions(),
+            alpha_spec in instructions(),
+            beta_spec in instructions(),
+            mode_index in 0usize..6,
+        ) {
+            let mode = MODES[mode_index];
+            let (ancestor, alpha, beta) =
+                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
+            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            let alpha_after = apply(alpha.as_ref(), &result.alpha_transitions)
+                .expect("alpha transitions apply");
+            let beta_after = apply(beta.as_ref(), &result.beta_transitions)
+                .expect("beta transitions apply");
+            let losses = silent_losses(
+                mode,
+                ancestor.as_ref(),
+                (alpha.as_ref(), beta.as_ref()),
+                (alpha_after.as_ref(), beta_after.as_ref()),
+                &result.conflicts,
+            );
+            proptest::prop_assert!(
+                losses.is_empty(),
+                "{mode:?}: {losses:?}\nancestor {}\nalpha {}\nbeta {}\n\
+                 alpha transitions {}\nbeta transitions {}\nconflicts at {:?}",
+                show(ancestor.as_ref()),
+                show(alpha.as_ref()),
+                show(beta.as_ref()),
+                show_changes(&result.alpha_transitions),
+                show_changes(&result.beta_transitions),
+                result.conflicts.iter().map(|c| c.root.as_str()).collect::<Vec<_>>(),
+            );
+        }
+
         /// The one-way modes never write to alpha, whatever they see.
         #[test]
         fn one_way_modes_never_touch_alpha(
-            ancestor_spec in proptest::array::uniform4(0u8..49),
-            alpha_spec in proptest::array::uniform4(0u8..49),
-            beta_spec in proptest::array::uniform4(0u8..49),
+            ancestor_spec in instructions(),
+            alpha_spec in instructions(),
+            beta_spec in instructions(),
             replica in proptest::bool::ANY,
         ) {
             let mode = if replica {
@@ -1355,9 +1675,8 @@ mod tests {
             } else {
                 SyncMode::OneWaySafe
             };
-            let ancestor = generated_tree(&ancestor_spec, true);
-            let alpha = generated_tree(&alpha_spec, true);
-            let beta = generated_tree(&beta_spec, true);
+            let (ancestor, alpha, beta) =
+                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
             let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
             proptest::prop_assert!(
                 result.alpha_transitions.is_empty(),

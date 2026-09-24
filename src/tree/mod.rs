@@ -225,6 +225,17 @@ impl Node {
             .map(|index| &children[index])
     }
 
+    /// Whether any child of this node synchronizes: a directory, a file or
+    /// a symbolic link. A directory holding nothing but excluded entries —
+    /// a bare mount point with its `.DS_Store`, a wiped checkout with its
+    /// `.git` — holds nothing synchronization carries, and every judgment
+    /// of emptiness goes by this rather than by `children().is_empty()`.
+    pub fn holds_synchronizable(&self) -> bool {
+        self.children()
+            .iter()
+            .any(|child| child.content.synchronizable())
+    }
+
     /// Performs a content equivalence comparison with another node, ignoring
     /// names and scan metadata. If `deep` is true, directory contents are
     /// compared recursively (as a linear merge over the sorted children).

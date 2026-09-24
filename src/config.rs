@@ -611,6 +611,9 @@ pub struct SessionPlan {
     /// a supervisor and a manual `sync` — share one identity and therefore
     /// one state lock.
     identifier: String,
+    /// The beta path, shown in the label when another plan of the group
+    /// shares this one's host: `group@host` alone would name both.
+    shown_path: Option<String>,
 }
 
 /// A resolved synchronization endpoint: either side of a session.
@@ -652,9 +655,15 @@ impl EndpointTarget {
 }
 
 impl SessionPlan {
-    /// Returns the display name of the session (`group@host`).
+    /// Returns the display name of the session: `group@host`, or
+    /// `group@host:path` when another beta of the group is on the same
+    /// host. For people to read; sessions are told apart by
+    /// [`identifier`](Self::identifier).
     pub fn display(&self) -> String {
-        format!("{}@{}", self.group, self.host)
+        match &self.shown_path {
+            Some(path) => format!("{}@{}:{path}", self.group, self.host),
+            None => format!("{}@{}", self.group, self.host),
+        }
     }
 
     /// Returns the beta specification string used for session identity.
@@ -696,6 +705,7 @@ impl SessionPlan {
             alpha,
             beta,
             identifier,
+            shown_path: None,
             ..self.clone()
         }
     }
@@ -933,6 +943,19 @@ impl OwnState {
             bail!("invalid configuration:\n  {}", problems.join("\n  "));
         }
         Ok(())
+    }
+}
+
+/// Whether a mode writes its alpha. A `match` with no wildcard arm, so
+/// a mode added later is classified by whoever adds it: counted read-only
+/// by default, it would escape the cross-session nesting check.
+fn alpha_is_written(mode: SyncMode) -> bool {
+    match mode {
+        SyncMode::TwoWaySafe
+        | SyncMode::TwoWayParanoid
+        | SyncMode::TwoWayResolved
+        | SyncMode::TwoWayStrict => true,
+        SyncMode::OneWaySafe | SyncMode::OneWayReplica => false,
     }
 }
 
@@ -1508,6 +1531,7 @@ impl Config {
                     default_group: default_group.clone(),
                     peering,
                     identifier,
+                    shown_path: None,
                 };
                 if let Err(problem) =
                     check_session_topology(&plan.alpha, &plan.beta, &alpha_identity, &beta_identity)
@@ -1529,6 +1553,23 @@ impl Config {
             }
         }
 
+        // Two betas of one group on one host would read alike, in status,
+        // in the logs and in the messages below; they show their paths.
+        let shared: Vec<usize> = (0..plans.len())
+            .filter(|&index| {
+                plans.iter().enumerate().any(|(other, plan)| {
+                    other != index
+                        && plan.group == plans[index].group
+                        && plan.host == plans[index].host
+                })
+            })
+            .collect();
+        for index in shared {
+            if let EndpointTarget::Remote { path, .. } = &plans[index].beta {
+                plans[index].shown_path = Some(path.clone());
+            }
+        }
+
         // Across sessions, a writable endpoint nested inside another
         // session's endpoint means two sessions mutate one tree region from
         // independent ancestors: each can read the other's writes as user
@@ -1541,19 +1582,9 @@ impl Config {
         // configurations in separate processes are outside what this can
         // see; the endpoint-pair lock covers the identical pair there, and
         // anything else is documented as unsupported.
-        let writable = |plan: &SessionPlan, alpha: bool| -> bool {
-            if alpha {
-                matches!(
-                    plan.mode,
-                    SyncMode::TwoWaySafe
-                        | SyncMode::TwoWayParanoid
-                        | SyncMode::TwoWayResolved
-                        | SyncMode::TwoWayStrict
-                )
-            } else {
-                true
-            }
-        };
+        // A beta is always written; an alpha is written by the two-way
+        // modes.
+        let writable = |plan: &SessionPlan, alpha: bool| !alpha || alpha_is_written(plan.mode);
         let mut endpoints: Vec<(String, Place, bool, String)> = Vec::new();
         for plan in &plans {
             endpoints.push((
@@ -1573,7 +1604,11 @@ impl Config {
             for (offset, (other_identity, other_place, other_writes, other_owner)) in
                 endpoints.iter().enumerate().skip(index + 1)
             {
-                if owner == other_owner {
+                // Endpoints are pushed two per plan, alpha then beta, so an
+                // endpoint at index i belongs to plan i / 2. Plans, not
+                // labels: two betas of one group on one host share a label
+                // and are still two sessions.
+                if index / 2 == offset / 2 {
                     continue; // within-session overlap is checked above
                 }
                 if place == other_place {
@@ -1609,8 +1644,6 @@ impl Config {
                 // it refuses configurations that do not actually overlap —
                 // "synchronize this project, and ship its build output
                 // somewhere else" being the ordinary one.
-                // Endpoints are pushed two per plan, alpha then beta, so an
-                // endpoint at index i belongs to plan i / 2.
                 let outer_plan = &plans[outer_index / 2];
                 let excluded = IgnoreSet::new(&outer_plan.ignores)
                     .is_ok_and(|ignores| ignores.ignored(&relative, true));
@@ -2951,6 +2984,80 @@ betas = ["build.example.com:/tmp/beta"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);
+    }
+
+    /// Two betas of one group on one host are two sessions, with two
+    /// ancestors, even though both are `group@host`: one written inside
+    /// the other is refused like any other cross-session nesting. The
+    /// check once told sessions apart by that label and skipped the pair.
+    #[test]
+    fn nested_betas_on_one_host_in_one_group_are_rejected() {
+        // Every beta is written, whatever the mode, so the one-way form
+        // follows the same rule.
+        for mode in ["two-way-safe", "one-way-replica"] {
+            let config = parse(&format!(
+                r#"
+                [groups.tree]
+                alpha = "/srv/tree"
+                mode = "{mode}"
+                betas = ["host:/tree", "host:/tree/nested"]
+                "#
+            ));
+            let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+            assert!(
+                error.contains("host:/tree/nested is nested inside host:/tree"),
+                "{mode}: {error}"
+            );
+        }
+    }
+
+    /// Two betas of one group on one host are told apart by their paths
+    /// in every label; a beta alone on its host keeps the short label.
+    #[test]
+    fn betas_sharing_a_host_are_labelled_with_their_paths() {
+        let config = parse(
+            r#"
+            [groups.tree]
+            alpha = "/srv/tree"
+            mode = "two-way-safe"
+            betas = ["host:/tree", "host:/other", "elsewhere:/tree", "/local/tree"]
+            "#,
+        );
+        let labels: Vec<String> = config
+            .plans()
+            .expect("plans should build")
+            .iter()
+            .map(SessionPlan::display)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                "tree@host:/tree",
+                "tree@host:/other",
+                "tree@elsewhere",
+                "tree@/local/tree"
+            ]
+        );
+    }
+
+    /// Every mode the parser accepts is classified as writing its alpha
+    /// or not, and the two-way modes are the ones that do.
+    #[test]
+    fn every_mode_says_whether_it_writes_the_alpha() {
+        let advertised = parse_mode("not-a-mode").expect_err("an unknown mode is refused");
+        let names: Vec<&str> = advertised
+            .split(['(', ')', ':', ',', ' ', '\'', '\n'])
+            .filter(|word| word.contains("-way-"))
+            .collect();
+        assert!(names.len() >= 6, "{advertised}");
+        for name in names {
+            let mode = parse_mode(name).expect("an advertised mode parses");
+            assert_eq!(
+                alpha_is_written(mode),
+                name.starts_with("two-way-"),
+                "{name}"
+            );
+        }
     }
 
     #[test]

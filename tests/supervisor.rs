@@ -1849,10 +1849,27 @@ fn a_supervised_session_reports_what_it_is_doing() {
 
         // Both sides have completed a scan, so both left a total behind.
         // These are what a later scan is measured against; without them
-        // there is no honest estimate, only elapsed time.
-        let live = control::query_progress(&world.state_root()).expect("progress is reported");
-        let alpha_entries = live[0].progress.alpha.expected.expect("alpha has a total");
-        let beta_entries = live[0].progress.beta.expected.expect("beta has a total");
+        // there is no honest estimate, only elapsed time. Waited for, not
+        // read at once: the session can be caught waiting right after the
+        // cycle that filled beta, before any scan of beta since — its total
+        // is then the empty root it first saw, until the next cycle (a
+        // heartbeat, at most a second here) scans it again.
+        let totals = || {
+            control::query_progress(&world.state_root()).and_then(|live| {
+                Some((
+                    live[0].progress.alpha.expected?,
+                    live[0].progress.beta.expected?,
+                ))
+            })
+        };
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                totals().is_some_and(|(alpha, beta)| alpha == beta)
+            }),
+            "both sides leave a total: {:?}",
+            totals()
+        );
+        let (alpha_entries, beta_entries) = totals().expect("both sides have totals");
         assert!(
             alpha_entries >= 65,
             "the total counts the tree: {alpha_entries}"

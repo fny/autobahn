@@ -511,8 +511,9 @@ enum Command {
     ///
     /// The bundle is refreshed before the login service restarts, so a
     /// controller never comes back on a version whose agents it cannot
-    /// install. The binary it replaces is kept beside the new one, and
-    /// restored if the service does not come back.
+    /// install. The binary and bundle it replaces are kept until the
+    /// service is confirmed running the new build, and restored if it is
+    /// not.
     Update {
         /// Install this release rather than the latest stable one.
         /// Prereleases are never picked up by default: a tester opts in
@@ -531,6 +532,10 @@ enum Command {
         /// anything.
         #[arg(long)]
         dry_run: bool,
+        /// When the login service runs an executable other than the one
+        /// being updated, point it at the updated one instead of refusing.
+        #[arg(long)]
+        retarget: bool,
     },
     /// Re-read every file's content on the sessions' next cycle, making
     /// content that changed without its metadata moving (restored
@@ -627,22 +632,26 @@ fn main() {
         Command::Uninstall => autobahn::service::uninstall().map(|()| {
             println!("stopped and unregistered the login service");
         }),
-        Command::Start => check_startable(None).and_then(|()| {
-            autobahn::service::start().map(|()| {
-                println!("started the login service");
-            })
-        }),
+        Command::Start => autobahn::service::installed_config()
+            .and_then(check_startable)
+            .and_then(|()| {
+                autobahn::service::start().map(|()| {
+                    println!("started the login service");
+                })
+            }),
         Command::Stop => autobahn::service::stop().map(|()| {
             println!(
                 "stopped the login service (it returns at the next login; `uninstall` \
                  removes it)"
             );
         }),
-        Command::Restart => check_startable(None).and_then(|()| {
-            autobahn::service::restart().map(|()| {
-                println!("restarted the login service");
-            })
-        }),
+        Command::Restart => autobahn::service::installed_config()
+            .and_then(check_startable)
+            .and_then(|()| {
+                autobahn::service::restart().map(|()| {
+                    println!("restarted the login service");
+                })
+            }),
         Command::Status {
             config,
             state_root,
@@ -754,11 +763,13 @@ fn main() {
             bin_dir,
             no_agents,
             dry_run,
+            retarget,
         } => autobahn::update::run(autobahn::update::Options {
             version,
             bin_dir,
             no_agents,
             dry_run,
+            retarget,
         }),
         Command::Clean {
             config,

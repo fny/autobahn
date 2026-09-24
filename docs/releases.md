@@ -77,17 +77,19 @@ autobahn update --version v0.5.0-dev.1     # a prerelease, by tag
 autobahn update --dry-run                  # what it would do, and where
 autobahn update --bin-dir ~/bin            # where the command goes
 autobahn update --no-agents                # leave the agent bundle alone
+autobahn update --retarget                 # point a service run from elsewhere at ~/.local/bin
 ```
 
 The order of the steps is the point of the command:
 
-1. Download the platform binary, the agent bundle and `SHA256SUMS` into a temporary directory.
-2. Verify every file against `SHA256SUMS`.
-3. Run the downloaded binary from the temporary directory and read the version it reports. Ask it which baseline formats it reads: if some session's baseline is in another, the new build will rebuild it from the two sides, which is safe only where they match — so if any such session is not settled (synchronized, no conflicts, nothing blocked), stop here and name it.
-4. Replace the agent bundle. Write a temporary directory, then rename it into place.
+0. Check what the login service runs. If it is registered at another executable than the one being updated, restarting it would restart the old version, so stop and say so; `--retarget` points the service at the updated binary instead.
+1. Download the platform binary, the agent bundle and `SHA256SUMS` into a private temporary directory under `~/.autobahn/tmp/`.
+2. Verify every file against `SHA256SUMS`. Each file is opened once, and everything after this reads that open file, so what is installed is what was checked.
+3. Copy the verified binary beside the target, run that copy and read the version it reports. Ask it which baseline formats it reads: if some session's baseline is in another, the new build will rebuild it from the two sides, which is safe only where they match — so if any such session is not settled (synchronized, no conflicts, nothing blocked), stop here and name it.
+4. Replace the agent bundle. Write a temporary directory, then rename it into place. Keep the old one as `agents.previous`.
 5. Rename the new binary into place. Keep the old one as `autobahn.previous`.
 6. Restart the login service, if one is installed.
-7. Confirm that the service came back. If it did not, put `autobahn.previous` back and restart again.
+7. Confirm that the service came back, and ask it over the control socket which build it is. If it did not come back, or came back on another version, put `agents.previous` and `autobahn.previous` back, bundle first, and restart again. If it did, remove both.
 
 Each step guards against one failure:
 
@@ -95,7 +97,7 @@ Each step guards against one failure:
 - Step 3 catches a release that published the wrong asset under this platform's name. Such an asset matches its own checksum. Its second half catches an upgrade across a baseline format while two sides still differ: rebuilt then, a baseline would bring back deletions. A build from before the question existed cannot answer it and is let through.
 - Step 4 runs before step 6, always. If the controller restarts on a new version while the bundle still holds the old binaries, it uploads an agent named for the new version whose bytes are the old one. Every host on another platform then fails its handshake.
 - Step 5 renames, and never writes over the binary in place. A running process holds the inode of the file it started from. A write into that file kills the running service. A rename leaves the old inode alone until the service restarts.
-- Step 7 is the only proof that the new version runs here. A restart command returns as soon as the service manager accepts it.
+- Step 7 is the only proof that the new version runs here. A restart command returns as soon as the service manager accepts it, and a service that is running may still be running the old file. It restores the bundle with the binary, because an old controller uploading the new bundle's agents fails every handshake on another platform just as the reverse does.
 
 If no login service is installed, the command says so and skips the restart. Start the supervisor yourself with `autobahn watch`, or register a service with `autobahn install`.
 

@@ -1734,17 +1734,24 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     }
     assert!(quiet, "the pair never went quiet");
 
-    fs::write(
-        harness.alpha.join("dir0/nested/file0.txt"),
-        "edited on alpha",
-    )
-    .unwrap();
+    // Alpha's edit lands during a wait, not before one. Every wait ends
+    // with beta's watch request running out at the same moment, and its
+    // "nothing changed" answer arriving just after: from then until the
+    // next wait asks again, beta's watch is not standing, and a cycle
+    // rightly scans it. Edited a second into a wait, beta's request has
+    // been renewed and has most of its time left when the cycle runs.
+    let alpha_file = harness.alpha.join("dir0/nested/file0.txt");
+    let editor = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        fs::write(alpha_file, "edited on alpha").unwrap();
+    });
     assert!(
         session
             .await_change(std::time::Duration::from_secs(5))
             .expect("wait"),
         "alpha's edit wakes the wait"
     );
+    editor.join().unwrap();
     let report = session.run_cycle().expect("cycle");
     assert!(
         report.beta_scan_skipped,
@@ -1755,26 +1762,41 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     harness.assert_trees_equal("after the skipped scan");
 
     // Beta changes: its watch answers, and a cycle scans it. Not always
-    // the very next one — a wake from alpha's side can land before beta's
-    // watch has fired for the edit, and that cycle still reuses beta's
-    // snapshot; the watch fires moments later and the cycle after scans.
-    // Never lost, at most one cycle later.
-    fs::write(harness.beta.join("dir1/nested/file1.txt"), "edited on beta").unwrap();
+    // the very next one — a wake from alpha's side, or a late event from
+    // an earlier transition, can bring a cycle (even one that scans beta)
+    // before the kernel has reported this edit; the watch fires moments
+    // later and a cycle after carries it. Never lost, only late: so the
+    // test waits for the edit to land on alpha, within a bound, and
+    // separately requires that some cycle on the way scanned beta.
+    const EDIT: &str = "dir1/nested/file1.txt";
+    fs::write(harness.beta.join(EDIT), "edited on beta").unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let landed = |harness: &Harness| {
+        fs::read_to_string(harness.alpha.join(EDIT)).is_ok_and(|s| s == "edited on beta")
+    };
     let mut scanned = false;
-    for _ in 0..4 {
-        assert!(session
-            .await_change(std::time::Duration::from_secs(5))
-            .expect("wait"));
-        let report = session.run_cycle().expect("cycle");
-        if !report.beta_scan_skipped {
-            scanned = true;
+    let mut cycles = 0;
+    while !landed(&harness) && cycles < 4 {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
             break;
         }
+        // A quiet wait is not a failure: the cycle after it reuses beta's
+        // snapshot, and the bound decides.
+        session
+            .await_change(left.min(std::time::Duration::from_secs(5)))
+            .expect("wait");
+        let report = session.run_cycle().expect("cycle");
+        cycles += 1;
+        scanned |= !report.beta_scan_skipped;
     }
-    assert!(scanned, "beta's edit never brought a scan");
-    assert_eq!(
-        fs::read_to_string(harness.alpha.join("dir1/nested/file1.txt")).unwrap(),
-        "edited on beta"
+    assert!(
+        landed(&harness),
+        "beta's edit did not reach alpha within {cycles} cycles or 20 s"
+    );
+    assert!(
+        scanned,
+        "beta's edit arrived without any cycle scanning beta"
     );
     drop(session);
     harness.assert_trees_equal("after beta's edit");

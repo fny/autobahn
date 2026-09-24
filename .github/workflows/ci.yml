@@ -135,7 +135,7 @@ jobs:
         # Only Xcode 26's actool compiles the Icon Composer bundle; without
         # it build.sh falls back to the committed .icns, and this says which.
         run: |
-          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' 2>/dev/null | sort -V | tail -1)
           if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
           xcodebuild -version
       - name: Tests

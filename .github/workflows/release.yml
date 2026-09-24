@@ -157,7 +157,7 @@ jobs:
         # it, build.sh falls back to the committed .icns: still the real
         # icon, only without the macOS 26 variants.
         run: |
-          XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -1)
+          XCODE=$(find /Applications -maxdepth 1 -name 'Xcode_26*.app' 2>/dev/null | sort -V | tail -1)
           if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
           xcodebuild -version
       - name: Build the command-line binaries
@@ -202,6 +202,8 @@ jobs:
             -P "$P12_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s \
             -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" >/dev/null
+          # Split on purpose: one argument per keychain already listed.
+          # shellcheck disable=SC2046
           security list-keychains -d user -s "$KEYCHAIN" \
             $(security list-keychains -d user | tr -d '"')
           rm "$RUNNER_TEMP/certificate.p12"

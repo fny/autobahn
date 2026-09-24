@@ -24,13 +24,13 @@
 //!   with the [`TEMPORARY_PREFIX`] that scans skip, so an in-flight (or
 //!   abandoned) transition is never mistaken for synchronizable content.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -838,119 +838,101 @@ impl LocalEndpoint {
         Ok(true)
     }
 
-    /// Buffers the complete delta for the supply stream's current need.
+    /// Produces the supply stream's next frame, or `None` once every need
+    /// has been supplied.
     ///
-    /// Deltas are generated one file at a time, in full, because
-    /// [`rsync::deltify`] streams to a callback while
-    /// [`supply_pull`](Endpoint::supply_pull) must return bounded batches.
-    /// The buffer therefore holds one file's operations (whose total size is
-    /// the size of that file's *delta*, not the file), never more: the next
-    /// file is only deltified once the previous one has been fully drained.
-    fn buffer_delta(&self, need: &StagingNeed, pending: &mut VecDeque<TransferFrame>) {
-        // The requested path supplies first; if it can't (vanished, become
-        // unreadable, or changed), any other scanned path recording the
-        // same digest holds identical content and is tried in its place —
-        // so one bad path never starves the paths that share its content.
-        // (The receiver verifies the digest regardless, so a stale
-        // candidate merely fails staging as it would have anyway.)
-        pending.push_back(TransferFrame::Begin {
-            digest: need.request.digest,
-        });
-        let digest = &need.request.digest;
-        let error = match self.try_supply(&need.request.path, digest, &need.signature, pending) {
-            Ok(()) => None,
-            Err(primary_error) => {
-                let recovered = self
-                    .digest_paths(digest, &need.request.path)
-                    .into_iter()
-                    .any(|candidate| {
-                        self.try_supply(&candidate, digest, &need.signature, pending)
-                            .is_ok()
-                    });
-                (!recovered).then_some(primary_error)
-            }
-        };
-        // A failed supply still terminates the file's stream, so that the
-        // receiver discards its partial content and moves on rather than
-        // desynchronizing from the need list.
-        pending.push_back(TransferFrame::EndOfFile { error });
-    }
-
-    /// Attempts to supply one file's delta from a specific root-relative
-    /// path, buffering its operations. A failure removes whatever the
-    /// attempt buffered, leaving `pending` exactly as it was.
-    fn try_supply(
-        &self,
-        path: &str,
-        digest: &Digest,
-        signature: &Signature,
-        pending: &mut VecDeque<TransferFrame>,
-    ) -> Result<(), String> {
-        let mark = pending.len();
-        let result = self.supply_from(path, digest, signature, pending);
-        if result.is_err() {
-            pending.truncate(mark);
-        }
-        result
-    }
-
-    /// The single-path supply attempt behind [`try_supply`](Self::try_supply).
-    ///
-    /// A peer names the path, so it is supplied only if this side's last
-    /// scan recorded a regular file there with exactly the requested
-    /// digest (see [`snapshot_file`](Self::snapshot_file)): nothing outside
-    /// the root, through a symbolic link, ignored, or other than what was
-    /// asked for can leave. The file is then opened without following a
-    /// final symbolic link and without blocking on a FIFO, and must still
-    /// be the regular file of the scanned inode and size; at most the
-    /// scanned size is read, however the file grows.
-    fn supply_from(
-        &self,
-        path: &str,
-        digest: &Digest,
-        signature: &Signature,
-        pending: &mut VecDeque<TransferFrame>,
-    ) -> Result<(), String> {
-        let file = self.open_scanned(path, digest)?;
-        if signature.is_empty() {
-            // With no base to delta against the file streams through whole,
-            // read directly into owned operation-sized chunks — no shared
-            // scratch buffer to zero, no copy out of it, and no size probe.
-            // Files within the operation size limit (the vast majority)
-            // arrive as a single chunk.
-            let mut file = file;
-            loop {
-                let mut chunk = Vec::with_capacity(rsync::MAXIMUM_DATA_OPERATION_SIZE);
-                match Read::by_ref(&mut file)
-                    .take(rsync::MAXIMUM_DATA_OPERATION_SIZE as u64)
-                    .read_to_end(&mut chunk)
-                {
-                    Err(error) => break Err(format!("unable to read {path}: {error}")),
-                    Ok(0) => break Ok(()),
-                    Ok(read) => {
-                        // Small files would otherwise pin a full-sized
-                        // allocation through the batch pipeline.
-                        if read < rsync::MAXIMUM_DATA_OPERATION_SIZE / 2 {
-                            chunk.shrink_to_fit();
-                        }
-                        pending.push_back(TransferFrame::Op(rsync::Op::Data(chunk)));
-                    }
+    /// A file streams: each call reads or receives only its next
+    /// operation, so the supplier holds about one batch however large the
+    /// file (see [`SupplySource`]). A need begins by choosing where its
+    /// content comes from, before its begin frame goes out; once it has,
+    /// a failure ends the file with an error rather than trying elsewhere.
+    fn next_supply_frame(&self, state: &mut SupplyState) -> Option<TransferFrame> {
+        if let Some(source) = state.current.as_mut() {
+            let next = source.next_op();
+            return Some(match next {
+                Ok(Some(op)) => TransferFrame::Op(op),
+                // A failed supply still terminates the file's stream, so
+                // that the receiver discards its partial content and moves
+                // on rather than desynchronizing from the need list.
+                ended => {
+                    state.current = None;
+                    TransferFrame::EndOfFile { error: ended.err() }
                 }
-            }
-        } else {
-            rsync::deltify(file, signature, &mut |op| {
-                pending.push_back(TransferFrame::Op(op));
-                Ok(())
-            })
-            .map_err(|error| format!("unable to compute a delta for {path}: {error:#}"))
+            });
         }
+        let need = state.needs.get_mut(state.next)?;
+        state.next += 1;
+        let digest = need.request.digest;
+        state.current = Some(self.begin_supply(need).unwrap_or_else(SupplySource::Failed));
+        Some(TransferFrame::Begin { digest })
+    }
+
+    /// Chooses and opens the source of one need's content.
+    ///
+    /// The requested path supplies first; if it can't (vanished, become
+    /// unreadable, changed, or refused by [`open_scanned`](Self::open_scanned)),
+    /// any other scanned path recording the same digest holds identical
+    /// content and is tried in its place — so one bad path never starves
+    /// the paths that share its content. This is the only point at which
+    /// another path can be tried: nothing of the file has been sent yet.
+    /// (The receiver verifies the digest regardless, so a stale candidate
+    /// merely fails staging as it would have anyway.)
+    ///
+    /// The need's signature moves into the source, which is its last user.
+    fn begin_supply(&self, need: &mut StagingNeed) -> Result<SupplySource, String> {
+        let digest = need.request.digest;
+        let (path, file) = match self.open_scanned(&need.request.path, &digest) {
+            Ok(file) => (need.request.path.clone(), file),
+            Err(primary_error) => self
+                .digest_paths(&digest, &need.request.path)
+                .into_iter()
+                .find_map(|candidate| {
+                    let file = self.open_scanned(&candidate, &digest).ok()?;
+                    Some((candidate, file))
+                })
+                .ok_or(primary_error)?,
+        };
+        let signature = std::mem::take(&mut need.signature);
+        if signature.is_empty() {
+            return Ok(SupplySource::Whole { path, file });
+        }
+        // A delta is computed on a helper thread, which blocks once the
+        // channel holds a few batches' worth and ends when it is dropped.
+        let (sender, operations) = mpsc::sync_channel(SUPPLY_CHANNEL_DEPTH);
+        let failed_path = path.clone();
+        std::thread::Builder::new()
+            .name("autobahn-supply".into())
+            .spawn(move || {
+                let result = rsync::deltify(file, &signature, &mut |op| {
+                    sender
+                        .send(DeltaMessage::Op(op))
+                        .map_err(|_| anyhow::anyhow!("the supply stream was closed"))
+                });
+                let last = match result {
+                    Ok(()) => DeltaMessage::Done,
+                    Err(error) => DeltaMessage::Failed(format!(
+                        "unable to compute a delta for {failed_path}: {error:#}"
+                    )),
+                };
+                let _ = sender.send(last);
+            })
+            .map_err(|error| format!("unable to start a delta for {path}: {error}"))?;
+        Ok(SupplySource::Delta { path, operations })
     }
 
     /// Opens a file a peer asked for, if and only if the last scan recorded
-    /// a regular file at `path` with `digest`, and it is still that file:
-    /// the gate and checks [`supply_from`](Self::supply_from) describes.
-    /// The reader stops at the scanned size.
-    fn open_scanned(&self, path: &str, digest: &Digest) -> Result<io::Take<File>, String> {
+    /// a regular file at `path` with `digest`, and it is still that file.
+    ///
+    /// A peer names the path, so the last scan must record a regular file
+    /// there with exactly the requested digest (see
+    /// [`snapshot_file`](Self::snapshot_file)): nothing outside the root,
+    /// through a symbolic link, ignored, or other than what was asked for
+    /// can leave. The file is then opened without following a final
+    /// symbolic link and without blocking on a FIFO, and must still be the
+    /// regular file of the scanned inode and size. The reader stops at the
+    /// scanned size, and fails if the file ends before it (see
+    /// [`ScannedFile`]).
+    fn open_scanned(&self, path: &str, digest: &Digest) -> Result<ScannedFile, String> {
         validate_path(path).map_err(|error| format!("refused {path:?}: {error}"))?;
         let (recorded, scanned) = self
             .snapshot_file(path)
@@ -974,7 +956,10 @@ impl LocalEndpoint {
         {
             return Err(format!("{path} changed since the scan"));
         }
-        Ok(file.take(scanned.size))
+        Ok(ScannedFile {
+            file,
+            remaining: scanned.size,
+        })
     }
 
     /// Collects every root-relative path (other than the excluded one) whose
@@ -1363,8 +1348,8 @@ impl Endpoint for LocalEndpoint {
     fn supply_open(&mut self, needs: Vec<StagingNeed>) -> Result<()> {
         self.supply = Some(SupplyState {
             needs,
-            current: 0,
-            pending: VecDeque::new(),
+            next: 0,
+            current: None,
         });
         Ok(())
     }
@@ -1380,25 +1365,11 @@ impl Endpoint for LocalEndpoint {
         let mut frames = Vec::new();
         let mut bytes = 0usize;
         while frames.len() < limit && bytes < SUPPLY_TARGET_BYTES {
-            if state.pending.is_empty() {
-                if state.current >= state.needs.len() {
-                    break;
-                }
-                // Split the borrow: the delta for one need is buffered into
-                // the pending queue, and only then is the cursor advanced.
-                let need = &state.needs[state.current];
-                self.buffer_delta(need, &mut state.pending);
-                state.current += 1;
-            }
-            while frames.len() < limit && bytes < SUPPLY_TARGET_BYTES {
-                match state.pending.pop_front() {
-                    Some(frame) => {
-                        bytes += frame_weight(&frame);
-                        frames.push(frame);
-                    }
-                    None => break,
-                }
-            }
+            let Some(frame) = self.next_supply_frame(&mut state) else {
+                break;
+            };
+            bytes += frame_weight(&frame);
+            frames.push(frame);
         }
 
         // An empty batch signals exhaustion, at which point the stream is
@@ -1744,16 +1715,124 @@ impl Endpoint for LocalEndpoint {
     }
 }
 
-/// The state of an open supply stream: the needs being supplied, the index of
-/// the next need to deltify, and the frames buffered for the need currently
-/// being drained.
+/// The state of an open supply stream: the needs being supplied, the index
+/// of the next need to begin, and the source of the one being streamed.
 struct SupplyState {
     /// The needs to supply, in order.
     needs: Vec<StagingNeed>,
-    /// The index of the next need to deltify.
-    current: usize,
-    /// The frames buffered for the current need.
-    pending: VecDeque<TransferFrame>,
+    /// The index of the next need to begin.
+    next: usize,
+    /// Where the rest of the current need's content comes from, once it
+    /// has begun.
+    current: Option<SupplySource>,
+}
+
+/// How many operations a delta's helper thread may run ahead of the
+/// stream: at most [`SUPPLY_TARGET_BYTES`] of literal data, so a supply
+/// holds about two batches — the one being built and this — whatever the
+/// file's size.
+const SUPPLY_CHANNEL_DEPTH: usize = SUPPLY_TARGET_BYTES / rsync::MAXIMUM_DATA_OPERATION_SIZE;
+
+/// Where the rest of one supplied file's operations come from.
+enum SupplySource {
+    /// No base to delta against: the file itself, read one operation-sized
+    /// chunk per frame.
+    Whole {
+        /// The root-relative path being read, for errors.
+        path: String,
+        /// The file.
+        file: ScannedFile,
+    },
+    /// A delta against the destination's base, computed on a helper thread
+    /// into a bounded channel. Dropping the receiver ends the thread.
+    Delta {
+        /// The root-relative path being read, for errors.
+        path: String,
+        /// The thread's output.
+        operations: mpsc::Receiver<DeltaMessage>,
+    },
+    /// No source could be opened: the file ends with this error.
+    Failed(String),
+}
+
+impl SupplySource {
+    /// The file's next operation, `None` at its end, or the error that
+    /// ends it.
+    fn next_op(&mut self) -> Result<Option<rsync::Op>, String> {
+        match self {
+            SupplySource::Whole { path, file } => {
+                // Read directly into owned operation-sized chunks — no
+                // shared scratch buffer to zero, and no copy out of it.
+                // Files within the operation size limit (the vast
+                // majority) arrive as a single chunk.
+                let mut chunk = Vec::with_capacity(rsync::MAXIMUM_DATA_OPERATION_SIZE);
+                match Read::by_ref(file)
+                    .take(rsync::MAXIMUM_DATA_OPERATION_SIZE as u64)
+                    .read_to_end(&mut chunk)
+                {
+                    Err(error) => Err(format!("unable to read {path}: {error}")),
+                    Ok(0) => Ok(None),
+                    Ok(read) => {
+                        // Small files would otherwise pin a full-sized
+                        // allocation through the batch pipeline.
+                        if read < rsync::MAXIMUM_DATA_OPERATION_SIZE / 2 {
+                            chunk.shrink_to_fit();
+                        }
+                        Ok(Some(rsync::Op::Data(chunk)))
+                    }
+                }
+            }
+            SupplySource::Delta { path, operations } => match operations.recv() {
+                Ok(DeltaMessage::Op(op)) => Ok(Some(op)),
+                Ok(DeltaMessage::Done) => Ok(None),
+                Ok(DeltaMessage::Failed(error)) => Err(error),
+                Err(mpsc::RecvError) => Err(format!("the delta for {path} stopped")),
+            },
+            SupplySource::Failed(error) => Err(std::mem::take(error)),
+        }
+    }
+}
+
+/// What a delta's helper thread sends: operations, then how it ended.
+enum DeltaMessage {
+    /// The next operation.
+    Op(rsync::Op),
+    /// The delta is complete.
+    Done,
+    /// The delta failed, and the file ends with this error.
+    Failed(String),
+}
+
+/// A file opened for supply by [`open_scanned`](LocalEndpoint::open_scanned),
+/// read no further than the size its scan recorded — a file growing since
+/// cannot stream forever — and failing if it ends before that size: a file
+/// truncated mid-supply is an error the receiver is told of, not a short
+/// file it discovers by digest.
+struct ScannedFile {
+    /// The open file.
+    file: File,
+    /// The bytes of the scanned size not yet read.
+    remaining: u64,
+}
+
+impl Read for ScannedFile {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let wanted = buffer
+            .len()
+            .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+        if wanted == 0 {
+            return Ok(0);
+        }
+        let read = self.file.read(&mut buffer[..wanted])?;
+        if read == 0 {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "the file was truncated since the scan",
+            ));
+        }
+        self.remaining -= read as u64;
+        Ok(read)
+    }
 }
 
 /// The state of an in-progress staging operation, running in parallel with
@@ -6990,5 +7069,72 @@ mod supply_receive_tests {
             "{text}"
         );
         assert!(!text.contains(TEMPORARY_PREFIX), "{text}");
+    }
+
+    /// Pulls and pushes to exhaustion, counting the files that ended in an
+    /// error.
+    fn drain_counting_errors(pair: &mut Pair) -> usize {
+        let mut errors = 0;
+        loop {
+            let frames = pair.alpha.supply_pull(4).expect("supply should pull");
+            if frames.is_empty() {
+                return errors;
+            }
+            errors += frames
+                .iter()
+                .filter(|frame| matches!(frame, TransferFrame::EndOfFile { error: Some(_) }))
+                .count();
+            pair.beta.stage_push(frames).expect("staging should accept");
+        }
+    }
+
+    /// A file truncated after its first frame has gone out cannot fall
+    /// back to another path: it ends in an error, the receiver keeps
+    /// nothing, and the next cycle transfers what is there now.
+    #[test]
+    fn a_file_truncated_mid_supply_ends_in_an_error_and_converges_next_cycle() {
+        let mut pair = pair();
+        let path = pair.alpha_root.join("big.bin");
+        fs::write(&path, vec![5u8; 1 << 20]).expect("file should be writable");
+        let needs = pair.begin();
+        let frames = pair.alpha.supply_pull(2).expect("supply should pull");
+        assert!(matches!(
+            frames.as_slice(),
+            [TransferFrame::Begin { .. }, TransferFrame::Op(_)]
+        ));
+        pair.beta.stage_push(frames).expect("staging should accept");
+        File::options()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.set_len(1 << 19))
+            .expect("file should be truncatable");
+        assert_eq!(drain_counting_errors(&mut pair), 1);
+        assert!(!pair.beta.staged_path(&needs[0].request.digest).exists());
+        assert!(receive_temporaries(&pair.beta_staging).is_empty());
+
+        // The next cycle.
+        let needs = pair.begin();
+        assert_eq!(drain_counting_errors(&mut pair), 0);
+        assert_eq!(needs[0].request.digest, digest_of(&vec![5u8; 1 << 19]));
+        assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
+    }
+
+    /// A file that grows after its first frame has gone out supplies
+    /// exactly what was scanned.
+    #[test]
+    fn a_file_grown_mid_supply_supplies_what_was_scanned() {
+        let mut pair = pair();
+        let path = pair.alpha_root.join("big.bin");
+        fs::write(&path, vec![5u8; 1 << 20]).expect("file should be writable");
+        let needs = pair.begin();
+        let frames = pair.alpha.supply_pull(2).expect("supply should pull");
+        pair.beta.stage_push(frames).expect("staging should accept");
+        File::options()
+            .append(true)
+            .open(&path)
+            .and_then(|mut file| file.write_all(&[6u8; 1 << 20]))
+            .expect("file should grow");
+        assert_eq!(drain_counting_errors(&mut pair), 0);
+        assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
     }
 }

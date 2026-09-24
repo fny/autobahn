@@ -27,8 +27,10 @@
 //! and checksums to sha256sum or shasum, exactly as the installer does,
 //! so both paths resolve the same assets and refuse on the same grounds.
 
+use std::fs::File;
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{anyhow, bail, Context, Result};
 
@@ -98,10 +100,11 @@ pub fn run(options: Options) -> Result<()> {
         return Ok(());
     }
 
-    let work = Workspace::new()?;
+    let work = workspace(&state_root)?;
 
-    // 1. Everything lands in a temporary directory first. Nothing that
-    //    follows can be undone halfway through a download.
+    // 1. Everything lands in a private temporary directory first. Nothing
+    //    that follows can be undone halfway through a download, and
+    //    nobody else can reach what is downloaded.
     let staged_binary = work.path().join(format!("autobahn-{platform}"));
     source
         .fetch(&format!("autobahn-{platform}"), &staged_binary)
@@ -121,44 +124,55 @@ pub fn run(options: Options) -> Result<()> {
     )?;
 
     // 2. Verified before anything moves. A checksum checked after the
-    //    file is in place is a report, not a guard.
+    //    file is in place is a report, not a guard. Each download is
+    //    opened once, and everything after this reads that handle: the
+    //    bytes installed are the bytes checked, whatever happens to the
+    //    name in the meantime.
     let sums = std::fs::read_to_string(&staged_sums)
         .with_context(|| format!("unable to read {}", staged_sums.display()))?;
-    verify(&staged_binary, &format!("autobahn-{platform}"), &sums)?;
-    if !options.no_agents {
-        verify(&staged_agents, AGENTS_ASSET, &sums)?;
-    }
+    let binary = Verified::open(&staged_binary, &format!("autobahn-{platform}"), &sums)?;
+    let agents = match options.no_agents {
+        true => None,
+        false => Some(Verified::open(&staged_agents, AGENTS_ASSET, &sums)?),
+    };
     println!("  checksums verified");
 
-    // 3. The one check a checksum cannot make: that this binary runs
-    //    *here*. A release whose assets were assembled with two platforms
-    //    transposed matches its own checksums perfectly.
-    let reported = run_reports_version(&staged_binary)?;
+    // 3. The verified bytes, copied beside the target, where the rename
+    //    that installs them happens. Everything that runs the new build
+    //    before then runs this copy, never the download.
+    let target = bin_dir.join("autobahn");
+    let previous = bin_dir.join("autobahn.previous");
+    let incoming = Incoming::stage(&binary, &target)?;
+    drop(binary);
+
+    // 3a. The one check a checksum cannot make: that this binary runs
+    //     *here*. A release whose assets were assembled with two platforms
+    //     transposed matches its own checksums perfectly.
+    let reported = run_reports_version(incoming.path())?;
     println!("  the downloaded binary reports {reported}");
 
     // 3b. Whether it can read every session's baseline. A build that
     //     cannot rebuilds one from the two sides, which is safe only where
     //     they already match — so where they might not, stop here, before
     //     anything is replaced, and say which to settle.
-    check_baselines(&staged_binary, &state_root)?;
+    check_baselines(incoming.path(), &state_root)?;
 
     // 4. The bundle, before the restart. A controller that comes back new
     //    while the bundle is old installs agents that fail every
     //    handshake on every host of another platform.
-    if options.no_agents {
-        println!("  skipped the agent bundle (--no-agents)");
-    } else {
-        let count = refresh_agents(&staged_agents, &state_root)?;
-        println!(
-            "  refreshed {count} agents in {}",
-            state_root.join("agents").display()
-        );
+    match &agents {
+        None => println!("  skipped the agent bundle (--no-agents)"),
+        Some(agents) => {
+            let count = refresh_agents(agents, &state_root)?;
+            println!(
+                "  refreshed {count} agents in {}",
+                state_root.join("agents").display()
+            );
+        }
     }
 
     // 5. The command, by rename, with the old one kept beside it.
-    let target = bin_dir.join("autobahn");
-    let previous = bin_dir.join("autobahn.previous");
-    place_binary(&staged_binary, &target, &previous)?;
+    incoming.place(&target, &previous)?;
     println!("  installed {}", target.display());
 
     // 6 and 7. The service, and the proof that it came back.
@@ -329,7 +343,7 @@ fn confirm_running() -> ServiceState {
 /// behind any interruption, and a half-populated bundle is worse than an
 /// old one: the old one installs a stale agent that fails a handshake
 /// loudly, while a missing one refuses the host outright.
-fn refresh_agents(archive: &Path, state_root: &Path) -> Result<usize> {
+fn refresh_agents(archive: &Verified, state_root: &Path) -> Result<usize> {
     std::fs::create_dir_all(state_root)
         .with_context(|| format!("unable to create {}", state_root.display()))?;
     // Extracted inside the state root, not in the temporary directory,
@@ -341,11 +355,14 @@ fn refresh_agents(archive: &Path, state_root: &Path) -> Result<usize> {
         .with_context(|| format!("unable to create {}", staging.display()))?;
 
     let extracted = (|| -> Result<PathBuf> {
+        // Unpacked from the verified handle, on tar's standard input, so
+        // what is unpacked is what was checked.
         let status = Command::new("tar")
             .arg("xzf")
-            .arg(archive)
+            .arg("-")
             .arg("-C")
             .arg(&staging)
+            .stdin(archive.reader()?)
             .status()
             .context("unable to run tar")?;
         if !status.success() {
@@ -399,57 +416,129 @@ fn refresh_agents(archive: &Path, state_root: &Path) -> Result<usize> {
     Ok(count)
 }
 
-/// Puts the new binary at `target`, keeping whatever was there at
-/// `previous`.
+/// A verified download, held open.
 ///
-/// The new file is copied next to the target first, because the download
-/// is in a temporary directory that is usually on another filesystem, and
-/// then renamed. Rename is what makes this safe for a running process:
-/// the old inode is untouched and stays open until the service restarts.
-fn place_binary(staged: &Path, target: &Path, previous: &Path) -> Result<()> {
-    let directory = target
-        .parent()
-        .ok_or_else(|| anyhow!("{} has no directory", target.display()))?;
-    std::fs::create_dir_all(directory)
-        .with_context(|| format!("unable to create {}", directory.display()))?;
-
-    let incoming = directory.join(format!(".autobahn.update.{}", std::process::id()));
-    std::fs::copy(staged, &incoming)
-        .with_context(|| format!("unable to write {}", incoming.display()))?;
-    if let Err(error) = make_executable(&incoming) {
-        let _ = std::fs::remove_file(&incoming);
-        return Err(error);
-    }
-
-    // `symlink_metadata`, so a directory entry that is a symlink (a
-    // hand-managed install, or a development tree) is kept rather than
-    // followed and missed.
-    if std::fs::symlink_metadata(target).is_ok() {
-        let _ = std::fs::remove_file(previous);
-        std::fs::rename(target, previous).with_context(|| {
-            format!(
-                "unable to keep the current binary at {}",
-                previous.display()
-            )
-        })?;
-    }
-    if let Err(error) = std::fs::rename(&incoming, target) {
-        // Nothing is left half-installed: the old binary goes back under
-        // its own name before this returns.
-        let _ = std::fs::rename(previous, target);
-        let _ = std::fs::remove_file(&incoming);
-        return Err(error)
-            .with_context(|| format!("unable to move the new binary into {}", target.display()));
-    }
-    Ok(())
+/// The checksum is computed from this handle, and every later use of the
+/// download reads it too, so replacing the file under its name after the
+/// check changes nothing that is installed.
+struct Verified {
+    file: File,
 }
 
-/// Makes a staged binary executable by its owner and readable by anyone,
-/// which is what the installer's `chmod 755` means.
-fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
-        .with_context(|| format!("unable to make {} executable", path.display()))
+impl Verified {
+    /// Opens a download and checks it against the release's checksums.
+    fn open(path: &Path, name: &str, sums: &str) -> Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("unable to open {}", path.display()))?;
+        let verified = Self { file };
+        verify(&verified, name, sums)?;
+        Ok(verified)
+    }
+
+    /// The verified bytes from the start, as a child's standard input.
+    fn reader(&self) -> Result<Stdio> {
+        Ok(Stdio::from(self.rewound()?))
+    }
+
+    /// A second descriptor on the same open file, at its start.
+    fn rewound(&self) -> Result<File> {
+        let mut file = self
+            .file
+            .try_clone()
+            .context("unable to reopen a download")?;
+        file.seek(SeekFrom::Start(0))
+            .context("unable to rewind a download")?;
+        Ok(file)
+    }
+}
+
+/// The new binary, copied beside the target and not yet installed.
+///
+/// Its own file, created fresh and private and made executable only
+/// once its bytes are written, so it is the verified content and
+/// nothing else. It is removed if it is dropped before it is placed.
+struct Incoming {
+    path: PathBuf,
+    placed: bool,
+}
+
+impl Incoming {
+    /// Copies the verified bytes next to `target`. The download is in a
+    /// temporary directory that may be on another filesystem, and the
+    /// rename that installs the binary cannot cross one.
+    fn stage(binary: &Verified, target: &Path) -> Result<Self> {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = target
+            .parent()
+            .ok_or_else(|| anyhow!("{} has no directory", target.display()))?;
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("unable to create {}", directory.display()))?;
+        let path = directory.join(format!(
+            ".autobahn.update.{}",
+            crate::fsutil::random_hex(8)?
+        ));
+        let mut file = crate::fsutil::private_file(&path)?;
+        let incoming = Self {
+            path,
+            placed: false,
+        };
+        std::io::copy(&mut binary.rewound()?, &mut file)
+            .with_context(|| format!("unable to write {}", incoming.path.display()))?;
+        // Through the handle, and before it is closed: nothing can be
+        // executed from this file before its content is complete.
+        file.set_permissions(std::fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("unable to make {} executable", incoming.path.display()))?;
+        // Closed before anything runs it: Linux refuses to execute a file
+        // that is open for writing.
+        drop(file);
+        Ok(incoming)
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Puts the new binary at `target`, keeping whatever was there at
+    /// `previous`.
+    ///
+    /// Rename is what makes this safe for a running process: the old
+    /// inode is untouched and stays open until the service restarts.
+    fn place(mut self, target: &Path, previous: &Path) -> Result<()> {
+        // `symlink_metadata`, so a directory entry that is a symlink (a
+        // hand-managed install, or a development tree) is kept rather than
+        // followed and missed.
+        if std::fs::symlink_metadata(target).is_ok() {
+            let _ = std::fs::remove_file(previous);
+            std::fs::rename(target, previous).with_context(|| {
+                format!(
+                    "unable to keep the current binary at {}",
+                    previous.display()
+                )
+            })?;
+        }
+        if let Err(error) = std::fs::rename(&self.path, target) {
+            // Nothing is left half-installed: the old binary goes back under
+            // its own name before this returns.
+            let _ = std::fs::rename(previous, target);
+            return Err(error).with_context(|| {
+                format!("unable to move the new binary into {}", target.display())
+            });
+        }
+        self.placed = true;
+        Ok(())
+    }
+}
+
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if !self.placed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 /// Runs a downloaded binary and returns the version it reports.
@@ -458,7 +547,6 @@ fn make_executable(path: &Path) -> Result<()> {
 /// assembled with two platforms transposed, or an asset renamed by hand,
 /// matches its own SHA256SUMS exactly and still cannot run here.
 fn run_reports_version(binary: &Path) -> Result<String> {
-    make_executable(binary)?;
     let output = Command::new(binary)
         .arg("--version")
         .output()
@@ -587,7 +675,7 @@ fn reported_version(output: &str) -> Option<&str> {
 }
 
 /// Verifies one downloaded file against the release's checksums.
-fn verify(file: &Path, name: &str, sums: &str) -> Result<()> {
+fn verify(file: &Verified, name: &str, sums: &str) -> Result<()> {
     let expected = expected_checksum(sums, name)
         .ok_or_else(|| anyhow!("SHA256SUMS has no entry for {name}"))?;
     let actual = checksum(file)?;
@@ -630,7 +718,10 @@ fn is_sha256(token: &str) -> bool {
 /// Computes a file's SHA-256, using whichever of the two standard tools
 /// this machine has. The installer makes the same choice, so both refuse
 /// on the same machines rather than one silently skipping the check.
-fn checksum(file: &Path) -> Result<String> {
+///
+/// The tool reads the open file on its standard input rather than a
+/// path, so the digest is of the bytes behind this handle.
+fn checksum(file: &Verified) -> Result<String> {
     let (program, arguments): (&str, &[&str]) = if have("sha256sum") {
         ("sha256sum", &[])
     } else if have("shasum") {
@@ -640,15 +731,11 @@ fn checksum(file: &Path) -> Result<String> {
     };
     let output = Command::new(program)
         .args(arguments)
-        .arg(file)
+        .stdin(file.reader()?)
         .output()
         .with_context(|| format!("unable to run {program}"))?;
     if !output.status.success() {
-        bail!(
-            "{program} exited with {} for {}",
-            output.status,
-            file.display()
-        );
+        bail!("{program} exited with {}", output.status);
     }
     let reported = String::from_utf8_lossy(&output.stdout);
     parse_checksum_output(&reported)
@@ -816,37 +903,13 @@ fn tag_from_release_url(url: &str) -> Option<&str> {
     }
 }
 
-/// A temporary directory that removes itself.
-///
-/// Its own type rather than a bare path, so every early return in `run`
-/// takes the downloads with it. `tempfile` is a development dependency
-/// and is deliberately not made a shipping one for this.
-struct Workspace(PathBuf);
-
-impl Workspace {
-    fn new() -> Result<Self> {
-        let path = std::env::temp_dir().join(format!(
-            "autobahn-update-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|since| since.as_nanos())
-                .unwrap_or(0)
-        ));
-        std::fs::create_dir_all(&path)
-            .with_context(|| format!("unable to create {}", path.display()))?;
-        Ok(Self(path))
-    }
-
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for Workspace {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+/// The private directory a run downloads into, under the state root's
+/// `tmp/`, never the shared temporary directory: a download is read again
+/// after it is checked, and nobody else may be able to reach it. Removed,
+/// with everything in it, when dropped, so every early return in `run`
+/// takes the downloads with it.
+fn workspace(state_root: &Path) -> Result<crate::fsutil::PrivateTempDir> {
+    crate::fsutil::private_tempdir_in(state_root)
 }
 
 /// Whether a program is on the PATH, which is `command -v` without a
@@ -1001,15 +1064,17 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
         let wrong = "\
 0000000000000000000000000000000000000000000000000000000000000000  autobahn-linux-x86_64
 ";
-        let error = verify(&file, "autobahn-linux-x86_64", wrong)
-            .expect_err("a wrong checksum must refuse");
+        let error = Verified::open(&file, "autobahn-linux-x86_64", wrong)
+            .err()
+            .expect("a wrong checksum must refuse");
         assert!(format!("{error}").contains("checksum mismatch"), "{error}");
 
         let absent = "\
 0000000000000000000000000000000000000000000000000000000000000000  autobahn-agents.tar.gz
 ";
-        let error =
-            verify(&file, "autobahn-linux-x86_64", absent).expect_err("a missing entry refuses");
+        let error = Verified::open(&file, "autobahn-linux-x86_64", absent)
+            .err()
+            .expect("a missing entry refuses");
         assert!(format!("{error}").contains("no entry"), "{error}");
     }
 
@@ -1020,9 +1085,149 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
         let directory = tempfile::tempdir().expect("temporary directory");
         let file = directory.path().join("autobahn-linux-x86_64");
         std::fs::write(&file, b"content").expect("writes");
-        let digest = checksum(&file).expect("a digest");
-        let sums = format!("{digest}  autobahn-linux-x86_64\n");
-        verify(&file, "autobahn-linux-x86_64", &sums).expect("its own digest verifies");
+        let sums = sums_for(&file, "autobahn-linux-x86_64");
+        Verified::open(&file, "autobahn-linux-x86_64", &sums).expect("its own digest verifies");
+    }
+
+    /// A `SHA256SUMS` line for `file` as it is now, from the machine's
+    /// own tool.
+    fn sums_for(file: &Path, name: &str) -> String {
+        let handle = Verified {
+            file: File::open(file).expect("opens"),
+        };
+        format!("{}  {name}\n", checksum(&handle).expect("a digest"))
+    }
+
+    /// What is installed is what was checked. The name of a download can
+    /// be replaced after its checksum passes; the copy that is run and
+    /// installed comes from the handle the checksum read.
+    #[test]
+    fn a_download_swapped_after_verification_is_not_what_is_installed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let staged = directory.path().join("autobahn-linux-x86_64");
+        std::fs::write(&staged, b"the verified binary").expect("writes");
+        let sums = sums_for(&staged, "autobahn-linux-x86_64");
+        let verified = Verified::open(&staged, "autobahn-linux-x86_64", &sums).expect("verifies");
+
+        // A new file under the name, the way somebody racing the update
+        // would replace it, not a write into the checked one.
+        let aside = directory.path().join("replacement");
+        std::fs::write(&aside, b"somebody else's binary").expect("writes");
+        std::fs::rename(&aside, &staged).expect("renames");
+
+        let target = directory.path().join("bin").join("autobahn");
+        let previous = directory.path().join("bin").join("autobahn.previous");
+        let incoming = Incoming::stage(&verified, &target).expect("stages");
+        assert_eq!(
+            std::fs::read(incoming.path()).expect("reads"),
+            b"the verified binary",
+            "what runs --version is the checked bytes"
+        );
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(incoming.path())
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o755);
+        incoming.place(&target, &previous).expect("installs");
+        assert_eq!(
+            std::fs::read(&target).expect("reads"),
+            b"the verified binary"
+        );
+    }
+
+    /// The same for the bundle: tar unpacks the handle, not the name.
+    #[test]
+    fn a_bundle_swapped_after_verification_is_not_what_is_unpacked() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let archive = directory.path().join(AGENTS_ASSET);
+        bundle(
+            &directory.path().join("good"),
+            b"the verified agent",
+            &archive,
+        );
+        let sums = sums_for(&archive, AGENTS_ASSET);
+        let verified = Verified::open(&archive, AGENTS_ASSET, &sums).expect("verifies");
+
+        let evil = directory.path().join("evil.tar.gz");
+        bundle(
+            &directory.path().join("bad"),
+            b"somebody else's agent",
+            &evil,
+        );
+        std::fs::rename(&evil, &archive).expect("renames");
+
+        let state_root = directory.path().join("state");
+        refresh_agents(&verified, &state_root).expect("refreshes");
+        assert_eq!(
+            std::fs::read(state_root.join("agents").join("autobahn-linux-x86_64")).expect("reads"),
+            b"the verified agent"
+        );
+    }
+
+    /// Writes an agent bundle holding one agent with `content`.
+    fn bundle(scratch: &Path, content: &[u8], archive: &Path) {
+        std::fs::create_dir_all(scratch.join("agents")).expect("directories");
+        std::fs::write(
+            scratch.join("agents").join("autobahn-linux-x86_64"),
+            content,
+        )
+        .expect("writes");
+        let status = Command::new("tar")
+            .arg("czf")
+            .arg(archive)
+            .arg("-C")
+            .arg(scratch)
+            .arg("agents")
+            .status()
+            .expect("runs tar");
+        assert!(status.success());
+    }
+
+    /// Downloads land in a directory only this user can enter, under the
+    /// state root, not in the shared temporary directory.
+    #[test]
+    fn the_update_workspace_is_private_under_the_state_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let state_root = directory.path().join("state");
+        let work = workspace(&state_root).expect("a workspace");
+        assert_eq!(work.path().parent(), Some(state_root.join("tmp").as_path()));
+        let mode = std::fs::symlink_metadata(work.path())
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o7777, 0o700);
+        let path = work.path().to_path_buf();
+        drop(work);
+        assert!(!path.exists(), "the workspace goes when the run does");
+    }
+
+    /// A staged binary that is never placed does not stay behind in the
+    /// directory on the PATH.
+    #[test]
+    fn a_binary_staged_and_not_placed_is_removed() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let staged = directory.path().join("downloaded");
+        std::fs::write(&staged, b"the new binary").expect("writes");
+        let verified = Verified {
+            file: File::open(&staged).expect("opens"),
+        };
+        let bin_dir = directory.path().join("bin");
+        let incoming = Incoming::stage(&verified, &bin_dir.join("autobahn")).expect("stages");
+        drop(incoming);
+        assert_eq!(std::fs::read_dir(&bin_dir).expect("lists").count(), 0);
+    }
+
+    /// Stages and places a download, as `run` does once it is verified.
+    fn place(staged: &Path, target: &Path, previous: &Path) {
+        let verified = Verified {
+            file: File::open(staged).expect("opens"),
+        };
+        Incoming::stage(&verified, target)
+            .expect("stages")
+            .place(target, previous)
+            .expect("installs");
     }
 
     /// The release publishes `darwin-*`, and Rust calls the same machine
@@ -1110,7 +1315,7 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
         let staged = directory.path().join("downloaded");
         std::fs::write(&staged, b"the new binary").expect("writes");
 
-        place_binary(&staged, &target, &previous).expect("installs");
+        place(&staged, &target, &previous);
 
         assert_eq!(
             std::fs::read(&target).expect("reads"),
@@ -1143,7 +1348,7 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
         let staged = directory.path().join("downloaded");
         std::fs::write(&staged, b"the new binary").expect("writes");
 
-        place_binary(&staged, &target, &previous).expect("installs");
+        place(&staged, &target, &previous);
         assert_eq!(std::fs::read(&target).expect("reads"), b"the new binary");
         assert!(!previous.exists(), "nothing was displaced");
     }

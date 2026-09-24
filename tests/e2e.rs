@@ -2332,11 +2332,20 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
     let beta = directory.path().join("b");
     let home = directory.path().join("home");
     fs::create_dir_all(&home).expect("home");
-    // 2,500 levels where the platform allows paths that long; Linux refuses
-    // any path over 4,096 bytes, so there the chain is as deep as fits.
-    let limit = 4_000usize.saturating_sub(beta.as_os_str().len() + 16);
+    // 2,500 levels where the platform allows paths that long, else as deep
+    // as its path limit fits (Linux: 4,096 bytes). macOS allows only 1,024,
+    // about 500 levels, far too shallow to exhaust a default thread stack,
+    // so there the overflow this guards against cannot be built this way.
+    let path_max = libc::PATH_MAX as usize;
+    let limit = path_max.saturating_sub(96 + beta.as_os_str().len() + 16);
     let depth = 2_500.min(limit / 2);
-    assert!(depth > 1_700, "too shallow to test anything: {depth}");
+    if depth <= 1_700 {
+        eprintln!(
+            "skipped: this platform's paths ({path_max} bytes) cannot hold a chain \
+             deep enough to overflow a default stack ({depth} levels)"
+        );
+        return;
+    }
     let mut leaf = alpha.clone();
     for _ in 0..depth {
         leaf.push("d");

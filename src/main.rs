@@ -928,6 +928,18 @@ fn run_sync(
             &ignores,
         )
         .map_err(|problem| anyhow::anyhow!(problem))?;
+    // Credentials are synchronized as asked, and said so first.
+    for (target, identity) in [
+        (&alpha_target, &alpha_identity),
+        (&beta_target, &beta_identity),
+    ] {
+        if let (autobahn::config::EndpointTarget::Local(_), Some(warning)) = (
+            target,
+            autobahn::config::secrets_warning(identity, &ignores),
+        ) {
+            eprintln!("warning: {warning}; pass --ignore for each to leave them out");
+        }
+    }
 
     // Construct the endpoints: an agent connection (SSH or explicit
     // command) for remote specifications, a local endpoint otherwise.
@@ -1474,6 +1486,9 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
     }
     let state_root = resolve_state_root(state_root)?;
     autobahn::config::OwnState::new(&state_root, Some(&config)).check_plans(&plans)?;
+    for warning in autobahn::config::secret_warnings(&plans) {
+        eprintln!("warning: {warning}");
+    }
     let supervisor = Supervisor::new(plans, state_root, false);
     let outcomes = supervisor.run_once();
     let mut failures = 0usize;
@@ -1563,6 +1578,9 @@ fn run_watch(
     let state_root = resolve_state_root(state_root)?;
     let own_state = autobahn::config::OwnState::new(&state_root, Some(&config_path));
     own_state.check_plans(&loaded.plans)?;
+    for warning in autobahn::config::secret_warnings(&loaded.plans) {
+        eprintln!("warning: {warning}");
+    }
 
     // Said before the first cycle, while someone is still looking at the
     // terminal. These sessions will stop on their own anyway; the point is

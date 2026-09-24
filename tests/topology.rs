@@ -301,3 +301,57 @@ fn a_manual_sync_of_the_home_directory_needs_the_state_root_ignored() {
     assert_eq!(fs::read_to_string(beta.join("notes.txt")).unwrap(), "mine");
     assert!(!beta.join(".autobahn").exists());
 }
+
+/// A root holding credentials is synchronized as asked, and said so,
+/// once, at the start of the run.
+#[test]
+fn a_root_holding_credentials_is_warned_about_at_startup() {
+    let world = World::new();
+    let tree = world.directory("tree");
+    write(&tree, ".aws/credentials", "secret");
+    let beta = world.keep.path().join("beta");
+    let config = world.keep.path().join("config.toml");
+    let text = |extra: &str| {
+        format!(
+            r#"
+            [groups.tree]
+            alpha = "{tree}"
+            mode = "two-way-safe"
+            betas = ["{beta}"]
+            {extra}
+            "#,
+            tree = tree.display(),
+            beta = beta.display()
+        )
+    };
+    let state = world.keep.path().join("state");
+    let run = || {
+        world.cli(&[
+            "sync",
+            "--config",
+            path(&config),
+            "--state-root",
+            path(&state),
+        ])
+    };
+
+    fs::write(&config, text("")).unwrap();
+    let (ok, output) = run();
+    assert!(ok, "{output}");
+    assert_eq!(
+        output.matches("holds credentials (.aws)").count(),
+        1,
+        "{output}"
+    );
+
+    fs::write(&config, text("acknowledge_secrets = true")).unwrap();
+    let (ok, output) = run();
+    assert!(ok && !output.contains("credentials"), "{output}");
+
+    // The manual form says so too, and names its own way out.
+    let other = world.keep.path().join("other");
+    let (ok, output) = world.cli(&["sync", path(&tree), path(&other)]);
+    assert!(ok, "{output}");
+    assert!(output.contains("holds credentials (.aws)"), "{output}");
+    assert!(output.contains("--ignore"), "{output}");
+}

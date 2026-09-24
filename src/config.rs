@@ -541,6 +541,10 @@ pub struct Group {
     /// they are, so turning it back on resumes rather than starts over.
     #[serde(default)]
     pub disabled: bool,
+    /// Silences the warning about a root that holds credentials (`.ssh`,
+    /// `.aws` and the like): the group means to synchronize them.
+    #[serde(default)]
+    pub acknowledge_secrets: bool,
     /// Advanced: connect this group's remote endpoints through this command
     /// (whitespace split into argv) instead of SSH. Used for testing and
     /// custom transports; the endpoint's host is then informational only.
@@ -611,6 +615,9 @@ pub struct SessionPlan {
     /// a supervisor and a manual `sync` — share one identity and therefore
     /// one state lock.
     identifier: String,
+    /// Whether the group said it means to synchronize credentials, which
+    /// silences [`secret_warnings`] for its roots.
+    pub acknowledge_secrets: bool,
     /// The beta path, shown in the label when another plan of the group
     /// shares this one's host: `group@host` alone would name both.
     shown_path: Option<String>,
@@ -957,6 +964,75 @@ fn alpha_is_written(mode: SyncMode) -> bool {
         | SyncMode::TwoWayStrict => true,
         SyncMode::OneWaySafe | SyncMode::OneWayReplica => false,
     }
+}
+
+/// The directories under a root that hold credentials, which a root
+/// covering a home directory would send to every destination. Not ignored
+/// by default, since someone may mean to synchronize them; warned about
+/// instead.
+const SECRET_PATHS: [&str; 5] = [".ssh", ".aws", ".gnupg", ".config/gcloud", ".kube"];
+
+/// Describes the credentials a local root would synchronize, if any: the
+/// credential directories it holds that its ignores leave in, or, for a
+/// home directory, every one they leave in, since a home that does not
+/// hold one yet soon may. `None` when there is nothing to say.
+pub fn secrets_warning(identity: &str, ignores: &[String]) -> Option<String> {
+    let home = std::env::var_os("HOME").map(|home| resolve_for_identity(Path::new(&home)));
+    secrets_warning_in(identity, ignores, home.as_deref())
+}
+
+fn secrets_warning_in(identity: &str, ignores: &[String], home: Option<&Path>) -> Option<String> {
+    let root = Path::new(identity);
+    let is_home = home == Some(root);
+    let ignores = IgnoreSet::new(ignores).ok();
+    let found: Vec<&str> = SECRET_PATHS
+        .into_iter()
+        .filter(|path| is_home || root.join(path).symlink_metadata().is_ok())
+        .filter(|path| {
+            !ignores
+                .as_ref()
+                .is_some_and(|ignores| excluded_by(ignores, path))
+        })
+        .collect();
+    if found.is_empty() {
+        return None;
+    }
+    let home = match is_home {
+        true => " is your home directory, and",
+        false => "",
+    };
+    Some(format!(
+        "the root {identity}{home} holds credentials ({}) that every destination will \
+         receive",
+        found.join(", ")
+    ))
+}
+
+/// The credential warnings for a set of plans: one per local root, however
+/// many sessions share it, skipping the groups that set
+/// `acknowledge_secrets`. Said once, when a run starts.
+pub fn secret_warnings(plans: &[SessionPlan]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut warnings = Vec::new();
+    for plan in plans.iter().filter(|plan| !plan.acknowledge_secrets) {
+        for (target, identity) in [
+            (&plan.alpha, &plan.alpha_identity),
+            (&plan.beta, &plan.beta_identity),
+        ] {
+            if !matches!(target, EndpointTarget::Local(_)) || seen.contains(&identity.as_str()) {
+                continue;
+            }
+            seen.push(identity);
+            if let Some(warning) = secrets_warning(identity, &plan.ignores) {
+                warnings.push(format!(
+                    "group '{}': {warning}; add them to the group's `ignores`, or set \
+                     `acknowledge_secrets = true` on it if that is meant",
+                    plan.group
+                ));
+            }
+        }
+    }
+    warnings
 }
 
 fn default_reload() -> bool {
@@ -1531,6 +1607,7 @@ impl Config {
                     default_group: default_group.clone(),
                     peering,
                     identifier,
+                    acknowledge_secrets: group.acknowledge_secrets,
                     shown_path: None,
                 };
                 if let Err(problem) =
@@ -2879,6 +2956,64 @@ betas = ["build.example.com:/tmp/beta"]
             .check(&target, &base.to_string_lossy(), &["state".to_owned()])
             .expect_err("the configuration's directory");
         assert!(problem.contains("autobahn's configuration"), "{problem}");
+    }
+
+    /// A root holding credentials is warned about, once, naming them —
+    /// unless they are ignored or the group says it means it.
+    #[test]
+    fn a_root_holding_credentials_is_warned_about_unless_ignored_or_acknowledged() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        std::fs::create_dir_all(root.join(".config/gcloud")).unwrap();
+        std::fs::create_dir_all(root.join(".config/other")).unwrap();
+        let warnings = |extra: &str| {
+            let config = parse(&format!(
+                r#"
+                [groups.dots]
+                alpha = "{root}"
+                mode = "two-way-safe"
+                betas = ["host:/dots", "other:/dots"]
+                {extra}
+                "#,
+                root = root.display()
+            ));
+            secret_warnings(&config.plans().expect("plans should build"))
+        };
+
+        let found = warnings("");
+        assert_eq!(found.len(), 1, "once per root, not per session: {found:?}");
+        assert!(found[0].contains(".ssh, .config/gcloud"), "{found:?}");
+        assert!(found[0].contains("acknowledge_secrets = true"), "{found:?}");
+        assert!(found[0].contains("ignores"), "{found:?}");
+
+        let found = warnings(r#"ignores = [".ssh"]"#);
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(!found[0].contains(".ssh"), "{found:?}");
+        assert!(warnings(r#"ignores = [".ssh", ".config/gcloud"]"#).is_empty());
+        assert!(warnings(r#"ignores = [".ssh", ".config"]"#).is_empty());
+        assert!(warnings("acknowledge_secrets = true").is_empty());
+    }
+
+    /// A home directory is warned about for every credential directory it
+    /// could hold, present yet or not, that is not ignored.
+    #[test]
+    fn a_home_root_is_warned_about_for_every_unignored_credential_directory() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let home = resolve_for_identity(keep.path());
+        let identity = home.to_string_lossy();
+        let found = secrets_warning_in(&identity, &[], Some(&home)).expect("a warning");
+        assert!(found.contains("home directory"), "{found}");
+        assert!(
+            found.contains(".ssh, .aws, .gnupg, .config/gcloud, .kube"),
+            "{found}"
+        );
+        let ignores: Vec<String> = [".ssh", ".aws", ".gnupg", ".config/gcloud", ".kube"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(secrets_warning_in(&identity, &ignores, Some(&home)).is_none());
+        let elsewhere = home.join("project");
+        assert!(secrets_warning_in(&elsewhere.to_string_lossy(), &[], Some(&home)).is_none());
     }
 
     /// A nested endpoint the outer session ignores is not shared with it:

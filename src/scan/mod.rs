@@ -113,7 +113,7 @@ const MODE_EXECUTABLE_MASK: u32 = 0o111;
 
 /// The name prefix used by transition staging temporaries, which are
 /// invisible to scans.
-const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
+pub(crate) const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 
 /// Whether a name is one of autobahn's own temporary names, as opposed to a
 /// user's file that merely begins with the reserved prefix.
@@ -132,7 +132,7 @@ const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 /// Anything else in the reserved space is surfaced as a scan problem: not
 /// silently skipped (the divergence above), and not synchronized either
 /// (another process's in-flight temporary must never be transferred).
-fn autobahn_temporary(name: &str) -> bool {
+pub(crate) fn autobahn_temporary(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(TEMPORARY_PREFIX) else {
         return false;
     };

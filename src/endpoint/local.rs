@@ -36,15 +36,15 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
 use crate::rsync::{self, Signature};
+// `TEMPORARY_PREFIX` names every temporary this module creates. It is the
+// scanner's own constant, so temporaries are invisible to the
+// synchronization hierarchy wherever they live, and the refusal in
+// `validate_name` cannot drift from what scans hide.
 use crate::scan::{
     self, recompose, validate_portable_target, FilesystemBehavior, IgnoreSet, SymlinkMode,
+    TEMPORARY_PREFIX,
 };
 use crate::tree::{path_join, Change, Content, Digest, FileMetadata, Node, Problem, Snapshot};
-
-/// The name prefix shared by every temporary file this module creates. It
-/// matches the prefix that scanning skips, so temporaries are invisible to
-/// the synchronization hierarchy no matter which directory they live in.
-const TEMPORARY_PREFIX: &str = ".autobahn-tmp";
 
 /// The default permission bits applied to created directories. The default
 /// is deliberately conservative (owner-only, matching Mutagen): synchronized
@@ -1131,12 +1131,7 @@ impl Endpoint for LocalEndpoint {
     }
 
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {
-        fs::create_dir_all(&self.staging_root).with_context(|| {
-            format!(
-                "unable to create staging directory {}",
-                self.staging_root.display()
-            )
-        })?;
+        prepare_staging_root(&self.staging_root, &self.root)?;
 
         // Any receive state left over from a previous staging operation
         // belongs to a stream that will never be continued.
@@ -2295,7 +2290,10 @@ impl<'a> Transitioner<'a> {
             // crash can leave a correctly named file with truncated bytes.
             // Publishing that would install content matching nothing and
             // then model it as correct.
-            let copied = match copy_verifying(&staged, &temporary, digest) {
+            let copied = match File::open(&staged)
+                .with_context(|| format!("unable to open {}", staged.display()))
+                .and_then(|mut input| copy_into_private(&mut input, &staged, &temporary, digest))
+            {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     let _ = fs::remove_file(&temporary);
@@ -2806,6 +2804,51 @@ pub fn staging_root_for(
     }
 }
 
+/// Makes the staging directory ready to receive into: a real directory,
+/// owned by this user, that only this user can use.
+///
+/// Inside the root, the staging directory's name is one a peer could once
+/// create — as a symbolic link to anywhere, which a plain `create_dir_all`
+/// accepted and staging then wrote through. [`private_dir`] refuses a link,
+/// a non-directory and another user's directory, creates with mode `0700`,
+/// and tightens an older, looser one rather than refusing it, so staging
+/// directories made by earlier versions keep working.
+///
+/// A missing parent is created, owner-only: for the state placement that
+/// is the state area's own `staging` directory, and for the inside-root
+/// one the root itself, which staging has always been able to create
+/// before the transition that fills it. The root is then verified without
+/// following links, as the transition path verifies it; the other parents
+/// lie outside the synchronized tree, where a peer cannot put a link, and
+/// may legitimately be reached through one.
+///
+/// [`private_dir`]: crate::fsutil::private_dir
+fn prepare_staging_root(staging_root: &Path, root: &Path) -> Result<()> {
+    let parent = staging_root
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .with_context(|| {
+            format!(
+                "the staging directory {} has no parent",
+                staging_root.display()
+            )
+        })?;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(parent)
+        .with_context(|| format!("unable to create {}", parent.display()))?;
+    if parent == root {
+        verify_directory(parent).map_err(|error| anyhow!("unable to stage: {error}"))?;
+    } else if !fs::metadata(parent)
+        .with_context(|| format!("unable to inspect {}", parent.display()))?
+        .is_dir()
+    {
+        bail!("unable to stage: {} is not a directory", parent.display());
+    }
+    crate::fsutil::private_dir(staging_root).context("unable to prepare the staging directory")
+}
+
 /// Renders a digest as the lowercase hex name its staged content lives under.
 fn digest_hex(digest: &Digest) -> String {
     use std::fmt::Write;
@@ -2822,12 +2865,29 @@ fn staged_path(staging_root: &Path, digest: &Digest) -> PathBuf {
 
 /// Generates a unique temporary file name carrying the scan-invisible prefix.
 /// Names are unique within a process and, through the process identifier,
-/// between concurrent processes sharing a staging directory.
+/// between concurrent processes sharing a directory. The trailing token is
+/// a keyed hash of the counter under a per-process random key, so another
+/// local user who can see the process identifier still cannot predict the
+/// next name to plant something there.
 fn temporary_name(purpose: &str) -> String {
+    static KEY: std::sync::OnceLock<[u8; 32]> = std::sync::OnceLock::new();
+    let key = KEY.get_or_init(|| {
+        let seed = crate::fsutil::random_hex(16).unwrap_or_else(|_| {
+            // No /dev/urandom: the names stay unique, and the private
+            // creation of every temporary still refuses a planted entry.
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{}-{}", std::process::id(), now.as_nanos())
+        });
+        *blake3::hash(seed.as_bytes()).as_bytes()
+    });
     let count = TEMPORARY_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let token = blake3::keyed_hash(key, &count.to_le_bytes());
     format!(
-        "{TEMPORARY_PREFIX}-{purpose}-{}-{count}",
-        std::process::id()
+        "{TEMPORARY_PREFIX}-{purpose}-{}-{count}-{}",
+        std::process::id(),
+        &token.to_hex()[..16]
     )
 }
 
@@ -3091,6 +3151,40 @@ fn copy_verifying(source: &Path, temporary: &Path, digest: &Digest) -> Result<bo
     Ok(hasher.finalize().as_bytes() == digest)
 }
 
+/// Streams already-open content into a new private temporary while
+/// digesting it, returning whether the content matched the expected
+/// digest. The temporary is created with [`private_file`]: `0600` until
+/// publication gives it its configured mode, and never through anything
+/// already at that name, a planted symbolic link included.
+///
+/// [`private_file`]: crate::fsutil::private_file
+fn copy_into_private(
+    input: &mut File,
+    source: &Path,
+    temporary: &Path,
+    digest: &Digest,
+) -> Result<bool> {
+    let mut output = crate::fsutil::private_file(temporary)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
+    loop {
+        let count = input
+            .read(&mut buffer)
+            .with_context(|| format!("unable to read {}", source.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        output
+            .write_all(&buffer[..count])
+            .with_context(|| format!("unable to write {}", temporary.display()))?;
+    }
+    output
+        .flush()
+        .with_context(|| format!("unable to flush {}", temporary.display()))?;
+    Ok(hasher.finalize().as_bytes() == digest)
+}
+
 /// Computes the rsync signature of whatever base content exists at a path.
 ///
 /// Anything other than a readable regular file yields an empty signature,
@@ -3145,6 +3239,14 @@ fn validate_name(name: &str) -> Result<(), String> {
     }
     if name.contains('/') || name.contains('\0') {
         return Err("path component contains a separator or NUL".into());
+    }
+    // Scanning hides autobahn's own temporaries and reports every other
+    // name in the reserved space as unsynchronizable, so no genuine
+    // controller proposes one. A peer that could create one would make
+    // an entry every later scan skips — or, named as an inside-root
+    // staging directory, a symbolic link that staging writes through.
+    if name.starts_with(TEMPORARY_PREFIX) {
+        return Err("path component uses a name reserved for autobahn".into());
     }
     Ok(())
 }
@@ -5392,5 +5494,206 @@ mod apply_path_tests {
         assert!(format!("{error:#}").contains("already exists"), "{error:#}");
         assert_eq!(fs::read(fixture.root.join("b.txt")).unwrap(), b"occupant");
         assert_eq!(fs::read(fixture.root.join("a.txt")).unwrap(), b"moved");
+    }
+
+    fn file_node(name: &str) -> Node {
+        Node {
+            name: name.to_owned(),
+            content: Content::File {
+                digest: [9; 32],
+                executable: false,
+                metadata: FileMetadata::default(),
+            },
+        }
+    }
+
+    fn problem_paths(outcome: &TransitionOutcome) -> Vec<&str> {
+        outcome
+            .problems
+            .iter()
+            .map(|problem| problem.path.as_str())
+            .collect()
+    }
+
+    /// What scanning hides or refuses to synchronize, a peer cannot
+    /// create: neither at a transition's own path nor as a child of a
+    /// directory it creates.
+    #[test]
+    fn a_transition_creating_a_reserved_name_is_refused() {
+        let fixture = escape();
+        let mut endpoint = fixture.endpoint;
+        endpoint.scan().expect("scan");
+        let changes = vec![
+            Change {
+                path: ".autobahn-tmp-staging-s-beta".into(),
+                old: None,
+                new: Some(Node::directory(".autobahn-tmp-staging-s-beta", Vec::new())),
+            },
+            Change {
+                path: ".autobahn-tmp-x".into(),
+                old: None,
+                new: Some(file_node(".autobahn-tmp-x")),
+            },
+            Change {
+                path: "d".into(),
+                old: None,
+                new: Some(Node::directory(
+                    "d",
+                    vec![file_node(".autobahn-tmp-recv-1-1")],
+                )),
+            },
+        ];
+        let outcome = endpoint.transition(changes).expect("transition");
+        let problems = problem_paths(&outcome);
+        for path in [
+            ".autobahn-tmp-staging-s-beta",
+            ".autobahn-tmp-x",
+            "d/.autobahn-tmp-recv-1-1",
+        ] {
+            assert!(problems.contains(&path), "{path}: {:?}", outcome.problems);
+            assert!(
+                fs::symlink_metadata(fixture.root.join(path)).is_err(),
+                "{path} was created"
+            );
+        }
+        assert!(outcome
+            .problems
+            .iter()
+            .all(|problem| problem.message.contains("reserved")));
+    }
+
+    fn endpoint_staging_in(root: &Path, staging: PathBuf) -> LocalEndpoint {
+        LocalEndpoint::new(root.to_path_buf(), staging, EndpointOptions::default())
+            .expect("endpoint")
+    }
+
+    /// An inside-root staging directory that is a symbolic link out of the
+    /// root is refused, and nothing is staged at its target.
+    #[test]
+    fn a_symlinked_inside_root_staging_directory_is_refused() {
+        use crate::endpoint::StagingMode;
+        let fixture = escape();
+        let staging = staging_root_for(
+            StagingMode::InsideRoot,
+            &fixture.root,
+            PathBuf::new(),
+            "s1",
+            "beta",
+        )
+        .expect("staging root");
+        let target = fixture.outside.join("planted");
+        fs::create_dir(&target).expect("planted");
+        symlink(&target, &staging).expect("link");
+        let mut endpoint = endpoint_staging_in(&fixture.root, staging);
+        let error = endpoint
+            .stage_begin(vec![FileRequest {
+                path: "a.txt".into(),
+                digest: [1; 32],
+            }])
+            .expect_err("staging through a symbolic link must be refused");
+        assert!(format!("{error:#}").contains("symbolic link"), "{error:#}");
+        assert_eq!(fs::read_dir(&target).expect("target").count(), 0);
+    }
+
+    /// Every placement's staging directory is created owner-only.
+    #[test]
+    fn new_staging_directories_are_private_in_every_placement() {
+        use crate::endpoint::StagingMode;
+        let keep = tempdir().expect("temporary directory");
+        let state = keep.path().join("state/staging/s1-beta");
+        for mode in [
+            StagingMode::State,
+            StagingMode::BesideRoot,
+            StagingMode::InsideRoot,
+        ] {
+            let root = keep.path().join(format!("{mode:?}")).join("root");
+            fs::create_dir_all(&root).expect("root");
+            let staging =
+                staging_root_for(mode, &root, state.clone(), "s1", "beta").expect("staging root");
+            endpoint_staging_in(&root, staging.clone())
+                .stage_begin(Vec::new())
+                .expect("staging begins");
+            let metadata = fs::symlink_metadata(&staging).expect("staging exists");
+            assert!(metadata.is_dir(), "{mode:?}");
+            assert_eq!(metadata.mode() & 0o777, 0o700, "{mode:?}");
+        }
+        // The state area's own staging parent is created owner-only too.
+        let parent = fs::metadata(keep.path().join("state/staging")).expect("parent");
+        assert_eq!(parent.mode() & 0o777, 0o700);
+    }
+
+    /// A staging directory an older version left loose is tightened, not
+    /// refused.
+    #[test]
+    fn a_loose_staging_directory_is_tightened() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let staging = keep.path().join("staging");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir(&staging).expect("staging");
+        fs::set_permissions(&staging, Permissions::from_mode(0o755)).expect("loosen");
+        endpoint_staging_in(&root, staging.clone())
+            .stage_begin(Vec::new())
+            .expect("staging begins");
+        let mode = fs::metadata(&staging).expect("staging").mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    /// Another user's staging directory is refused. Only root can make
+    /// one, so the test runs only as root.
+    #[test]
+    fn a_staging_directory_owned_by_another_user_is_refused() {
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let staging = keep.path().join("staging");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir(&staging).expect("staging");
+        std::os::unix::fs::chown(&staging, Some(65534), Some(65534)).expect("chown");
+        let error = endpoint_staging_in(&root, staging)
+            .stage_begin(Vec::new())
+            .expect_err("another user's staging directory must be refused");
+        assert!(format!("{error:#}").contains("owned by"), "{error:#}");
+    }
+
+    /// Temporary names carry an unpredictable token, and still read as
+    /// autobahn's own to the scanner.
+    #[test]
+    fn temporary_names_are_unpredictable_and_hidden_from_scans() {
+        let first = temporary_name("apply");
+        let second = temporary_name("apply");
+        assert!(scan::autobahn_temporary(&first), "{first}");
+        let token = |name: &str| name.rsplit('-').next().unwrap().to_owned();
+        assert_eq!(token(&first).len(), 16);
+        assert_ne!(token(&first), token(&second));
+    }
+
+    /// A copy-publish never writes through something planted at its
+    /// temporary's name, and what it creates is owner-only.
+    #[test]
+    fn a_publish_copy_is_private_and_never_follows_a_planted_link() {
+        let keep = tempdir().expect("temporary directory");
+        let source = keep.path().join("source");
+        fs::write(&source, b"content").expect("source");
+        let digest = *blake3::hash(b"content").as_bytes();
+
+        let victim = keep.path().join("victim");
+        fs::write(&victim, b"untouched").expect("victim");
+        let planted = keep.path().join("planted");
+        symlink(&victim, &planted).expect("planted");
+        let mut input = File::open(&source).expect("open");
+        copy_into_private(&mut input, &source, &planted, &digest)
+            .expect_err("a planted link must be refused");
+        assert_eq!(fs::read(&victim).unwrap(), b"untouched");
+
+        let temporary = keep.path().join("temporary");
+        let mut input = File::open(&source).expect("open");
+        assert!(copy_into_private(&mut input, &source, &temporary, &digest).expect("copy"));
+        assert_eq!(
+            fs::metadata(&temporary).expect("temporary").mode() & 0o777,
+            0o600
+        );
     }
 }

@@ -2003,18 +2003,22 @@ fn connect(
 
 /// Opens a plan's two endpoints without taking its session lock.
 ///
-/// The supervisor takes the lock first and then calls this; `resolve` and
-/// `diff` call it alone, because they operate *beside* a running session —
-/// reading and writing individual files through the same endpoints, in the
-/// way any other program writing to the tree would — rather than owning
-/// the pair. The identity check is the same: a root that no longer
+/// The supervisor takes the lock first and then calls this; `doctor`,
+/// `resolve` and `diff` call it alone, because they operate *beside* a
+/// running session — reading and writing individual files through the same
+/// endpoints, in the way any other program writing to the tree would —
+/// rather than owning the pair. The identity check is the same: a root that no longer
 /// resolves to the tree it was planned against is refused.
+///
+/// None of those callers ever waits for a change, so the endpoints are
+/// opened one-shot: neither side, local or on an agent, watches its root.
+/// A scan without a watch walks the tree, so nothing they read is stale.
 pub fn open_endpoints(
     plan: &SessionPlan,
     state_root: &Path,
     pool: &AgentPool,
 ) -> Result<(Box<dyn Endpoint + Send>, Box<dyn Endpoint + Send>)> {
-    open_session_endpoints(plan, state_root, pool, false)
+    open_session_endpoints(plan, state_root, pool, true)
 }
 
 /// Opens a plan's two endpoints as [`open_endpoints`] does. `one_shot`
@@ -3039,8 +3043,8 @@ mod tests {
     }
 
     /// A single pass never waits for a change, so it asks its agents not
-    /// to watch their roots; `resolve` and `diff`, which open endpoints
-    /// through `open_endpoints`, are left as they were.
+    /// to watch their roots; nor do `doctor`, `diff` and `resolve`, which
+    /// open endpoints through `open_endpoints` and never wait either.
     #[test]
     fn a_single_pass_asks_its_agents_not_to_watch() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
@@ -3062,7 +3066,7 @@ mod tests {
         let initialize = initialized
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the agent was sent an initialization");
-        assert!(!initialize.one_shot);
+        assert!(initialize.one_shot, "open_endpoints asked for a watch");
     }
 
     #[test]

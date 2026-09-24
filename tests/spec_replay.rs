@@ -494,8 +494,8 @@ impl Game {
             self.mode,
             self.steps.join("\n  "),
             show(&self.alpha),
-            self.beta.iter().map(|t| show(t)).collect::<Vec<_>>(),
-            self.ancestor.iter().map(|t| show(t)).collect::<Vec<_>>(),
+            self.beta.iter().map(&show).collect::<Vec<_>>(),
+            self.ancestor.iter().map(show).collect::<Vec<_>>(),
             self.conflicts
                 .iter()
                 .map(|c| c.iter().map(|&q| board.joined(q)).collect::<Vec<_>>())

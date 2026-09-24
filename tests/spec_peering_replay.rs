@@ -632,7 +632,7 @@ fn play(
             }
             6 if game.changes < max_changes => game.takeover(rng.below(betas)),
             7 if game.changes < max_changes => game.handoff(),
-            8 | 9 | 10 => game.cycle(rng.below(hosts), rng.below(hosts)),
+            8..=10 => game.cycle(rng.below(hosts), rng.below(hosts)),
             11 => game.replicate(rng.below(hosts), rng.below(hosts)),
             _ => false,
         };

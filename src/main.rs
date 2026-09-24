@@ -2979,13 +2979,12 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
         ("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE),
         ("open-status", autobahn::config::OPEN_STATUS_EXAMPLE),
     ] {
-        match write_example_script(path.parent(), name, contents)? {
-            Some(written) => println!("wrote {}", written.display()),
-            // Never replaced, not even under `--force`: the configuration
-            // is autobahn's to rewrite, but a hook is a script its owner
-            // may have made their own, and there is no way to tell one
-            // that was edited from one that was not.
-            None => {}
+        // An existing script is never replaced, not even under `--force`:
+        // the configuration is autobahn's to rewrite, but a hook is a
+        // script its owner may have made their own, and there is no way to
+        // tell one that was edited from one that was not.
+        if let Some(written) = write_example_script(path.parent(), name, contents)? {
+            println!("wrote {}", written.display());
         }
     }
     println!("  it describes {sessions} session(s): edit the example group to add one");

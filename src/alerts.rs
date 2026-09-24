@@ -341,22 +341,22 @@ impl Alerter {
                     .0 += 1;
             } else {
                 groups.insert(session.group.as_str());
-                lines.push(format!(
+                lines.push(hook_line(&format!(
                     "{} → {}: {}",
                     session.group,
                     short_host(&session.host, &hosts),
                     session.summary
-                ));
+                )));
             }
         }
         let host_lines: Vec<String> = away
             .iter()
             .map(|(host, (count, reason))| {
-                format!(
+                hook_line(&format!(
                     "{} {reason} — {} paused",
                     short_host(host, &hosts),
                     plural(*count, "group")
-                )
+                ))
             })
             .collect();
 
@@ -377,12 +377,15 @@ impl Alerter {
                 parts.join(", ")
             }
         };
-        let detail = lines
+        // Each line is made safe as it is composed: a session's summary
+        // carries error text, and error text carries names the other side
+        // chose.
+        let indented: Vec<String> = lines
             .iter()
             .chain(host_lines.iter())
             .map(|line| format!("  {line}"))
-            .collect::<Vec<_>>()
-            .join("\n");
+            .collect();
+        let detail = hook_lines(indented.iter().map(String::as_str));
         Fire::Alert {
             summary,
             detail,
@@ -471,6 +474,7 @@ impl Dispatcher {
             return false;
         }
         let running = self.running.clone();
+        let environment = hook_environment(environment);
         std::thread::spawn(move || {
             for command in commands {
                 if let Err(error) = run(&command, &environment, &document, timeout) {
@@ -530,6 +534,266 @@ fn run(
         std::thread::sleep(Duration::from_millis(20));
     }
 }
+
+/// The longest line a hook is handed, in bytes. A notification shows a
+/// line or two; an error that runs to kilobytes says nothing more there.
+pub const HOOK_LINE_MAX: usize = 400;
+
+/// The most lines `AUTOBAHN_DETAIL` holds. The rest are counted, so a
+/// hundred sessions failing together stay well inside what one
+/// environment variable may hold.
+pub const HOOK_DETAIL_LINES: usize = 50;
+
+/// One line of text for a hook: control characters escaped, so it stays
+/// one line and cannot steer a terminal that shows it, and cut to
+/// [`HOOK_LINE_MAX`]. Quotes are left alone: a hook that passes the text
+/// as data, as it should, would only see them garbled.
+pub fn hook_line(text: &str) -> String {
+    let safe = crate::text::display_safe(text);
+    crate::text::cap_line(&safe, HOOK_LINE_MAX).into_owned()
+}
+
+/// Several lines for a hook, each made safe by [`hook_line`], and no more
+/// than [`HOOK_DETAIL_LINES`] of them.
+pub fn hook_lines<'a>(lines: impl IntoIterator<Item = &'a str>) -> String {
+    let lines: Vec<&str> = lines.into_iter().collect();
+    let mut kept: Vec<String> = lines
+        .iter()
+        .take(HOOK_DETAIL_LINES)
+        .map(|line| hook_line(line))
+        .collect();
+    if lines.len() > HOOK_DETAIL_LINES {
+        kept.push(format!("  … and {} more", lines.len() - HOOK_DETAIL_LINES));
+    }
+    kept.join("\n")
+}
+
+/// The environment a hook is handed, with the summary and detail made safe
+/// whoever composed them. The alerter already composes them safely; this
+/// holds for every other caller, such as the refused-configuration alert.
+pub fn hook_environment(environment: Vec<(String, String)>) -> Vec<(String, String)> {
+    environment
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match key.as_str() {
+                "AUTOBAHN_SUMMARY" => hook_line(&value),
+                "AUTOBAHN_DETAIL" => hook_lines(value.split('\n')),
+                _ => value,
+            };
+            (key, value)
+        })
+        .collect()
+}
+
+/// What [`refresh_example_hook`] found at the hook `on_alert` names.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExampleHook {
+    /// An example exactly as an earlier `init` wrote it, now replaced by
+    /// the current one.
+    Rewritten(std::path::PathBuf),
+    /// A script of someone's own that still has the example's unsafe
+    /// AppleScript line. Left alone, and worth a warning.
+    Unsafe(std::path::PathBuf),
+    /// An example that should have been replaced and could not be.
+    Failed(std::path::PathBuf, String),
+    /// Anything else: the current example, someone's own script, a
+    /// command line, or nothing at all.
+    Other,
+}
+
+/// Brings an example hook written by an earlier `init` up to date.
+///
+/// Early examples put `$AUTOBAHN_SUMMARY` inside AppleScript source, so a
+/// file name chosen by the other side could run a command. `init` never
+/// replaces a script, and a hook is a script its owner may have made their
+/// own; but one that matches a shipped example byte for byte was never
+/// edited, and is replaced. Anything that differs is left alone.
+pub fn refresh_example_hook(on_alert: &str) -> ExampleHook {
+    match std::env::var_os("HOME") {
+        Some(home) => refresh_example_hook_in(on_alert, std::path::Path::new(&home)),
+        None => refresh_example_hook_in(on_alert, std::path::Path::new("")),
+    }
+}
+
+/// [`refresh_example_hook`], with `~` meaning `home`.
+fn refresh_example_hook_in(on_alert: &str, home: &std::path::Path) -> ExampleHook {
+    use std::path::{Path, PathBuf};
+
+    // Only a hook that is one path, as `init`'s configuration names it,
+    // can be the example; a command line is someone's own.
+    let command = on_alert.trim();
+    if command.is_empty() || command.contains(char::is_whitespace) {
+        return ExampleHook::Other;
+    }
+    let path: PathBuf = match command.strip_prefix("~/") {
+        Some(rest) if home.is_absolute() => home.join(rest),
+        Some(_) => return ExampleHook::Other,
+        None if Path::new(command).is_absolute() => PathBuf::from(command),
+        None => return ExampleHook::Other,
+    };
+    let Ok(contents) = std::fs::read(&path) else {
+        return ExampleHook::Other;
+    };
+    let current = crate::config::ON_ALERT_EXAMPLE.as_bytes();
+    if contents == current {
+        return ExampleHook::Other;
+    }
+    if !SHIPPED_ON_ALERT_EXAMPLES
+        .iter()
+        .any(|shipped| shipped.as_bytes() == contents)
+    {
+        return match contents
+            .windows(UNSAFE_OSASCRIPT_LINE.len())
+            .any(|window| window == UNSAFE_OSASCRIPT_LINE.as_bytes())
+        {
+            true => ExampleHook::Unsafe(path),
+            false => ExampleHook::Other,
+        };
+    }
+    match replace_file(&path, current) {
+        Ok(()) => ExampleHook::Rewritten(path),
+        Err(error) => ExampleHook::Failed(path, format!("{error:#}")),
+    }
+}
+
+/// Replaces the file at `path`, or the file a link there points at, with
+/// `contents`, keeping its permissions. Written beside it and renamed, so
+/// a hook starting meanwhile runs one version or the other, never half.
+fn replace_file(path: &std::path::Path, contents: &[u8]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    use std::io::Write;
+
+    let target = std::fs::canonicalize(path)
+        .with_context(|| format!("unable to resolve {}", path.display()))?;
+    let permissions = std::fs::metadata(&target)
+        .with_context(|| format!("unable to read {}", target.display()))?
+        .permissions();
+    let name = target
+        .file_name()
+        .context("the hook has no file name")?
+        .to_string_lossy();
+    let temporary = target.with_file_name(format!(".{name}.autobahn-new"));
+    let _ = std::fs::remove_file(&temporary);
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)
+            .with_context(|| format!("unable to create {}", temporary.display()))?;
+        file.write_all(contents)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temporary, permissions)?;
+        std::fs::rename(&temporary, &target)
+            .with_context(|| format!("unable to move {} into place", temporary.display()))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+/// At startup: brings the configured hook up to date if it is an unedited
+/// shipped example, and warns once if it is someone's own script with the
+/// example's unsafe line in it.
+pub fn refresh_configured_example_hook(plan: &AlertPlan) {
+    let Some(command) = plan.on_alert.as_deref() else {
+        return;
+    };
+    match refresh_example_hook(command) {
+        ExampleHook::Rewritten(path) => crate::note!(
+            "rewrote the alert hook {}: it was an earlier example, which put the summary \
+             inside AppleScript",
+            path.display()
+        ),
+        ExampleHook::Unsafe(path) => crate::complain!(
+            "warning: the alert hook {} puts $AUTOBAHN_SUMMARY inside AppleScript source, \
+             where a file name can run a command; hand it to osascript as an argument, as \
+             `autobahn init`'s example now does",
+            path.display()
+        ),
+        ExampleHook::Failed(path, error) => crate::complain!(
+            "unable to rewrite the alert hook {}, an earlier example with an unsafe \
+             AppleScript line: {error}",
+            path.display()
+        ),
+        ExampleHook::Other => {}
+    }
+}
+
+/// The line of the early example hooks that made the summary AppleScript.
+const UNSAFE_OSASCRIPT_LINE: &str = r#"-e "display notification \"$AUTOBAHN_SUMMARY\""#;
+
+/// Every example hook `init` has written, exactly, oldest first. A file
+/// matching one byte for byte is ours to replace; see
+/// [`refresh_example_hook`]. Never edit these: add the next one.
+const SHIPPED_ON_ALERT_EXAMPLES: &[&str] = &[
+    // 0.4: interpolated the summary into AppleScript source.
+    r##"#!/bin/sh
+# autobahn — run when a session needs a person. EXPERIMENTAL: an example,
+# not a contract; edit it freely, and expect it to change between releases.
+#
+# Named by `on_alert` in config.toml. What it is handed:
+#
+#   $AUTOBAHN_SUMMARY      one line: the whole story, or a count
+#   $AUTOBAHN_DETAIL       one indented line per session that needs you
+#   $AUTOBAHN_ICON         autobahn's icon, as an absolute path
+#   $AUTOBAHN_STATES       the state names present, comma separated
+#   $AUTOBAHN_ALERT_COUNT  how many sessions are in the set
+#   $AUTOBAHN_EVENT        "alert" the first time, "repeat" after that
+#
+# The service runs with a sparse PATH and a sparse environment, which is
+# why commands are named in full and the bus address is worked out below.
+set -eu
+
+case "$(uname -s)" in
+Darwin)
+    # A click needs a terminal opened around the shop, which `open` does.
+    OPEN="open -a Terminal $HOME/.autobahn/open-status"
+
+    # terminal-notifier carries a subtitle and a click. Homebrew puts it
+    # in one of two places depending on the chip.
+    for notifier in \
+        /opt/homebrew/bin/terminal-notifier \
+        /usr/local/bin/terminal-notifier
+    do
+        [ -x "$notifier" ] || continue
+        exec "$notifier" \
+            -title autobahn -group autobahn \
+            -appIcon "$AUTOBAHN_ICON" \
+            -subtitle "$AUTOBAHN_DETAIL" \
+            -message "$AUTOBAHN_SUMMARY" \
+            -execute "$OPEN"
+    done
+
+    # Built in, and always there. It holds one line and no click.
+    exec /usr/bin/osascript \
+        -e "display notification \"$AUTOBAHN_SUMMARY\" with title \"autobahn\""
+    ;;
+Linux)
+    # notify-send talks to the desktop over the session bus. A service
+    # started by the user's own systemd inherits the address; one started
+    # by the system does not, so it is guessed from the user id.
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        # Urgency is normal, not critical: a conflict wants attention
+        # today, not a notification that refuses to go away.
+        exec notify-send \
+            --app-name autobahn \
+            --icon "$AUTOBAHN_ICON" \
+            "$AUTOBAHN_SUMMARY" \
+            "$AUTOBAHN_DETAIL"
+    fi
+    ;;
+esac
+
+# No notifier, or a headless host: the log is still the record, and
+# standard error goes to it.
+echo "autobahn: $AUTOBAHN_SUMMARY" >&2
+"##,
+];
 
 #[cfg(test)]
 mod tests {
@@ -1149,5 +1413,209 @@ mod tests {
         assert!(alerter
             .observe(&[session("b", &[Alert::Halted])], start)
             .is_some());
+    }
+
+    /// Runs the example hook's macOS fallback, with `osascript` replaced
+    /// by a stub that writes each argument it receives, NUL-terminated.
+    fn osascript_arguments(summary: &str) -> Vec<String> {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let stub = directory.path().join("osascript");
+        let received = directory.path().join("received");
+        std::fs::write(
+            &stub,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\0' \"$a\"; done > {}\n",
+                crate::text::shell_quote(&received.display().to_string())
+            ),
+        )
+        .expect("the stub is written");
+        std::fs::set_permissions(&stub, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .expect("the stub is executable");
+        // Pretend to be a Mac with no terminal-notifier. Each substitution
+        // must find its target, or the test is not running the example.
+        let mut script = crate::config::ON_ALERT_EXAMPLE.to_owned();
+        for (from, to) in [
+            ("\"$(uname -s)\"", "Darwin".to_owned()),
+            ("/usr/bin/osascript", stub.display().to_string()),
+            (
+                "/opt/homebrew/bin/terminal-notifier",
+                directory.path().join("absent-1").display().to_string(),
+            ),
+            (
+                "/usr/local/bin/terminal-notifier",
+                directory.path().join("absent-2").display().to_string(),
+            ),
+        ] {
+            assert!(script.contains(from), "the example no longer names {from}");
+            script = script.replace(from, &to);
+        }
+        let hook = directory.path().join("on-alert.sh");
+        std::fs::write(&hook, script).expect("the hook is written");
+        let status = std::process::Command::new("sh")
+            .arg(&hook)
+            .current_dir(directory.path())
+            .env("AUTOBAHN_SUMMARY", summary)
+            .env("AUTOBAHN_DETAIL", "  detail")
+            .env("AUTOBAHN_ICON", "/nonexistent/icon.png")
+            .status()
+            .expect("the hook runs");
+        assert!(status.success(), "the hook failed: {status}");
+        let received = std::fs::read(&received).expect("the stub ran");
+        String::from_utf8(received)
+            .expect("utf-8 arguments")
+            .split_terminator('\0')
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A summary is text, and the example hands it to AppleScript as an
+    /// argument: a name built to close the string and run a shell command
+    /// arrives whole, and the script it is shown by is the same whatever
+    /// it says.
+    #[test]
+    fn the_example_hook_hands_the_summary_to_applescript_as_data() {
+        let hostile = r#"x" & (do shell script "touch pwned") & "\ back"#;
+        let arguments = osascript_arguments(hostile);
+        let plain = osascript_arguments("3 conflicts");
+        assert_eq!(arguments.last().map(String::as_str), Some(hostile));
+        assert_eq!(plain.last().map(String::as_str), Some("3 conflicts"));
+        assert_eq!(
+            arguments[..arguments.len() - 1],
+            plain[..plain.len() - 1],
+            "the AppleScript must not change with the summary"
+        );
+        assert!(arguments[..arguments.len() - 1]
+            .iter()
+            .all(|argument| !argument.contains("do shell script")));
+    }
+
+    /// A session's text comes partly from the other side. What the hook is
+    /// handed has no control characters left in it, so a hook that echoes
+    /// it into a terminal or a log cannot be steered by it, and it is
+    /// bounded, however long the error was.
+    #[test]
+    fn a_composed_alert_carries_no_control_characters_and_is_bounded() {
+        let mut alerter = Alerter::new(plan());
+        let start = Instant::now();
+        let hostile = format!(
+            "errored: a\u{1b}]52;c;Zm9v\u{7}b\nforged line{}",
+            "x".repeat(1_000)
+        );
+        let sessions = [
+            session_in("work", "boite", &[Alert::Errored], &hostile),
+            session_in("play\u{1b}[2J", "boite", &[Alert::Errored], "fine"),
+        ];
+        alerter.observe(&sessions, start);
+        let Some(Fire::Alert {
+            summary, detail, ..
+        }) = alerter.observe(&sessions, start + Duration::from_secs(31))
+        else {
+            panic!("expected an alert");
+        };
+        assert!(!summary.chars().any(char::is_control), "{summary:?}");
+        let lines: Vec<&str> = detail.split('\n').collect();
+        assert_eq!(lines.len(), 2, "one line per session: {detail:?}");
+        for line in lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+            assert!(line.len() <= HOOK_LINE_MAX, "{} bytes", line.len());
+        }
+        assert!(detail.contains("\\x1b"), "escaped, not dropped: {detail:?}");
+
+        // A single session is the whole headline, and bounded the same way.
+        let mut alerter = Alerter::new(plan());
+        let one = [session_in("work", "boite", &[Alert::Errored], &hostile)];
+        alerter.observe(&one, start);
+        let Some(Fire::Alert { summary, .. }) =
+            alerter.observe(&one, start + Duration::from_secs(31))
+        else {
+            panic!("expected an alert");
+        };
+        assert!(!summary.chars().any(char::is_control), "{summary:?}");
+        assert!(summary.len() <= HOOK_LINE_MAX, "{} bytes", summary.len());
+    }
+
+    /// Whoever composed them, the summary and detail reach a hook clean:
+    /// the dispatcher sanitizes them too, keeping the detail's line breaks.
+    #[test]
+    fn the_dispatcher_hands_a_hook_clean_text() {
+        let environment = hook_environment(vec![
+            ("AUTOBAHN_SUMMARY".into(), "a\u{1b}[31m\nb".into()),
+            ("AUTOBAHN_DETAIL".into(), "  one\u{7}\n  two".into()),
+            ("AUTOBAHN_ICON".into(), "/icon.png".into()),
+        ]);
+        assert_eq!(
+            environment,
+            vec![
+                ("AUTOBAHN_SUMMARY".to_owned(), "a\\x1b[31m\\nb".to_owned()),
+                ("AUTOBAHN_DETAIL".to_owned(), "  one\\x07\n  two".to_owned()),
+                ("AUTOBAHN_ICON".to_owned(), "/icon.png".to_owned()),
+            ]
+        );
+    }
+
+    /// The example hook exactly as `init` wrote it before its AppleScript
+    /// took the summary as data.
+    fn shipped_example() -> &'static str {
+        SHIPPED_ON_ALERT_EXAMPLES[0]
+    }
+
+    #[test]
+    fn a_shipped_example_hook_is_rewritten_and_an_edited_one_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let hook = directory.path().join("on-alert.sh");
+        let command = hook.display().to_string();
+
+        // The shipped copy, untouched: replaced, and still executable.
+        std::fs::write(&hook, shipped_example()).expect("written");
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o750)).expect("chmod");
+        assert_eq!(
+            refresh_example_hook(&command),
+            ExampleHook::Rewritten(hook.clone())
+        );
+        assert_eq!(
+            std::fs::read_to_string(&hook).expect("read"),
+            crate::config::ON_ALERT_EXAMPLE
+        );
+        assert_eq!(
+            std::fs::metadata(&hook).expect("stat").permissions().mode() & 0o777,
+            0o750
+        );
+        // Now current, so left alone.
+        assert_eq!(refresh_example_hook(&command), ExampleHook::Other);
+
+        // Named through `~`, as `init`'s configuration names it: the same.
+        let under_home = format!("~/{}", hook.file_name().unwrap().to_string_lossy());
+        std::fs::write(&hook, shipped_example()).expect("written");
+        assert_eq!(
+            refresh_example_hook_in(&under_home, directory.path()),
+            ExampleHook::Rewritten(hook.clone())
+        );
+
+        // Edited, even by one byte: never touched, but warned about.
+        let edited = format!("{}# mine\n", shipped_example());
+        std::fs::write(&hook, &edited).expect("written");
+        assert_eq!(
+            refresh_example_hook(&command),
+            ExampleHook::Unsafe(hook.clone())
+        );
+        assert_eq!(std::fs::read_to_string(&hook).expect("read"), edited);
+
+        // A hook that is a command line rather than a file: not ours.
+        assert_eq!(
+            refresh_example_hook("terminal-notifier -message \"$AUTOBAHN_SUMMARY\""),
+            ExampleHook::Other
+        );
+        assert_eq!(
+            refresh_example_hook(&directory.path().join("absent").display().to_string()),
+            ExampleHook::Other
+        );
+    }
+
+    /// The copy kept for recognition is the one `init` wrote.
+    #[test]
+    fn the_shipped_example_is_the_unsafe_one() {
+        assert!(shipped_example().contains(UNSAFE_OSASCRIPT_LINE));
+        assert!(!crate::config::ON_ALERT_EXAMPLE.contains(UNSAFE_OSASCRIPT_LINE));
     }
 }

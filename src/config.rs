@@ -159,9 +159,14 @@ Darwin)
             -execute "$OPEN"
     done
 
-    # Built in, and always there. It holds one line and no click.
+    # Built in, and always there. It holds one line and no click. The
+    # summary goes in as an argument, never as part of the AppleScript: it
+    # can hold a file name someone else chose.
     exec /usr/bin/osascript \
-        -e "display notification \"$AUTOBAHN_SUMMARY\" with title \"autobahn\""
+        -e 'on run argv' \
+        -e 'display notification (item 1 of argv) with title "autobahn"' \
+        -e 'end run' \
+        "$AUTOBAHN_SUMMARY"
     ;;
 Linux)
     # notify-send talks to the desktop over the session bus. A service

@@ -2152,6 +2152,7 @@ fn watch_alerts(
 ) {
     use crate::alerts::{Alerter, Dispatcher, Fire, SessionAlerts};
 
+    crate::alerts::refresh_configured_example_hook(&plan);
     let timeout = plan.timeout;
     let mut alerter = Alerter::new(plan);
     let dispatcher = Dispatcher::default();

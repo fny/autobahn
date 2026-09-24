@@ -3818,3 +3818,58 @@ fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
             .expect("supervision should succeed");
     });
 }
+
+#[test]
+fn watch_keeps_synchronizing_after_its_standard_output_closes() {
+    // `autobahn watch | head -1`: the reader goes away, and every later
+    // log line meets a closed pipe. That costs the lines, not the sessions.
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "first.txt", "first");
+    let path = world.path("config.toml");
+    fs::write(
+        &path,
+        format!(
+            "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-safe\"\ninterval = 1\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .expect("configuration should be writable");
+    let mut child = std::process::Command::new(agent_binary())
+        .args(["watch", "--log", "--config"])
+        .arg(&path)
+        .arg("--state-root")
+        .arg(world.state_root())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("watch starts");
+    drop(child.stdout.take());
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Kill(child);
+    assert!(
+        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+        "the first file synchronizes"
+    );
+    for index in 0..3 {
+        let name = format!("later-{index}.txt");
+        write(&alpha, &name, "later");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join(&name).exists()),
+            "{name} synchronizes with nobody reading the log"
+        );
+    }
+    assert!(
+        child.0.try_wait().expect("waitable").is_none(),
+        "the supervisor is still running"
+    );
+}

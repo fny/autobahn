@@ -526,14 +526,14 @@ pub(crate) fn serve(listener: UnixListener, registry: &Registry, stop: &AtomicBo
         match listener.accept() {
             Ok((stream, _)) => {
                 if let Err(error) = handle(stream, registry) {
-                    eprintln!("control request failed: {error:#}");
+                    crate::complain!("control request failed: {error:#}");
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
             Err(error) => {
-                eprintln!("control socket failed: {error:#}");
+                crate::complain!("control socket failed: {error:#}");
                 return;
             }
         }

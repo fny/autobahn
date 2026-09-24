@@ -223,6 +223,10 @@ pub struct Supervisor {
     /// Autobahn's own directories, which no root may hold: an edit whose
     /// sessions would is complained about and not applied.
     own_state: Option<crate::config::OwnState>,
+    /// How many times each session, by identifier, panics before its next
+    /// attempts — for the tests that a panic stays in its session.
+    #[cfg(test)]
+    panics: Mutex<std::collections::HashMap<String, u32>>,
 }
 
 /// Peering, from the supervisor's side: the role, and what the leader
@@ -487,6 +491,8 @@ impl Supervisor {
             log_level: None,
             shown: None,
             own_state: None,
+            #[cfg(test)]
+            panics: Mutex::default(),
         }
     }
 
@@ -603,7 +609,17 @@ impl Supervisor {
                 .collect();
             handles
                 .into_iter()
-                .map(|handle| handle.join().expect("session worker panicked"))
+                .zip(&self.plans)
+                .map(|(handle, plan)| {
+                    handle.join().unwrap_or_else(|payload| {
+                        let message = panic_message(payload.as_ref());
+                        crate::complain!("[{}] internal error: {message}", plan.display());
+                        SessionOutcome {
+                            display: plan.display(),
+                            result: Err(format!("internal error: {message}")),
+                        }
+                    })
+                })
                 .collect()
         })
     }
@@ -663,7 +679,7 @@ impl Supervisor {
         // both it and the workers borrow this.
         let watched: Watched = Mutex::default();
 
-        std::thread::scope(|scope| {
+        let escaped = std::thread::scope(|scope| {
             let halt = &halt;
             if let Some(listener) = listener {
                 let registry = &registry;
@@ -700,6 +716,7 @@ impl Supervisor {
             }
 
             let mut running: Vec<Running<'_>> = Vec::new();
+            let mut escaped = 0usize;
             self.supervise(
                 scope,
                 &mut running,
@@ -707,6 +724,7 @@ impl Supervisor {
                 &registry,
                 &watched,
                 false,
+                &mut escaped,
             );
             while !stop.load(Ordering::Relaxed) {
                 if let Some(next) = self.reloader.as_ref().and_then(|reloader| reloader.take()) {
@@ -736,6 +754,7 @@ impl Supervisor {
                             &registry,
                             &watched,
                             true,
+                            &mut escaped,
                         ),
                     }
                 }
@@ -745,7 +764,16 @@ impl Supervisor {
             for session in &running {
                 session.stop.store(true, Ordering::Relaxed);
             }
+            for session in running {
+                if session.handle.join().is_err() {
+                    escaped += 1;
+                }
+            }
+            escaped
         });
+        if escaped > 0 {
+            bail!("{escaped} session worker(s) panicked outside their containment; see the log");
+        }
         Ok(())
     }
 
@@ -775,7 +803,9 @@ impl Supervisor {
     /// flight, if any), and one that is new, or changed, is started. A
     /// pooled connection stays up while any session still running reaches
     /// its host, and closes once none does. `edit` says whether `next`
-    /// came from an edit, which is worth a line in the log.
+    /// came from an edit, which is worth a line in the log. A worker
+    /// found to have panicked past its containment is counted in `escaped`.
+    #[allow(clippy::too_many_arguments)]
     fn supervise<'scope>(
         &'scope self,
         scope: &'scope std::thread::Scope<'scope, '_>,
@@ -784,6 +814,7 @@ impl Supervisor {
         registry: &control::Registry,
         watched: &Watched,
         edit: bool,
+        escaped: &mut usize,
     ) {
         let changes = plan_changes(running.iter().map(|session| &session.plan), &next);
         if edit && changes.is_empty() {
@@ -801,6 +832,7 @@ impl Supervisor {
             let display = session.plan.display();
             if session.handle.join().is_err() {
                 crate::complain!("[{display}] the session's worker panicked");
+                *escaped += 1;
             }
             crate::note!(
                 "[{display}] stopped: {}",
@@ -870,6 +902,74 @@ impl Supervisor {
         }
     }
 
+    /// Runs one session's cycles until `stop`: each attempt, then its
+    /// backoff or its wait for activity, answering the control flags in
+    /// between.
+    fn run_session(
+        &self,
+        plan: &SessionPlan,
+        stop: &AtomicBool,
+        flags: &control::WorkerControl,
+        progress: &Arc<crate::progress::Progress>,
+        published: &Arc<Mutex<Option<SessionStatus>>>,
+    ) {
+        let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
+        worker.peering = self.peering.as_ref();
+        worker.progress = progress.clone();
+        worker.published = Some(published.clone());
+        let identifier = plan.identifier();
+        let mut failures = 0u32;
+        while !stop.load(Ordering::Relaxed) {
+            if flags.paused.load(Ordering::Relaxed) {
+                worker.hold_paused(flags, stop);
+                continue;
+            }
+            if flags.reset.swap(false, Ordering::Relaxed) {
+                worker.reset();
+            }
+            if flags.verify.swap(false, Ordering::Relaxed) {
+                worker.verify_pending = true;
+            }
+            #[cfg(test)]
+            self.panic_if_asked(&identifier);
+            let result = worker.attempt();
+            let failed = result.is_err();
+            if let Err(error) = worker.conclude(&result) {
+                crate::complain!("[{}] unable to record status: {error:#}", plan.display());
+            }
+            if failed {
+                failures = failures.saturating_add(1);
+                let delay = backoff_delay(
+                    plan.interval,
+                    failures,
+                    jitter_percent(&identifier, failures),
+                );
+                worker.progress.rest(crate::progress::Phase::Retrying);
+                sleep_flagged(delay, stop, flags);
+            } else {
+                failures = 0;
+                worker.progress.rest(crate::progress::Phase::Waiting);
+                worker.await_activity(plan.interval, stop, flags);
+            }
+        }
+    }
+
+    /// Panics before this session's next attempt, if a test asked for it.
+    #[cfg(test)]
+    fn panic_if_asked(&self, identifier: &str) {
+        let mut panics = self
+            .panics
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(remaining) = panics.get_mut(identifier) {
+            if *remaining > 0 {
+                *remaining -= 1;
+                drop(panics);
+                panic!("a panic a test asked for\nwith a second line");
+            }
+        }
+    }
+
     /// Starts one session's worker, the `order`th started together.
     fn start_session<'scope>(
         &'scope self,
@@ -912,42 +1012,61 @@ impl Supervisor {
                     .min(plan.interval);
                 sleep_interruptible(stagger, stop);
 
-                let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
-                worker.peering = self.peering.as_ref();
-                worker.progress = progress;
-                worker.published = Some(published);
-                let identifier = plan.identifier();
-                let mut failures = 0u32;
-                while !stop.load(Ordering::Relaxed) {
-                    if flags.paused.load(Ordering::Relaxed) {
-                        worker.hold_paused(&flags, stop);
-                        continue;
-                    }
-                    if flags.reset.swap(false, Ordering::Relaxed) {
-                        worker.reset();
-                    }
-                    if flags.verify.swap(false, Ordering::Relaxed) {
-                        worker.verify_pending = true;
-                    }
-                    let result = worker.attempt();
-                    let failed = result.is_err();
-                    if let Err(error) = worker.conclude(&result) {
-                        crate::complain!("[{}] unable to record status: {error:#}", plan.display());
-                    }
-                    if failed {
-                        failures = failures.saturating_add(1);
-                        let delay = backoff_delay(
-                            plan.interval,
-                            failures,
-                            jitter_percent(&identifier, failures),
+                // A panic is this session's alone. The session is dropped
+                // as it unwinds, releasing its lock and its store, so the
+                // next run starts from what is on disk, as a process
+                // restart would; the other sessions never notice.
+                let mut panics: Vec<std::time::Instant> = Vec::new();
+                loop {
+                    let run = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        self.run_session(plan, stop, &flags, &progress, &published)
+                    }));
+                    let Err(payload) = run else {
+                        return;
+                    };
+                    let message = panic_message(payload.as_ref());
+                    let now = std::time::Instant::now();
+                    panics.retain(|at| now.duration_since(*at) < PANIC_WINDOW);
+                    panics.push(now);
+                    let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
+                    worker.peering = self.peering.as_ref();
+                    worker.progress = progress.clone();
+                    worker.published = Some(published.clone());
+                    if panics.len() >= PANIC_LIMIT {
+                        crate::complain!(
+                            "[{}] internal error: {message}; that is {} in a row, so the \
+                             session is halted until the supervisor restarts",
+                            plan.display(),
+                            panics.len()
                         );
                         worker.progress.rest(crate::progress::Phase::Retrying);
-                        sleep_flagged(delay, stop, &flags);
-                    } else {
-                        failures = 0;
-                        worker.progress.rest(crate::progress::Phase::Waiting);
-                        worker.await_activity(plan.interval, stop, &flags);
+                        worker.record_failure(
+                            "halted",
+                            format!(
+                                "repeated internal errors ({} within {} minutes), the last: \
+                                 {message}; the supervisor log has each one",
+                                panics.len(),
+                                PANIC_WINDOW.as_secs() / 60
+                            ),
+                        );
+                        while !stop.load(Ordering::Relaxed) {
+                            std::thread::sleep(STOP_POLL_INTERVAL);
+                        }
+                        return;
                     }
+                    crate::complain!(
+                        "[{}] internal error: {message}; restarting the session",
+                        plan.display()
+                    );
+                    worker.record_failure("errored", format!("internal error: {message}"));
+                    let failures = panics.len() as u32;
+                    let delay = backoff_delay(
+                        plan.interval,
+                        failures,
+                        jitter_percent(&plan.identifier(), failures),
+                    );
+                    worker.progress.rest(crate::progress::Phase::Retrying);
+                    sleep_flagged(delay, stop, &flags);
                 }
             })
         };
@@ -960,6 +1079,26 @@ impl Supervisor {
             handle,
         }
     }
+}
+
+/// How many panics in a row, within [`PANIC_WINDOW`], halt a session
+/// rather than restart it again: one that panics on every run would
+/// otherwise restart forever.
+const PANIC_LIMIT: usize = 5;
+
+/// How far back panics count towards [`PANIC_LIMIT`].
+const PANIC_WINDOW: Duration = Duration::from_secs(600);
+
+/// What a panic said, made safe to write to a log line or a status file.
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    let message = if let Some(message) = payload.downcast_ref::<&str>() {
+        message
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.as_str()
+    } else {
+        "a panic without a message"
+    };
+    crate::text::display_safe(message).into_owned()
 }
 
 /// How often the supervisor looks for an edit the watch has loaded. The
@@ -1533,6 +1672,16 @@ impl<'a> Worker<'a> {
 
     /// Records a bare state (such as `paused`) to the status file.
     fn record_state(&self, state: &str) {
+        self.record_state_with(state, None);
+    }
+
+    /// Records a failure that no attempt returned — an internal error — as
+    /// `state`, with `error` saying what it was.
+    fn record_failure(&self, state: &str, error: String) {
+        self.record_state_with(state, Some(error));
+    }
+
+    fn record_state_with(&self, state: &str, error: Option<String>) {
         let status = SessionStatus {
             group: self.plan.group.clone(),
             host: self.plan.host.clone(),
@@ -1546,7 +1695,7 @@ impl<'a> Worker<'a> {
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             blocked: Vec::new(),
-            error: None,
+            error,
             updated_at: epoch_seconds(),
             alpha_entries: self.progress.alpha.expected_total(),
             beta_entries: self.progress.beta.expected_total(),
@@ -3191,6 +3340,119 @@ mod tests {
         let emptied = plan_changes(running.iter(), &[]);
         assert_eq!(emptied.removed.len(), 3);
         assert!(emptied.changed.is_empty() && emptied.added.is_empty());
+    }
+
+    /// Runs a watching supervisor over `groups` whose `panicking` session
+    /// panics before each of its next `panics` attempts, backing off from
+    /// `backoff` after each, until `until`
+    /// holds of the two sessions' statuses or ten seconds pass. Returns the
+    /// last statuses seen, the panicking session's first.
+    fn watched_with_panics(
+        panics: u32,
+        backoff: Duration,
+        until: impl Fn(&SessionStatus, &SessionStatus) -> bool,
+    ) -> (SessionStatus, SessionStatus, u64) {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let mut plans = planned(root.path(), &[("panicking", ""), ("steady", "")]);
+        // The panicking session backs off from its interval.
+        plans[0].interval = backoff;
+        plans[1].interval = Duration::from_millis(50);
+        std::fs::write(root.path().join("steady").join("file.txt"), "steady").expect("written");
+        let state_root = root.path().join("state");
+        let (panicking, steady) = (plans[0].clone(), plans[1].clone());
+        let supervisor = Supervisor::new(plans, state_root.clone(), false);
+        supervisor
+            .panics
+            .lock()
+            .expect("unpoisoned")
+            .insert(panicking.identifier(), panics);
+        let stop = AtomicBool::new(false);
+        let status =
+            |plan: &SessionPlan| read_status(&state_root, &plan.identifier()).ok().flatten();
+        std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| supervisor.run_watch(&stop));
+            let started = std::time::Instant::now();
+            let mut steady_cycles_at_first_panic = None;
+            let seen = loop {
+                let (first, second) = (status(&panicking), status(&steady));
+                if let (Some(first), Some(second)) = (&first, &second) {
+                    if first
+                        .error
+                        .as_deref()
+                        .is_some_and(|e| e.contains("internal error"))
+                        && steady_cycles_at_first_panic.is_none()
+                    {
+                        steady_cycles_at_first_panic = Some(second.cycles);
+                    }
+                    if until(first, second) {
+                        break (first.clone(), second.clone());
+                    }
+                }
+                if started.elapsed() > Duration::from_secs(10) {
+                    stop.store(true, Ordering::Relaxed);
+                    panic!("the sessions never got there: {first:?} and {second:?}");
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            stop.store(true, Ordering::Relaxed);
+            watcher
+                .join()
+                .expect("the supervisor returns")
+                .expect("no panic escaped its session");
+            (
+                seen.0,
+                seen.1,
+                steady_cycles_at_first_panic.unwrap_or(u64::MAX),
+            )
+        })
+    }
+
+    #[test]
+    fn a_panicking_session_is_recorded_restarted_and_alone() {
+        // First: the panic is recorded as an internal error, on one line,
+        // and alerted like any other error.
+        // A second's backoff keeps the error in place long enough to see.
+        let (first, _, _) = watched_with_panics(1, Duration::from_secs(1), |first, _| {
+            first
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("internal error"))
+        });
+        assert_eq!(first.state, "errored");
+        assert_eq!(alerts_for(&first), vec![crate::alerts::Alert::Errored]);
+        let error = first.error.expect("an error");
+        assert!(
+            error.starts_with("internal error: a panic a test asked for"),
+            "{error}"
+        );
+        assert!(!error.contains('\n'), "one line: {error:?}");
+
+        // Then: the session runs again, and the other kept cycling.
+        let (first, second, steady_at_panic) =
+            watched_with_panics(1, Duration::from_millis(50), |first, second| {
+                first.state == "synchronized" && first.cycles > 0 && second.cycles > 2
+            });
+        assert_eq!(first.state, "synchronized", "{:?}", first.error);
+        assert!(second.cycles > steady_at_panic || steady_at_panic == u64::MAX);
+        assert_eq!(second.state, "synchronized");
+    }
+
+    #[test]
+    fn repeated_panics_halt_the_session_and_leave_the_other_running() {
+        let (first, second, steady_at_panic) = watched_with_panics(
+            PANIC_LIMIT as u32 + 3,
+            Duration::from_millis(50),
+            |first, second| first.state == "halted" && second.cycles > 3,
+        );
+        assert_eq!(first.state, "halted", "{:?}", first.error);
+        let error = first.error.clone().unwrap_or_default();
+        assert!(error.contains("repeated internal errors"), "{error}");
+        assert!(error.contains("log"), "{error}");
+        assert_eq!(alerts_for(&first), vec![crate::alerts::Alert::Halted]);
+        assert!(
+            second.cycles > steady_at_panic,
+            "the other session kept cycling"
+        );
     }
 
     #[test]

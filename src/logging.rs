@@ -11,7 +11,8 @@
 //! taken on every logged line from every worker thread and must not cost
 //! a lock.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 /// How much the supervisor says.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -106,13 +107,57 @@ pub fn timestamp() -> String {
     }
 }
 
+/// Set once a log line could not be written, and never cleared: the
+/// supervisor says so where `status` can show it, since the log itself is
+/// the one place that cannot.
+static FAILED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a log line has failed to be written since this process started
+/// — standard output closed under `watch | head`, or the disk under the
+/// service log full.
+pub fn failed() -> bool {
+    FAILED.load(Ordering::Relaxed)
+}
+
+/// Where a line goes.
+#[doc(hidden)]
+#[derive(Clone, Copy)]
+pub enum Stream {
+    Out,
+    Err,
+}
+
+/// Writes one stamped line, as the macros below do. A line that cannot be
+/// written costs that line and sets [`failed`] — never the thread that
+/// wrote it, which is a session's worker.
+#[doc(hidden)]
+pub fn emit(stream: Stream, marker: &str, arguments: std::fmt::Arguments) {
+    let line = format!("{} {marker}{arguments}\n", timestamp());
+    let written = match stream {
+        Stream::Out => write_line(&mut std::io::stdout().lock(), &line),
+        Stream::Err => write_line(&mut std::io::stderr().lock(), &line),
+    };
+    if !written {
+        FAILED.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Writes a line and flushes it, saying whether both worked.
+fn write_line(out: &mut dyn Write, line: &str) -> bool {
+    out.write_all(line.as_bytes()).is_ok() && out.flush().is_ok()
+}
+
 /// Writes one line at `Normal`, stamped with the time.
 #[macro_export]
 macro_rules! note {
     ($($argument:tt)*) => {
         {
             if $crate::logging::enabled($crate::logging::Level::Normal) {
-                println!("{} {}", $crate::logging::timestamp(), format_args!($($argument)*));
+                $crate::logging::emit(
+                    $crate::logging::Stream::Out,
+                    "",
+                    format_args!($($argument)*),
+                );
             }
         }
     };
@@ -125,7 +170,11 @@ macro_rules! debug {
     ($($argument:tt)*) => {
         {
             if $crate::logging::enabled($crate::logging::Level::Debug) {
-                println!("{} debug: {}", $crate::logging::timestamp(), format_args!($($argument)*));
+                $crate::logging::emit(
+                    $crate::logging::Stream::Out,
+                    "debug: ",
+                    format_args!($($argument)*),
+                );
             }
         }
     };
@@ -137,7 +186,11 @@ macro_rules! debug {
 macro_rules! complain {
     ($($argument:tt)*) => {
         {
-            eprintln!("{} {}", $crate::logging::timestamp(), format_args!($($argument)*))
+            $crate::logging::emit(
+                $crate::logging::Stream::Err,
+                "",
+                format_args!($($argument)*),
+            )
         }
     };
 }
@@ -168,6 +221,27 @@ mod tests {
     fn a_higher_level_includes_the_lower_ones() {
         assert!(Level::Debug > Level::Normal);
         assert!(Level::Normal > Level::Quiet);
+    }
+
+    /// A writer standing in for a full disk, or a closed pipe.
+    struct Failing;
+
+    impl Write for Failing {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("no space left on device"))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Err(std::io::Error::other("no space left on device"))
+        }
+    }
+
+    #[test]
+    fn a_line_that_cannot_be_written_is_lost_without_a_panic() {
+        assert!(!write_line(&mut Failing, "lost\n"));
+        let mut kept = Vec::new();
+        assert!(write_line(&mut kept, "kept\n"));
+        assert_eq!(kept, b"kept\n");
     }
 
     #[test]

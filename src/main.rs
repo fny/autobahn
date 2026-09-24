@@ -1724,7 +1724,13 @@ fn run_watch(
     };
 
     if !live_display {
-        println!("supervising {sessions} session(s); status is available via `autobahn status`");
+        // Written as the log is, so a closed standard output costs the line
+        // and not the supervisor.
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stdout(),
+            "supervising {sessions} session(s); status is available via `autobahn status`"
+        );
         return supervise(true);
     }
 

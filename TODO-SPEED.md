@@ -66,6 +66,8 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 
 ## From the 2026-09-23 reviews
 
+**Final check of branch `speed-review` against `main` (2026-09-24, c6i.8xlarge, `bench/ab.sh`, 40k-file corpus, ten agents, four interleaved legs each).** Local destination: p50 17.2 → 8.1 ms, cold sync 3.7 → 2.7 s. Over ssh to localhost: p50 19.6 → 11.9 ms, cold sync 3.7–4.2 → 2.6–3.2 s. Remote-side edits at 420k files: 582 → 19 ms p50. No regression found.
+
 The six code reviews in `REVIEWS/` proposed these. They are estimates from reading the code, so the rule above applies: each names what would decide it. They are grouped by how clear-cut they look, not by expected gain.
 
 ### First — the likely largest latency win on large trees

@@ -52,10 +52,40 @@ pub fn default_config_path() -> Result<PathBuf> {
 /// `$AUTOBAHN_HOME` when it is set and non-empty, and `~/.autobahn`
 /// otherwise.
 pub fn default_state_root() -> Result<PathBuf> {
+    // Unit tests never reach the real state root. Some code under test
+    // derives machine-wide paths from it, such as the endpoint-pair locks,
+    // and a test run must not leave anything in the home directory of the
+    // machine running it (CI checks that `~/.autobahn` is untouched).
+    #[cfg(test)]
+    {
+        Ok(unit_test_state_root())
+    }
+    #[cfg(not(test))]
+    {
+        user_state_root()
+    }
+}
+
+/// The state root a real run uses: `$AUTOBAHN_HOME`, or `~/.autobahn`.
+#[cfg_attr(test, allow(dead_code))]
+fn user_state_root() -> Result<PathBuf> {
     match home_override()? {
         Some(home) => Ok(home),
         None => Ok(absolute_home()?.join(".autobahn")),
     }
+}
+
+/// A state root private to this unit-test process, under the system
+/// temporary directory, so parallel test runs never share one.
+#[cfg(test)]
+fn unit_test_state_root() -> PathBuf {
+    static ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!("autobahn-unit-tests-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&root);
+        root
+    })
+    .clone()
 }
 
 /// `$AUTOBAHN_HOME`, when it is set to something. Absolute, for the same
@@ -224,6 +254,17 @@ fn absolute_home() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Unit tests get a private state root, never the real one: a test run
+    /// must leave the home directory of the machine running it untouched.
+    #[test]
+    fn unit_tests_never_use_the_real_state_root() {
+        let root = default_state_root().expect("a state root");
+        assert!(root.starts_with(std::env::temp_dir()), "{}", root.display());
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(!root.starts_with(PathBuf::from(home).join(".autobahn")));
+        }
+    }
 
     #[test]
     fn tilde_expansion() {

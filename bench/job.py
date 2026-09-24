@@ -636,7 +636,6 @@ def measure_floor(emitter, nonce):
     result = run_argv([
         BINARY, "floor",
         "--observer", f"{peer_ip()}:{OBSERVER_BASE_PORT}",
-        "--dest-root", DEST,
         "--nonce", str(nonce),
     ], timeout=300)
     peer(f"rm -rf {DEST}/floor-probe")

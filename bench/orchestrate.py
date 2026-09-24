@@ -842,7 +842,7 @@ def _dispatch_body(options):
         for host, ports in listeners:
             run(f"ssh -i {key_path(key)} ubuntu@{host} "
                 f"'for p in {ports}; do setsid nohup ~/bench/benchmark observer $p "
-                f"> ~/observer-$p.log 2>&1 < /dev/null & done'")
+                f"--listen 0.0.0.0 --root ~/dest > ~/observer-$p.log 2>&1 < /dev/null & done'")
         for host, ports in listeners:
             ready = run(
                 f"ssh -i {key_path(key)} ubuntu@{host} "

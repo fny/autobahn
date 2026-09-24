@@ -70,9 +70,9 @@ EOF
 
 echo "== observer + floor =="
 mkdir -p "$WORK/dst"
-"$BINARY" observer 19911 > "$WORK/observer.log" 2>&1 &
+"$BINARY" observer 19911 --root "$WORK/dst" > "$WORK/observer.log" 2>&1 &
 sleep 0.5
-FLOOR=$("$BINARY" floor --observer 127.0.0.1:19911 --dest-root "$WORK/dst" --nonce 7)
+FLOOR=$("$BINARY" floor --observer 127.0.0.1:19911 --nonce 7)
 echo "  floor: $FLOOR"
 python3 - "$FLOOR" <<'EOF'
 import json, sys
@@ -109,7 +109,7 @@ echo "== patch mode edits a region of a large file =="
 # where a tool that always sent everything would score identically.
 rm -rf "$WORK/src-patch" "$WORK/dst-patch"
 cp -r "$WORK/src" "$WORK/src-patch"; cp -r "$WORK/src" "$WORK/dst-patch"
-"$BINARY" observer 19915 > "$WORK/observer-patch.log" 2>&1 &
+"$BINARY" observer 19915 --root "$WORK/dst-patch" > "$WORK/observer-patch.log" 2>&1 &
 sleep 0.5
 BEFORE=$(find "$WORK/src-patch/large" -type f -printf '%s\n' | paste -sd+ | bc)
 python3 "$HERE/toysync.py" "$WORK/src-patch" "$WORK/dst-patch" &
@@ -139,7 +139,7 @@ echo "== a fan-out edit waits for every destination =="
 # destination, announce to all of them, and only finish an edit once every
 # one has confirmed. A regression here would silently turn a fan-out
 # measurement back into a single-destination one.
-"$BINARY" observer 19912 > "$WORK/observer2.log" 2>&1 &
+"$BINARY" observer 19912 --root "$WORK/dst" > "$WORK/observer2.log" 2>&1 &
 sleep 0.5
 FANOUT=$("$BINARY" agents \
   --root "$WORK/src-run" --peer-root "$WORK/dst" \

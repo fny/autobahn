@@ -109,7 +109,7 @@ leg() {
     local expected
     expected=$("$BM" manifest cheap "$CORPUS")
 
-    "$BM" observer "$port" > "$WORK/observer-$name.log" 2>&1 &
+    "$BM" observer "$port" --root "$dest" > "$WORK/observer-$name.log" 2>&1 &
     STARTED+=($!)
     sleep 1
 

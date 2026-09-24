@@ -20,7 +20,7 @@ ssh -n dest "rm -rf ~/dest/$CORPUS && mkdir -p ~/dest/$CORPUS"
 # starts one, so a single line would kill its own shell before the
 # observer existed. Nothing else on the destination runs as `benchmark`.
 ssh -n dest "pkill -x benchmark 2>/dev/null; true"
-ssh -n dest "setsid nohup ~/bench/benchmark observer 9911 > ~/observer.log 2>&1 < /dev/null &"
+ssh -n dest "setsid nohup ~/bench/benchmark observer 9911 --listen 0.0.0.0 --root ~/dest/$CORPUS > ~/observer.log 2>&1 < /dev/null &"
 sleep 2
 ssh -n dest "pgrep -x benchmark > /dev/null" \
   || { echo "the observer did not start on the destination"; exit 1; }

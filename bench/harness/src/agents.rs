@@ -647,7 +647,6 @@ fn is_timeout(error: &std::io::Error) -> bool {
 /// direction (the floor can only be reported too high, never too low).
 pub fn floor(arguments: &[&str]) -> Result<(), String> {
     let mut observer = None;
-    let mut destination = None;
     let mut nonce = 0u64;
     let mut iterator = arguments.iter();
     while let Some(flag) = iterator.next() {
@@ -656,13 +655,11 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
             .ok_or_else(|| format!("{flag} needs a value"))?;
         match *flag {
             "--observer" => observer = Some((*value).to_owned()),
-            "--dest-root" => destination = Some(PathBuf::from(value)),
             "--nonce" => nonce = value.parse().map_err(|_| "--nonce".to_owned())?,
             _ => return Err(format!("unknown flag {flag}")),
         }
     }
     let observer = observer.ok_or("--observer is required")?;
-    let destination = destination.ok_or("--dest-root is required")?;
 
     let connection =
         TcpStream::connect(&observer).map_err(|error| format!("observer {observer}: {error}"))?;
@@ -677,13 +674,13 @@ pub fn floor(arguments: &[&str]) -> Result<(), String> {
     for seq in 0..50u64 {
         let size = EDIT_SIZE.0 + rng.index(EDIT_SIZE.1 - EDIT_SIZE.0);
         rng.fill(&mut payload[..size]);
-        let path = destination.join(format!("floor-probe/file-{seq}.dat"));
+        // Relative: the observer writes it beneath its own --root.
         crate::send_message(
             &mut writer,
             &json!({
                 "seq": seq,
                 "op": "floor_arm",
-                "path": path.to_string_lossy(),
+                "path": format!("floor-probe/file-{seq}.dat"),
                 "payload_hex": crate::to_hex(&payload[..size]),
             }),
         )

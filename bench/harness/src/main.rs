@@ -12,7 +12,8 @@
 //!   manifest cheap|full <root>          tree summaries for convergence
 //!   partitions <root> <output.json>     bake-time working-set generation
 //!   verify-partitions <partitions.json> re-assert disjointness at run time
-//!   observer <port>                     destination-side verifier + floor
+//!   observer <port> --root <dir> [--listen <addr>]
+//!                                       destination-side verifier + floor
 //!   agents <options>                    the edit workload (one measures)
 //!   floor <options>                     harness self-measurement
 //!   sampler <pattern> <output>          RSS/CPU series for a process tree
@@ -38,8 +39,8 @@ fn main() {
         ["manifest", "full", root] => walk::print_full(Path::new(root)),
         ["partitions", root, output] => partitions::generate(Path::new(root), Path::new(output)),
         ["verify-partitions", file] => partitions::verify_file(Path::new(file)),
-        ["observer", port] => observer::serve(port.parse().expect("port")),
         ["sampler", pattern, output] => sampler::run(pattern, Path::new(output)),
+        arguments if arguments.first() == Some(&"observer") => observer::run(&arguments[1..]),
         arguments if arguments.first() == Some(&"agents") => agents::run(&arguments[1..]),
         arguments if arguments.first() == Some(&"floor") => agents::floor(&arguments[1..]),
         _ => {
@@ -144,7 +145,11 @@ pub fn read_message<R: BufRead>(reader: &mut R) -> std::io::Result<Option<serde_
 }
 
 pub fn send_message<W: Write>(writer: &mut W, value: &serde_json::Value) -> std::io::Result<()> {
-    writer.write_all(serde_json::to_string(value).expect("serializable").as_bytes())?;
+    writer.write_all(
+        serde_json::to_string(value)
+            .expect("serializable")
+            .as_bytes(),
+    )?;
     writer.write_all(b"\n")?;
     writer.flush()
 }

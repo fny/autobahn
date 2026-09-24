@@ -16,7 +16,7 @@ for d in $(seq 0 29); do
 done
 cp -r "$W/src/." "$W/dst/"
 "$BM" partitions "$W/src" "$W/parts.json" > /dev/null
-for i in 1 2 3; do "$BM" observer $((19980+i)) > /dev/null 2>&1 & PIDS+=($!); done
+for i in 1 2 3; do "$BM" observer $((19980+i)) --root "$W/dst" > /dev/null 2>&1 & PIDS+=($!); done
 sleep 1
 # Copy source to the shared destination, so observers 1 and 2 can confirm.
 python3 - "$W" <<'PY' &

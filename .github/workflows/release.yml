@@ -167,6 +167,11 @@ jobs:
             cargo build --release --locked --target "$target"
             cp "target/$target/release/autobahn" "autobahn-$platform"
           done
+      - name: Build the app, unsigned
+        # Every build happens before the certificate exists: a dependency's
+        # build script or proc macro that runs while the identity is usable
+        # could sign anything as us. Nothing after the import compiles.
+        run: apps/macos/build.sh --unsigned
       - name: Import the Developer ID certificate
         env:
           P12: ${{ secrets.DEVELOPER_ID_P12 }}
@@ -197,13 +202,14 @@ jobs:
           AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           AUTOBAHN_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
         run: apps/macos/notarize-cli.sh autobahn-darwin-aarch64 autobahn-darwin-x86_64
-      - name: Build, sign, notarise and staple the app
+      - name: Sign, notarise and staple the app
+        # --sign-only compiles nothing: it signs the bundle built above.
         env:
           AUTOBAHN_NOTARY_KEY: ${{ runner.temp }}/notary.p8
           AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           AUTOBAHN_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
           AUTOBAHN_RELEASE_ZIP: Autobahn-macos-aarch64.zip
-        run: apps/macos/release.sh
+        run: apps/macos/release.sh --sign-only apps/macos/Autobahn.app
       - name: Remove the credentials
         # Whether the build passed or failed. The runner is discarded after
         # the job anyway; this is so nothing outlives the step that needed it.

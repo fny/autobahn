@@ -10,7 +10,7 @@ Autobahn ships three things. They ship independently. A build that refreshes one
 
 A plain `cargo build --release` gives you a new controller only. The menu bar app keeps the binary it was built with. The agent bundle in `~/.autobahn/agents` keeps the binaries the installer put there.
 
-Remote hosts are different again. The controller runs the agent at `~/.autobahn/bin/autobahn-<version>` on the host. It uploads an agent only if that path fails to run. `<version>` is the package version plus the compatibility epoch, which `protocol::version()` writes as `0.4.0+e12`. So a host takes a new agent only if that whole string changes.
+Remote hosts are different again. The controller runs the agent at `~/.autobahn/bin/autobahn-<version>-<digest>` on the host, and uploads one only if that path fails to run. `<version>` is the package version plus the compatibility epoch, which `protocol::version()` writes as `0.4.0+e12`; `<digest>` is the first twelve hex digits of the binary's blake3. So a host takes a new agent whenever the bytes the controller would send change — a new release, or a rebuild at the same version — and never the same bytes twice.
 
 ## The release pipeline
 
@@ -63,7 +63,7 @@ Keep one counter for the whole project. Do not keep one counter per channel.
 
 The handshake compares the whole version string, so a collision between channels could never fool it. The damage is different. A per-channel counter lets a stable release carry a lower epoch than a dev build that already ran on the same hosts. The number then stops meaning "this behaviour is superseded", which is the only thing it is for.
 
-After you bump the epoch, rebuild the agent bundle before you restart the supervisor. If the bundle is stale, the controller uploads an old binary under the new name, and every session fails its handshake.
+After you bump the epoch, rebuild the agent bundle before you restart the supervisor. A released bundle carries a `MANIFEST` naming the version and blake3 of every binary in it, and a controller refuses to upload a binary its manifest says belongs to another build — before it reaches any host. A bundle you built yourself has no manifest, so a stale one is uploaded and every session fails its handshake, with a message naming the bundle and its age.
 
 ## `autobahn update`
 

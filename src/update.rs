@@ -357,8 +357,14 @@ fn refresh_agents(archive: &Path, state_root: &Path) -> Result<usize> {
         }
     };
 
+    // Binaries only: the bundle also carries its MANIFEST.
     let count = std::fs::read_dir(&extracted)
-        .map(|entries| entries.flatten().count())
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().starts_with("autobahn-"))
+                .count()
+        })
         .unwrap_or(0);
 
     let agents = state_root.join("agents");

@@ -171,15 +171,41 @@ jobs:
     needs: [linux, mac]
     runs-on: ubuntu-latest
     steps:
+      # Only for the epoch, which the manifest states beside the version.
+      - uses: actions/checkout@v4
+        with:
+          path: source
+          sparse-checkout: src/protocol.rs
       - uses: actions/download-artifact@v4
         with:
           merge-multiple: true
       - name: Assemble the agents bundle and checksums
         # The agents bundle takes the lower-case autobahn-* binaries, which
         # now include the signed macOS ones; the app archive is Autobahn-*.
+        #
+        # The MANIFEST names the build of every binary in it — version,
+        # epoch, and blake3 — so a controller refuses to upload a stale
+        # bundle before it reaches any host, rather than having every host
+        # refuse it at the handshake (src/transport/install.rs). Hashed
+        # here, after signing, because signing changes the bytes.
         run: |
+          epoch=$(sed -n 's/^pub const COMPATIBILITY_EPOCH: u32 = \([0-9]*\);/\1/p' source/src/protocol.rs)
+          test -n "$epoch" || { echo "no COMPATIBILITY_EPOCH in src/protocol.rs" >&2; exit 1; }
+          version="${GITHUB_REF_NAME#v}+e${epoch}"
+          python3 -m pip install --quiet blake3
           mkdir agents
           cp autobahn-* agents/
+          python3 - "$version" <<'PY'
+          import blake3, os, sys
+          version = sys.argv[1]
+          names = sorted(n for n in os.listdir("agents") if n.startswith("autobahn-"))
+          with open("agents/MANIFEST", "w") as manifest:
+              for name in names:
+                  with open(os.path.join("agents", name), "rb") as binary:
+                      digest = blake3.blake3(binary.read()).hexdigest()
+                  manifest.write(f"{name} {version} {digest}\n")
+          PY
+          cat agents/MANIFEST
           tar czf autobahn-agents.tar.gz agents
           sha256sum autobahn-* Autobahn-macos-aarch64.zip > SHA256SUMS
       - name: Publish release

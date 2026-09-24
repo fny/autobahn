@@ -26,10 +26,185 @@ use anyhow::{anyhow, bail, Context, Result};
 
 use crate::protocol;
 
-/// Returns the remote command invoking this version's installed agent. The
-/// path is home-relative and unquoted, expanded by the remote login shell.
+/// Returns the remote command invoking this build's agent.
+///
+/// An agent is named for its version *and its content*:
+/// `autobahn-<version>-<digest>`. The version alone let a rebuilt agent
+/// at the same version run the old one forever, since the path existed and
+/// nothing was ever uploaded again. Named by content, a changed binary is
+/// always a missing one, and an unchanged one is never sent twice.
+///
+/// The controller cannot know the remote platform without asking, and
+/// asking is a round trip on every connect, so the command asks for it:
+/// a `sh` script maps `uname` to the bundle's naming, as `platform_name`
+/// does, and runs the agent this controller would have installed for that
+/// platform. A platform it holds no binary for falls back to the version's
+/// plain name, which is what every controller before this one installed.
+/// A missing agent exits 127, which is what a missing agent always looked
+/// like, and the caller installs it.
 pub fn versioned_remote_command() -> String {
-    format!("~/.autobahn/bin/autobahn-{} agent", protocol::version())
+    let version = protocol::version();
+    let mut branches = String::new();
+    for (platform, path) in agent_candidates() {
+        if let Some(digest) = file_digest(&path) {
+            branches.push_str(&format!(
+                "{platform}) exec \"$HOME/.autobahn/bin/autobahn-{version}-{digest}\" agent;; "
+            ));
+        }
+    }
+    // Run by `sh` whatever the login shell is: the script is POSIX, and a
+    // login shell like fish would not parse it. Single-quoted as one word;
+    // nothing inside it holds a single quote.
+    format!(
+        "sh -c 's=$(uname -s | tr A-Z a-z); m=$(uname -m); \
+         case $m in arm64) m=aarch64;; amd64) m=x86_64;; esac; \
+         case $s-$m in {branches}*) exec \"$HOME/.autobahn/bin/autobahn-{version}\" agent;; esac'"
+    )
+}
+
+/// The first `digest_length` hex digits of a binary's blake3: enough to
+/// tell two builds apart, short enough to read in a file listing.
+const DIGEST_LENGTH: usize = 12;
+
+/// Names an agent binary's content.
+fn content_digest(content: &[u8]) -> String {
+    blake3::hash(content).to_hex()[..DIGEST_LENGTH].to_owned()
+}
+
+/// Names a file's content, remembered per path while the file's size and
+/// modification time stand, so building the remote command on every
+/// connect does not read several megabytes each time.
+fn file_digest(path: &std::path::Path) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    type Seen = HashMap<PathBuf, (std::time::SystemTime, u64, String)>;
+    static SEEN: OnceLock<Mutex<Seen>> = OnceLock::new();
+    let metadata = fs::metadata(path).ok()?;
+    let stamp = (metadata.modified().ok()?, metadata.len());
+    let seen = SEEN.get_or_init(Mutex::default);
+    if let Some((modified, length, digest)) = seen
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(path)
+    {
+        if (*modified, *length) == stamp {
+            return Some(digest.clone());
+        }
+    }
+    let digest = content_digest(&fs::read(path).ok()?);
+    seen.lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(path.to_path_buf(), (stamp.0, stamp.1, digest.clone()));
+    Some(digest)
+}
+
+/// Every platform this controller could install an agent for, with the
+/// binary it would install — the same search `locate_agent_binary` makes,
+/// the first place holding a platform winning.
+fn agent_candidates() -> Vec<(String, PathBuf)> {
+    let mut found: Vec<(String, PathBuf)> = Vec::new();
+    for directory in agent_directories() {
+        let Ok(entries) = fs::read_dir(&directory) else {
+            continue;
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .filter(|name| name.starts_with("autobahn-"))
+            .collect();
+        names.sort();
+        for name in names {
+            let platform = name["autobahn-".len()..].to_owned();
+            if !platform.is_empty()
+                && platform
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+                && !found.iter().any(|(known, _)| *known == platform)
+            {
+                found.push((platform, directory.join(&name)));
+            }
+        }
+    }
+    let local = local_platform();
+    if !found.iter().any(|(known, _)| *known == local) {
+        if let Ok(executable) = std::env::current_exe() {
+            found.push((local, executable));
+        }
+    }
+    found
+}
+
+/// Where agent bundles are looked for, in order.
+fn agent_directories() -> Vec<PathBuf> {
+    let mut directories = Vec::new();
+    if let Ok(directory) = std::env::var("AUTOBAHN_AGENTS_DIR") {
+        directories.push(PathBuf::from(directory));
+    }
+    if let Ok(state_root) = crate::paths::default_state_root() {
+        directories.push(state_root.join("agents"));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(directory) = executable.parent() {
+            directories.push(directory.join("agents"));
+        }
+    }
+    directories
+}
+
+/// The file a bundle states its contents in: one line per binary,
+/// `autobahn-<platform> <version> <blake3>`, written by the release.
+pub const MANIFEST: &str = "MANIFEST";
+
+/// Checks a bundle binary against its bundle's manifest, before anything
+/// is sent anywhere. A binary from an older build would be uploaded under
+/// this build's name and refused by the handshake, on every host, with a
+/// message about the host; this refuses it here, naming the bundle.
+///
+/// A bundle with no manifest — a local cross-build — is not checked, and
+/// the handshake remains the check.
+fn check_manifest(binary: &std::path::Path, platform: &str) -> Result<()> {
+    let Some(directory) = binary.parent() else {
+        return Ok(());
+    };
+    let Ok(manifest) = fs::read_to_string(directory.join(MANIFEST)) else {
+        return Ok(());
+    };
+    let name = format!("autobahn-{platform}");
+    let version = protocol::version();
+    let Some(line) = manifest
+        .lines()
+        .find(|line| line.split_whitespace().next() == Some(name.as_str()))
+    else {
+        bail!(
+            "the agent bundle in {} has a manifest that does not list {name}; \
+             reinstall the bundle (autobahn update)",
+            directory.display()
+        );
+    };
+    let mut fields = line.split_whitespace().skip(1);
+    let (Some(stated), Some(digest)) = (fields.next(), fields.next()) else {
+        bail!(
+            "the agent bundle manifest in {} is malformed",
+            directory.display()
+        );
+    };
+    if stated != version {
+        bail!(
+            "the agent bundle in {} is for {stated}, and this is {version}; \
+             `autobahn update` installs the matching bundle",
+            directory.display()
+        );
+    }
+    let content = fs::read(binary)
+        .with_context(|| format!("unable to read agent binary {}", binary.display()))?;
+    if blake3::hash(&content).to_hex().as_str() != digest {
+        bail!(
+            "{} is not the binary its bundle's manifest lists; \
+             `autobahn update` reinstalls the bundle",
+            binary.display()
+        );
+    }
+    Ok(())
 }
 
 /// Ensures this version's agent is installed on the remote host: probes the
@@ -54,6 +229,9 @@ pub fn ensure_agent(destination: &str) -> Result<Installed> {
              containing autobahn-{platform} beside the executable)"
         )
     })?;
+    if binary != std::env::current_exe().unwrap_or_default() {
+        check_manifest(&binary, &platform)?;
+    }
     upload_agent(destination, &binary)
         .with_context(|| format!("unable to install the {platform} agent on {destination}"))?;
     Ok(Installed {
@@ -165,31 +343,10 @@ fn local_platform() -> String {
 /// and — for the local platform — the running executable itself, since it
 /// *is* an agent for its own platform.
 fn locate_agent_binary(platform: &str) -> Option<PathBuf> {
-    let name = format!("autobahn-{platform}");
-    if let Ok(directory) = std::env::var("AUTOBAHN_AGENTS_DIR") {
-        let candidate = PathBuf::from(directory).join(&name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    if let Ok(state_root) = crate::paths::default_state_root() {
-        let candidate = state_root.join("agents").join(&name);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(directory) = executable.parent() {
-            let candidate = directory.join("agents").join(&name);
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-        if platform == local_platform() {
-            return Some(executable);
-        }
-    }
-    None
+    agent_candidates()
+        .into_iter()
+        .find(|(candidate, path)| candidate == platform && path.is_file())
+        .map(|(_, path)| path)
 }
 
 /// Streams a binary to the remote host's versioned agent path over one SSH
@@ -210,13 +367,16 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
     // catches a stream cut short (a dropped connection, a killed ssh)
     // before anything is published; the rename is atomic and
     // last-writer-wins with a verified whole binary.
+    // Named for the bytes streamed, not for the file's name: what runs
+    // under this name is exactly what was measured here.
+    let digest = content_digest(&content);
     let script = format!(
         "mkdir -p ~/.autobahn/bin && \
          tmp=~/.autobahn/bin/.autobahn-tmp-install-{version}-$$ && \
          cat > \"$tmp\" && \
          [ \"$(wc -c < \"$tmp\")\" -eq {length} ] || {{ rm -f \"$tmp\"; exit 70; }} && \
          chmod 755 \"$tmp\" && \
-         mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}",
+         mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}-{digest}",
         length = content.len()
     );
     let mut child = ssh_command(destination, &script)
@@ -274,6 +434,9 @@ pub struct Pruned {
 /// last needed it, which is what the mtime records.
 pub fn prune_agents(destination: &str, keep: usize, dry_run: bool) -> Result<Pruned> {
     let current = format!("autobahn-{}", protocol::version());
+    // One name per build of this version since agents were named by
+    // content: the newest is the one in use, and older builds of the same
+    // version are spares like any other.
     // Oldest first, one name per line. `ls -t` is newest first, so this is
     // reversed on arrival rather than trusting a second sort remotely.
     let script = "ls -t ~/.autobahn/bin/ 2>/dev/null | grep '^autobahn-' || true";
@@ -345,8 +508,16 @@ fn select_agents(
     let mut kept = Vec::new();
     let mut removed = Vec::new();
     let mut spare = keep;
+    let mut in_use = false;
     for name in newest_first {
-        if name == current {
+        // This version's agent, by its plain name or by a build of it: the
+        // newest such is the one running.
+        let this_version = name == current
+            || name
+                .strip_prefix(current)
+                .is_some_and(|rest| rest.starts_with('-'));
+        if this_version && !in_use {
+            in_use = true;
             kept.push(name.clone());
         } else if spare > 0 {
             spare -= 1;
@@ -506,8 +677,127 @@ mod tests {
     #[test]
     fn the_versioned_command_names_this_build() {
         let command = versioned_remote_command();
-        assert!(command.starts_with("~/.autobahn/bin/autobahn-"));
-        assert!(command.ends_with(" agent"));
-        assert!(command.contains(&protocol::version()));
+        assert!(command.contains(&format!("/.autobahn/bin/autobahn-{}", protocol::version())));
+        assert!(command.contains("\" agent;;"));
+    }
+
+    #[test]
+    fn builds_of_the_version_in_use_keep_only_the_newest() {
+        let all = vec![
+            "autobahn-0.4.0+e9-bbbbbbbbbbbb".to_owned(),
+            "autobahn-0.4.0+e9-aaaaaaaaaaaa".to_owned(),
+            "autobahn-0.4.0+e9".to_owned(),
+            "autobahn-0.4.0+e8".to_owned(),
+        ];
+        let (kept, removed) = select_agents(&all, "autobahn-0.4.0+e9", 0);
+        assert_eq!(kept, vec!["autobahn-0.4.0+e9-bbbbbbbbbbbb".to_owned()]);
+        assert_eq!(removed.len(), 3);
+        // A version whose name merely begins the same is another version.
+        let (kept, _) = select_agents(&["autobahn-0.4.0+e90".to_owned()], "autobahn-0.4.0+e9", 0);
+        assert!(kept.is_empty());
+    }
+
+    #[test]
+    fn the_remote_command_is_one_posix_word_naming_each_build_by_content() {
+        let command = versioned_remote_command();
+        assert!(
+            command.starts_with("sh -c '") && command.ends_with('\''),
+            "{command}"
+        );
+        // One quoted word: nothing inside closes it early.
+        assert_eq!(command.matches('\'').count(), 2, "{command}");
+        let version = protocol::version();
+        // The running executable is always a candidate for its own
+        // platform, named by its digest.
+        let executable = std::env::current_exe().expect("the test binary");
+        let digest = file_digest(&executable).expect("digestible");
+        assert_eq!(digest.len(), DIGEST_LENGTH);
+        assert!(
+            command.contains(&format!("autobahn-{version}-{digest}"))
+                || agent_candidates()
+                    .iter()
+                    .any(|(platform, _)| *platform == local_platform()),
+            "{command}"
+        );
+        // And an unknown platform falls back to the plain versioned name.
+        assert!(command.contains(&format!(
+            "*) exec \"$HOME/.autobahn/bin/autobahn-{version}\" agent;;"
+        )));
+    }
+
+    #[test]
+    fn the_remote_command_runs_under_sh_and_picks_this_platform() {
+        // Run the script as the remote would, with $HOME pointed at a
+        // directory holding a stand-in "agent" under the expected name.
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let bin = home.path().join(".autobahn/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let (platform, path) = agent_candidates()
+            .into_iter()
+            .find(|(platform, _)| *platform == local_platform())
+            .expect("the local platform is always a candidate");
+        let _ = platform;
+        let name = format!(
+            "autobahn-{}-{}",
+            protocol::version(),
+            file_digest(&path).unwrap()
+        );
+        let stand_in = bin.join(&name);
+        fs::write(&stand_in, "#!/bin/sh\necho picked \"$1\"\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&stand_in, fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(versioned_remote_command())
+            .env("HOME", home.path())
+            .output()
+            .expect("sh runs");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            "picked agent"
+        );
+        // Missing, it fails the way a missing agent always has.
+        fs::remove_file(&stand_in).unwrap();
+        let output = Command::new("sh")
+            .arg("-c")
+            .arg(versioned_remote_command())
+            .env("HOME", home.path())
+            .output()
+            .expect("sh runs");
+        assert_eq!(output.status.code(), Some(127));
+    }
+
+    #[test]
+    fn a_manifest_for_another_version_is_refused_before_anything_is_sent() {
+        let bundle = tempfile::tempdir().expect("a temporary directory");
+        let binary = bundle.path().join("autobahn-linux-x86_64");
+        fs::write(&binary, b"an agent").unwrap();
+        // No manifest: not checked.
+        assert!(check_manifest(&binary, "linux-x86_64").is_ok());
+        let digest = blake3::hash(b"an agent").to_hex().to_string();
+        let version = protocol::version();
+        fs::write(
+            bundle.path().join(MANIFEST),
+            format!("autobahn-linux-x86_64 {version} {digest}\n"),
+        )
+        .unwrap();
+        assert!(check_manifest(&binary, "linux-x86_64").is_ok());
+        fs::write(
+            bundle.path().join(MANIFEST),
+            format!("autobahn-linux-x86_64 0.0.1+e1 {digest}\n"),
+        )
+        .unwrap();
+        let error = check_manifest(&binary, "linux-x86_64").expect_err("another version");
+        assert!(
+            format!("{error:#}").contains("is for 0.0.1+e1"),
+            "{error:#}"
+        );
+        fs::write(
+            bundle.path().join(MANIFEST),
+            format!("autobahn-linux-x86_64 {version} {}\n", "0".repeat(64)),
+        )
+        .unwrap();
+        let error = check_manifest(&binary, "linux-x86_64").expect_err("replaced binary");
+        assert!(format!("{error:#}").contains("not the binary"), "{error:#}");
     }
 }

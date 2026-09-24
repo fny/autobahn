@@ -12,7 +12,7 @@ Everything autobahn keeps lives under one directory, `~/.autobahn`, on every mac
 | `staging/` | in-flight content, held aside until verified, then renamed into place; swept at the end of every cycle, so a version that changed while in flight does not linger |
 | `endpoint-locks/` | one lock per pair of roots, so two sessions never write one tree from independent ancestors |
 | `agents/` | the agent bundle — binaries for platforms other than this one |
-| `bin/autobahn-<version>` | on a *remote* host: the agent this controller streamed there |
+| `bin/autobahn-<version>-<digest>` | on a *remote* host: the agent this controller streamed there, named by its version and its content |
 | `ignores/` | ignore files, named from the config — see [Ignores](./ignores.md) |
 | `peering/` | experimental: the lease, this host's name in the star, the pushed configuration, and the ancestor copies a leader keeps here — see [Peering](./peering.md). `clean` leaves it alone |
 | `service.log` | the supervisor's log — see [The log](./logging.md) |
@@ -36,7 +36,7 @@ Staged content this machine holds *as an agent* for sessions driven from other m
 
 ## Agents
 
-Remote hosts need nothing pre-installed. Connections invoke a versioned agent path (`~/.autobahn/bin/autobahn-<version>`); when it is missing — a fresh host, or your first connect after upgrading — the controller probes the platform, streams the matching agent into place over the same SSH connection, and retries. Upgrades therefore roll out host by host, automatically, on first contact.
+Remote hosts need nothing pre-installed. Connections run the agent this controller would install for the host's platform, by a path naming its version and a digest of its bytes (`~/.autobahn/bin/autobahn-0.4.0+e13-613662c7aad6`) — the platform is read on the host, in the same command, so it costs no extra round trip. When that path is missing — a fresh host, your first connect after upgrading, or a rebuild at the same version — the controller streams the matching agent into place and retries. Upgrades therefore roll out host by host, automatically, on first contact, and the agent running is always exactly the build the controller holds.
 
 The binary to stream is looked for in `AUTOBAHN_AGENTS_DIR`, then `~/.autobahn/agents`, then an `agents` directory beside the running executable — and, when the remote platform matches the local one, the running executable itself. A fleet on one platform needs no bundle at all.
 
@@ -55,7 +55,7 @@ One thing to know: "in use" means the version of the binary *running `clean`*, w
 
 The agent's version must match the controller's exactly. A change that breaks the wire protocol, or one that makes the two sides disagree about a tree — a scan rule, an ignore rule — bumps a compatibility epoch that rides inside the version string (`0.4.0+e8`). A mismatched agent fails the handshake, and the installer places the new agent at a path the old one never occupied, so both sides are enforced with no protocol change.
 
-The one failure the installer cannot catch itself is a *stale bundle*: an `agents/` binary left over from an older build gets uploaded under the new name, and the handshake is the first thing to notice. The message names the bundle and its age when that happens.
+A *stale bundle* — an `agents/` binary left over from an older build — is refused before upload when the bundle has a `MANIFEST`, which every released bundle does: the message names the bundle, the build it is for, and `autobahn update` as the fix. A bundle built by hand has no manifest; its stale binary is uploaded, the handshake refuses it, and the message names the bundle and its age.
 
 ## See also
 

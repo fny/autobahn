@@ -913,15 +913,20 @@ fn run_sync(
     // as this once did — reopens the window in which a retargeted symlink
     // binds a different tree than the state and lock identify, letting a
     // stale ancestor authorize writes into the wrong tree.
-    let frozen_of = |spec: &str, agent: &Option<String>| -> Option<PathBuf> {
+    //
+    // A leading `~` is expanded first, as a configured endpoint's is: a
+    // quoted `'~/backup'` means home here too, not a directory named `~`.
+    let frozen_of = |spec: &str, agent: &Option<String>| -> Result<Option<PathBuf>> {
         if agent.is_some() || parse_remote(spec).is_some() {
-            None
+            Ok(None)
         } else {
-            Some(paths::resolve_for_identity(&PathBuf::from(spec)))
+            Ok(Some(paths::resolve_for_identity(&paths::expand_tilde(
+                spec,
+            )?)))
         }
     };
-    let alpha_frozen = frozen_of(&alpha, &alpha_agent);
-    let beta_frozen = frozen_of(&beta, &beta_agent);
+    let alpha_frozen = frozen_of(&alpha, &alpha_agent)?;
+    let beta_frozen = frozen_of(&beta, &beta_agent)?;
     let identity_from = |spec: &str, frozen: &Option<PathBuf>| -> String {
         match frozen {
             Some(path) => path.to_string_lossy().into_owned(),

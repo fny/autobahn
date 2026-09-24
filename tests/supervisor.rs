@@ -1572,6 +1572,27 @@ fn a_manual_sync_exits_two_when_a_conflict_remains() {
     assert_eq!(code, Some(2), "{text}");
 }
 
+/// A quoted `~` reaches a manual sync unexpanded by the shell; it means
+/// home there as it does in the configuration, not a directory named `~`.
+#[test]
+fn a_manual_sync_expands_a_quoted_tilde() {
+    let world = World::new();
+    let home = world.directory("home");
+    let cwd = world.directory("cwd");
+    write(&home, "a/file.txt", "content");
+    fs::create_dir_all(home.join("b")).unwrap();
+    let output = std::process::Command::new(agent_binary())
+        .args(["sync", "~/a", "~/b"])
+        .current_dir(&cwd)
+        .env("HOME", &home)
+        .env_remove("AUTOBAHN_HOME")
+        .output()
+        .expect("the CLI runs");
+    let text = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(0), "{text}");
+    assert_eq!(read(&home, "b/file.txt"), "content");
+    assert!(!cwd.join("~").exists(), "a literal ./~ was created");
+}
 // ── clean and disabled sessions ──────────────────────────────────────
 
 /// Turns a group off or on through the CLI.

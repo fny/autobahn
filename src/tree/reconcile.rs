@@ -1557,7 +1557,7 @@ mod tests {
                     },
                 },
                 3 => dir(name, vec![]),
-                _ => file(name, byte, kind % 7 == 0),
+                _ => file(name, byte, kind.is_multiple_of(7)),
             }
         };
         let modes = [

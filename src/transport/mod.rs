@@ -570,7 +570,10 @@ fn serve_channel<W: Write + Send>(
     // the next delta's baseline, kept rather than re-encoded. It changes
     // only with `last_sent` — a transition's fold or a failed send clears
     // it — so it always describes exactly that snapshot.
-    let mut last_sent_encoding: Option<(Vec<u8>, crate::tree::Digest)> = None;
+    let mut last_sent_encoding: Option<Encoding> = None;
+    // Tree digests for changed scans, remembering what it hashed so a scan
+    // costs the size of its change.
+    let mut digester = crate::tree::TreeDigester::default();
     // The operations of a snapshot delta in flight, drained by ScanPull.
     let mut pending: std::collections::VecDeque<crate::rsync::Op> = Default::default();
     // Peering. The fence is the lease this channel was refused against:
@@ -591,7 +594,7 @@ fn serve_channel<W: Write + Send>(
         let mut anchor = Anchor::Keep;
         // The encoding of the snapshot an `Anchor::To` names, when a scan
         // just produced it.
-        let mut anchor_encoding: Option<(Vec<u8>, crate::tree::Digest)> = None;
+        let mut anchor_encoding: Option<Encoding> = None;
         // The fence refuses every write. Reads still answer, so a fenced
         // controller can see the tree it is no longer allowed to change,
         // and its scans keep the session's model honest for when it is
@@ -696,11 +699,12 @@ fn serve_channel<W: Write + Send>(
                         &snapshot,
                         last_sent.as_ref(),
                         last_sent_encoding.as_ref(),
+                        &mut digester,
                         &mut pending,
                         endpoint.generation().unwrap_or(0),
                     )?;
                     anchor = Anchor::To(Some(snapshot));
-                    anchor_encoding = Some(encoding);
+                    anchor_encoding = encoding;
                     Ok(answer)
                 }),
             Request::ScanVerified => {
@@ -712,11 +716,12 @@ fn serve_channel<W: Write + Send>(
                             &snapshot,
                             last_sent.as_ref(),
                             last_sent_encoding.as_ref(),
+                            &mut digester,
                             &mut pending,
                             endpoint.generation().unwrap_or(0),
                         )?;
                         anchor = Anchor::To(Some(snapshot));
-                        anchor_encoding = Some(encoding);
+                        anchor_encoding = encoding;
                         Ok(answer)
                     },
                 )
@@ -790,6 +795,12 @@ fn serve_channel<W: Write + Send>(
             (Ok(()), Anchor::To(snapshot)) => {
                 last_sent = snapshot;
                 last_sent_encoding = anchor_encoding;
+                // Digested now, while the controller works on the answer,
+                // rather than when the next scan is waited on. After a
+                // changed scan this finds everything already digested.
+                if let Some(sent) = &last_sent {
+                    digester.snapshot(sent);
+                }
             }
             (Ok(()), Anchor::Keep) => {}
             // Forgetting everything costs one full resend and avoids having
@@ -847,48 +858,47 @@ fn anchor_after_transition(sent: Option<&Snapshot>, folded: Option<&Snapshot>) -
 /// whole) and suits a rewrite of much of the tree better anyway.
 const SCAN_CHANGES_MAX_BYTES: u64 = 4 * 1024 * 1024;
 
+/// A snapshot's encoding and the digest of it.
+pub(crate) type Encoding = (Vec<u8>, crate::tree::Digest);
+
 /// Answers a changed scan: as the changes from the snapshot last sent when
-/// the channel has that snapshot's encoding to name as the baseline and the
-/// changes are small, and as a byte delta otherwise. Returns the answer
-/// and the new snapshot's encoding, which becomes the next baseline.
+/// there is one and the changes are small, and as a byte delta otherwise.
+/// Returns the answer and, for a byte delta, the new snapshot's encoding,
+/// which the next byte delta can use as its base; after changes it is made
+/// only if a byte delta ever needs it.
 fn changed_scan(
     snapshot: &Snapshot,
     last_sent: Option<&Snapshot>,
-    last_sent_encoding: Option<&(Vec<u8>, crate::tree::Digest)>,
+    last_sent_encoding: Option<&Encoding>,
+    digester: &mut crate::tree::TreeDigester,
     pending: &mut std::collections::VecDeque<crate::rsync::Op>,
     generation: u64,
-) -> Result<(Response, (Vec<u8>, crate::tree::Digest))> {
+) -> Result<(Response, Option<Encoding>)> {
     if let Some(sent) = last_sent {
         let changes = exact_changes(sent.root.as_ref(), snapshot.root.as_ref());
         let small =
             bincode::serialized_size(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
         if small {
-            // The baseline's digest: kept from the scan that sent it, or —
-            // after a transition refolded it — encoded now, which is still
-            // far cheaper than the byte delta it would otherwise take.
-            let baseline = match last_sent_encoding {
-                Some((_, digest)) => *digest,
-                None => *blake3::hash(&encode_snapshot(sent)?).as_bytes(),
-            };
-            let target = encode_snapshot(snapshot)?;
-            let digest = *blake3::hash(&target).as_bytes();
-            let head = Snapshot {
-                root: None,
-                ..snapshot.clone()
-            };
+            // Both digests are tree digests, which hash only what changed
+            // since the digester last saw these trees: no encoding at all
+            // on this path. One is made only if a later scan needs a byte
+            // delta against this snapshot.
             let answer = Response::ScanChanges(protocol::ScanChanges {
                 generation,
-                baseline,
-                digest,
-                head,
+                baseline: digester.snapshot(sent),
+                digest: digester.snapshot(snapshot),
+                head: Snapshot {
+                    root: None,
+                    ..snapshot.clone()
+                },
                 changes,
             });
-            return Ok((answer, (target, digest)));
+            return Ok((answer, None));
         }
     }
     let (header, encoding) =
         snapshot_delta(snapshot, last_sent, last_sent_encoding, pending, generation)?;
-    Ok((Response::ScanDelta(header), encoding))
+    Ok((Response::ScanDelta(header), Some(encoding)))
 }
 
 /// The changes that turn `base` into `target` *exactly* — scan metadata
@@ -999,10 +1009,10 @@ pub(crate) fn exact_changes(base: Option<&Node>, target: Option<&Node>) -> Vec<C
 fn snapshot_delta(
     snapshot: &Snapshot,
     baseline: Option<&Snapshot>,
-    baseline_encoding: Option<&(Vec<u8>, crate::tree::Digest)>,
+    baseline_encoding: Option<&Encoding>,
     pending: &mut std::collections::VecDeque<crate::rsync::Op>,
     generation: u64,
-) -> Result<(protocol::ScanDelta, (Vec<u8>, crate::tree::Digest))> {
+) -> Result<(protocol::ScanDelta, Encoding)> {
     let target = encode_snapshot(snapshot)?;
     let digest = *blake3::hash(&target).as_bytes();
     let (baseline_digest, signature) = match baseline {

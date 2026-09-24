@@ -254,17 +254,19 @@ pub enum Response {
 /// the controller applies them copy-on-write, so what did not change is
 /// neither sent nor rebuilt.
 ///
-/// It is held to the same standard as a byte delta. The changes apply to
-/// the encoding whose digest is `baseline`, and must produce the encoding
-/// whose digest is `digest`; the controller encodes what it built and
-/// checks, and anything that disagrees is asked for in full.
+/// It is held to the same standard as a byte delta: the changes apply to
+/// the snapshot whose digest is `baseline`, and must produce the one whose
+/// digest is `digest`, and anything that disagrees is asked for in full.
+/// These are tree digests (`TreeDigester`), which cover every field of
+/// every node as an encoding's hash does, and cost the size of the change
+/// rather than of the tree.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ScanChanges {
     /// The generation of the root's observer the snapshot was taken at.
     pub generation: u64,
-    /// The digest of the encoding the changes apply to.
+    /// The tree digest of the snapshot the changes apply to.
     pub baseline: Digest,
-    /// The digest of the encoding they must produce.
+    /// The tree digest of the snapshot they must produce.
     pub digest: Digest,
     /// Everything about the snapshot but its hierarchy.
     pub head: Snapshot,

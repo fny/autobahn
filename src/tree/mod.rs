@@ -541,6 +541,132 @@ impl Node {
     }
 }
 
+/// A digest of a whole snapshot, computed from its hierarchy the way a
+/// Merkle tree is: a directory's digest covers its children's, so what did
+/// not change since the last digest is not hashed again.
+///
+/// It stands in for hashing a snapshot's encoding where both sides of a
+/// session must prove they hold the same snapshot after applying changes:
+/// that meant encoding and hashing the whole thing — 45 MB at 420k files,
+/// on each side, for every edit. Any difference in any field of any node,
+/// or in the snapshot's other fields, changes it.
+///
+/// Directories' digests are kept per shared child list. An entry holds a
+/// weak reference to the list, which keeps the allocation — and so its
+/// address — reserved while the entry exists: an entry can never be taken
+/// for a different list that happens to reuse the memory. Entries whose
+/// list is gone are swept when the table has doubled since the last sweep.
+#[derive(Default)]
+pub struct TreeDigester {
+    directories: std::collections::HashMap<usize, (std::sync::Weak<Vec<Node>>, Digest)>,
+    swept_at: usize,
+}
+
+impl TreeDigester {
+    /// The digest of a snapshot: its hierarchy's, and every other field.
+    pub fn snapshot(&mut self, snapshot: &Snapshot) -> Digest {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"autobahn snapshot 1");
+        let head = Snapshot {
+            root: None,
+            ..snapshot.clone()
+        };
+        hasher.update(&bincode::serialize(&head).unwrap_or_default());
+        match &snapshot.root {
+            Some(root) => {
+                hasher.update(&[1]);
+                hasher.update(&self.node(root));
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        if self.directories.len() > 2 * self.swept_at.max(1024) {
+            self.directories
+                .retain(|_, (list, _)| list.strong_count() > 0);
+            self.swept_at = self.directories.len();
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// The digest of a snapshot's root node.
+    fn node(&mut self, node: &Node) -> Digest {
+        let mut bytes = Vec::new();
+        self.feed(&mut bytes, node);
+        *blake3::hash(&bytes).as_bytes()
+    }
+
+    /// Writes a node's bytes into its parent's. Every part is either of
+    /// fixed size or preceded by its length, so no two different nodes, or
+    /// lists of them, write the same bytes. Only directories are hashed on
+    /// their own — theirs is the digest that is kept — so a cold digest of a
+    /// tree hashes each byte once, in a call per directory.
+    fn feed(&mut self, bytes: &mut Vec<u8>, node: &Node) {
+        bytes.extend_from_slice(&(node.name.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(node.name.as_bytes());
+        match &node.content {
+            Content::Directory(children) => {
+                bytes.push(0);
+                bytes.extend_from_slice(&self.children(children));
+            }
+            Content::File {
+                digest,
+                executable,
+                metadata,
+            } => {
+                // Named in full, so a field added later cannot be left out.
+                let FileMetadata {
+                    mtime_seconds,
+                    mtime_nanos,
+                    size,
+                    inode,
+                    mode,
+                } = metadata;
+                bytes.push(1);
+                bytes.extend_from_slice(digest);
+                bytes.push(u8::from(*executable));
+                bytes.extend_from_slice(&mtime_seconds.to_le_bytes());
+                bytes.extend_from_slice(&mtime_nanos.to_le_bytes());
+                bytes.extend_from_slice(&size.to_le_bytes());
+                bytes.extend_from_slice(&inode.to_le_bytes());
+                bytes.extend_from_slice(&mode.to_le_bytes());
+            }
+            Content::Symlink { target } => {
+                bytes.push(2);
+                bytes.extend_from_slice(&(target.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(target.as_bytes());
+            }
+            Content::Untracked => bytes.push(3),
+            Content::Problematic { message } => {
+                bytes.push(4);
+                bytes.extend_from_slice(&(message.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(message.as_bytes());
+            }
+        }
+    }
+
+    fn children(&mut self, children: &Arc<Vec<Node>>) -> Digest {
+        let key = Arc::as_ptr(children) as usize;
+        if let Some((list, digest)) = self.directories.get(&key) {
+            if list
+                .upgrade()
+                .is_some_and(|list| Arc::ptr_eq(&list, children))
+            {
+                return *digest;
+            }
+        }
+        let mut bytes = Vec::with_capacity(children.len() * 96);
+        bytes.extend_from_slice(&(children.len() as u64).to_le_bytes());
+        for child in children.iter() {
+            self.feed(&mut bytes, child);
+        }
+        let digest = *blake3::hash(&bytes).as_bytes();
+        self.directories
+            .insert(key, (Arc::downgrade(children), digest));
+        digest
+    }
+}
+
 /// The node at a root-relative path (`""` is the root itself), if any.
 pub fn node_at<'a>(root: Option<&'a Node>, path: &str) -> Option<&'a Node> {
     let mut node = root?;
@@ -771,5 +897,119 @@ mod tests {
             root = changed;
             problems = reused;
         }
+    }
+
+    #[test]
+    fn a_tree_digest_tells_every_difference_and_nothing_else() {
+        let snapshot = |root: Node| Snapshot {
+            root: Some(root),
+            files: 3,
+            ..Snapshot::default()
+        };
+        let tree = || {
+            Node::directory(
+                "",
+                vec![
+                    Node::directory("d", vec![file("a", 1, false), file("b", 2, false)]),
+                    file("c", 3, true),
+                ],
+            )
+        };
+        let mut digester = TreeDigester::default();
+        let first = digester.snapshot(&snapshot(tree()));
+        // The same content built separately — sharing nothing — agrees,
+        // and so does a fresh digester, which has cached nothing.
+        assert_eq!(digester.snapshot(&snapshot(tree())), first);
+        assert_eq!(TreeDigester::default().snapshot(&snapshot(tree())), first);
+        // Every kind of difference shows.
+        let changed = |change: Change| {
+            let root = apply(Some(&tree()), &[change]).unwrap().unwrap();
+            TreeDigester::default().snapshot(&snapshot(root))
+        };
+        let touched = {
+            let mut node = file("a", 1, false);
+            if let Content::File { metadata, .. } = &mut node.content {
+                metadata.mtime_nanos = 1;
+            }
+            node
+        };
+        for (what, change) in [
+            (
+                "metadata",
+                Change {
+                    path: "d/a".into(),
+                    old: None,
+                    new: Some(touched),
+                },
+            ),
+            (
+                "content",
+                Change {
+                    path: "d/a".into(),
+                    old: None,
+                    new: Some(file("a", 9, false)),
+                },
+            ),
+            (
+                "executability",
+                Change {
+                    path: "c".into(),
+                    old: None,
+                    new: Some(file("c", 3, false)),
+                },
+            ),
+            (
+                "removal",
+                Change {
+                    path: "d/b".into(),
+                    old: None,
+                    new: None,
+                },
+            ),
+            (
+                "addition",
+                Change {
+                    path: "d/z".into(),
+                    old: None,
+                    new: Some(file("z", 1, false)),
+                },
+            ),
+            (
+                "kind",
+                Change {
+                    path: "c".into(),
+                    old: None,
+                    new: Some(Node::directory("c", vec![])),
+                },
+            ),
+        ] {
+            assert_ne!(changed(change), first, "{what}");
+        }
+        let mut other_head = snapshot(tree());
+        other_head.files = 4;
+        assert_ne!(
+            TreeDigester::default().snapshot(&other_head),
+            first,
+            "the head"
+        );
+        // Incremental: a digester that saw the old tree, given one changed
+        // copy-on-write, agrees with one that saw nothing.
+        let old = tree();
+        let mut remembering = TreeDigester::default();
+        remembering.snapshot(&snapshot(old.clone()));
+        let new = apply(
+            Some(&old),
+            &[Change {
+                path: "d/b".into(),
+                old: None,
+                new: Some(file("b", 7, false)),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            remembering.snapshot(&snapshot(new.clone())),
+            TreeDigester::default().snapshot(&snapshot(new))
+        );
     }
 }

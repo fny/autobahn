@@ -76,6 +76,9 @@ pub struct RemoteEndpoint {
     /// re-encoded. Cleared whenever `last_snapshot` changes any other way,
     /// so it only ever describes that snapshot exactly.
     last_encoding: Option<(Vec<u8>, crate::tree::Digest)>,
+    /// Tree digests of `last_snapshot` and what changes build from it,
+    /// remembering what it hashed; see `TreeDigester`.
+    digester: crate::tree::TreeDigester,
     /// Where this endpoint's scans report that they are running.
     progress: Option<Arc<crate::progress::SideProgress>>,
 }
@@ -220,9 +223,10 @@ impl RemoteEndpoint {
         what: &str,
     ) -> Result<Snapshot> {
         match self.apply_changes(&scan) {
-            Ok((snapshot, encoding)) => {
+            Ok(snapshot) => {
                 self.last_snapshot = Some(snapshot.clone());
-                self.last_encoding = Some((encoding, scan.digest));
+                // Encoded only if a byte delta ever needs it as a base.
+                self.last_encoding = None;
                 Ok(snapshot)
             }
             Err(error) => {
@@ -247,19 +251,12 @@ impl RemoteEndpoint {
 
     /// Builds the snapshot a changed scan describes, verified; see
     /// [`receive_changes`](RemoteEndpoint::receive_changes).
-    fn apply_changes(
-        &mut self,
-        scan: &crate::protocol::ScanChanges,
-    ) -> Result<(Snapshot, Vec<u8>)> {
+    fn apply_changes(&mut self, scan: &crate::protocol::ScanChanges) -> Result<Snapshot> {
         let last = self
             .last_snapshot
             .as_ref()
             .ok_or_else(|| anyhow!("no previous snapshot to apply the changes to"))?;
-        let baseline = match &self.last_encoding {
-            Some((_, digest)) => *digest,
-            None => *blake3::hash(&crate::transport::encode_snapshot(last)?).as_bytes(),
-        };
-        if baseline != scan.baseline {
+        if self.digester.snapshot(last) != scan.baseline {
             bail!("the changes apply to a baseline this side does not hold");
         }
         for change in &scan.changes {
@@ -275,11 +272,10 @@ impl RemoteEndpoint {
             root,
             ..scan.head.clone()
         };
-        let encoding = crate::transport::encode_snapshot(&snapshot)?;
-        if *blake3::hash(&encoding).as_bytes() != scan.digest {
+        if self.digester.snapshot(&snapshot) != scan.digest {
             bail!("the snapshot built from the changes does not match the agent's digest");
         }
-        Ok((snapshot, encoding))
+        Ok(snapshot)
     }
 
     /// Pulls a delta's operations and applies them to the baseline this
@@ -387,6 +383,7 @@ impl RemoteEndpoint {
             pending_pushes: 0,
             last_snapshot: None,
             last_encoding: None,
+            digester: crate::tree::TreeDigester::default(),
             progress: None,
         }
     }

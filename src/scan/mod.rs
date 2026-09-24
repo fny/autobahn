@@ -139,16 +139,25 @@ pub struct DirtyPaths {
 struct DirtyNode {
     /// Whether this directory's entries must be listed again — set on the
     /// *parent* of every marked path, since creation and removal are only
-    /// observable by listing.
+    /// observable by listing, and on the marked path itself.
     relist: bool,
+    /// Whether this entry was itself marked. A marked directory may be a
+    /// different directory from the baseline's — renamed into place,
+    /// removed and made again — and the rename that brought it is the only
+    /// event there was: nothing beneath it was reported. So its whole
+    /// subtree is read, as a full scan would, and none of it is adopted
+    /// unread. (Relisting it alone catches a swap one level deep; a swap
+    /// whose names coincide further down would keep the old contents.)
+    marked: bool,
     /// Marked entries beneath this one, by name.
     children: std::collections::HashMap<String, DirtyNode>,
 }
 
 impl DirtyPaths {
     /// Marks a root-relative path (`""` for the root itself) as changed:
-    /// the entry is rescanned, and its parent is listed again so that its
-    /// creation or removal is observed.
+    /// the entry is rescanned — a directory with everything beneath it —
+    /// and its parent is listed again so that its creation or removal is
+    /// observed.
     pub fn mark(&mut self, path: &str) {
         let mut components: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let name = components.pop();
@@ -158,8 +167,10 @@ impl DirtyPaths {
         }
         node.relist = true;
         if let Some(name) = name {
-            node.children.entry(name.to_owned()).or_default();
+            node = node.children.entry(name.to_owned()).or_default();
+            node.relist = true;
         }
+        node.marked = true;
     }
 
     /// Indicates whether nothing at all is marked.
@@ -601,6 +612,17 @@ impl<'a> Scanner<'a> {
                     return baseline.content.clone();
                 }
             }
+        }
+
+        // A directory marked itself may not be the baseline's directory at
+        // all, so it is read whole, as a full scan reads it: every entry
+        // listed and probed, digests still reused where the metadata
+        // allows, unchanged storage still shared.
+        if self.incremental && dirty.is_some_and(|node| node.marked) {
+            self.incremental = false;
+            let content = self.scan_directory(disk_path, path, baseline, None);
+            self.incremental = true;
+            return content;
         }
 
         // With the entry list itself unchanged, the baseline's children can
@@ -1543,6 +1565,77 @@ mod tests {
                 "top.txt",
             ],
         );
+    }
+
+    /// A directory replaced by another under the same name: only the names
+    /// the watcher reported are marked, never the contents that arrived
+    /// with the rename. Reproduced before the fix: the swapped-in `live`
+    /// kept the old `live`'s files until the next full walk.
+    #[test]
+    fn a_replaced_directory_is_read_again_not_adopted() {
+        // An atomic deploy swap, with the same names at every level.
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "live/f1", "old content");
+        write(root, "live/sub/f2", "old deeper");
+        write(root, "staging/f1", "new content");
+        write(root, "staging/sub/f2", "new deeper");
+        let baseline = scan_fixture(root, None);
+        fs::rename(root.join("live"), root.join("old")).expect("rename");
+        fs::rename(root.join("staging"), root.join("live")).expect("rename");
+        assert_incremental_matches_full(root, &baseline, &["live", "old", "staging"]);
+
+        // A directory removed, made again, and populated. The population's
+        // own events mark the new names; a name the old directory also held
+        // is marked by its creation, so only the directory's own mark is
+        // asked to cover what vanished.
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "x/keep", "old");
+        write(root, "x/gone", "old");
+        write(root, "x/sub/deep", "old");
+        let baseline = scan_fixture(root, None);
+        fs::remove_dir_all(root.join("x")).expect("remove");
+        fs::create_dir(root.join("x")).expect("mkdir");
+        write(root, "x/keep", "new");
+        write(root, "x/sub/deep", "new");
+        assert_incremental_matches_full(root, &baseline, &["x", "x/keep", "x/sub"]);
+
+        // A directory renamed over an empty one.
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "full/f1", "content");
+        write(root, "full/sub/f2", "content");
+        fs::create_dir(root.join("empty")).expect("mkdir");
+        let baseline = scan_fixture(root, None);
+        fs::rename(root.join("full"), root.join("empty")).expect("rename");
+        assert_incremental_matches_full(root, &baseline, &["full", "empty"]);
+    }
+
+    /// Swaps at every depth of a small tree, one after another, each
+    /// checked against a full scan. The rename is the whole change: no
+    /// event names anything inside the directories that moved.
+    #[test]
+    fn directory_swaps_at_any_depth_agree_with_full_scans() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        let levels = ["", "a", "a/b", "a/b/c"];
+        for (round, level) in levels.iter().enumerate() {
+            let at = |name: &str| path_join(level, name);
+            write(root, &at("one/f"), &format!("one {round}"));
+            write(root, &at("one/deeper/g"), &format!("one deeper {round}"));
+            write(root, &at("two/f"), &format!("two {round}!"));
+            write(root, &at("two/deeper/g"), &format!("two deeper {round}!"));
+            let baseline = scan_fixture(root, None);
+            fs::rename(root.join(at("one")), root.join(at("spare"))).expect("rename");
+            fs::rename(root.join(at("two")), root.join(at("one"))).expect("rename");
+            fs::rename(root.join(at("spare")), root.join(at("two"))).expect("rename");
+            assert_incremental_matches_full(
+                root,
+                &baseline,
+                &[&at("one"), &at("two"), &at("spare")],
+            );
+        }
     }
 
     #[test]

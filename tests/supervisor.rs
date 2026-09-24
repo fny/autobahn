@@ -2659,3 +2659,73 @@ fn walk_files(root: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
     found.sort();
     found
 }
+
+/// An atomic deploy swap on the alpha, seen by the watcher as three
+/// renamed names and nothing inside them. Reproduced before the fix: the
+/// beta kept the old `live/` contents, duplicated them into `old/`, and
+/// deleted `staging/`, until a full walk minutes later.
+#[test]
+fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "live/f1", "old content");
+    write(&alpha, "live/sub/f2", "old deeper");
+    write(&alpha, "staging/f1", "new content");
+    write(&alpha, "staging/sub/f2", "new deeper");
+
+    let mut plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+    plans[0].interval = Duration::from_millis(30);
+
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans, world.state_root(), false);
+        let stop = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop));
+        let _guard = StopGuard(stop);
+
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                beta.join("staging/sub/f2").exists() && beta.join("live/sub/f2").exists()
+            }),
+            "initial content should propagate"
+        );
+        // Let the first cycles settle, so the swap is seen by an
+        // incremental scan against a baseline that holds both trees.
+        std::thread::sleep(Duration::from_millis(500));
+
+        fs::rename(alpha.join("live"), alpha.join("old")).expect("rename");
+        fs::rename(alpha.join("staging"), alpha.join("live")).expect("rename");
+
+        let settled = || {
+            !beta.join("staging").exists()
+                && fs::read_to_string(beta.join("live/f1")).ok().as_deref() == Some("new content")
+                && fs::read_to_string(beta.join("live/sub/f2")).ok().as_deref()
+                    == Some("new deeper")
+                && fs::read_to_string(beta.join("old/f1")).ok().as_deref() == Some("old content")
+                && fs::read_to_string(beta.join("old/sub/f2")).ok().as_deref() == Some("old deeper")
+        };
+        assert!(
+            wait_until(Duration::from_secs(15), settled),
+            "the beta should hold the swapped tree: live/f1 = {:?}, old/f1 = {:?}, staging = {}",
+            fs::read_to_string(beta.join("live/f1")).ok(),
+            fs::read_to_string(beta.join("old/f1")).ok(),
+            beta.join("staging").exists(),
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
+    });
+}

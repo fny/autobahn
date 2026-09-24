@@ -1284,6 +1284,37 @@ fn icon_rgba(health: Health, ink: Ink) -> Vec<u8> {
     rgba
 }
 
+/// How long a phase must have run before the menu reports it in place of
+/// the last cycle's outcome. The menu is glanced at, not watched, and a
+/// line that flickers into "scanning" between polls says less than the one
+/// it replaces. Matches the command line's threshold.
+const SLOW_PHASE_SECONDS: u64 = 5;
+
+/// Formats an elapsed or remaining duration, at two significant units.
+fn format_elapsed(seconds: u64) -> String {
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => match (seconds / 60, seconds % 60) {
+            (minutes, 0) => format!("{minutes}m"),
+            (minutes, rest) => format!("{minutes}m{rest:02}s"),
+        },
+        _ => match (seconds / 3600, (seconds % 3600) / 60) {
+            (hours, 0) => format!("{hours}h"),
+            (hours, minutes) => format!("{hours}h{minutes:02}m"),
+        },
+    }
+}
+
+fn format_age(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s ago")
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else {
+        format!("{}h ago", seconds / 3600)
+    }
+}
+
 #[cfg(test)]
 mod icon_tests {
     use super::*;
@@ -1381,36 +1412,5 @@ mod icon_tests {
                 assert_eq!(at(1, 1)[3], 0, "{name}: corner is clear");
             }
         }
-    }
-}
-
-/// How long a phase must have run before the menu reports it in place of
-/// the last cycle's outcome. The menu is glanced at, not watched, and a
-/// line that flickers into "scanning" between polls says less than the one
-/// it replaces. Matches the command line's threshold.
-const SLOW_PHASE_SECONDS: u64 = 5;
-
-/// Formats an elapsed or remaining duration, at two significant units.
-fn format_elapsed(seconds: u64) -> String {
-    match seconds {
-        0..=59 => format!("{seconds}s"),
-        60..=3599 => match (seconds / 60, seconds % 60) {
-            (minutes, 0) => format!("{minutes}m"),
-            (minutes, rest) => format!("{minutes}m{rest:02}s"),
-        },
-        _ => match (seconds / 3600, (seconds % 3600) / 60) {
-            (hours, 0) => format!("{hours}h"),
-            (hours, minutes) => format!("{hours}h{minutes:02}m"),
-        },
-    }
-}
-
-fn format_age(seconds: u64) -> String {
-    if seconds < 60 {
-        format!("{seconds}s ago")
-    } else if seconds < 3600 {
-        format!("{}m ago", seconds / 60)
-    } else {
-        format!("{}h ago", seconds / 3600)
     }
 }

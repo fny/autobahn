@@ -26,14 +26,17 @@ tray-icon = { version = "0.24", optional = true }
 muda = { version = "0.19", optional = true }
 winit = { version = "0.30", optional = true }
 notify-rust = { version = "4", optional = true }
+toml_edit = "0.25.15"
+
 # The menu bar's ink, for the tray icon: the sign is drawn in the bar's
 # own black or white, which a template image cannot do once a coloured
 # dot is part of it — read from the status item's own button, whose
 # appearance is the menu bar's. Versions already in the tree through
-# tray-icon, so its NSStatusItem is the same type as ours.
+# tray-icon, so its NSStatusItem is the same type as ours. macOS only:
+# objc2 refuses to compile anywhere else, and the tray builds on Linux.
+[target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSAppearance", "NSResponder", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView"] }
-toml_edit = "0.25.15"
 
 [features]
 tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit"]

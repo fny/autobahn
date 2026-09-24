@@ -25,9 +25,102 @@ pub struct Reconciliation {
 }
 
 /// The recursive reconciler.
-struct Reconciler {
+struct Reconciler<'m> {
     mode: SyncMode,
     result: Reconciliation,
+    /// The previous reconciliation of the same session, when there is one
+    /// to skip against: see [`reconcile_since`].
+    memo: Option<&'m ReconcileMemo>,
+}
+
+/// What one reconciliation needs to remember so the next can skip what did
+/// not change: its three inputs, and every path where it produced anything.
+///
+/// Reconciling a subtree depends on nothing but the subtree's path, its
+/// three inputs and the mode — the reconciler keeps no state across
+/// subtrees — so three inputs storage-identical to last time, where last
+/// time produced nothing, produce nothing again. A scan adopts what it did
+/// not revisit, a snapshot applied from changes shares what did not
+/// change, and the ancestor is updated copy-on-write, so from one cycle to
+/// the next nearly every subtree is exactly that. Walking them all again
+/// was about a third of the controller's time per changed cycle at 420k
+/// files.
+#[derive(Clone, Debug, Default)]
+pub struct ReconcileMemo {
+    ancestor: Option<Node>,
+    alpha: Option<Node>,
+    beta: Option<Node>,
+    /// Every path the reconciliation produced a change, transition or
+    /// conflict at, sorted.
+    produced: Vec<String>,
+}
+
+impl ReconcileMemo {
+    /// Remembers a reconciliation of these inputs, for the next.
+    pub fn of(
+        ancestor: Option<&Node>,
+        alpha: Option<&Node>,
+        beta: Option<&Node>,
+        result: &Reconciliation,
+    ) -> ReconcileMemo {
+        let mut produced: Vec<String> = result
+            .ancestor_changes
+            .iter()
+            .chain(&result.alpha_transitions)
+            .chain(&result.beta_transitions)
+            .map(|change| change.path.clone())
+            .chain(
+                result
+                    .conflicts
+                    .iter()
+                    .map(|conflict| conflict.root.clone()),
+            )
+            .collect();
+        produced.sort();
+        produced.dedup();
+        ReconcileMemo {
+            ancestor: ancestor.cloned(),
+            alpha: alpha.cloned(),
+            beta: beta.cloned(),
+            produced,
+        }
+    }
+
+    /// Whether anything was produced exactly at `path`.
+    fn produced_at(&self, path: &str) -> bool {
+        self.produced
+            .binary_search_by(|p| p.as_str().cmp(path))
+            .is_ok()
+    }
+
+    /// Whether anything was produced at `path` or beneath it.
+    fn produced_within(&self, path: &str) -> bool {
+        if path.is_empty() {
+            return !self.produced.is_empty();
+        }
+        // Everything starting with `path` sorts together, from where `path`
+        // itself would; among them are siblings like `path-x`, which is why
+        // the separator is checked.
+        let start = self.produced.partition_point(|p| p.as_str() < path);
+        self.produced[start..]
+            .iter()
+            .take_while(|p| p.starts_with(path))
+            .any(|p| p.len() == path.len() || p.as_bytes()[path.len()] == b'/')
+    }
+}
+
+/// The inputs a subtree was reconciled with last time, when they can be
+/// trusted to be exactly that.
+type Previous<'m> = Option<(Option<&'m Node>, Option<&'m Node>, Option<&'m Node>)>;
+
+/// Whether two optional nodes are the same storage: both absent, or both
+/// directories sharing their children.
+fn identical(now: Option<&Node>, then: Option<&Node>) -> bool {
+    match (now, then) {
+        (None, None) => true,
+        (Some(now), Some(then)) => super::nodes_share_storage(Some(now), Some(then)),
+        _ => false,
+    }
 }
 
 /// Extracts the non-deletion changes (creations and modifications) from a
@@ -129,14 +222,27 @@ fn large_in_ancestor(ancestor: Option<&Node>) -> bool {
     })
 }
 
-impl Reconciler {
+impl<'m> Reconciler<'m> {
     fn reconcile(
         &mut self,
         path: &str,
         ancestor: Option<&Node>,
         alpha: Option<&Node>,
         beta: Option<&Node>,
+        previous: Previous<'m>,
     ) {
+        // The same three inputs as last time, where last time produced
+        // nothing: nothing again. See [`ReconcileMemo`].
+        if let (Some((then_ancestor, then_alpha, then_beta)), Some(memo)) = (previous, self.memo) {
+            if identical(ancestor, then_ancestor)
+                && identical(alpha, then_alpha)
+                && identical(beta, then_beta)
+                && !memo.produced_within(path)
+            {
+                return;
+            }
+        }
+
         // If either side is purely problematic at this path, then there's
         // nothing safe to do here: the problem is already surfaced as a scan
         // problem.
@@ -289,7 +395,37 @@ impl Reconciler {
                 };
 
                 let child_path = path_join(path, name);
-                self.reconcile(&child_path, ancestor_child, alpha_child, beta_child);
+                // Last time's inputs for the child are the children of last
+                // time's here only if last time recursed here with its real
+                // ancestor: all three were directories (anything else
+                // returns or dispatches without recursing, or clears the
+                // ancestor's children) and it produced nothing at exactly
+                // this path (a conflict here, or an ancestor update, means
+                // it did not recurse as now). Otherwise nothing below is
+                // skipped.
+                let child_previous = previous.and_then(|(a, x, y)| {
+                    let directory = |node: Option<&'m Node>| {
+                        matches!(node, Some(node) if matches!(node.content, Content::Directory(_)))
+                    };
+                    let recursed = directory(a)
+                        && directory(x)
+                        && directory(y)
+                        && !self.memo.is_some_and(|memo| memo.produced_at(path));
+                    recursed.then(|| {
+                        (
+                            a.and_then(|node| node.child(name)),
+                            x.and_then(|node| node.child(name)),
+                            y.and_then(|node| node.child(name)),
+                        )
+                    })
+                });
+                self.reconcile(
+                    &child_path,
+                    ancestor_child,
+                    alpha_child,
+                    beta_child,
+                    child_previous,
+                );
             }
             return;
         }
@@ -671,11 +807,33 @@ pub fn reconcile(
     beta: Option<&Node>,
     mode: SyncMode,
 ) -> Reconciliation {
+    reconcile_since(ancestor, alpha, beta, mode, None)
+}
+
+/// [`reconcile`], skipping every subtree whose three inputs are the very
+/// ones `memo` reconciled to nothing — the same result, in the same order,
+/// for the size of what changed. `memo` must come from the same session's
+/// previous reconciliation, in the same mode.
+pub fn reconcile_since(
+    ancestor: Option<&Node>,
+    alpha: Option<&Node>,
+    beta: Option<&Node>,
+    mode: SyncMode,
+    memo: Option<&ReconcileMemo>,
+) -> Reconciliation {
     let mut reconciler = Reconciler {
         mode,
         result: Reconciliation::default(),
+        memo,
     };
-    reconciler.reconcile("", ancestor, alpha, beta);
+    let previous = memo.map(|memo| {
+        (
+            memo.ancestor.as_ref(),
+            memo.alpha.as_ref(),
+            memo.beta.as_ref(),
+        )
+    });
+    reconciler.reconcile("", ancestor, alpha, beta, previous);
     reconciler.result
 }
 
@@ -1364,6 +1522,136 @@ mod tests {
                 "a one-way mode emitted alpha transitions: {:?}",
                 result.alpha_transitions
             );
+        }
+    }
+
+    /// `reconcile_since` is `reconcile`, faster: across hundreds of rounds of
+    /// copy-on-write changes to all three trees, in every mode, the result
+    /// against the previous round's memo is the fresh result exactly —
+    /// content and order.
+    #[test]
+    fn reconcile_since_is_reconcile() {
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let leaf = |name: &str, kind: u64, byte: u8| -> Node {
+            match kind % 10 {
+                0 => Node {
+                    name: name.into(),
+                    content: Content::Untracked,
+                },
+                1 => Node {
+                    name: name.into(),
+                    content: Content::Problematic {
+                        message: "unreadable".into(),
+                    },
+                },
+                2 => Node {
+                    name: name.into(),
+                    content: Content::Symlink {
+                        target: format!("t{byte}"),
+                    },
+                },
+                3 => dir(name, vec![]),
+                _ => file(name, byte, kind % 7 == 0),
+            }
+        };
+        let modes = [
+            SyncMode::TwoWaySafe,
+            SyncMode::TwoWayResolved,
+            SyncMode::TwoWayParanoid,
+            SyncMode::TwoWayStrict,
+            SyncMode::OneWaySafe,
+            SyncMode::OneWayReplica,
+        ];
+        for (trial, mode) in modes.iter().cycle().take(18).enumerate() {
+            // A shared starting tree: most of it agrees on all three sides,
+            // as a synchronized pair does, with storage shared among them.
+            let base = dir(
+                "",
+                (0..6)
+                    .map(|d| {
+                        dir(
+                            &format!("d{d}"),
+                            (0..10)
+                                .map(|e| {
+                                    dir(
+                                        &format!("e{e}"),
+                                        (0..9)
+                                            .map(|f| file(&format!("f{f}"), (f + e) as u8, false))
+                                            .collect(),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            );
+            let (mut ancestor, mut alpha, mut beta) =
+                (Some(base.clone()), Some(base.clone()), Some(base));
+            let mut memo: Option<ReconcileMemo> = None;
+            for round in 0..120 {
+                // A few copy-on-write changes to one side or another, or to
+                // the ancestor (as a cycle's record of what it did would).
+                for _ in 0..(1 + next() % 4) {
+                    let depth = 1 + next() % 3;
+                    let mut path = format!("d{}", next() % 7);
+                    if depth > 1 {
+                        path.push_str(&format!("/e{}", next() % 11));
+                    }
+                    if depth > 2 {
+                        path.push_str(&format!("/f{}", next() % 10));
+                    }
+                    let name = path.rsplit('/').next().unwrap().to_owned();
+                    let new = match next() % 5 {
+                        0 => None,
+                        _ => Some(leaf(&name, next(), (next() % 250) as u8)),
+                    };
+                    let change = Change {
+                        path,
+                        old: None,
+                        new,
+                    };
+                    let target = match next() % 3 {
+                        0 => &mut ancestor,
+                        1 => &mut alpha,
+                        _ => &mut beta,
+                    };
+                    if let Ok(changed) = apply(target.as_ref(), std::slice::from_ref(&change)) {
+                        *target = changed;
+                    }
+                }
+                let fresh = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), *mode);
+                let skipping = reconcile_since(
+                    ancestor.as_ref(),
+                    alpha.as_ref(),
+                    beta.as_ref(),
+                    *mode,
+                    memo.as_ref(),
+                );
+                assert_eq!(
+                    format!("{skipping:?}"),
+                    format!("{fresh:?}"),
+                    "trial {trial} ({mode:?}), round {round}"
+                );
+                memo = Some(ReconcileMemo::of(
+                    ancestor.as_ref(),
+                    alpha.as_ref(),
+                    beta.as_ref(),
+                    &fresh,
+                ));
+                // Sometimes the cycle lands: its record reaches the
+                // ancestor, as a session's would, copy-on-write.
+                if next() % 2 == 0 {
+                    if let Ok(recorded) = apply(ancestor.as_ref(), &fresh.ancestor_changes) {
+                        ancestor = recorded;
+                    }
+                }
+            }
         }
     }
 }

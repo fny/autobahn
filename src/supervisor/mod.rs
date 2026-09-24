@@ -1669,6 +1669,10 @@ pub struct StatusReport {
     /// sessions run on under the last good one until it is fixed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_notice: Option<reload::Notice>,
+    /// A supervisor is running but is another build, so it cannot say
+    /// what it is doing; what to tell someone about it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_mismatch: Option<String>,
 }
 
 /// One group's report.
@@ -1796,8 +1800,12 @@ pub fn unreadable_ancestors(plans: &[SessionPlan], state_root: &Path) -> Vec<(St
 /// Builds the report for a set of plans.
 pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport {
     // One round trip serves both questions: a supervisor that answers is
-    // running, and its answer is what every session is doing.
-    let live = control::query_progress(state_root);
+    // running, and its answer is what every session is doing. One of
+    // another build is running too, and can say only that.
+    let probe = control::probe(state_root);
+    let running = probe.is_running();
+    let mismatch = probe.mismatch_message();
+    let live = probe.progress();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
@@ -1860,11 +1868,12 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         }
     }
     StatusReport {
-        version: 3,
-        supervisor_running: live.is_some(),
+        version: 4,
+        supervisor_running: running,
+        supervisor_mismatch: mismatch,
         // Only a running supervisor's refusal is news: the one that wrote
         // it is gone otherwise, and `start` checks the file itself.
-        config_notice: live.as_ref().and(reload::read_notice(state_root)),
+        config_notice: running.then(|| reload::read_notice(state_root)).flatten(),
         service: match crate::service::state() {
             Ok(crate::service::ServiceState::NotInstalled) => "not-installed",
             Ok(crate::service::ServiceState::Stopped) => "stopped",

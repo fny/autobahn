@@ -1009,6 +1009,11 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
         // `run_control` sends only the verbs; progress is asked for by
         // `status`, which reads the answer itself.
         ControlResponse::Progress(_) => bail!("the supervisor answered with progress"),
+        // `send` turns this into an error with the remedy; kept for the
+        // match to be whole.
+        ControlResponse::Mismatch { supervisor } => bail!(
+            autobahn::supervisor::control::mismatch_message(Some(&supervisor))
+        ),
     }
 }
 
@@ -3195,7 +3200,10 @@ fn render_status(
     // session doing"; the recorded status on disk answers "how did the last
     // cycle end". A session is described by the first when it is working
     // and by the second when it is not.
-    let reported = autobahn::supervisor::control::query_progress(state_root);
+    let probe = autobahn::supervisor::control::probe(state_root);
+    let mismatch = probe.mismatch_message();
+    let running = probe.is_running();
+    let reported = probe.progress();
     let rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = selected
         .iter()
         .map(|plan| {
@@ -3211,7 +3219,15 @@ fn render_status(
     // hour ago still reads as "synchronized" — the command's most
     // misleading possible output, since nothing is synchronizing at all.
     // The service's state says what to do about it.
-    if reported.is_none() {
+    if let Some(mismatch) = &mismatch {
+        // Running, and synchronizing, but not this build: it cannot be
+        // asked what it is doing, so what follows is what it last recorded.
+        let _ = writeln!(
+            out,
+            "\x1b[33ma supervisor of another build is running\x1b[0m; what follows is \
+             the state last recorded, not what is happening now\n{mismatch}\n"
+        );
+    } else if !running {
         let remedy = match autobahn::service::state() {
             Ok(autobahn::service::ServiceState::NotInstalled) => {
                 "run `autobahn watch` here, or `autobahn install` for a login service"
@@ -3232,9 +3248,9 @@ fn render_status(
     }
     // The supervisor's own word on the file, when it refused an edit: the
     // sessions below run on under the configuration that last loaded.
-    if let Some(notice) = reported
-        .as_ref()
-        .and(autobahn::supervisor::reload::read_notice(state_root))
+    if let Some(notice) = running
+        .then(|| autobahn::supervisor::reload::read_notice(state_root))
+        .flatten()
     {
         let _ = writeln!(
             out,

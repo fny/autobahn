@@ -87,6 +87,8 @@ The estimate is withheld unless the phase has been running long enough to have a
 
 A session between cycles is described by how its last cycle ended; so is a paused one, and one backing off from an error, both of which the recorded status names.
 
+Every command that talks to the running supervisor — `status`, `flush`, `pause`, `mi`, the menu bar app — sends its own build with the request, and a supervisor of another build refuses it rather than guess. After installing a new build by hand, before the service is restarted, `status` says so — *the running supervisor is 0.4.0+e13 and this is 0.4.1+e13; `autobahn restart` to run this build* — and shows what the supervisor last recorded. `autobahn update` restarts the service itself, so it never shows there.
+
 A group with nothing to say is one line — every destination synchronized, nothing waiting on anyone, nothing going on long enough to earn a line:
 
 ```
@@ -118,7 +120,7 @@ Conflicts and blocked paths co-occur, so both counts are reported rather than on
 
 ## `--json`
 
-`autobahn status --json` and `autobahn conflicts --json` print everything as one versioned document, for scripts and user interfaces. The `version` is 3: it went from 2 with `config_notice`, present only while the running supervisor is refusing an edit to the configuration (see [Editing it while it runs](./configuration.md#editing-it-while-it-runs)). Each session carries a `progress` object while a supervisor is running. `--filter` applies to the JSON too, while `--depth`, being a way of reading a list, does not. The alert hook receives this same document on standard input, and [the shop](./shop.md) and [the menu bar app](./macos-app.md) read nothing else.
+`autobahn status --json` and `autobahn conflicts --json` print everything as one versioned document, for scripts and user interfaces. The `version` is 4. Version 3 added `config_notice`, present only while the running supervisor is refusing an edit to the configuration (see [Editing it while it runs](./configuration.md#editing-it-while-it-runs)); version 4 added `supervisor_mismatch`, present only while the running supervisor is another build. Each session carries a `progress` object while a supervisor is running. `--filter` applies to the JSON too, while `--depth`, being a way of reading a list, does not. The alert hook receives this same document on standard input, and [the shop](./shop.md) and [the menu bar app](./macos-app.md) read nothing else.
 
 ## One-off syncs and scripting
 

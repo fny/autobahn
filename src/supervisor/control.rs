@@ -43,6 +43,19 @@ pub enum ControlRequest {
         /// Who leads next.
         to: String,
     },
+    /// Any of the above, sent with the sender's build. The request is
+    /// carried as bytes and decoded only once the versions agree, so a
+    /// change to any request's shape can never be misread across builds:
+    /// a mismatch is answered with `Mismatch`, which both builds decode.
+    ///
+    /// Variant order is the wire: this and `Mismatch` stay last, and later
+    /// variants go after them.
+    Versioned {
+        /// The sender's `protocol::version()`.
+        version: String,
+        /// The request, encoded.
+        request: Vec<u8>,
+    },
 }
 
 /// Selects sessions by group and destination.
@@ -76,6 +89,64 @@ pub enum ControlResponse {
     Progress(Vec<SessionProgress>),
     /// The request failed.
     Error(String),
+    /// The request came from another build. Nothing was applied: the
+    /// running supervisor and this command must be the same build, and a
+    /// restart makes them so.
+    Mismatch {
+        /// The running supervisor's `protocol::version()`.
+        supervisor: String,
+    },
+}
+
+/// What asking the running supervisor came to.
+#[derive(Clone, Debug)]
+pub enum Probe {
+    /// It answered, with every session's progress.
+    Answered(Vec<SessionProgress>),
+    /// One is running but is another build, named when it said so. A
+    /// supervisor from before builds were compared cannot say, and does
+    /// not understand the question.
+    Mismatch(Option<String>),
+    /// Nothing is listening.
+    Absent,
+}
+
+impl Probe {
+    /// Whether a supervisor is running, answering or not.
+    pub fn is_running(&self) -> bool {
+        !matches!(self, Probe::Absent)
+    }
+
+    /// The progress, when the supervisor answered.
+    pub fn progress(self) -> Option<Vec<SessionProgress>> {
+        match self {
+            Probe::Answered(sessions) => Some(sessions),
+            _ => None,
+        }
+    }
+
+    /// What to tell someone about a supervisor of another build.
+    pub fn mismatch_message(&self) -> Option<String> {
+        match self {
+            Probe::Mismatch(supervisor) => Some(mismatch_message(supervisor.as_deref())),
+            _ => None,
+        }
+    }
+}
+
+/// Says that the running supervisor is another build, and what to do.
+pub fn mismatch_message(supervisor: Option<&str>) -> String {
+    let this = crate::protocol::version();
+    match supervisor {
+        Some(supervisor) => format!(
+            "the running supervisor is {supervisor} and this is {this}; \
+             `autobahn restart` to run this build"
+        ),
+        None => format!(
+            "a supervisor is running but does not understand this build ({this}) — \
+             most likely it is older; `autobahn restart` to run this build"
+        ),
+    }
 }
 
 /// One supervised session's live progress.
@@ -153,6 +224,21 @@ impl Registry {
                 Err(error) => ControlResponse::Error(format!("{error:#}")),
             };
         }
+        if let ControlRequest::Versioned { version, request } = request {
+            if *version != crate::protocol::version() {
+                return ControlResponse::Mismatch {
+                    supervisor: crate::protocol::version(),
+                };
+            }
+            return match bincode::deserialize::<ControlRequest>(request) {
+                // Nested once, never twice: the inner request is a verb.
+                Ok(ControlRequest::Versioned { .. }) => {
+                    ControlResponse::Error("a versioned request inside another".into())
+                }
+                Ok(inner) => self.apply(&inner),
+                Err(error) => ControlResponse::Error(format!("undecodable request: {error}")),
+            };
+        }
         if let ControlRequest::Progress = request {
             return ControlResponse::Progress(
                 self.entries
@@ -185,7 +271,9 @@ impl Registry {
                 control.verify.store(true, Ordering::Relaxed);
                 control.wake.store(true, Ordering::Relaxed);
             }),
-            ControlRequest::Progress | ControlRequest::Yield { .. } => {
+            ControlRequest::Progress
+            | ControlRequest::Yield { .. }
+            | ControlRequest::Versioned { .. } => {
                 unreachable!("answered above")
             }
         };
@@ -378,8 +466,49 @@ pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlRespon
         .try_clone()
         .context("unable to clone the control connection")?;
     let mut writer = stream;
-    crate::transport::send_control_frame(&mut writer, request)?;
-    crate::transport::receive_control_frame(&mut reader)
+    let versioned = ControlRequest::Versioned {
+        version: crate::protocol::version(),
+        request: bincode::serialize(request).context("unable to encode the control request")?,
+    };
+    crate::transport::send_control_frame(&mut writer, &versioned)?;
+    match crate::transport::receive_control_frame(&mut reader) {
+        Ok(ControlResponse::Mismatch { supervisor }) => {
+            Err(anyhow::anyhow!(mismatch_message(Some(&supervisor))))
+        }
+        Ok(response) => Ok(response),
+        // Connected, and then nothing that decodes: a supervisor from
+        // before builds were compared, which cannot read the envelope.
+        Err(error) => Err(error.context(mismatch_message(None))),
+    }
+}
+
+/// Asks the supervisor owning `state_root` what its sessions are doing,
+/// and says which of the three answers came back.
+pub fn probe(state_root: &Path) -> Probe {
+    let stream = match UnixStream::connect(socket_path(state_root)) {
+        Ok(stream) => stream,
+        Err(_) => return Probe::Absent,
+    };
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let Ok(mut reader) = stream.try_clone() else {
+        return Probe::Absent;
+    };
+    let mut writer = stream;
+    let Ok(request) = bincode::serialize(&ControlRequest::Progress) else {
+        return Probe::Absent;
+    };
+    let versioned = ControlRequest::Versioned {
+        version: crate::protocol::version(),
+        request,
+    };
+    if crate::transport::send_control_frame(&mut writer, &versioned).is_err() {
+        return Probe::Mismatch(None);
+    }
+    match crate::transport::receive_control_frame(&mut reader) {
+        Ok(ControlResponse::Progress(sessions)) => Probe::Answered(sessions),
+        Ok(ControlResponse::Mismatch { supervisor }) => Probe::Mismatch(Some(supervisor)),
+        _ => Probe::Mismatch(None),
+    }
 }
 
 /// Asks the supervisor owning `state_root` what its sessions are doing.
@@ -389,10 +518,7 @@ pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlRespon
 /// from a different build may not understand the request; that is reported
 /// the same way, because the caller's remedy is identical.
 pub fn query_progress(state_root: &Path) -> Option<Vec<SessionProgress>> {
-    match send(state_root, &ControlRequest::Progress) {
-        Ok(ControlResponse::Progress(sessions)) => Some(sessions),
-        _ => None,
-    }
+    probe(state_root).progress()
 }
 
 #[cfg(test)]
@@ -461,5 +587,58 @@ mod tests {
             host: None,
         }));
         assert!(matches!(response, ControlResponse::Error(_)));
+    }
+
+    fn versioned(version: &str, request: &ControlRequest) -> ControlRequest {
+        ControlRequest::Versioned {
+            version: version.into(),
+            request: bincode::serialize(request).expect("encodes"),
+        }
+    }
+
+    #[test]
+    fn a_request_from_this_build_is_applied_and_one_from_another_is_not() {
+        let registry = registry();
+        let flush = ControlRequest::Flush(Selector::default());
+        match registry.apply(&versioned(&crate::protocol::version(), &flush)) {
+            ControlResponse::Applied { sessions } => assert_eq!(sessions, 3),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+        match registry.apply(&versioned("0.0.1+e1", &flush)) {
+            ControlResponse::Mismatch { supervisor } => {
+                assert_eq!(supervisor, crate::protocol::version())
+            }
+            other => panic!("expected Mismatch, got {other:?}"),
+        }
+        // Nothing was flipped by the refused one.
+        for entry in &registry.entries {
+            entry.control.wake.store(false, Ordering::Relaxed);
+        }
+        registry.apply(&versioned("0.0.1+e1", &flush));
+        assert!(registry
+            .entries
+            .iter()
+            .all(|entry| !entry.control.wake.load(Ordering::Relaxed)));
+    }
+
+    #[test]
+    fn the_envelope_and_the_mismatch_keep_their_place_on_the_wire() {
+        // Variant order is the wire: a later build adding a request must
+        // add it after these, or an older supervisor misreads the envelope
+        // as something else and a newer one cannot say "restart".
+        let envelope = bincode::serialize(&versioned("x", &ControlRequest::Progress)).unwrap();
+        assert_eq!(envelope[..4], 7u32.to_le_bytes());
+        let mismatch = bincode::serialize(&ControlResponse::Mismatch {
+            supervisor: "x".into(),
+        })
+        .unwrap();
+        assert_eq!(mismatch[..4], 3u32.to_le_bytes());
+    }
+
+    #[test]
+    fn probing_a_socket_nobody_listens_on_is_absent() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        assert!(matches!(probe(root.path()), Probe::Absent));
+        assert!(!probe(root.path()).is_running());
     }
 }

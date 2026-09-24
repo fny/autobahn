@@ -468,6 +468,9 @@ impl App {
         if report.config_notice.is_some() {
             parts.push("configuration refused".to_owned());
         }
+        if report.supervisor_mismatch.is_some() {
+            parts.push("restart needed".to_owned());
+        }
         parts.push(format!("{} synchronized", count("synchronized")));
         for (state, word) in [
             ("conflicts", "in conflict"),
@@ -494,6 +497,12 @@ impl App {
                     .config_notice
                     .as_ref()
                     .map(|notice| format!("⚠ configuration refused: {}", notice.message))
+            })
+            .or_else(|| {
+                report
+                    .supervisor_mismatch
+                    .as_ref()
+                    .map(|mismatch| format!("⚠ {mismatch}"))
             });
         set_optional(&model.menu, &model.summary, &mut model.error, error_text);
         if let Some(tray) = &self.tray {

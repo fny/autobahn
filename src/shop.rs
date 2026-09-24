@@ -840,6 +840,13 @@ impl Shop<'_> {
 
         // The supervisor refused an edit to the configuration: said under
         // the sign, where the orders it still fills can be read against it.
+        if let Some(mismatch) = &self.report.supervisor_mismatch {
+            lines.push(format!(
+                "  \x1b[33m⚠ another build\x1b[0m {}",
+                shorten(mismatch, width.saturating_sub(20))
+            ));
+            lines.push(String::new());
+        }
         if let Some(notice) = &self.report.config_notice {
             lines.push(format!(
                 "  \x1b[33m⚠ configuration refused\x1b[0m {}",
@@ -1936,11 +1943,12 @@ mod tests {
             sessions: vec![session.clone()],
         };
         let report = |role: &str| StatusReport {
-            version: 3,
+            version: 4,
             supervisor_running: true,
             service: "running".into(),
             groups: vec![group(role)],
             config_notice: None,
+            supervisor_mismatch: None,
         };
 
         let rail = |role: &str| {

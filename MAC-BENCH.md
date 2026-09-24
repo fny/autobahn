@@ -230,7 +230,22 @@ Section 5 found that detaching a volume leaves an empty mount point, and the emp
 
 **Note (2026-09-24, from reading the code):** being *ignored* does not protect a leftover. `one_side_emptied_root` (`src/session/mod.rs:1335`) judges a side gone by `children().is_empty()`, and `src/scan/mod.rs:730` records an ignored entry as an `Untracked` child — so the shipped default ignore of `.DS_Store` still leaves the root non-empty. The check is really "any leftover entry, ignored or not". Recorded on the C-1 entry in `FINAL.md`.
 
+**Filed against** C-1, which now carries this reproduction.
+
 **Record:** the status line, and the beta's file count.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Reproduced, in both modes.**
+
+20 files on a 20 MB APFS image at `~/mb7/vol`, synced to `~/mb7/b`, state root `~/mb7/state`.
+
+| mode | after `hdiutil detach` + `touch .DS_Store`, one cycle | beta |
+|---|---|---|
+| `two-way-conflict` | `synchronized: 0 change(s) to alpha, 22 change(s) to beta` | **0 files** (was 20) |
+| `two-way-paranoid` | `synchronized: 0 change(s) to alpha, 22 change(s) to beta` | **0 files** (was 20) |
+
+No halt, no conflict, no blocked path — the cycle reports success while deleting every file on the side that still had them. The count of 22 is the 20 files plus the directory entries.
+
+This is C-1, reproduced on macOS from the outside. The mechanism was confirmed by reading: `one_side_emptied_root` (`src/session/mod.rs:1335`) decides a side is gone by `children().is_empty()`, and `src/scan/mod.rs:730` records an ignored entry as an `Untracked` child — so the shipped default ignore of `.DS_Store` does not save it; it is what defeats the guard. Any leftover entry does the same.
 
 ### 7b. A directory swapped by rename, under FSEvents — F-H4
 
@@ -240,6 +255,24 @@ Section 5 found that detaching a volume leaves an empty mount point, and the emp
 **Expected:** within one cycle, the beta has the new `live/f1` and `old/f1`, and no `staging`. **Before the fix, on Linux:** the old `live` content stayed for up to two minutes. Record whether FSEvents' per-directory events already hide this on macOS.
 
 **Record:** the beta's tree after one cycle, and after 30 seconds.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Reproduced; FSEvents does not hide it, and it did not heal at the two-minute walk.**
+
+`a/live/f1` = `live-one`, `a/staging/f1` = `staging-one`, synced, then `mv a/live a/old && mv a/staging a/live`.
+
+| when | beta `live/f1` | beta `old/f1` | shape |
+|---|---|---|---|
+| 8 s | `live-one` (stale) | `live-one` | `old/` and `live/`, no `staging/` ✓ |
+| 30 s | `live-one` (stale) | `live-one` | unchanged |
+| 2 m 30 s | `live-one` (stale) | `live-one` | unchanged |
+| after `flush` | `live-one` (stale) | `live-one` | unchanged |
+| after `verify` | `staging-one` ✓ | `live-one` | correct at last |
+
+The directory *names* move within a cycle, so the tree shape looks right immediately — which is what makes it dangerous. The content does not: beta ends up holding two copies of the old file and no copy of the new one, while the session reports `synchronized`. Alpha's `live/f1` said `staging-one` throughout.
+
+Unlike the Linux note, the two-minute full walk did not fix it here, and neither did a forced `flush`. Only `verify`, which re-reads every byte, healed it — so on macOS the stale content survives until something forces a content re-read, not merely a rescan.
+
+**Filed against** H-4, which now carries this reproduction.
 
 ### 7c. A deep tree — F-H5
 
@@ -251,6 +284,18 @@ macOS limits a path to 1,024 bytes, not Linux's 4,096, so a `d/d/d/…` chain st
 **Expected:** no abort. Either it syncs, or the too-deep part is reported as a problem.
 
 **Record:** the depth reached, and the outcome. This tells us whether the stack overflow can happen on macOS at all.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Passes.**
+
+The shell reached the full 600 levels (each `mkdir d; cd d` keeps the *relative* path short, so the chain is only bounded when something walks it absolutely). `autobahn sync` did not abort and did not overflow. It synced 500 levels to the beta and reported the rest as a problem on alpha:
+
+```
+alpha problem at "d/d/d/…/d": unable to probe entry: File name too long (os error 63)
+```
+
+So macOS's 1,024-byte path limit is reached at depth ~500 — `d/` is two bytes — and it arrives as a blocked path, which is the "reported as a problem" half of the expectation. No stack overflow is reachable this way on macOS.
+
+**Filed against** H-5, which now records that macOS's path limit prevents it.
 
 ### 7d. The example alert hook with a hostile summary — F-H27
 
@@ -264,6 +309,27 @@ Also check that a pre-fix `on-alert.sh` is rewritten at startup, and that an edi
 
 **Record:** the notification text, and whether the file appeared.
 
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Reproduced: `/tmp/mb7-pwned` appeared.**
+
+The hook was the one `autobahn init` writes, with only the `terminal-notifier` branch deleted, to stand in for "not installed". It was then run the way `src/alerts.rs:488` runs it — `sh -c <hook>`, values passed by environment — with
+
+```
+AUTOBAHN_SUMMARY=voltai → fny: halted: x" & (do shell script "touch /tmp/mb7-pwned") & "
+```
+
+The hook exited 0, printed nothing, and `/tmp/mb7-pwned` existed two seconds later. The injectable line is `src/config.rs:164`:
+
+```sh
+exec /usr/bin/osascript -e \
+    "display notification \"$AUTOBAHN_SUMMARY\" with title \"autobahn\""
+```
+
+(the file has been removed again).
+
+**On the route, which changes the severity rather than the bug.** A blocked path does *not* put a name in the summary: `alert_summary` (`src/supervisor/mod.rs:1973-1979`) emits only `plural(n, "blocked path")`. Names reach the summary through the `halted` and `errored` arms (`:1966-1971`), which append the last clause of `status.error` — and that clause carries paths and peer-supplied text. So the filename route the section describes needs an error, not a blocked path.
+
+**Filed against** H-27, which already describes this; this is its first execution on a Mac.
+
 ### 7e. A replaced root under FSEvents — F-M-OBS (M-27)
 
 1. `watch` a pair.
@@ -273,6 +339,10 @@ Also check that a pre-fix `on-alert.sh` is rewritten at startup, and that an edi
 **Expected:** the edit reaches the beta within a cycle, not after the two-minute walk. Also check that edits in `alpha.old` are ignored.
 
 **Record:** the delay, for both.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Passes, both halves.**
+
+`mv alpha alpha.old && cp -a alpha.old alpha`, then an edit at 02:28:44. The cycle for it is logged at 02:28:44, and the beta held the new content within ten seconds. An edit made afterwards in `alpha.old` never reached the beta.
 
 ### 7f. Chmod through a hard link — LOCAL-11
 
@@ -285,6 +355,21 @@ macOS has no `fs.protected_hardlinks`.
 **Expected after the fix:** `alpha/tool.sh` becomes executable, and `~/mb7/outside/tool.sh` stays `0644`, because the link was broken. **Before the fix:** both become executable.
 
 **Record:** both modes, and `ls -li` to show whether the link still exists.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Reproduced, and it rewrites more than the execute bit.**
+
+`~/mb7/outside/tool.sh` at `0644`, hard-linked into the alpha; the beta's copy made executable; one cycle:
+
+```
+before  139616704 -rw-r--r--  2  a/tool.sh          (same inode, 2 links)
+        139616704 -rw-r--r--  2  outside/tool.sh
+after   139616704 -rwx------  2  a/tool.sh
+        139616704 -rwx------  2  outside/tool.sh
+```
+
+The link is intact (still one inode, two links), so the chmod went straight through to the file outside the synchronization root — LOCAL-11 as written. Worth adding to that ticket: the outside file did not merely gain `+x`, it was rewritten to the session's configured `file_mode` (`0700`), so it also *lost* the group and world read bits it had.
+
+**Filed against** [`LOCAL-11`](REVIEWS/fixes/LOCAL-11-hardlink-chmod.md) and L-3.
 
 ### 7g. Running under `sudo` — LOCAL-08
 
@@ -305,6 +390,21 @@ macOS has no `fs.protected_hardlinks`.
 
 **Record:** the socket path and its directory's mode.
 
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Passes on macOS.**
+
+A 122-byte state root. The socket is not in it; it fell back to
+
+```
+/var/folders/lx/…/T/autobahn-501/d1a312d66e32819e.sock
+drwx------@  /var/folders/lx/…/T/autobahn-501
+```
+
+which is macOS's per-user `$TMPDIR`, owned by me, mode `0700`. `autobahn status` worked against it.
+
+Evidence for LOCAL-05: on macOS the fallback is already private, because `$TMPDIR` is per-user here. The hazard that ticket describes — another user creating the directory first — needs a shared `/tmp`, which is the Linux case.
+
+**Filed against** [`LOCAL-05`](REVIEWS/fixes/LOCAL-05-control-socket-fallback.md): no change needed for macOS.
+
 ### 7i. The menu bar app — CI-09, LOCAL-04, F-H30
 
 1. `cargo test --release --features tray` passes locally. This is what CI-09 adds to CI.
@@ -312,6 +412,26 @@ macOS has no `fs.protected_hardlinks`.
 3. Create conflicts on two top-level files, one named `--all`. Settle `--all` from the menu. **Expected:** only that conflict is settled. **Before the fix:** both are.
 
 **Record:** the test output, the diff file's path, and which conflicts were settled.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Step 1 fails, for a platform-dependent assertion.**
+
+```
+cargo test --release --features tray
+test result: FAILED. 386 passed; 1 failed
+  transport::install::tests::the_remote_command_runs_under_sh_and_picks_this_platform
+  assertion `left == right` failed: left: Some(126), right: Some(127)
+```
+
+It fails identically without `--features tray`, so the tray feature is not the cause: the suite simply does not pass on macOS. The assertion at `src/transport/install.rs:767` expects a missing agent to make `sh` exit 127. Measured directly on both platforms:
+
+| | missing file under `exec` | unexecutable file |
+|---|---|---|
+| macOS `sh` | **126** | 126 |
+| Linux `sh` | 127 | 126 |
+
+So the launcher behaves correctly on both; only the test's expectation is Linux-only. This matters for CI-09, which proposes adding these tests to CI — a macOS runner would go red on arrival. Filed as [`MAC-5`](REVIEWS/fixes/MAC-5-sh-exit-code-assertion.md).
+
+Steps 2 and 3 (the diff scratch path, and `--all` as a filename) still need the menu, and a person to click it.
 
 ### 7j. Escape sequences in file names — F-M-OUT
 
@@ -323,12 +443,40 @@ macOS has no `fs.protected_hardlinks`.
 
 **Record:** each terminal's result.
 
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. The raw escape is emitted; the clipboard half still needs a person.**
+
+Two files named `x\x1b]52;c;cHduZWQ=\x07` with different contents, one conflict. `autobahn issues`, piped through `cat -v`:
+
+```
+    1 conflict
+      x^[]52;c;cHduZWQ=^G
+        alpha  10 B, modified 14s ago
+        /Users/faraz/mb7/j8/b 9 B, modified 14s ago
+      fix: autobahn resolve esc x^[]52;c;cHduZWQ=^G --keep alpha|…|both
+```
+
+`^[` is ESC and `^G` is BEL, so the OSC 52 sequence reaches the terminal intact — and a second time inside a `resolve` command the reader is invited to copy. In a terminal that honours OSC 52 (iTerm2 with the setting enabled) that writes the clipboard.
+
+Not everything is raw: `sync`'s own conflict line printed the name escaped, as `"x\u{1b}]52;c;cHduZWQ=\u{7}"`. So the sanitising exists in one path and not the other, which is M-6's point exactly. Whether each terminal acts on it was not tested — that needs a person at Terminal.app and iTerm2.
+
+**Filed as** [`F-M6`](REVIEWS/fixes/F-M6-terminal-escapes-in-issues.md) (M-6).
+
 ### 7k. The app build and signing — HYG-1, CI-05
 
 1. `apps/macos/build.sh`, then `plutil -p apps/macos/Autobahn.app/Contents/Info.plist | grep -i version`. **Expected:** it matches `Cargo.toml`'s version.
 2. After CI-05 splits building from signing, `apps/macos/release.sh` with no arguments still builds, signs, notarises and staples in one go on a laptop.
 
 **Record:** the plist versions, and whether `spctl -a -vv` accepts the app.
+
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Step 1 passes.**
+
+```
+CFBundleShortVersionString => 0.4.0
+CFBundleVersion            => 0.4.0
+LSMinimumSystemVersion     => 11.0
+```
+
+Both match `Cargo.toml`'s `version = "0.4.0"`. `spctl -a -vv` says `rejected — source=Unnotarized Developer ID`, which is correct for a locally built app: `build.sh` signs with the Developer ID but does not notarise. Step 2 waits for CI-05.
 
 ### 7l. The Intel build under Rosetta — optional, from the wishlist
 

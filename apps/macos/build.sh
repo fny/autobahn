@@ -9,10 +9,26 @@
 #
 # It wraps the same binary the terminal runs: the app is a way to launch
 # `autobahn tray`, not a second implementation of it.
+#
+#   apps/macos/build.sh [--unsigned] [path/to/Autobahn.app]
+#
+# --unsigned stops at the assembled bundle, touching no keychain: the
+# release builds that way before its certificate exists, so no build
+# script or proc macro ever runs while the identity is usable, and
+# `release.sh --sign-only` signs the result.
 set -euo pipefail
+usage() { echo "usage: $0 [--unsigned] [path/to/Autobahn.app]" >&2; exit 2; }
+SIGN=yes
+if [ "${1:-}" = --unsigned ]; then SIGN=no; shift; fi
+[ $# -le 1 ] || usage
+case "${1:-}" in -*) usage ;; esac
+# A path given is the caller's, so it is resolved before leaving their
+# directory.
+APP="${1:-}"
+if [ -n "$APP" ] && [[ "$APP" != /* ]]; then APP="$PWD/$APP"; fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
 source apps/macos/plist.sh
-APP="${1:-apps/macos/Autobahn.app}"
+APP="${APP:-apps/macos/Autobahn.app}"
 # The version the app reports is Cargo.toml's, read before the build so a
 # manifest without one costs a second rather than a compile.
 VERSION=$(crate_version Cargo.toml)
@@ -57,6 +73,11 @@ render_info_plist apps/macos/Info.plist "$APP/Contents/Info.plist" "$VERSION" "$
 # Signing the same binary outside a bundle succeeds, which is what makes
 # it so misleading.
 xattr -cr "$APP"
+if [ "$SIGN" = no ]; then
+    echo "built $APP, unsigned"
+    echo "  apps/macos/release.sh --sign-only $APP    # sign, notarise and staple it"
+    exit 0
+fi
 # Signed with the best identity in the keychain. An unsigned bundle is
 # refused a notification identity altogether, which is what the bundle is
 # for; ad-hoc earns one but is anonymous, so macOS treats every rebuild as

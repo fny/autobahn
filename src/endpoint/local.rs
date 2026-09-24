@@ -263,6 +263,13 @@ fn watch_tree(
             }
         }
     }
+    // Autobahn's own state root is never scanned wherever it falls inside
+    // a root (see `scan::exclude_state_root`), so it is never watched:
+    // its journals and locks change every cycle.
+    let state_roots = crate::scan::state_root_identities();
+    if directory_identity(start).is_some_and(|identity| state_roots.contains(&identity)) {
+        return Ok(());
+    }
     let mut stack = vec![(start.to_path_buf(), region)];
     while let Some((dir, region)) = stack.pop() {
         if let Err(error) = watcher
@@ -292,7 +299,9 @@ fn watch_tree(
             // `symlink_metadata`, so a link to a directory is not a
             // directory here: the watch never follows links.
             if !fs::symlink_metadata(&path).is_ok_and(|metadata| {
-                metadata.is_dir() && device.is_none_or(|device| metadata.dev() == device)
+                metadata.is_dir()
+                    && device.is_none_or(|device| metadata.dev() == device)
+                    && !state_roots.contains(&(metadata.dev(), metadata.ino()))
             }) {
                 continue;
             }
@@ -6123,6 +6132,42 @@ mod watch_tests {
         assert!(
             recorded.iter().all(|path| !path.starts_with(&ignored)),
             "a write beneath an ignored directory was recorded: {recorded:?}"
+        );
+    }
+
+    /// Autobahn's own state root inside a root is never scanned, so it is
+    /// never watched either — whether it was there when the watch was
+    /// built or appeared afterwards: its journals and locks change every
+    /// cycle, and each change would otherwise wake the session to rescan.
+    #[test]
+    fn a_state_root_inside_the_root_is_not_watched() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("kept")).unwrap();
+        std::fs::create_dir_all(root.path().join("state/sessions")).unwrap();
+        crate::scan::exclude_state_root(&root.path().join("state"));
+        let later = root.path().join("later-state");
+        crate::scan::exclude_state_root(&later);
+        let watcher =
+            ChangeWatcher::new(root.path(), IgnoreSet::default(), true, || {}).expect("watch");
+
+        std::fs::create_dir_all(later.join("sessions")).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        std::fs::write(root.path().join("state/sessions/journal"), b"j").unwrap();
+        std::fs::write(later.join("sessions/journal"), b"j").unwrap();
+        std::fs::write(root.path().join("kept/a"), b"a").unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("kept/a"),
+            Duration::from_secs(3)
+        ));
+        std::thread::sleep(Duration::from_millis(300));
+        let recorded = watcher.recorded();
+        assert!(
+            recorded.iter().all(|path| {
+                !path.starts_with(root.path().join("state/sessions"))
+                    && !path.starts_with(later.join("sessions"))
+            }),
+            "a write inside a state root was recorded: {recorded:?}"
         );
     }
 

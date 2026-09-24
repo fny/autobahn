@@ -251,7 +251,7 @@ pub fn exclude_state_root(state_root: &Path) {
 }
 
 /// The device and inode of every state root that exists now.
-fn state_root_identities() -> Vec<(u64, u64)> {
+pub(crate) fn state_root_identities() -> Vec<(u64, u64)> {
     let registered = STATE_ROOTS
         .lock()
         .unwrap_or_else(|error| error.into_inner())

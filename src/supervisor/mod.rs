@@ -482,7 +482,12 @@ pub struct Following {
 impl Supervisor {
     /// Creates a supervisor over the provided plans, with state and status
     /// kept under the provided root.
+    ///
+    /// The state root is registered with the scanner, so that no scan in
+    /// this process ever synchronizes it, whichever caller built the
+    /// supervisor and whether or not it checked its roots against it.
     pub fn new(plans: Vec<SessionPlan>, state_root: PathBuf, verbose: bool) -> Supervisor {
+        crate::scan::exclude_state_root(&state_root);
         Supervisor {
             plans,
             state_root,
@@ -3549,5 +3554,35 @@ mod tests {
             sleep_interruptible(Duration::from_secs(60), &stop);
         });
         assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    /// A supervisor started with a state root inside one of its roots —
+    /// by an embedder, or a test, that skipped planning's refusal — still
+    /// never synchronizes that state: the scanner's backstop knows it.
+    #[test]
+    fn a_supervisors_state_root_inside_a_root_is_never_synchronized() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let plans = planned(root.path(), &[("home", "")]);
+        let alpha = root.path().join("home");
+        std::fs::write(alpha.join("file.txt"), "synchronized").expect("written");
+        let state_root = alpha.join("custom-state");
+        std::fs::create_dir_all(state_root.join("sessions")).expect("created");
+        std::fs::write(state_root.join("config.toml"), "secret").expect("written");
+
+        let outcomes = Supervisor::new(plans, state_root, false).run_once();
+        assert!(
+            outcomes.iter().all(|outcome| outcome.result.is_ok()),
+            "the pass failed: {:?}",
+            outcomes.iter().map(|o| &o.result).collect::<Vec<_>>()
+        );
+        let mirror = root.path().join("home-mirror");
+        assert!(
+            mirror.join("file.txt").exists(),
+            "the root was synchronized"
+        );
+        assert!(
+            !mirror.join("custom-state").exists(),
+            "the supervisor's own state was synchronized"
+        );
     }
 }

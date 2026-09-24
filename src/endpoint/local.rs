@@ -130,6 +130,9 @@ pub struct LocalEndpoint {
     staging_root: PathBuf,
     /// The treatment of symbolic links, applied when creating them.
     symlink_mode: SymlinkMode,
+    /// The ignore set scans apply, kept so a directory's removal can tell
+    /// content a pattern excludes from content excluded for what it is.
+    ignores: IgnoreSet,
     /// The permission bits for created non-executable files.
     file_mode: u32,
     /// The permission bits for created directories.
@@ -593,6 +596,7 @@ impl LocalEndpoint {
             root,
             staging_root,
             symlink_mode: options.symlink_mode,
+            ignores: options.ignores.clone(),
             file_mode: options.file_mode.unwrap_or(DEFAULT_FILE_MODE) & 0o777,
             directory_mode: options.directory_mode.unwrap_or(DEFAULT_DIRECTORY_MODE) & 0o777,
             max_entry_count: options.max_entry_count,
@@ -1472,6 +1476,7 @@ impl Endpoint for LocalEndpoint {
             scanned: self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()),
             behavior: self.observer.behavior(),
             symlink_mode: self.symlink_mode,
+            ignores: &self.ignores,
             file_mode: self.file_mode,
             directory_mode: self.directory_mode,
             owner: self.owner,
@@ -1765,6 +1770,9 @@ struct Transitioner<'a> {
     behavior: FilesystemBehavior,
     /// The treatment of symbolic links.
     symlink_mode: SymlinkMode,
+    /// The endpoint's ignore set: what a pattern excludes, which alone is
+    /// removed along with a deleted directory.
+    ignores: &'a IgnoreSet,
     /// The permission bits for created non-executable files.
     file_mode: u32,
     /// The permission bits for created directories.
@@ -1801,6 +1809,7 @@ impl<'a> Transitioner<'a> {
             scanned: self.scanned,
             behavior: self.behavior,
             symlink_mode: self.symlink_mode,
+            ignores: self.ignores,
             file_mode: self.file_mode,
             directory_mode: self.directory_mode,
             owner: self.owner,
@@ -2563,7 +2572,8 @@ impl<'a> Transitioner<'a> {
                         unexpected = true;
                         continue;
                     }
-                    // Excluded content goes with the directory around it.
+                    // Content a pattern excludes goes with the directory
+                    // around it.
                     //
                     // An ignore says which files synchronization carries,
                     // not which files exist. Deleting a directory is an
@@ -2581,9 +2591,34 @@ impl<'a> Transitioner<'a> {
                     // path — is that session's own root-deletion halt,
                     // which stops it before it carries the loss any
                     // further.
-                    let removed = match entry.file_type() {
-                        Ok(kind) if kind.is_dir() => fs::remove_dir_all(entry.path()),
-                        _ => fs::remove_file(entry.path()),
+                    //
+                    // The scan records far more than ignored entries as
+                    // untracked, though: a file over the size limit, a
+                    // FIFO or socket or device, a symbolic link under the
+                    // `ignore` symlink mode, a mount point. Nobody asked
+                    // to leave any of those out, and the other side has
+                    // never seen them, so a deletion there would be the
+                    // only copy lost. They stay, and so does the directory
+                    // holding them.
+                    let kind = entry.file_type().ok();
+                    let is_directory = kind.is_some_and(|kind| kind.is_dir());
+                    if !self.pattern_ignored(&child_path, is_directory) {
+                        let reason = match kind {
+                            Some(kind) if kind.is_file() => "excluded by size",
+                            Some(kind) if kind.is_symlink() => "excluded by the symlink mode",
+                            Some(kind) if kind.is_dir() => "excluded as a mount point",
+                            _ => "excluded by type",
+                        };
+                        self.problem(
+                            &child_path,
+                            format!("left in place, with its directory: {reason}"),
+                        );
+                        unexpected = true;
+                        continue;
+                    }
+                    let removed = match is_directory {
+                        true => fs::remove_dir_all(entry.path()),
+                        false => fs::remove_file(entry.path()),
                     };
                     if let Err(error) = removed {
                         self.problem(
@@ -2610,6 +2645,16 @@ impl<'a> Transitioner<'a> {
                 Some(Node::directory(expectation.name.clone(), Vec::new()))
             }
         }
+    }
+
+    /// Whether an ignore pattern excludes the entry at `path`: the entry
+    /// itself, or a directory above it — inside an ignored directory that a
+    /// negation opened for walking, everything not re-included is ignored.
+    fn pattern_ignored(&self, path: &str, is_directory: bool) -> bool {
+        self.ignores.ignored(path, is_directory)
+            || path
+                .match_indices('/')
+                .any(|(index, _)| self.ignores.ignored(&path[..index], true))
     }
 
     /// Applies a replacement.
@@ -5695,5 +5740,100 @@ mod apply_path_tests {
             fs::metadata(&temporary).expect("temporary").mode() & 0o777,
             0o600
         );
+    }
+
+    /// Deletes `path` on an endpoint just scanned, with the synchronizable
+    /// part of what the scan saw there as the expectation, as a
+    /// reconciled deletion carries.
+    fn delete_scanned(endpoint: &mut LocalEndpoint, path: &str) -> TransitionOutcome {
+        let snapshot = endpoint.scan().expect("scan");
+        let mut node = snapshot.root.as_ref().expect("root");
+        for component in path.split('/') {
+            node = node.child(component).expect("scanned");
+        }
+        let old = node.synchronizable_subtree();
+        endpoint
+            .transition(vec![Change {
+                path: path.into(),
+                old,
+                new: None,
+            }])
+            .expect("transition")
+    }
+
+    fn endpoint_with(root: &Path, options: EndpointOptions) -> LocalEndpoint {
+        LocalEndpoint::new(root.to_path_buf(), root.with_extension("staging"), options)
+            .expect("endpoint")
+    }
+
+    /// A file over the size limit exists only on this side: deleting its
+    /// directory removes the rest, and leaves it, and the directory, with
+    /// a problem saying why.
+    #[test]
+    fn a_deleted_directory_leaves_an_oversized_file_in_place() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(root.join("data")).expect("data");
+        fs::write(root.join("data/small.txt"), b"small").expect("small");
+        fs::write(root.join("data/dump.sql"), vec![7u8; 4096]).expect("dump");
+        let mut endpoint = endpoint_with(
+            &root,
+            EndpointOptions {
+                max_file_size: Some(1024),
+                ..EndpointOptions::default()
+            },
+        );
+        let outcome = delete_scanned(&mut endpoint, "data");
+        assert_eq!(fs::read(root.join("data/dump.sql")).unwrap().len(), 4096);
+        assert!(!root.join("data/small.txt").exists());
+        let problem = outcome
+            .problems
+            .iter()
+            .find(|problem| problem.path == "data/dump.sql")
+            .expect("the survivor is reported");
+        assert!(problem.message.contains("excluded by size"), "{problem:?}");
+        assert!(!problem.disagreement);
+    }
+
+    /// A FIFO is excluded for what it is, not by a pattern, so it stays.
+    #[test]
+    fn a_deleted_directory_leaves_a_fifo_in_place() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(root.join("d")).expect("d");
+        fs::write(root.join("d/a.txt"), b"a").expect("a");
+        let fifo = root.join("d/fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let mut endpoint = endpoint_with(&root, EndpointOptions::default());
+        let outcome = delete_scanned(&mut endpoint, "d");
+        assert!(fs::symlink_metadata(&fifo).is_ok(), "the FIFO was removed");
+        assert!(!root.join("d/a.txt").exists());
+        assert!(outcome
+            .problems
+            .iter()
+            .any(|problem| problem.path == "d/fifo" && problem.message.contains("by type")));
+    }
+
+    /// What a pattern ignores still goes with its directory, at any depth.
+    #[test]
+    fn a_deleted_directory_still_takes_its_ignored_content() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(root.join("project/.git/objects")).expect("git");
+        fs::write(root.join("project/.git/objects/x"), b"x").expect("object");
+        fs::write(root.join("project/build.log"), b"log").expect("log");
+        fs::write(root.join("project/main.rs"), b"fn main() {}").expect("main");
+        let mut endpoint = endpoint_with(
+            &root,
+            EndpointOptions {
+                ignores: IgnoreSet::new(&[".git".to_string(), "*.log".to_string()])
+                    .expect("ignores"),
+                ..EndpointOptions::default()
+            },
+        );
+        let outcome = delete_scanned(&mut endpoint, "project");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert!(!root.join("project").exists());
     }
 }

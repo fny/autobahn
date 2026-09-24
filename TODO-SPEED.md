@@ -25,7 +25,7 @@ An edit cost ~2.5 round trips to a remote beta: the beta scan, `StageBegin`, and
 
 - [x] ~~Skip the re-read in `publish_file` by verifying the staged inode's identity (device, inode, size, ctime) against what receipt recorded.~~ Built and measured 2026-09-23: the 1,000-file burst cycle 0.12–0.13 → 0.12–0.14 s, the 40k cold sync within the run-to-run spread. The re-read is page-cached and hashing is fast; the second hash is not a cost worth a change to the safety path. Dropped.
 - [ ] The rsync delta on the source (`supply_pull`) is one thread. Only matters for large files on a cold sync or a patch cell; measure `chromium-1-patch` before touching it.
-- [ ] blake3 on a single large file is one thread; `update_rayon` would split a multi-GB file. Nobody has asked; leave it until a cell shows it.
+- [x] ~~blake3 on a single large file is one thread.~~ Measured 2026-09-24 on a 2 GB file and closed. Warm in the page cache, blake3's multithreaded mode over a memory map hashes 4× faster (0.73–0.91 s → 0.18 s), but a memory-mapped file truncated mid-hash raises SIGBUS, and the scanner hashes files people are editing. Read into a 16 MB buffer and hashed across threads instead — safe — it is 10% faster warm (0.73 → 0.67 s; the copy costs as much as the hash) and slower cold from EBS (6.8–7.7 s → 7.7–7.9 s, disk-bound). Not worth a change.
 
 ## The warm walk — explained
 

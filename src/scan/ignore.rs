@@ -247,6 +247,62 @@ impl IgnoreSet {
         dead
     }
 
+    /// Reports wildcard negations that an ignored directory above them
+    /// makes do nothing.
+    ///
+    /// `vendor` with `!vendor/*.patch` re-includes nothing: a wildcard
+    /// negation cannot say in advance which directories hold what it
+    /// matches, so it opens none (see [`IgnoreSet::holds_a_re_inclusion`]),
+    /// and the walk prunes at `vendor` before the negation is ever asked.
+    /// Only the negation's literal leading directories are examined — a
+    /// pattern like `!**/*.patch` names no directory to test — and each is
+    /// decided exactly as the walk decides it, so a directory that another,
+    /// wildcard-free negation opens is not reported.
+    ///
+    /// These are warnings, not errors: a configuration that relies on them
+    /// ran before, and still does, only without the effect it meant.
+    pub fn ineffective_negations(&self) -> Vec<String> {
+        let mut ineffective = Vec::new();
+        for pattern in self.patterns.iter().filter(|pattern| pattern.negated) {
+            let path = pattern.matcher.glob().glob();
+            if !path.contains(['*', '?', '[']) {
+                continue;
+            }
+            if let Some(directory) = self.pruned_ancestor(path) {
+                ineffective.push(format!(
+                    "!{path} has no effect: {directory} is ignored, and a negation with a \
+                     wildcard does not open an ignored directory. Ignore its contents \
+                     instead ({directory}/*), or name what to keep without a wildcard"
+                ));
+            }
+        }
+        ineffective
+    }
+
+    /// The first directory above `path` at which a walk from the root
+    /// stops: one that is ignored and that no negation opens. Mirrors the
+    /// scanner, which inverts the question inside an ignored region it
+    /// was let into. Directories spelled with a wildcard end the search,
+    /// since they name no one directory.
+    fn pruned_ancestor<'a>(&self, path: &'a str) -> Option<&'a str> {
+        let mut within_ignored = false;
+        for (at, _) in path.match_indices('/') {
+            let directory = &path[..at];
+            if directory.contains(['*', '?', '[']) {
+                break;
+            }
+            let ignored = match within_ignored {
+                true => !self.re_included(directory, true),
+                false => self.ignored(directory, true),
+            };
+            if ignored && !self.holds_a_re_inclusion(directory) {
+                return Some(directory);
+            }
+            within_ignored = ignored;
+        }
+        None
+    }
+
     /// Indicates whether or not the root-relative path (with `is_directory`
     /// disambiguating directory-only patterns) is ignored.
     pub fn ignored(&self, path: &str, is_directory: bool) -> bool {
@@ -460,6 +516,91 @@ mod tests {
         assert!(!supported.ignored("node_modules", true));
         assert!(supported.ignored("node_modules/other", false));
         assert!(!supported.ignored("node_modules/keep", false));
+    }
+
+    /// The scanner's verdict on one path: whether the walk reaches it and,
+    /// if so, whether it is carried. Built from the same questions the
+    /// scanner asks, in the same order.
+    fn carried(set: &IgnoreSet, path: &str, is_directory: bool) -> bool {
+        let mut within_ignored = false;
+        for (at, _) in path.match_indices('/') {
+            let directory = &path[..at];
+            let ignored = match within_ignored {
+                true => !set.re_included(directory, true),
+                false => set.ignored(directory, true),
+            };
+            if ignored && !set.holds_a_re_inclusion(directory) {
+                return false;
+            }
+            within_ignored = ignored;
+        }
+        match within_ignored {
+            true => set.re_included(path, is_directory),
+            false => !set.ignored(path, is_directory),
+        }
+    }
+
+    /// `vendor` with `!vendor/*.patch` re-includes nothing, and says so,
+    /// pointing at the spelling that works.
+    #[test]
+    fn a_wildcard_negation_under_an_ignored_directory_is_reported() {
+        let set = ignores(&["vendor", "!vendor/*.patch"]);
+        let ineffective = set.ineffective_negations();
+        assert_eq!(ineffective.len(), 1, "{ineffective:?}");
+        assert!(
+            ineffective[0].contains("!vendor/*.patch"),
+            "{ineffective:?}"
+        );
+        assert!(ineffective[0].contains("has no effect"), "{ineffective:?}");
+        assert!(ineffective[0].contains("vendor/*"), "{ineffective:?}");
+        assert!(!carried(&set, "vendor/fix.patch", false));
+
+        // The suggested spelling works, and is not reported.
+        let fixed = ignores(&["vendor/*", "!vendor/*.patch"]);
+        assert!(fixed.ineffective_negations().is_empty());
+        assert!(carried(&fixed, "vendor/fix.patch", false));
+    }
+
+    /// Not reported where the negation does take effect: a directory a
+    /// wildcard-free negation opens is walked, and a negation naming no
+    /// directory is not guessed at.
+    #[test]
+    fn a_wildcard_negation_that_can_take_effect_is_not_reported() {
+        let opened = ignores(&["vendor", "!vendor/keep.txt", "!vendor/*.patch"]);
+        assert!(opened.ineffective_negations().is_empty());
+        assert!(carried(&opened, "vendor/fix.patch", false));
+        assert!(ignores(&["vendor", "!**/*.patch"])
+            .ineffective_negations()
+            .is_empty());
+        assert!(ignores(&["build/", "!**/src/**/build/"])
+            .ineffective_negations()
+            .is_empty());
+        assert!(ignores(&["*.log", "!keep*.log"])
+            .ineffective_negations()
+            .is_empty());
+    }
+
+    /// Inside a walked region, a negation applies wherever it matches, so
+    /// `!*.md` re-includes `vendor/README.md` — but not a file in a
+    /// directory the region still prunes. That is git's result for the
+    /// `vendor/*` spelling (checked against `git status` on this tree),
+    /// which is the spelling this one is meant to agree with.
+    #[test]
+    fn a_negation_inside_a_walked_region_matches_git() {
+        let region = ignores(&["vendor", "!vendor/keep.txt", "!*.md"]);
+        let git = ignores(&["vendor/*", "!vendor/keep.txt", "!*.md"]);
+        // What `git status --untracked-files=all` lists for the second list.
+        let expected = [
+            ("top.md", false, true),
+            ("vendor/README.md", false, true),
+            ("vendor/keep.txt", false, true),
+            ("vendor/junk.txt", false, false),
+            ("vendor/sub/x.md", false, false),
+        ];
+        for (path, is_directory, listed) in expected {
+            assert_eq!(carried(&region, path, is_directory), listed, "{path}");
+            assert_eq!(carried(&git, path, is_directory), listed, "{path}");
+        }
     }
 
     #[test]

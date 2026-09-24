@@ -1593,6 +1593,34 @@ fn a_manual_sync_expands_a_quoted_tilde() {
     assert_eq!(read(&home, "b/file.txt"), "content");
     assert!(!cwd.join("~").exists(), "a literal ./~ was created");
 }
+
+/// A wildcard negation under an ignored directory re-includes nothing,
+/// and loading the configuration says so rather than staying silent.
+#[test]
+fn a_wildcard_negation_under_an_ignored_directory_is_warned_about() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "vendor/fix.patch", "patch");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\
+             ignores = [\"vendor\", \"!vendor/*.patch\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+    let (ok, text) = cli(&world, &config, &["sync"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("warning: group 'g': !vendor/*.patch has no effect"),
+        "{text}"
+    );
+    assert!(!beta.join("vendor").exists(), "{text}");
+}
 // ── clean and disabled sessions ──────────────────────────────────────
 
 /// Turns a group off or on through the CLI.

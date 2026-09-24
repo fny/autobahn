@@ -1412,12 +1412,20 @@ impl Config {
                 // refusing, not a preference: combining ignore files
                 // written independently is exactly how they appear, and
                 // the reader cannot see it by looking at either file.
-                Ok(compiled) => errors.extend(
-                    compiled
-                        .dead_negations()
-                        .into_iter()
-                        .map(|dead| format!("group '{name}': {dead}")),
-                ),
+                Ok(compiled) => {
+                    // A wildcard negation under an ignored directory is
+                    // said, not refused: such a list ran before, just
+                    // without the effect it meant.
+                    for warning in compiled.ineffective_negations() {
+                        eprintln!("autobahn: warning: group '{name}': {warning}");
+                    }
+                    errors.extend(
+                        compiled
+                            .dead_negations()
+                            .into_iter()
+                            .map(|dead| format!("group '{name}': {dead}")),
+                    )
+                }
             }
             let interval = Duration::from_secs(
                 group

@@ -52,6 +52,10 @@ A negation reaches inside an ignored directory. `vendor` followed by `!vendor/ke
 
 This is one place autobahn is deliberately more forgiving than git, which refuses to re-include beneath an excluded directory. It is safe for every configuration that runs today: before this, such a list was refused at startup, so nothing that synchronizes now changes shape.
 
+Only a negation without wildcards opens an ignored directory, because only it names the directories to walk. `vendor` with `!vendor/*.patch` re-includes nothing: the walk stops at `vendor` before the negation is ever asked. Loading the configuration warns about such a line. Ignore the directory's contents instead, `vendor/*` with `!vendor/*.patch`, or name what to keep without a wildcard.
+
+Once a directory is walked this way, every negation applies inside it wherever it matches: `vendor`, `!vendor/keep.txt` and `!*.md` carry `vendor/README.md` too. A subdirectory that nothing opens stays pruned, so `vendor/sub/notes.md` is not carried. That is what git does with the `vendor/*` spelling.
+
 An ignored directory with nothing re-included beneath it is still never opened, which is what keeps `node_modules` free. The directories a negation reaches are computed once from the patterns, so a list with no negations pays nothing.
 
 ## Dead negations

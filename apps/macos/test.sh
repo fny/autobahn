@@ -123,6 +123,11 @@ if run "$WORK/signed/apps/macos/build.sh"; then
     done
     if grep -q '__' "$plist"; then fail "a placeholder survived into the bundle's Info.plist"
     else pass "no placeholder survives into the bundle's Info.plist"; fi
+    # Cargo.lock as committed, or no build: a stale lock file fails
+    # rather than being quietly re-resolved into what ships.
+    if grep -qE '^cargo build( .*)? --locked( |$)' "$WORK/calls"; then
+        pass "build.sh builds with --locked"
+    else fail "build.sh builds without --locked:"; grep '^cargo ' "$WORK/calls" >&2; fi
     if [ -x "$WORK/signed/apps/macos/Autobahn.app/Contents/MacOS/autobahn" ]; then
         pass "build.sh puts the executable in the bundle"
     else fail "build.sh left no executable in the bundle"; fi

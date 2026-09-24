@@ -40,7 +40,7 @@ VERSION=$(crate_version Cargo.toml)
 # whatever the last unrelated build left there. Same fragility as a stale
 # agent bundle, and the same fix: separate outputs, nothing shared.
 TARGET="${AUTOBAHN_TRAY_TARGET:-target/tray}"
-CARGO_TARGET_DIR="$TARGET" cargo build --release --features tray
+CARGO_TARGET_DIR="$TARGET" cargo build --release --locked --features tray
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn"

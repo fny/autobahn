@@ -79,6 +79,76 @@ fn home_override_from(value: &str) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(value)))
 }
 
+/// The directories under the state root that hold what autobahn keeps
+/// about hosts, paths and sessions, and are made private at startup with
+/// the root itself.
+pub const PRIVATE_SUBDIRECTORIES: [&str; 4] = ["sessions", "status", "staging", "peering"];
+
+/// Makes the state root, and each of [`PRIVATE_SUBDIRECTORIES`] under it,
+/// a directory only the current user can use (see
+/// [`crate::fsutil::private_dir`]), then sweeps its `tmp/` of old scratch
+/// files. Every entry point that touches state calls this first, so the
+/// root is private because it was made that way, not as a side effect of
+/// whichever command happened to run first.
+///
+/// Missing parents of the root are created as ordinary directories: they
+/// are not autobahn's, and an explicit `--state-root` may name a path
+/// that does not exist yet. A root or subdirectory that is a symbolic
+/// link or owned by another user is an error, and a looser one is
+/// tightened with a warning. A failed sweep is reported and does not stop
+/// the command.
+pub fn prepare_state_root(root: &std::path::Path) -> Result<()> {
+    if let Some(parent) = root.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("unable to create {}", parent.display()))?;
+        }
+    }
+    crate::fsutil::private_dir(root)?;
+    for name in PRIVATE_SUBDIRECTORIES {
+        crate::fsutil::private_dir(&root.join(name))?;
+    }
+    if let Err(error) = crate::fsutil::sweep_private_tmp(root, crate::fsutil::TMP_MAX_AGE) {
+        crate::complain!("warning: {error:#}");
+    }
+    Ok(())
+}
+
+/// Describes why a file others can write to should not be trusted, when
+/// they can: the file, or the directory it is in, is writable by its group
+/// or by everyone. `None` when neither is, or when either cannot be
+/// inspected (reading the file reports that better).
+///
+/// The configuration holds commands autobahn runs (`on_alert`,
+/// `agent_command`), so whoever can write it can run commands as this
+/// user — the check ssh makes of its own configuration.
+pub fn loose_write_permissions(path: &std::path::Path) -> Option<String> {
+    use std::os::unix::fs::PermissionsExt;
+    let writable = |path: &std::path::Path| {
+        std::fs::metadata(path)
+            .ok()
+            .map(|metadata| metadata.permissions().mode() & 0o7777)
+            .filter(|mode| mode & 0o022 != 0)
+    };
+    if let Some(mode) = writable(path) {
+        return Some(format!(
+            "{} is mode {mode:04o}, writable by others",
+            path.display()
+        ));
+    }
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => std::path::Path::new("."),
+    };
+    writable(directory).map(|mode| {
+        format!(
+            "{} is in {}, which is mode {mode:04o}, writable by others",
+            path.display(),
+            directory.display()
+        )
+    })
+}
+
 /// Resolves a path to its physical identity: fully canonicalized when it
 /// exists, and otherwise the canonicalized deepest *existing* ancestor with
 /// the missing suffix reappended (lexically normalized).
@@ -197,6 +267,75 @@ mod tests {
         assert_eq!(
             resolve_for_identity(std::path::Path::new("/nonexistent/./x")),
             PathBuf::from("/nonexistent/x")
+        );
+    }
+
+    fn mode(path: &std::path::Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .expect("the path should exist")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn the_state_root_and_its_subdirectories_are_made_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("nested").join(".autobahn");
+        prepare_state_root(&root).expect("the state root should be preparable");
+        assert_eq!(mode(&root), 0o700);
+        for name in PRIVATE_SUBDIRECTORIES {
+            assert_eq!(mode(&root.join(name)), 0o700, "{name}");
+        }
+        // One left readable by an older build is tightened.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(
+            root.join("sessions"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        prepare_state_root(&root).expect("the state root should be preparable");
+        assert_eq!(mode(&root), 0o700);
+        assert_eq!(mode(&root.join("sessions")), 0o700);
+    }
+
+    #[test]
+    fn a_state_root_that_is_a_link_is_refused() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let elsewhere = keep.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        let root = keep.path().join(".autobahn");
+        std::os::unix::fs::symlink(&elsewhere, &root).unwrap();
+        assert!(prepare_state_root(&root).is_err());
+        assert!(!elsewhere.join("sessions").exists());
+    }
+
+    #[test]
+    fn a_file_or_directory_others_can_write_is_named() {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let directory = keep.path().join("home");
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let config = directory.join("config.toml");
+        std::fs::write(&config, b"").unwrap();
+        for private in [0o600, 0o644] {
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(private)).unwrap();
+            assert_eq!(loose_write_permissions(&config), None, "{private:04o}");
+        }
+        for loose in [0o620, 0o602, 0o666] {
+            std::fs::set_permissions(&config, std::fs::Permissions::from_mode(loose)).unwrap();
+            let warning = loose_write_permissions(&config).expect("a loose file is named");
+            assert!(warning.contains(&format!("{loose:04o}")), "{warning}");
+        }
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let warning = loose_write_permissions(&config).expect("a loose directory is named");
+        assert!(
+            warning.contains(&directory.display().to_string()),
+            "{warning}"
         );
     }
 }

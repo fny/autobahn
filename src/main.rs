@@ -953,9 +953,11 @@ fn run_sync(
     .map_err(|problem| anyhow::anyhow!("{alpha} and {beta}: {problem}"))?;
     let state_directory = match state_dir {
         Some(directory) => directory,
-        None => paths::default_state_root()?
-            .join("sessions")
-            .join(&identifier),
+        None => {
+            let state_root = paths::default_state_root()?;
+            paths::prepare_state_root(&state_root)?;
+            state_root.join("sessions").join(&identifier)
+        }
     };
     autobahn::config::OwnState::new(&state_directory, None)
         .check_session(
@@ -976,6 +978,12 @@ fn run_sync(
             eprintln!("warning: {warning}; pass --ignore for each to leave them out");
         }
     }
+    // The ancestor within says which paths exist and what they hold.
+    if let Some(parent) = state_directory.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("unable to create {}", parent.display()))?;
+    }
+    autobahn::fsutil::private_dir(&state_directory)?;
 
     // Construct the endpoints: an agent connection (SSH or explicit
     // command) for remote specifications, a local endpoint otherwise.
@@ -1514,13 +1522,15 @@ fn load_config(path: Option<PathBuf>) -> Result<Config> {
     Config::load(&path)
 }
 
-/// Resolves the state root from an explicit override or the default.
+/// Resolves the state root from an explicit override or the default, and
+/// makes it private (see `paths::prepare_state_root`).
 fn resolve_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
     let root = match state_root {
         Some(root) => root,
         None => paths::default_state_root()?,
     };
     autobahn::scan::exclude_state_root(&root);
+    paths::prepare_state_root(&root)?;
     Ok(root)
 }
 
@@ -3556,7 +3566,10 @@ fn run_resolve(
 fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
     let path = match config {
         Some(path) => path,
-        None => paths::default_config_path()?,
+        None => {
+            paths::prepare_state_root(&paths::default_state_root()?)?;
+            paths::default_config_path()?
+        }
     };
     if path.exists() {
         if !force {
@@ -3580,12 +3593,10 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
             .with_context(|| format!("unable to create {}", parent.display()))?;
     }
     // Written beside and renamed, so an interrupted write never leaves a
-    // half-written configuration where a whole one used to be.
-    let temporary = path.with_extension("toml.new");
-    std::fs::write(&temporary, autobahn::config::TEMPLATE)
-        .with_context(|| format!("unable to write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("unable to move {} into place", temporary.display()))?;
+    // half-written configuration where a whole one used to be; private
+    // when new, and a replaced one's mode kept.
+    autobahn::persist::write_atomically(&path, autobahn::config::TEMPLATE.as_bytes())
+        .with_context(|| format!("unable to write {}", path.display()))?;
 
     let sessions = autobahn::config::Config::load(&path)
         .and_then(|config| config.plans())
@@ -3676,10 +3687,9 @@ fn run_availability(
 
     // Written beside and renamed, so an interrupted write never leaves a
     // half-written configuration where a whole one used to be — the same
-    // rule `init` follows.
-    let temporary = path.with_extension("toml.new");
-    std::fs::write(&temporary, &updated)
-        .with_context(|| format!("unable to write {}", temporary.display()))?;
+    // rule `init` follows. It keeps the mode the file had.
+    let temporary = autobahn::persist::write_beside(&path, updated.as_bytes())
+        .with_context(|| format!("unable to write beside {}", path.display()))?;
     // Read back before it is moved into place: a configuration this
     // command cannot load is one the supervisor would refuse at its next
     // start, which is the worst moment to find out.

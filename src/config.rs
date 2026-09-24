@@ -1044,6 +1044,13 @@ impl Config {
     pub fn load(path: &std::path::Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("unable to read configuration {}", path.display()))?;
+        // It names commands autobahn runs. Warned, not refused, so a
+        // setup that worked before keeps working.
+        if let Some(problem) = crate::paths::loose_write_permissions(path) {
+            crate::complain!(
+                "warning: {problem}; whoever can change the configuration can run commands as you"
+            );
+        }
         Config::parse(path, &text)
     }
 

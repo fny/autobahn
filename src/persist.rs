@@ -223,14 +223,60 @@ fn lock_shared(lock: &Mutex<Shared>) -> std::sync::MutexGuard<'_, Shared> {
 /// Writes a file by way of a temporary and a rename, so that a reader never
 /// observes a partially written state. The temporary is removed if the
 /// rename fails, so a failed write leaves nothing behind.
+///
+/// The file keeps the mode of the one it replaces, and is `0600` when it
+/// is new; the temporary is private from the moment it exists (see
+/// [`write_beside`]).
 pub fn write_atomically(path: &Path, data: &[u8]) -> std::io::Result<()> {
-    let temporary = path.with_extension(format!("tmp.{}", std::process::id()));
-    std::fs::write(&temporary, data)?;
+    let temporary = write_beside(path, data)?;
     if let Err(error) = std::fs::rename(&temporary, path) {
         let _ = std::fs::remove_file(&temporary);
         return Err(error);
     }
     Ok(())
+}
+
+/// Writes `data` to a new temporary beside `path`, ready to be renamed
+/// over it, and returns the temporary's path. For a caller that checks
+/// what it wrote before it moves it into place; [`write_atomically`] is
+/// this and the rename.
+///
+/// Guarantees, when it returns `Ok`: the temporary is a new file in
+/// `path`'s directory, named `.<name>.tmp.<random>` so another local user
+/// cannot guess and pre-create it, created with `O_EXCL` and
+/// `O_NOFOLLOW` (see [`crate::fsutil::private_file`]), so it is never an
+/// existing file or a link's target. It holds `data`, and its mode is that
+/// of the file at `path` — a regular file, not followed through a link —
+/// or `0600` when there is none, so a rewrite never loosens a mode the
+/// user tightened. On an error nothing is left behind.
+pub fn write_beside(path: &Path, data: &[u8]) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let mode = match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.permissions().mode() & 0o7777,
+        _ => 0o600,
+    };
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{} names no file", path.display()),
+        )
+    })?;
+    let suffix = crate::fsutil::random_hex(8).map_err(std::io::Error::other)?;
+    let mut temporary_name = std::ffi::OsString::from(".");
+    temporary_name.push(name);
+    temporary_name.push(format!(".tmp.{suffix}"));
+    let temporary = path.with_file_name(temporary_name);
+    let mut file = crate::fsutil::private_file(&temporary).map_err(std::io::Error::other)?;
+    let written = file
+        .write_all(data)
+        .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(mode)));
+    if let Err(error) = written {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    Ok(temporary)
 }
 
 #[cfg(test)]
@@ -425,6 +471,55 @@ mod tests {
         // derived, so the cost is a slower next cycle, not a hang.
         writer.store(keep.path().join("state"), || Some(b"ignored".to_vec()));
         writer.flush();
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .expect("the file should exist")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    #[test]
+    fn a_new_state_file_is_private() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let path = keep.path().join("state");
+        write_atomically(&path, b"new").expect("the write should succeed");
+        assert_eq!(mode(&path), 0o600);
+    }
+
+    #[test]
+    fn a_rewrite_keeps_the_mode_of_the_file_it_replaces() {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        for kept in [0o600, 0o640, 0o644] {
+            let path = keep.path().join(format!("state-{kept:o}"));
+            std::fs::write(&path, b"before").expect("state should be writable");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(kept))
+                .expect("mode should be settable");
+            write_atomically(&path, b"after").expect("the write should succeed");
+            assert_eq!(mode(&path), kept, "{kept:04o} was not kept");
+            assert_eq!(std::fs::read(&path).unwrap(), b"after");
+        }
+    }
+
+    #[test]
+    fn the_temporary_is_private_and_unpredictable() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let path = keep.path().join("state");
+        let first = write_beside(&path, b"one").expect("the write should succeed");
+        let second = write_beside(&path, b"two").expect("the write should succeed");
+        assert_ne!(first, second);
+        assert_eq!(first.parent(), Some(keep.path()));
+        assert!(!first
+            .to_string_lossy()
+            .ends_with(&format!(".tmp.{}", std::process::id())));
+        assert_eq!(mode(&first), 0o600);
+        assert_eq!(std::fs::read(&second).unwrap(), b"two");
+        // Not moved into place: that is the caller's to do.
+        assert!(!path.exists());
     }
 
     #[test]

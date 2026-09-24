@@ -64,6 +64,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Formatting
         run: cargo fmt --check
+      - name: The app's build scripts
+        # Needs no Mac: build.sh and release.sh run against stand-ins for
+        # cargo and Apple's tools, so their own logic is checked on every
+        # push, not only on the macOS runner and the release.
+        run: apps/macos/test.sh
       - name: Lints
         run: cargo clippy --release --locked --all-targets -- -D warnings
       # The suite must leave the real ~/.autobahn alone: a test that writes

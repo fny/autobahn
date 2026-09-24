@@ -934,7 +934,7 @@ impl LocalEndpoint {
                     }
                     state.current = Some(match state.needs.get(&digest) {
                         Some(need) => Receiving::File {
-                            file: self.open_receive_file(need)?,
+                            file: Box::new(self.open_receive_file(need)?),
                             need: need.clone(),
                         },
                         None => Receiving::Sink,
@@ -960,7 +960,7 @@ impl LocalEndpoint {
                         if error.is_some() {
                             file.discard();
                         } else {
-                            self.finish_receive(file, &need)?;
+                            self.finish_receive(*file, &need)?;
                             state.needs.remove(&need.request.digest);
                         }
                     }
@@ -1607,10 +1607,12 @@ struct ReceiveState {
 
 /// Where the frames of the current file go.
 enum Receiving {
-    /// A file this endpoint asked for.
+    /// A file this endpoint asked for. The file is boxed: it holds the
+    /// digesting writer's buffers, and would otherwise make every state,
+    /// the sink included, thousands of bytes.
     File {
         need: StagingNeed,
-        file: ReceiveFile,
+        file: Box<ReceiveFile>,
     },
     /// Content this endpoint did not ask for: read to the end and dropped.
     Sink,

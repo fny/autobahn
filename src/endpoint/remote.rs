@@ -779,11 +779,15 @@ struct RemoteWatch {
         Option<u64>,
     )>,
     /// The last wait's answer — changed, watching — until it is polled.
-    verdict: Arc<Mutex<Option<Result<(bool, bool)>>>>,
+    verdict: Arc<Mutex<Option<WatchVerdict>>>,
     /// The generation the outstanding wait was begun from, while one is
     /// sent and not yet polled.
     outstanding: Option<Option<u64>>,
 }
+
+/// A wait's answer: whether anything changed, and whether the agent's
+/// watch is standing.
+type WatchVerdict = Result<(bool, bool)>;
 
 impl RemoteWatch {
     fn start(mut channel: AgentChannel) -> RemoteWatch {
@@ -792,7 +796,7 @@ impl RemoteWatch {
             Arc<crate::endpoint::WakeSignal>,
             Option<u64>,
         )>();
-        let verdict: Arc<Mutex<Option<Result<(bool, bool)>>>> = Arc::default();
+        let verdict: Arc<Mutex<Option<WatchVerdict>>> = Arc::default();
         let recorded = Arc::clone(&verdict);
         std::thread::Builder::new()
             .name("autobahn-watch".into())

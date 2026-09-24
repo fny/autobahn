@@ -2020,6 +2020,17 @@ fn common_prefix(paths: &[&str]) -> String {
     prefix.join("/")
 }
 
+/// `path` quoted as one shell word, except that a leading `~` stays
+/// outside the quotes as `"$HOME"`, so a root written home-relative still
+/// expands on the side that runs the command.
+fn home_quoted(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => format!("\"$HOME\"/{}", autobahn::text::shell_quote(rest)),
+        None if path == "~" => "\"$HOME\"".to_owned(),
+        None => autobahn::text::shell_quote(path),
+    }
+}
+
 /// What to do about a group of blocked paths.
 ///
 /// Specific where it can be. A permission problem on a remote destination
@@ -2034,30 +2045,58 @@ fn blocked_fix(
     let mut fixes = Vec::new();
     let where_ = if prefix.is_empty() { "." } else { prefix };
     if cause.contains("Permission denied") {
-        match side {
+        // The command is meant to be pasted into a shell, and the path in
+        // it is made of names the other side chose. Every value is quoted
+        // as one word, so a `;`, a `$(…)` or a quote in a name is only a
+        // name — and a name with a control character in it is not put in
+        // a command at all, since no quoting makes a newline safe to
+        // paste.
+        let (remote, root) = match side {
             "beta" => {
                 let spec = plan.beta_spec();
                 match spec.split_once(':') {
-                    Some((destination, root)) => {
-                        let user = destination.split('@').next().unwrap_or(destination);
-                        fixes.push(format!(
-                            "ssh {destination} 'sudo chown -R {user} {root}/{where_}'"
-                        ));
-                    }
-                    None => fixes.push(format!("sudo chown -R \"$(whoami)\" {spec}/{where_}")),
+                    Some((destination, root)) => (Some(destination.to_owned()), root.to_owned()),
+                    None => (None, spec),
                 }
             }
-            _ => fixes.push(format!(
-                "sudo chown -R \"$(whoami)\" {}/{where_}",
-                plan.alpha_spec
-            )),
+            _ => (None, plan.alpha_spec.clone()),
+        };
+        let path = format!("{root}/{where_}");
+        if path.chars().any(char::is_control) {
+            fixes.push(format!(
+                "fix permissions on {} by hand",
+                autobahn::text::display_safe(&path)
+            ));
+        } else {
+            match remote {
+                // Quoted twice: once for the remote shell, which runs the
+                // inner command, and once for the local one, which hands
+                // that command to ssh as a single argument. The user is
+                // asked of the remote shell, since a destination without a
+                // `user@` names only a host.
+                Some(destination) => {
+                    let inner = format!("sudo chown -R \"$(id -un)\" {}", home_quoted(&path));
+                    fixes.push(format!(
+                        "ssh {} {}",
+                        autobahn::text::shell_quote(&destination),
+                        autobahn::text::shell_quote(&inner)
+                    ));
+                }
+                None => fixes.push(format!(
+                    "sudo chown -R \"$(whoami)\" {}",
+                    home_quoted(&path)
+                )),
+            }
         }
         // An ignore is only the answer for something generated. The
         // deepest hidden directory in the path is that; the last segment
         // is often a version ("0.9.10") or a real folder ("static"), and
         // ignoring either would be worse than the permissions.
         if let Some(name) = prefix.split('/').rev().find(|name| name.starts_with('.')) {
-            fixes.push(format!("or add \"{name}\" to the group's ignores"));
+            fixes.push(format!(
+                "or add \"{}\" to the group's ignores",
+                autobahn::text::display_safe(name)
+            ));
         }
     } else if cause == "unicode collision" || cause == "casing collision" {
         // The other side holds one name twice, under spellings this
@@ -4976,6 +5015,160 @@ mod tests {
         );
     }
 
+    /// A plan whose one beta is `beta`, for the fix-command tests.
+    fn fix_plan(beta: &str) -> autobahn::config::SessionPlan {
+        let text = format!(
+            "[groups.g]\nalpha = \"/tmp/a\"\nmode = \"two-way-conflict\"\nbetas = [\"{beta}\"]\n"
+        );
+        toml::from_str::<autobahn::config::Config>(&text)
+            .expect("parses")
+            .plans()
+            .expect("plans")
+            .remove(0)
+    }
+
+    /// Runs `command` through `sh` in `dir`, with `ssh` standing in for a
+    /// remote shell (it drops the destination and runs the rest through
+    /// `sh -c`, as sshd does) and `sudo` recording its arguments one per
+    /// line in `dir/args` instead of running anything. Returns the
+    /// recorded arguments.
+    fn run_stubbed(dir: &std::path::Path, command: &str) -> Vec<String> {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let sudo = bin.join("sudo");
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\nfor a in \"$@\"; do printf '%s\\n' \"$a\"; done > {}\n",
+                dir.join("args").display()
+            ),
+        )
+        .unwrap();
+        let ssh = bin.join("ssh");
+        std::fs::write(&ssh, "#!/bin/sh\nshift\nexec sh -c \"$*\"\n").unwrap();
+        for stub in [&sudo, &ssh] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(stub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(dir)
+            .env(
+                "PATH",
+                format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+            )
+            .status()
+            .expect("sh runs");
+        assert!(status.success(), "{command}");
+        std::fs::read_to_string(dir.join("args"))
+            .expect("sudo was reached")
+            .lines()
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A fix command pasted into a shell does what it says, whatever the
+    /// names in it: the path arrives as one argument, and nothing in it
+    /// runs. The names come from the other side, and the local form runs
+    /// under sudo.
+    #[test]
+    fn a_fix_command_quotes_every_name_it_holds() {
+        let prefix = "a dir/it's;$(touch pwned)/`touch pwned`";
+        for beta in ["u@h:/tmp/b", "/tmp/b"] {
+            let plan = fix_plan(beta);
+            for side in ["alpha", "beta"] {
+                let fixes = blocked_fix(side, "Permission denied (os error 13)", prefix, &plan);
+                let command = &fixes[0];
+                let parsed = std::process::Command::new("sh")
+                    .args(["-n", "-c", command])
+                    .status()
+                    .expect("sh runs");
+                assert!(parsed.success(), "sh -n rejects {command}");
+
+                let dir = tempfile::tempdir().unwrap();
+                let args = run_stubbed(dir.path(), command);
+                let root = match (side, beta) {
+                    ("beta", _) => "/tmp/b",
+                    _ => "/tmp/a",
+                };
+                assert_eq!(
+                    args.last().map(String::as_str),
+                    Some(format!("{root}/{prefix}").as_str()),
+                    "{command}"
+                );
+                assert_eq!(args[..2], ["chown", "-R"], "{command}");
+                assert!(!dir.path().join("pwned").exists(), "{command} ran a name");
+            }
+        }
+    }
+
+    /// Without a `user@`, the remote user is whoever the remote shell runs
+    /// as — never the host name, which is all the destination says.
+    #[test]
+    fn a_remote_fix_names_the_remote_user_not_the_host() {
+        let fixes = blocked_fix(
+            "beta",
+            "Permission denied (os error 13)",
+            "x",
+            &fix_plan("h:/tmp/b"),
+        );
+        assert!(fixes[0].contains("$(id -un)"), "{fixes:?}");
+        assert!(!fixes[0].contains("chown -R h "), "{fixes:?}");
+        let dir = tempfile::tempdir().unwrap();
+        let args = run_stubbed(dir.path(), &fixes[0]);
+        assert_eq!(args[2], whoami(), "{fixes:?}");
+    }
+
+    fn whoami() -> String {
+        let out = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .unwrap();
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    /// A name holding a control character is not put in a command to
+    /// paste at all: it is shown escaped, with a word to do it by hand.
+    #[test]
+    fn a_strange_name_gets_a_manual_fix_not_a_command() {
+        for beta in ["u@h:/tmp/b", "/tmp/b"] {
+            let fixes = blocked_fix(
+                "beta",
+                "Permission denied (os error 13)",
+                "evil\nrm -rf ~\x1b[2J",
+                &fix_plan(beta),
+            );
+            assert!(fixes[0].starts_with("fix permissions on "), "{fixes:?}");
+            assert!(fixes[0].ends_with(" by hand"), "{fixes:?}");
+            assert!(
+                !fixes[0].contains('\n') && !fixes[0].contains('\x1b'),
+                "{fixes:?}"
+            );
+            assert!(fixes[0].contains("evil\\nrm"), "{fixes:?}");
+        }
+    }
+
+    /// A root written with `~` still expands on the side it names: a
+    /// quoted `~` would be a directory called `~`.
+    #[test]
+    fn a_fix_for_a_home_relative_root_expands_the_home() {
+        let fixes = blocked_fix(
+            "beta",
+            "Permission denied (os error 13)",
+            "x",
+            &fix_plan("u@h:~/mirror"),
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let args = run_stubbed(dir.path(), &fixes[0]);
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(
+            args.last().unwrap(),
+            &format!("{home}/mirror/x"),
+            "{fixes:?}"
+        );
+    }
+
     /// The ignore suggestion has to name something generated.
     #[test]
     fn an_ignore_is_suggested_only_for_a_generated_directory() {
@@ -4999,10 +5192,7 @@ mod tests {
             "azure/backend/.ruff_cache/0.9.10",
             &plan,
         );
-        assert!(
-            fixes[0].starts_with("ssh u@h 'sudo chown -R u "),
-            "{fixes:?}"
-        );
+        assert!(fixes[0].starts_with("ssh 'u@h' "), "{fixes:?}");
         assert!(fixes[1].contains("\".ruff_cache\""), "{fixes:?}");
 
         // Nothing hidden in the path, so no ignore is offered: ignoring a

@@ -1756,14 +1756,21 @@ mod fan_out_races {
         fs::read_to_string(root.join(path)).unwrap_or_else(|e| panic!("{}: {e}", root.display()))
     }
 
-    /// Lets the watchers deliver the events for writes just made. A cycle
-    /// run straight after a write can precede its event, and an
-    /// incremental scan then rightly finds nothing marked; the supervisor
-    /// catches such an edit on the next wake, but these tests interleave
-    /// one particular cycle and need the marks in place before it. Marks
-    /// wait for a scan, so a pause is all it takes.
-    fn events_delivered() {
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    /// Makes the next cycle of each session read its trees in full, so it
+    /// sees writes just made however far behind the watchers are.
+    ///
+    /// These tests are about what a race comes to, not about how fast a
+    /// watcher reports, and an incremental scan sees only what has been
+    /// reported. A pause lost that race about a third of the time with the
+    /// three tests side by side; waiting for "a change" was no better, since
+    /// a session's own initial copy leaves events of its own that arrive
+    /// late and answer the wait first. The supervisor is untroubled by
+    /// either — the next event wakes it again — but an interleaved test
+    /// holds one particular cycle and needs it to see everything.
+    fn look_again(sessions: &mut [&mut Session]) {
+        for session in sessions {
+            session.request_verify();
+        }
     }
 
     /// Runs `held`'s cycle on a thread, stopped at `point` until `run`
@@ -1807,7 +1814,7 @@ mod fan_out_races {
 
             fs::write(harness.beta.join(PATH), "from beta1").unwrap();
             fs::write(beta2.join(PATH), "from beta2").unwrap();
-            events_delivered();
+            look_again(&mut [&mut s1, &mut s2]);
             let report1 = interleave(&mut s1, CyclePoint::BeforeAlphaTransition, || {
                 s2.run_cycle().expect("session 2's cycle");
             })
@@ -1855,7 +1862,7 @@ mod fan_out_races {
 
             fs::write(harness.beta.join(PATH), "from beta1").unwrap();
             fs::write(beta2.join(OTHER), "from beta2").unwrap();
-            events_delivered();
+            look_again(&mut [&mut s1, &mut s2]);
             let report1 = interleave(&mut s1, CyclePoint::BeforeAlphaTransition, || {
                 s2.run_cycle().expect("session 2's cycle");
             })
@@ -1919,7 +1926,7 @@ mod fan_out_races {
             // edit of another file on alpha.
             fs::write(harness.alpha.join(PATH), "alpha edit").unwrap();
             fs::write(beta2.join(OTHER), "from beta2").unwrap();
-            events_delivered();
+            look_again(&mut [&mut s1, &mut s2]);
             let report1 = interleave(&mut s1, CyclePoint::AfterScans, || {
                 s2.run_cycle().expect("session 2's cycle");
             })
@@ -1931,17 +1938,24 @@ mod fan_out_races {
             );
             assert_eq!(read(&harness.beta, PATH), "alpha edit", "{context}");
 
-            let report1 = s1.run_cycle().expect("session 1 again");
-            assert!(
-                report1.conflicts.is_empty(),
-                "{context}: {:?}",
-                report1.conflicts
-            );
-            assert_eq!(
-                read(&harness.beta, OTHER),
-                "from beta2",
-                "{context}: not carried"
-            );
+            // What session 2 landed on alpha reaches beta1 on the cycles
+            // that follow, as the watcher reports it, and never as a
+            // conflict. (Session 1's own writes may wake it first, so it
+            // cycles on each wake until the edit arrives.)
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while read(&harness.beta, OTHER) != "from beta2" {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{context}: not carried"
+                );
+                let _ = s1.await_change(std::time::Duration::from_millis(500));
+                let report1 = s1.run_cycle().expect("session 1 again");
+                assert!(
+                    report1.conflicts.is_empty(),
+                    "{context}: {:?}",
+                    report1.conflicts
+                );
+            }
             for _ in 0..2 {
                 s2.run_cycle().expect("2");
             }

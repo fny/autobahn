@@ -685,7 +685,7 @@ fn serve_channel<W: Write + Send>(
                         None if crate::peering::ancestor_copy_path(
                             directory,
                             &initialize.session,
-                        )
+                        )?
                         .exists() =>
                         {
                             Some(
@@ -949,6 +949,9 @@ enum Anchor {
 /// area — `crate::paths::default_state_root()` in production, so that
 /// `AUTOBAHN_HOME` moves it with everything else autobahn keeps.
 fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Result<LocalEndpoint> {
+    // The session and side come off the wire and name directories below;
+    // nothing touches the filesystem until they are known to be genuine.
+    initialize.validate()?;
     let state_root = state_root
         .as_ref()
         .map_err(|error| anyhow!("unable to determine the agent's state directory: {error:#}"))?;
@@ -957,10 +960,6 @@ fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Res
     // hosts lands in each host's own home rather than a literal `~`.
     let root = crate::paths::expand_tilde(&initialize.root)?;
     let staging_area = state_root.join("staging");
-    // Earlier versions keyed staging by session alone; such a directory can
-    // only belong to this same session under an older agent, so it is
-    // retired (best-effort) rather than left to hold stale content forever.
-    let _ = std::fs::remove_dir_all(staging_area.join(&initialize.session));
     let state_staging = staging_area.join(format!("{}-{}", initialize.session, initialize.side));
     let staging_root = crate::endpoint::local::staging_root_for(
         initialize.staging,
@@ -1480,6 +1479,89 @@ pub(crate) mod tests {
     use std::sync::mpsc::{channel, Receiver, Sender};
 
     use crate::endpoint::FileRequest;
+
+    /// A hostile controller's traversal session is refused before
+    /// anything touches the filesystem: `..` once named the state area
+    /// itself to a `remove_dir_all`, taking the configuration, every
+    /// ancestor and the agent bundle with it.
+    #[test]
+    fn a_traversal_session_is_refused_with_no_filesystem_effect() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state = keep.path().join(".autobahn");
+        let sentinel = state.join("sentinel");
+        std::fs::create_dir_all(state.join("staging")).expect("the state area");
+        std::fs::write(&sentinel, b"kept").expect("the sentinel");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).expect("the root");
+
+        for (session, side) in [
+            ("..", "beta"),
+            ("../..", "beta"),
+            ("/tmp/x", "beta"),
+            ("", "beta"),
+            (
+                crate::session::session_identifier("a", "b").as_str(),
+                "../..",
+            ),
+        ] {
+            let initialize = Initialize {
+                root: root.to_string_lossy().into_owned(),
+                session: session.into(),
+                ignores: Vec::new(),
+                symlink_mode: crate::scan::SymlinkMode::Raw,
+                file_mode: None,
+                directory_mode: None,
+                side: side.into(),
+                staging: Default::default(),
+                max_file_size: None,
+                max_entry_count: None,
+                ignore_mounts: true,
+                default_owner: None,
+                default_group: None,
+            };
+            let error = create_endpoint(&initialize, &Ok(state.clone()))
+                .err()
+                .expect("the endpoint must be refused");
+            assert!(
+                format!("{error:#}").contains("refusing"),
+                "{session:?}/{side:?}: {error:#}"
+            );
+            assert!(
+                sentinel.is_file(),
+                "{session:?}/{side:?} removed the state area"
+            );
+        }
+        // Nothing was created for any of them either.
+        let staged: Vec<_> = std::fs::read_dir(state.join("staging"))
+            .expect("staging is readable")
+            .collect();
+        assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// A genuine session and side are served, under the agent's state area.
+    #[test]
+    fn a_genuine_session_is_accepted() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).expect("the root");
+        let initialize = Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier("a", "b"),
+            ignores: Vec::new(),
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "beta".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+        };
+        create_endpoint(&initialize, &Ok(keep.path().join("state")))
+            .expect("a genuine initialization is served");
+    }
 
     /// What this channel recorded as sent must encode exactly as the
     /// controller's own model does. Every delta names its baseline by a

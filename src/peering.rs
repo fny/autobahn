@@ -287,8 +287,14 @@ pub fn read_pushed_file(directory: &Path, name: &str) -> Result<Option<Vec<u8>>>
 }
 
 /// Where a session's ancestor copy lives on a peer.
-pub fn ancestor_copy_path(directory: &Path, session: &str) -> PathBuf {
-    directory.join("ancestors").join(session).join("ancestor")
+pub fn ancestor_copy_path(directory: &Path, session: &str) -> Result<PathBuf> {
+    // Checked here as well as where the agent takes the session off the
+    // wire, so that no caller can join anything but one hex name.
+    anyhow::ensure!(
+        crate::protocol::is_session_identifier(session),
+        "refusing session identifier {session:?}"
+    );
+    Ok(directory.join("ancestors").join(session).join("ancestor"))
 }
 
 /// A host's copy of one session's ancestor: the leader's journal records,
@@ -302,7 +308,7 @@ pub(crate) struct AncestorCopy {
 impl AncestorCopy {
     /// Opens (or starts) the copy for `session` under `directory`.
     pub(crate) fn open(directory: &Path, session: &str) -> Result<AncestorCopy> {
-        let path = ancestor_copy_path(directory, session);
+        let path = ancestor_copy_path(directory, session)?;
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("unable to create {}", parent.display()))?;
@@ -344,6 +350,27 @@ impl AncestorCopy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ancestor copy's path is built only from a genuine session
+    /// identifier, whoever the caller: a traversal names another session's
+    /// store, or somewhere outside the peering directory altogether.
+    #[test]
+    fn an_ancestor_copy_path_needs_a_genuine_session() {
+        let directory = Path::new("/state/peering");
+        for session in ["..", "../sessions/x", "a/b", "", "/tmp/x"] {
+            let error =
+                ancestor_copy_path(directory, session).expect_err("the session must be refused");
+            assert!(
+                format!("{error:#}").contains("refusing session identifier"),
+                "{session:?}: {error:#}"
+            );
+        }
+        let session = crate::session::session_identifier("a", "b");
+        assert_eq!(
+            ancestor_copy_path(directory, &session).expect("a genuine session"),
+            directory.join("ancestors").join(&session).join("ancestor")
+        );
+    }
 
     #[test]
     fn a_lease_admits_a_higher_term_or_the_same_leader() {
@@ -406,7 +433,8 @@ mod tests {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path().join(DIRECTORY);
         let file = |name: &str| Node::directory(name, Vec::new());
-        let mut copy = AncestorCopy::open(&directory, "s1").unwrap();
+        let session = crate::session::session_identifier("a", "b");
+        let mut copy = AncestorCopy::open(&directory, &session).unwrap();
         assert_eq!(copy.generation(), 0);
 
         // The first record carries the whole tree, as a leader's does.
@@ -428,7 +456,7 @@ mod tests {
         drop(copy);
 
         // And it all survives a reopen, as an ancestor a leader could use.
-        let copy = AncestorCopy::open(&directory, "s1").unwrap();
+        let copy = AncestorCopy::open(&directory, &session).unwrap();
         assert_eq!(copy.generation(), 9);
         assert_eq!(copy.ancestor.as_ref().map(|n| n.children().len()), Some(2));
     }
@@ -732,7 +760,7 @@ pub fn destination_of(leader: &str) -> &str {
 /// way; an alpha that gets the lead back adopts what the beta recorded
 /// meanwhile. Returns whether anything was adopted.
 pub fn adopt_newer_copy(state_root: &Path, directory: &Path, session: &str) -> Result<bool> {
-    let copy = ancestor_copy_path(directory, session);
+    let copy = ancestor_copy_path(directory, session)?;
     if !copy.exists() {
         return Ok(false);
     }

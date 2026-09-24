@@ -2115,7 +2115,8 @@ fn a_peering_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
         fs::read_to_string(peering.join("config.toml")).expect("config"),
         configuration
     );
-    let copy = autobahn::peering::ancestor_copy_path(&peering, &plan.identifier());
+    let copy = autobahn::peering::ancestor_copy_path(&peering, &plan.identifier())
+        .expect("a plan's identifier is a session identifier");
     assert!(
         copy.exists(),
         "the ancestor copy exists at {}",

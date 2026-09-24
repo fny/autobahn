@@ -157,10 +157,9 @@ impl Harness {
                         connection,
                         Initialize {
                             root: beta_root.to_string_lossy().into_owned(),
-                            session: format!(
-                                "e2e-{}-{}",
-                                state.to_string_lossy().len(),
-                                blake3::hash(state.to_string_lossy().as_bytes()).to_hex()
+                            session: autobahn::session::session_identifier(
+                                &state.to_string_lossy(),
+                                "e2e",
                             ),
                             ignores: self.ignores.clone(),
                             symlink_mode: SymlinkMode::Raw,
@@ -779,10 +778,9 @@ impl Harness {
                 connection,
                 Initialize {
                     root: self.beta.to_string_lossy().into_owned(),
-                    session: format!(
-                        "e2e-{}-{}",
-                        self.state.to_string_lossy().len(),
-                        blake3::hash(self.state.to_string_lossy().as_bytes()).to_hex()
+                    session: autobahn::session::session_identifier(
+                        &self.state.to_string_lossy(),
+                        "e2e",
                     ),
                     ignores: self.ignores.clone(),
                     symlink_mode: SymlinkMode::Raw,
@@ -930,7 +928,10 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
             connection,
             Initialize {
                 root: root.to_string_lossy().into_owned(),
-                session: "peering-e2e".into(),
+                session: autobahn::session::session_identifier(
+                    &root.to_string_lossy(),
+                    "peering-e2e",
+                ),
                 ignores: Vec::new(),
                 symlink_mode: SymlinkMode::Raw,
                 file_mode: None,

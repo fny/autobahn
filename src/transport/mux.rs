@@ -727,6 +727,41 @@ mod tests {
         assert_clean_exit(&finished);
     }
 
+    /// Through the wire: a channel opened with a traversal session fails
+    /// its open, leaves the agent's state area alone, and leaves the
+    /// connection serving.
+    #[test]
+    fn a_traversal_session_fails_its_open_and_touches_nothing() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        let state = keep.path().join("state");
+        let sentinel = state.join("sentinel");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        std::fs::create_dir_all(state.join("staging")).expect("staging should be creatable");
+        std::fs::write(&sentinel, b"kept").expect("the sentinel should be writable");
+
+        let (client, finished) = spawned_agent(&state);
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        let mut hostile = initialize(&root);
+        hostile.session = "..".into();
+        let error = connection
+            .open(hostile)
+            .err()
+            .expect("the open must be refused");
+        assert!(
+            format!("{error:#}").contains("refusing session identifier"),
+            "unexpected error: {error:#}"
+        );
+        assert!(sentinel.is_file(), "the state area was removed");
+
+        // The refusal is the channel's alone.
+        let mut channel = connection.open(initialize(&root)).expect("open");
+        channel.exchange(Request::Scan).expect("the scan exchanges");
+        drop(channel);
+        drop(connection);
+        assert_clean_exit(&finished);
+    }
+
     #[test]
     fn channels_multiplex_without_blocking_each_other() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");

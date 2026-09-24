@@ -71,6 +71,35 @@ pub struct Initialize {
     pub default_group: Option<String>,
 }
 
+/// Whether a string is a session identifier as
+/// [`crate::session::session_identifier`] produces it: 32 lowercase hex
+/// characters. Nothing else can name a directory of a session's own.
+pub fn is_session_identifier(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+impl Initialize {
+    /// Refuses identifiers that could not have come from a genuine
+    /// controller. The session and side name the agent's staging and its
+    /// ancestor copy, so this runs before anything touches the filesystem.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            is_session_identifier(&self.session),
+            "refusing session identifier {:?}",
+            self.session
+        );
+        anyhow::ensure!(
+            matches!(self.side.as_str(), "alpha" | "beta"),
+            "refusing side {:?}",
+            self.side
+        );
+        Ok(())
+    }
+}
+
 /// A request from the controller to the agent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum Request {
@@ -295,4 +324,91 @@ pub const COMPATIBILITY_EPOCH: u32 = 14;
 /// installation: the package version qualified by the compatibility epoch.
 pub fn version() -> String {
     format!("{}+e{}", env!("CARGO_PKG_VERSION"), COMPATIBILITY_EPOCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An initialization that differs from a genuine one only where a
+    /// test says.
+    fn initialize(session: &str, side: &str) -> Initialize {
+        Initialize {
+            root: "/unused".into(),
+            session: session.into(),
+            ignores: Vec::new(),
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: side.into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+        }
+    }
+
+    #[test]
+    fn a_genuine_identifier_is_accepted() {
+        let session = crate::session::session_identifier("a", "b");
+        assert!(is_session_identifier(&session));
+        initialize(&session, "beta")
+            .validate()
+            .expect("a genuine session and side are accepted");
+        initialize(&session, "alpha")
+            .validate()
+            .expect("a genuine session and side are accepted");
+    }
+
+    /// Anything a path could be made of beyond one hex name is refused:
+    /// traversal, separators, absolute paths, the empty name, and the
+    /// wrong length either way.
+    #[test]
+    fn a_session_that_is_not_32_hex_characters_is_refused() {
+        let hex = "0123456789abcdef0123456789abcdef";
+        for session in [
+            "..",
+            "../../..",
+            "a/b",
+            "/tmp/x",
+            "",
+            &hex[..31],
+            &format!("{hex}0"),
+            &format!("{}/", &hex[..31]),
+        ] {
+            assert!(!is_session_identifier(session), "{session:?}");
+            let error = initialize(session, "beta")
+                .validate()
+                .expect_err("the session must be refused");
+            assert!(
+                format!("{error:#}").contains("refusing session identifier"),
+                "{session:?}: {error:#}"
+            );
+        }
+    }
+
+    /// `session_identifier` never produces uppercase hex, so a controller
+    /// that sends it is not a genuine one.
+    #[test]
+    fn an_uppercase_session_is_refused() {
+        let session = crate::session::session_identifier("a", "b").to_uppercase();
+        assert!(!is_session_identifier(&session));
+        assert!(initialize(&session, "beta").validate().is_err());
+    }
+
+    #[test]
+    fn an_unknown_side_is_refused() {
+        let session = crate::session::session_identifier("a", "b");
+        for side in ["gamma", "../alpha", "", "Beta"] {
+            let error = initialize(&session, side)
+                .validate()
+                .expect_err("the side must be refused");
+            assert!(
+                format!("{error:#}").contains("refusing side"),
+                "{side:?}: {error:#}"
+            );
+        }
+    }
 }

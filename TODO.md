@@ -50,7 +50,9 @@ Each of these is either a way to lose data, a version mismatch that has already 
 
   *Why here:* the wrong state word fires the wrong alert, and a vanished root is a halt
 
-- [ ] **Merge `[alerts]` into `[defaults]`.** Currently its own top-level table. Open question to settle when doing it: is this purely relocation (tidier config, same global behaviour), or does living under `[defaults]` mean groups may override alerts individually — a different `on_alert` for `voltai` than for `aws`, say? The second is more work (the alerter is currently one state machine over all sessions, and per-group commands would need the firing split by group) but is what `[defaults]` promises everywhere else in the file, so the name would otherwise lie. Config compatibility: keep reading a top-level `[alerts]`, since it is in the wild as of 758e240.
+- [x] **Merge `[alerts]` into `[defaults]`.** Currently its own top-level table. Open question to settle when doing it: is this purely relocation (tidier config, same global behaviour), or does living under `[defaults]` mean groups may override alerts individually — a different `on_alert` for `voltai` than for `aws`, say? The second is more work (the alerter is currently one state machine over all sessions, and per-group commands would need the firing split by group) but is what `[defaults]` promises everywhere else in the file, so the name would otherwise lie. Config compatibility: keep reading a top-level `[alerts]`, since it is in the wild as of 758e240.
+
+  **Closed 2026-09-24:** the relocation happened (`on_alert` at the top level, timing under `[advanced.alerts]`, `dab4e64`). One hook for every group; per-group hooks not wanted.
 
   *Why here:* config shape: decide before v1, even if the decision is to leave it
 

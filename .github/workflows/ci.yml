@@ -66,8 +66,24 @@ jobs:
         run: cargo fmt --check
       - name: Lints
         run: cargo clippy --release --locked --all-targets -- -D warnings
+      # The suite must leave the real ~/.autobahn alone: a test that writes
+      # there would do it on a developer's machine too, beside a live
+      # supervisor. Every entry's type, mode, size and mtime, before and after.
+      - name: Snapshot ~/.autobahn
+        run: |
+          { find ~/.autobahn -printf '%y %m %s %T@ %p\n' 2>/dev/null || true; } |
+            sort > "$RUNNER_TEMP/autobahn-before"
       - name: Tests
         run: cargo test --release --locked
+      - name: The tests left ~/.autobahn unchanged
+        run: |
+          { find ~/.autobahn -printf '%y %m %s %T@ %p\n' 2>/dev/null || true; } |
+            sort > "$RUNNER_TEMP/autobahn-after"
+          if ! diff -u "$RUNNER_TEMP/autobahn-before" "$RUNNER_TEMP/autobahn-after"; then
+            echo "the test run changed ~/.autobahn (above); tests must keep" \
+                 "their state in their own temporary directories" >&2
+            exit 1
+          fi
 
   spec:
     # The specification, checked at its quick bound, and the implementation

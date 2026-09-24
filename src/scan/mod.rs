@@ -70,6 +70,28 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// The deepest a scan descends: a directory this many levels below the
+/// root is recorded as a problem rather than walked. Real trees cannot get
+/// near it — `PATH_MAX` stops them at about 2,000 levels — but a FUSE
+/// filesystem can fake an arbitrarily deep one without any path growing
+/// past the limit, and every level costs stack. See [`crate::threads`].
+const MAX_SCAN_DEPTH: usize = 4_096;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of depth cap for scans started on this thread.
+    static MAX_DEPTH: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The depth cap for a scan starting now.
+fn max_scan_depth() -> usize {
+    #[cfg(test)]
+    if let Some(depth) = MAX_DEPTH.with(|depth| depth.get()) {
+        return depth;
+    }
+    MAX_SCAN_DEPTH
+}
+
 /// How many threads a scan may add beside the one it runs on.
 fn scan_helpers() -> usize {
     #[cfg(test)]
@@ -533,6 +555,11 @@ struct Scanner<'a> {
     /// The device and inode of every state root, never scanned. See
     /// [`exclude_state_root`].
     state_roots: &'a [(u64, u64)],
+    /// How many levels below the root the directory being scanned is.
+    depth: usize,
+    /// The depth past which a directory is not walked. See
+    /// [`MAX_SCAN_DEPTH`].
+    max_depth: usize,
 }
 
 /// What probing a listed entry established.
@@ -603,6 +630,8 @@ impl<'a> Scanner<'a> {
             ignore_mounts: false,
             mount_points: Vec::new(),
             state_roots,
+            depth: 0,
+            max_depth: max_scan_depth(),
         }
     }
 
@@ -625,6 +654,7 @@ impl<'a> Scanner<'a> {
         forked.within_ignored = within_ignored;
         forked.device = self.device;
         forked.ignore_mounts = self.ignore_mounts;
+        forked.max_depth = self.max_depth;
         forked
     }
 
@@ -687,6 +717,13 @@ impl<'a> Scanner<'a> {
         baseline: Option<&'n Node>,
         dirty: Option<&'n DirtyNode>,
     ) -> Content {
+        if self.depth > self.max_depth {
+            return problematic(format!(
+                "too deep: more than {} levels below the root",
+                self.max_depth
+            ));
+        }
+
         // Nothing marked beneath this directory: adopt the baseline whole.
         // This is what makes an incremental scan cost the size of the
         // change rather than the size of the tree.
@@ -920,9 +957,10 @@ impl<'a> Scanner<'a> {
                             if self.take_helper() {
                                 let mut forked = self.fork(region);
                                 forked.device = device;
+                                forked.depth = self.depth + 1;
                                 handles.push((
                                     nodes.len(),
-                                    scope.spawn(move || {
+                                    crate::threads::spawn_deep_scoped(scope, move || {
                                         let content = forked.scan_directory(
                                             &entry_path,
                                             &child_path,
@@ -1107,7 +1145,9 @@ impl<'a> Scanner<'a> {
         let (outer, outer_device) = (self.within_ignored, self.device);
         self.within_ignored = region;
         self.device = device;
+        self.depth += 1;
         let content = self.scan_directory(entry_path, child_path, baseline, dirty);
+        self.depth -= 1;
         self.within_ignored = outer;
         self.device = outer_device;
         content
@@ -2003,6 +2043,44 @@ mod tests {
             child(snapshot.root.as_ref().expect("root"), "state").content,
             Content::Untracked
         ));
+    }
+
+    /// The backstop against a tree deeper than any stack should be asked
+    /// to walk — a FUSE filesystem can fake one without any path growing
+    /// past its limit: past the cap, a directory is a problem, not a
+    /// descent. The cap is lowered for the test; the real one sits past
+    /// what `PATH_MAX` lets a real tree reach.
+    #[test]
+    fn a_directory_past_the_depth_cap_is_problematic() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path();
+        write(root, "a/b/c/d/e/f.txt", "deep");
+        write(root, "a/shallow.txt", "shallow");
+        MAX_DEPTH.with(|depth| depth.set(Some(3)));
+        for helpers in [0, 4] {
+            HELPERS.with(|cell| cell.set(Some(helpers)));
+            let snapshot = scan_fixture(root, None);
+            let root_node = snapshot.root.as_ref().expect("root");
+            assert!(matches!(
+                child(root_node, "a/shallow.txt").content,
+                Content::File { .. }
+            ));
+            assert!(matches!(
+                child(root_node, "a/b/c").content,
+                Content::Directory(_)
+            ));
+            match &child(root_node, "a/b/c/d").content {
+                Content::Problematic { message } => {
+                    assert!(
+                        message.contains("too deep"),
+                        "unexpected message: {message}"
+                    )
+                }
+                other => panic!("expected a problem past the cap, found {other:?}"),
+            }
+        }
+        MAX_DEPTH.with(|depth| depth.set(None));
+        HELPERS.with(|cell| cell.set(None));
     }
 
     #[test]

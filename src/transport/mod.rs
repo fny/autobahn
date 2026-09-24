@@ -468,7 +468,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                         let (sender, receiver) = std::sync::mpsc::channel::<Request>();
                         channels.insert(channel, sender);
                         let output = &output;
-                        scope.spawn(move || {
+                        crate::threads::spawn_deep_scoped(scope, move || {
                             serve_channel(channel, initialize, state_root, receiver, output)
                         });
                     }

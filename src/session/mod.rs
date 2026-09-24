@@ -806,11 +806,12 @@ impl Session {
             let alpha = &mut self.alpha;
             let beta = &mut self.beta;
             std::thread::scope(|scope| {
-                let alpha_scan = scope.spawn(move || match alpha_cached {
-                    Some(snapshot) => Ok(snapshot),
-                    None if verify => alpha.scan_verified(),
-                    None => alpha.scan(),
-                });
+                let alpha_scan =
+                    crate::threads::spawn_deep_scoped(scope, move || match alpha_cached {
+                        Some(snapshot) => Ok(snapshot),
+                        None if verify => alpha.scan_verified(),
+                        None => alpha.scan(),
+                    });
                 let beta_result = match beta_cached {
                     Some(snapshot) => Ok(snapshot),
                     None if verify => beta.scan_verified(),

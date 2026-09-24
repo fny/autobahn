@@ -793,18 +793,21 @@ fn main() {
             beta_agent,
             alpha_agent,
         } => parse_policy(symlink_mode, file_mode, directory_mode).and_then(|policy| {
-            run_sync(
-                alpha,
-                beta,
-                mode,
-                ignores,
-                policy,
-                watch,
-                interval,
-                state_dir,
-                beta_agent,
-                alpha_agent,
-            )
+            // On a thread with room for a deep tree, not the main thread.
+            autobahn::threads::run_deep(move || {
+                run_sync(
+                    alpha,
+                    beta,
+                    mode,
+                    ignores,
+                    policy,
+                    watch,
+                    interval,
+                    state_dir,
+                    beta_agent,
+                    alpha_agent,
+                )
+            })
         }),
     };
     if let Err(error) = result {

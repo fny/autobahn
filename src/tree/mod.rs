@@ -87,6 +87,30 @@ pub struct Node {
     pub content: Content,
 }
 
+/// Frees a hierarchy without recursing into it, so that dropping a deep
+/// tree needs no deep stack: the derived drop would descend once per
+/// level. Children are moved onto a list and freed one at a time, each
+/// with nothing left beneath it. A directory whose storage is still shared
+/// elsewhere is not freed here at all, only released.
+impl Drop for Node {
+    fn drop(&mut self) {
+        let mut pending = match &mut self.content {
+            Content::Directory(children) => match Arc::get_mut(children) {
+                Some(children) if !children.is_empty() => std::mem::take(children),
+                _ => return,
+            },
+            _ => return,
+        };
+        while let Some(mut node) = pending.pop() {
+            if let Content::Directory(children) = &mut node.content {
+                if let Some(children) = Arc::get_mut(children) {
+                    pending.append(children);
+                }
+            }
+        }
+    }
+}
+
 /// The synchronization mode governing reconciliation directionality and
 /// conflict handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]

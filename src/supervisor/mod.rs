@@ -530,7 +530,7 @@ impl Supervisor {
                 .plans
                 .iter()
                 .map(|plan| {
-                    scope.spawn(move || {
+                    crate::threads::spawn_deep_scoped(scope, move || {
                         let mut worker =
                             Worker::new(plan, &self.state_root, &self.pool, self.verbose);
                         worker.peering = self.peering.as_ref();
@@ -708,7 +708,7 @@ impl Supervisor {
                 let flags = controls[index].clone();
                 let progress = progresses[index].clone();
                 let published = published[index].clone();
-                scope.spawn(move || {
+                crate::threads::spawn_deep_scoped(scope, move || {
                     // Stagger the first attempts so a large fan-out doesn't
                     // open every connection in the same instant (bounded, so
                     // small deployments and fast test intervals barely

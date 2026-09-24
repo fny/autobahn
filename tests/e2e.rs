@@ -2121,3 +2121,53 @@ mod unreadable_ancestor {
         assert!(!harness.state.join("ancestor.rebuilt").exists());
     }
 }
+
+/// A one-shot `sync` of a directory chain deeper than a default 2 MiB
+/// thread stack can walk. Reproduced before the fix at 1,700 levels: the
+/// process aborted with a stack overflow (exit 134), which is not a panic
+/// and took every session with it. Run as a child process, so an abort is
+/// a failed exit rather than the end of the test binary.
+#[test]
+fn a_one_shot_sync_of_a_deep_chain_succeeds() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let alpha = directory.path().join("a");
+    let beta = directory.path().join("b");
+    let home = directory.path().join("home");
+    fs::create_dir_all(&home).expect("home");
+    // 2,500 levels where the platform allows paths that long; Linux refuses
+    // any path over 4,096 bytes, so there the chain is as deep as fits.
+    let limit = 4_000usize.saturating_sub(beta.as_os_str().len() + 16);
+    let depth = 2_500.min(limit / 2);
+    assert!(depth > 1_700, "too shallow to test anything: {depth}");
+    let mut leaf = alpha.clone();
+    for _ in 0..depth {
+        leaf.push("d");
+    }
+    fs::create_dir_all(&leaf).expect("the chain should be creatable");
+    fs::write(leaf.join("f"), "deep").expect("leaf file");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_autobahn"))
+        .arg("sync")
+        .arg(&alpha)
+        .arg(&beta)
+        .arg("--state-dir")
+        .arg(directory.path().join("state"))
+        .env("AUTOBAHN_HOME", &home)
+        .env("HOME", &home)
+        .output()
+        .expect("the binary should run");
+    assert!(
+        output.status.success(),
+        "sync failed ({:?}): {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut copied = beta.clone();
+    for _ in 0..depth {
+        copied.push("d");
+    }
+    assert_eq!(
+        fs::read_to_string(copied.join("f")).expect("the leaf should be synchronized"),
+        "deep"
+    );
+}

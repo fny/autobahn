@@ -169,7 +169,7 @@ impl AgentConnection {
         // does — cleanly after a shutdown, or with the failure it then
         // reports to every waiting channel.
         let router = shared.clone();
-        std::thread::spawn(move || {
+        crate::threads::spawn_deep(move || {
             let failure = loop {
                 match super::receive_frame::<_, MuxResponse>(&mut reader) {
                     Ok(MuxResponse { channel, response }) => {

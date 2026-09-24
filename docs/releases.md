@@ -10,7 +10,7 @@ Autobahn ships three things. They ship independently. A build that refreshes one
 
 A plain `cargo build --release` gives you a new controller only. The menu bar app keeps the binary it was built with. The agent bundle in `~/.autobahn/agents` keeps the binaries the installer put there.
 
-Remote hosts are different again. The controller runs the agent at `~/.autobahn/bin/autobahn-<version>-<digest>` on the host, and uploads one only if that path fails to run. `<version>` is the package version plus the compatibility epoch, which `protocol::version()` writes as `0.4.0+e12`; `<digest>` is the first twelve hex digits of the binary's blake3. So a host takes a new agent whenever the bytes the controller would send change — a new release, or a rebuild at the same version — and never the same bytes twice.
+Remote hosts are different again. The controller runs the agent at `~/.autobahn/bin/autobahn-<version>-<digest>` on the host, and uploads one only if that path fails to run. `<version>` is the package version plus the compatibility epoch, which `protocol::version()` writes as `0.4.0+e15`; `<digest>` is the first twelve hex digits of the binary's blake3. So a host takes a new agent whenever the bytes the controller would send change — a new release, or a rebuild at the same version — and never the same bytes twice.
 
 ## The release pipeline
 
@@ -53,7 +53,7 @@ autobahn update --version v0.5.0-dev.1
 
 The agent path holds the package version. Give the prerelease its own package version, and the agent path moves with it.
 
-Set `version = "0.5.0-dev.1"` in `Cargo.toml` and tag `v0.5.0-dev.1`. The agent path becomes `~/.autobahn/bin/autobahn-0.5.0-dev.1+e12`. No host has that file. Each host installs the new agent on its next connection. The old agent stays in place, so a controller that is still on `0.4.0` keeps working.
+Set `version = "0.5.0-dev.1"` in `Cargo.toml` and tag `v0.5.0-dev.1`. The agent path becomes `~/.autobahn/bin/autobahn-0.5.0-dev.1+e15`. No host has that file. Each host installs the new agent on its next connection. The old agent stays in place, so a controller that is still on `0.4.0` keeps working.
 
 Do not bump the epoch for this. The version string already changed, and the version string is what the handshake compares.
 

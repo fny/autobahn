@@ -5,7 +5,10 @@
 //! protocol is a strict request/response mirror of the [`Endpoint`] trait:
 //! bincode-serialized, length-prefixed frames, preceded by a version
 //! handshake. Both ends must be the same version (agents are expected to be
-//! installed alongside the CLI on the remote host).
+//! installed alongside the CLI on the remote host). Beside the responses,
+//! an agent reports each channel's work as it moves
+//! ([`MuxResponse::Progress`]), so the controller can tell a slow request
+//! from a stuck one.
 //!
 //! [`Endpoint`]: crate::endpoint::Endpoint
 
@@ -335,7 +338,7 @@ pub enum MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 14;
+pub const COMPATIBILITY_EPOCH: u32 = 15;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

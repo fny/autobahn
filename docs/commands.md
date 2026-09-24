@@ -89,7 +89,7 @@ The estimate is withheld unless the phase has been running long enough to have a
 
 A session between cycles is described by how its last cycle ended; so is a paused one, and one backing off from an error, both of which the recorded status names.
 
-Every command that talks to the running supervisor — `status`, `flush`, `pause`, `mi`, the menu bar app — sends its own build with the request, and a supervisor of another build refuses it rather than guess. After installing a new build by hand, before the service is restarted, `status` says so — *the running supervisor is 0.4.0+e13 and this is 0.4.1+e13; `autobahn restart` to run this build* — and shows what the supervisor last recorded. `autobahn update` restarts the service itself, so it never shows there.
+Every command that talks to the running supervisor — `status`, `flush`, `pause`, `mi`, the menu bar app — sends its own build with the request, and a supervisor of another build refuses it rather than guess. After installing a new build by hand, before the service is restarted, `status` says so — *the running supervisor is 0.4.0+e15 and this is 0.4.1+e15; `autobahn restart` to run this build* — and shows what the supervisor last recorded. `autobahn update` restarts the service itself, so it never shows there.
 
 A group with nothing to say is one line — every destination synchronized, nothing waiting on anyone, nothing going on long enough to earn a line:
 

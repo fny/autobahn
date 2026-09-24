@@ -58,5 +58,11 @@ codegen-units = 1
 # glibc); at 400k on Graviton, 190 against 130. The static Linux release
 # binaries are musl, so they get mimalloc. Its C needs a musl C compiler:
 # musl-tools on x86_64, zig (scripts/zig-cc) on aarch64.
+#
+# mimalloc purges freed memory only when the thread that freed it next
+# allocates, and a sync's threads go idle once it is done: after ten
+# 200 MB cold syncs the controller held ~85 MB and the agent ~130 MB
+# indefinitely. main.rs tunes it to give memory back; see `tune_allocator`.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
+libmimalloc-sys = { version = "0.1", features = ["extended"] }

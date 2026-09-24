@@ -30,6 +30,12 @@ build() {
         export CC_aarch64_unknown_linux_musl="$PWD/scripts/zig-cc aarch64-linux-musl"
         export AR_aarch64_unknown_linux_musl="$PWD/scripts/zig-ar"
     fi
+    # The link needs an aarch64 linker too, as in the release
+    # (apt install gcc-aarch64-linux-gnu); the host's cc cannot do it.
+    if [ "$target" = aarch64-unknown-linux-musl ] && command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 \
+        && [ -z "${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER:-}" ]; then
+        export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+    fi
     if ! cargo build --profile dist --target "$target"; then
         echo "skipping $platform (build failed; a cross linker may be required)"
         return 0

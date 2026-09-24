@@ -98,6 +98,8 @@ Real work, none of it load-bearing for a first release.
 
 - [ ] Collapse fully-synchronized groups to one line in `status`, so 15 healthy sessions don't cost 45 lines of scrolling.
 
+  **Decided 2026-09-24:** a group whose destinations are all synchronized and idle is one line (`✓ 3 synchronized · last cycle 4s ago`); any trouble or visible work expands it. `status <group>` and `status --all` expand everything; `--live` and `watch` collapse too; `--json` unchanged.
+
   *Why here:* 15 healthy sessions cost 45 lines; a reading problem, not a correctness one
 
 - [ ] **Three integration tests were broken for a day.** `82976d3` (the resolve confirmation) and the `issues` rename each broke assertions in `tests/supervisor.rs`, and neither was caught, because after each change I ran only `--bins`. The lesson is not "run everything every time" — it is that a change to a command's *output or prompting* has to run that command's integration tests, which are the only place the wording is asserted. Worth a note in the contributing guide.

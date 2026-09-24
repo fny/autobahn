@@ -80,15 +80,21 @@ Real work, none of it load-bearing for a first release.
 
   *Why here:* a diagnosis command; nothing depends on it
 
-- [ ] **Find out which phase is slow on fny, before optimizing anything.** Paused 2026-09-03 part way through. `examples/cycle_cost` now runs on real roots (cf68e9d) and is built on fny; the next step is simply to run it there against `~/Workspace/arcturus` and `~/Workspace/currents` and read which column dominates — rescan, reconcile, validate, encode, or write. Everything below depends on that answer and none of it should start without it.
+- [x] **Find out which phase is slow on fny, before optimizing anything.** Paused 2026-09-03 part way through. `examples/cycle_cost` now runs on real roots (cf68e9d) and is built on fny; the next step is simply to run it there against `~/Workspace/arcturus` and `~/Workspace/currents` and read which column dominates — rescan, reconcile, validate, encode, or write. Everything below depends on that answer and none of it should start without it.
+
+  **Closed 2026-09-24:** answered by the warm-walk profile (TODO-SPEED, "The warm walk — explained"): the cost was the one-shot process's watcher registration, now skipped, and the scan itself is parallel.
 
   *Why here:* everything in performance waits on this measurement
 
-- [ ] **Parallel scanning — worth doing only if `rescan` is the column.** The case is not "make alpha faster", it is "make fny faster", and the agent runs the same scanner. Note that `bench/ab.sh` drives two *local* roots, so it cannot see a remote-dominated cost and would report nothing — the instrument has to match the machine the cost is on.
+- [x] **Parallel scanning — worth doing only if `rescan` is the column.** The case is not "make alpha faster", it is "make fny faster", and the agent runs the same scanner. Note that `bench/ab.sh` drives two *local* roots, so it cannot see a remote-dominated cost and would report nothing — the instrument has to match the machine the cost is on.
+
+  **Closed 2026-09-24:** done in `c4e4109`, measured (160k-file cold scan 7–34 s → 2.9 s); the agent runs the same scanner.
 
   *Why here:* only after the measurement says `rescan` is the column
 
-- [ ] Parallel scanning — hashing pool first (clear win on first scans), then a parallel walk (pays off every cycle). Both hot-path: A/B gate before commit.
+- [x] Parallel scanning — hashing pool first (clear win on first scans), then a parallel walk (pays off every cycle). Both hot-path: A/B gate before commit.
+
+  **Closed 2026-09-24:** the parallel walk (`c4e4109`) hashes in its helpers, which covers the hashing pool too.
 
   *Why here:* same, with the order to do it in
 

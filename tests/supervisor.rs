@@ -2143,6 +2143,147 @@ fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
     assert!(after.contains("nothing needs you"), "{after}");
 }
 
+/// A group of one alpha and one beta in `mode`, holding `keep.txt` and a
+/// sibling (so no guard about emptied roots is in play), synchronized once.
+fn one_pair(world: &World, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let alpha = world.directory("alpha");
+    let beta = world.directory("b1");
+    write(&alpha, "keep.txt", "original");
+    write(&alpha, "other.txt", "other");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.r]\nmode = \"{mode}\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+    assert!(cli(world, &config, &["sync"]).0, "the first sync converges");
+    assert_eq!(read(&beta, "keep.txt"), "original");
+    (config, alpha, beta)
+}
+
+/// Resolving a path both sides already agree on retires nothing. Before
+/// the guard it retired beta's copy, and the next cycle read that as a
+/// deletion against an unchanged alpha and took the file from both sides.
+#[test]
+fn resolving_an_in_sync_path_twice_keeps_it_everywhere() {
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
+    for _ in 0..2 {
+        let (ok, text) = cli(
+            &world,
+            &config,
+            &["resolve", "r", "keep.txt", "--keep", "alpha", "--yes"],
+        );
+        assert!(ok, "{text}");
+        assert!(text.contains("already the same on every side"), "{text}");
+        cli(&world, &config, &["sync"]);
+    }
+    cli(&world, &config, &["sync"]);
+    assert_eq!(read(&alpha, "keep.txt"), "original");
+    assert_eq!(read(&beta, "keep.txt"), "original");
+}
+
+/// The root is never a path to resolve: retiring it would retire the
+/// whole synchronizable tree.
+#[test]
+fn resolving_the_root_is_refused() {
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
+    write(&beta, "keep.txt", "beta's edit");
+    for root in ["./", ".", ""] {
+        let (ok, text) = cli(
+            &world,
+            &config,
+            &["resolve", "r", root, "--keep", "alpha", "--yes"],
+        );
+        assert!(!ok, "resolving {root:?} must fail: {text}");
+        assert!(text.contains("not the root"), "{text}");
+    }
+    assert_eq!(read(&alpha, "keep.txt"), "original");
+    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
+    assert_eq!(read(&beta, "other.txt"), "other");
+}
+
+/// Keeping a side that has not changed since the last sync would delete
+/// it: removing the other copy reads as a deletion against an untouched
+/// file, and a deletion against an untouched file propagates.
+#[test]
+fn keeping_an_unchanged_side_is_refused_as_a_deletion() {
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
+    write(&beta, "keep.txt", "beta's edit");
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "keep.txt", "--keep", "alpha", "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("keeping alpha here would delete it"),
+        "{text}"
+    );
+    assert!(text.contains("settled 0 of 1"), "{text}");
+    assert_eq!(read(&alpha, "keep.txt"), "original");
+    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
+    // The same holds for `--keep both`: alpha's copy would be deleted by
+    // the rename aside of beta's.
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "keep.txt", "--keep", "both", "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("keeping alpha here would delete it"),
+        "{text}"
+    );
+    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
+    assert!(!beta.join("keep.txt.b1").exists());
+}
+
+/// A one-way mode never carries beta's content to alpha, so retiring
+/// alpha's copy cannot make beta's version win.
+#[test]
+fn keeping_beta_in_a_one_way_mode_is_refused() {
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "one-way-alpha");
+    write(&alpha, "keep.txt", "alpha's edit");
+    let beta_spec = beta.to_string_lossy().to_string();
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "keep.txt", "--keep", &beta_spec, "--yes"],
+    );
+    assert!(!ok, "{text}");
+    assert!(text.contains("one-way-alpha"), "{text}");
+    assert_eq!(read(&alpha, "keep.txt"), "alpha's edit");
+    assert_eq!(read(&beta, "keep.txt"), "original");
+}
+
+/// In two-way-alpha-strict alpha's deletion beats beta's edit, so
+/// retiring alpha's copy to keep beta's would delete beta's too.
+#[test]
+fn keeping_beta_in_the_strict_mode_is_refused() {
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "two-way-alpha-strict");
+    write(&beta, "keep.txt", "beta's edit");
+    let beta_spec = beta.to_string_lossy().to_string();
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "keep.txt", "--keep", &beta_spec, "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("two-way-alpha-strict"), "{text}");
+    assert!(text.contains("settled 0 of 1"), "{text}");
+    assert_eq!(read(&alpha, "keep.txt"), "original");
+    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
+}
+
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();

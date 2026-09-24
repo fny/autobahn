@@ -2751,6 +2751,52 @@ fn run_resolve(
     let group_plans: Vec<&autobahn::config::SessionPlan> =
         plans.iter().filter(|plan| plan.group == group).collect();
 
+    // The root is never a path to settle. Retiring it would retire every
+    // synchronized thing under it, which is no one's idea of keeping a
+    // version.
+    if targets
+        .iter()
+        .any(|(_, paths)| paths.iter().any(|path| path.is_empty() || path == "."))
+    {
+        bail!(
+            "resolve settles a path inside the root, not the root itself; \
+             name the file or folder to settle"
+        );
+    }
+
+    // Modes that cannot carry the kept version where it has to go. These
+    // are refused before anything is read, since no path could succeed.
+    match winner {
+        Winner::Beta(index)
+            if matches!(
+                group_plans[index].mode,
+                autobahn::tree::SyncMode::OneWaySafe | autobahn::tree::SyncMode::OneWayReplica
+            ) =>
+        {
+            bail!(
+                "--keep {keep} cannot work in {mode}: that mode never carries {host}'s \
+                 content to alpha, so removing alpha's copy would not make it win. \
+                 Nothing was changed",
+                mode = group_plans[index].mode_name(),
+                host = group_plans[index].host,
+            )
+        }
+        Winner::Both => {
+            if let Some((plan, _)) = targets
+                .iter()
+                .find(|(plan, _)| plan.mode == autobahn::tree::SyncMode::OneWayReplica)
+            {
+                bail!(
+                    "--keep both cannot work in {mode}: {host} is made identical to alpha, \
+                     so the copy moved aside there would be deleted. Nothing was changed",
+                    mode = plan.mode_name(),
+                    host = plan.host,
+                )
+            }
+        }
+        _ => {}
+    }
+
     // Who keeps their version, and who gets overwritten — named by their
     // actual roots. "alpha" is the word `--keep` takes, and on its own it
     // says nothing about which machine or folder that is.
@@ -2820,6 +2866,361 @@ fn run_resolve(
         .flat_map(|(_, paths)| paths.iter().cloned())
         .collect();
 
+    let mut settled = 0usize;
+    let mut refused: Vec<(String, String)> = Vec::new();
+    // Paths that cannot be settled this way at all, as opposed to ones
+    // that lost a race. The two need different words: one says try again,
+    // the other says this will never work.
+    let mut blocked: Vec<(String, String, String, String)> = Vec::new();
+
+    // Which side of each session loses. The winner keeps its version
+    // untouched; every other copy in the group is retired, including
+    // alpha's when a destination wins, since alpha is how the winning
+    // content reaches the group's other destinations.
+    //
+    // Alpha wins (or both sides are kept, in which case alpha's copy stays
+    // put and beta's moves aside): only each beta loses. A destination
+    // wins, so alpha loses — and alpha is retired *there*, on the winning
+    // session, for two reasons. Every session opens its own handle on
+    // alpha, so the retirement has to happen through exactly one of them;
+    // and that is the session that will carry the winning content back to
+    // alpha, from which the group's other destinations then take it. Every
+    // other destination loses too: its copy and alpha's both go, the pair
+    // reads as a deletion on both sides, which clears the ancestor entry,
+    // and the winner's content then arrives as ordinary new content.
+    struct Loser {
+        index: usize,
+        alpha: bool,
+        side: String,
+        root: Option<autobahn::tree::Node>,
+        actions: Vec<(String, Action)>,
+    }
+    enum Action {
+        Retire(autobahn::tree::Node),
+        Aside(String, autobahn::tree::Node),
+    }
+    // One scan per side, not one per path. A scan of a large tree is the
+    // slow part of this command, so it says whose tree it is reading. On a
+    // terminal the line is erased afterwards; anywhere else it is never
+    // written, since a carriage return in a log file is noise.
+    let scan = |endpoint: &mut Box<dyn autobahn::endpoint::Endpoint + Send>,
+                side: &str|
+     -> Result<Option<autobahn::tree::Node>> {
+        let transient = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
+        if transient {
+            eprint!("  reading {side}\r");
+        }
+        let snapshot = endpoint
+            .scan()
+            .with_context(|| format!("unable to read {side}"))?;
+        if transient {
+            eprint!("\r\x1b[2K");
+        }
+        Ok(snapshot.root)
+    };
+    let mut losers: Vec<Loser> = Vec::new();
+    let mut here_of: Vec<Vec<String>> = Vec::new();
+    for (index, plan) in group_plans.iter().enumerate() {
+        let (alpha, side) = match winner {
+            Winner::Beta(w) if w == index => (true, "alpha".to_owned()),
+            _ => (false, plan.host.clone()),
+        };
+        // Only paths that actually conflict on this session are touched;
+        // a destination that already agrees is left alone. Alpha is the
+        // exception: its copy must go for the winning content to reach it,
+        // whichever session reported the conflict.
+        let here: Vec<String> = paths
+            .iter()
+            .filter(|path| {
+                alpha
+                    || targets.iter().any(|(target, paths)| {
+                        target.identifier() == plan.identifier() && paths.contains(*path)
+                    })
+            })
+            .cloned()
+            .collect();
+        if here.is_empty() {
+            continue;
+        }
+        let endpoint = match alpha {
+            true => &mut endpoints[index].0,
+            false => &mut endpoints[index].1,
+        };
+        let root = scan(endpoint, &side)?;
+        losers.push(Loser {
+            index,
+            alpha,
+            side,
+            root,
+            actions: Vec::new(),
+        });
+        here_of.push(here);
+    }
+    if losers.is_empty() {
+        println!("settled 0 of {} (nothing to retire)", paths.len());
+        return Ok(());
+    }
+
+    // The winner is read too: what it holds is what the losers are
+    // compared against, and what the next cycle must be seen to keep.
+    let (winner_name, winner_root) = match winner {
+        Winner::Alpha | Winner::Both => ("alpha".to_owned(), scan(&mut endpoints[0].0, "alpha")?),
+        Winner::Beta(w) => {
+            let host = group_plans[w].host.clone();
+            let root = scan(&mut endpoints[w].1, &host)?;
+            (host, root)
+        }
+    };
+
+    // Content is compared as synchronization sees it: excluded entries
+    // are invisible, and two absences agree.
+    let same = |a: Option<&autobahn::tree::Node>, b: Option<&autobahn::tree::Node>| match (
+        a.and_then(autobahn::tree::Node::synchronizable_subtree),
+        b.and_then(autobahn::tree::Node::synchronizable_subtree),
+    ) {
+        (None, None) => true,
+        (Some(a), Some(b)) => a.content_equal(&b, true),
+        _ => false,
+    };
+
+    // What each loser would do, path by path.
+    let mut agreed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for (loser, here) in losers.iter_mut().zip(&here_of) {
+        for path in here {
+            let Some(node) = node_at(loser.root.as_ref(), path) else {
+                // Already gone on this side. Nothing to retire, and the
+                // cycle will carry the winner's version here anyway.
+                continue;
+            };
+            let kept = node_at(winner_root.as_ref(), path);
+            // Already what the winner holds. Retiring it would gain
+            // nothing, and where the winner is also what the last sync
+            // recorded it would lose the file everywhere: the removal
+            // reads as a deletion against an untouched copy, and that
+            // propagates. A repeated resolve, or a stale tray entry, lands
+            // here.
+            if same(Some(node), kept) {
+                agreed.insert(path.clone());
+                continue;
+            }
+            if winner == Winner::Both {
+                // Kept, not discarded: the losing version moves to a free
+                // name, from which it propagates to every side as ordinary
+                // new content. A rename does this for a whole tree without
+                // moving any of it, which is why it is a primitive rather
+                // than a read and a write.
+                let aside = free_name(loser.root.as_ref(), path, &loser.side);
+                loser
+                    .actions
+                    .push((path.clone(), Action::Aside(aside, node.clone())));
+                continue;
+            }
+            // Content synchronization never scanned cannot be removed by a
+            // transition — it refuses, by design, because nobody decided to
+            // delete what reconciliation never saw. Asking anyway does not
+            // fail cleanly: the removal runs bottom-up, takes away
+            // everything it *can* account for, and leaves the rest. That is
+            // the worst of both outcomes, a half-deleted tree and the
+            // conflict still open, so the check happens here rather than
+            // being discovered midway.
+            if let Some((example, reason)) = unsynchronizable_within(node, path) {
+                blocked.push((path.clone(), loser.side.clone(), example, reason));
+                continue;
+            }
+            // The *synchronizable* subtree, which is what the cycle would
+            // pass. An expectation is what the removal is permitted to take
+            // away, so handing it the raw scan would ask for the excluded
+            // entries too — and those are refused one by one, leaving the
+            // tree half-taken. Filtered, the removal takes what
+            // synchronization knows about and steps over the rest, exactly
+            // as an ordinary deletion does.
+            let Some(expectation) = node.synchronizable_subtree() else {
+                // Nothing here is synchronization's to remove.
+                continue;
+            };
+            loser
+                .actions
+                .push((path.clone(), Action::Retire(expectation)));
+        }
+    }
+
+    // Retiring the loser settles a path only if the next cycle then
+    // carries the winner over the gap. It does not when the winner is what
+    // the last sync recorded — the gap then reads as a deletion against an
+    // untouched copy, and the deletion propagates — nor in a mode that
+    // never carries that side's content, nor where alpha's deletion is
+    // final. So before anything is touched, each affected session's next
+    // cycle is worked out against its ancestor, read without writing, and
+    // a path whose kept version would not survive it is refused.
+    let mut unsafe_paths: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    let acted: std::collections::BTreeSet<String> = losers
+        .iter()
+        .flat_map(|loser| loser.actions.iter().map(|(path, _)| path.clone()))
+        .collect();
+    if !acted.is_empty() {
+        use autobahn::tree::{apply, reconcile, Change};
+        let removals_of = |loser: &Loser| -> Vec<Change> {
+            let mut changes = Vec::new();
+            for (path, action) in &loser.actions {
+                changes.push(Change {
+                    path: path.clone(),
+                    old: None,
+                    new: None,
+                });
+                if let Action::Aside(aside, node) = action {
+                    changes.push(Change {
+                        path: aside.clone(),
+                        old: None,
+                        new: Some(node.clone()),
+                    });
+                }
+            }
+            changes
+        };
+        let alpha_loser = losers.iter().find(|loser| loser.alpha);
+        for (index, plan) in group_plans.iter().enumerate() {
+            let beta_loser = losers
+                .iter()
+                .find(|loser| loser.index == index && !loser.alpha);
+            // Which paths this session's cycle decides.
+            let decided: Vec<&String> = match winner {
+                Winner::Beta(_) => acted.iter().collect(),
+                _ => match beta_loser {
+                    Some(loser) => loser.actions.iter().map(|(path, _)| path).collect(),
+                    None => continue,
+                },
+            };
+            if decided.is_empty() {
+                continue;
+            }
+            let checkpoint = state_root
+                .join("sessions")
+                .join(plan.identifier())
+                .join("ancestor");
+            let (ancestor, _) =
+                autobahn::session::ancestor::peek(&checkpoint).with_context(|| {
+                    format!(
+                        "unable to read what {} last synchronized, so whether resolving would \
+                     delete the kept version cannot be checked; nothing was changed",
+                        plan.display()
+                    )
+                })?;
+
+            // Both sides as the retirement leaves them. When a destination
+            // wins, alpha's copy is gone on the winning session; on every
+            // other session the worst order is assumed, the one in which
+            // alpha already holds the winner's version when that session
+            // next runs.
+            let (alpha_after, beta_after) = match winner {
+                Winner::Alpha | Winner::Both => {
+                    let loser = beta_loser.expect("an acting session has a losing beta");
+                    (
+                        winner_root.clone(),
+                        apply(loser.root.as_ref(), &removals_of(loser)),
+                    )
+                }
+                Winner::Beta(w) => {
+                    let alpha_loser = alpha_loser.expect("the winning session retires alpha");
+                    let alpha_after = if w == index {
+                        apply(alpha_loser.root.as_ref(), &removals_of(alpha_loser))
+                    } else {
+                        let replaced: Vec<Change> = alpha_loser
+                            .actions
+                            .iter()
+                            .map(|(path, _)| Change {
+                                path: path.clone(),
+                                old: None,
+                                new: node_at(winner_root.as_ref(), path).cloned(),
+                            })
+                            .collect();
+                        apply(alpha_loser.root.as_ref(), &replaced)
+                    };
+                    let beta_after = if w == index {
+                        Ok(winner_root.clone())
+                    } else if let Some(loser) = beta_loser {
+                        apply(loser.root.as_ref(), &removals_of(loser))
+                    } else {
+                        Ok(scan(&mut endpoints[index].1, &plan.host)?)
+                    };
+                    (alpha_after.map_err(anyhow::Error::msg)?, beta_after)
+                }
+            };
+            let beta_after = beta_after.map_err(anyhow::Error::msg)?;
+            let outcome = reconcile(
+                ancestor.as_ref(),
+                alpha_after.as_ref(),
+                beta_after.as_ref(),
+                plan.mode,
+            );
+            let alpha_final = apply(alpha_after.as_ref(), &outcome.alpha_transitions)
+                .map_err(anyhow::Error::msg)?;
+            let beta_final = apply(beta_after.as_ref(), &outcome.beta_transitions)
+                .map_err(anyhow::Error::msg)?;
+
+            for path in decided {
+                let kept = node_at(winner_root.as_ref(), path);
+                let on_alpha = same(node_at(alpha_final.as_ref(), path), kept);
+                let on_beta = same(node_at(beta_final.as_ref(), path), kept);
+                // Where a destination wins, a session other than the
+                // winner's needs only to leave alpha's new version alone;
+                // it reaches that destination on a later cycle.
+                let survives = match winner {
+                    Winner::Beta(w) if w != index => on_alpha,
+                    _ => on_alpha && on_beta,
+                };
+                let aside_lost = beta_loser.and_then(|loser| {
+                    loser.actions.iter().find_map(|(at, action)| match action {
+                        Action::Aside(aside, node) if at == path => {
+                            (!same(node_at(beta_final.as_ref(), aside), Some(node)))
+                                .then(|| aside.clone())
+                        }
+                        _ => None,
+                    })
+                });
+                let reason = if !survives {
+                    if matches!(winner, Winner::Beta(w) if w == index)
+                        && plan.mode == autobahn::tree::SyncMode::TwoWayStrict
+                    {
+                        format!(
+                            "keeping {winner_name} here would delete it: in {} alpha's \
+                             deletion beats {winner_name}'s edit, so removing alpha's copy \
+                             removes {winner_name}'s too",
+                            plan.mode_name()
+                        )
+                    } else if kept.is_some() && same(node_at(ancestor.as_ref(), path), kept) {
+                        format!(
+                            "keeping {winner_name} here would delete it: {winner_name} has \
+                             not changed since the last sync, so removing the other copy \
+                             reads as a deletion. Edit the file on {winner_name} first, or \
+                             wait for the fix to forcing a match"
+                        )
+                    } else {
+                        format!(
+                            "keeping {winner_name} here would not carry it to {} in {}",
+                            plan.host,
+                            plan.mode_name()
+                        )
+                    }
+                } else if let Some(aside) = aside_lost {
+                    format!(
+                        "{}'s copy, moved aside to {aside}, would not survive in {}",
+                        plan.host,
+                        plan.mode_name()
+                    )
+                } else {
+                    continue;
+                };
+                unsafe_paths.entry(path.clone()).or_insert(reason);
+            }
+        }
+    }
+    for loser in &mut losers {
+        loser
+            .actions
+            .retain(|(path, _)| !unsafe_paths.contains_key(path));
+    }
+
     // Resolution retires the *losing* version and lets the ordinary cycle
     // carry the winner's, rather than copying bytes across by hand.
     //
@@ -2840,157 +3241,58 @@ fn run_resolve(
     // so content that appeared while this command was running is never
     // destroyed by it. That validation is the whole reason to route through
     // the engine here rather than call `remove_dir_all`.
-    let mut settled = 0usize;
-    let mut refused: Vec<(String, String)> = Vec::new();
-    // Paths that cannot be settled this way at all, as opposed to ones
-    // that lost a race. The two need different words: one says try again,
-    // the other says this will never work.
-    let mut blocked: Vec<(String, String, String, String)> = Vec::new();
-    for (index, plan) in group_plans.iter().enumerate() {
-        // Which side of this session loses. The winner keeps its version
-        // untouched; every other copy in the group is retired, including
-        // alpha's when a destination wins, since alpha is how the winning
-        // content reaches the group's other destinations.
-        let losing: Vec<(&mut Box<dyn autobahn::endpoint::Endpoint + Send>, String)> = {
-            let (alpha, beta) = &mut endpoints[index];
-            match winner {
-                // Alpha wins (or both sides are kept, in which case alpha's
-                // copy stays put and beta's moves aside): only beta loses.
-                Winner::Alpha | Winner::Both => vec![(beta, plan.host.clone())],
-                // This destination wins, so alpha loses — and alpha is
-                // retired *here*, on the winning session, for two reasons.
-                // Every session opens its own handle on alpha, so the
-                // retirement has to happen through exactly one of them; and
-                // this is the session that will carry the winning content
-                // back to alpha, from which the group's other destinations
-                // then take it.
-                Winner::Beta(w) if w == index => vec![(alpha, "alpha".to_owned())],
-                // Another destination wins, so this one loses too. Its copy
-                // and alpha's both go; the pair reads as a deletion on both
-                // sides, which clears the ancestor entry, and the winner's
-                // content then arrives as ordinary new content.
-                Winner::Beta(_) => vec![(beta, plan.host.clone())],
-            }
+    for loser in losers {
+        let endpoint = match loser.alpha {
+            true => &mut endpoints[loser.index].0,
+            false => &mut endpoints[loser.index].1,
         };
-
-        for (endpoint, side) in losing {
-            // Only paths that actually conflict on this session are
-            // touched; a destination that already agrees is left alone.
-            // Alpha is the exception: its copy must go for the winning
-            // content to reach it, whichever session reported the conflict.
-            let here: Vec<&String> = paths
-                .iter()
-                .filter(|path| {
-                    side == "alpha"
-                        || targets.iter().any(|(target, paths)| {
-                            target.identifier() == plan.identifier() && paths.contains(*path)
-                        })
-                })
-                .collect();
-            if here.is_empty() {
-                continue;
-            }
-
-            // One scan per losing side, not one per path — and it must be
-            // the scan the removals are validated against, so nothing runs
-            // between it and the transition.
-            //
-            // A scan of a large tree is the slow part of this command, so
-            // it says whose tree it is reading. On a terminal the line is
-            // erased afterwards; anywhere else it is never written, since a
-            // carriage return in a log file is noise.
-            let transient = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
-            if transient {
-                eprint!("  reading {side}\r");
-            }
-            let snapshot = endpoint
-                .scan()
-                .with_context(|| format!("unable to read {side}"))?;
-            if transient {
-                eprint!("\r\x1b[2K");
-            }
-
-            let mut removals = Vec::new();
-            for path in here {
-                let Some(node) = node_at(snapshot.root.as_ref(), path) else {
-                    // Already gone on this side. Nothing to retire, and the
-                    // cycle will carry the winner's version here anyway.
-                    continue;
-                };
-                if winner == Winner::Both {
-                    // Kept, not discarded: the losing version moves to a
-                    // free name, from which it propagates to every side as
-                    // ordinary new content. A rename does this for a whole
-                    // tree without moving any of it, which is why it is a
-                    // primitive rather than a read and a write.
-                    let aside = free_name(snapshot.root.as_ref(), path, &side);
+        let side = loser.side;
+        let mut removals = Vec::new();
+        for (path, action) in loser.actions {
+            match action {
+                Action::Aside(aside, _) => {
                     endpoint
-                        .rename(path, &aside)
+                        .rename(&path, &aside)
                         .with_context(|| format!("unable to keep {side}'s {path}"))?;
                     println!("  {side}: kept {path} as {aside}");
                     settled += 1;
-                    continue;
                 }
-                // Content synchronization never scanned cannot be removed
-                // by a transition — it refuses, by design, because nobody
-                // decided to delete what reconciliation never saw. Asking
-                // anyway does not fail cleanly: the removal runs
-                // bottom-up, takes away everything it *can* account for,
-                // and leaves the rest. That is the worst of both outcomes,
-                // a half-deleted tree and the conflict still open, so the
-                // check happens here rather than being discovered midway.
-                if let Some((example, reason)) = unsynchronizable_within(node, path) {
-                    blocked.push((path.clone(), side.clone(), example, reason));
-                    continue;
-                }
-                // The *synchronizable* subtree, which is what the cycle
-                // would pass. An expectation is what the removal is
-                // permitted to take away, so handing it the raw scan would
-                // ask for the excluded entries too — and those are refused
-                // one by one, leaving the tree half-taken. Filtered, the
-                // removal takes what synchronization knows about and steps
-                // over the rest, exactly as an ordinary deletion does.
-                let Some(expectation) = node.synchronizable_subtree() else {
-                    // Nothing here is synchronization's to remove.
-                    continue;
-                };
-                removals.push(autobahn::tree::Change {
-                    path: path.clone(),
+                Action::Retire(expectation) => removals.push(autobahn::tree::Change {
+                    path,
                     old: Some(expectation),
                     new: None,
-                });
+                }),
             }
-
-            if removals.is_empty() {
-                continue;
-            }
-            let outcome = endpoint
-                .transition(removals)
-                .with_context(|| format!("unable to retire {side}'s version"))?;
-            // A refusal is not an error: the transition reports it and
-            // leaves the content alone. It means the path moved between the
-            // scan and the removal, which is exactly the case the
-            // validation exists to catch — so it is reported, by path, and
-            // the conflict stays.
-            for problem in &outcome.problems {
-                refused.push((problem.path.clone(), problem.message.clone()));
-            }
-            // A removal succeeded when nothing synchronization knew about
-            // survived it. Usually that means the path is gone; where the
-            // tree held excluded entries the directory itself necessarily
-            // remains, holding only them, and it is then invisible — so
-            // the conflict is settled even though something is still on
-            // disk. Counting only outright disappearance reports "settled
-            // 0" for a resolution that fully worked.
-            settled += outcome
-                .results
-                .iter()
-                .filter(|result| match result {
-                    None => true,
-                    Some(node) => node.children().is_empty(),
-                })
-                .count();
         }
+
+        if removals.is_empty() {
+            continue;
+        }
+        let outcome = endpoint
+            .transition(removals)
+            .with_context(|| format!("unable to retire {side}'s version"))?;
+        // A refusal is not an error: the transition reports it and leaves
+        // the content alone. It means the path moved between the scan and
+        // the removal, which is exactly the case the validation exists to
+        // catch — so it is reported, by path, and the conflict stays.
+        for problem in &outcome.problems {
+            refused.push((problem.path.clone(), problem.message.clone()));
+        }
+        // A removal succeeded when nothing synchronization knew about
+        // survived it. Usually that means the path is gone; where the tree
+        // held excluded entries the directory itself necessarily remains,
+        // holding only them, and it is then invisible — so the conflict is
+        // settled even though something is still on disk. Counting only
+        // outright disappearance reports "settled 0" for a resolution that
+        // fully worked.
+        settled += outcome
+            .results
+            .iter()
+            .filter(|result| match result {
+                None => true,
+                Some(node) => node.children().is_empty(),
+            })
+            .count();
     }
     // Always said, including "settled 0". A command that reports nothing
     // reads as a command that worked, and this one can legitimately settle
@@ -3000,6 +3302,19 @@ fn run_resolve(
         _ => "one version kept",
     };
     println!("settled {settled} of {} ({kept_word})", paths.len());
+
+    // Nothing to do, and said so: the sides already hold one version.
+    for path in agreed.iter().filter(|path| !acted.contains(*path)) {
+        if !blocked.iter().any(|(blocked, ..)| blocked == path) {
+            println!("  {path}: already the same on every side");
+        }
+    }
+
+    // Refused before anything was touched, because the next cycle would
+    // not have kept what was asked for.
+    for (path, reason) in &unsafe_paths {
+        println!("  {path}: not settled — {reason}.");
+    }
 
     // Blocked, and permanently: retiring this side would mean deleting
     // content synchronization never scanned, which it will not do. Saying

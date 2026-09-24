@@ -14,7 +14,7 @@
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -215,8 +215,9 @@ pub type YieldHandle = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 /// The registry mapping sessions to their control flags, shared between the
 /// socket thread and the workers.
 pub(crate) struct Registry {
-    /// One entry per supervised session.
-    pub entries: Vec<Entry>,
+    /// One entry per supervised session, replaced as an edit to the
+    /// configuration changes which sessions run.
+    pub entries: RwLock<Vec<Entry>>,
     /// Peering: how to hand the lead on, when this supervisor leads.
     pub yield_to: Option<YieldHandle>,
 }
@@ -224,6 +225,10 @@ pub(crate) struct Registry {
 impl Registry {
     /// Applies a control request, returning the number of affected sessions.
     fn apply(&self, request: &ControlRequest) -> ControlResponse {
+        let entries = self
+            .entries
+            .read()
+            .unwrap_or_else(|error| error.into_inner());
         // Progress reads rather than writes, and selects nothing: the
         // caller wants the whole picture and matches it up itself.
         if let ControlRequest::Yield { to } = request {
@@ -236,11 +241,11 @@ impl Registry {
                 Ok(()) => {
                     // Every worker hands its peer the new lease on its
                     // next attempt; woken, that is now.
-                    for entry in &self.entries {
+                    for entry in entries.iter() {
                         entry.control.wake.store(true, Ordering::Relaxed);
                     }
                     ControlResponse::Applied {
-                        sessions: self.entries.len(),
+                        sessions: entries.len(),
                     }
                 }
                 Err(error) => ControlResponse::Error(format!("{error:#}")),
@@ -257,13 +262,16 @@ impl Registry {
                 Ok(ControlRequest::Versioned { .. }) => {
                     ControlResponse::Error("a versioned request inside another".into())
                 }
-                Ok(inner) => self.apply(&inner),
+                Ok(inner) => {
+                    drop(entries);
+                    self.apply(&inner)
+                }
                 Err(error) => ControlResponse::Error(format!("undecodable request: {error}")),
             };
         }
         if let ControlRequest::Progress = request {
             return ControlResponse::Progress(
-                self.entries
+                entries
                     .iter()
                     .map(|entry| SessionProgress {
                         session: entry.session.clone(),
@@ -301,7 +309,7 @@ impl Registry {
             }
         };
         let mut sessions = 0;
-        for entry in &self.entries {
+        for entry in entries.iter() {
             if selector.matches(&entry.group, &entry.host) {
                 action(&entry.control);
                 sessions += 1;
@@ -725,11 +733,11 @@ mod tests {
     fn registry() -> Registry {
         Registry {
             yield_to: None,
-            entries: vec![
+            entries: RwLock::new(vec![
                 entry("work", "host1"),
                 entry("work", "host2"),
                 entry("other", "host1"),
-            ],
+            ]),
         }
     }
 
@@ -760,15 +768,24 @@ mod tests {
             host: None,
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 2 }));
-        assert!(registry.entries[0].control.paused.load(Ordering::Relaxed));
-        assert!(!registry.entries[2].control.paused.load(Ordering::Relaxed));
+        assert!(registry.entries.read().unwrap()[0]
+            .control
+            .paused
+            .load(Ordering::Relaxed));
+        assert!(!registry.entries.read().unwrap()[2]
+            .control
+            .paused
+            .load(Ordering::Relaxed));
         // One session.
         let response = registry.apply(&ControlRequest::Reset(Selector {
             group: Some("other".into()),
             host: Some("host1".into()),
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
-        assert!(registry.entries[2].control.reset.load(Ordering::Relaxed));
+        assert!(registry.entries.read().unwrap()[2]
+            .control
+            .reset
+            .load(Ordering::Relaxed));
         // No match.
         let response = registry.apply(&ControlRequest::Flush(Selector {
             group: Some("absent".into()),
@@ -799,12 +816,14 @@ mod tests {
             other => panic!("expected Mismatch, got {other:?}"),
         }
         // Nothing was flipped by the refused one.
-        for entry in &registry.entries {
+        for entry in registry.entries.read().unwrap().iter() {
             entry.control.wake.store(false, Ordering::Relaxed);
         }
         registry.apply(&versioned("0.0.1+e1", &flush));
         assert!(registry
             .entries
+            .read()
+            .unwrap()
             .iter()
             .all(|entry| !entry.control.wake.load(Ordering::Relaxed)));
     }

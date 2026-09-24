@@ -623,6 +623,16 @@ impl AgentPool {
             .insert(name.to_owned(), connection);
     }
 
+    /// Keeps only the slots whose key `keep` accepts. A slot removed here
+    /// drops the pool's handle on its connection, which closes once the
+    /// last session channel on it is gone too.
+    pub fn retain(&self, keep: impl Fn(&[String]) -> bool) {
+        self.slots
+            .lock()
+            .expect("the pool lock is never poisoned")
+            .retain(|key, _| keep(key));
+    }
+
     /// Peering: takes the connection a peer opened, if one is waiting.
     pub fn take_attachment(&self, name: &str) -> Option<super::Connection> {
         self.attachments

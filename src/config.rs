@@ -1044,7 +1044,13 @@ impl Config {
     pub fn load(path: &std::path::Path) -> Result<Config> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("unable to read configuration {}", path.display()))?;
-        toml::from_str(&text)
+        Config::parse(path, &text)
+    }
+
+    /// Parses a configuration already read from `path`, which only names
+    /// it in errors.
+    pub fn parse(path: &std::path::Path, text: &str) -> Result<Config> {
+        toml::from_str(text)
             .with_context(|| format!("unable to parse configuration {}", path.display()))
     }
 

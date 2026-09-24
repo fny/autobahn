@@ -836,10 +836,88 @@ fn watch_mode_synchronizes_continuously_until_stopped() {
     assert_eq!(status.state, "synchronized");
 }
 
+/// Runs a watching supervisor over the configuration at `path`, with the
+/// file watched every 20 ms, for as long as `during` runs — and asserts
+/// that it was still running at the end: every edit made meanwhile was
+/// applied in place, not by winding the supervisor down.
+fn supervise_with_reload(world: &World, path: &Path, during: impl FnOnce()) {
+    use autobahn::supervisor::reload::Reloader;
+    use std::sync::Arc;
+    let plans = Config::load(path)
+        .expect("configuration should load")
+        .plans()
+        .expect("plans should derive");
+    let reloader =
+        Arc::new(Reloader::new(path.to_path_buf()).with_interval(Duration::from_millis(20)));
+    let stop = AtomicBool::new(false);
+    let supervisor =
+        Supervisor::new(plans, world.state_root(), false).with_reload(Some(reloader.clone()));
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let watcher = scope.spawn(|| supervisor.run_watch(&stop));
+        during();
+        assert!(
+            !watcher.is_finished(),
+            "every edit was applied without winding the supervisor down"
+        );
+        stop.store(true, Ordering::Relaxed);
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
+    });
+    assert!(reloader.take().is_none(), "nothing was left for a restart");
+}
+
+/// An agent script that notes each launch, and each exit, in a counter
+/// file, so a test can tell a kept connection from a new one and a closed
+/// one from one left open.
+fn counting_agent(world: &World, name: &str) -> (PathBuf, PathBuf) {
+    let counter = world.path(&format!("{name}.count"));
+    let script = world.path(&format!("{name}.sh"));
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho launch >> {counter}\n{agent} agent\necho exit >> {counter}\n",
+            counter = counter.display(),
+            agent = agent_binary()
+        ),
+    )
+    .expect("script should be writable");
+    let mut permissions = fs::metadata(&script).expect("script").permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(&script, permissions).expect("script should be executable");
+    (script, counter)
+}
+
+/// How many times a counting agent's counter holds `word`.
+fn counted(counter: &Path, word: &str) -> usize {
+    fs::read_to_string(counter)
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == word)
+        .count()
+}
+
+/// The sessions a running supervisor says it is running, as
+/// `group@host`, or None when none answers.
+fn supervised(world: &World) -> Option<Vec<String>> {
+    autobahn::supervisor::control::query_progress(&world.state_root()).map(|sessions| {
+        sessions
+            .into_iter()
+            .map(|session| format!("{}@{}", session.group, session.host))
+            .collect()
+    })
+}
+
+/// The cycle count a session last recorded.
+fn cycles(world: &World, plan: &SessionPlan) -> u64 {
+    world.status(plan).map(|status| status.cycles).unwrap_or(0)
+}
+
 #[test]
 fn an_edited_configuration_is_applied_without_a_restart() {
-    use autobahn::supervisor::reload::{read_notice, Reloader};
-    use std::sync::Arc;
+    use autobahn::supervisor::reload::read_notice;
     let world = World::new();
     let alpha = world.directory("alpha");
     let beta = world.directory("beta");
@@ -847,6 +925,7 @@ fn an_edited_configuration_is_applied_without_a_restart() {
     let notes_mirror = world.path("notes-mirror");
     write(&alpha, "first.txt", "first");
     write(&notes, "todo.txt", "everything");
+    let (script, counter) = counting_agent(&world, "agent");
 
     let path = world.path("config.toml");
     let one_group = format!(
@@ -854,6 +933,102 @@ fn an_edited_configuration_is_applied_without_a_restart() {
         [groups.work]
         alpha = "{alpha}"
         mode = "two-way-safe"
+        interval = 1
+        agent_command = "{script}"
+        betas = ["host:{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+        script = script.display(),
+    );
+    let plans = world.plans(&one_group);
+    let work = plans[0].clone();
+
+    supervise_with_reload(&world, &path, || {
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            "the first configuration synchronizes"
+        );
+        // A broken edit is refused and recorded; the session runs on.
+        fs::write(&path, format!("{one_group}\n[groups.notes]\nmdoe = 1\n"))
+            .expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                read_notice(&world.state_root()).is_some()
+            }),
+            "the refusal is recorded"
+        );
+        write(&alpha, "second.txt", "second");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+            "the session runs on under the refused edit"
+        );
+        // A good one adds a group, which starts while the first runs on:
+        // the same worker, so its cycle count carries on from where it
+        // was, over the same connection.
+        let before = cycles(&world, &work);
+        assert!(before > 0);
+        fs::write(
+            &path,
+            format!(
+                "{one_group}\n[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                notes.display(),
+                notes_mirror.display()
+            ),
+        )
+        .expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                notes_mirror.join("todo.txt").exists()
+            }),
+            "the added group synchronizes"
+        );
+        write(&alpha, "third.txt", "third");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("third.txt").exists()),
+            "the kept group runs on"
+        );
+        assert!(
+            cycles(&world, &work) > before,
+            "the kept session's cycle count carried on rather than starting over"
+        );
+        assert_eq!(
+            counted(&counter, "launch"),
+            1,
+            "the kept connection was kept"
+        );
+        assert_eq!(
+            read_notice(&world.state_root()),
+            None,
+            "the refusal is over"
+        );
+    });
+}
+
+/// An edit applied in place is held to the check made at startup: a
+/// root holding autobahn's own state is complained about and not applied,
+/// and the sessions running carry on.
+#[test]
+fn an_edit_whose_root_holds_the_state_root_is_not_applied() {
+    use autobahn::supervisor::reload::Reloader;
+    use std::sync::Arc;
+    let world = World::new();
+    // The work group's trees are outside the world's directory, which the
+    // edit adds a root for.
+    let elsewhere = TempDir::new().expect("temporary directory should be creatable");
+    let alpha = elsewhere.path().join("alpha");
+    let beta = elsewhere.path().join("beta");
+    fs::create_dir_all(&alpha).expect("directory should be creatable");
+    fs::create_dir_all(&beta).expect("directory should be creatable");
+    let mirror = elsewhere.path().join("mirror");
+    write(&alpha, "first.txt", "first");
+    let path = world.path("config.toml");
+    let one_group = format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        interval = 1
         betas = ["{beta}"]
         "#,
         alpha = alpha.display(),
@@ -861,91 +1036,299 @@ fn an_edited_configuration_is_applied_without_a_restart() {
     );
     let plans = world.plans(&one_group);
     let reloader = Arc::new(Reloader::new(path.clone()).with_interval(Duration::from_millis(20)));
-
-    // What `watch` does: run the configuration, and then each edit that
-    // loads, until stopped.
     let stop = AtomicBool::new(false);
-    let mut loaded_plans = plans;
-    let mut rounds = 0;
+    let supervisor = Supervisor::new(plans, world.state_root(), false)
+        .with_reload(Some(reloader.clone()))
+        .with_own_state(autobahn::config::OwnState::new(
+            &world.state_root(),
+            Some(&path),
+        ));
     std::thread::scope(|scope| {
-        let stop = &stop;
-        let reloader = &reloader;
-        let _guard = StopGuard(stop);
-        loop {
-            rounds += 1;
-            let mut plans = loaded_plans.clone();
-            for plan in &mut plans {
-                plan.interval = Duration::from_millis(30);
-            }
-            let supervisor = Supervisor::new(plans, world.state_root(), false)
-                .with_reload(Some(reloader.clone()));
-            let watcher = scope.spawn(move || supervisor.run_watch(stop));
-            match rounds {
-                1 => {
-                    assert!(
-                        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
-                        "the first configuration synchronizes"
-                    );
-                    // A broken edit is refused and recorded; the session
-                    // runs on.
-                    fs::write(&path, format!("{one_group}\n[groups.notes]\nmdoe = 1\n"))
-                        .expect("configuration should be writable");
-                    assert!(
-                        wait_until(Duration::from_secs(15), || {
-                            read_notice(&world.state_root()).is_some()
-                        }),
-                        "the refusal is recorded"
-                    );
-                    assert!(!watcher.is_finished(), "the workers keep running");
-                    write(&alpha, "second.txt", "second");
-                    assert!(
-                        wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
-                        "the session runs on under the refused edit"
-                    );
-                    // A good one loads, and the supervisor winds down for
-                    // the caller to run it.
-                    fs::write(
-                        &path,
-                        format!(
-                            "{one_group}\n[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-                            notes.display(),
-                            notes_mirror.display()
-                        ),
-                    )
-                    .expect("configuration should be writable");
-                }
-                2 => {
-                    assert!(
-                        wait_until(Duration::from_secs(15), || {
-                            notes_mirror.join("todo.txt").exists()
-                        }),
-                        "the added group synchronizes"
-                    );
-                    write(&alpha, "third.txt", "third");
-                    assert!(
-                        wait_until(Duration::from_secs(15), || beta.join("third.txt").exists()),
-                        "the kept group runs on"
-                    );
-                    assert_eq!(
-                        read_notice(&world.state_root()),
-                        None,
-                        "the refusal is over"
-                    );
-                    stop.store(true, Ordering::Relaxed);
-                }
-                _ => unreachable!("two rounds"),
-            }
-            watcher
-                .join()
-                .expect("the watcher should stop cleanly")
-                .expect("supervision should succeed");
-            match reloader.take() {
-                Some(next) => loaded_plans = next.plans,
-                None => break,
-            }
-        }
+        let _guard = StopGuard(&stop);
+        let watcher = scope.spawn(|| supervisor.run_watch(&stop));
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            "the first configuration synchronizes"
+        );
+        // The world's directory holds the state root and the configuration.
+        fs::write(
+            &path,
+            format!(
+                "{one_group}\n[groups.everything]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                world.path("").display(),
+                mirror.display()
+            ),
+        )
+        .expect("configuration should be writable");
+        std::thread::sleep(Duration::from_millis(500));
+        write(&alpha, "second.txt", "second");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+            "the running session carries on"
+        );
+        assert_eq!(
+            supervised(&world),
+            Some(vec![format!("work@{}", beta.display())]),
+            "the edit was not applied"
+        );
+        assert!(!mirror.exists(), "nothing ran over the state root");
+        assert!(!watcher.is_finished());
+        stop.store(true, Ordering::Relaxed);
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
     });
-    assert_eq!(rounds, 2);
+}
+
+#[test]
+fn an_edit_to_one_groups_ignores_restarts_only_that_session() {
+    let world = World::new();
+    let alpha_one = world.directory("alpha-one");
+    let alpha_two = world.directory("alpha-two");
+    let beta_one = world.directory("beta-one");
+    let beta_two = world.directory("beta-two");
+    let (script, counter) = counting_agent(&world, "agent");
+    let path = world.path("config.toml");
+    let configuration = |ignores: &str| {
+        format!(
+            r#"
+            [defaults]
+            mode = "two-way-safe"
+            interval = 1
+
+            [groups.one]
+            alpha = "{alpha_one}"
+            agent_command = "{script}"
+            betas = ["shared-host:{beta_one}"]
+
+            [groups.two]
+            alpha = "{alpha_two}"
+            agent_command = "{script}"
+            ignores = [{ignores}]
+            betas = ["shared-host:{beta_two}"]
+            "#,
+            script = script.display(),
+            alpha_one = alpha_one.display(),
+            alpha_two = alpha_two.display(),
+            beta_one = beta_one.display(),
+            beta_two = beta_two.display(),
+        )
+    };
+    let plans = world.plans(&configuration(""));
+    let (one, two) = (plans[0].clone(), plans[1].clone());
+    write(&alpha_one, "one.txt", "one");
+    write(&alpha_two, "two.txt", "two");
+
+    supervise_with_reload(&world, &path, || {
+        assert!(wait_until(Duration::from_secs(15), || {
+            beta_one.join("one.txt").exists() && beta_two.join("two.txt").exists()
+        }));
+        // Run the session to be changed through more cycles than one
+        // attempt can hold, so its restart shows as a count that went back.
+        let limit = autobahn::supervisor::MAXIMUM_FOLLOW_UP_CYCLES as u64 + 1;
+        for index in 0..=limit {
+            let name = format!("warm-{index}.txt");
+            write(&alpha_two, &name, "warm");
+            assert!(wait_until(Duration::from_secs(15), || beta_two
+                .join(&name)
+                .exists()));
+        }
+        assert!(wait_until(Duration::from_secs(15), || {
+            cycles(&world, &one) >= 1 && cycles(&world, &two) > limit
+        }));
+        let one_before = cycles(&world, &one);
+        let two_before = cycles(&world, &two);
+        fs::write(&path, configuration("\"*.tmp\"")).expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || cycles(&world, &two)
+                < two_before),
+            "the changed session starts over ({} after {two_before})",
+            cycles(&world, &two)
+        );
+        write(&alpha_two, "scratch.tmp", "scratch");
+        write(&alpha_two, "kept.txt", "kept");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta_two
+                .join("kept.txt")
+                .exists()),
+            "the changed session runs under its new plan"
+        );
+        assert!(
+            !beta_two.join("scratch.tmp").exists(),
+            "the new ignores apply"
+        );
+        assert!(
+            wait_until(Duration::from_secs(15), || cycles(&world, &one)
+                > one_before),
+            "the untouched session carried on counting rather than starting over"
+        );
+        assert_eq!(
+            counted(&counter, "launch"),
+            1,
+            "the host's connection stayed up for both"
+        );
+    });
+}
+
+#[test]
+fn disabling_one_group_leaves_the_others_connected_and_closes_its_host() {
+    let world = World::new();
+    let alpha_one = world.directory("alpha-one");
+    let alpha_two = world.directory("alpha-two");
+    let beta_one = world.directory("beta-one");
+    let beta_two = world.directory("beta-two");
+    let (script_one, counter_one) = counting_agent(&world, "agent-one");
+    let (script_two, counter_two) = counting_agent(&world, "agent-two");
+    let path = world.path("config.toml");
+    let text = format!(
+        r#"
+        [defaults]
+        mode = "two-way-safe"
+        interval = 1
+
+        [groups.one]
+        alpha = "{alpha_one}"
+        agent_command = "{script_one}"
+        betas = ["host-one:{beta_one}"]
+
+        [groups.two]
+        alpha = "{alpha_two}"
+        agent_command = "{script_two}"
+        betas = ["host-two:{beta_two}"]
+        "#,
+        script_one = script_one.display(),
+        script_two = script_two.display(),
+        alpha_one = alpha_one.display(),
+        alpha_two = alpha_two.display(),
+        beta_one = beta_one.display(),
+        beta_two = beta_two.display(),
+    );
+    world.plans(&text);
+    write(&alpha_one, "one.txt", "one");
+    write(&alpha_two, "two.txt", "two");
+
+    supervise_with_reload(&world, &path, || {
+        assert!(wait_until(Duration::from_secs(15), || {
+            beta_one.join("one.txt").exists() && beta_two.join("two.txt").exists()
+        }));
+        let (disabled, _) =
+            autobahn::config::set_group_disabled(&text, "two", true).expect("the edit applies");
+        fs::write(&path, disabled).expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                supervised(&world).as_deref() == Some(&["one@host-one".to_owned()][..])
+            }),
+            "only the disabled group stops: {:?}",
+            supervised(&world)
+        );
+        // No session reaches host-two any more, so its connection closes.
+        assert!(
+            wait_until(Duration::from_secs(15), || counted(&counter_two, "exit")
+                == 1),
+            "the disabled group's host is not kept connected"
+        );
+        write(&alpha_one, "more.txt", "more");
+        assert!(wait_until(Duration::from_secs(15), || beta_one
+            .join("more.txt")
+            .exists()));
+        assert_eq!(
+            counted(&counter_one, "launch"),
+            1,
+            "the others did not reconnect"
+        );
+        assert_eq!(counted(&counter_one, "exit"), 0);
+    });
+}
+
+/// With one group running, `edit` turns it off and `undo` back on: the
+/// group stops syncing without the supervisor stopping, and when it is back
+/// it resumes from its ancestor — a deletion made meanwhile propagates,
+/// where a session that had lost its ancestor would bring the file back.
+fn turning_the_only_group_off_and_on(edit: impl Fn(&str) -> String) {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let path = world.path("config.toml");
+    let text = format!(
+        r#"
+        [groups.work]
+        alpha = "{alpha}"
+        mode = "two-way-safe"
+        interval = 1
+        agent_command = "{agent} agent"
+        betas = ["only-host:{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+        agent = agent_binary(),
+    );
+    world.plans(&text);
+    write(&alpha, "kept.txt", "kept");
+    write(&alpha, "doomed.txt", "doomed");
+
+    supervise_with_reload(&world, &path, || {
+        assert!(wait_until(Duration::from_secs(15), || {
+            beta.join("kept.txt").exists() && beta.join("doomed.txt").exists()
+        }));
+        fs::write(&path, edit(&text)).expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                supervised(&world).is_some_and(|sessions| sessions.is_empty())
+            }),
+            "the session stops, and the supervisor answers with nothing running"
+        );
+        let (succeeded, shown) = cli(&world, &path, &["status"]);
+        assert!(succeeded, "{shown}");
+        assert!(shown.contains("no active sessions"), "{shown}");
+        write(&alpha, "while-off.txt", "while off");
+        fs::remove_file(alpha.join("doomed.txt")).expect("removable");
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            !beta.join("while-off.txt").exists(),
+            "nothing propagates while off"
+        );
+        assert!(beta.join("doomed.txt").exists());
+
+        fs::write(&path, &text).expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || beta
+                .join("while-off.txt")
+                .exists()),
+            "syncing resumes"
+        );
+        assert!(
+            wait_until(Duration::from_secs(15), || !beta
+                .join("doomed.txt")
+                .exists()),
+            "the deletion propagates: the ancestor is intact"
+        );
+        assert!(!alpha.join("doomed.txt").exists());
+        assert_eq!(read(&beta, "kept.txt"), "kept");
+    });
+}
+
+#[test]
+fn disabling_the_only_group_stops_it_and_enabling_resumes_it() {
+    turning_the_only_group_off_and_on(|text| {
+        autobahn::config::set_group_disabled(text, "work", true)
+            .expect("the edit applies")
+            .0
+    });
+}
+
+#[test]
+fn disabling_the_only_host_stops_it_and_enabling_resumes_it() {
+    turning_the_only_group_off_and_on(|text| {
+        autobahn::config::set_host_disabled(text, "only-host", true)
+            .expect("the edit applies")
+            .0
+    });
+}
+
+#[test]
+fn removing_the_last_group_stops_it_and_restoring_resumes_it() {
+    turning_the_only_group_off_and_on(|_| "# nothing to do for now\n".to_owned());
 }
 
 #[test]

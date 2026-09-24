@@ -214,6 +214,15 @@ pub struct Supervisor {
     /// Peering, when any plan is in a peering mode: the role this
     /// supervisor holds, shared by its workers.
     peering: Option<PeeringContext>,
+    /// The log level the configuration asked for. An edit that changes it
+    /// is not applied in place: the caller settles the level.
+    log_level: Option<crate::logging::Level>,
+    /// Where the plans being supervised are shown, replaced whenever an
+    /// edit changes them — the live display draws from it.
+    shown: Option<Arc<Mutex<Vec<SessionPlan>>>>,
+    /// Autobahn's own directories, which no root may hold: an edit whose
+    /// sessions would is complained about and not applied.
+    own_state: Option<crate::config::OwnState>,
 }
 
 /// Peering, from the supervisor's side: the role, and what the leader
@@ -475,14 +484,41 @@ impl Supervisor {
             alerts: crate::alerts::AlertPlan::default(),
             reloader: None,
             peering: None,
+            log_level: None,
+            shown: None,
+            own_state: None,
         }
     }
 
-    /// Watches the configuration file the plans came from. `run_watch`
-    /// then returns when an edit loads, with the new configuration in the
-    /// reloader for the caller to run.
+    /// Watches the configuration file the plans came from. An edit that
+    /// loads is applied to the sessions it changes, while the rest run on.
+    /// One that changes what every session shares — the alerts, the log
+    /// level, the watch itself, or peering — makes `run_watch` return
+    /// instead, with the new configuration in the reloader for the caller
+    /// to start again from.
     pub fn with_reload(mut self, reloader: Option<Arc<reload::Reloader>>) -> Supervisor {
         self.reloader = reloader;
+        self
+    }
+
+    /// The log level the configuration asked for, so that an edit changing
+    /// it is handed back to the caller rather than applied in place.
+    pub fn with_log_level(mut self, level: Option<crate::logging::Level>) -> Supervisor {
+        self.log_level = level;
+        self
+    }
+
+    /// Keeps `shown` holding the plans being supervised, through every edit
+    /// applied in place.
+    pub fn with_shown(mut self, shown: Arc<Mutex<Vec<SessionPlan>>>) -> Supervisor {
+        self.shown = Some(shown);
+        self
+    }
+
+    /// Refuses an edit whose sessions would synchronize autobahn's own
+    /// state or configuration; the sessions running carry on.
+    pub fn with_own_state(mut self, own_state: crate::config::OwnState) -> Supervisor {
+        self.own_state = Some(own_state);
         self
     }
 
@@ -583,6 +619,9 @@ impl Supervisor {
     /// in-flight cycles to finish. SSH keepalives bound how long a dead
     /// network can hold one; for the CLI, process termination remains the
     /// hard stop.
+    ///
+    /// An edit to the configuration is applied here, session by session:
+    /// see [`with_reload`](Supervisor::with_reload).
     pub fn run_watch(&self, stop: &AtomicBool) -> Result<()> {
         // One supervisor per state root: a second one's workers would all
         // lose their session locks anyway, but it would still capture the
@@ -591,63 +630,24 @@ impl Supervisor {
         // non-zero — a refused supervisor is a failure, not a quiet no-op).
         let _supervisor_lock = SessionLock::acquire(self.state_root.join("supervisor"))
             .context("unable to supervise")?;
-        // A loaded edit winds the workers down through a flag of its own,
-        // mirrored from the caller's: the caller's `stop` still means
-        // stop, and the caller learns which it was from the reloader.
+        // What serves every session — the control socket, the log
+        // rotation, the alerter, the configuration watch — answers to
+        // `halt`, raised when the caller stops or an edit needs a fresh
+        // start. Each session answers to a flag of its own, so that an
+        // edit stops only the sessions it changes.
         let halt = AtomicBool::new(false);
-        let caller_stop = stop;
-        let stop: &AtomicBool = match self.reloader {
-            Some(_) => &halt,
-            None => caller_stop,
-        };
         // This supervisor started from a configuration that passed, so a
         // refusal an earlier one left behind is over.
         if self.reloader.is_some() {
             reload::clear_notice(&self.state_root);
         }
 
-        // Every session gets a control-flag block; the registry shares them
-        // with the control socket's server thread.
-        let controls: Vec<Arc<control::WorkerControl>> = self
-            .plans
-            .iter()
-            .map(|_| Arc::<control::WorkerControl>::default())
-            .collect();
-        // Every session also gets a progress record, seeded from what its
-        // last run recorded so that the first scan after a restart can be
-        // measured rather than merely timed.
-        let progresses: Vec<Arc<crate::progress::Progress>> = self
-            .plans
-            .iter()
-            .map(|plan| {
-                let progress = Arc::<crate::progress::Progress>::default();
-                if let Ok(Some(status)) = read_status(&self.state_root, &plan.identifier()) {
-                    if status.alpha_entries > 0 {
-                        progress.alpha.seed_expected(status.alpha_entries);
-                    }
-                    if status.beta_entries > 0 {
-                        progress.beta.seed_expected(status.beta_entries);
-                    }
-                    progress.seed_moved(status.moved_files, status.moved_bytes);
-                }
-                progress
-            })
-            .collect();
+        // The registry shares each session's control flags and progress
+        // with the control socket's server thread; it is filled as the
+        // sessions start, and replaced whenever an edit changes them.
         let registry = control::Registry {
             yield_to: self.peering.as_ref().map(|peering| peering.yield_handle()),
-            entries: self
-                .plans
-                .iter()
-                .zip(&controls)
-                .zip(&progresses)
-                .map(|((plan, flags), progress)| control::Entry {
-                    session: plan.identifier(),
-                    group: plan.group.clone(),
-                    host: plan.host.clone(),
-                    control: flags.clone(),
-                    progress: progress.clone(),
-                })
-                .collect(),
+            entries: Default::default(),
         };
         let listener = match control::bind(&self.state_root) {
             Ok(listener) => Some(listener),
@@ -658,20 +658,21 @@ impl Supervisor {
             }
         };
 
-        // The alerter watches what the workers publish. It lives outside
-        // the thread scope because both it and the workers borrow this.
-        let published: Vec<Arc<Mutex<Option<SessionStatus>>>> =
-            self.plans.iter().map(|_| Arc::default()).collect();
+        // The alerter watches what the workers publish, for whichever
+        // sessions are running. It lives outside the thread scope because
+        // both it and the workers borrow this.
+        let watched: Watched = Mutex::default();
 
         std::thread::scope(|scope| {
+            let halt = &halt;
             if let Some(listener) = listener {
                 let registry = &registry;
-                scope.spawn(move || control::serve(listener, registry, stop));
+                scope.spawn(move || control::serve(listener, registry, halt));
             }
             // The log is a file nobody else prunes: launchd and systemd
             // both write to it forever and neither rotates it.
             scope.spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
+                while !halt.load(Ordering::Relaxed) {
                     match crate::service::rotate_log() {
                         Ok(true) => {
                             crate::complain!("the service log reached its cap and was rotated")
@@ -681,90 +682,413 @@ impl Supervisor {
                             crate::complain!("unable to rotate the service log: {error:#}")
                         }
                     }
-                    sleep_interruptible(LOG_CHECK_INTERVAL, stop);
+                    sleep_interruptible(LOG_CHECK_INTERVAL, halt);
                 }
             });
 
             if self.alerts.is_configured() {
-                let plans = &self.plans;
-                let published = &published;
+                let watched = &watched;
                 let state_root = self.state_root.as_path();
                 let alerts = self.alerts.clone();
-                scope.spawn(move || watch_alerts(plans, published, state_root, alerts, stop));
+                scope.spawn(move || watch_alerts(watched, state_root, alerts, halt));
             }
 
             if let Some(reloader) = &self.reloader {
                 let state_root = self.state_root.as_path();
                 let alerts = &self.alerts;
-                let halt = &halt;
-                scope.spawn(move || {
-                    // The watch answers to the caller's stop; the workers
-                    // answer to `halt`, which it raises either way.
-                    reloader.watch(state_root, alerts, caller_stop, halt);
-                    halt.store(true, Ordering::Relaxed);
-                });
+                scope.spawn(move || reloader.watch(state_root, alerts, halt));
             }
 
-            for (index, plan) in self.plans.iter().enumerate() {
-                let flags = controls[index].clone();
-                let progress = progresses[index].clone();
-                let published = published[index].clone();
-                crate::threads::spawn_deep_scoped(scope, move || {
-                    // Stagger the first attempts so a large fan-out doesn't
-                    // open every connection in the same instant (bounded, so
-                    // small deployments and fast test intervals barely
-                    // notice it).
-                    let stagger = Duration::from_millis(100)
-                        .saturating_mul(index as u32)
-                        .min(Duration::from_secs(3))
-                        .min(plan.interval);
-                    sleep_interruptible(stagger, stop);
-
-                    let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
-                    worker.peering = self.peering.as_ref();
-                    worker.progress = progress;
-                    worker.published = Some(published);
-                    let identifier = plan.identifier();
-                    let mut failures = 0u32;
-                    while !stop.load(Ordering::Relaxed) {
-                        if flags.paused.load(Ordering::Relaxed) {
-                            worker.hold_paused(&flags, stop);
-                            continue;
-                        }
-                        if flags.reset.swap(false, Ordering::Relaxed) {
-                            worker.reset();
-                        }
-                        if flags.verify.swap(false, Ordering::Relaxed) {
-                            worker.verify_pending = true;
-                        }
-                        let result = worker.attempt();
-                        let failed = result.is_err();
-                        if let Err(error) = worker.conclude(&result) {
-                            crate::complain!(
-                                "[{}] unable to record status: {error:#}",
-                                plan.display()
-                            );
-                        }
-                        if failed {
-                            failures = failures.saturating_add(1);
-                            let delay = backoff_delay(
-                                plan.interval,
-                                failures,
-                                jitter_percent(&identifier, failures),
-                            );
-                            worker.progress.rest(crate::progress::Phase::Retrying);
-                            sleep_flagged(delay, stop, &flags);
-                        } else {
-                            failures = 0;
-                            worker.progress.rest(crate::progress::Phase::Waiting);
-                            worker.await_activity(plan.interval, stop, &flags);
-                        }
+            let mut running: Vec<Running<'_>> = Vec::new();
+            self.supervise(
+                scope,
+                &mut running,
+                self.plans.clone(),
+                &registry,
+                &watched,
+                false,
+            );
+            while !stop.load(Ordering::Relaxed) {
+                if let Some(next) = self.reloader.as_ref().and_then(|reloader| reloader.take()) {
+                    if let Some(Err(error)) = self
+                        .own_state
+                        .as_ref()
+                        .map(|own| own.check_plans(&next.plans))
+                    {
+                        crate::complain!("the edited configuration is not applied: {error:#}");
+                        continue;
                     }
-                });
+                    match self.restart_reason(&next) {
+                        Some(reason) => {
+                            crate::note!(
+                                "the edited configuration changes {reason}; starting every \
+                                 session again"
+                            );
+                            if let Some(reloader) = &self.reloader {
+                                reloader.restore(next);
+                            }
+                            break;
+                        }
+                        None => self.supervise(
+                            scope,
+                            &mut running,
+                            next.plans,
+                            &registry,
+                            &watched,
+                            true,
+                        ),
+                    }
+                }
+                sleep_interruptible(RELOAD_POLL_INTERVAL, stop);
+            }
+            halt.store(true, Ordering::Relaxed);
+            for session in &running {
+                session.stop.store(true, Ordering::Relaxed);
             }
         });
         Ok(())
     }
+
+    /// Why an edit cannot be applied session by session, if it cannot: it
+    /// changes something every session shares, which the caller settles by
+    /// starting the supervisor again.
+    fn restart_reason(&self, next: &reload::Loaded) -> Option<&'static str> {
+        if !next.reload {
+            Some("whether the configuration is watched")
+        } else if self.peering.is_some() || next.plans.iter().any(|plan| plan.peering.is_some()) {
+            Some("a peering group")
+        } else if (self.alerts.is_configured() || next.alerts.is_configured())
+            && format!("{:?}", self.alerts) != format!("{:?}", next.alerts)
+        {
+            Some("the alerts")
+        } else if self.log_level != next.log_level {
+            Some("the log level")
+        } else {
+            None
+        }
+    }
+
+    /// Makes `next` the set of sessions running, touching only what
+    /// differs: a session in both, with the same plan, runs on untouched —
+    /// its connection, its cycle count and any cycle in flight with it. One
+    /// that is gone, or whose plan changed, is stopped (after its cycle in
+    /// flight, if any), and one that is new, or changed, is started. A
+    /// pooled connection stays up while any session still running reaches
+    /// its host, and closes once none does. `edit` says whether `next`
+    /// came from an edit, which is worth a line in the log.
+    fn supervise<'scope>(
+        &'scope self,
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        running: &mut Vec<Running<'scope>>,
+        next: Vec<SessionPlan>,
+        registry: &control::Registry,
+        watched: &Watched,
+        edit: bool,
+    ) {
+        let changes = plan_changes(running.iter().map(|session| &session.plan), &next);
+        if edit && changes.is_empty() {
+            return;
+        }
+        let (stopping, kept): (Vec<Running<'scope>>, Vec<Running<'scope>>) =
+            std::mem::take(running)
+                .into_iter()
+                .partition(|session| changes.stops(&session.plan.identifier()));
+        for session in &stopping {
+            session.stop.store(true, Ordering::Relaxed);
+            session.control.wake.store(true, Ordering::Relaxed);
+        }
+        for session in stopping {
+            let display = session.plan.display();
+            if session.handle.join().is_err() {
+                crate::complain!("[{display}] the session's worker panicked");
+            }
+            crate::note!(
+                "[{display}] stopped: {}",
+                match changes.restarts(&session.plan.identifier()) {
+                    true => "its settings changed",
+                    false => "it is no longer in the configuration",
+                }
+            );
+        }
+        // A host no session reaches any more keeps no connection open.
+        let wanted: std::collections::HashSet<Vec<String>> =
+            next.iter().flat_map(pool_keys).collect();
+        self.pool.retain(|key| wanted.contains(key));
+
+        if edit {
+            for (session, problem) in
+                unreadable_ancestors(&changes.starting(&next), &self.state_root)
+            {
+                crate::complain!("[{session}] {problem}");
+            }
+        }
+        let mut kept: std::collections::HashMap<String, Running<'scope>> = kept
+            .into_iter()
+            .map(|session| (session.plan.identifier(), session))
+            .collect();
+        let mut started = 0u32;
+        for plan in next {
+            match kept.remove(&plan.identifier()) {
+                Some(session) => running.push(session),
+                None => {
+                    if edit {
+                        crate::note!("[{}] started", plan.display());
+                    }
+                    running.push(self.start_session(scope, plan, started));
+                    started += 1;
+                }
+            }
+        }
+        *registry
+            .entries
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = running
+            .iter()
+            .map(|session| control::Entry {
+                session: session.plan.identifier(),
+                group: session.plan.group.clone(),
+                host: session.plan.host.clone(),
+                control: session.control.clone(),
+                progress: session.progress.clone(),
+            })
+            .collect();
+        *watched.lock().unwrap_or_else(|error| error.into_inner()) = running
+            .iter()
+            .map(|session| (session.plan.clone(), session.published.clone()))
+            .collect();
+        if let Some(shown) = &self.shown {
+            *shown.lock().unwrap_or_else(|error| error.into_inner()) =
+                running.iter().map(|session| session.plan.clone()).collect();
+        }
+        if edit {
+            match running.len() {
+                0 => crate::note!("no active sessions (every group is disabled)"),
+                sessions => {
+                    crate::note!("supervising {sessions} session(s) under the edited configuration")
+                }
+            }
+        }
+    }
+
+    /// Starts one session's worker, the `order`th started together.
+    fn start_session<'scope>(
+        &'scope self,
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        plan: SessionPlan,
+        order: u32,
+    ) -> Running<'scope> {
+        let stop = Arc::<AtomicBool>::default();
+        let flags = Arc::<control::WorkerControl>::default();
+        // A progress record, seeded from what the session's last run
+        // recorded so that the first scan after a restart can be measured
+        // rather than merely timed.
+        let progress = Arc::<crate::progress::Progress>::default();
+        if let Ok(Some(status)) = read_status(&self.state_root, &plan.identifier()) {
+            if status.alpha_entries > 0 {
+                progress.alpha.seed_expected(status.alpha_entries);
+            }
+            if status.beta_entries > 0 {
+                progress.beta.seed_expected(status.beta_entries);
+            }
+            progress.seed_moved(status.moved_files, status.moved_bytes);
+        }
+        let published: Arc<Mutex<Option<SessionStatus>>> = Arc::default();
+        let handle = {
+            let plan = plan.clone();
+            let stop = stop.clone();
+            let flags = flags.clone();
+            let progress = progress.clone();
+            let published = published.clone();
+            crate::threads::spawn_deep_scoped(scope, move || {
+                let stop: &AtomicBool = &stop;
+                let plan = &plan;
+                // Stagger the first attempts so a large fan-out doesn't
+                // open every connection in the same instant (bounded, so
+                // small deployments and fast test intervals barely
+                // notice it).
+                let stagger = Duration::from_millis(100)
+                    .saturating_mul(order)
+                    .min(Duration::from_secs(3))
+                    .min(plan.interval);
+                sleep_interruptible(stagger, stop);
+
+                let mut worker = Worker::new(plan, &self.state_root, &self.pool, self.verbose);
+                worker.peering = self.peering.as_ref();
+                worker.progress = progress;
+                worker.published = Some(published);
+                let identifier = plan.identifier();
+                let mut failures = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    if flags.paused.load(Ordering::Relaxed) {
+                        worker.hold_paused(&flags, stop);
+                        continue;
+                    }
+                    if flags.reset.swap(false, Ordering::Relaxed) {
+                        worker.reset();
+                    }
+                    if flags.verify.swap(false, Ordering::Relaxed) {
+                        worker.verify_pending = true;
+                    }
+                    let result = worker.attempt();
+                    let failed = result.is_err();
+                    if let Err(error) = worker.conclude(&result) {
+                        crate::complain!("[{}] unable to record status: {error:#}", plan.display());
+                    }
+                    if failed {
+                        failures = failures.saturating_add(1);
+                        let delay = backoff_delay(
+                            plan.interval,
+                            failures,
+                            jitter_percent(&identifier, failures),
+                        );
+                        worker.progress.rest(crate::progress::Phase::Retrying);
+                        sleep_flagged(delay, stop, &flags);
+                    } else {
+                        failures = 0;
+                        worker.progress.rest(crate::progress::Phase::Waiting);
+                        worker.await_activity(plan.interval, stop, &flags);
+                    }
+                }
+            })
+        };
+        Running {
+            plan,
+            stop,
+            control: flags,
+            progress,
+            published,
+            handle,
+        }
+    }
+}
+
+/// How often the supervisor looks for an edit the watch has loaded. The
+/// watch's own read interval is what bounds how quickly an edit is acted
+/// on; this only has to be finer than that.
+const RELOAD_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+/// The sessions the alerter watches: each plan, with where its worker
+/// publishes the status it last recorded.
+type Watched = Mutex<Vec<(SessionPlan, Arc<Mutex<Option<SessionStatus>>>)>>;
+
+/// One running session, as the supervisor holds it: its plan, the flag
+/// that stops it alone, what it shares with the control socket and the
+/// alerter, and its worker thread.
+struct Running<'scope> {
+    plan: SessionPlan,
+    stop: Arc<AtomicBool>,
+    control: Arc<control::WorkerControl>,
+    progress: Arc<crate::progress::Progress>,
+    published: Arc<Mutex<Option<SessionStatus>>>,
+    handle: std::thread::ScopedJoinHandle<'scope, ()>,
+}
+
+/// What an edit changes, by session identifier: the sessions to stop, and
+/// which of those start again under a changed plan.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct PlanChanges {
+    /// Running, and gone from the edit.
+    removed: Vec<String>,
+    /// Running, and in the edit with a different plan.
+    changed: Vec<String>,
+    /// In the edit, and not running.
+    added: Vec<String>,
+}
+
+impl PlanChanges {
+    fn is_empty(&self) -> bool {
+        self.removed.is_empty() && self.changed.is_empty() && self.added.is_empty()
+    }
+
+    /// Whether the running session `identifier` stops.
+    fn stops(&self, identifier: &str) -> bool {
+        self.removed
+            .iter()
+            .chain(&self.changed)
+            .any(|id| id == identifier)
+    }
+
+    /// Whether the running session `identifier` starts again.
+    fn restarts(&self, identifier: &str) -> bool {
+        self.changed.iter().any(|id| id == identifier)
+    }
+
+    /// The plans in `next` that start.
+    fn starting(&self, next: &[SessionPlan]) -> Vec<SessionPlan> {
+        next.iter()
+            .filter(|plan| {
+                let identifier = plan.identifier();
+                self.added
+                    .iter()
+                    .chain(&self.changed)
+                    .any(|id| *id == identifier)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+/// Compares the running plans with an edit's by session identifier.
+///
+/// Plans are compared whole, through their `Debug` form, so that any field
+/// — the mode, the ignores, the interval, an option, and whatever a later
+/// field adds — counts as a change without a list here to keep in step.
+fn plan_changes<'a>(
+    running: impl Iterator<Item = &'a SessionPlan>,
+    next: &[SessionPlan],
+) -> PlanChanges {
+    let next_by_id: std::collections::HashMap<String, &SessionPlan> =
+        next.iter().map(|plan| (plan.identifier(), plan)).collect();
+    let mut changes = PlanChanges::default();
+    let mut seen = std::collections::HashSet::new();
+    for plan in running {
+        let identifier = plan.identifier();
+        match next_by_id.get(&identifier) {
+            None => changes.removed.push(identifier.clone()),
+            Some(edited) if format!("{plan:?}") != format!("{edited:?}") => {
+                changes.changed.push(identifier.clone())
+            }
+            Some(_) => {}
+        }
+        seen.insert(identifier);
+    }
+    for plan in next {
+        if !seen.contains(&plan.identifier()) {
+            changes.added.push(plan.identifier());
+        }
+    }
+    changes
+}
+
+/// The agent pool keys a plan's sessions connect through: one per remote
+/// side that is dialed rather than attached.
+fn pool_keys(plan: &SessionPlan) -> Vec<Vec<String>> {
+    [&plan.alpha, &plan.beta]
+        .into_iter()
+        .filter_map(|target| match target {
+            EndpointTarget::Remote {
+                destination,
+                agent_command,
+                ..
+            } => pooled_argv(destination, agent_command.as_deref()),
+            EndpointTarget::Local(_) => None,
+        })
+        .collect()
+}
+
+/// The spawn command a remote endpoint is pooled under — `None` for one
+/// reached by attachment, which is never pooled.
+fn pooled_argv(destination: &str, agent_command: Option<&[String]>) -> Option<Vec<String>> {
+    if crate::peering::attached_name(destination).is_some() {
+        return None;
+    }
+    Some(match agent_command {
+        Some(argv) => argv.to_vec(),
+        None => Connection::ssh_argv(
+            destination,
+            Some(&crate::transport::install::versioned_remote_command()),
+        ),
+    })
 }
 
 /// The per-session worker state: the live session (present while the
@@ -1629,23 +1953,14 @@ pub fn open_endpoints(
                 // Sessions sharing a spawn command share one pooled
                 // connection, each as its own channel — one SSH process per
                 // host, however many sessions (and sides) target it.
-                match agent_command {
-                    Some(argv) => Ok(Box::new(crate::endpoint::remote::connect_pooled(
-                        pool, None, argv, initialize,
-                    )?)),
-                    None => {
-                        let argv = Connection::ssh_argv(
-                            destination,
-                            Some(&crate::transport::install::versioned_remote_command()),
-                        );
-                        Ok(Box::new(crate::endpoint::remote::connect_pooled(
-                            pool,
-                            Some(destination),
-                            &argv,
-                            initialize,
-                        )?))
-                    }
-                }
+                let argv = pooled_argv(destination, agent_command.as_deref())
+                    .expect("an endpoint reached by attachment was answered above");
+                Ok(Box::new(crate::endpoint::remote::connect_pooled(
+                    pool,
+                    agent_command.is_none().then_some(destination.as_str()),
+                    &argv,
+                    initialize,
+                )?))
             }
         }
     };
@@ -2143,8 +2458,7 @@ fn blocked_paths(report: &CycleReport) -> Vec<String> {
 /// of a synchronization cycle. The worst a wedged hook can do from here is
 /// delay the *next* hook, which the dispatcher already declines to launch.
 fn watch_alerts(
-    plans: &[SessionPlan],
-    published: &[Arc<Mutex<Option<SessionStatus>>>],
+    watched: &Watched,
     state_root: &Path,
     plan: crate::alerts::AlertPlan,
     stop: &AtomicBool,
@@ -2156,9 +2470,14 @@ fn watch_alerts(
     let mut alerter = Alerter::new(plan);
     let dispatcher = Dispatcher::default();
     while !stop.load(Ordering::Relaxed) {
-        let sessions: Vec<SessionAlerts> = plans
+        // The sessions running now: an edit applied in place changes them.
+        let running = watched
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        let plans: Vec<&SessionPlan> = running.iter().map(|(plan, _)| plan).collect();
+        let sessions: Vec<SessionAlerts> = running
             .iter()
-            .zip(published)
             .map(|(plan, published)| {
                 let status = published
                     .lock()
@@ -2229,9 +2548,8 @@ fn watch_alerts(
             // The same document `status --json` prints, so a hook that
             // wants more than the summary reads the seam that already
             // exists rather than a second one invented for it.
-            let selected: Vec<&SessionPlan> = plans.iter().collect();
             let document =
-                serde_json::to_string(&status_report(&selected, state_root)).unwrap_or_default();
+                serde_json::to_string(&status_report(&plans, state_root)).unwrap_or_default();
             dispatcher.dispatch(commands, environment, document, timeout);
         }
 
@@ -2815,6 +3133,64 @@ mod tests {
         assert!(read_status(directory.path(), "missing")
             .expect("a missing status should read as None")
             .is_none());
+    }
+
+    fn planned(root: &Path, groups: &[(&str, &str)]) -> Vec<SessionPlan> {
+        let mut text = String::new();
+        for (group, ignores) in groups {
+            let alpha = root.join(group);
+            std::fs::create_dir_all(&alpha).expect("created");
+            text.push_str(&format!(
+                "[groups.{group}]\nmode = \"two-way-safe\"\nalpha = \"{}\"\n\
+                 betas = [\"{}\"]\nignores = [{ignores}]\n",
+                alpha.display(),
+                root.join(format!("{group}-mirror")).display()
+            ));
+        }
+        crate::config::Config::parse(Path::new("config.toml"), &text)
+            .expect("parses")
+            .plans()
+            .expect("plans")
+    }
+
+    #[test]
+    fn an_edit_is_compared_session_by_session() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let running = planned(root.path(), &[("kept", ""), ("changed", ""), ("gone", "")]);
+        let next = planned(
+            root.path(),
+            &[("kept", ""), ("changed", "\"*.tmp\""), ("new", "")],
+        );
+        let id = |plans: &[SessionPlan], group: &str| {
+            plans
+                .iter()
+                .find(|plan| plan.group == group)
+                .expect("planned")
+                .identifier()
+        };
+        let changes = plan_changes(running.iter(), &next);
+        assert_eq!(
+            changes,
+            PlanChanges {
+                removed: vec![id(&running, "gone")],
+                changed: vec![id(&running, "changed")],
+                added: vec![id(&next, "new")],
+            }
+        );
+        assert!(!changes.stops(&id(&running, "kept")));
+        assert!(changes.stops(&id(&running, "changed")) && changes.restarts(&id(&next, "changed")));
+        assert!(changes.stops(&id(&running, "gone")) && !changes.restarts(&id(&running, "gone")));
+        let starting: Vec<String> = changes
+            .starting(&next)
+            .iter()
+            .map(|plan| plan.group.clone())
+            .collect();
+        assert_eq!(starting, ["changed", "new"]);
+        // The same plans again change nothing; none at all stops everything.
+        assert!(plan_changes(running.iter(), &running).is_empty());
+        let emptied = plan_changes(running.iter(), &[]);
+        assert_eq!(emptied.removed.len(), 3);
+        assert!(emptied.changed.is_empty() && emptied.added.is_empty());
     }
 
     #[test]

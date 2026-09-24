@@ -36,13 +36,24 @@ pub struct Loaded {
 }
 
 /// Loads a configuration and derives everything the supervisor runs from,
-/// refusing exactly what the supervisor would refuse at startup.
+/// refusing anything that would not run. A configuration with no sessions
+/// in it loads: every group disabled is something a running supervisor
+/// applies, by stopping every session. Starting one over it is refused by
+/// [`load_for_startup`].
 pub fn load(path: &Path) -> Result<Loaded> {
-    let configuration = Config::load(path)?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("unable to read configuration {}", path.display()))?;
+    load_bytes(path, &bytes)
+}
+
+/// Loads a configuration from bytes already read from `path`, so that what
+/// is validated is exactly what was read: the watch compares these bytes
+/// and records them as applied, and a second read could meet a later write.
+pub fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Loaded> {
+    let text = std::str::from_utf8(bytes)
+        .with_context(|| format!("unable to read configuration {}", path.display()))?;
+    let configuration = Config::parse(path, text)?;
     let plans = configuration.plans()?;
-    if plans.is_empty() {
-        anyhow::bail!("the configuration describes no sessions");
-    }
     let alerts = configuration.alert_plan()?;
     let log_level = configuration.log_level()?;
     Ok(Loaded {
@@ -51,6 +62,17 @@ pub fn load(path: &Path) -> Result<Loaded> {
         log_level,
         reload: configuration.reload,
     })
+}
+
+/// Loads a configuration to start a supervisor over, which is refused when
+/// it describes no sessions: a supervisor started with nothing to do is
+/// almost always a mistake. A running one applies the same configuration.
+pub fn load_for_startup(path: &Path) -> Result<Loaded> {
+    let loaded = load(path)?;
+    if loaded.plans.is_empty() {
+        anyhow::bail!("the configuration describes no sessions");
+    }
+    Ok(loaded)
 }
 
 /// A refused configuration: what was wrong with it, and when.
@@ -94,13 +116,18 @@ pub fn clear_notice(state_root: &Path) {
 pub struct Reloader {
     path: PathBuf,
     interval: Duration,
-    /// What the last edit loaded to, waiting for the caller to run it.
+    /// What the last edit loaded to, waiting for the supervisor (or, for a
+    /// change it cannot apply in place, its caller) to run it.
     pending: Mutex<Option<Loaded>>,
     /// The bytes the running configuration came from — or the last edit
     /// refused, which has been heard about. Kept across watches, so an
     /// edit made while no supervisor was watching (the alpha attached to
     /// a beta that led) is found by the next one.
     applied: Mutex<Option<Vec<u8>>>,
+    /// Runs between the read that settles an edit and its load, so a test
+    /// can write the file in between.
+    #[cfg(test)]
+    after_read: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 impl Reloader {
@@ -111,6 +138,8 @@ impl Reloader {
             interval: CONFIG_CHECK_INTERVAL,
             pending: Mutex::default(),
             applied: Mutex::new(applied),
+            #[cfg(test)]
+            after_read: Mutex::default(),
         }
     }
 
@@ -142,6 +171,20 @@ impl Reloader {
             .take()
     }
 
+    /// Leaves a taken edit for the caller after all: the supervisor took
+    /// it, found a change it cannot apply in place, and is winding down so
+    /// the caller can start again from it. A later edit already waiting
+    /// is newer, and stays.
+    pub(super) fn restore(&self, loaded: Loaded) {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if pending.is_none() {
+            *pending = Some(loaded);
+        }
+    }
+
     fn applied(&self) -> Option<Vec<u8>> {
         self.applied
             .lock()
@@ -156,21 +199,22 @@ impl Reloader {
             .unwrap_or_else(|error| error.into_inner()) = Some(bytes);
     }
 
-    /// Watches the file until `stop`, or until an edit loads: then the
-    /// new configuration is left in `take` and `halt` is raised so the
-    /// supervisor winds its workers down. An edit that does not load is
-    /// recorded and reported, and the watch goes on.
+    /// Watches the file until `stop`. An edit that loads is left in
+    /// `take` for the supervisor, which applies it to the sessions it
+    /// changes; one that does not load is recorded and reported. Either
+    /// way the watch goes on.
     ///
     /// The bytes are what is compared, not the mtime: an editor that saves
     /// twice in a second and a `touch` both leave the mtime a poor
     /// witness. An edit counts once it has read the same twice in a row,
     /// so a file caught half-written is read again rather than refused.
+    /// Those bytes are the ones loaded and recorded as applied: the file
+    /// is not read a third time.
     pub(super) fn watch(
         &self,
         state_root: &Path,
         alerts: &crate::alerts::AlertPlan,
         stop: &AtomicBool,
-        halt: &AtomicBool,
     ) {
         let mut seen: Option<Vec<u8>> = None;
         while !stop.load(Ordering::Relaxed) {
@@ -191,7 +235,16 @@ impl Reloader {
                 seen = Some(current);
                 continue;
             }
-            match load(&self.path) {
+            seen = None;
+            #[cfg(test)]
+            if let Some(hook) = &*self
+                .after_read
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+            {
+                hook();
+            }
+            match load_bytes(&self.path, &current) {
                 Ok(loaded) => {
                     crate::note!("configuration reloaded from {}", self.path.display());
                     self.set_applied(current);
@@ -200,8 +253,6 @@ impl Reloader {
                         .pending
                         .lock()
                         .unwrap_or_else(|error| error.into_inner()) = Some(loaded);
-                    halt.store(true, Ordering::Relaxed);
-                    return;
                 }
                 Err(error) => {
                     // Heard once: the same bytes are read again every few
@@ -288,12 +339,52 @@ mod tests {
     }
 
     #[test]
-    fn load_refuses_what_start_refuses() {
+    fn startup_refuses_a_configuration_with_no_sessions() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let path = root.path().join("config.toml");
         std::fs::write(&path, "").expect("written");
-        let error = load(&path).expect_err("no sessions is refused");
+        let error = load_for_startup(&path).expect_err("no sessions is refused at startup");
         assert!(format!("{error:#}").contains("no sessions"), "{error:#}");
+        let alpha = root.path().join("alpha");
+        std::fs::create_dir_all(&alpha).expect("created");
+        std::fs::write(
+            &path,
+            format!(
+                "{}disabled = true\n",
+                configuration(&alpha, &root.path().join("beta"))
+            ),
+        )
+        .expect("written");
+        let error = load_for_startup(&path).expect_err("every group disabled is refused");
+        assert!(format!("{error:#}").contains("no sessions"), "{error:#}");
+    }
+
+    #[test]
+    fn a_live_reload_loads_a_configuration_with_no_sessions() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let path = root.path().join("config.toml");
+        std::fs::write(&path, "").expect("written");
+        assert!(load(&path).expect("an empty file loads").plans.is_empty());
+        let alpha = root.path().join("alpha");
+        std::fs::create_dir_all(&alpha).expect("created");
+        std::fs::write(
+            &path,
+            format!(
+                "{}disabled = true\n",
+                configuration(&alpha, &root.path().join("beta"))
+            ),
+        )
+        .expect("written");
+        assert!(load(&path)
+            .expect("every group disabled loads")
+            .plans
+            .is_empty());
+    }
+
+    #[test]
+    fn load_refuses_what_start_refuses() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let path = root.path().join("config.toml");
         std::fs::write(&path, "reload = true\nmdoe = \"two-way-safe\"\n").expect("written");
         let error = load(&path).expect_err("an unknown key is refused");
         assert!(format!("{error:#}").contains("mdoe"), "{error:#}");
@@ -312,8 +403,8 @@ mod tests {
         assert!(!load(&path).expect("loads").reload);
     }
 
-    /// Runs one watch on its own thread until it returns or the deadline
-    /// passes, returning whether it raised `halt`.
+    /// Runs one watch on its own thread until an edit is pending or the
+    /// deadline passes, returning whether one is.
     fn watched(
         reloader: &Reloader,
         state_root: &Path,
@@ -321,19 +412,18 @@ mod tests {
         during: impl FnOnce(),
     ) -> bool {
         let stop = AtomicBool::new(false);
-        let halt = AtomicBool::new(false);
         let alerts = crate::alerts::AlertPlan::default();
         std::thread::scope(|scope| {
-            let watcher = scope.spawn(|| reloader.watch(state_root, &alerts, &stop, &halt));
+            let watcher = scope.spawn(|| reloader.watch(state_root, &alerts, &stop));
             during();
             let started = std::time::Instant::now();
-            while !watcher.is_finished() && started.elapsed() < deadline {
+            while !reloader.is_pending() && started.elapsed() < deadline {
                 std::thread::sleep(Duration::from_millis(10));
             }
             stop.store(true, Ordering::Relaxed);
             watcher.join().expect("the watch returns");
         });
-        halt.load(Ordering::Relaxed)
+        reloader.is_pending()
     }
 
     #[test]
@@ -349,26 +439,24 @@ mod tests {
         let reloader = Reloader::new(path.clone()).with_interval(Duration::from_millis(10));
 
         // Untouched, the watch stands: nothing loads, nothing is refused.
-        let halted = watched(&reloader, &state_root, Duration::from_millis(100), || {});
-        assert!(!halted);
-        assert!(!reloader.is_pending());
+        let pending = watched(&reloader, &state_root, Duration::from_millis(100), || {});
+        assert!(!pending);
         assert_eq!(read_notice(&state_root), None);
 
         // Broken: refused, recorded, and the watch stands.
-        let halted = watched(&reloader, &state_root, Duration::from_millis(300), || {
+        let pending = watched(&reloader, &state_root, Duration::from_millis(300), || {
             std::fs::write(&path, "[groups.work]\nmdoe = 1\n").expect("written");
         });
-        assert!(!halted, "a refused edit does not halt the workers");
-        assert!(!reloader.is_pending());
+        assert!(!pending, "a refused edit leaves nothing to run");
         let notice = read_notice(&state_root).expect("the refusal is recorded");
         assert!(notice.message.contains("mdoe"), "{}", notice.message);
         assert!(notice.at > 0);
 
-        // Fixed, with a second group: loads, and the workers are halted
-        // for the caller to run it.
+        // Fixed, with a second group: loads, and is left for the
+        // supervisor to run.
         let other = root.path().join("other");
         std::fs::create_dir_all(&other).expect("created");
-        let halted = watched(&reloader, &state_root, Duration::from_secs(5), || {
+        let pending = watched(&reloader, &state_root, Duration::from_secs(5), || {
             std::fs::write(
                 &path,
                 format!(
@@ -380,15 +468,15 @@ mod tests {
             )
             .expect("written");
         });
-        assert!(halted, "a loaded edit halts the workers");
+        assert!(pending, "a loaded edit is left to run");
         assert_eq!(read_notice(&state_root), None, "the refusal is over");
         let loaded = reloader.take().expect("the edit is pending");
         assert_eq!(loaded.plans.len(), 2);
         assert!(reloader.take().is_none(), "taken once");
 
         // The same bytes again are the running configuration, not an edit.
-        let halted = watched(&reloader, &state_root, Duration::from_millis(100), || {});
-        assert!(!halted);
+        let pending = watched(&reloader, &state_root, Duration::from_millis(100), || {});
+        assert!(!pending);
     }
 
     #[test]
@@ -405,8 +493,59 @@ mod tests {
         // edit is still an edit when it leads again.
         std::fs::write(&path, configuration(&alpha, &root.path().join("elsewhere")))
             .expect("written");
-        let halted = watched(&reloader, &state_root, Duration::from_secs(5), || {});
-        assert!(halted);
+        let pending = watched(&reloader, &state_root, Duration::from_secs(5), || {});
+        assert!(pending);
         assert!(reloader.take().is_some());
+    }
+
+    #[test]
+    fn what_is_applied_is_what_was_read_not_a_later_write() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let state_root = root.path().join("state");
+        std::fs::create_dir_all(&state_root).expect("created");
+        let alpha = root.path().join("alpha");
+        let other = root.path().join("other");
+        std::fs::create_dir_all(&alpha).expect("created");
+        std::fs::create_dir_all(&other).expect("created");
+        let path = root.path().join("config.toml");
+        let one = configuration(&alpha, &root.path().join("beta"));
+        std::fs::write(&path, &one).expect("written");
+        let reloader = Reloader::new(path.clone()).with_interval(Duration::from_millis(10));
+
+        // The edit read is two groups; the file then becomes three
+        // between that read and the load.
+        let two = format!(
+            "{one}[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            other.display(),
+            root.path().join("other-mirror").display()
+        );
+        let three = format!(
+            "{two}[groups.more]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            other.display(),
+            root.path().join("more-mirror").display()
+        );
+        {
+            let path = path.clone();
+            let three = three.clone();
+            *reloader.after_read.lock().expect("unpoisoned") = Some(Box::new(move || {
+                std::fs::write(&path, &three).expect("written");
+            }));
+        }
+        let pending = watched(&reloader, &state_root, Duration::from_secs(5), || {
+            std::fs::write(&path, &two).expect("written");
+        });
+        assert!(pending);
+        *reloader.after_read.lock().expect("unpoisoned") = None;
+        let loaded = reloader.take().expect("the edit is pending");
+        assert_eq!(loaded.plans.len(), 2, "the bytes read are the bytes loaded");
+        assert_eq!(
+            reloader.applied().as_deref(),
+            Some(two.as_bytes()),
+            "the bytes read are the bytes recorded as applied"
+        );
+        // The later write is an edit of its own, found by the next read.
+        let pending = watched(&reloader, &state_root, Duration::from_secs(5), || {});
+        assert!(pending);
+        assert_eq!(reloader.take().expect("pending").plans.len(), 3);
     }
 }

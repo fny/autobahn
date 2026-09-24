@@ -1495,9 +1495,10 @@ fn check_startable(config: Option<PathBuf>) -> Result<()> {
         Some(path) => path,
         None => paths::default_config_path()?,
     };
-    // The same checks the supervisor makes: at startup, and again on
-    // every edit while it runs.
-    let loaded = autobahn::supervisor::reload::load(&path)
+    // The same checks the supervisor makes at startup. A running one
+    // makes them again on every edit, but applies an edit that disables
+    // every session rather than refusing it.
+    let loaded = autobahn::supervisor::reload::load_for_startup(&path)
         .context("the configuration would stop the supervisor at startup")?;
     autobahn::config::OwnState::new(&paths::default_state_root()?, Some(&path))
         .check_plans(&loaded.plans)
@@ -1617,7 +1618,7 @@ fn run_watch(
             return autobahn::supervisor::peer::run(&directory, &state_root, !log, &stop);
         }
     }
-    let mut loaded = autobahn::supervisor::reload::load(&config_path)?;
+    let mut loaded = autobahn::supervisor::reload::load_for_startup(&config_path)?;
     // The file is watched while the sessions run, unless it says not to.
     let mut reloader = loaded.reload.then(|| {
         Arc::new(autobahn::supervisor::reload::Reloader::new(
@@ -1682,6 +1683,12 @@ fn run_watch(
                 } else {
                     Supervisor::new(loaded.plans.clone(), state_root.clone(), verbose)
                         .with_alerts(loaded.alerts.clone())
+                        .with_log_level(loaded.log_level)
+                        .with_shown(shown.clone())
+                        .with_own_state(autobahn::config::OwnState::new(
+                            &state_root,
+                            Some(&config_path),
+                        ))
                         .with_reload(reloader.clone())
                         .run_watch(&stop)?;
                 }
@@ -4105,6 +4112,9 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// What `status` says when the configuration leaves nothing to run.
+const NO_ACTIVE_SESSIONS: &str = "no active sessions (every group is disabled)";
+
 /// Shows the recorded status of the configured sessions.
 #[allow(clippy::too_many_arguments)]
 fn run_status(
@@ -4128,6 +4138,17 @@ fn run_status(
     };
     let state_root = resolve_state_root(state_root)?;
 
+    // Every group turned off is a state, not an error: a running
+    // supervisor applies it by stopping every session, and waits.
+    if plans.is_empty() && group.is_none() && host.is_none() {
+        if json {
+            let report = autobahn::supervisor::status_report(&[], &state_root);
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        } else {
+            println!("{NO_ACTIVE_SESSIONS}");
+        }
+        return Ok(());
+    }
     let selection = select(&plans, group.as_deref(), host.as_deref())?;
     let selected: Vec<_> = selection.plans;
     if live {

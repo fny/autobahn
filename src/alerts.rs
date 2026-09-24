@@ -477,7 +477,8 @@ impl Dispatcher {
         let environment = hook_environment(environment);
         std::thread::spawn(move || {
             for command in commands {
-                if let Err(error) = run(&command, &environment, &document, timeout) {
+                let log = |line: &str| crate::complain!("alert hook: {line}");
+                if let Err(error) = run(&command, &environment, &document, timeout, &log) {
                     eprintln!("alert hook failed: {error:#}");
                 }
             }
@@ -487,18 +488,33 @@ impl Dispatcher {
     }
 }
 
+/// The most of a hook's standard error that is logged per run, in bytes.
+pub const HOOK_STDERR_MAX: usize = 4096;
+
 /// Runs one hook command through the shell, giving it the report on
-/// standard input and killing it if it outstays its welcome.
+/// standard input, logging what it says on standard error, and killing it
+/// if it outstays its welcome.
+///
+/// The deadline covers the whole run. The report is written, and standard
+/// error read, on threads of their own: a hook that never reads its input,
+/// or writes more to standard error than a pipe holds, would otherwise
+/// block the write or itself, and every later alert would be skipped
+/// behind it. The hook leads a process group of its own, so a kill takes
+/// whatever it started, too.
 fn run(
     command: &str,
     environment: &[(String, String)],
     document: &str,
     timeout: Duration,
+    log: &dyn Fn(&str),
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::io::Write;
+    use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
+    use std::sync::mpsc;
 
+    let deadline = Instant::now() + timeout;
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(command)
@@ -506,32 +522,141 @@ fn run(
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
+        .process_group(0)
         .spawn()
         .with_context(|| format!("unable to run the alert hook {command:?}"))?;
 
     // The document goes in and the pipe closes, so a hook that reads to end
-    // of file is not left waiting for one.
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(document.as_bytes());
+    // of file is not left waiting for one. A hook that exits without
+    // reading it ends the write with a broken pipe.
+    let writer = child.stdin.take().map(|mut stdin| {
+        let document = document.to_owned();
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(document.as_bytes());
+        })
+    });
+    // Lines come back over a channel, so logging stays on this thread and
+    // the reader ends, closing the channel, when the last holder of the
+    // pipe has gone.
+    let (lines, logged) = mpsc::channel();
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::spawn(move || drain_stderr(stderr, &lines));
     }
+    let log_waiting = || {
+        while let Ok(line) = logged.try_recv() {
+            log(&line);
+        }
+    };
 
-    let deadline = Instant::now() + timeout;
-    loop {
+    let outcome = loop {
+        log_waiting();
         match child.try_wait() {
-            Ok(Some(status)) if status.success() => return Ok(()),
-            Ok(Some(status)) => anyhow::bail!("the alert hook {command:?} exited with {status}"),
+            Ok(Some(status)) => break Ok(status),
             Ok(None) => {}
-            Err(error) => return Err(error).context("unable to wait for the alert hook"),
+            Err(error) => {
+                kill_group(&mut child);
+                break Err(anyhow::Error::new(error).context("unable to wait for the alert hook"));
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!(
+            kill_group(&mut child);
+            break Err(anyhow::anyhow!(
                 "the alert hook {command:?} was killed after {} seconds",
-                timeout.as_secs()
-            );
+                timeout.as_secs_f32()
+            ));
         }
         std::thread::sleep(Duration::from_millis(20));
+    };
+
+    // The rest of what it said. Something it left running in the
+    // background may still hold the pipe; that is waited on only briefly,
+    // and the reader is left to finish on its own.
+    let grace = Instant::now() + HOOK_DRAIN_GRACE;
+    while let Ok(line) = logged.recv_timeout(grace.saturating_duration_since(Instant::now())) {
+        log(&line);
+    }
+    // Likewise the writer: with the hook gone the write fails at once,
+    // unless something left behind holds the pipe without reading it.
+    if let Some(writer) = writer {
+        while !writer.is_finished() && Instant::now() < grace {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if writer.is_finished() {
+            let _ = writer.join();
+        }
+    }
+
+    let status = outcome?;
+    if !status.success() {
+        anyhow::bail!("the alert hook {command:?} exited with {status}");
+    }
+    Ok(())
+}
+
+/// How long, once a hook has exited, its standard error is still read.
+const HOOK_DRAIN_GRACE: Duration = Duration::from_secs(1);
+
+/// Kills a hook's whole process group, then reaps the hook.
+fn kill_group(child: &mut std::process::Child) {
+    // The hook was spawned leading its own group, so its pid names the
+    // group. Negative: the group, not just the shell.
+    if let Ok(group) = libc::pid_t::try_from(child.id()) {
+        // SAFETY: kill has no memory effects; the group is the hook's own,
+        // made at spawn, and the hook is not yet reaped, so the id is not
+        // reused.
+        unsafe {
+            libc::kill(-group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Reads a hook's standard error to its end, sending each line on, made
+/// safe to log, until [`HOOK_STDERR_MAX`] bytes have been sent. Past that
+/// it keeps reading, so the hook never blocks on a full pipe, but sends
+/// only a marker, once, at the end.
+fn drain_stderr(mut stderr: impl std::io::Read, lines: &std::sync::mpsc::Sender<String>) {
+    let mut budget = HOOK_STDERR_MAX;
+    let mut line: Vec<u8> = Vec::new();
+    let mut truncated = false;
+    let mut chunk = [0u8; 8192];
+    let send = |line: &[u8]| {
+        let text = String::from_utf8_lossy(line);
+        let text = text.strip_suffix('\r').unwrap_or(&text);
+        if !text.is_empty() {
+            let _ = lines.send(hook_line(text));
+        }
+    };
+    loop {
+        let count = match stderr.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        if truncated {
+            continue;
+        }
+        for &byte in &chunk[..count] {
+            if byte == b'\n' {
+                send(&line);
+                line.clear();
+                continue;
+            }
+            if budget == 0 {
+                send(&line);
+                line.clear();
+                truncated = true;
+                break;
+            }
+            line.push(byte);
+            budget -= 1;
+        }
+    }
+    send(&line);
+    if truncated {
+        let _ = lines.send("… truncated".to_owned());
     }
 }
 
@@ -1330,7 +1455,7 @@ mod tests {
     #[test]
     fn a_hook_that_hangs_is_killed_rather_than_waited_on() {
         let started = Instant::now();
-        let error = run("sleep 60", &[], "", Duration::from_millis(300))
+        let error = run("sleep 60", &[], "", Duration::from_millis(300), &|_| {})
             .expect_err("a hook that outstays its timeout fails");
         assert!(format!("{error:#}").contains("killed"), "{error:#}");
         assert!(
@@ -1351,6 +1476,7 @@ mod tests {
             &[("AUTOBAHN_SUMMARY".into(), "work@a: 3 conflicts".into())],
             "{\"version\":2}",
             Duration::from_secs(10),
+            &|_| {},
         )
         .expect("the hook runs");
         assert_eq!(
@@ -1617,5 +1743,119 @@ mod tests {
     fn the_shipped_example_is_the_unsafe_one() {
         assert!(shipped_example().contains(UNSAFE_OSASCRIPT_LINE));
         assert!(!crate::config::ON_ALERT_EXAMPLE.contains(UNSAFE_OSASCRIPT_LINE));
+    }
+
+    /// Runs a hook on its own thread, collecting what it logs, and fails
+    /// the test rather than hanging it if the hook is not over by `limit`.
+    fn run_within(
+        limit: Duration,
+        command: &str,
+        document: String,
+        timeout: Duration,
+    ) -> (anyhow::Result<()>, Vec<String>) {
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let command = command.to_owned();
+        std::thread::spawn(move || {
+            let logged = std::sync::Mutex::new(Vec::new());
+            let result = run(&command, &[], &document, timeout, &|line| {
+                logged.lock().unwrap().push(line.to_owned())
+            });
+            let _ = sender.send((result, logged.into_inner().unwrap()));
+        });
+        receiver
+            .recv_timeout(limit)
+            .expect("the hook run must end by its deadline")
+    }
+
+    /// A hook that never reads its standard input, handed a report larger
+    /// than a pipe holds, is still killed at its deadline, and the next
+    /// alert still runs.
+    #[test]
+    fn a_hook_that_ignores_a_large_report_is_killed_at_its_deadline() {
+        let started = Instant::now();
+        let (result, _) = run_within(
+            Duration::from_secs(10),
+            "sleep 60",
+            "x".repeat(1 << 20),
+            Duration::from_millis(300),
+        );
+        let error = result.expect_err("the hook outstays its timeout");
+        assert!(format!("{error:#}").contains("killed"), "{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let (result, _) = run_within(
+            Duration::from_secs(10),
+            "true",
+            String::new(),
+            Duration::from_secs(5),
+        );
+        result.expect("the next hook runs");
+    }
+
+    /// What a hook says on standard error reaches the log, a line at a
+    /// time, made safe to show.
+    #[test]
+    fn a_hooks_standard_error_is_logged() {
+        let (result, logged) = run_within(
+            Duration::from_secs(10),
+            "printf 'one\\ntwo\\n' >&2; printf 'th\\033ree' >&2",
+            String::new(),
+            Duration::from_secs(5),
+        );
+        result.expect("the hook runs");
+        assert_eq!(logged, vec!["one", "two", "th\\x1bree"]);
+    }
+
+    /// A hook that writes without end to standard error neither blocks on
+    /// a full pipe nor fills the log.
+    #[test]
+    fn a_hooks_standard_error_is_capped_and_never_blocks_it() {
+        let (result, logged) = run_within(
+            Duration::from_secs(20),
+            "yes 'a line of complaint' | head -c 10000000 >&2",
+            String::new(),
+            Duration::from_secs(15),
+        );
+        result.expect("the hook runs to the end");
+        let bytes: usize = logged.iter().map(String::len).sum();
+        assert!(bytes <= HOOK_STDERR_MAX + 64, "{bytes} bytes logged");
+        assert_eq!(logged.last().map(String::as_str), Some("… truncated"));
+    }
+
+    /// Killing a hook kills what it started, not just the shell.
+    #[test]
+    fn a_hook_killed_at_its_deadline_takes_its_children_with_it() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let pid_file = directory.path().join("pid");
+        let (result, _) = run_within(
+            Duration::from_secs(10),
+            &format!(
+                "sleep 60 & echo $! > {}; wait",
+                crate::text::shell_quote(&pid_file.display().to_string())
+            ),
+            String::new(),
+            Duration::from_millis(500),
+        );
+        result.expect_err("the hook outstays its timeout");
+        let pid = std::fs::read_to_string(&pid_file)
+            .expect("the hook wrote its child's pid")
+            .trim()
+            .to_owned();
+        // Dead, or a zombie waiting for init to reap it.
+        let alive = || {
+            std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .map(|stat| {
+                    let state = stat.rsplit(')').next().unwrap_or("").trim_start();
+                    !state.starts_with('Z')
+                })
+                .unwrap_or(false)
+        };
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if alive() {
+            let _ = std::process::Command::new("kill").arg(&pid).status();
+            panic!("the hook's child {pid} outlived it");
+        }
     }
 }

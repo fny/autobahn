@@ -184,6 +184,32 @@ impl IgnoreSet {
         !self.reachable.is_empty() && self.reachable.contains(path)
     }
 
+    /// Whether an entry is ignored, given whether its parent lies inside
+    /// an ignored region. Outside one the patterns decide as usual.
+    /// Inside one, the question inverts: everything is ignored except what
+    /// a negation explicitly re-includes.
+    pub fn ignored_within(&self, path: &str, is_directory: bool, within_ignored: bool) -> bool {
+        match within_ignored {
+            true => !self.re_included(path, is_directory),
+            false => self.ignored(path, is_directory),
+        }
+    }
+
+    /// How a walk treats an entry: `None` when it is left out, otherwise
+    /// whether it is itself inside an ignored region — ignored, but walked
+    /// because it is a directory holding a re-inclusion.
+    ///
+    /// The one traversal policy. The scanner decides what it descends into
+    /// with it, and the watcher decides what it watches with it, so the
+    /// two agree on which directories can hold a synchronized change.
+    pub fn traversal(&self, path: &str, is_directory: bool, within_ignored: bool) -> Option<bool> {
+        let ignored = self.ignored_within(path, is_directory, within_ignored);
+        match ignored && !(is_directory && self.holds_a_re_inclusion(path)) {
+            true => None,
+            false => Some(ignored),
+        }
+    }
+
     /// Inside an ignored region, whether an explicit negation saves this
     /// entry. Everything else in the region is ignored by virtue of where
     /// it is, so the question is not "does anything ignore it" but "does

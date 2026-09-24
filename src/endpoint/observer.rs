@@ -35,6 +35,12 @@
 //! while that generation still stands. There is no staleness window to tune:
 //! a quiet tree serves one snapshot indefinitely, and the first event forces
 //! exactly one fresh scan that every waiting session then shares.
+//!
+//! That reasoning needs a watch covering the whole tree: without one, an
+//! external write moves no generation. So a root that is not watched, or
+//! is watched only in part, reuses nothing, and every scan walks — though
+//! a walk begun after a caller asked serves that caller too, so callers
+//! arriving together still share one.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -127,9 +133,13 @@ struct State {
     watcher: Option<crate::endpoint::local::ChangeWatcher>,
     /// When to next attempt a watch that failed.
     watch_retry_after: Option<Instant>,
-    /// The published scan and the generation it was taken at. Served while
-    /// that generation still stands.
-    published: Option<(u64, Snapshot)>,
+    /// The published scan. Served while its generation still stands and a
+    /// healthy watcher stands behind that generation, or to a caller that
+    /// arrived before its walk began.
+    published: Option<Published>,
+    /// How many walks have begun, so a caller can tell a walk that began
+    /// after it asked from one already under way.
+    walks_begun: u64,
     /// The tree a scan starts from, which is what makes it incremental.
     /// Advanced by a scan, and by a transition folding what it achieved.
     baseline: Option<Snapshot>,
@@ -142,6 +152,30 @@ struct State {
     /// Set while a scan is running, so concurrent callers wait for it
     /// rather than each walking the tree.
     scanning: bool,
+}
+
+/// A published scan.
+struct Published {
+    /// The generation the scan was taken at.
+    generation: u64,
+    snapshot: Snapshot,
+    /// Which walk produced it, counted by [`State::walks_begun`].
+    walk: u64,
+}
+
+/// Holds a scan as running for as long as it lives. Dropping it — on
+/// success, on an error, or while a panic unwinds out of the walk — lets
+/// the next caller in, so nobody waits out the timeout on a scan that is
+/// no longer running.
+struct Scanning<'a>(&'a RootObserver);
+
+impl Drop for Scanning<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.scanning = false;
+        drop(state);
+        self.0.scanned.notify_all();
+    }
 }
 
 /// One root, observed once on behalf of every session that synchronizes it.
@@ -173,6 +207,10 @@ pub struct RootObserver {
     /// because no kernel event ever arrives to stamp a stale publication.
     #[cfg(test)]
     pub(crate) suppress_watching: std::sync::atomic::AtomicBool,
+    /// A test seam that fails the next walk once, after it has taken its
+    /// dirty marks: the moment a failure could lose them.
+    #[cfg(test)]
+    pub(crate) fail_walk: std::sync::atomic::AtomicBool,
 }
 
 impl RootObserver {
@@ -182,11 +220,23 @@ impl RootObserver {
     }
 
     /// Whether the root is being watched, as opposed to polled: only then
-    /// does a generation that did not move mean nothing changed.
+    /// does a generation that did not move mean nothing changed. A watch
+    /// that has stopped covering the tree — part of it could not be
+    /// watched, or the root was replaced — is not watching.
     pub fn is_watching(&self) -> bool {
         self.ensure_watching();
         let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        state.watcher.is_some()
+        Self::watched(&state)
+    }
+
+    /// Whether a watcher stands behind the generation, whole: the one
+    /// condition under which a generation that did not move proves the
+    /// tree did not either.
+    fn watched(state: &State) -> bool {
+        state
+            .watcher
+            .as_ref()
+            .is_some_and(|watcher| watcher.fault().is_none())
     }
 
     /// Waits until the generation moves past `seen`, or the timeout expires.
@@ -266,8 +316,40 @@ impl RootObserver {
             return;
         }
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.watcher.is_some() {
-            return;
+        if let Some(watcher) = state.watcher.as_ref() {
+            use crate::endpoint::local::WatchFault;
+            match watcher.fault() {
+                None => return,
+                // A watch on a directory that is no longer the root sees
+                // nothing that is synchronized. It is rebuilt at once: a
+                // replaced root needs a full walk anyway, and nothing
+                // suggests the host is at its watch limit.
+                Some(WatchFault::Replaced) => {
+                    eprintln!(
+                        "[{}] the root was replaced; watching it afresh",
+                        self.key.root.display()
+                    );
+                    state.watcher = None;
+                    state.watch_retry_after = None;
+                }
+                // Part of the tree is unwatched, so the watch proves
+                // nothing about it. Polling takes over, and the watch is
+                // rebuilt whole after the usual backoff: the usual cause is
+                // the watch limit, which an immediate retry only meets
+                // again. Said once; the rebuild says when it succeeds.
+                Some(WatchFault::Incomplete(reason)) => {
+                    eprintln!(
+                        "[{}] part of the tree could not be watched ({reason}); falling back \
+                         to interval polling, rebuilding the watch every {}s",
+                        self.key.root.display(),
+                        WATCH_RETRY_INTERVAL.as_secs()
+                    );
+                    state.watcher = None;
+                    state.last_full_scan = None;
+                    state.watch_retry_after = Some(Instant::now() + WATCH_RETRY_INTERVAL);
+                    return;
+                }
+            }
         }
         if let Some(retry_after) = state.watch_retry_after {
             if Instant::now() < retry_after {
@@ -301,7 +383,15 @@ impl RootObserver {
                         WATCH_RETRY_INTERVAL.as_secs()
                     );
                 }
-                state.watch_retry_after = Some(Instant::now() + WATCH_RETRY_INTERVAL);
+                // A root that is missing — moved aside, say, with its
+                // replacement still being copied — is not a watch limit,
+                // so it is tried again at the next opportunity rather than
+                // after the backoff.
+                let retry_in = match std::fs::symlink_metadata(&self.key.root) {
+                    Ok(_) => WATCH_RETRY_INTERVAL,
+                    Err(_) => Duration::ZERO,
+                };
+                state.watch_retry_after = Some(Instant::now() + retry_in);
             }
         }
     }
@@ -341,20 +431,34 @@ impl RootObserver {
         progress: Option<&crate::progress::SideProgress>,
     ) -> Result<(Snapshot, u64)> {
         self.ensure_watching();
+        // The walks already begun when this caller arrived. A walk begun
+        // after it is as fresh as one of its own.
+        let mut arrived = None;
 
         loop {
-            let (baseline, behavior, want_full) = {
+            let (baseline, behavior, want_full, walk, running) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let arrived = *arrived.get_or_insert(state.walks_begun);
 
                 // Serve the published scan while its generation still
                 // stands: nothing has happened to the tree since it was
-                // taken, so a fresh walk could only reproduce it.
+                // taken, so a fresh walk could only reproduce it. That
+                // holds only while a whole watch stands behind the
+                // generation; without one an external write never moves
+                // it, so every scan walks, which is the polling a root
+                // without a watch is promised. A walk that began after this
+                // caller arrived serves it either way, so callers waiting
+                // on one walk share it.
                 // A verifying scan never serves the cache: the re-read is
                 // the entire point.
                 if !rehash {
-                    if let Some((taken_at, snapshot)) = &state.published {
-                        if *taken_at == self.signal.current() && !self.full_scan_due(&state) {
-                            return Ok((snapshot.clone(), *taken_at));
+                    if let Some(published) = &state.published {
+                        let current = published.generation == self.signal.current()
+                            && !self.full_scan_due(&state)
+                            && Self::watched(&state);
+                        if current || published.walk > arrived {
+                            self.within_limit(&published.snapshot, max_entry_count)?;
+                            return Ok((published.snapshot.clone(), published.generation));
                         }
                     }
                 }
@@ -373,11 +477,14 @@ impl RootObserver {
                     state.behavior = Some(scan::probe(&self.key.root));
                 }
                 state.scanning = true;
+                state.walks_begun += 1;
                 let want_full = rehash || self.full_scan_due(&state);
                 (
                     state.baseline.clone(),
                     state.behavior.unwrap_or_default(),
                     want_full,
+                    state.walks_begun,
+                    Scanning(self),
                 )
             };
 
@@ -395,26 +502,27 @@ impl RootObserver {
             }
 
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            state.scanning = false;
-            self.scanned.notify_all();
-            let (snapshot, taken_at, was_full) = result?;
+            // An incremental walk has taken the watcher's dirty marks by
+            // now. If it cannot publish, the next scan is full: that reads
+            // everything the marks named, where putting them back could
+            // only race the events recorded since.
+            let (snapshot, taken_at, was_full) = match result {
+                Ok(walked) => walked,
+                Err(error) => {
+                    state.last_full_scan = None;
+                    return Err(error);
+                }
+            };
             if was_full {
                 state.last_full_scan = Some(Instant::now());
             }
 
-            // The entry limit guards against synchronizing the wrong tree
-            // entirely, so exceeding it fails rather than making partial
-            // progress on a probable mistake. Checked per caller, since
-            // sessions may configure different limits over one root.
-            if let Some(limit) = max_entry_count {
-                let entries = snapshot.directories + snapshot.files + snapshot.symlinks;
-                if entries > limit {
-                    bail!(
-                        "the scan of {} found {entries} entries, exceeding the configured \
-                         limit of {limit}",
-                        self.key.root.display()
-                    );
+            // A refused scan updates nothing, and loses no marks either.
+            if let Err(error) = self.within_limit(&snapshot, max_entry_count) {
+                if !was_full {
+                    state.last_full_scan = None;
                 }
+                return Err(error);
             }
 
             // Persist only when the hierarchy actually changed: an unchanged
@@ -431,9 +539,38 @@ impl RootObserver {
 
             state.baseline = Some(snapshot.clone());
             state.baseline_generation = taken_at;
-            state.published = Some((taken_at, snapshot.clone()));
+            state.published = Some(Published {
+                generation: taken_at,
+                snapshot: snapshot.clone(),
+                walk,
+            });
+            // The state lock is released before the scan is: `running`
+            // takes it again to let the next caller in.
+            drop(state);
+            drop(running);
             return Ok((snapshot, taken_at));
         }
+    }
+
+    /// Refuses a snapshot with more entries than the caller's limit.
+    ///
+    /// The entry limit guards against synchronizing the wrong tree
+    /// entirely, so exceeding it fails rather than making partial progress
+    /// on a probable mistake. Checked per caller and on every return,
+    /// cached or walked, since sessions sharing one root may configure
+    /// different limits.
+    fn within_limit(&self, snapshot: &Snapshot, max_entry_count: Option<u64>) -> Result<()> {
+        if let Some(limit) = max_entry_count {
+            let entries = snapshot.directories + snapshot.files + snapshot.symlinks;
+            if entries > limit {
+                bail!(
+                    "the scan of {} found {entries} entries, exceeding the configured limit of \
+                     {limit}",
+                    self.key.root.display()
+                );
+            }
+        }
+        Ok(())
     }
 
     fn full_scan_due(&self, state: &State) -> bool {
@@ -463,12 +600,21 @@ impl RootObserver {
             None
         } else {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-            let watcher = state.watcher.as_mut();
-            match (watcher, baseline) {
-                (Some(watcher), Some(_)) => watcher.take_dirty(&self.key.root, behavior),
+            // Only a whole watch's marks can stand for what changed.
+            let watched = Self::watched(&state);
+            match (state.watcher.as_mut(), baseline) {
+                (Some(watcher), Some(_)) if watched => watcher.take_dirty(&self.key.root, behavior),
                 _ => None,
             }
         };
+
+        #[cfg(test)]
+        if self
+            .fail_walk
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            bail!("an injected walk failure");
+        }
 
         let snapshot = scan::scan(
             &self.key.root,
@@ -631,6 +777,7 @@ pub fn observer_for(
             watcher: None,
             watch_retry_after: None,
             published: None,
+            walks_begun: 0,
             baseline: None,
             baseline_generation: 0,
             last_full_scan: None,
@@ -643,6 +790,8 @@ pub fn observer_for(
         after_walk: Mutex::new(None),
         #[cfg(test)]
         suppress_watching: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        fail_walk: std::sync::atomic::AtomicBool::new(false),
     });
     // A cold start seeds the baseline from the persisted cache, so the first
     // scan of a process re-digests only what changed since the last one.
@@ -738,28 +887,330 @@ mod tests {
     // sweep of operation sequences.
 
     fn harness_observer(root: &std::path::Path) -> Arc<RootObserver> {
-        let cache = root.parent().expect("parent").join(format!(
-            "cache-{}-{}",
-            std::process::id(),
-            root.file_name().and_then(|n| n.to_str()).unwrap_or("root")
-        ));
-        let observer = observer_for(
-            ObserverKey {
-                root: canonical_root(root),
-                ignores: String::new(),
-                symlink_mode: crate::scan::SymlinkMode::default(),
-                max_file_size: None,
-                ignore_mounts: true,
-            },
-            IgnoreSet::new(&[]).expect("ignores"),
-            cache,
-        );
+        let observer = observer_with(root, &[]);
         // Watched, as a continuous session's root is: only then are scans
         // incremental, and dirty marks — what a stale baseline can hide a
         // change behind — come into play at all.
         observer.want_watching();
         assert!(observer.is_watching(), "the harness root is watched");
         observer
+    }
+
+    /// An observer over `root` with the given ignore patterns, not yet
+    /// asked to watch.
+    fn observer_with(root: &std::path::Path, patterns: &[&str]) -> Arc<RootObserver> {
+        let cache = root.parent().expect("parent").join(format!(
+            "cache-{}-{}",
+            std::process::id(),
+            root.file_name().and_then(|n| n.to_str()).unwrap_or("root")
+        ));
+        let ignores = IgnoreSet::new(
+            &patterns
+                .iter()
+                .map(|pattern| pattern.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .expect("ignores");
+        observer_for(
+            ObserverKey {
+                root: canonical_root(root),
+                ignores: ignores.key(),
+                symlink_mode: crate::scan::SymlinkMode::default(),
+                max_file_size: None,
+                ignore_mounts: true,
+            },
+            ignores,
+            cache,
+        )
+    }
+
+    /// The node at a root-relative path, if the snapshot records one.
+    fn node_at<'s>(snapshot: &'s Snapshot, path: &str) -> Option<&'s crate::tree::Node> {
+        let mut current = snapshot.root.as_ref();
+        for component in path.split('/') {
+            current = current.and_then(|node| node.child(component));
+        }
+        current
+    }
+
+    fn digest_at(snapshot: &Snapshot, path: &str) -> Option<crate::tree::Digest> {
+        match &node_at(snapshot, path)?.content {
+            crate::tree::Content::File { digest, .. } => Some(*digest),
+            _ => None,
+        }
+    }
+
+    /// Waits for `condition`, polling, for up to ten seconds.
+    fn eventually(mut condition: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            if condition() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    }
+
+    /// Scans until the watcher is quiet, so every kernel event in flight
+    /// has been consumed. Returns the last scan.
+    fn settle(observer: &RootObserver) -> Snapshot {
+        let (mut snapshot, mut generation) = observer.scan(None, None).expect("scans");
+        for _ in 0..50 {
+            std::thread::sleep(Duration::from_millis(100));
+            if observer.generation() == generation {
+                return snapshot;
+            }
+            (snapshot, generation) = observer.scan(None, None).expect("scans");
+        }
+        panic!("the root never went quiet");
+    }
+
+    /// Writes `contents` at `path`, and waits for the watcher to report
+    /// it before returning, so the next scan consumes every mark it left.
+    fn write_observed(observer: &RootObserver, path: &std::path::Path, contents: &str) {
+        let before = observer.generation();
+        std::fs::write(path, contents).expect("writes");
+        assert!(
+            observer.await_change(before, Duration::from_secs(10)),
+            "the write to {} was never observed",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // ── what a scan serves, and when ─────────────────────────────────
+
+    /// Finding M-24: without a watcher, nothing advances the generation
+    /// for an external write, so a cached snapshot would be served until
+    /// the full walk. Every scan walks instead — both when the watcher is
+    /// unavailable and when nobody asked for one (a one-shot run).
+    #[test]
+    fn an_unwatched_root_scans_an_unannounced_write() {
+        for suppressed in [true, false] {
+            let keep = tempfile::tempdir().expect("tempdir");
+            let root = keep.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            std::fs::write(root.join("old.txt"), b"old").expect("writes");
+            let observer = observer_with(&root, &[]);
+            if suppressed {
+                observer
+                    .suppress_watching
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                observer.want_watching();
+            }
+            assert!(!observer.is_watching());
+
+            let (first, _) = observer.scan(None, None).expect("scans");
+            assert!(node_at(&first, "new.txt").is_none());
+            std::fs::write(root.join("new.txt"), b"new").expect("writes");
+            let (second, _) = observer.scan(None, None).expect("scans");
+            assert!(
+                node_at(&second, "new.txt").is_some(),
+                "an unwatched root served a stale snapshot (suppressed: {suppressed})"
+            );
+        }
+    }
+
+    /// Finding M-23: the observer is shared across sessions with
+    /// different entry limits, so a snapshot a generous session warmed
+    /// must still be refused to a strict one — in either order.
+    #[test]
+    fn the_entry_limit_holds_for_a_cached_scan_in_either_order() {
+        for strict_first in [true, false] {
+            let keep = tempfile::tempdir().expect("tempdir");
+            let root = keep.path().join("root");
+            std::fs::create_dir(&root).expect("root");
+            for name in ["a", "b", "c"] {
+                std::fs::write(root.join(name), name).expect("writes");
+            }
+            let observer = harness_observer(&root);
+            if strict_first {
+                assert!(observer.scan(Some(1), None).is_err());
+                assert!(observer.scan(None, None).is_ok());
+            } else {
+                settle(&observer);
+            }
+            let error = observer
+                .scan(Some(1), None)
+                .expect_err("a cached scan must honour the caller's limit");
+            assert!(error.to_string().contains("limit"), "{error:#}");
+            assert!(observer.scan(Some(100), None).is_ok());
+        }
+    }
+
+    /// Finding M-28: a walk that fails has already taken the dirty marks
+    /// it was given. The next scan must still see the change they named.
+    #[test]
+    fn a_failed_walk_keeps_the_changes_it_consumed() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        write_observed(&observer, &root.join("file.txt"), "after!");
+        observer.invalidate(["file.txt"]);
+        observer
+            .fail_walk
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(observer.scan(None, None).is_err(), "the injected failure");
+
+        let (fresh, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&fresh, "file.txt"),
+            Some(*blake3::hash(b"after!").as_bytes()),
+            "the change a failed walk consumed was lost"
+        );
+    }
+
+    /// Finding M-28, the entry-limit half: a refused scan updates
+    /// nothing, and loses nothing either.
+    #[test]
+    fn a_refused_scan_keeps_the_changes_it_consumed() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        write_observed(&observer, &root.join("file.txt"), "after!");
+        observer.invalidate(["file.txt"]);
+        assert!(observer.scan(Some(1), None).is_err(), "the limit refuses");
+
+        let (fresh, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&fresh, "file.txt"),
+            Some(*blake3::hash(b"after!").as_bytes()),
+            "the change a refused scan consumed was lost"
+        );
+    }
+
+    /// Finding L-27: a walk that panics must not leave the scan marked as
+    /// running, or every later caller waits out the 60-second timeout.
+    #[test]
+    fn a_panicking_walk_does_not_hold_the_next_scan() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        let observer = harness_observer(&root);
+        *observer.after_walk.lock().unwrap() = Some(Box::new(|| panic!("an injected panic")));
+        let panicking = Arc::clone(&observer);
+        assert!(std::thread::spawn(move || panicking.scan(None, None))
+            .join()
+            .is_err());
+        // The panic unwound through the seam's own lock.
+        *observer
+            .after_walk
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let second = Arc::clone(&observer);
+        std::thread::spawn(move || {
+            let _ = sender.send(second.scan(None, None).is_ok());
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "a scan after a panicking walk waited for it"
+        );
+    }
+
+    // ── what the watch covers ───────────────────────────────────────
+
+    /// Finding M-25: the scanner walks into an ignored directory that
+    /// holds a re-inclusion, so the watch must too, or an edit to the
+    /// re-included file waits for the full walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_edit_under_a_re_inclusion_reaches_an_incremental_scan() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(root.join("vendor/deeper")).expect("root");
+        std::fs::write(root.join("vendor/keep.txt"), b"before").expect("writes");
+        std::fs::write(root.join("vendor/deeper/keep.txt"), b"before").expect("writes");
+        std::fs::write(root.join("vendor/other.txt"), b"ignored").expect("writes");
+        let observer = observer_with(&root, &["vendor", "!vendor/keep.txt"]);
+        observer.want_watching();
+        assert!(observer.is_watching());
+        let first = settle(&observer);
+        assert!(digest_at(&first, "vendor/keep.txt").is_some());
+
+        write_observed(&observer, &root.join("vendor/keep.txt"), "after!");
+        let (fresh, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&fresh, "vendor/keep.txt"),
+            Some(*blake3::hash(b"after!").as_bytes())
+        );
+    }
+
+    /// Finding M-26: a directory that appears after the watch was built
+    /// and cannot be watched leaves the observer partly watched. It must
+    /// then say it is not watching, and scans must walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_watch_that_cannot_extend_falls_back_to_polling() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        let observer = harness_observer(&root);
+        settle(&observer);
+        observer
+            .state
+            .lock()
+            .unwrap()
+            .watcher
+            .as_ref()
+            .expect("watching")
+            .fail_extension
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        std::fs::create_dir(root.join("fresh")).expect("creates");
+        assert!(
+            eventually(|| !observer.is_watching()),
+            "a watch that failed to extend still reports itself whole"
+        );
+        std::fs::write(root.join("fresh/unwatched.txt"), b"new").expect("writes");
+        let (fresh, _) = observer.scan(None, None).expect("scans");
+        assert!(node_at(&fresh, "fresh/unwatched.txt").is_some());
+    }
+
+    /// Finding M-27: a root moved aside and replaced by a copy left the
+    /// watch on the old directory. The replacement must be noticed, and
+    /// a later edit must arrive without waiting for the full walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_replaced_root_is_watched_afresh() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        // The copy lands only after the move has been noticed, as a
+        // `cp -a` of any size does: a new root already in place when the
+        // move's event arrives is re-watched by accident.
+        std::fs::rename(&root, keep.path().join("root.old")).expect("moves");
+        assert!(
+            eventually(|| !observer.is_watching()),
+            "a watch on a root moved aside still reports itself whole"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let replaced = settle(&observer);
+        assert!(digest_at(&replaced, "file.txt").is_some());
+
+        write_observed(&observer, &root.join("file.txt"), "after!");
+        let (fresh, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&fresh, "file.txt"),
+            Some(*blake3::hash(b"after!").as_bytes())
+        );
     }
 
     fn digest_of(snapshot: &Snapshot, name: &str) -> crate::tree::Digest {

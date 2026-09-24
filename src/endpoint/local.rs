@@ -211,14 +211,20 @@ impl PendingChanges {
 }
 
 /// Watches `start` and every directory beneath it that the scanner would
-/// visit, one non-recursive watch each, skipping ignored directories and
-/// never following symbolic links.
+/// visit, one non-recursive watch each, never following symbolic links.
+///
+/// Which directories the scanner visits is [`IgnoreSet::traversal`]'s
+/// answer, asked here exactly as the scanner asks it: an ignored directory
+/// is skipped, unless a negation re-includes something inside it, in which
+/// case it is watched as part of an ignored region.
 ///
 /// A directory that vanished or cannot be read is skipped, exactly as the
 /// backend's own recursive walk skips it. Anything else — the kernel's
 /// watch limit above all — fails the whole watch, so the observer falls
 /// back to polling and says so, rather than watching part of the tree in
 /// silence.
+///
+/// [`IgnoreSet::traversal`]: crate::scan::IgnoreSet::traversal
 #[cfg(target_os = "linux")]
 fn watch_tree(
     watcher: &Mutex<notify::RecommendedWatcher>,
@@ -238,18 +244,27 @@ fn watch_tree(
         }
         Some(parts.join("/"))
     };
-    let mut stack = vec![start.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        // Ignores are consulted on the way in, as the scanner does. A name
-        // that cannot be expressed cannot be matched, and is watched — the
-        // safe direction.
-        if dir != root {
-            if let Some(relative) = relative(&dir) {
-                if ignores.ignored(&relative, true) {
-                    continue;
-                }
+    // Where the walk starts, it has to know the region it is in, so the
+    // policy is asked of every directory from the root down, as the
+    // scanner reaches them. A start the scanner never reaches is not
+    // watched. A name that cannot be expressed cannot be matched, and is
+    // watched outside any region — the safe direction.
+    let mut region = false;
+    if let Some(relative) = relative(start).filter(|relative| !relative.is_empty()) {
+        let mut prefix = String::new();
+        for name in relative.split('/') {
+            if !prefix.is_empty() {
+                prefix.push('/');
+            }
+            prefix.push_str(name);
+            match ignores.traversal(&prefix, true, region) {
+                Some(inside) => region = inside,
+                None => return Ok(()),
             }
         }
+    }
+    let mut stack = vec![(start.to_path_buf(), region)];
+    while let Some((dir, region)) = stack.pop() {
         if let Err(error) = watcher
             .lock()
             .expect("the watcher lock is never poisoned")
@@ -276,14 +291,41 @@ fn watch_tree(
             let path = entry.path();
             // `symlink_metadata`, so a link to a directory is not a
             // directory here: the watch never follows links.
-            if fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            if !fs::symlink_metadata(&path).is_ok_and(|metadata| {
                 metadata.is_dir() && device.is_none_or(|device| metadata.dev() == device)
             }) {
-                stack.push(path);
+                continue;
             }
+            // Ignores are consulted on the way in, as the scanner does.
+            let inside = match relative(&path) {
+                Some(relative) => match ignores.traversal(&relative, true, region) {
+                    Some(inside) => inside,
+                    None => continue,
+                },
+                None => region,
+            };
+            stack.push((path, inside));
         }
     }
     Ok(())
+}
+
+/// Why a watcher no longer covers what the scanner reads.
+pub(crate) enum WatchFault {
+    /// The root is no longer the directory the watch was built on: it was
+    /// moved aside, removed, or replaced by a copy.
+    Replaced,
+    /// A directory that appeared could not be watched — the kernel's
+    /// watch limit, most likely — so part of the tree goes unwatched.
+    Incomplete(String),
+}
+
+/// The identity of the directory at `root`, so a watch can tell when the
+/// root it was built on has been replaced.
+fn directory_identity(root: &Path) -> Option<(u64, u64)> {
+    fs::metadata(root)
+        .ok()
+        .map(|metadata| (metadata.dev(), metadata.ino()))
 }
 
 /// A filesystem watcher over the synchronization root, recording changed
@@ -309,6 +351,17 @@ pub(crate) struct ChangeWatcher {
     _watcher: notify::RecommendedWatcher,
     /// The changed paths recorded since the last scan consumed them.
     pending: Arc<Mutex<PendingChanges>>,
+    /// The root watched, and the identity of the directory it was when
+    /// the watch was built.
+    root: PathBuf,
+    root_identity: Option<(u64, u64)>,
+    /// The first failure to extend the watch to a directory that
+    /// appeared, if any. Once set, the watch is partial.
+    incomplete: Arc<Mutex<Option<String>>>,
+    /// A test seam that makes extending the watch to a new directory
+    /// fail, as the kernel's watch limit would.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fail_extension: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PendingChanges {
@@ -348,6 +401,7 @@ impl ChangeWatcher {
         notify: impl Fn() + Send + 'static,
     ) -> Result<ChangeWatcher> {
         use notify::Watcher;
+        let root_identity = directory_identity(root);
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
         let mut watcher =
@@ -367,6 +421,9 @@ impl ChangeWatcher {
         Ok(ChangeWatcher {
             _watcher: watcher,
             pending,
+            root: root.to_path_buf(),
+            root_identity,
+            incomplete: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -390,7 +447,10 @@ impl ChangeWatcher {
             ),
             false => None,
         };
+        // Taken before the walk, so a root replaced during it is noticed.
+        let root_identity = directory_identity(root);
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let incomplete = Arc::new(Mutex::new(None));
         // Events cross a channel to a thread that owns the watcher.
         // Extending the watch to a directory that just appeared needs the
         // watcher, and the backend's callback cannot reach it.
@@ -403,7 +463,13 @@ impl ChangeWatcher {
         watch_tree(&watcher, root, root, &ignores, device)?;
 
         let recorder = Arc::clone(&pending);
+        let failures = Arc::clone(&incomplete);
         let extender = Arc::downgrade(&watcher);
+        #[cfg(test)]
+        let fail_extension = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        #[cfg(test)]
+        let failing = Arc::clone(&fail_extension);
+        let watched_root = root.to_path_buf();
         let root = root.to_path_buf();
         std::thread::Builder::new()
             .name("autobahn-watch".into())
@@ -430,8 +496,26 @@ impl ChangeWatcher {
                                 let is_directory = std::fs::symlink_metadata(path)
                                     .map(|metadata| metadata.is_dir())
                                     .unwrap_or(false);
-                                if is_directory {
-                                    let _ = watch_tree(&watcher, &root, path, &ignores, device);
+                                if !is_directory {
+                                    continue;
+                                }
+                                #[cfg(test)]
+                                let extended = match failing
+                                    .load(std::sync::atomic::Ordering::SeqCst)
+                                {
+                                    true => Err(anyhow::anyhow!("an injected watch failure")),
+                                    false => watch_tree(&watcher, &root, path, &ignores, device),
+                                };
+                                #[cfg(not(test))]
+                                let extended = watch_tree(&watcher, &root, path, &ignores, device);
+                                // The subtree goes unwatched, so the watch
+                                // is partial: recorded for the observer,
+                                // which stops trusting it and rebuilds it.
+                                if let Err(error) = extended {
+                                    failures
+                                        .lock()
+                                        .expect("the failure lock is never poisoned")
+                                        .get_or_insert_with(|| format!("{error:#}"));
                                 }
                             }
                         }
@@ -447,7 +531,26 @@ impl ChangeWatcher {
         Ok(ChangeWatcher {
             _watcher: watcher,
             pending,
+            root: watched_root,
+            root_identity,
+            incomplete,
+            #[cfg(test)]
+            fail_extension,
         })
+    }
+
+    /// Whether the watch has stopped covering what the scanner reads, and
+    /// why. Checked by the observer before it trusts the watch — to serve
+    /// a cached scan, to scan incrementally, or to say it is watching.
+    pub(crate) fn fault(&self) -> Option<WatchFault> {
+        if directory_identity(&self.root) != self.root_identity {
+            return Some(WatchFault::Replaced);
+        }
+        self.incomplete
+            .lock()
+            .expect("the failure lock is never poisoned")
+            .clone()
+            .map(WatchFault::Incomplete)
     }
 
     /// The raw paths recorded so far, for tests of what the watch sees.
@@ -6020,6 +6123,62 @@ mod watch_tests {
         assert!(
             recorded.iter().all(|path| !path.starts_with(&ignored)),
             "a write beneath an ignored directory was recorded: {recorded:?}"
+        );
+    }
+
+    /// Finding M-25: an ignored directory holding a re-inclusion is walked
+    /// by the scanner, so it is watched too — whether it was there when
+    /// the watch was built or appeared afterwards — while what it holds
+    /// that nothing re-includes is left unwatched, as the scanner leaves
+    /// it unread.
+    #[test]
+    fn an_ignored_directory_holding_a_re_inclusion_is_watched() {
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(root.path().join("vendor/deeper")).unwrap();
+        let ignores = IgnoreSet::new(&["vendor".to_string(), "!vendor/keep.txt".to_string()])
+            .expect("ignores");
+        let watcher = ChangeWatcher::new(root.path(), ignores, true, || {}).expect("watch");
+
+        std::fs::write(root.path().join("vendor/keep.txt"), b"k").unwrap();
+        assert!(
+            recorded_within(
+                &watcher,
+                &root.path().join("vendor/keep.txt"),
+                Duration::from_secs(3)
+            ),
+            "an edit to a re-included file was not seen"
+        );
+        std::fs::write(root.path().join("vendor/deeper/other"), b"o").unwrap();
+
+        // Moved away and back, so the watch reaches it only by extension.
+        std::fs::rename(root.path().join("vendor"), root.path().join("aside")).unwrap();
+        std::fs::rename(root.path().join("aside"), root.path().join("vendor")).unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("vendor"),
+            Duration::from_secs(3)
+        ));
+        std::fs::write(root.path().join("vendor/keep.txt"), b"k2").unwrap();
+        let wanted = root.path().join("vendor/keep.txt");
+        let end = Instant::now() + Duration::from_secs(3);
+        let mut seen = 0;
+        while Instant::now() < end && seen < 2 {
+            seen = watcher.recorded().iter().filter(|p| **p == wanted).count();
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            seen >= 2,
+            "an edit to a re-included file under a directory that arrived later was not seen"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+        let deeper = root.path().join("vendor/deeper");
+        assert!(
+            watcher
+                .recorded()
+                .iter()
+                .all(|path| !path.starts_with(&deeper) || path == &deeper),
+            "a directory nothing re-includes was watched: {:?}",
+            watcher.recorded()
         );
     }
 

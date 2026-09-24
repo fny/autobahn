@@ -1037,10 +1037,8 @@ impl<'a> Scanner<'a> {
     /// question inverts: everything is ignored except what a negation
     /// explicitly re-includes.
     fn entry_ignored(&self, child_path: &str, is_directory: bool) -> bool {
-        match self.within_ignored {
-            true => !self.ignores.re_included(child_path, is_directory),
-            false => self.ignores.ignored(child_path, is_directory),
-        }
+        self.ignores
+            .ignored_within(child_path, is_directory, self.within_ignored)
     }
 
     fn scan_entry(
@@ -1093,10 +1091,12 @@ impl<'a> Scanner<'a> {
         if is_directory && self.state_roots.contains(&(metadata.dev(), metadata.ino())) {
             return Probed::Settled(Content::Untracked);
         }
-        let ignored = self.entry_ignored(child_path, is_directory);
-        if ignored && !(is_directory && self.ignores.holds_a_re_inclusion(child_path)) {
+        let Some(ignored) = self
+            .ignores
+            .traversal(child_path, is_directory, self.within_ignored)
+        else {
             return Probed::Settled(Content::Untracked);
-        }
+        };
 
         if is_directory {
             // A directory on another device than the one holding it is a

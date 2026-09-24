@@ -66,9 +66,12 @@ pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
     // An incomplete walk must never produce "verified" partitions: a
     // sampling frame missing part of the tree would bias the working
     // sets toward whatever happened to be readable at bake time.
-    let (files, errors) = crate::walk::files_with_errors(root).map_err(|error| error.to_string())?;
+    let (files, errors) =
+        crate::walk::files_with_errors(root).map_err(|error| error.to_string())?;
     if errors > 0 {
-        return Err(format!("walk saw {errors} errors; refusing to sample from an incomplete frame"));
+        return Err(format!(
+            "walk saw {errors} errors; refusing to sample from an incomplete frame"
+        ));
     }
     let editable: Vec<&String> = files
         .iter()
@@ -145,7 +148,13 @@ pub fn generate(root: &Path, output: &Path) -> Result<(), String> {
         for &count in AGENT_COUNTS {
             let background: Vec<Vec<String>> = if count > 1 {
                 (0..count - 1)
-                    .map(|index| pool.iter().skip(index).step_by(count - 1).cloned().collect())
+                    .map(|index| {
+                        pool.iter()
+                            .skip(index)
+                            .step_by(count - 1)
+                            .cloned()
+                            .collect()
+                    })
                     .collect()
             } else {
                 Vec::new()
@@ -229,7 +238,9 @@ fn verify(partitions: &Partitions) -> Result<(), String> {
                     ));
                 }
                 if !seen.insert(file) {
-                    return Err(format!("{side}/{count}: {file} appears twice in the large set"));
+                    return Err(format!(
+                        "{side}/{count}: {file} appears twice in the large set"
+                    ));
                 }
             }
             for (index, background) in sets.background.iter().enumerate() {

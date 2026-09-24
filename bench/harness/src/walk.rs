@@ -16,7 +16,12 @@ const EXCLUDED_DIRECTORIES: &[&str] = &[".git", "out"];
 
 /// Name fragments marking temporaries owned by the harness or the tools;
 /// they exist transiently mid-write and must never count.
-const TEMPORARY_MARKERS: &[&str] = &[".bench-tmp", ".floor-tmp", ".autobahn-tmp", ".mutagen-temporary"];
+const TEMPORARY_MARKERS: &[&str] = &[
+    ".bench-tmp",
+    ".floor-tmp",
+    ".autobahn-tmp",
+    ".mutagen-temporary",
+];
 
 fn excluded_directory(name: &str) -> bool {
     EXCLUDED_DIRECTORIES.contains(&name) || TEMPORARY_MARKERS.iter().any(|m| name.contains(m))

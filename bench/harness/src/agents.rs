@@ -83,7 +83,10 @@ fn parse(arguments: &[&str]) -> Result<Options, String> {
         let value = iterator
             .next()
             .ok_or_else(|| format!("{flag} needs a value"))?;
-        map.insert(flag.trim_start_matches("--").to_owned(), (*value).to_owned());
+        map.insert(
+            flag.trim_start_matches("--").to_owned(),
+            (*value).to_owned(),
+        );
     }
     let take = |key: &str| -> Result<String, String> {
         map.get(key)
@@ -97,7 +100,9 @@ fn parse(arguments: &[&str]) -> Result<Options, String> {
         partitions: PathBuf::from(take("partitions")?),
         side: take("side")?,
         agents: take("agents")?.parse().map_err(|_| "--agents".to_owned())?,
-        seconds: take("seconds")?.parse().map_err(|_| "--seconds".to_owned())?,
+        seconds: take("seconds")?
+            .parse()
+            .map_err(|_| "--seconds".to_owned())?,
         label: take("label")?,
         nonce: take("nonce")?.parse().map_err(|_| "--nonce".to_owned())?,
         mode: match map.get("mode").map(String::as_str).unwrap_or("replace") {
@@ -266,8 +271,8 @@ fn measure(
     let mut readers = Vec::with_capacity(destinations);
     let mut shutdown_handles = Vec::with_capacity(destinations);
     for address in &addresses {
-        let connection = TcpStream::connect(address)
-            .map_err(|error| format!("observer {address}: {error}"))?;
+        let connection =
+            TcpStream::connect(address).map_err(|error| format!("observer {address}: {error}"))?;
         let _ = connection.set_nodelay(true);
         let reader_stream = connection.try_clone().map_err(|e| e.to_string())?;
         // The reader wakes periodically to check for shutdown: a blocked
@@ -359,7 +364,10 @@ fn measure(
                 if !accepted {
                     let entry = table.remove(&seq).expect("just looked it up");
                     drop(table);
-                    reader_busy.lock().expect("busy lock").remove(&entry.file_index);
+                    reader_busy
+                        .lock()
+                        .expect("busy lock")
+                        .remove(&entry.file_index);
                     if !entry.warmup {
                         reader_censored.fetch_add(1, Ordering::Relaxed);
                     }
@@ -371,7 +379,10 @@ fn measure(
                 }
                 let entry = table.remove(&seq).expect("just looked it up");
                 drop(table);
-                reader_busy.lock().expect("busy lock").remove(&entry.file_index);
+                reader_busy
+                    .lock()
+                    .expect("busy lock")
+                    .remove(&entry.file_index);
                 let elapsed = entry.started.elapsed();
                 let spread = entry
                     .first_ack
@@ -454,10 +465,9 @@ fn measure(
                     }
                     Mode::Patch => {
                         let path = options.root.join(relative);
-                        let mut existing =
-                            std::fs::read(&path).map_err(|error| {
-                                format!("unable to read {} for patching: {error}", path.display())
-                            })?;
+                        let mut existing = std::fs::read(&path).map_err(|error| {
+                            format!("unable to read {} for patching: {error}", path.display())
+                        })?;
                         if existing.len() <= PATCH_SIZE.1 {
                             return Err(format!(
                                 "{} is {} bytes, too small to patch",
@@ -468,8 +478,7 @@ fn measure(
                         let length = PATCH_SIZE.0 + rng.index(PATCH_SIZE.1 - PATCH_SIZE.0);
                         let offset = rng.index(existing.len() - length);
                         rng.fill(&mut payload[..length]);
-                        existing[offset..offset + length]
-                            .copy_from_slice(&payload[..length]);
+                        existing[offset..offset + length].copy_from_slice(&payload[..length]);
                         existing
                     }
                 };
@@ -512,11 +521,7 @@ fn measure(
                     .map_err(|error| error.to_string())?;
                 // T0: the local write is complete and the content is the
                 // tool's to propagate.
-                if let Some(entry) = in_flight
-                    .lock()
-                    .expect("in-flight lock")
-                    .get_mut(&sequence)
-                {
+                if let Some(entry) = in_flight.lock().expect("in-flight lock").get_mut(&sequence) {
                     entry.started = Instant::now();
                     // Warmup is a property of the true T0, not of the
                     // tick that scheduled the edit.

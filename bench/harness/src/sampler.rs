@@ -43,7 +43,11 @@ fn scan_processes() -> HashMap<u32, ProcessRecord> {
         return table;
     };
     for entry in entries.filter_map(Result::ok) {
-        let Some(pid) = entry.file_name().to_str().and_then(|n| n.parse::<u32>().ok()) else {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
             continue;
         };
         let Ok(command_raw) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
@@ -94,9 +98,7 @@ fn tool_tree(
     loop {
         let additions: Vec<u32> = table
             .iter()
-            .filter(|(pid, record)| {
-                !members.contains(pid) && members.contains(&record.parent)
-            })
+            .filter(|(pid, record)| !members.contains(pid) && members.contains(&record.parent))
             .map(|(&pid, _)| pid)
             .collect();
         if additions.is_empty() {

@@ -172,6 +172,19 @@ jobs:
         # build script or proc macro that runs while the identity is usable
         # could sign anything as us. Nothing after the import compiles.
         run: apps/macos/build.sh --unsigned
+      - name: The app must report the tag's version
+        # build.sh writes both keys from Cargo.toml, which the version job
+        # has already matched to the tag; this checks what actually ships.
+        run: |
+          plist=apps/macos/Autobahn.app/Contents/Info.plist
+          for key in CFBundleShortVersionString CFBundleVersion; do
+            value=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")
+            if [ "$value" != "${GITHUB_REF_NAME#v}" ]; then
+              echo "the app's $key is '$value', but the tag is $GITHUB_REF_NAME" >&2
+              exit 1
+            fi
+          done
+          echo "the app reports ${GITHUB_REF_NAME#v}"
       - name: Import the Developer ID certificate
         env:
           P12: ${{ secrets.DEVELOPER_ID_P12 }}

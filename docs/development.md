@@ -6,7 +6,7 @@ cargo test --release          # unit + end-to-end suites (e2e spawns real agents
 cargo clippy --all-targets
 scripts/mi                    # a guided tour of every command and state
 scripts/build-agents.sh       # cross-build the agents bundle
-gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
+gh workflow run ci.yml        # Linux, ARM Linux and macOS
 ```
 
 CI runs on every push to `main` and every pull request, except changes that cannot affect a build — Markdown, `docs/`, `bench/`, the README artwork, and the release workflow. There is one macOS job, which runs the suite and then builds the app, signed ad-hoc; the certificate belongs to the release alone. A newer push cancels an older run of the same branch.

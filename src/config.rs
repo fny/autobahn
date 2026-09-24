@@ -77,10 +77,11 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 #   one-way-conflict   alpha to beta; an edit on beta is reported, not overwritten
 #   one-way-alpha      alpha to beta; beta is made identical (also spelled "mirror")
 #
-# Experimental: as the two-way modes, and a beta takes the lead while the
-# alpha is away (docs/peering.md). The alpha must be this machine.
-#   peering-conflict-experimental
-#   peering-alpha-experimental
+# Dangerously experimental: as the two-way modes, and a beta takes the lead
+# while the alpha is away. Known security and collision issues are open;
+# read docs/peering.md first. The alpha must be this machine.
+#   peering-conflict-dangerously-experimental
+#   peering-alpha-dangerously-experimental
 mode = "two-way-conflict"
 
 # Applied everywhere, in gitignore syntax: a bare name matches at any
@@ -320,11 +321,15 @@ pub struct Advanced {
     pub alerts: AlertsAdvanced,
     /// Peering timing. The section carries the experiment's suffix as the
     /// modes do, so a configuration that names it says so on its face.
-    #[serde(default, rename = "peering-experimental")]
+    #[serde(default, rename = "peering-dangerously-experimental")]
     pub peering: PeeringAdvanced,
+    /// Renamed. Kept only so that a configuration written against the old
+    /// name gets an answer rather than "unknown field".
+    #[serde(default, rename = "peering-experimental")]
+    pub retired_peering: Option<toml::Value>,
 }
 
-/// The `[advanced.peering-experimental]` section: how long a lease lives,
+/// The `[advanced.peering-dangerously-experimental]` section: how long a lease lives,
 /// and how long a peer waits past a dead lease before it takes the lead.
 ///
 /// As with the alerter's timing, the defaults are the answer. A blip must
@@ -674,8 +679,8 @@ impl SessionPlan {
     /// shows, so a reader sees the word they wrote.
     pub fn mode_name(&self) -> &'static str {
         match (self.peering, self.mode) {
-            (Some(_), SyncMode::TwoWayResolved) => "peering-alpha-experimental",
-            (Some(_), _) => "peering-conflict-experimental",
+            (Some(_), SyncMode::TwoWayResolved) => "peering-alpha-dangerously-experimental",
+            (Some(_), _) => "peering-conflict-dangerously-experimental",
             (None, mode) => mode_name(mode),
         }
     }
@@ -848,16 +853,25 @@ impl Config {
         })
     }
 
-    /// The peering timing, from `[advanced.peering-experimental]` and the
+    /// The peering timing, from `[advanced.peering-dangerously-experimental]` and the
     /// built-in defaults. Resolved whether or not any group is in a
     /// peering mode: a bad value is a configuration error either way.
     pub fn peering_plan(&self) -> Result<PeeringPlan> {
+        if self.advanced.retired_peering.is_some() {
+            bail!(
+                "invalid configuration:\n  [advanced.peering-experimental] was renamed to \
+                 [advanced.peering-dangerously-experimental]: peering has known security \
+                 and collision issues. Read docs/peering.md before enabling it."
+            );
+        }
         let advanced = &self.advanced.peering;
-        let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
+        let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| {
+            match spec {
             None => Ok(fallback),
             Some(spec) => parse_duration(spec).map_err(|message| {
-                anyhow!("invalid configuration:\n  advanced.peering-experimental.{what}: {message}")
+                anyhow!("invalid configuration:\n  advanced.peering-dangerously-experimental.{what}: {message}")
             }),
+        }
         };
         let ttl = duration(&advanced.ttl, "ttl", DEFAULT_PEERING_TTL)?;
         let failover_after = duration(
@@ -870,7 +884,7 @@ impl Config {
         // still good.
         if failover_after < ttl {
             bail!(
-                "invalid configuration:\n  advanced.peering-experimental.failover_after \
+                "invalid configuration:\n  advanced.peering-dangerously-experimental.failover_after \
                  ({}s) is shorter than ttl ({}s); a peer must not take the lead while the \
                  lease is still valid",
                 failover_after.as_secs(),
@@ -878,7 +892,7 @@ impl Config {
             );
         }
         if ttl.is_zero() {
-            bail!("invalid configuration:\n  advanced.peering-experimental.ttl must not be zero");
+            bail!("invalid configuration:\n  advanced.peering-dangerously-experimental.ttl must not be zero");
         }
         Ok(PeeringPlan {
             ttl,
@@ -1106,7 +1120,7 @@ impl Config {
             if let Some(plan) = peering {
                 if plan.ttl < interval.saturating_mul(2) {
                     errors.push(format!(
-                        "group '{name}': advanced.peering-experimental.ttl ({}s) must be at \
+                        "group '{name}': advanced.peering-dangerously-experimental.ttl ({}s) must be at \
                          least twice the interval ({}s); the lease is renewed once per cycle",
                         plan.ttl.as_secs(),
                         interval.as_secs()
@@ -1574,12 +1588,20 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
         "one-way-alpha" | "one-way-replica" | "mirror" => Ok((SyncMode::OneWayReplica, false)),
         // A third direction: two-way, and the betas can take the lead
         // while the alpha is away. Experimental, and spelled so.
-        "peering-conflict-experimental" => Ok((SyncMode::TwoWaySafe, true)),
-        "peering-alpha-experimental" => Ok((SyncMode::TwoWayResolved, true)),
+        "peering-conflict-dangerously-experimental" => Ok((SyncMode::TwoWaySafe, true)),
+        "peering-alpha-dangerously-experimental" => Ok((SyncMode::TwoWayResolved, true)),
+        // The old spellings are answered, not merely unknown: the rename is
+        // the point, and a configuration that used them should be told why
+        // rather than quietly carried across.
+        "peering-conflict-experimental" | "peering-alpha-experimental" => Err(format!(
+            "mode '{mode}' was renamed to '{}': peering has known security and \
+             collision issues. Read docs/peering.md before enabling it",
+            mode.replace("-experimental", "-dangerously-experimental")
+        )),
         other => Err(format!(
             "unknown mode '{other}' (expected one of: two-way-conflict, two-way-paranoid, \
              two-way-alpha, two-way-alpha-strict, one-way-conflict, one-way-alpha, \
-             peering-conflict-experimental, peering-alpha-experimental)"
+             peering-conflict-dangerously-experimental, peering-alpha-dangerously-experimental)"
         )),
     }
 }
@@ -1776,6 +1798,40 @@ mod tests {
         for mode in named {
             parse_mode(mode).unwrap_or_else(|error| panic!("{mode}: {error}"));
         }
+    }
+
+    /// The pre-rename peering spellings are refused with the new name and
+    /// the reason, not as an unknown mode or field.
+    #[test]
+    fn the_old_peering_names_are_answered_with_the_rename() {
+        for old in [
+            "peering-conflict-experimental",
+            "peering-alpha-experimental",
+        ] {
+            let error = parse_mode_spec(old).expect_err("the old mode name is refused");
+            let new = old.replace("-experimental", "-dangerously-experimental");
+            assert!(error.contains(&new), "{error}");
+            assert!(error.contains("docs/peering.md"), "{error}");
+        }
+        let error = format!(
+            "{:#}",
+            parse(
+                r#"
+                [advanced.peering-experimental]
+                ttl = "30s"
+
+                [groups.g]
+                alpha = "/tmp/a"
+                betas = ["u@h:/tmp/b"]
+                "#,
+            )
+            .plans()
+            .expect_err("the old section name is refused")
+        );
+        assert!(
+            error.contains("peering-dangerously-experimental"),
+            "{error}"
+        );
     }
 
     fn parse(text: &str) -> Config {
@@ -2820,11 +2876,11 @@ betas = ["build.example.com:/tmp/beta"]
     #[test]
     fn peering_modes_parse_and_print_back() {
         assert_eq!(
-            parse_mode_spec("peering-conflict-experimental").unwrap(),
+            parse_mode_spec("peering-conflict-dangerously-experimental").unwrap(),
             (SyncMode::TwoWaySafe, true)
         );
         assert_eq!(
-            parse_mode_spec("peering-alpha-experimental").unwrap(),
+            parse_mode_spec("peering-alpha-dangerously-experimental").unwrap(),
             (SyncMode::TwoWayResolved, true)
         );
         assert_eq!(
@@ -2834,13 +2890,13 @@ betas = ["build.example.com:/tmp/beta"]
         // The refusal message advertises them, which the template test
         // also relies on.
         let advertised = parse_mode("nope").unwrap_err();
-        assert!(advertised.contains("peering-conflict-experimental"));
-        assert!(advertised.contains("peering-alpha-experimental"));
+        assert!(advertised.contains("peering-conflict-dangerously-experimental"));
+        assert!(advertised.contains("peering-alpha-dangerously-experimental"));
 
         let config = parse(
             r#"
             [groups.g]
-            mode = "peering-alpha-experimental"
+            mode = "peering-alpha-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["u@h:/tmp/b"]
             "#,
@@ -2848,7 +2904,10 @@ betas = ["build.example.com:/tmp/beta"]
         let plans = config.plans().expect("plans");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].mode, SyncMode::TwoWayResolved);
-        assert_eq!(plans[0].mode_name(), "peering-alpha-experimental");
+        assert_eq!(
+            plans[0].mode_name(),
+            "peering-alpha-dangerously-experimental"
+        );
         let peering = plans[0].peering.expect("a peering plan");
         assert_eq!(peering.ttl, DEFAULT_PEERING_TTL);
         assert_eq!(peering.failover_after, DEFAULT_PEERING_FAILOVER_AFTER);
@@ -2872,11 +2931,11 @@ betas = ["build.example.com:/tmp/beta"]
     fn peering_timing_is_read_defaulted_and_checked() {
         let config = parse(
             r#"
-            [advanced.peering-experimental]
+            [advanced.peering-dangerously-experimental]
             ttl = "10s"
             failover_after = 45
             [groups.g]
-            mode = "peering-conflict-experimental"
+            mode = "peering-conflict-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["u@h:/tmp/b"]
             "#,
@@ -2887,11 +2946,11 @@ betas = ["build.example.com:/tmp/beta"]
 
         let config = parse(
             r#"
-            [advanced.peering-experimental]
+            [advanced.peering-dangerously-experimental]
             ttl = "60s"
             failover_after = "30s"
             [groups.g]
-            mode = "peering-conflict-experimental"
+            mode = "peering-conflict-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["u@h:/tmp/b"]
             "#,
@@ -2904,7 +2963,7 @@ betas = ["build.example.com:/tmp/beta"]
         // peering group: an unknown key is refused everywhere.
         let result: std::result::Result<Config, _> = toml::from_str(
             r#"
-            [advanced.peering-experimental]
+            [advanced.peering-dangerously-experimental]
             lease = "10s"
             "#,
         );
@@ -2918,7 +2977,7 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.g]
-            mode = "peering-conflict-experimental"
+            mode = "peering-conflict-dangerously-experimental"
             alpha = "u@h:/tmp/a"
             betas = ["v@k:/tmp/b"]
             "#,
@@ -2929,7 +2988,7 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.g]
-            mode = "peering-conflict-experimental"
+            mode = "peering-conflict-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["/tmp/b", "u@h:/tmp/c"]
             "#,

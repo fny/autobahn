@@ -1923,7 +1923,7 @@ mod tests {
         let session = SessionReport {
             host: "fny".into(),
             beta: "ubuntu@fny:~/w".into(),
-            mode: "peering-alpha-experimental".into(),
+            mode: "peering-alpha-dangerously-experimental".into(),
             state: "synchronized".into(),
             cycles: 3,
             age_seconds: Some(1),

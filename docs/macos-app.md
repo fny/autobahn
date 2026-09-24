@@ -17,13 +17,51 @@ Choices are queued, not run where you click. They go to a worker thread and run 
 
 When no `on_alert` hook is configured, the tray raises desktop notifications itself, under exactly the rules the hook would use — a condition must hold before it counts, only something *joining* the set in trouble is news, a cascade is gathered into one, and recovery is silent. See [Alerts](./alerts.md) for the rules. When a hook *is* configured, the tray stays quiet: the hook is the one place notifications come from, and two sources with identical rules would still mean everything twice.
 
-It is a view over `status --json`, polled every few seconds, and holds no state of its own. macOS and Linux (with a system tray).
+It is a view over `status --json`, polled every few seconds, and holds no state of its own. macOS is the supported platform. On Linux it is an unverified, build-it-yourself experiment; see [On Linux](#on-linux-experimental-unverified).
 
 ## Starting it
 
 Open `apps/macos/Autobahn.app`, or drag it to `/Applications` and open it there. **It does not start at login on its own**: add it under System Settings → General → Login Items. The supervisor is separate and already survives logout through `autobahn install`; the app only watches it.
 
 From a terminal, `autobahn tray` runs the same menu bar app — but only in a binary built with `--features tray`. A plain build answers that it has no menu bar app. `build.sh` builds that binary into `target/tray` (`AUTOBAHN_TRAY_TARGET` moves it), never `target/release`: the login service runs `target/release/autobahn` through a symlink, and an app build must not replace it.
+
+## On Linux (experimental, unverified)
+
+> **Build it yourself, at your own risk.** No release includes a Linux tray, and CI never builds one. Nobody has confirmed that the steps below build it, or that it runs once built. It can break between versions without anyone noticing.
+
+The tray code is shared with macOS. On Linux, desktop notifications go through the freedesktop notification service, and "Show diff" opens the diff with `xdg-open`.
+
+**What you need**
+
+- Rust, installed with `rustup`.
+- The GTK 3 development packages the tray libraries build against. On Debian and Ubuntu this is probably:
+
+  ```sh
+  sudo apt install libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+  ```
+
+  The list comes from the tray libraries' own requirements and has not been checked here. Other distributions name these packages differently.
+- A desktop that shows tray icons through AppIndicator or StatusNotifierItem. KDE and most others do. GNOME needs an extension, such as "AppIndicator and KStatusNotifierItem Support".
+
+**Build and run**
+
+```sh
+git clone https://github.com/fny/autobahn && cd autobahn
+cargo build --release --locked --features tray
+target/release/autobahn tray
+```
+
+The tray watches a supervisor; it does not run one. Start one first with `autobahn watch`, or with `autobahn install` for a login service.
+
+Do not build into the directory a login service runs from: `build.sh` on macOS avoids `target/release` for that reason. If the service runs `target/release/autobahn`, build the tray with `CARGO_TARGET_DIR=target/tray` instead.
+
+**Known problems**
+
+- **It may build but never show an icon.** On Linux the tray libraries need GTK started on the thread that runs the event loop, and the code does not start it today. This is expected from the libraries' documentation, not observed.
+- **It pulls in about 170 more crates**, mostly GTK 3 bindings. Those bindings are no longer maintained, and `glib 0.18` has a soundness advisory. The published command-line tool and agent contain none of this.
+- **It does not start at login.** Add `autobahn tray` to your desktop's autostart settings.
+
+If you get it working, the exact packages, desktop and steps are worth reporting, so this section can drop "unverified."
 
 ## The icon
 

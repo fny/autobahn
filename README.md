@@ -94,7 +94,7 @@ There is also `autobahn mi`, a terminal view of every session, and an experiment
 
 Real, shipped, and still moving. Expect the wording, the keys and the shape to change between releases.
 
-- **Peering** — a beta takes the lead when the alpha is away, and gives it back. Powerful and easy to point at your own foot. See [Peering](docs/peering.md).
+- **Peering** (dangerously experimental) — a beta takes the lead when the alpha is away, and gives it back. It has known security and collision issues that are not fixed in this release; any peer that can lead is trusted with every other peer. Read [Peering](docs/peering.md) before enabling it.
 - **The menu bar app** and the **alert hook example** — see their pages.
 
 ## AI disclaimer
@@ -130,7 +130,7 @@ Or build from source with `cargo build --release` (Rust stable, Unix only).
 
 ## Scope
 
-Unix only: Linux (x86-64 and arm64), macOS (Apple Silicon), FreeBSD — with macOS a first-class target, not a build target. Transport is SSH. Roots must live on local filesystems; network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).
+Unix only: Linux (x86-64 and arm64) and macOS (Apple Silicon), with macOS a first-class target, not a build target. Transport is SSH. Roots must live on local filesystems; network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).
 
 <!-- ─────────────────────────────────────────────────────────────────────
      The previous README follows, kept for merging. Delete it, and this
@@ -149,7 +149,7 @@ Sold? Jump to [Getting Started](#getting-started).
 - **Light** 33 MB for a 40,000-file tree and 249 MB for Chromium. Idle it uses 0.2% of a core.
 - **Zero remote setup.** Autobahn streams its own sync agent over SSH on first contact, and upgrades roll out the same way.
 - **Safe.** Autobahn performs three-way reconciliation against a remembered baseline. "You deleted this file" never conflicts with "this file never existed here." You can even calibrate your risk tolerance with different sync modes. [How errors are prevented](docs/safety.md).
-- **User friendly.** We have a TUI tray item that works on most operating systems. Experimental (i.e. unstable API) but functional
+- **User friendly.** A menu bar app on macOS shows every session at a glance and settles conflicts from a menu. Experimental (i.e. unstable API) but functional. On Linux the same tray is an unverified [build-it-yourself experiment](docs/macos-app.md#on-linux-experimental-unverified).
 
  - Editing files on a remote machine over SSH or NFS is slow and clunky.
  - You can have a fleet of agents run `--dangerously` on one or many machines while keeping only the files on your machine.
@@ -345,4 +345,4 @@ Or build from source with `cargo build --release` (Rust stable, Unix only).
 
 ## Scope
 
-Unix only: Linux (x86-64 and arm64), macOS (Apple Silicon), and FreeBSD, with macOS a first-class target rather than a build target. Transport is SSH. Roots must live on local filesystems: network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).
+Unix only: Linux (x86-64 and arm64) and macOS (Apple Silicon), with macOS a first-class target rather than a build target. Transport is SSH. Roots must live on local filesystems: network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).

@@ -603,7 +603,7 @@ mod star_tests {
     use super::*;
 
     const PUSHED: &str = r#"
-        [advanced.peering-experimental]
+        [advanced.peering-dangerously-experimental]
         ttl = "10s"
         failover_after = "20s"
 
@@ -615,7 +615,7 @@ mod star_tests {
         betas = ["x@h:/tmp/plain"]
 
         [groups.g]
-        mode = "peering-conflict-experimental"
+        mode = "peering-conflict-dangerously-experimental"
         alpha = "/home/faraz/Workspace/Voltai"
         betas = ["ubuntu@vm", "box2:/srv/ws"]
         ignores = ["target"]

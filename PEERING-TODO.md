@@ -2,7 +2,7 @@
 
 Failover for the star. The alpha leads; when it is gone for long enough, the first beta that is up takes the lead; when the alpha returns, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes. The design is in `docs/peering.md` (written in phase 6).
 
-One word everywhere: the mode is `peering-*-experimental`, the section is `[advanced.peering-experimental]`, the state lives in `~/.autobahn/peering/`, the verbs are `autobahn peering …`. "Peer" is prose for one member.
+One word everywhere: the mode is `peering-*-dangerously-experimental`, the section is `[advanced.peering-dangerously-experimental]`, the state lives in `~/.autobahn/peering/`, the verbs are `autobahn peering …`. "Peer" is prose for one member.
 
 Rules the build must keep:
 
@@ -14,9 +14,9 @@ Rules the build must keep:
 ## Phase 1 — the mode and the section
 
 - [x] `SyncMode` gains nothing; `SessionPlan` gains `peering: Option<PeeringPlan>` — `None` for the plain modes
-- [x] `parse_mode_spec` accepts `peering-conflict-experimental` → `TwoWaySafe` + peering, `peering-alpha-experimental` → `TwoWayResolved` + peering
+- [x] `parse_mode_spec` accepts `peering-conflict-dangerously-experimental` → `TwoWaySafe` + peering, `peering-alpha-dangerously-experimental` → `TwoWayResolved` + peering
 - [x] `SessionPlan::mode_name` prints the peering spelling back for a peering plan; status and `mi` use it
-- [x] `[advanced.peering-experimental]` with `ttl` (default 30s) and `failover_after` (default 120s), refused when `failover_after < ttl`
+- [x] `[advanced.peering-dangerously-experimental]` with `ttl` (default 30s) and `failover_after` (default 120s), refused when `failover_after < ttl`
 - [x] A peering group must have a local alpha and every beta on another host
 - [x] CLI `--mode` (one-off `sync`): not applicable — a one-off has no leader; the spelling is refused there
 - [x] `init` template names the two modes in the mode comment (the template test now counts `peering-*` too)
@@ -54,7 +54,7 @@ Rules the build must keep:
 - [x] Takeover: `term + 1`, lease on self (renewed every `ttl / 2` while leading), then a supervisor whose sessions present the lease to every other beta on their first cycle
 - [x] Plans re-derived (`peering::derive_star`): own spec → local path, other betas unchanged, plain groups dropped. The configured alpha is *not* in the star — it dials in (phase 5)
 - [x] Ancestors seeded from `peering/ancestors/` (`peering::adopt_newer_copy`, under the session lock, whenever the copy is newer): a beta that leads seeds the (alpha, me) session; an alpha that gets the lead back adopts what the beta recorded. A (me, other) pair starts without one
-- [x] `peering-alpha-experimental`: the configured alpha stays the alpha of every pair it is in — the attached session keeps the alpha on the alpha side and the leader pushes `sessions/<group>` so the identifier is the same
+- [x] `peering-alpha-dangerously-experimental`: the configured alpha stays the alpha of every pair it is in — the attached session keeps the alpha on the alpha side and the leader pushes `sessions/<group>` so the identifier is the same
 - [x] Tests: `a_follower_turns_the_star_around` (unit); `a_peer_takes_the_lead_when_the_lease_goes_stale` (supervisor suite, real agents) — the takeover reaches the other beta with lease, name and config, and the returning old leader is fenced and steps down
 
 ## Phase 5 — the alpha dials in, and the handoff

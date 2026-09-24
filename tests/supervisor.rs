@@ -2014,7 +2014,7 @@ fn a_peering_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
     let configuration = format!(
         r#"
         [groups.g]
-        mode = "peering-conflict-experimental"
+        mode = "peering-conflict-dangerously-experimental"
         alpha = "{alpha}"
         agent_command = "{script}"
         betas = ["peer:{beta}"]
@@ -2099,7 +2099,7 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     let plans = world.plans(&format!(
         r#"
         [groups.g]
-        mode = "peering-conflict-experimental"
+        mode = "peering-conflict-dangerously-experimental"
         alpha = "{alpha}"
         agent_command = "{script}"
         betas = ["peer:{beta}"]
@@ -2198,12 +2198,12 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     // lifetime and a wait short enough for a test.
     let pushed = format!(
         r#"
-        [advanced.peering-experimental]
+        [advanced.peering-dangerously-experimental]
         ttl = "2s"
         failover_after = "2s"
 
         [groups.g]
-        mode = "peering-conflict-experimental"
+        mode = "peering-conflict-dangerously-experimental"
         interval = 1
         alpha = "/nonexistent/alpha"
         agent_command = "{script}"
@@ -2270,7 +2270,7 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         let plans = world.plans(&format!(
             r#"
             [groups.g]
-            mode = "peering-conflict-experimental"
+            mode = "peering-conflict-dangerously-experimental"
             alpha = "{alpha}"
             agent_command = "{script}"
             betas = ["other:{other_root}"]
@@ -2329,12 +2329,12 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     // one beta, its own root as the alpha, and the session's identifier.
     let configuration = format!(
         r#"
-        [advanced.peering-experimental]
+        [advanced.peering-dangerously-experimental]
         ttl = "2s"
         failover_after = "2s"
 
         [groups.g]
-        mode = "peering-conflict-experimental"
+        mode = "peering-conflict-dangerously-experimental"
         interval = 1
         alpha = "{alpha_root}"
         agent_command = "{script}"

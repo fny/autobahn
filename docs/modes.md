@@ -6,7 +6,7 @@ A mode is a direction and a policy. The direction is whether changes flow both w
 |---|---|---|
 | **two-way** | `two-way-conflict` | `two-way-alpha` |
 | **one-way** | `one-way-conflict` | `one-way-alpha` |
-| **peering** (experimental) | `peering-conflict-experimental` | `peering-alpha-experimental` |
+| **peering** (dangerously experimental) | `peering-conflict-dangerously-experimental` | `peering-alpha-dangerously-experimental` |
 
 Off the grid there are two more. `two-way-paranoid` is `two-way-conflict` that also refuses to trust a large directory going empty or missing on one side; see [Large directories](#large-directories) below. `two-way-alpha-strict` is `two-way-alpha` with its one exception removed: alpha wins every collision, including when alpha's side of it is a deletion; see [Deletions against edits](#deletions-against-edits) below.
 
@@ -18,7 +18,7 @@ There is no default. Direction is never guessed, so a group (or the defaults) mu
 |---|---|
 | `two-way-conflict` | You edit on both sides and want nothing lost, ever. |
 | `two-way-paranoid` | As above, and a disk that unmounts mid-session must not empty the other side. |
-| `peering-conflict-experimental` | As `two-way-conflict`, and a beta takes the lead while the alpha is away. See [Peering](./peering.md). |
+| `peering-conflict-dangerously-experimental` | As `two-way-conflict`, and a beta takes the lead while the alpha is away. See [Peering](./peering.md). |
 | `two-way-alpha` | You edit on both sides but alpha is the truth when they collide. |
 | `two-way-alpha-strict` | As above, and when alpha deletes something beta was editing, it stays deleted. |
 | `one-way-conflict` | Deploy-ish flows where the remote side may hold extra files (logs, caches). |
@@ -65,9 +65,9 @@ Three-way reconciliation reads a directory that is empty on one side and full on
 
 Smaller directories, and directories the other side also changed, follow the ordinary rules. The other four modes have neither rule: an emptied directory is deletions, and they propagate.
 
-## Peering (experimental)
+## Peering (dangerously experimental)
 
-The peering modes are the two-way modes plus failover: while the alpha is away for longer than a configured wait, the first beta that is up leads the others, and the alpha gets the lead back when it returns. Reconciliation is unchanged — `peering-conflict-experimental` reconciles as `two-way-conflict`, `peering-alpha-experimental` as `two-way-alpha`, with the configured alpha winning wherever it is involved whoever leads. The whole of it is in [Peering](./peering.md).
+The peering modes are the two-way modes plus failover: while the alpha is away for longer than a configured wait, the first beta that is up leads the others, and the alpha gets the lead back when it returns. Reconciliation is unchanged — `peering-conflict-dangerously-experimental` reconciles as `two-way-conflict`, `peering-alpha-dangerously-experimental` as `two-way-alpha`, with the configured alpha winning wherever it is involved whoever leads. The whole of it is in [Peering](./peering.md).
 
 ## Modes and fan-out
 
@@ -78,4 +78,4 @@ When one alpha fans out to several betas, each destination is its own session, a
 - [Configuration](./configuration.md) — where `mode` goes
 - [Conflicts](./conflicts.md) — settling a disagreement once it is reported
 - [Safety](./safety.md) — the deletions that are refused in every mode
-- [Peering](./peering.md) — failover for the star, experimental
+- [Peering](./peering.md) — failover for the star, dangerously experimental; known security and collision issues

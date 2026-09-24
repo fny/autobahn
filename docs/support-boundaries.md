@@ -2,7 +2,7 @@
 
 ## Scope
 
-Unix only. The full test suite runs green on **Linux (x86-64 and arm64), macOS (Apple Silicon), and FreeBSD**; CI covers all four on demand. macOS is a first-class target, not a build target: its Unicode normalization, case-folding, and atomic-creation behaviors are implemented against the platform's own primitives and exercised on real APFS volumes. Windows would be a port rather than a build target.
+Unix only. The full test suite runs green on **Linux (x86-64 and arm64) and macOS (Apple Silicon)**, and CI covers all three. macOS is a first-class target, not a build target: its Unicode normalization, case-folding, and atomic-creation behaviors are implemented against the platform's own primitives and exercised on real APFS volumes. Windows would be a port rather than a build target.
 
 Transport is SSH (or any stdio subprocess) — no Docker, no daemon, no port forwarding.
 

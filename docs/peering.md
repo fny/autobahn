@@ -1,8 +1,16 @@
-# Peering (experimental)
+# Peering (dangerously experimental)
 
 Failover for the star. The alpha leads, as it always has. When it is gone for long enough, the first beta that is up takes the lead, and the other betas keep syncing through it. When the alpha comes back, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes.
 
-**Experimental** means three things here. The design is new and the modes carry the word in their names so a configuration says so on its face. The on-disk state under `peering/` may change shape between releases without a migration. And a few edges are known and left open — they are listed at the end.
+> **Do not enable peering unless you accept the issues below.** A September 2026 review found security and collision issues in peering that are not fixed in this release. Any peer that can lead can run commands on every other peer, and on the alpha's machine through one path. Two leaders can write the same root at once in some timings. See [Known security issues](#known-security-issues) and [Known collision issues](#known-collision-issues).
+
+**Dangerously experimental** means four things here:
+- The design is new, and the modes carry the words in their names so a configuration says so on its face.
+- The on-disk state under `peering/` may change shape between releases without a migration.
+- The fence described below does not yet hold in every timing. Peering can let two controllers write one root.
+- Peering trusts every peer that can lead with every other peer, including the alpha's machine. Use it only among machines that already trust each other with a shell.
+
+The old names, `peering-conflict-experimental`, `peering-alpha-experimental` and `[advanced.peering-experimental]`, are refused with a message pointing here. The rename is deliberate: turning peering on should mean reading this page.
 
 ## The configuration
 
@@ -10,22 +18,22 @@ A normal star, with a different mode word:
 
 ```toml
 [groups.voltai]
-mode  = "peering-conflict-experimental"      # or peering-alpha-experimental
-alpha = "~/Workspace/Voltai"                 # this machine; the preferred leader
-betas = [                                    # the peers, in failover order
+mode  = "peering-conflict-dangerously-experimental"  # or peering-alpha-dangerously-experimental
+alpha = "~/Workspace/Voltai"                         # this machine; the preferred leader
+betas = [                                            # the peers, in failover order
   "ubuntu@fny.voltai.party:~/Workspace",
   "box2:~/Workspace",
 ]
 ```
 
-`peering-conflict-experimental` is `two-way-conflict` plus failover. `peering-alpha-experimental` is `two-way-alpha` plus failover: the configured alpha's version wins wherever the alpha is involved, whoever leads at the time.
+`peering-conflict-dangerously-experimental` is `two-way-conflict` plus failover. `peering-alpha-dangerously-experimental` is `two-way-alpha` plus failover: the configured alpha's version wins wherever the alpha is involved, whoever leads at the time.
 
 The alpha must be the machine the configuration runs on, and every beta must be another host. The mode is refused otherwise.
 
 Timing lives where the alerter's does, correct as shipped:
 
 ```toml
-[advanced.peering-experimental]
+[advanced.peering-dangerously-experimental]
 ttl            = "30s"     # a lease is stale this long after its last renewal
 failover_after = "120s"    # a candidate waits this long past stale before it leads
 ```
@@ -44,7 +52,9 @@ The leader's claim on a host is a small file the leader renews on every cycle, t
 { "leader": "alpha", "term": 7, "renewed_at": 1789544514, "ttl_seconds": 30 }
 ```
 
-The term increases by one at every change of leader. **The agent refuses writes from a controller whose term is below the lease's**, and from a different leader at the same term. That refusal — the fence — is the whole safety argument. No root is ever written by two controllers, whatever the network does. Reads still answer, so a fenced controller can see the tree it may no longer change.
+The term increases by one at every change of leader. **The agent refuses writes from a controller whose term is below the lease's**, and from a different leader at the same term. That refusal — the fence — is the whole safety argument. Reads still answer, so a fenced controller can see the tree it may no longer change.
+
+The design intent is that no root is ever written by two controllers, whatever the network does. The current code does not meet it. The fence is checked only when a controller presents a lease, not on every write, and taking a lease is not atomic. [Known collision issues](#known-collision-issues) lists the timings where two controllers can write.
 
 ### What the leader pushes
 
@@ -66,7 +76,7 @@ A peer reads its lease every interval. While the lease is fresh, or stale for le
 
 When it is time, the peer writes a lease at the next term, and runs the leader's configuration turned around: itself as the alpha, every other beta as a beta. Its sessions present the new lease to each host on their first cycle. A host a newer term has already taken refuses it, and the peer steps down and follows again.
 
-Two candidates acting at once — clocks a lifetime apart, say — present the same term to the same hosts. Each host keeps the first and refuses the second. The fence, not the stagger, is the guarantee.
+Two candidates acting at once — clocks a lifetime apart, say — present the same term to the same hosts. The intent is that each host keeps the first and refuses the second. Today a host can accept both, because it reads, checks and writes the lease without a lock. See [Known collision issues](#known-collision-issues).
 
 ### The alpha is never dialed
 
@@ -101,6 +111,46 @@ autobahn peering yield --to alpha      # from the leading peer: hand the lead ba
 autobahn peering yield --to <spec>     # ...or to a named beta
 autobahn peering attach                # what the alpha runs over ssh; not for typing
 ```
+
+## Known security issues
+
+These are open and will not be fixed before peering leaves this status.
+
+**Every peer that can lead is trusted like a shell on every other peer.** A leader pushes its configuration to every follower, and a follower runs it when it takes the lead. Two consequences follow:
+- **Pushed commands.** A pushed group's `agent_command` is kept as written. A follower runs it when it next leads, even after the leader that pushed it has gone.
+- **Pushed roots.** A follower's own root comes from the `name` file the leader pushes. A leader can point a follower at any of that follower's directories.
+
+In the usual setup this grants nothing new, because a leader already holds an SSH login to every peer. It does mean you should peer only machines that would each trust the others with a shell. SSH keys locked to `command="autobahn agent"` do not contain a peering leader, and are not supported with peering.
+
+**While a beta leads, it controls the alpha's machine more than it should.** When the alpha attaches, it runs the full agent for the leader over a connection the alpha opened. The leader never needed any access to the alpha, yet today it can:
+- choose which directory on the alpha to sync, with any ignores, symlink handling and permissions;
+- push files into the alpha's `~/.autobahn/peering/`. A genuine leader never does this. A pushed `name` file makes the alpha refuse to start alongside its own configuration. If you then move your configuration aside as the error suggests, the alpha runs the pushed configuration instead, including its commands. If this happens, delete `~/.autobahn/peering/name` and keep your own configuration.
+
+A laptop that attaches to a leading beta therefore trusts that beta with the laptop user's files.
+
+**A pushed session identifier can escape `~/.autobahn`.** A follower uses the pushed `sessions/<group>` content as a directory name after trimming whitespace, without other checks. A malicious leader can place session state, locks and status files elsewhere in the follower's home directory.
+
+**A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
+
+**The attach socket does not check who connects.** On the leading beta, `~/.autobahn/peering/attach.sock` has no peer-credential check, no explicit permissions and no timeout. Unlike the control socket, it accepts any local process that can connect and send the alpha's greeting. On a multi-user host, another local user could pose as the alpha. Do not run a peering beta on a machine shared with users you do not trust.
+
+## Known collision issues
+
+These can let two controllers write one root, or leave a peer stuck, in some timings.
+
+- **An accepted channel is not fenced after a takeover.** A channel whose lease was accepted keeps writing until it next presents a lease. A leader that pauses mid-transfer, or runs a cycle longer than `ttl` plus `failover_after`, can keep writing after another peer has taken the lead.
+- **Taking a lease is not atomic.** Two candidates can both be accepted at the same term. A delayed write at a lower term can overwrite a higher one. Lease files are not fsynced, so a power loss can roll the term back.
+- **A newer ancestor can be replaced by an older replica.** If a peer's ancestor still lives only in its journal, adoption treats it as generation zero. An older replica then overwrites it, losing the history that tells a deliberate edit from an unchanged file.
+- **Temporary file names collide.** Peering state files are written through temporary names built from the process id only. Two channels in one agent can overwrite each other's lease, configuration or name file.
+- **Several peering groups share one identity.** Groups aimed at different roots on one host push different `name` files to the same place. The last push wins, so failover covers only part of the groups.
+- **A follower takes over with an old configuration.** A follower reads the pushed configuration once, before it starts following. Changes pushed while it follows are ignored at takeover.
+- **Handoff can stall or go to the wrong peer.**
+  - Handoff never completes while the leader has plain groups or a paused session.
+  - Plain groups stop while the alpha follows.
+  - `peering yield --to <beta>` does not check its target, so a typo leaves nobody leading until the timeout.
+  - Some leases ignore the configured `ttl`.
+- **A healthy alpha can lose the lead.** Session backoff can reach several minutes, longer than the takeover wait. After a network blip of about a minute, a beta can take over from an alpha that is fine.
+- **An oversized ancestor record can wedge a follower.** A record over the 1 GiB read limit is still written, and every later open of that ancestor then fails until `reset`.
 
 ## What is not covered
 

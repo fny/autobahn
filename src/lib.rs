@@ -36,6 +36,7 @@ pub mod scan;
 pub mod service;
 pub mod session;
 pub mod supervisor;
+pub mod text;
 pub mod transport;
 #[cfg(feature = "tray")]
 pub mod tray;

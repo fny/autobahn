@@ -561,16 +561,13 @@ pub fn prune_agents(destination: &str, keep: usize, dry_run: bool) -> Result<Pru
         }
     }
 
-    let newest_first: Vec<String> = String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        // A half-finished upload is named `.autobahn-tmp-install-…`, which
-        // does not match, but an interrupted rename could leave anything;
-        // only well-formed agent names are ever considered.
-        .filter(|name| name.starts_with("autobahn-") && !name.contains('/'))
-        .map(str::to_owned)
-        .collect();
+    let (newest_first, refused) = agent_names(&String::from_utf8_lossy(&output.stdout));
+    for name in &refused {
+        eprintln!(
+            "note: leaving {} on {destination} alone: not a name autobahn gives an agent",
+            crate::text::display_safe(name)
+        );
+    }
 
     let (kept, mut removed) = select_agents(&newest_first, &current, keep);
 
@@ -579,15 +576,7 @@ pub fn prune_agents(destination: &str, keep: usize, dry_run: bool) -> Result<Pru
         return Ok(Pruned { removed, kept });
     }
 
-    // Removed by exact name under the one directory, never by pattern: a
-    // glob here would be a remote `rm` whose reach depends on what happens
-    // to be on the far side.
-    let names = removed
-        .iter()
-        .map(|name| format!("~/.autobahn/bin/{name}"))
-        .collect::<Vec<_>>()
-        .join(" ");
-    let script = format!("rm -f {names}");
+    let script = removal_script(&removed);
     let output = ssh_command(destination, &script)
         .stdin(Stdio::null())
         .output()
@@ -601,6 +590,45 @@ pub fn prune_agents(destination: &str, keep: usize, dry_run: bool) -> Result<Pru
     }
     removed.reverse();
     Ok(Pruned { removed, kept })
+}
+
+/// Splits a remote listing of `~/.autobahn/bin` into the names of agents,
+/// in listing order, and the names that start like one but are not one.
+///
+/// The listing is the remote host's word, and a name goes on to a remote
+/// shell, so only names autobahn itself could have given an agent are
+/// accepted: `autobahn-` and then letters, digits and `._+-`. A
+/// half-finished upload (`.autobahn-tmp-install-…`) does not start like
+/// one; `autobahn-x; curl … | sh` is refused.
+fn agent_names(listing: &str) -> (Vec<String>, Vec<String>) {
+    let mut names = Vec::new();
+    let mut refused = Vec::new();
+    for name in listing.lines().map(str::trim) {
+        let Some(rest) = name.strip_prefix("autobahn-") else {
+            continue;
+        };
+        let allowed = !rest.is_empty()
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+        match allowed {
+            true => names.push(name.to_owned()),
+            false => refused.push(name.to_owned()),
+        }
+    }
+    (names, refused)
+}
+
+/// The script removing agents by exact name under the one directory, each
+/// path one quoted word: never a pattern, and never anything a name could
+/// make the shell do.
+fn removal_script(names: &[String]) -> String {
+    let paths = names
+        .iter()
+        .map(|name| format!("~/.autobahn/bin/{}", crate::text::shell_quote(name)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("rm -f -- {paths}")
 }
 
 /// Chooses which agent binaries to keep, given the remote directory
@@ -839,6 +867,61 @@ mod tests {
 
     /// The agent in use is never a candidate, whatever it costs. Removing
     /// it would take every session on that host down until the controller
+    #[test]
+    fn a_prune_removes_exactly_the_allowed_names_and_nothing_else_runs() {
+        let listing = "autobahn-0.4.0+e13\n\
+                       autobahn-x; touch pwned\n\
+                       autobahn-$(touch pwned)\n\
+                       autobahn-a b\n\
+                       autobahn-\n\
+                       autobahn-0.3.0+e9-0123456789ab\n";
+        let (names, refused) = agent_names(listing);
+        assert_eq!(
+            names,
+            ["autobahn-0.4.0+e13", "autobahn-0.3.0+e9-0123456789ab"]
+        );
+        assert_eq!(
+            refused,
+            [
+                "autobahn-x; touch pwned",
+                "autobahn-$(touch pwned)",
+                "autobahn-a b",
+                "autobahn-"
+            ]
+        );
+
+        // Handed every name, hostile ones included, the script still
+        // removes each as one exact path, and runs nothing.
+        let home = tempfile::tempdir().expect("a temporary directory");
+        let bin = home.path().join(".autobahn/bin");
+        fs::create_dir_all(&bin).unwrap();
+        let all: Vec<String> = listing.lines().map(str::to_owned).collect();
+        for name in &all {
+            fs::write(bin.join(name), b"").unwrap();
+        }
+        let script = removal_script(&all[..1]);
+        let checked = Command::new("sh").arg("-n").arg("-c").arg(&script).status();
+        assert!(checked.expect("sh runs").success(), "{script}");
+        let hostile = removal_script(&all);
+        let checked = Command::new("sh")
+            .arg("-n")
+            .arg("-c")
+            .arg(&hostile)
+            .status();
+        assert!(checked.expect("sh runs").success(), "{hostile}");
+        let ran = Command::new("sh")
+            .arg("-c")
+            .arg(&hostile)
+            .current_dir(home.path())
+            .env("HOME", home.path())
+            .status()
+            .expect("sh runs");
+        assert!(ran.success());
+        assert!(!home.path().join("pwned").exists());
+        assert!(!bin.join("pwned").exists());
+        assert_eq!(fs::read_dir(&bin).unwrap().count(), 0);
+    }
+
     /// reinstalled it.
     #[test]
     fn the_version_in_use_is_never_removed() {

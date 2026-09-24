@@ -133,6 +133,68 @@ struct RelayState {
 /// diagnosis is in the first few; a runaway is not worth the memory.
 const HELD_STDERR_LINES: usize = 64;
 
+/// The most of one line relayed as one piece. A longer line arrives as
+/// several, so a stream without newlines costs no more than this.
+const RELAY_LINE_BYTES: usize = 4096;
+
+/// Reads a far side's standard error to its end, handing each line to
+/// `each` as text safe to print: decoded lossily (one bad byte no longer
+/// ends the relay and loses everything after it), with control characters
+/// escaped, so nothing it says can drive the terminal or split a log
+/// line, and in pieces of at most [`RELAY_LINE_BYTES`], each but the last
+/// of a long line marked with `…`.
+fn relay_lines(stderr: impl Read, mut each: impl FnMut(String)) {
+    use std::io::BufRead;
+    let mut reader = std::io::BufReader::new(stderr);
+    let mut line = Vec::new();
+    let mut emit = |line: &mut Vec<u8>, cut: bool| {
+        if line.last() == Some(&b'\r') && !cut {
+            line.pop();
+        }
+        let text = String::from_utf8_lossy(line);
+        let text = crate::text::display_safe(&text);
+        each(match cut {
+            true => format!("{text}…"),
+            false => text.into_owned(),
+        });
+        line.clear();
+    };
+    loop {
+        let buffer = match reader.fill_buf() {
+            Ok([]) => break,
+            Ok(buffer) => buffer,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        let room = RELAY_LINE_BYTES - line.len();
+        if room == 0 {
+            // A full piece: the line ends here, or goes on in another.
+            let ends = buffer[0] == b'\n';
+            if ends {
+                reader.consume(1);
+            }
+            emit(&mut line, !ends);
+            continue;
+        }
+        let window = &buffer[..buffer.len().min(room)];
+        match window.iter().position(|&byte| byte == b'\n') {
+            Some(end) => {
+                line.extend_from_slice(&window[..end]);
+                reader.consume(end + 1);
+                emit(&mut line, false);
+            }
+            None => {
+                let taken = window.len();
+                line.extend_from_slice(window);
+                reader.consume(taken);
+            }
+        }
+    }
+    if !line.is_empty() {
+        emit(&mut line, false);
+    }
+}
+
 impl StderrRelay {
     fn start(label: String, stderr: std::process::ChildStderr) -> StderrRelay {
         let state = Arc::new(Mutex::new(RelayState {
@@ -147,16 +209,14 @@ impl StderrRelay {
         let _ = std::thread::Builder::new()
             .name("autobahn-agent-stderr".into())
             .spawn(move || {
-                use std::io::BufRead;
-                for line in std::io::BufReader::new(stderr).lines() {
-                    let Ok(line) = line else { break };
+                relay_lines(stderr, |line| {
                     let mut state = relay.lock().unwrap_or_else(|e| e.into_inner());
                     if state.released {
                         eprintln!("[{}] {line}", state.label);
                     } else if state.held.len() < HELD_STDERR_LINES {
                         state.held.push(line);
                     }
-                }
+                });
             });
         StderrRelay { state }
     }
@@ -2098,6 +2158,37 @@ pub(crate) mod tests {
             Request::SupplyPull(3)
         ));
         connection.close().expect("unable to close");
+    }
+
+    #[test]
+    fn relayed_stderr_is_escaped_capped_and_survives_bad_bytes() {
+        let mut input = Vec::new();
+        input.extend_from_slice(b"plain\r\n");
+        input.extend_from_slice(b"\x1b]52;c;cGF5bG9hZA==\x07\x1b[2J\rsettled\n");
+        input.extend_from_slice(b"bad \xff byte\n");
+        input.extend_from_slice(&vec![b'a'; 3 * RELAY_LINE_BYTES + 5]);
+        input.extend_from_slice(b"\n");
+        input.extend_from_slice(&vec![b'b'; RELAY_LINE_BYTES]);
+        input.extend_from_slice(b"\nafter\nno newline at the end");
+        let mut lines = Vec::new();
+        relay_lines(std::io::Cursor::new(input), |line| lines.push(line));
+
+        assert_eq!(lines[0], "plain");
+        assert_eq!(lines[1], "\\x1b]52;c;cGF5bG9hZA==\\x07\\x1b[2J\\rsettled");
+        assert_eq!(lines[2], "bad \u{fffd} byte");
+        // The long line, in capped pieces, all but the last marked.
+        let long = &lines[3..7];
+        assert!(long[..3]
+            .iter()
+            .all(|piece| piece.len() == RELAY_LINE_BYTES + "…".len() && piece.ends_with('…')));
+        assert_eq!(long[3], "aaaaa");
+        // Nothing is lost after the bad byte or the long line.
+        // A line of exactly one piece is not marked.
+        assert_eq!(lines[7], "b".repeat(RELAY_LINE_BYTES));
+        assert_eq!(&lines[8..], ["after", "no newline at the end"]);
+        for line in &lines {
+            assert!(!line.chars().any(char::is_control), "{line:?}");
+        }
     }
 
     #[test]

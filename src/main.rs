@@ -1,5 +1,11 @@
 //! The autobahn command line interface.
 
+/// The static Linux builds link musl, whose allocator is slow and
+/// serializes on one lock; see the note in Cargo.toml.
+#[cfg(all(target_env = "musl", target_arch = "x86_64"))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

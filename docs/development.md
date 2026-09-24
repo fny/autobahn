@@ -9,6 +9,8 @@ scripts/build-agents.sh       # cross-build the agents bundle
 gh workflow run ci.yml        # Linux, ARM Linux, macOS and FreeBSD
 ```
 
+The static x86_64 Linux build (`--target x86_64-unknown-linux-musl`, which the release and `build-agents.sh` make) links mimalloc in place of musl's allocator, and its C needs a musl C compiler: `apt install musl-tools`. musl's allocator took a remote-side edit at 420k files from 208 ms to 264; the aarch64 build still uses it, because Ubuntu packages no aarch64 musl compiler.
+
 CI runs on every push to `main` and every pull request, except changes that cannot affect a build — Markdown, `docs/`, `bench/`, the README artwork, and the release workflow. There is one macOS job, which runs the suite and then builds the app, signed ad-hoc; the certificate belongs to the release alone. A newer push cancels an older run of the same branch.
 
 macOS runners are the slow and scarce ones, so the macOS job waits for the Linux job and runs only if it passed — a change that fails there is broken anyway. For a change that cannot touch macOS, put `[skip mac]` in the head commit's message, or in a pull request's title, and the macOS job is skipped while everything else runs. Only the head commit of a push is read, so the marker has to be on the last commit you push.

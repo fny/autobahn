@@ -53,6 +53,8 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             platform: linux-x86_64
+            # mimalloc's C, for the musl build (see Cargo.toml).
+            packages: musl-tools
           - target: aarch64-unknown-linux-musl
             platform: linux-aarch64
             linker: aarch64-linux-gnu-gcc

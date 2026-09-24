@@ -44,3 +44,11 @@ tempfile = "3"
 
 [profile.release]
 lto = true
+
+# musl's allocator is slow and takes a global lock: a remote-side edit at
+# 420k files took 264 ms with it, 208 with mimalloc, 164 on glibc. The
+# static Linux release binaries are musl, so they get mimalloc — on x86_64
+# for now: its C needs a musl C compiler, which Ubuntu packages
+# (musl-tools) for x86_64 and not for aarch64.
+[target.'cfg(all(target_env = "musl", target_arch = "x86_64"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

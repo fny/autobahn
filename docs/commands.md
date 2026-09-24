@@ -143,6 +143,14 @@ autobahn sync ~/project host:/srv/project \
     --watch --mode one-way-alpha --ignore target --ignore '*.log'
 ```
 
+A `sync` that finishes — of two roots, or of every configured session when it is given none — exits with a code a script can act on. With several sessions, the worst one decides: `1` beats `2`, which beats `0`.
+
+| Code | Meaning |
+|---|---|
+| `0` | Every session converged, with no conflicts and no blocked paths. |
+| `1` | An error stopped a session: unreachable, halted, a bad configuration. |
+| `2` | Every session finished its pass, but conflicts or blocked paths remain. |
+
 One-shots share session state with the supervisor (same roots → same session), so deletions propagate correctly across runs, conflicts are detected across runs, and interrupted transfers resume. A `sync` and a supervisor can never race the same pairing: each session's state is exclusively locked while it runs.
 
 ## See also

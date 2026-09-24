@@ -1425,6 +1425,152 @@ fn remote_home_relative_roots_resolve_against_the_agent_home() {
     assert_eq!(read(&remote_home, "mirror/file.txt"), "content");
 }
 
+// ── sync exit codes ──────────────────────────────────────────────────
+
+/// Runs the CLI like [`cli`], answering with its exit code.
+fn cli_code(world: &World, config: &Path, args: &[&str]) -> (Option<i32>, String) {
+    let output = std::process::Command::new(agent_binary())
+        .args(args)
+        .arg("--config")
+        .arg(config)
+        .arg("--state-root")
+        .arg(world.state_root())
+        .output()
+        .expect("the CLI runs");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (output.status.code(), text)
+}
+
+/// Writes a configuration of one two-way-conflict group per `(name,
+/// alpha, beta)`, with an extra line of settings for each.
+fn exit_code_config(world: &World, groups: &[(&str, &Path, &str, &str)]) -> PathBuf {
+    let config = world.path("config.toml");
+    let mut text = String::new();
+    for (name, alpha, beta, extra) in groups {
+        text.push_str(&format!(
+            "[groups.{name}]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{beta}\"]\n{extra}\n",
+            alpha.display()
+        ));
+    }
+    fs::write(&config, text).unwrap();
+    config
+}
+
+#[test]
+fn sync_exits_zero_when_every_session_converged() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "content");
+    let beta_spec = beta.to_string_lossy().to_string();
+    let config = exit_code_config(&world, &[("g", &alpha, &beta_spec, "")]);
+    let (code, text) = cli_code(&world, &config, &["sync"]);
+    assert_eq!(code, Some(0), "{text}");
+    assert_eq!(read(&beta, "file.txt"), "content");
+}
+
+#[test]
+fn sync_exits_two_when_a_conflict_remains() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "original");
+    let beta_spec = beta.to_string_lossy().to_string();
+    let config = exit_code_config(&world, &[("g", &alpha, &beta_spec, "")]);
+    assert_eq!(cli_code(&world, &config, &["sync"]).0, Some(0));
+    write(&alpha, "file.txt", "v-alpha");
+    write(&beta, "file.txt", "v-beta");
+    let (code, text) = cli_code(&world, &config, &["sync"]);
+    assert_eq!(code, Some(2), "{text}");
+    assert!(text.contains("conflict"), "{text}");
+}
+
+#[test]
+fn sync_exits_one_when_a_destination_is_unreachable() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    write(&alpha, "file.txt", "content");
+    let config = exit_code_config(
+        &world,
+        &[(
+            "g",
+            &alpha,
+            "unreachable-host:/anywhere",
+            "agent_command = \"/nonexistent/agent-binary agent\"",
+        )],
+    );
+    let (code, text) = cli_code(&world, &config, &["sync"]);
+    assert_eq!(code, Some(1), "{text}");
+}
+
+/// Several sessions exit with the worst of them: an error outranks a
+/// conflict.
+#[test]
+fn sync_exits_with_the_worst_session_an_error_beating_a_conflict() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let doomed = world.directory("doomed");
+    write(&alpha, "file.txt", "original");
+    write(&doomed, "file.txt", "content");
+    let beta_spec = beta.to_string_lossy().to_string();
+    let only_conflicted = exit_code_config(&world, &[("g", &alpha, &beta_spec, "")]);
+    assert_eq!(cli_code(&world, &only_conflicted, &["sync"]).0, Some(0));
+    write(&alpha, "file.txt", "v-alpha");
+    write(&beta, "file.txt", "v-beta");
+    let config = exit_code_config(
+        &world,
+        &[
+            ("g", &alpha, &beta_spec, ""),
+            (
+                "doomed",
+                &doomed,
+                "unreachable-host:/anywhere",
+                "agent_command = \"/nonexistent/agent-binary agent\"",
+            ),
+        ],
+    );
+    let (code, text) = cli_code(&world, &config, &["sync"]);
+    assert_eq!(code, Some(1), "{text}");
+    // The conflicted session still ran its pass and said so.
+    assert!(text.contains("1 conflict(s)"), "{text}");
+}
+
+/// A manual sync of two roots follows the same codes.
+#[test]
+fn a_manual_sync_exits_two_when_a_conflict_remains() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "original");
+    let state = world.path("manual-state");
+    let run = || {
+        let output = std::process::Command::new(agent_binary())
+            .arg("sync")
+            .arg(&alpha)
+            .arg(&beta)
+            .arg("--mode")
+            .arg("two-way-safe")
+            .arg("--state-dir")
+            .arg(&state)
+            .output()
+            .expect("the CLI runs");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    };
+    let (code, text) = run();
+    assert_eq!(code, Some(0), "{text}");
+    write(&alpha, "file.txt", "v-alpha");
+    write(&beta, "file.txt", "v-beta");
+    let (code, text) = run();
+    assert_eq!(code, Some(2), "{text}");
+}
 // ── conflicts, diff, resolve ─────────────────────────────────────────
 
 /// Runs the CLI against a world's configuration file and state root.

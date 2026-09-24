@@ -812,9 +812,26 @@ fn main() {
     };
     if let Err(error) = result {
         eprintln!("autobahn: {error:#}");
-        std::process::exit(1);
+        std::process::exit(match error.downcast_ref::<Unsettled>() {
+            Some(_) => 2,
+            None => 1,
+        });
     }
 }
+
+/// A sync that finished its pass but left conflicts or blocked paths
+/// behind. It exits 2 rather than 1, so a script can tell "stopped with
+/// something to settle" from "could not run"; see `docs/commands.md`.
+#[derive(Debug)]
+struct Unsettled(String);
+
+impl std::fmt::Display for Unsettled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsettled {}
 
 /// Parses an scp-style beta specification into (host, path) if it denotes a
 /// remote root. A specification is remote when it contains a colon before
@@ -1053,6 +1070,17 @@ fn run_sync(
             follow_ups = 0;
         }
         if !watch {
+            let conflicts = report.conflicts.len();
+            let blocked = report.alpha_scan_problems.len()
+                + report.beta_scan_problems.len()
+                + report.alpha_transition_problems.len()
+                + report.beta_transition_problems.len();
+            if conflicts > 0 || blocked > 0 {
+                return Err(Unsettled(format!(
+                    "{conflicts} conflict(s) and {blocked} blocked path(s) remain"
+                ))
+                .into());
+            }
             break;
         }
         // Wait for a change on either side (with the interval as the
@@ -1476,8 +1504,8 @@ fn resolve_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
 }
 
 /// Runs the supervisor over the configured sessions.
-/// One pass over every configured session, then exit — non-zero if any
-/// session failed.
+/// One pass over every configured session, then exit: 1 if any session
+/// failed, else 2 if any left conflicts or blocked paths, else 0.
 fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> {
     let config = config.map_or_else(paths::default_config_path, Ok)?;
     let plans = load_config(Some(config.clone()))?.plans()?;
@@ -1492,6 +1520,7 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
     let supervisor = Supervisor::new(plans, state_root, false);
     let outcomes = supervisor.run_once();
     let mut failures = 0usize;
+    let mut unsettled = 0usize;
     for outcome in &outcomes {
         match &outcome.result {
             Ok(digest) => {
@@ -1505,6 +1534,9 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
                 if digest.problems > 0 {
                     summary.push_str(&format!(", {} blocked", digest.problems));
                 }
+                if digest.conflicts > 0 || digest.problems > 0 {
+                    unsettled += 1;
+                }
                 println!("[{}] synchronized: {summary}", outcome.display);
             }
             Err(error) => {
@@ -1515,6 +1547,12 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
     }
     if failures > 0 {
         bail!("{failures} session(s) failed");
+    }
+    if unsettled > 0 {
+        return Err(Unsettled(format!(
+            "{unsettled} session(s) left conflicts or blocked paths"
+        ))
+        .into());
     }
     Ok(())
 }

@@ -853,31 +853,170 @@ impl Harness {
     }
 }
 
+/// The change a cut or crashed cycle carries, and the oracle every
+/// recovery from one answers to. Alpha holds a file to rewrite, one to
+/// delete, and one to replace with a directory; the change rewrites,
+/// creates, deletes and replaces them.
+struct CutScenario {
+    old_bytes: Vec<u8>,
+    new_bytes: Vec<u8>,
+    created: Vec<u8>,
+}
+
+/// The file to delete, and what it held.
+const GONE: (&str, &[u8]) = ("gone.txt", b"to be deleted");
+/// The file replaced by a directory, and what it held.
+const MORPH: (&str, &[u8]) = ("morph", b"a file, then a directory");
+/// The file inside the directory that replaces it.
+const MORPH_INNER: (&str, &[u8]) = ("morph/inner.txt", b"inside the new directory");
+/// The paths the change touches: the only ones a conflict may name.
+const CUT_PATHS: [&str; 4] = ["modify.txt", "created.bin", GONE.0, MORPH.0];
+
+impl CutScenario {
+    fn new() -> CutScenario {
+        CutScenario {
+            old_bytes: (0..64 * 1024u32).map(|i| (i % 251) as u8).collect(),
+            new_bytes: (0..80 * 1024u32).map(|i| (i % 241) as u8).collect(),
+            created: (0..96 * 1024u32).map(|i| (i % 239) as u8).collect(),
+        }
+    }
+
+    /// The converged tree before the change.
+    fn prepare(&self, harness: &mut Harness) {
+        fs::write(harness.alpha.join("stable.txt"), b"stable").unwrap();
+        fs::write(harness.alpha.join("modify.txt"), &self.old_bytes).unwrap();
+        fs::write(harness.alpha.join(GONE.0), GONE.1).unwrap();
+        fs::write(harness.alpha.join(MORPH.0), MORPH.1).unwrap();
+        harness.cycle_ok();
+        harness.cycle_ok();
+        harness.assert_trees_equal("pre-cut convergence");
+    }
+
+    /// The user's change on alpha, which the next cycle carries.
+    fn change(&self, harness: &Harness) {
+        fs::write(harness.alpha.join("modify.txt"), &self.new_bytes).unwrap();
+        fs::write(harness.alpha.join("created.bin"), &self.created).unwrap();
+        fs::remove_file(harness.alpha.join(GONE.0)).unwrap();
+        fs::remove_file(harness.alpha.join(MORPH.0)).unwrap();
+        fs::create_dir(harness.alpha.join(MORPH.0)).unwrap();
+        fs::write(harness.alpha.join(MORPH_INNER.0), MORPH_INNER.1).unwrap();
+    }
+
+    /// Ordinary sessions over the same state, until a cycle moves nothing.
+    fn recover(harness: &mut Harness) -> CycleReport {
+        let mut last: Option<CycleReport> = None;
+        for _ in 0..6 {
+            let report = harness.cycle().expect("recovery cycles run");
+            let settled = report.alpha_transitions == 0
+                && report.beta_transitions == 0
+                && !report.missing_staged_files;
+            last = Some(report);
+            if settled {
+                break;
+            }
+        }
+        last.expect("at least one recovery cycle")
+    }
+
+    /// Whether `root` holds the user's latest version of `path`.
+    fn is_new(&self, root: &Path, path: &str) -> bool {
+        let bytes = fs::read(root.join(path)).ok();
+        match path {
+            "modify.txt" => bytes.as_deref() == Some(&self.new_bytes[..]),
+            "created.bin" => bytes.as_deref() == Some(&self.created[..]),
+            p if p == GONE.0 => fs::symlink_metadata(root.join(p)).is_err(),
+            p if p == MORPH.0 => {
+                root.join(p).is_dir()
+                    && fs::read(root.join(MORPH_INNER.0)).ok().as_deref() == Some(MORPH_INNER.1)
+            }
+            other => unreachable!("{other} is not a path of the change"),
+        }
+    }
+
+    /// The safety line after recovery. Nothing torn: every path holds one
+    /// of its legitimate versions. Conflicts only on the change's paths.
+    /// The user's latest version is never lost: on a path in no conflict
+    /// both sides hold it, and on a conflicted path at least one side
+    /// does — except that a deletion may come undone, which loses no
+    /// data. Without conflicts, full agreement.
+    fn assert_recovered(&self, harness: &Harness, report: &CycleReport, context: &str) {
+        let is_old = |root: &Path, path: &str| {
+            let bytes = fs::read(root.join(path)).ok();
+            match path {
+                "modify.txt" => bytes.as_deref() == Some(&self.old_bytes[..]),
+                "created.bin" => bytes.is_none() && fs::symlink_metadata(root.join(path)).is_err(),
+                p if p == GONE.0 => bytes.as_deref() == Some(GONE.1),
+                p if p == MORPH.0 => bytes.as_deref() == Some(MORPH.1),
+                other => unreachable!("{other} is not a path of the change"),
+            }
+        };
+        for root in [&harness.alpha, &harness.beta] {
+            assert_eq!(
+                fs::read(root.join("stable.txt")).ok().as_deref(),
+                Some(&b"stable"[..]),
+                "{context}: stable.txt was disturbed in {}",
+                root.display()
+            );
+            for path in CUT_PATHS {
+                assert!(
+                    self.is_new(root, path) || is_old(root, path),
+                    "{context}: {path} in {} holds none of its legitimate versions",
+                    root.display()
+                );
+            }
+        }
+        for conflict in &report.conflicts {
+            assert!(
+                CUT_PATHS.contains(&conflict.root.as_str()),
+                "{context}: conflict off the cut cycle's paths: {}",
+                conflict.root
+            );
+        }
+        for path in CUT_PATHS {
+            let conflicted = report.conflicts.iter().any(|c| c.root == path);
+            let on_alpha = self.is_new(&harness.alpha, path);
+            let on_beta = self.is_new(&harness.beta, path);
+            if path == GONE.0 && !on_alpha && !on_beta {
+                // An interrupted cycle drops the provenance of every path
+                // it announced, so the file beta still holds reads as a
+                // creation there and comes back to alpha. Undoing a
+                // deletion loses nothing; only the old bytes may return.
+                continue;
+            }
+            if conflicted {
+                assert!(
+                    on_alpha || on_beta,
+                    "{context}: the latest {path} survives on neither side of its conflict"
+                );
+            } else {
+                assert!(
+                    on_alpha && on_beta,
+                    "{context}: the latest {path} was lost (alpha holds it: {on_alpha}, \
+                     beta: {on_beta})"
+                );
+            }
+        }
+        if report.conflicts.is_empty() {
+            harness.assert_trees_equal(&format!("{context}: recovery"));
+        }
+    }
+}
+
 /// The sweep: for both directions, cut at the boundary after every frame
 /// of the canonical exchange (and two bytes into the frame after it),
 /// recover, and hold the safety line every time. The sweep is self-
 /// terminating — it ends when a cut point lies beyond the whole exchange.
 #[test]
 fn every_cut_connection_recovers_to_a_safe_tree() {
-    let old_bytes: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 251) as u8).collect();
-    let new_bytes: Vec<u8> = (0..80 * 1024u32).map(|i| (i % 241) as u8).collect();
-    let created: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 239) as u8).collect();
-
+    let scenario = CutScenario::new();
     for direction in [CutDirection::FromAgent, CutDirection::ToAgent] {
         let mut cut_points = 0usize;
         let mut conflicted_points = 0usize;
         'sweep: for frames in 0.. {
             for extra in [0u64, 2] {
                 let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-                fs::write(harness.alpha.join("stable.txt"), b"stable").unwrap();
-                fs::write(harness.alpha.join("modify.txt"), &old_bytes).unwrap();
-                harness.cycle_ok();
-                harness.cycle_ok();
-                harness.assert_trees_equal("pre-cut convergence");
-
-                // The change the cut cycle carries.
-                fs::write(harness.alpha.join("modify.txt"), &new_bytes).unwrap();
-                fs::write(harness.alpha.join("created.bin"), &created).unwrap();
+                scenario.prepare(&mut harness);
+                scenario.change(&harness);
 
                 let (result, fired) = harness.agent_cycle_with_cut(direction, frames, extra);
                 if !fired {
@@ -892,51 +1031,15 @@ fn every_cut_connection_recovers_to_a_safe_tree() {
                 }
                 cut_points += 1;
 
-                // Recovery: ordinary sessions over the same state.
-                let mut last: Option<CycleReport> = None;
-                for _ in 0..6 {
-                    let report = harness.cycle().expect("recovery cycles run");
-                    let settled = report.alpha_transitions == 0
-                        && report.beta_transitions == 0
-                        && !report.missing_staged_files;
-                    last = Some(report);
-                    if settled {
-                        break;
-                    }
-                }
-                let report = last.expect("at least one recovery cycle");
-
-                // The safety line: nothing torn, conflicts only on the cut
-                // cycle's paths, and full agreement without them.
-                let candidate = |root: &Path, name: &str, allowed: &[Option<&[u8]>]| {
-                    let actual = fs::read(root.join(name)).ok();
-                    assert!(
-                        allowed.contains(&actual.as_deref()),
-                        "{direction:?} frames={frames} extra={extra}: {name} holds \
-                         none of its legitimate versions ({:?} bytes)",
-                        actual.map(|bytes| bytes.len())
-                    );
-                };
-                for root in [&harness.alpha, &harness.beta] {
-                    candidate(root, "stable.txt", &[Some(b"stable")]);
-                    candidate(root, "modify.txt", &[Some(&old_bytes), Some(&new_bytes)]);
-                    candidate(root, "created.bin", &[None, Some(&created)]);
-                }
-                if report.conflicts.is_empty() {
-                    harness.assert_trees_equal(&format!(
-                        "{direction:?} frames={frames} extra={extra}: recovery"
-                    ));
-                } else {
+                let report = CutScenario::recover(&mut harness);
+                if !report.conflicts.is_empty() {
                     conflicted_points += 1;
-                    for conflict in &report.conflicts {
-                        assert!(
-                            ["modify.txt", "created.bin"].contains(&conflict.root.as_str()),
-                            "{direction:?} frames={frames} extra={extra}: conflict off \
-                             the cut cycle's paths: {}",
-                            conflict.root
-                        );
-                    }
                 }
+                scenario.assert_recovered(
+                    &harness,
+                    &report,
+                    &format!("{direction:?} frames={frames} extra={extra}"),
+                );
             }
         }
         eprintln!(
@@ -944,6 +1047,76 @@ fn every_cut_connection_recovers_to_a_safe_tree() {
              {conflicted_points} recovered with conflicts"
         );
         assert!(cut_points > 0, "the sweep never engaged a cut");
+    }
+}
+
+/// The mutation check on the oracle above: a recovery that rolls the
+/// user's latest `modify.txt` back to the old one on both sides — or
+/// loses the created file on both — leaves two equal trees and no
+/// conflict, and the oracle must still fail it.
+#[test]
+fn the_cut_oracle_fails_a_rollback_of_the_latest_version() {
+    let scenario = CutScenario::new();
+    type Mutation = fn(&CutScenario, &Path);
+    let mutations: [(&str, Mutation); 2] = [
+        ("modify.txt rolled back", |s, root| {
+            fs::write(root.join("modify.txt"), &s.old_bytes).unwrap()
+        }),
+        ("created.bin lost", |_, root| {
+            fs::remove_file(root.join("created.bin")).unwrap()
+        }),
+    ];
+    for (name, mutate) in mutations {
+        let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
+        scenario.prepare(&mut harness);
+        scenario.change(&harness);
+        let report = CutScenario::recover(&mut harness);
+        scenario.assert_recovered(&harness, &report, "unmutated");
+
+        for root in [&harness.alpha, &harness.beta] {
+            mutate(&scenario, root);
+        }
+        harness.assert_trees_equal(name);
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            scenario.assert_recovered(&harness, &report, name)
+        }));
+        assert!(
+            caught.is_err(),
+            "the oracle accepted a recovery with {name}"
+        );
+    }
+}
+
+/// A restart inside the window the journal announces: the process dies
+/// after the intent is recorded — before beta's transition, after it, or
+/// after every transition but before the achieved ancestor record — and
+/// a fresh session recovers over the same state. The same oracle as the
+/// cut sweep. The death is a panic out of the cycle hook, which unwinds
+/// through the session and drops it unrecorded; over both transports.
+#[test]
+fn a_restart_between_the_intent_and_the_record_recovers_to_a_safe_tree() {
+    let scenario = CutScenario::new();
+    for transport in [Transport::Local, Transport::Agent] {
+        for point in [
+            CyclePoint::BeforeBetaTransition,
+            CyclePoint::AfterBetaTransition,
+            CyclePoint::BeforeRecord,
+        ] {
+            let context = format!("{transport:?} {point:?}");
+            let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
+            scenario.prepare(&mut harness);
+            scenario.change(&harness);
+            let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                harness.cycle_at(point, || panic!("the process died here"))
+            }));
+            assert!(
+                died.is_err(),
+                "{context}: the cycle never reached the point"
+            );
+
+            let report = CutScenario::recover(&mut harness);
+            scenario.assert_recovered(&harness, &report, &context);
+        }
     }
 }
 

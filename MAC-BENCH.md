@@ -381,6 +381,23 @@ The link is intact (still one inode, two links), so the chmod went straight thro
 
 **Record:** the message, and the ownership.
 
+**Result — `d7c2e21` plus fny's uncommitted peering rename, macOS 26.5.1, Apple M4, 2026-09-24. Reproduced, with two consequences the check did not anticipate.**
+
+```
+whoami: root
+HOME:   /Users/faraz
+supervising 10 session(s); status is available via `autobahn status`
+2026-09-24 07:55:53 peering: leading as the alpha at term 1
+```
+
+- **Root-owned state, as expected:** `control.sock`, `sessions/`, `status/` and `supervisor/` under `~/mb7/state`, a directory owned by the user. No message, no refusal.
+- **`--state-root` moved the state but not the configuration.** `$HOME` stays the caller's under macOS `sudo`, so the config resolved to `~/.autobahn/config.toml` and root supervised **the live fleet** — ten sessions against real roots and hosts — not the throwaway pair. The endpoint locks refused each one, which is the only thing that stopped two supervisors writing the same trees.
+- **It reached the live state root.** `~/.autobahn/peering/lease.json` is now owned by root and the user's supervisor cannot renew it. Repair needs `sudo chown`.
+
+**Is it macOS-specific?** The default path is; the gap is not. Measured on both: macOS `sudo` keeps `HOME=/Users/faraz`, while Ubuntu's `Defaults env_reset` gives `HOME=/root`, so on Linux the same command reads root's own config and writes root's own state. `sudo -E` puts Linux in the same position.
+
+**Filed against** [`LOCAL-08`](REVIEWS/fixes/LOCAL-08-refuse-root.md), which now carries this run and a platform-neutral clause: refuse when the config or state root is owned by another user, whatever the uid.
+
 ### 7h. The control socket with a long state root — LOCAL-05
 
 1. Use a state root deep enough that its path passes 100 bytes, and start `watch`.

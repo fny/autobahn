@@ -3706,6 +3706,7 @@ fn render_status(
     live: bool,
     out: &mut String,
 ) {
+    use autobahn::supervisor::control::progress_of;
     use std::fmt::Write;
 
     // One round trip answers both "is anything running" and "what is each
@@ -3804,12 +3805,10 @@ fn render_status(
         // enough to be worth a line. Fifteen healthy sessions were forty-five
         // lines, and the one that needed a person scrolled off the top.
         let live_progress = |plan: &autobahn::config::SessionPlan| {
-            reported.as_ref().and_then(|sessions| {
-                sessions
-                    .iter()
-                    .find(|session| session.group == plan.group && session.host == plan.host)
-                    .map(|session| session.progress.clone())
-            })
+            reported
+                .as_deref()
+                .and_then(|sessions| progress_of(sessions, &plan.identifier()))
+                .cloned()
         };
         if !expand {
             if let Some(line) = collapsed_group(block, &live_progress, live) {
@@ -3829,12 +3828,9 @@ fn render_status(
         );
 
         for (plan, status) in block {
-            let progress = reported.as_ref().and_then(|sessions| {
-                sessions
-                    .iter()
-                    .find(|session| session.group == plan.group && session.host == plan.host)
-                    .map(|session| &session.progress)
-            });
+            let progress = reported
+                .as_deref()
+                .and_then(|sessions| progress_of(sessions, &plan.identifier()));
             render_status_entry(
                 &plan.beta_spec(),
                 plan.mode_name(),
@@ -4445,6 +4441,61 @@ mod tests {
         // Waiting is never a phase to report: a session between cycles is
         // described by how the last one ended.
         assert!(!shows(&snapshot(Phase::Waiting, 600), true));
+    }
+
+    /// Two betas on one host in one group share a group and a host, so
+    /// progress keyed by those showed each the other's. Keyed by the
+    /// session, each shows its own.
+    #[test]
+    fn two_betas_on_one_host_show_their_own_progress() {
+        use autobahn::progress::{Phase, ProgressSnapshot};
+        use autobahn::supervisor::control::{progress_of, SessionProgress};
+
+        let keep = tempfile::tempdir().expect("tempdir");
+        let config = keep.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\n\
+             betas = [\"host:/tree\", \"host:/other\"]\n",
+        )
+        .unwrap();
+        let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].host, plans[1].host);
+
+        let snapshot = |phase: Phase| ProgressSnapshot {
+            phase,
+            seconds: 0,
+            working_seconds: 0,
+            alpha: side(),
+            beta: side(),
+            staged: 0,
+            staged_total: 0,
+            staged_bytes: 0,
+            staged_bytes_total: 0,
+            moved_files: 0,
+            moved_bytes: 0,
+            applied: 0,
+            applied_total: 0,
+            remaining_seconds: None,
+        };
+        let reported: Vec<SessionProgress> = plans
+            .iter()
+            .zip([Phase::Scanning, Phase::Paused])
+            .map(|(plan, phase)| SessionProgress {
+                session: plan.identifier(),
+                group: plan.group.clone(),
+                host: plan.host.clone(),
+                progress: snapshot(phase),
+            })
+            .collect();
+        let phase = |index: usize| {
+            progress_of(&reported, &plans[index].identifier())
+                .expect("each session has progress")
+                .phase
+        };
+        assert_eq!(phase(0), Phase::Scanning);
+        assert_eq!(phase(1), Phase::Paused);
     }
 
     fn side() -> autobahn::progress::SideSnapshot {

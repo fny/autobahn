@@ -156,12 +156,28 @@ pub fn mismatch_message(supervisor: Option<&str>) -> String {
 /// One supervised session's live progress.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionProgress {
+    /// The session's identifier: what tells two sessions apart when they
+    /// share a group and a destination host.
+    pub session: String,
     /// The session's group.
     pub group: String,
     /// The session's destination.
     pub host: String,
     /// What it is doing.
     pub progress: crate::progress::ProgressSnapshot,
+}
+
+/// The live progress of the session `identifier` names, from a
+/// supervisor's answer. By identifier, not by group and host, which two
+/// betas on one host share.
+pub fn progress_of<'a>(
+    sessions: &'a [SessionProgress],
+    identifier: &str,
+) -> Option<&'a crate::progress::ProgressSnapshot> {
+    sessions
+        .iter()
+        .find(|session| session.session == identifier)
+        .map(|session| &session.progress)
 }
 
 /// The control flags of one supervised session, flipped by the control
@@ -181,6 +197,8 @@ pub(crate) struct WorkerControl {
 /// One registry entry: a session, its control flags, and its live
 /// progress.
 pub(crate) struct Entry {
+    /// The session's identifier.
+    pub session: String,
     /// The session's group.
     pub group: String,
     /// The session's destination.
@@ -248,6 +266,7 @@ impl Registry {
                 self.entries
                     .iter()
                     .map(|entry| SessionProgress {
+                        session: entry.session.clone(),
                         group: entry.group.clone(),
                         host: entry.host.clone(),
                         progress: entry.progress.snapshot(),
@@ -695,6 +714,7 @@ mod tests {
 
     fn entry(group: &str, host: &str) -> Entry {
         Entry {
+            session: format!("{group}-{host}"),
             group: group.into(),
             host: host.into(),
             control: Arc::default(),

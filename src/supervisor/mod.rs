@@ -641,6 +641,7 @@ impl Supervisor {
                 .zip(&controls)
                 .zip(&progresses)
                 .map(|((plan, flags), progress)| control::Entry {
+                    session: plan.identifier(),
                     group: plan.group.clone(),
                     host: plan.host.clone(),
                     control: flags.clone(),
@@ -1825,12 +1826,10 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
     let mut groups: Vec<GroupReport> = Vec::new();
     for plan in plans {
         let status = read_status(state_root, &plan.identifier()).ok().flatten();
-        let progress = live.as_ref().and_then(|sessions| {
-            sessions
-                .iter()
-                .find(|session| session.group == plan.group && session.host == plan.host)
-                .map(|session| session.progress.clone())
-        });
+        let progress = live
+            .as_deref()
+            .and_then(|sessions| control::progress_of(sessions, &plan.identifier()))
+            .cloned();
         let (role, term) = status
             .as_ref()
             .map(|status| (status.role.clone(), status.term))

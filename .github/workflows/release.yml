@@ -65,9 +65,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sha=$(git rev-parse HEAD)
+          # Not pull_request runs: those test the pull request merged into
+          # its base, which is not this commit's tree.
           runs=$(gh api --paginate \
             "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&per_page=100" \
-            --jq '.workflow_runs[].id') || exit 1
+            --jq '.workflow_runs[] | select(.event != "pull_request") | .id') || exit 1
           # The jobs that succeeded in the latest attempt of each run.
           passed=$(for run in $runs; do
             gh api --paginate \

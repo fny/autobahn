@@ -5,7 +5,7 @@
 **Your files stay on your machine. Your work runs anywhere else.** Autobahn keeps a folder identical across every machine you use — laptop, server, GPU box — in about 50 ms.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
+curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
 Then [three steps to your first sync](#start-here). Or read [how it works](docs/how-it-works.md) first.
@@ -29,7 +29,7 @@ Then [three steps to your first sync](#start-here). Or read [how it works](docs/
 **1. Install it.**
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
+curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
 **2. Say what stays in sync.** Each **group** fans one source root (the *alpha*) out to any number of destinations (the *betas*).
@@ -104,10 +104,10 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 ## Installing it other ways
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
+curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
-The installer puts `autobahn` on your `PATH` and copies the agent bundle into `~/.autobahn/agents`, which is what bootstraps hosts on other platforms. `--bin-dir` moves the command (default `~/.local/bin`), `--no-agents` skips the bundle (usually a mistake), `--version` picks a release. `AUTOBAHN_BIN_DIR` and `AUTOBAHN_HOME` set the same two from the environment, for a non-interactive install. Later, `autobahn update` does it all again, with `--dry-run` and `--version TAG`.
+The installer puts `autobahn` on your `PATH` and copies the agent bundle into `~/.autobahn/agents`, which is what bootstraps hosts on other platforms. `--bin-dir` moves the command (default `~/.local/bin`), `--no-agents` skips the bundle (usually a mistake), `--version` picks a release. Every download is checked against the release's `SHA256SUMS`, and the installer refuses when it cannot be; `--insecure` is only for an old release that publishes none. `AUTOBAHN_BIN_DIR` and `AUTOBAHN_HOME` set the same two from the environment, for a non-interactive install. Later, `autobahn update` does it all again, with `--dry-run` and `--version TAG`.
 
 By hand: grab a binary from [Releases](https://github.com/fny/autobahn/releases).
 
@@ -198,7 +198,7 @@ autobahn install # or run as a service
 First install Autobahn:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fny/autobahn/release/scripts/install.sh | sh
+curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
 Then update `~/.autobahn/config.toml` to list your sync groups. For details on configuration options, see [Configuration](docs/configuration.md).
@@ -275,7 +275,7 @@ Most of the internal documentation was orignally written by LLMs. Forgive me for
 ## Custom Installation
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/fny/autobahn/main/scripts/install.sh | sh
+curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
 - Installs `autobahn` to your `PATH`

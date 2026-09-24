@@ -20,11 +20,13 @@ A tag that starts with `v` starts `.github/workflows/release.yml`.
 2. The Linux job builds static musl binaries for x86-64 and arm64.
 3. The macOS job builds both macOS binaries and the menu bar app. It signs them with the Developer ID certificate. Apple notarises them. This job waits for approval, because it holds the secrets.
 4. The release job collects every `autobahn-<os>-<arch>` binary into `autobahn-agents.tar.gz`. It writes `SHA256SUMS` over every asset.
-5. `gh release create` publishes the binaries, the bundle, the app archive and the checksums.
+5. `gh release create` publishes the binaries, the bundle, the app archive, the checksums and `scripts/install.sh`.
 
 The guard job exists because nothing checked the tag before. The package version names the agent on every remote host. If the tag and the package version disagree, the release publishes binaries whose agents carry a different version than the tag. No handshake catches this, because both ends of a session still agree with each other.
 
-`scripts/install.sh` installs from a published release. It maps the platform the same way the controller does. It verifies every download against `SHA256SUMS`. It writes to a temporary file and renames the file into place. It puts the command on your PATH and the agent bundle in `~/.autobahn/agents`.
+`scripts/install.sh` installs from a published release, and the release publishes it too, so the one-liner runs the installer that matches the release it installs. It maps the platform the same way the controller does. It downloads the binary and the agent bundle, and verifies both against `SHA256SUMS` before it installs either. It refuses a bundle member that would land outside `agents/`. It writes to a temporary file and renames the file into place. It puts the command on your PATH and the agent bundle in `~/.autobahn/agents`.
+
+A `SHA256SUMS` that cannot be downloaded stops the install, with one message when the release has none (a `404`) and another when the download failed. `--insecure`, or `AUTOBAHN_INSECURE=1` in the piped form, installs an old release that publishes no checksums. It prints a warning, and nothing then checks that the files are the ones that were published. It never excuses a checksum that does not match.
 
 ## Prereleases
 

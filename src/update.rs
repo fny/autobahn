@@ -114,8 +114,10 @@ pub fn run(options: Options) -> Result<()> {
     }
     let staged_sums = work.path().join(CHECKSUMS_ASSET);
     source.fetch(CHECKSUMS_ASSET, &staged_sums).context(
-        "unable to download SHA256SUMS. Nothing is installed unverified: retry, or \
-         use scripts/install.sh if this release publishes no checksums",
+        "unable to download SHA256SUMS, so nothing can be verified and nothing was \
+         installed. Retry. Only an old release publishes no checksums; installing one \
+         means `scripts/install.sh --insecure --version <tag>`, and nothing then checks \
+         that its files are the ones that were published",
     )?;
 
     // 2. Verified before anything moves. A checksum checked after the

@@ -3077,7 +3077,7 @@ fn base_signature(path: &Path) -> Signature {
     let Ok(file) = File::open(path) else {
         return Signature::default();
     };
-    rsync::signature(file, rsync::optimal_block_size(metadata.len())).unwrap_or_default()
+    rsync::file_signature(&file, rsync::optimal_block_size(metadata.len())).unwrap_or_default()
 }
 
 /// Verifies that a path is a real directory, without following symbolic

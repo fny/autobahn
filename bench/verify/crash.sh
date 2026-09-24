@@ -23,16 +23,21 @@
 # stale journal could be replayed onto a checkpoint that already holds it.
 #
 # Usage: crash.sh [trials] [betas]
-set -u
+set -euo pipefail
 TRIALS=${1:-40}
 BETAS=${2:-1}
 AB=${AB:-/home/ubuntu/Workspace/autobahn/target/release/autobahn}
 BM=${BM:-/home/ubuntu/Workspace/autobahn/bench/harness/target/release/benchmark}
 PASS=0; FAIL=0; LOST=0
-mkdir -p /tmp/crashtest && rm -rf /tmp/crashtest/*
+
+# Fail at once on a binary that is missing or does not run, rather than
+# reporting every trial as a failed convergence.
+"$AB" --version > /dev/null 2>&1 || { echo "autobahn at $AB does not run" >&2; exit 1; }
+[ -x "$BM" ] || { echo "no benchmark harness at $BM" >&2; exit 1; }
+ROOT=$(mktemp -d /tmp/crashtest.XXXXXX)
 
 for trial in $(seq 1 "$TRIALS"); do
-  W=/tmp/crashtest/t$trial
+  W=$ROOT/t$trial
   mkdir -p "$W/src" "$W/state"
   for b in $(seq 1 "$BETAS"); do mkdir -p "$W/dst$b"; done
   # A small tree with a file we will revert, plus filler to make cycles real.
@@ -43,18 +48,23 @@ for trial in $(seq 1 "$TRIALS"); do
   {
     echo "[groups.crash]"
     echo "alpha = \"$W/src\""
-    echo 'mode = "two-way-safe"'
+    echo 'mode = "two-way-conflict"'
     echo "interval = 2"
     printf 'betas = ['
     for b in $(seq 1 "$BETAS"); do
       printf '"%s/dst%s"' "$W" "$b"
-      [ "$b" -lt "$BETAS" ] && printf ', '
+      if [ "$b" -lt "$BETAS" ]; then printf ', '; fi
     done
     printf ']\n'
   } > "$W/ab.toml"
 
-  # Converge once so both sides and the ancestor agree.
-  timeout 60 "$AB" up --config "$W/ab.toml" --state-root "$W/state" --once > "$W/first.log" 2>&1
+  # Converge once so both sides and the ancestor agree. Nothing has
+  # crashed yet, so a failure here is a broken setup, not a finding.
+  if ! timeout 60 "$AB" sync --config "$W/ab.toml" --state-root "$W/state" > "$W/first.log" 2>&1; then
+    echo "trial $trial: the first synchronization failed; the end of its log:" >&2
+    tail -n 20 "$W/first.log" >&2
+    exit 1
+  fi
 
   before_target=$(cat "$W/dst1/target.txt" 2>/dev/null || echo MISSING)
   [ "$before_target" != "ORIGINAL" ] && { echo "trial $trial: setup did not converge"; FAIL=$((FAIL+1)); continue; }
@@ -69,25 +79,33 @@ for trial in $(seq 1 "$TRIALS"); do
   # during an append.
   for i in $(seq 1 200); do printf 'v2-%s-%s' "$i" "$RANDOM" > "$W/src/f$i.txt"; done
 
-  setsid "$AB" up --config "$W/ab.toml" --state-root "$W/state" > "$W/watch.log" 2>&1 &
+  setsid "$AB" watch --config "$W/ab.toml" --state-root "$W/state" > "$W/watch.log" 2>&1 &
   UP=$!
   # Kill at a random point inside the window where a cycle is likely running.
   sleep "0.$(( RANDOM % 9 + 1 ))"
-  kill -9 $UP 2>/dev/null
-  pkill -9 -x autobahn 2>/dev/null
+  if ! kill -0 "$UP" 2>/dev/null; then
+    echo "trial $trial: watch exited before it could be killed; the end of its log:" >&2
+    tail -n 20 "$W/watch.log" >&2
+    exit 1
+  fi
+  # The whole process group setsid made, and nothing else on the machine.
+  kill -9 -- "-$UP" 2>/dev/null || true
+  wait "$UP" 2>/dev/null || true
   sleep 0.3
 
   # Restart and let it settle.
-  timeout 90 "$AB" up --config "$W/ab.toml" --state-root "$W/state" --once > "$W/second.log" 2>&1
-  timeout 90 "$AB" up --config "$W/ab.toml" --state-root "$W/state" --once >> "$W/second.log" 2>&1
+  # A failure here is the kind of thing a trial exists to find: it is
+  # judged below, from the trees and the log, not allowed to end the run.
+  timeout 90 "$AB" sync --config "$W/ab.toml" --state-root "$W/state" > "$W/second.log" 2>&1 || true
+  timeout 90 "$AB" sync --config "$W/ab.toml" --state-root "$W/state" >> "$W/second.log" 2>&1 || true
 
-  src_m=$("$BM" manifest full "$W/src" 2>/dev/null)
+  src_m=$("$BM" manifest full "$W/src" 2>/dev/null || true)
   src_target=$(cat "$W/src/target.txt" 2>/dev/null || echo MISSING)
 
   ok=1; why=""
   after_target=MISSING; doomed_back=NO
   for b in $(seq 1 "$BETAS"); do
-    dst_m=$("$BM" manifest full "$W/dst$b" 2>/dev/null)
+    dst_m=$("$BM" manifest full "$W/dst$b" 2>/dev/null || true)
     [ "$src_m" != "$dst_m" ] && { ok=0; why="$why diverged(dst$b);"; }
     [ "$(cat "$W/dst$b/target.txt" 2>/dev/null || echo MISSING)" != "REVERTED" ] \
       && after_target=BAD
@@ -111,5 +129,6 @@ for trial in $(seq 1 "$TRIALS"); do
     FAIL=$((FAIL+1)); echo "trial $trial FAILED:$why (kept at $W)"
   fi
 done
+[ "$FAIL" = 0 ] && rm -rf "$ROOT"
 echo "crash trials: $PASS passed, $FAIL failed, $LOST with lost reverts"
 [ $FAIL = 0 ]

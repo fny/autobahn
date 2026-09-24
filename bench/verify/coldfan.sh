@@ -11,7 +11,7 @@
 #
 # Run on the source. Destinations must be reachable as dest1..destN.
 # Usage: coldfan.sh [corpus] [max-width] [repeats]
-set -u
+set -euo pipefail
 
 CORPUS=${1:-sub50k}
 MAX=${2:-2}
@@ -20,6 +20,11 @@ AB=${AB:-$HOME/autobahn}
 BM=${BM:-$HOME/bench/benchmark}
 TIMEOUT=${TIMEOUT:-900}
 POLL=${POLL:-3}
+
+# Fail at once on a binary that is missing or does not run, before any
+# host is touched.
+"$AB" --version > /dev/null 2>&1 || { echo "autobahn at $AB does not run" >&2; exit 1; }
+[ -x "$BM" ] || { echo "no benchmark harness at $BM" >&2; exit 1; }
 
 for b in $(seq 1 "$MAX"); do
   ssh -o ConnectTimeout=5 -n "dest$b" true 2>/dev/null || {
@@ -43,7 +48,7 @@ for width in $(seq 1 "$MAX"); do
   for repeat in $(seq 1 "$REPEATS"); do
     # Reset every destination, not just the ones this width uses, so each run
     # starts from the same state regardless of what ran before it.
-    pkill -x autobahn 2>/dev/null
+    pkill -x autobahn 2>/dev/null || true
     for b in $(seq 1 "$MAX"); do
       # Match the process NAME exactly, never the full command line: -f scans
       # arguments, and the rm below names ~/.autobahn, so a -f pattern matches
@@ -64,32 +69,38 @@ for width in $(seq 1 "$MAX"); do
         exit 1
       fi
     done
-    sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1
+    sync; echo 3 | sudo tee /proc/sys/vm/drop_caches > /dev/null 2>&1 || true
     for b in $(seq 1 "$MAX"); do
-      ssh -n "dest$b" "sync; echo 3 | sudo tee /proc/sys/vm/drop_caches" > /dev/null 2>&1
+      ssh -n "dest$b" "sync; echo 3 | sudo tee /proc/sys/vm/drop_caches" > /dev/null 2>&1 || true
     done
 
     {
       echo "[groups.fan]"
       echo "alpha = \"$HOME/corpus/$CORPUS\""
-      echo 'mode = "two-way-safe"'
+      echo 'mode = "two-way-conflict"'
       echo "interval = 5"
       printf 'betas = ['
       for b in $(seq 1 "$width"); do
         printf '"dest%s:%s/dest/%s"' "$b" "$HOME" "$CORPUS"
-        [ "$b" -lt "$width" ] && printf ', '
+        if [ "$b" -lt "$width" ]; then printf ', '; fi
       done
       printf ']\n'
     } > "$HOME/fan.toml"
 
     start=$(date +%s.%N)
-    setsid "$AB" up --config "$HOME/fan.toml" --state-root "$HOME/state" \
-      > "$HOME/fan-$width-$repeat.log" 2>&1 &
-    pid=""
-    for _ in $(seq 1 30); do
-      pid=$(pgrep -x autobahn | head -1); [ -n "$pid" ] && break; sleep 0.2
-    done
-    [ -z "$pid" ] && { printf '%6s %7s %11s\n' "$width" "$repeat" DIED; continue; }
+    log="$HOME/fan-$width-$repeat.log"
+    setsid "$AB" watch --config "$HOME/fan.toml" --state-root "$HOME/state" > "$log" 2>&1 &
+    pid=$!
+    # A subject that is not running makes every number below meaningless:
+    # stop the whole run and say why, rather than print a row.
+    died() {
+      printf '%6s %7s %11s\n' "$width" "$repeat" DIED
+      echo "autobahn $1; the end of $log:" >&2
+      tail -n 20 "$log" >&2
+      exit 1
+    }
+    sleep 0.2
+    kill -0 "$pid" 2>/dev/null || died "did not start"
     j0=$(awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null || echo 0)
 
     # Poll with the cheap manifest (names, sizes, modes) and only once every
@@ -115,16 +126,18 @@ for width in $(seq 1 "$MAX"); do
         ) &
         probe_pids="$probe_pids $!"
       done
+      # A probe that finds no match exits nonzero; that is an answer.
       # shellcheck disable=SC2086
-      wait $probe_pids
+      wait $probe_pids || true
       agree=$(find "$probes" -type f | wc -l)
       [ "$agree" = "$width" ] && { converged=yes; break; }
-      kill -0 "$pid" 2>/dev/null || break
+      kill -0 "$pid" 2>/dev/null || died "exited during the cold sync"
       sleep "$POLL"
     done
     end=$(date +%s.%N)
     j1=$(awk '{print $14+$15}' "/proc/$pid/stat" 2>/dev/null || echo "$j0")
-    pkill -x autobahn 2>/dev/null
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
 
     if [ "$converged" != yes ]; then
       printf '%6s %7s %11s\n' "$width" "$repeat" "NO-CONVERGE"

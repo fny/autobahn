@@ -5,9 +5,17 @@
 #
 # Each scenario builds a source tree, an initial destination state, runs one
 # tool to convergence, and records the resulting destination manifest.
-set -u
+set -euo pipefail
+AB=${AB:-/home/ubuntu/Workspace/autobahn/target/release/autobahn}
 BM=${BM:-/home/ubuntu/Workspace/autobahn/bench/harness/target/release/benchmark}
+MU=${MU:-/home/ubuntu/Workspace/mutagen-bench/bin-stock/mutagen}
 OUT=~/differential
+
+# Fail at once on a tool that is missing or does not run: every scenario
+# would otherwise record a failure that says nothing about semantics.
+"$AB" --version > /dev/null 2>&1 || { echo "autobahn at $AB does not run" >&2; exit 1; }
+"$MU" version > /dev/null 2>&1 || { echo "mutagen at $MU does not run" >&2; exit 1; }
+[ -x "$BM" ] || { echo "no benchmark harness at $BM" >&2; exit 1; }
 mkdir -p "$OUT"; rm -f "$OUT"/*.txt "$OUT"/result.jsonl
 
 build_scenario() {   # $1 = scenario dir
@@ -29,31 +37,34 @@ build_scenario() {   # $1 = scenario dir
 }
 
 run_autobahn() {   # $1 = scenario dir
-  rm -rf ~/.autobahn ~/.autobahn-dev
   cat > "$1/ab.toml" <<TOML
 [groups.diff]
 alpha = "$1/src"
-mode = "two-way-safe"
+mode = "two-way-conflict"
 interval = 2
 betas = ["$1/dst"]
 TOML
-  timeout 120 ${AB:-/home/ubuntu/Workspace/autobahn/target/release/autobahn} up --config "$1/ab.toml" --once > "$1/ab.log" 2>&1
-  echo $?
+  # Its own state root per scenario: nothing carries over between them,
+  # and the real ~/.autobahn is never touched.
+  local rc=0
+  timeout 120 "$AB" sync --config "$1/ab.toml" --state-root "$1/state" > "$1/ab.log" 2>&1 || rc=$?
+  echo "$rc"
 }
 
 run_mutagen() {    # $1 = scenario dir
   rm -rf ~/.mutagen ~/.mutagen-dev
-  ${MU:-/home/ubuntu/Workspace/mutagen-bench/bin-stock/mutagen} daemon start > /dev/null 2>&1
-  ${MU:-/home/ubuntu/Workspace/mutagen-bench/bin-stock/mutagen} sync create --name=diff --sync-mode=two-way-safe \
+  "$MU" daemon start > /dev/null 2>&1 || true
+  "$MU" sync create --name=diff --sync-mode=two-way-safe \
     "$1/src" "$1/dst" > "$1/mu.log" 2>&1 || { echo 1; return; }
+  local status
   for _ in $(seq 1 60); do
-    status=$(${MU:-/home/ubuntu/Workspace/mutagen-bench/bin-stock/mutagen} sync list 2>/dev/null | grep -c "Watching for changes")
+    status=$("$MU" sync list 2>/dev/null | grep -c "Watching for changes" || true)
     [ "$status" -ge 1 ] && break
     sleep 2
   done
   sleep 3
-  ${MU:-/home/ubuntu/Workspace/mutagen-bench/bin-stock/mutagen} sync terminate diff > /dev/null 2>&1
-  ${MU:-/home/ubuntu/Workspace/mutagen-bench/bin-stock/mutagen} daemon stop > /dev/null 2>&1
+  "$MU" sync terminate diff > /dev/null 2>&1 || true
+  "$MU" daemon stop > /dev/null 2>&1 || true
   echo 0
 }
 

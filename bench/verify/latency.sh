@@ -5,16 +5,21 @@
 # for both, the floor is a constant - round trip plus the settle window. If
 # it scales with entry count, the floor is the scan and reconcile over the
 # tree, which is a different problem with a different fix.
-set -u
+set -euo pipefail
 C=${1:-sub5k}
 EDITS=${2:-20}
-AB=$HOME/autobahn
-BM=$HOME/bench/benchmark
+AB=${AB:-$HOME/autobahn}
+BM=${BM:-$HOME/bench/benchmark}
 SRC=$HOME/corpus/$C
+
+# Fail at once on a binary that is missing or does not run, before any
+# host is touched.
+"$AB" --version > /dev/null 2>&1 || { echo "autobahn at $AB does not run" >&2; exit 1; }
+[ -x "$BM" ] || { echo "no benchmark harness at $BM" >&2; exit 1; }
 
 ssh -n dest "pkill -x 'autobahn(-linux-x86_64)?' 2>/dev/null; sleep 0.5; \
   rm -rf ~/dest/$C ~/.autobahn ~/.autobahn-dev; mkdir -p ~/dest/$C" >/dev/null 2>&1
-pkill -x autobahn 2>/dev/null
+pkill -x autobahn 2>/dev/null || true
 rm -rf ~/.autobahn ~/.autobahn-dev ~/state; mkdir -p ~/state
 # Probe files from any earlier run would be seen instantly by the poller,
 # with timestamps minutes old, and would dominate every percentile.
@@ -22,15 +27,25 @@ rm -rf "$HOME"/corpus/*/probe
 ssh -n dest 'rm -rf ~/dest/*/probe ~/arrivals.txt' >/dev/null 2>&1
 mkdir -p "$SRC/probe"
 
-printf '[groups.g]\nalpha = "%s"\nmode = "two-way-safe"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
+printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
   "$SRC" "$HOME" "$C" > ~/lat.toml
-setsid "$AB" up --config ~/lat.toml --state-root ~/state > ~/lat.log 2>&1 &
+setsid "$AB" watch --config ~/lat.toml --state-root ~/state > ~/lat.log 2>&1 &
+AUTOBAHN=$!
+sleep 1
+kill -0 "$AUTOBAHN" 2>/dev/null \
+  || { echo "autobahn did not start; the end of its log:" >&2; tail -n 20 ~/lat.log >&2; exit 1; }
 
 expected=$("$BM" manifest cheap "$SRC")
+converged=""
 for _ in $(seq 1 300); do
-  [ "$(ssh -n dest "$BM manifest cheap ~/dest/$C" 2>/dev/null)" = "$expected" ] && break
+  if [ "$(ssh -n dest "$BM manifest cheap ~/dest/$C" 2>/dev/null)" = "$expected" ]; then
+    converged=1; break
+  fi
+  kill -0 "$AUTOBAHN" 2>/dev/null \
+    || { echo "autobahn exited; the end of its log:" >&2; tail -n 20 ~/lat.log >&2; exit 1; }
   sleep 1
 done
+[ -n "$converged" ] || { echo "corpus $C did not converge in 300s" >&2; exit 1; }
 echo "corpus $C converged ($(find "$SRC" -type f | wc -l) files); measuring $EDITS edits"
 
 # The destination side polls locally and stamps arrival with its own clock;
@@ -54,6 +69,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
 done
 POLL
 ssh -n dest 'chmod +x ~/poll.sh' 2>/dev/null
+# shellcheck disable=SC2088  # the tilde is the destination's, expanded there
 ssh -n dest "~/poll.sh $C" > ~/arrivals.txt 2>/dev/null &
 poller=$!
 sleep 2
@@ -63,8 +79,8 @@ for i in $(seq 1 "$EDITS"); do
   sleep 4
 done
 sleep 5
-kill $poller 2>/dev/null
-pkill -x autobahn 2>/dev/null
+kill "$poller" 2>/dev/null || true
+kill "$AUTOBAHN" 2>/dev/null || true
 
 sort -n ~/arrivals.txt > ~/sorted.txt
 n=$(wc -l < ~/sorted.txt)

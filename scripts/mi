@@ -6,11 +6,16 @@
 # Nothing here is simulated: each section drives the actual binary over
 # actual files and prints what it actually said. The tour builds its own
 # scratch tree, and removes it (and the supervisor it starts) on the way
-# out, however it exits.
+# out, however it exits. It keeps its state, and its HOME, inside that
+# tree too, so nothing it runs reads or writes the real ~/.autobahn.
+#
+# A step that fails stops the tour with an error, rather than letting it
+# narrate output that never came: a command the binary no longer has, or
+# a supervisor that did not start, is a broken tour.
 #
 # Usage:  scripts/mi [path-to-autobahn-binary]
 #
-set -u
+set -euo pipefail
 
 BINARY="${1:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/target/release/autobahn}"
 if [ ! -x "$BINARY" ]; then
@@ -24,8 +29,10 @@ WORK="$(mktemp -d "/tmp/autobahn-mi.XXXXXX")"
 SUPERVISOR=""
 
 cleanup() {
-    [ -n "$SUPERVISOR" ] && kill "$SUPERVISOR" 2>/dev/null
-    wait "$SUPERVISOR" 2>/dev/null
+    if [ -n "$SUPERVISOR" ]; then
+        kill "$SUPERVISOR" 2>/dev/null || true
+        wait "$SUPERVISOR" 2>/dev/null || true
+    fi
     rm -rf "$WORK"
 }
 trap cleanup EXIT INT TERM
@@ -61,11 +68,34 @@ narrate() {
 
 pause_briefly() { sleep "${1:-3}"; }
 
+# Starts the supervisor in the background, and stops the tour at once if
+# it does not stay up.
+start_supervisor() {
+    "$BINARY" watch --config "$CONFIG" --state-root "$STATE" >> watch.log 2>&1 &
+    SUPERVISOR=$!
+    sleep 1
+    if ! kill -0 "$SUPERVISOR" 2>/dev/null; then
+        SUPERVISOR=""
+        echo "the supervisor did not start; the end of its log:" >&2
+        tail -n 20 watch.log >&2
+        exit 1
+    fi
+}
+
+stop_supervisor() {
+    kill "$SUPERVISOR" 2>/dev/null || true
+    wait "$SUPERVISOR" 2>/dev/null || true
+    SUPERVISOR=""
+}
+
 # The tour runs *inside* the scratch tree and refers to everything
 # relatively, so the commands on screen are the commands a reader would
 # type rather than a wall of temporary-directory noise.
-mkdir -p "$WORK/alpha/lib" "$WORK/beta" "$WORK/state"
-cd "$WORK" || exit 1
+mkdir -p "$WORK/alpha/lib" "$WORK/beta" "$WORK/state" "$WORK/home"
+cd "$WORK"
+# Commands that take no --state-root (the two-root `sync`) keep their
+# state under ~/.autobahn: that is this scratch HOME, not the reader's.
+export HOME="$WORK/home"
 ALPHA="alpha"
 BETA="beta"
 STATE="state"
@@ -94,10 +124,9 @@ show cat "$CONFIG"
 chapter "autobahn watch" \
         "Starts the supervisor: every session in the configuration, watched continuously."
 narrate "autobahn watch --config $CONFIG --state-root $STATE &"
-"$BINARY" up --config "$CONFIG" --state-root "$STATE" > up.log 2>&1 &
-SUPERVISOR=$!
-pause_briefly 5
-show tail -2 up.log
+start_supervisor
+pause_briefly 4
+show tail -2 watch.log
 
 chapter "the first sync landed" ""
 show find "$BETA" -type f
@@ -109,7 +138,7 @@ show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 chapter "the supervisor stops" \
         "Status still answers from what was last recorded — and says so."
 narrate "kill \$SUPERVISOR"
-kill "$SUPERVISOR" 2>/dev/null; wait "$SUPERVISOR" 2>/dev/null; SUPERVISOR=""
+stop_supervisor
 pause_briefly 1
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
@@ -123,9 +152,8 @@ narrate "echo only-on-alpha > alpha/unrelated.txt   # no conflict here"
 echo "only-on-alpha" > "$ALPHA/unrelated.txt"
 
 narrate "autobahn watch --config $CONFIG --state-root $STATE &"
-"$BINARY" watch --config "$CONFIG" --state-root "$STATE" >> up.log 2>&1 &
-SUPERVISOR=$!
-pause_briefly 6
+start_supervisor
+pause_briefly 5
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
 chapter "neither side was touched" \
@@ -136,9 +164,9 @@ echo "  beta:  $(cat "$BETA/notes.txt")"
 narrate "# and the unrelated file propagated anyway:"
 echo "  beta/unrelated.txt: $(cat "$BETA/unrelated.txt" 2>/dev/null || echo '(missing)')"
 
-chapter "autobahn conflicts" \
-        "Every conflict, with what each side holds."
-show "$BINARY" conflicts --config "$CONFIG" --state-root "$STATE"
+chapter "autobahn issues" \
+        "Everything that needs you — here, the conflict — with the command that clears it."
+show "$BINARY" issues --config "$CONFIG" --state-root "$STATE"
 
 chapter "autobahn diff" \
         "The two sides of the file — addressed by its path, from anywhere."
@@ -146,7 +174,7 @@ show "$BINARY" diff "$ALPHA/notes.txt" --config "$CONFIG" --state-root "$STATE"
 
 chapter "autobahn resolve" \
         "Choose a winner; its version is put on every side, and the next cycle records the agreement."
-show "$BINARY" resolve "$ALPHA/notes.txt" --keep alpha --config "$CONFIG" --state-root "$STATE"
+show "$BINARY" resolve "$ALPHA/notes.txt" --keep alpha --yes --config "$CONFIG" --state-root "$STATE"
 pause_briefly 5
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
@@ -170,7 +198,7 @@ show "$BINARY" status demo --config "$CONFIG" --state-root "$STATE"
 chapter "autobahn reset" \
         "Discards the synchronization baselines. Deliberate by construction: the group is required."
 narrate "autobahn reset --state-root $STATE     # no group named"
-"$BINARY" reset --state-root "$STATE" 2>&1 | head -4
+"$BINARY" reset --state-root "$STATE" 2>&1 | head -4 || true
 show "$BINARY" reset demo --state-root "$STATE"
 pause_briefly 4
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
@@ -184,7 +212,7 @@ show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 narrate "# alpha is untouched:"
 show find "$ALPHA" -type f
 
-kill "$SUPERVISOR" 2>/dev/null; wait "$SUPERVISOR" 2>/dev/null; SUPERVISOR=""
+stop_supervisor
 
 chapter "autobahn sync" \
         "One pass over two roots, no supervisor and no configuration file."

@@ -7,12 +7,17 @@
 # second save landing inside that window waits for it. Comparing an
 # isolated save against the second of two saves 100ms apart measures
 # exactly that, and nothing else.
-set -u
+set -euo pipefail
 C=${1:-chromium}
 N=${2:-10}
-AB=$HOME/autobahn
-BM=$HOME/bench/benchmark
+AB=${AB:-$HOME/autobahn}
+BM=${BM:-$HOME/bench/benchmark}
 SRC=$HOME/corpus/$C
+
+# Fail at once on a binary that is missing or does not run, before any
+# host is touched.
+"$AB" --version > /dev/null 2>&1 || { echo "autobahn at $AB does not run" >&2; exit 1; }
+[ -x "$BM" ] || { echo "no benchmark harness at $BM" >&2; exit 1; }
 
 echo "corpus $C: $(find "$SRC" -type f | wc -l) files"
 
@@ -21,16 +26,20 @@ echo "corpus $C: $(find "$SRC" -type f | wc -l) files"
 ssh -n dest "pkill -x 'autobahn(-linux-x86_64)?' 2>/dev/null; sleep 1; \
   rm -rf ~/dest/$C ~/.autobahn ~/.autobahn-dev ~/poll.sh; mkdir -p ~/dest; \
   cp -a ~/corpus/$C ~/dest/$C" >/dev/null 2>&1
-pkill -x autobahn 2>/dev/null
-pkill -f '[p]oll\.sh' 2>/dev/null
+pkill -x autobahn 2>/dev/null || true
+pkill -f '[p]oll\.sh' 2>/dev/null || true
 rm -rf ~/.autobahn ~/.autobahn-dev ~/state ~/arrivals.txt; mkdir -p ~/state
 rm -rf "$SRC/probe"; mkdir -p "$SRC/probe"
 ssh -n dest "rm -rf ~/dest/$C/probe" >/dev/null 2>&1
 
-printf '[groups.g]\nalpha = "%s"\nmode = "two-way-safe"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
+printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
   "$SRC" "$HOME" "$C" > ~/gates.toml
-AUTOBAHN_SHARING_PROBE=1 setsid "$AB" up --config ~/gates.toml --state-root ~/state \
+AUTOBAHN_SHARING_PROBE=1 setsid "$AB" watch --config ~/gates.toml --state-root ~/state \
   > ~/gates.log 2>&1 &
+AUTOBAHN=$!
+sleep 1
+kill -0 "$AUTOBAHN" 2>/dev/null \
+  || { echo "autobahn did not start; the end of its log:" >&2; tail -n 20 ~/gates.log >&2; exit 1; }
 
 # A pre-seeded destination matches immediately, so a manifest comparison
 # proves nothing about whether the session is running yet. Wait for the
@@ -41,7 +50,7 @@ AUTOBAHN_SHARING_PROBE=1 setsid "$AB" up --config ~/gates.toml --state-root ~/st
 # on was removed once it had answered its question.
 for _ in $(seq 1 900); do
   grep -q 'synchronized' ~/gates.log && break
-  pgrep -x autobahn >/dev/null || { echo "autobahn died:"; tail -5 ~/gates.log; exit 1; }
+  kill -0 "$AUTOBAHN" 2>/dev/null || { echo "autobahn died:"; tail -5 ~/gates.log; exit 1; }
   sleep 2
 done
 grep -q 'synchronized' ~/gates.log || { echo "no cycle in 30 minutes"; tail -5 ~/gates.log; exit 1; }
@@ -75,6 +84,7 @@ while [ "$(date +%s)" -lt "$end" ]; do
 done
 POLL
 ssh -n dest 'chmod +x ~/poll.sh'
+# shellcheck disable=SC2088  # the tilde is the destination's, expanded there
 ssh -n dest "~/poll.sh $C" > ~/arrivals.txt 2>/dev/null &
 poller=$!
 sleep 2
@@ -93,22 +103,22 @@ for i in $(seq 1 "$N"); do
   sleep 7
 done
 sleep 10
-kill $poller 2>/dev/null
-ssh -n dest 'pkill -f "[p]oll\.sh"' 2>/dev/null
-pkill -x autobahn 2>/dev/null
+kill "$poller" 2>/dev/null || true
+ssh -n dest 'pkill -f "[p]oll\.sh"' 2>/dev/null || true
+kill "$AUTOBAHN" 2>/dev/null || true
 
 stat() {
-  grep "^$1" ~/arrivals.txt | awk '{print $2}' | sort -n > /tmp/s.$1
-  local n; n=$(wc -l < /tmp/s.$1)
-  [ "$n" -lt 2 ] && { echo "$1: only $n samples"; return; }
+  { grep "^$1" ~/arrivals.txt || true; } | awk '{print $2}' | sort -n > ~/s."$1"
+  local n; n=$(wc -l < ~/s."$1")
+  if [ "$n" -lt 2 ]; then echo "$1: only $n samples"; return; fi
   awk -v n="$n" -v label="$2" '{v[NR]=$1}
     END{printf "%-28s n=%-3d min %7.1f  p50 %7.1f  max %7.1f\n",
-        label, n, v[1], v[int(n*0.5)+1], v[n]}' /tmp/s.$1
+        label, n, v[1], v[int(n*0.5)+1], v[n]}' ~/s."$1"
 }
 echo
 stat i "isolated save"
 stat b "second of two (100ms apart)"
 echo
 echo "=== gate 2: sharing on real reconcile inputs ==="
-grep '\[sharing\]' ~/gates.log | tail -5
-echo "distinct sharing lines: $(grep -c '\[sharing\]' ~/gates.log)"
+grep '\[sharing\]' ~/gates.log | tail -5 || true
+echo "distinct sharing lines: $(grep -c '\[sharing\]' ~/gates.log || true)"

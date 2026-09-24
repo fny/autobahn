@@ -2289,28 +2289,27 @@ fn run_issues(
     if let Some(0) = depth {
         bail!("--depth counts path segments, so it starts at 1");
     }
-    // Where to look. `resolve` and `diff` both take a path this way, and
-    // both accept it as the selector itself — `autobahn conflicts .`
-    // should mean the folder you are standing in, not the whole group.
-    let scope = match (&path, &selection.relative) {
-        (Some(path), _) => Some(
-            path.trim_start_matches("./")
-                .trim_end_matches('/')
-                .to_owned(),
-        ),
-        (None, Some(rest)) => Some(rest.clone()),
-        (None, None) => None,
-    };
-    let within = |path: &str| match &scope {
+    // Where to look, per session. `resolve` and `diff` both take a path
+    // this way, and both accept it as the selector itself — `autobahn
+    // conflicts .` should mean the folder you are standing in, not the
+    // whole group. A folder inside nested groups is a different path in
+    // each, so each session is scoped by its own.
+    let scopes: Vec<Option<String>> = (0..selection.plans.len())
+        .map(
+            |index| match (&path, selection.relatives.get(index).cloned().flatten()) {
+                (Some(path), _) => Some(
+                    path.trim_start_matches("./")
+                        .trim_end_matches('/')
+                        .to_owned(),
+                ),
+                (None, rest) => rest,
+            },
+        )
+        .collect();
+    let within = |scope: &Option<String>, path: &str| match scope {
         None => true,
         Some(scope) => path == scope || path.starts_with(&format!("{scope}/")),
     };
-    // Depth counts from the scope, not from the root. Rolling up from the
-    // root inside a scope would collapse everything into the scope itself.
-    let below = scope
-        .as_deref()
-        .map(|scope| scope.split('/').count())
-        .unwrap_or(0);
     if json {
         // Depth is a way of *reading* a long list, and a reader that wants
         // JSON has its own. Rolling the records up here would hand it a
@@ -2320,10 +2319,20 @@ fn run_issues(
             bail!("--depth is a display option; with --json, group the paths yourself");
         }
         let mut report = autobahn::supervisor::status_report(&selection.plans, &state_root);
+        let scope_of = |session: &autobahn::supervisor::SessionReport| {
+            selection
+                .plans
+                .iter()
+                .position(|plan| {
+                    autobahn::supervisor::control::SessionKey::of(plan) == session.session
+                })
+                .and_then(|index| scopes[index].clone())
+        };
         for group in &mut report.groups {
             for session in &mut group.sessions {
+                let scope = scope_of(session);
                 let keep = |path: &str| {
-                    within(path) && matches.as_ref().is_none_or(|matches| matches(path))
+                    within(&scope, path) && matches.as_ref().is_none_or(|matches| matches(path))
                 };
                 session.conflicts.retain(|conflict| keep(&conflict.path));
                 session
@@ -2345,12 +2354,20 @@ fn run_issues(
 
     let mut total = 0;
     let mut current_group: Option<&str> = None;
-    for plan in &selection.plans {
+    for (plan, scope) in selection.plans.iter().zip(&scopes) {
         let Some(status) = read_status(&state_root, &plan.identifier())? else {
             continue;
         };
-        let keep =
-            |path: &str| within(path) && matches.as_ref().is_none_or(|matches| matches(path));
+        let keep = |path: &str| {
+            within(scope, path) && matches.as_ref().is_none_or(|matches| matches(path))
+        };
+        // Depth counts from the scope, not from the root. Rolling up from
+        // the root inside a scope would collapse everything into the scope
+        // itself.
+        let below = scope
+            .as_deref()
+            .map(|scope| scope.split('/').count())
+            .unwrap_or(0);
         let selected: Vec<&String> = status.conflicts.iter().filter(|path| keep(path)).collect();
         let blocked: Vec<&String> = status
             .blocked
@@ -2547,7 +2564,14 @@ fn run_issues(
         }
     }
     if total == 0 {
+        // Nested groups name one place differently; it is named when every
+        // session agrees on its name.
+        let scope = match scopes.split_first() {
+            Some((first, rest)) if rest.iter().all(|other| other == first) => first.clone(),
+            _ => scopes.iter().flatten().next().map(|_| String::new()),
+        };
         match (&scope, &filter) {
+            (Some(scope), _) if scope.is_empty() => say!("nothing needs you there"),
             (Some(scope), _) => say!("nothing needs you under {}", display_safe(scope)),
             (None, Some(pattern)) => say!("nothing needs you matching {pattern:?}"),
             (None, None) => say!("nothing needs you"),

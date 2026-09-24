@@ -62,13 +62,19 @@ Real work, none of it load-bearing for a first release.
 
 - [ ] **Record mount boundaries by device number.** The proper fix for the hole reopened by dropping I7-A: a mountpoint removed on eject (macOS `/Volumes`, automounts, or any mount whose parent was on the vanished filesystem) presents as *absent*, which now propagates. Compare each directory's `dev()` with its parent's during the scan — the stat already happens, so the device number is free — carry the boundaries in the snapshot and the session state, and halt when a recorded boundary is empty or absent. That makes the trigger a fact rather than a shape, and lets the size threshold go entirely. Costs: `Snapshot` gains a field, so the compatibility epoch bumps and every agent reinstalls; the mount list must survive incremental scans (which adopt subtrees without visiting them) or it silently empties; A/B the scan hot path before commit.
 
+  **Decided 2026-09-23:** built with `ignore_mounts` (item 1), from the same list of skipped mount points, under the same epoch bump.
+
   *Why here:* the proper fix; needs a snapshot field and an epoch bump
 
 - [ ] **Rebuild an ancestor that cannot be read, when it is safe.** Now justified by corruption alone — versioning covers planned changes. Scan both sides. If they hold identical content, adopt it and carry on: nothing can be resurrected when the two sides already agree, so the fix is provably a no-op. If they differ, do not act. Halt and name `autobahn reset`, because rebuilding then resurrects deletions. Make it loud either way, and refuse a second rebuild on the same session — a disk that corrupts one ancestor will corrupt another, and a silent retry turns a hardware fault into a mystery.
 
+  **Decided 2026-09-24:** built with `doctor` (next item), which shares its "do the two sides match?" check; it also serves the journal plan (item 5).
+
   *Why here:* today it halts and names `reset`, which is correct if unkind
 
 - [ ] **`autobahn doctor <group>`** — promote `examples/probe.rs` to a real command. Read-only: opens both endpoints, scans, and reports what each root looks like plus every directory populated on one side and empty/absent on the other. It answered a question the product could not answer about itself, which is the argument for shipping it. Delete the example when it lands.
+
+  **Decided 2026-09-24:** do it, together with item 10. Also reports whether the ancestor loads and how far each side has drifted from it, so it says before a `reset` whether the reset is free.
 
   *Why here:* a diagnosis command; nothing depends on it
 

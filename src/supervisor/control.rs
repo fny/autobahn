@@ -15,6 +15,7 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -107,6 +108,9 @@ pub enum Probe {
     /// supervisor from before builds were compared cannot say, and does
     /// not understand the question.
     Mismatch(Option<String>),
+    /// One is running, or its socket is still being listened on, but it
+    /// did not answer within the client timeout: wedged.
+    Unresponsive,
     /// Nothing is listening.
     Absent,
 }
@@ -300,7 +304,128 @@ impl Registry {
 /// behind — so its presence proves nothing, while a refused connection
 /// proves nobody is listening.
 pub fn supervisor_is_running(state_root: &Path) -> bool {
-    UnixStream::connect(socket_path(state_root)).is_ok()
+    // A connection that cannot even be queued within the timeout is a
+    // supervisor too wedged to accept, not an absent one.
+    match connect_client(&socket_path(state_root), CLIENT_TIMEOUT) {
+        Ok(_) => true,
+        Err(error) => error.kind() == std::io::ErrorKind::TimedOut,
+    }
+}
+
+/// How long a client call to the control socket may take, each of the
+/// connect, the request's write, and the answer's read. A wedged
+/// supervisor then reads as not responding, instead of freezing `status`,
+/// the shop, or the tray's event loop.
+pub const CLIENT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Connects to a control socket within `timeout`, with read and write
+/// timeouts of the same length on the stream.
+///
+/// A blocking connect to a Unix socket whose supervisor has stopped
+/// accepting waits as soon as the listen queue is full, and has no
+/// timeout of its own, so the connect is made non-blocking and retried
+/// until the deadline. A full queue is reported as `TimedOut`.
+fn connect_client(path: &Path, timeout: Duration) -> std::io::Result<UnixStream> {
+    use std::io::{Error, ErrorKind};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    let bytes = path.as_os_str().as_bytes();
+    // SAFETY: an all-zero `sockaddr_un` is a valid (empty) address.
+    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    if bytes.len() >= address.sun_path.len() {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "control socket path too long",
+        ));
+    }
+    address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    for (slot, byte) in address.sun_path.iter_mut().zip(bytes) {
+        *slot = *byte as libc::c_char;
+    }
+    // SAFETY: plain socket creation; the descriptor is owned by the stream
+    // at once, which closes it on every path out.
+    let descriptor = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if descriptor < 0 {
+        return Err(Error::last_os_error());
+    }
+    let stream = unsafe { UnixStream::from_raw_fd(descriptor) };
+    stream.set_nonblocking(true)?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        // SAFETY: the address is initialized and its length is its size.
+        let connected = unsafe {
+            libc::connect(
+                stream.as_raw_fd(),
+                &address as *const libc::sockaddr_un as *const libc::sockaddr,
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            )
+        };
+        if connected == 0 {
+            break;
+        }
+        let error = Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::EINTR) => continue,
+            // The listen queue is full: the supervisor is not accepting.
+            Some(libc::EAGAIN) => {
+                let now = std::time::Instant::now();
+                if now >= deadline {
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        "the supervisor is not accepting connections",
+                    ));
+                }
+                std::thread::sleep((deadline - now).min(Duration::from_millis(20)));
+            }
+            // In progress: wait for it to finish, within the deadline.
+            Some(libc::EINPROGRESS) => {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                let mut poll = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                // SAFETY: one valid pollfd.
+                let ready =
+                    unsafe { libc::poll(&mut poll, 1, remaining.as_millis() as libc::c_int) };
+                if ready == 0 {
+                    return Err(Error::new(
+                        ErrorKind::TimedOut,
+                        "the supervisor is not accepting connections",
+                    ));
+                }
+                if ready < 0 {
+                    return Err(Error::last_os_error());
+                }
+                if let Some(error) = stream.take_error()? {
+                    return Err(error);
+                }
+                break;
+            }
+            _ => return Err(error),
+        }
+    }
+    stream.set_nonblocking(false)?;
+    // A zero timeout means "none" to the socket; the smallest real one
+    // keeps a zero deadline a deadline.
+    let timeout = Some(timeout.max(Duration::from_millis(1)));
+    stream.set_read_timeout(timeout)?;
+    stream.set_write_timeout(timeout)?;
+    Ok(stream)
+}
+
+/// Whether a client call failed because the supervisor did not answer in
+/// time, rather than for any other reason.
+fn timed_out(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<std::io::Error>().is_some_and(|error| {
+            matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+            )
+        })
+    })
 }
 
 /// Returns the control socket path for a state root.
@@ -455,13 +580,41 @@ fn handle(stream: UnixStream, registry: &Registry) -> Result<()> {
 /// Sends one control request to the supervisor owning `state_root`,
 /// returning its response.
 pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlResponse> {
+    // Handing the lead on talks to a peer before it answers; every other
+    // request only flips a flag.
+    let timeout = match request {
+        ControlRequest::Yield { .. } => crate::transport::mux::SETUP_TIMEOUT,
+        _ => CLIENT_TIMEOUT,
+    };
+    send_within(state_root, request, timeout)
+}
+
+/// [`send`], with the client timeout given.
+fn send_within(
+    state_root: &Path,
+    request: &ControlRequest,
+    timeout: Duration,
+) -> Result<ControlResponse> {
     let path = socket_path(state_root);
-    let stream = UnixStream::connect(&path).with_context(|| {
+    let unresponsive = || {
         format!(
-            "unable to reach a running supervisor at {} (is `autobahn watch` running?)",
-            path.display()
+            "the supervisor at {} is not responding (waited {} s)",
+            path.display(),
+            timeout.as_secs_f64()
         )
-    })?;
+    };
+    let stream = match connect_client(&path, timeout) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            return Err(anyhow::Error::new(error).context(unresponsive()));
+        }
+        Err(error) => {
+            return Err(anyhow::Error::new(error).context(format!(
+                "unable to reach a running supervisor at {} (is `autobahn watch` running?)",
+                path.display()
+            )));
+        }
+    };
     let mut reader = stream
         .try_clone()
         .context("unable to clone the control connection")?;
@@ -470,12 +623,18 @@ pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlRespon
         version: crate::protocol::version(),
         request: bincode::serialize(request).context("unable to encode the control request")?,
     };
-    crate::transport::send_control_frame(&mut writer, &versioned)?;
+    if let Err(error) = crate::transport::send_control_frame(&mut writer, &versioned) {
+        return Err(match timed_out(&error) {
+            true => error.context(unresponsive()),
+            false => error,
+        });
+    }
     match crate::transport::receive_control_frame(&mut reader) {
         Ok(ControlResponse::Mismatch { supervisor }) => {
             Err(anyhow::anyhow!(mismatch_message(Some(&supervisor))))
         }
         Ok(response) => Ok(response),
+        Err(error) if timed_out(&error) => Err(error.context(unresponsive())),
         // Connected, and then nothing that decodes: a supervisor from
         // before builds were compared, which cannot read the envelope.
         Err(error) => Err(error.context(mismatch_message(None))),
@@ -483,13 +642,18 @@ pub fn send(state_root: &Path, request: &ControlRequest) -> Result<ControlRespon
 }
 
 /// Asks the supervisor owning `state_root` what its sessions are doing,
-/// and says which of the three answers came back.
+/// and says which of the answers came back.
 pub fn probe(state_root: &Path) -> Probe {
-    let stream = match UnixStream::connect(socket_path(state_root)) {
+    probe_within(state_root, CLIENT_TIMEOUT)
+}
+
+/// [`probe`], with the client timeout given.
+fn probe_within(state_root: &Path, timeout: Duration) -> Probe {
+    let stream = match connect_client(&socket_path(state_root), timeout) {
         Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Probe::Unresponsive,
         Err(_) => return Probe::Absent,
     };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
     let Ok(mut reader) = stream.try_clone() else {
         return Probe::Absent;
     };
@@ -501,12 +665,16 @@ pub fn probe(state_root: &Path) -> Probe {
         version: crate::protocol::version(),
         request,
     };
-    if crate::transport::send_control_frame(&mut writer, &versioned).is_err() {
-        return Probe::Mismatch(None);
+    if let Err(error) = crate::transport::send_control_frame(&mut writer, &versioned) {
+        return match timed_out(&error) {
+            true => Probe::Unresponsive,
+            false => Probe::Mismatch(None),
+        };
     }
     match crate::transport::receive_control_frame(&mut reader) {
         Ok(ControlResponse::Progress(sessions)) => Probe::Answered(sessions),
         Ok(ControlResponse::Mismatch { supervisor }) => Probe::Mismatch(Some(supervisor)),
+        Err(error) if timed_out(&error) => Probe::Unresponsive,
         _ => Probe::Mismatch(None),
     }
 }
@@ -633,6 +801,75 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mismatch[..4], 3u32.to_le_bytes());
+    }
+
+    /// A control socket whose supervisor is wedged: bound and listening,
+    /// never accepting. With `backlog_full`, its queue of pending
+    /// connections is full too, so a blocking connect would never return.
+    fn wedged_socket(state_root: &Path, backlog_full: bool) -> UnixListener {
+        let listener = UnixListener::bind(socket_path(state_root)).expect("binds");
+        if backlog_full {
+            use std::os::unix::io::AsRawFd;
+            // Listening again sets the backlog; the smallest fills fast.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
+            let mut pending = Vec::new();
+            let full =
+                (0..64).any(
+                    |_| match connect_client(&socket_path(state_root), Duration::ZERO) {
+                        Ok(stream) => {
+                            pending.push(stream);
+                            false
+                        }
+                        Err(_) => true,
+                    },
+                );
+            assert!(full, "the backlog never filled");
+            std::mem::forget(pending);
+        }
+        listener
+    }
+
+    #[test]
+    fn a_wedged_supervisor_is_unresponsive_within_the_client_timeout() {
+        for backlog_full in [false, true] {
+            let root = tempfile::tempdir().expect("a temporary directory");
+            let _listener = wedged_socket(root.path(), backlog_full);
+            let started = std::time::Instant::now();
+            let probe = probe_within(root.path(), Duration::from_millis(300));
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "backlog full {backlog_full}: took {:?}",
+                started.elapsed()
+            );
+            assert!(
+                matches!(probe, Probe::Unresponsive),
+                "backlog full {backlog_full}: {probe:?}"
+            );
+            assert!(probe.is_running());
+
+            let started = std::time::Instant::now();
+            let error = send_within(
+                root.path(),
+                &ControlRequest::Flush(Selector::default()),
+                Duration::from_millis(300),
+            )
+            .expect_err("a wedged supervisor cannot answer");
+            assert!(started.elapsed() < Duration::from_secs(3));
+            assert!(format!("{error:#}").contains("not responding"), "{error:#}");
+        }
+    }
+
+    /// The tray and `status` build their report through the probe, so a
+    /// wedged supervisor costs them the client timeout, not their event
+    /// loop.
+    #[test]
+    fn a_status_report_against_a_wedged_supervisor_returns() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let _listener = wedged_socket(root.path(), true);
+        let started = std::time::Instant::now();
+        let report = crate::supervisor::status_report(&[], root.path());
+        assert!(started.elapsed() < CLIENT_TIMEOUT + Duration::from_secs(5));
+        assert!(report.supervisor_running);
     }
 
     #[test]

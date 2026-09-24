@@ -452,9 +452,10 @@ pub fn connect_pooled(
     initialize: Initialize,
 ) -> Result<RemoteEndpoint> {
     let establish = || match destination {
-        // The SSH path installs the agent on first contact; under the
-        // pool's per-key lock, concurrent sessions for one host wait for
-        // this single bootstrap instead of racing their own.
+        // The SSH path installs the agent on first contact; the pool lets
+        // one session per host establish at a time, so concurrent sessions
+        // for one host wait for this single bootstrap instead of racing
+        // their own.
         Some(destination) => establish_ssh(destination),
         None => AgentConnection::connect(Connection::spawn(argv)?),
     };

@@ -297,10 +297,13 @@ fn describe_age(age: std::time::Duration) -> String {
 /// Probes the remote host's platform, returning it in bundle naming form
 /// (`linux-x86_64`, `darwin-aarch64`, ...).
 fn probe_platform(destination: &str) -> Result<String> {
-    let output = ssh_command(destination, "uname -sm")
-        .stdin(Stdio::null())
-        .output()
-        .context("unable to run ssh")?;
+    let output = run_within(
+        ssh_command(destination, "uname -sm"),
+        None,
+        SETUP_TIMEOUT,
+        "the platform probe",
+    )
+    .with_context(|| format!("unable to reach {destination}"))?;
     if !output.status.success() {
         // ssh's own message is the diagnosis — "Permission denied
         // (publickey)", "Could not resolve hostname", "Connection refused" —
@@ -398,34 +401,121 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
          mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}-{digest}",
         length = content.len()
     );
-    let mut child = ssh_command(destination, &script)
-        .stdin(Stdio::piped())
-        .spawn()
-        .context("unable to run ssh")?;
-    let complaint = child.stderr.take();
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow!("ssh standard input unavailable"))?;
-    let write = stdin.write_all(&content);
-    drop(stdin);
-    let status = child.wait().context("unable to wait for ssh")?;
-    write.context("unable to stream the agent binary")?;
-    if !status.success() {
-        let detail = complaint
-            .map(|mut stderr| {
-                use std::io::Read;
-                let mut text = String::new();
-                let _ = stderr.read_to_string(&mut text);
-                text.trim().to_owned()
-            })
-            .filter(|text| !text.is_empty());
-        match detail {
-            Some(detail) => bail!("the installation command failed: {detail}"),
-            None => bail!("the installation command exited with {status}"),
+    let timeout = upload_timeout(content.len());
+    let output = run_within(
+        ssh_command(destination, &script),
+        Some(content),
+        timeout,
+        "the agent upload",
+    )?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        match detail.is_empty() {
+            false => bail!("the installation command failed: {detail}"),
+            true => bail!("the installation command exited with {}", output.status),
         }
     }
     Ok(())
+}
+
+/// How long each remote step of an installation may take: the probe, and
+/// the upload before its allowance for size. Generous for a slow login;
+/// a login stuck in a slow rc file otherwise holds the host's sessions
+/// forever.
+const SETUP_TIMEOUT: std::time::Duration = crate::transport::mux::SETUP_TIMEOUT;
+
+/// The slowest link an upload is allowed for, in bytes per second.
+const UPLOAD_FLOOR_RATE: u64 = 128 * 1024;
+
+/// The deadline for uploading a binary of `length` bytes: the setup
+/// deadline, plus its transfer at [`UPLOAD_FLOOR_RATE`].
+fn upload_timeout(length: usize) -> std::time::Duration {
+    SETUP_TIMEOUT + std::time::Duration::from_secs(length as u64 / UPLOAD_FLOOR_RATE)
+}
+
+/// Runs a command to completion within `timeout`, feeding it `input` (or
+/// nothing), and collects what it wrote. Past the deadline the command is
+/// killed and the step, named by `what`, fails. The input is written and
+/// the output read on their own threads, so a far side that stops reading
+/// or keeps writing cannot hold the wait past its deadline.
+fn run_within(
+    mut command: Command,
+    input: Option<Vec<u8>>,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    use std::io::Read;
+    command.stdin(match input {
+        Some(_) => Stdio::piped(),
+        None => Stdio::null(),
+    });
+    let mut child = command.spawn().context("unable to run ssh")?;
+    let feeding = match (input, child.stdin.take()) {
+        (Some(content), Some(mut stdin)) => Some(std::thread::spawn(move || {
+            // Dropping stdin at the end is the end of the stream.
+            stdin.write_all(&content)
+        })),
+        (Some(_), None) => bail!("ssh standard input unavailable"),
+        _ => None,
+    };
+    let collect = |stream: Option<Box<dyn Read + Send>>| {
+        stream.map(|mut stream| {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stream.read_to_end(&mut bytes);
+                bytes
+            })
+        })
+    };
+    let stdout = collect(
+        child
+            .stdout
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let stderr = collect(
+        child
+            .stderr
+            .take()
+            .map(|s| Box::new(s) as Box<dyn Read + Send>),
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait().context("unable to wait for ssh")? {
+            Some(status) => break status,
+            None if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The threads are left to finish on their own: a
+                // grandchild (a proxy command) may still hold the pipes.
+                bail!(
+                    "ssh did not finish {what} within {}",
+                    crate::transport::mux::describe_timeout(timeout)
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    };
+    let joined = |handle: Option<std::thread::JoinHandle<Vec<u8>>>| {
+        handle
+            .map(|handle| handle.join().unwrap_or_default())
+            .unwrap_or_default()
+    };
+    let output = std::process::Output {
+        status,
+        stdout: joined(stdout),
+        stderr: joined(stderr),
+    };
+    if let Some(feeding) = feeding {
+        match feeding.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Err(error).context("unable to stream the agent binary");
+            }
+            Err(_) => bail!("the thread streaming the agent binary panicked"),
+        }
+    }
+    Ok(output)
 }
 
 /// What a prune found and did on one host.
@@ -569,6 +659,57 @@ fn ssh_command(destination: &str, script: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_remote_step_that_never_finishes_is_killed_at_its_deadline() {
+        let deadline = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let error =
+            run_within(command, None, deadline, "the probe").expect_err("the step must time out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            format!("{error:#}").contains("did not finish the probe within"),
+            "{error:#}"
+        );
+
+        // An upload the far side never reads: the write blocks on a full
+        // pipe, and the deadline still holds.
+        let started = std::time::Instant::now();
+        let mut command = Command::new("sleep");
+        command.arg("30");
+        let error = run_within(command, Some(vec![0; 8 << 20]), deadline, "the upload")
+            .expect_err("the step must time out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        assert!(
+            format!("{error:#}").contains("did not finish the upload within"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_remote_step_within_its_deadline_returns_what_it_said() {
+        let input = vec![7u8; 1 << 20];
+        let mut command = Command::new("cat");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let output = run_within(
+            command,
+            Some(input.clone()),
+            std::time::Duration::from_secs(30),
+            "the copy",
+        )
+        .expect("the step finishes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, input);
+    }
+
+    #[test]
+    fn an_upload_deadline_grows_with_the_binary() {
+        assert_eq!(upload_timeout(0), SETUP_TIMEOUT);
+        assert!(upload_timeout(64 << 20) > upload_timeout(8 << 20));
+        assert!(upload_timeout(8 << 20) > SETUP_TIMEOUT);
+    }
 
     /// The installer places the bundle in the state root, so that is where
     /// a bundle must be found — the alternative is an installer whose work

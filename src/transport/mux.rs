@@ -41,6 +41,18 @@ use super::Connection;
 /// almost immediately; the timeout only bounds a wedged one.
 const REAP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long each step of setting a connection up may take: the agent's
+/// handshake, and each channel open. A login stuck in a slow rc file, or an
+/// agent that is alive but wedged, otherwise holds every session to that
+/// host forever without an error, so nothing retries and nothing alerts.
+pub const SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a session waits for another session's connection to the same
+/// host to be established. Establishment is itself bounded (each ssh step
+/// and each setup step has its own deadline), so this only bounds the sum
+/// of an installation's steps.
+const POOL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 /// A multiplexed agent connection handle. Handles (and open channels) keep
 /// the connection alive; channels are opened through any handle.
 pub struct AgentConnection {
@@ -76,6 +88,8 @@ struct Shared {
     next_channel: AtomicU32,
     /// The agent's relayed standard error, kept for the connection's life.
     _stderr: Option<super::StderrRelay>,
+    /// How long a channel open may wait for its answer.
+    setup_timeout: std::time::Duration,
 }
 
 /// One channel's routing slot.
@@ -111,42 +125,74 @@ impl AgentConnection {
     /// Establishes a multiplexed connection: exchanges handshakes
     /// (enforcing version equality) and starts the response router. A
     /// handshake failure reaps the spawned process before reporting.
-    pub fn connect(mut connection: Connection) -> Result<AgentConnection> {
+    pub fn connect(connection: Connection) -> Result<AgentConnection> {
+        AgentConnection::connect_within(connection, SETUP_TIMEOUT)
+    }
+
+    /// Establishes a multiplexed connection as [`connect`](Self::connect)
+    /// does, with `setup_timeout` bounding the handshake and each channel
+    /// open. A missed deadline fails the connection as
+    /// [`ConnectionFailed`], so its sessions back off and reconnect.
+    pub fn connect_within(
+        mut connection: Connection,
+        setup_timeout: std::time::Duration,
+    ) -> Result<AgentConnection> {
         // Held until the handshake proves the far side is an agent. After
         // that it is the agent's own voice, and everything it says about
         // itself — a watch it could not establish above all — is worth
         // hearing. Before that it is ssh's, and belongs in the error.
         let stderr = connection.take_stderr_relay();
-        let (mut reader, mut writer, child) = connection.into_parts();
+        let (reader, mut writer, child) = connection.into_parts();
 
         // Exchange handshakes. Ours goes out first (the agent does the
         // same), so neither side blocks waiting for the other to speak. On
         // failure the child must be reaped here — `into_parts` transferred
-        // that responsibility to us.
-        let handshake = (|| -> Result<()> {
-            super::send_frame(&mut writer, &super::local_handshake())
-                .context("unable to send handshake")?;
-            let peer: Handshake = super::receive_frame(&mut reader)
-                .context("unable to receive the agent's handshake")?;
-            super::verify_handshake(&peer)
-        })();
-        if let Err(error) = handshake {
-            if let Some(mut child) = child {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            // Read after the reap, so what ssh wrote on its way out has
-            // arrived. Best effort: the relay thread may still be a line
-            // behind, and a diagnosis short one line beats none.
-            let said = stderr
-                .as_ref()
-                .map(|relay| relay.held().join("\n"))
-                .unwrap_or_default();
-            return Err(match said.is_empty() {
-                true => error,
-                false => error.context(format!("the far side said: {said}")),
+        // that responsibility to us. The agent's handshake is read on its
+        // own thread, which hands the reader back, so that the wait for it
+        // has a deadline: a read cannot be interrupted, but killing the
+        // child ends it.
+        let (arrived, arrival) = mpsc::channel();
+        let handshake = std::thread::Builder::new()
+            .name("autobahn-handshake".into())
+            .spawn(move || {
+                let mut reader = reader;
+                let peer = super::receive_frame::<_, Handshake>(&mut reader);
+                let _ = arrived.send((reader, peer));
+            })
+            .context("unable to start the handshake reader")
+            .and_then(|_| {
+                super::send_frame(&mut writer, &super::local_handshake())
+                    .context("unable to send handshake")?;
+                let (reader, peer) = arrival.recv_timeout(setup_timeout).map_err(|_| {
+                    ConnectionFailed::new(&format!(
+                        "the agent did not answer the handshake within {}",
+                        describe_timeout(setup_timeout)
+                    ))
+                })?;
+                let peer = peer.context("unable to receive the agent's handshake")?;
+                super::verify_handshake(&peer)?;
+                Ok(reader)
             });
-        }
+        let mut reader = match handshake {
+            Ok(reader) => reader,
+            Err(error) => {
+                if let Some(mut child) = child {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                }
+                // Read after the reap, so what ssh wrote on its way out has
+                // arrived. Best effort: the relay thread may still be a line
+                // behind, and a diagnosis short one line beats none.
+                let said = stderr
+                    .as_ref()
+                    .map(|relay| relay.held().join("\n"))
+                    .unwrap_or_default();
+                return Err(match said.is_empty() {
+                    true => error,
+                    false => error.context(format!("the far side said: {said}")),
+                });
+            }
+        };
         if let Some(relay) = &stderr {
             relay.release();
         }
@@ -163,6 +209,7 @@ impl AgentConnection {
                 shutdown: false,
             }),
             next_channel: AtomicU32::new(1),
+            setup_timeout,
         });
 
         // The router: the connection's only reader. It ends when the stream
@@ -259,11 +306,23 @@ impl AgentConnection {
                     initialize,
                 })
                 .context("unable to send channel open")?;
-            match receiver.recv() {
+            match receiver.recv_timeout(self.shared.setup_timeout) {
                 Ok(Response::Initialized) => Ok(()),
                 Ok(Response::Error(message)) => bail!("remote error: {message}"),
                 Ok(_) => bail!("protocol error: unexpected answer to a channel open"),
-                Err(_) => Err(ConnectionFailed::new(&self.shared.death_reason()).into()),
+                // Silence fails the whole connection, not just this open:
+                // an agent that cannot open a channel cannot serve the
+                // sessions already on it either, and they must reconnect.
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    self.shared.fail(format!(
+                        "the agent did not answer a channel open within {}",
+                        describe_timeout(self.shared.setup_timeout)
+                    ));
+                    Err(ConnectionFailed::new(&self.shared.death_reason()).into())
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(ConnectionFailed::new(&self.shared.death_reason()).into())
+                }
             }
         })();
         match opened {
@@ -543,7 +602,10 @@ impl Shared {
 #[derive(Default)]
 pub struct AgentPool {
     /// The per-key slots.
-    slots: Mutex<HashMap<Vec<String>, Arc<Mutex<PoolSlot>>>>,
+    slots: Mutex<HashMap<Vec<String>, Arc<PoolSlot>>>,
+    /// How long a session waits on another's establishment, when not
+    /// [`POOL_WAIT_TIMEOUT`].
+    wait_timeout: Option<std::time::Duration>,
     /// Peering: connections that dialed *in*, by the peer's name, waiting
     /// for the session that will use them. The configured alpha attaches
     /// to a beta that leads this way, since the alpha is never dialed.
@@ -597,11 +659,67 @@ impl ConnectionFailed {
     }
 }
 
-/// One pool slot: the live connection for a key, if any.
+/// One pool slot: the live connection for a key, if any, or the mark of
+/// a session establishing one.
+///
+/// The slot's lock is held only to read or change that state, never
+/// across the network waits of establishing a connection or opening a
+/// channel: a session that finds the slot connecting waits on the
+/// condition, with a deadline, rather than on a lock the connecting
+/// session holds for as long as its login takes.
 #[derive(Default)]
 struct PoolSlot {
+    /// The slot's state.
+    state: Mutex<SlotState>,
+    /// Signalled whenever the state leaves [`SlotState::Connecting`].
+    changed: std::sync::Condvar,
+}
+
+/// The state of one pool slot.
+#[derive(Default)]
+enum SlotState {
+    /// No connection, and nobody establishing one.
+    #[default]
+    Empty,
+    /// A session is establishing the connection.
+    Connecting,
     /// The connection, which may have died since it was stored.
-    connection: Option<AgentConnection>,
+    Ready(AgentConnection),
+}
+
+/// A session's claim on a slot it marked as connecting. Dropped without
+/// being published — an establishment that failed, or panicked — it
+/// empties the slot, so the next session establishes afresh.
+struct SlotClaim<'a> {
+    /// The claimed slot.
+    slot: &'a PoolSlot,
+    /// Whether a connection was published into the slot.
+    published: bool,
+}
+
+impl SlotClaim<'_> {
+    /// Stores the established connection and wakes the waiting sessions.
+    fn publish(mut self, connection: AgentConnection) {
+        self.set(SlotState::Ready(connection));
+        self.published = true;
+    }
+
+    fn set(&self, state: SlotState) {
+        *self
+            .slot
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = state;
+        self.slot.changed.notify_all();
+    }
+}
+
+impl Drop for SlotClaim<'_> {
+    fn drop(&mut self) {
+        if !self.published {
+            self.set(SlotState::Empty);
+        }
+    }
 }
 
 impl AgentPool {
@@ -611,6 +729,10 @@ impl AgentPool {
     /// on an otherwise healthy connection) is returned as-is — it would
     /// refuse identically on a fresh connection, and rebuilding would
     /// strand the sessions using the current one.
+    ///
+    /// One session at a time establishes a key's connection; the others
+    /// wait for it, up to a deadline, without a lock held across its
+    /// network waits.
     pub fn channel(
         &self,
         key: &[String],
@@ -621,22 +743,69 @@ impl AgentPool {
             let mut slots = self.slots.lock().expect("the pool lock is never poisoned");
             slots.entry(key.to_vec()).or_default().clone()
         };
-        let mut slot = slot.lock().expect("the slot lock is never poisoned");
-        if let Some(connection) = &slot.connection {
-            if connection.usable() {
-                match connection.open(initialize.clone()) {
-                    Ok(channel) => return Ok(channel),
-                    // Still usable: the refusal is channel-local.
-                    Err(error) if connection.usable() => return Err(error),
-                    // The connection died underneath the open; rebuild.
-                    Err(_) => {}
+        let wait = self.wait_timeout.unwrap_or(POOL_WAIT_TIMEOUT);
+        let deadline = std::time::Instant::now() + wait;
+        let claim = loop {
+            let mut state = slot.state.lock().unwrap_or_else(|error| error.into_inner());
+            match &*state {
+                SlotState::Ready(connection) if connection.usable() => {
+                    let connection = connection.clone();
+                    drop(state);
+                    match connection.open(initialize.clone()) {
+                        Ok(channel) => return Ok(channel),
+                        // Still usable: the refusal is channel-local.
+                        Err(error) if connection.usable() => return Err(error),
+                        // The connection died underneath the open; the
+                        // next pass rebuilds it.
+                        Err(_) => continue,
+                    }
+                }
+                SlotState::Connecting => {
+                    let now = std::time::Instant::now();
+                    if now >= deadline {
+                        bail!(
+                            "another session's connection to this host is still connecting \
+                             after {}",
+                            describe_timeout(wait)
+                        );
+                    }
+                    let _ = slot
+                        .changed
+                        .wait_timeout(state, deadline - now)
+                        .unwrap_or_else(|error| error.into_inner());
+                }
+                // Nothing, or a connection that has died: this session
+                // establishes the replacement, outside the lock.
+                SlotState::Empty | SlotState::Ready(_) => {
+                    *state = SlotState::Connecting;
+                    break SlotClaim {
+                        slot: &slot,
+                        published: false,
+                    };
                 }
             }
-        }
+        };
         let connection = establish()?;
         let channel = connection.open(initialize)?;
-        slot.connection = Some(connection);
+        claim.publish(connection);
         Ok(channel)
+    }
+
+    /// A pool whose sessions wait `wait` for another's establishment.
+    #[cfg(test)]
+    pub(crate) fn with_wait(wait: std::time::Duration) -> AgentPool {
+        AgentPool {
+            wait_timeout: Some(wait),
+            ..AgentPool::default()
+        }
+    }
+}
+
+/// A deadline as it reads in a death reason: "60 s", or "300 ms".
+pub(crate) fn describe_timeout(timeout: std::time::Duration) -> String {
+    match timeout.as_secs() {
+        0 => format!("{} ms", timeout.as_millis()),
+        seconds => format!("{seconds} s"),
     }
 }
 
@@ -992,6 +1161,129 @@ mod tests {
         );
         // Reaped: the pid no longer refers to a process (or zombie) of ours.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    /// A far side that takes whatever it is sent and never says a word,
+    /// kept alive (so its silence is silence, not a closed stream) until
+    /// the returned sender is dropped.
+    fn silent_peer(connection: Connection) -> mpsc::Sender<()> {
+        let (keep, hold) = mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _connection = connection;
+            let _ = hold.recv();
+        });
+        keep
+    }
+
+    #[test]
+    fn an_agent_that_never_answers_the_handshake_fails_within_the_deadline() {
+        let (client, agent) = connected_pair();
+        let _keep = silent_peer(agent);
+        let started = std::time::Instant::now();
+        let error = AgentConnection::connect_within(client, std::time::Duration::from_millis(300))
+            .err()
+            .expect("the handshake must time out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(ConnectionFailed::is_in(&error), "{error:#}");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("did not answer the handshake"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn an_agent_that_never_answers_a_channel_open_fails_the_connection() {
+        let (scripted, client) = connected_pair();
+        let (keep, hold) = mpsc::channel::<()>();
+        std::thread::spawn(move || -> Result<()> {
+            let mut connection = scripted;
+            let _: Handshake = connection.receive()?;
+            connection.send(&crate::transport::local_handshake())?;
+            // Takes the open, and says nothing.
+            let _: MuxRequest = connection.receive()?;
+            let _ = hold.recv();
+            Ok(())
+        });
+        let connection =
+            AgentConnection::connect_within(client, std::time::Duration::from_millis(300))
+                .expect("the handshake completes");
+        let started = std::time::Instant::now();
+        let error = connection
+            .open(initialize(std::path::Path::new("/unused")))
+            .err()
+            .expect("the open must time out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert!(ConnectionFailed::is_in(&error), "{error:#}");
+        assert!(
+            format!("{error:#}").contains("did not answer a channel open"),
+            "{error:#}"
+        );
+        // The whole connection is failed, so every session on it reconnects.
+        assert!(!connection.usable());
+        drop(keep);
+    }
+
+    #[test]
+    fn a_session_waits_on_a_connecting_slot_with_a_deadline_not_on_a_lock() {
+        let pool = Arc::new(AgentPool::with_wait(std::time::Duration::from_millis(300)));
+        let key = vec!["slow-host".to_owned()];
+
+        // The first session's establishment hangs (a login stuck in a slow
+        // rc file) until released.
+        let (release, hung) = mpsc::channel::<()>();
+        let (entered, establishing) = mpsc::channel::<()>();
+        let first = {
+            let pool = pool.clone();
+            let key = key.clone();
+            std::thread::spawn(move || {
+                pool.channel(&key, initialize(std::path::Path::new("/unused")), || {
+                    let _ = entered.send(());
+                    let _ = hung.recv();
+                    bail!("the login never finished")
+                })
+                .err()
+                .expect("the first session fails")
+            })
+        };
+        establishing
+            .recv()
+            .expect("the first session is establishing");
+
+        // A second session to the same host is not stuck behind it: it
+        // gives up within the wait, and never establishes a second time
+        // while the first is connecting.
+        let started = std::time::Instant::now();
+        let error = pool
+            .channel(&key, initialize(std::path::Path::new("/unused")), || {
+                panic!("a second establishment while the first is connecting")
+            })
+            .err()
+            .expect("the second session gives up");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "waited {:?}",
+            started.elapsed()
+        );
+        assert!(
+            format!("{error:#}").contains("still connecting"),
+            "{error:#}"
+        );
+
+        drop(release);
+        let error = first.join().expect("the first session's thread");
+        assert!(format!("{error:#}").contains("never finished"), "{error:#}");
+
+        // With the slot free again, the next session establishes afresh.
+        let (client, agent) = connected_pair();
+        let _keep = silent_peer(agent);
+        let error = pool
+            .channel(&key, initialize(std::path::Path::new("/unused")), || {
+                AgentConnection::connect_within(client, std::time::Duration::from_millis(200))
+            })
+            .err()
+            .expect("a silent agent fails the handshake");
+        assert!(ConnectionFailed::is_in(&error), "{error:#}");
     }
 
     #[test]

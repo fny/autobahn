@@ -1451,6 +1451,7 @@ impl Endpoint for LocalEndpoint {
             .map(|(digest, uses)| (digest, AtomicUsize::new(uses)))
             .collect();
         let helpers = AtomicUsize::new(apply_helpers());
+        let swept = Mutex::new(HashSet::new());
         // The observation is about to stop describing the tree, so it is
         // invalidated *before* the first write rather than after the last,
         // and the paths about to change ride along: the watcher's own
@@ -1483,6 +1484,9 @@ impl Endpoint for LocalEndpoint {
             group: self.group,
             staged_uses: &staged_uses,
             helpers: &helpers,
+            #[cfg(test)]
+            after_use_counted: None,
+            swept: &swept,
             problems: Vec::new(),
             missing_staged_files: false,
             missing_staged: Vec::new(),
@@ -1790,6 +1794,15 @@ struct Transitioner<'a> {
     /// Threads not currently applying a slice of this transition, shared
     /// by every transitioner of it. See [`apply_helpers`].
     helpers: &'a AtomicUsize,
+    /// A test seam between a publish counting its use of staged content
+    /// and acting on it — the window in which another publish of the same
+    /// digest can take the last use and move the staged file away.
+    #[cfg(test)]
+    after_use_counted: Option<&'a (dyn Fn() + Sync)>,
+    /// The directories already swept of leftover publish temporaries in
+    /// this transition, shared by every transitioner of it, so each is
+    /// listed once. See [`Transitioner::sweep_leftovers`].
+    swept: &'a Mutex<HashSet<PathBuf>>,
     /// The problems accumulated so far.
     problems: Vec<Problem>,
     /// Whether or not any staged content was found missing.
@@ -1816,6 +1829,9 @@ impl<'a> Transitioner<'a> {
             group: self.group,
             staged_uses: self.staged_uses,
             helpers: self.helpers,
+            #[cfg(test)]
+            after_use_counted: self.after_use_counted,
+            swept: self.swept,
             problems: Vec::new(),
             missing_staged_files: false,
             missing_staged: Vec::new(),
@@ -2057,6 +2073,9 @@ impl<'a> Transitioner<'a> {
         }
 
         let (parent, name) = self.resolve_parent(path)?;
+        if matches!(new.content, Content::File { .. }) {
+            self.sweep_leftovers(&parent);
+        }
         // Creating over existing content would destroy something nobody
         // asked to destroy: the change carries no expectation about what's
         // there, so there's nothing to validate it against.
@@ -2240,6 +2259,16 @@ impl<'a> Transitioner<'a> {
     ) -> Option<FileMetadata> {
         let staged = staged_path(self.staging_root, digest);
         let mode = creation_mode(self.file_mode, executable);
+        // The staged file is opened *before* this publish counts its use.
+        // Once counted, the publish that takes the count to zero may move
+        // the file away at any moment, and an earlier use that opened only
+        // afterwards found nothing and scheduled a needless retransfer.
+        // Holding the handle, an earlier use copies the content it opened,
+        // wherever the name has gone since.
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&staged);
         let last_use = match self.staged_uses.get(digest) {
             Some(count) => {
                 // Counted down atomically: the publish that takes the
@@ -2253,11 +2282,43 @@ impl<'a> Transitioner<'a> {
             }
             None => false,
         };
+        #[cfg(test)]
+        if let Some(hook) = self.after_use_counted {
+            hook();
+        }
 
         // A missing staged file surfaces as NotFound from whichever
         // operation touches it first: the content was never supplied or has
         // since vanished, and the controller runs another cycle immediately.
         let missing = |error: &io::Error| error.kind() == ErrorKind::NotFound;
+        let mut input = match opened {
+            Ok(input) => input,
+            Err(error) if missing(&error) => {
+                self.retransfer(
+                    path,
+                    digest,
+                    "staged content is unavailable; it will be retransferred on the next \
+                     cycle",
+                );
+                return None;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => {
+                // Staging only ever writes regular files there, so a link
+                // is not content; it goes, and the content comes again.
+                let _ = fs::remove_file(&staged);
+                self.retransfer(
+                    path,
+                    digest,
+                    "staged content is not a regular file; it will be retransferred on the \
+                     next cycle",
+                );
+                return None;
+            }
+            Err(error) => {
+                self.problem(path, format!("unable to stage content into place: {error}"));
+                return None;
+            }
+        };
 
         // The achieved metadata is captured from the *staged* file, after
         // its permissions are final and before the rename publishes it.
@@ -2271,25 +2332,28 @@ impl<'a> Transitioner<'a> {
         // editor's content invisible to every later scan and let a
         // validated transition overwrite it.
         // The move is taken only for a staged entry that is still a
-        // regular file whose bytes still match the digest. Receive
-        // verified those bytes once, but the digest-named path is
-        // addressable between then and now, and a rename would promote
-        // whatever sits there into the tree *as* the verified content —
-        // with the achieved record then pairing the requested digest with
-        // the impostor's own metadata, hiding it from every later scan.
+        // regular file whose bytes still match the digest, and whose name
+        // still leads to the file this publish opened. Receive verified
+        // those bytes once, but the digest-named path is addressable
+        // between then and now, and a rename would promote whatever sits
+        // there into the tree *as* the verified content — with the
+        // achieved record then pairing the requested digest with the
+        // impostor's own metadata, hiding it from every later scan.
         // Anything doubtful falls through to the copy path, which digests
         // what it moves and turns a mismatch into a retransfer.
         let mut published: Option<FileMetadata> = None;
         let moved = last_use
-            && fs::set_permissions(&staged, Permissions::from_mode(mode)).is_ok()
-            && {
-                published = fs::symlink_metadata(&staged)
-                    .ok()
-                    .filter(|metadata| metadata.file_type().is_file())
-                    .map(|metadata| file_metadata(&metadata));
-                published.is_some()
+            && input.set_permissions(Permissions::from_mode(mode)).is_ok()
+            && match input.metadata() {
+                Ok(opened) if opened.file_type().is_file() => {
+                    published = Some(file_metadata(&opened));
+                    content_matches(&mut input, digest)
+                        && fs::symlink_metadata(&staged).is_ok_and(|named| {
+                            (named.dev(), named.ino()) == (opened.dev(), opened.ino())
+                        })
+                }
+                _ => false,
             }
-            && staged_content_matches(&staged, digest)
             && publish_rename(&staged, target, replace).is_ok();
         if !moved {
             let temporary = parent.join(temporary_name("apply"));
@@ -2299,21 +2363,18 @@ impl<'a> Transitioner<'a> {
             // crash can leave a correctly named file with truncated bytes.
             // Publishing that would install content matching nothing and
             // then model it as correct.
-            let copied = match File::open(&staged)
-                .with_context(|| format!("unable to open {}", staged.display()))
-                .and_then(|mut input| copy_into_private(&mut input, &staged, &temporary, digest))
+            let copied = match input
+                .seek(SeekFrom::Start(0))
+                .with_context(|| format!("unable to read {}", staged.display()))
+                .and_then(|_| copy_into_private(&mut input, &staged, &temporary, digest))
             {
                 Ok(true) => Ok(()),
                 Ok(false) => {
                     let _ = fs::remove_file(&temporary);
                     let _ = fs::remove_file(&staged);
-                    self.missing_staged_files = true;
-                    self.missing_staged.push(crate::endpoint::FileRequest {
-                        path: path.to_owned(),
-                        digest: *digest,
-                    });
-                    self.problem(
+                    self.retransfer(
                         path,
+                        digest,
                         "staged content does not match its digest; it will be \
                          retransferred on the next cycle",
                     );
@@ -2343,13 +2404,9 @@ impl<'a> Transitioner<'a> {
                     Err(ref probe) if probe.kind() == ErrorKind::NotFound
                 );
                 if missing(&error) && staged_absent {
-                    self.missing_staged_files = true;
-                    self.missing_staged.push(crate::endpoint::FileRequest {
-                        path: path.to_owned(),
-                        digest: *digest,
-                    });
-                    self.problem(
+                    self.retransfer(
                         path,
+                        digest,
                         "staged content is unavailable; it will be retransferred on the next \
                          cycle",
                     );
@@ -2391,6 +2448,47 @@ impl<'a> Transitioner<'a> {
 
         self.apply_ownership(path, target);
         published
+    }
+
+    /// Removes what a crashed copy-publish left in `directory`: an
+    /// `.autobahn-tmp-apply-*` file old enough that no copy is still
+    /// writing it, whose process is gone (or which is old enough that its
+    /// process identifier has surely been reused). Scans hide such files
+    /// and the staging sweep never looks here, so without this a large
+    /// file's leftover leaked its size in disk for good.
+    ///
+    /// Called before publishing into a directory that already existed;
+    /// each directory is listed once per transition.
+    fn sweep_leftovers(&mut self, directory: &Path) {
+        if !self
+            .swept
+            .lock()
+            .expect("the swept set is never poisoned")
+            .insert(directory.to_path_buf())
+        {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if stale_publish_leftover(name, &entry) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+    }
+
+    /// Records that the staged content for `path` is gone or unusable, so
+    /// the controller transfers it again, with a problem saying why.
+    fn retransfer(&mut self, path: &str, digest: &Digest, message: &str) {
+        self.missing_staged_files = true;
+        self.missing_staged.push(crate::endpoint::FileRequest {
+            path: path.to_owned(),
+            digest: *digest,
+        });
+        self.problem(path, message);
     }
 
     /// Applies the configured ownership to a created entry (best-effort:
@@ -2553,6 +2651,26 @@ impl<'a> Transitioner<'a> {
                         survivors.push(survivor);
                     }
                 }
+                None if scan::autobahn_temporary(name) => {
+                    // Autobahn's own litter — a crashed publish's
+                    // temporary, most likely. Scans never record it, so it
+                    // is always unaccounted for; treated as unexpected it
+                    // kept the directory and reported a disagreement,
+                    // which forced a full walk every cycle, forever. No
+                    // peer can create such a name (see `validate_name`),
+                    // so it goes with the directory.
+                    let removed = match entry.file_type() {
+                        Ok(kind) if kind.is_dir() => fs::remove_dir_all(entry.path()),
+                        _ => fs::remove_file(entry.path()),
+                    };
+                    if let Err(error) = removed {
+                        self.problem(
+                            &child_path,
+                            format!("unable to remove a leftover temporary: {error}"),
+                        );
+                        unexpected = true;
+                    }
+                }
                 None => {
                     // Two very different things reach here. An expectation
                     // never mentions excluded content, so an ignored entry
@@ -2673,6 +2791,9 @@ impl<'a> Transitioner<'a> {
         let Some((parent, name)) = self.resolve_parent(path) else {
             return Some(old.clone());
         };
+        if matches!(new.content, Content::File { .. }) {
+            self.sweep_leftovers(&parent);
+        }
         let target = parent.join(name);
 
         // File-to-file replacements are performed in place, which is both
@@ -3082,6 +3203,72 @@ fn staged_content_matches(path: &Path, digest: &Digest) -> bool {
     let Ok(mut file) = fs::File::open(path) else {
         return false;
     };
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = vec![0u8; 128 * 1024];
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => {
+                hasher.update(&buffer[..count]);
+            }
+            Err(_) => return false,
+        }
+    }
+    hasher.finalize().as_bytes() == digest
+}
+
+/// How long a copy-publish temporary must have gone unmodified before it is
+/// taken for a crash's leftover. A copy in progress writes continuously,
+/// so its modification time stays current; this only has to outlast a
+/// stalled write.
+const LEFTOVER_MINIMUM_AGE: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// Whether a directory entry is a copy-publish temporary that nothing will
+/// finish: see [`Transitioner::sweep_leftovers`].
+fn stale_publish_leftover(name: &str, entry: &fs::DirEntry) -> bool {
+    if !scan::autobahn_temporary(name) {
+        return false;
+    }
+    let Some(pid) = name
+        .strip_prefix(TEMPORARY_PREFIX)
+        .and_then(|rest| rest.strip_prefix("-apply-"))
+        .and_then(|rest| rest.split('-').next())
+        .and_then(|pid| pid.parse::<libc::pid_t>().ok())
+    else {
+        return false;
+    };
+    let Ok(metadata) = entry.metadata() else {
+        return false;
+    };
+    let age = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+        .unwrap_or_default();
+    metadata.file_type().is_file()
+        && age >= LEFTOVER_MINIMUM_AGE
+        && (!process_running(pid) || age >= crate::fsutil::TMP_MAX_AGE)
+}
+
+/// Whether a process with this identifier exists on this host.
+fn process_running(pid: libc::pid_t) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    if pid as u32 == std::process::id() {
+        return true;
+    }
+    // SAFETY: signal 0 only checks that the process exists and may be
+    // signalled; nothing is sent.
+    let signalled = unsafe { libc::kill(pid, 0) };
+    signalled == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// Whether an open file's bytes, read from its start, hash to `digest`.
+fn content_matches(file: &mut File, digest: &Digest) -> bool {
+    if file.seek(SeekFrom::Start(0)).is_err() {
+        return false;
+    }
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; 128 * 1024];
     loop {
@@ -5835,5 +6022,147 @@ mod apply_path_tests {
         let outcome = delete_scanned(&mut endpoint, "project");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert!(!root.join("project").exists());
+    }
+
+    /// Two publishes of one digest: the first counts its use, and before
+    /// it acts the second takes the last use and moves the staged file
+    /// into place. The first still publishes, from the file it opened,
+    /// rather than finding nothing and asking for the content again.
+    #[test]
+    fn an_earlier_publish_survives_the_last_use_moving_the_staged_file() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let staging = keep.path().join("staging");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&staging).expect("staging");
+        let digest = *blake3::hash(b"shared").as_bytes();
+        let staged = staged_path(&staging, &digest);
+        fs::write(&staged, b"shared").expect("staged");
+
+        let uses: HashMap<Digest, AtomicUsize> = [(digest, AtomicUsize::new(2))].into();
+        let helpers = AtomicUsize::new(0);
+        let ignores = IgnoreSet::default();
+        let moved_to = root.join("b");
+        let hook = || {
+            // The other publish, taking the last use: a move into place.
+            fs::rename(&staged, &moved_to).expect("the last use moves the file");
+        };
+        let mut transitioner = Transitioner {
+            root: &root,
+            staging_root: &staging,
+            scanned: None,
+            behavior: FilesystemBehavior::default(),
+            symlink_mode: SymlinkMode::default(),
+            ignores: &ignores,
+            file_mode: DEFAULT_FILE_MODE,
+            directory_mode: DEFAULT_DIRECTORY_MODE,
+            owner: None,
+            group: None,
+            staged_uses: &uses,
+            helpers: &helpers,
+            after_use_counted: Some(&hook),
+            swept: &Mutex::new(HashSet::new()),
+            problems: Vec::new(),
+            missing_staged_files: false,
+            missing_staged: Vec::new(),
+        };
+        let published =
+            transitioner.publish_file("a", &root, &root.join("a"), &digest, false, false);
+        assert!(
+            transitioner.problems.is_empty(),
+            "{:?}",
+            transitioner.problems
+        );
+        assert!(!transitioner.missing_staged_files);
+        assert!(published.is_some());
+        assert_eq!(fs::read(root.join("a")).unwrap(), b"shared");
+        assert_eq!(fs::read(root.join("b")).unwrap(), b"shared");
+    }
+
+    /// Writes an `.autobahn-tmp-apply-*` leftover into `directory`, by a
+    /// process identifier no process has, modified `age` ago.
+    fn leftover(directory: &Path, count: u32, age: std::time::Duration) -> PathBuf {
+        let path = directory.join(format!("{TEMPORARY_PREFIX}-apply-{}-{count}", i32::MAX));
+        let file = File::create(&path).expect("leftover");
+        file.set_modified(std::time::SystemTime::now() - age)
+            .expect("backdate");
+        path
+    }
+
+    /// A crashed publish's temporary inside a deleted directory goes with
+    /// it: no disagreement, which would force a full walk every cycle.
+    #[test]
+    fn a_deleted_directory_takes_a_leftover_temporary_with_it() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(root.join("d")).expect("d");
+        fs::write(root.join("d/a.txt"), b"a").expect("a");
+        leftover(&root.join("d"), 1, std::time::Duration::ZERO);
+        let mut endpoint = endpoint_with(&root, EndpointOptions::default());
+        let outcome = delete_scanned(&mut endpoint, "d");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert!(!root.join("d").exists());
+    }
+
+    /// Publishing into a directory sweeps a stale leftover from it, and
+    /// leaves one a copy may still be writing.
+    #[test]
+    fn publishing_into_a_directory_sweeps_its_stale_leftovers() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(root.join("d")).expect("d");
+        let stale = leftover(&root.join("d"), 1, std::time::Duration::from_secs(3600));
+        let fresh = leftover(&root.join("d"), 2, std::time::Duration::ZERO);
+        let mut endpoint = endpoint_with(&root, EndpointOptions::default());
+        let digest = *blake3::hash(b"new").as_bytes();
+        prepare_staging_root(&endpoint.staging_root, &root).expect("staging");
+        fs::write(staged_path(&endpoint.staging_root, &digest), b"new").expect("staged");
+        endpoint.scan().expect("scan");
+        let outcome = endpoint
+            .transition(vec![Change {
+                path: "d/new".into(),
+                old: None,
+                new: Some(Node {
+                    name: "new".into(),
+                    content: Content::File {
+                        digest,
+                        executable: false,
+                        metadata: FileMetadata::default(),
+                    },
+                }),
+            }])
+            .expect("transition");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert_eq!(fs::read(root.join("d/new")).unwrap(), b"new");
+        assert!(!stale.exists(), "the stale leftover was kept");
+        assert!(fresh.exists(), "a leftover still being written was removed");
+    }
+
+    #[test]
+    fn a_leftover_of_a_running_process_is_kept_until_it_is_very_old() {
+        let keep = tempdir().expect("temporary directory");
+        let ours = |count: u32, age: std::time::Duration| {
+            let path = keep.path().join(format!(
+                "{TEMPORARY_PREFIX}-apply-{}-{count}",
+                std::process::id()
+            ));
+            File::create(&path)
+                .expect("leftover")
+                .set_modified(std::time::SystemTime::now() - age)
+                .expect("backdate");
+        };
+        ours(1, std::time::Duration::from_secs(3600));
+        ours(
+            2,
+            crate::fsutil::TMP_MAX_AGE + std::time::Duration::from_secs(60),
+        );
+        let stale: Vec<String> = fs::read_dir(keep.path())
+            .expect("list")
+            .flatten()
+            .filter(|entry| stale_publish_leftover(entry.file_name().to_str().unwrap(), entry))
+            .map(|entry| entry.file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(stale.len(), 1, "{stale:?}");
+        assert!(stale[0].ends_with("-2"), "{stale:?}");
     }
 }

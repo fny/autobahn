@@ -139,6 +139,9 @@ struct State {
     /// Set while a scan is running, so concurrent callers wait for it
     /// rather than each walking the tree.
     scanning: bool,
+    /// How many walks have been published, so a caller can tell a scan
+    /// walked while it waited from one that was already there.
+    walks: u64,
 }
 
 /// One root, observed once on behalf of every session that synchronizes it.
@@ -337,16 +340,25 @@ impl RootObserver {
     ) -> Result<(Snapshot, u64)> {
         self.ensure_watching();
 
+        let mut walks_at_entry = None;
         loop {
             let (baseline, behavior, want_full) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+                let walks_at_entry = *walks_at_entry.get_or_insert(state.walks);
 
                 // Serve the published scan while its generation still
                 // stands: nothing has happened to the tree since it was
                 // taken, so a fresh walk could only reproduce it.
                 // A verifying scan never serves the cache: the re-read is
-                // the entire point.
-                if !rehash {
+                // the entire point. Nor does a root nobody watches, where
+                // nothing moves the generation when the tree changes — a
+                // one-shot's follow-up cycle would be handed the very scan
+                // whose file changed under the transfer, ask for the same
+                // content again, and stop with "staging is failing". There
+                // a published scan serves only a caller that waited for it.
+                let current = self.watch_wanted.load(std::sync::atomic::Ordering::SeqCst)
+                    || state.walks > walks_at_entry;
+                if !rehash && current {
                     if let Some((taken_at, snapshot)) = &state.published {
                         if *taken_at == self.signal.current() && !self.full_scan_due(&state) {
                             return Ok((snapshot.clone(), *taken_at));
@@ -427,6 +439,7 @@ impl RootObserver {
             state.baseline = Some(snapshot.clone());
             state.baseline_generation = taken_at;
             state.published = Some((taken_at, snapshot.clone()));
+            state.walks += 1;
             return Ok((snapshot, taken_at));
         }
     }
@@ -623,6 +636,7 @@ pub fn observer_for(
             watcher: None,
             watch_retry_after: None,
             published: None,
+            walks: 0,
             baseline: None,
             baseline_generation: 0,
             last_full_scan: None,
@@ -806,6 +820,28 @@ mod tests {
             "the mid-scan change was never observed"
         );
         assert!(fresh_generation > stale_generation);
+    }
+
+    /// With nothing watching the root, nothing moves the generation when a
+    /// file changes, so a scan is never served from the last one: the
+    /// change is found without anyone invalidating it. This is a one-shot's
+    /// follow-up cycle after a source file changed under its transfer.
+    #[test]
+    fn an_unwatched_root_is_walked_for_every_scan() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+
+        let (first, _) = observer.scan(None, None).expect("scans");
+        std::fs::write(root.join("file.txt"), b"after, and longer").expect("writes");
+        let (second, _) = observer.scan(None, None).expect("scans");
+        assert_ne!(
+            digest_of(&second, "file.txt"),
+            digest_of(&first, "file.txt"),
+            "an unwatched root served a scan from before the change"
+        );
     }
 
     /// A stale fold offered as the baseline is a hint, never an oracle: a

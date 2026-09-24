@@ -1619,14 +1619,15 @@ fn locate_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
 /// failed, else 2 if any left conflicts or blocked paths, else 0.
 fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> {
     let config = config.map_or_else(paths::default_config_path, Ok)?;
-    let plans = load_config(Some(config.clone()))?.plans()?;
+    let loaded = load_config(Some(config.clone()))?;
+    let plans = loaded.plans()?;
     if plans.is_empty() {
         bail!("the configuration describes no sessions");
     }
     let state_root = locate_state_root(state_root)?;
     autobahn::config::OwnState::new(&state_root, Some(&config)).check_plans(&plans)?;
     paths::prepare_state_root(&state_root)?;
-    for warning in autobahn::config::secret_warnings(&plans) {
+    for warning in loaded.warnings() {
         eprintln!("warning: {warning}");
     }
     let supervisor = Supervisor::new(plans, state_root, false);
@@ -1729,7 +1730,7 @@ fn run_watch(
     let own_state = autobahn::config::OwnState::new(&state_root, Some(&config_path));
     own_state.check_plans(&loaded.plans)?;
     paths::prepare_state_root(&state_root)?;
-    for warning in autobahn::config::secret_warnings(&loaded.plans) {
+    for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
 
@@ -4295,6 +4296,7 @@ fn run_status(
     // A running supervisor says which sessions it runs; the file on disk
     // may since have been edited into one it refused.
     let mut inventory = None;
+    let mut warnings = Vec::new();
     let plans = match peer_plans(&config)? {
         Some((plans, header)) => {
             if !json {
@@ -4310,6 +4312,7 @@ fn run_status(
             match autobahn::supervisor::shown_plans(&path, &state_root) {
                 Ok(shown) => {
                     inventory = shown.inventory;
+                    warnings = shown.warnings;
                     shown.plans
                 }
                 Err(error) if !json => return show_recorded(&state_root, &error),
@@ -4326,6 +4329,16 @@ fn run_status(
             "\x1b[33mthe supervisor could not write some of its log\x1b[0m (standard output \
              closed, or the disk under the log full); the sessions are unaffected\n\n",
         );
+    }
+    // Said here, once, rather than every time the sessions are planned.
+    if !json && !live && !warnings.is_empty() {
+        for warning in &warnings {
+            style::emit(&format!(
+                "\x1b[33mwarning\x1b[0m: {}\n",
+                display_safe(warning)
+            ));
+        }
+        println!();
     }
 
     // Every group turned off is a state, not an error: a running

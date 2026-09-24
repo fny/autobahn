@@ -303,6 +303,11 @@ pub struct Config {
     /// Tuning that has a correct value already.
     #[serde(default)]
     pub advanced: Advanced,
+    /// What is worth saying about this configuration without refusing
+    /// it, gathered once per load by [`warnings`](Self::warnings) however
+    /// many times its sessions are planned.
+    #[serde(skip)]
+    warnings: std::sync::OnceLock<Vec<String>>,
     /// Where `ignore_files` entries are looked up when set: a peer runs the
     /// leader's pushed configuration against the pushed ignore files,
     /// not against its own `~/.autobahn/ignores`. Never read from the
@@ -1014,7 +1019,7 @@ fn secrets_warning_in(identity: &str, ignores: &[String], home: Option<&Path>) -
 
 /// The credential warnings for a set of plans: one per local root, however
 /// many sessions share it, skipping the groups that set
-/// `acknowledge_secrets`. Said once, when a run starts.
+/// `acknowledge_secrets`. Part of [`Config::warnings`], said once per load.
 pub fn secret_warnings(plans: &[SessionPlan]) -> Vec<String> {
     let mut seen: Vec<&str> = Vec::new();
     let mut warnings = Vec::new();
@@ -1241,7 +1246,33 @@ impl Config {
     }
 
     pub fn plans(&self) -> Result<Vec<SessionPlan>> {
+        let (plans, mut warnings) = self.plans_and_warnings()?;
+        // Nothing is said here: planning happens many times per load, and
+        // the warnings are gathered for a caller to say once.
+        self.warnings.get_or_init(|| {
+            warnings.extend(secret_warnings(&plans));
+            warnings
+        });
+        Ok(plans)
+    }
+
+    /// What is worth saying about this configuration without refusing it:
+    /// a wildcard negation that can have no effect, and a root that holds
+    /// credentials nothing ignores. Gathered once, by the first planning,
+    /// so a caller that says them once per load says each once however
+    /// often the sessions are planned. Empty for a configuration that does
+    /// not plan, whose error is what to say instead.
+    pub fn warnings(&self) -> &[String] {
+        if self.warnings.get().is_none() && self.plans().is_err() {
+            return &[];
+        }
+        self.warnings.get().map(Vec::as_slice).unwrap_or_default()
+    }
+
+    /// The sessions, and the ineffective negations found planning them.
+    fn plans_and_warnings(&self) -> Result<(Vec<SessionPlan>, Vec<String>)> {
         let mut errors = Vec::new();
+        let mut warnings = Vec::new();
         if self.disabled.is_some() {
             errors.push(
                 "`disabled` at the top level is now `disabled_hosts`. A group has a \
@@ -1444,7 +1475,7 @@ impl Config {
                     // said, not refused: such a list ran before, just
                     // without the effect it meant.
                     for warning in compiled.ineffective_negations() {
-                        eprintln!("autobahn: warning: group '{name}': {warning}");
+                        warnings.push(format!("group '{name}': {warning}"));
                     }
                     errors.extend(
                         compiled
@@ -1775,7 +1806,7 @@ impl Config {
         if !errors.is_empty() {
             bail!("invalid configuration:\n  {}", errors.join("\n  "));
         }
-        Ok(plans)
+        Ok((plans, warnings))
     }
 }
 
@@ -3050,6 +3081,34 @@ betas = ["build.example.com:/tmp/beta"]
         assert!(warnings(r#"ignores = [".ssh", ".config/gcloud"]"#).is_empty());
         assert!(warnings(r#"ignores = [".ssh", ".config"]"#).is_empty());
         assert!(warnings("acknowledge_secrets = true").is_empty());
+    }
+
+    /// A configuration's warnings are one list, gathered once per load:
+    /// planning it again says nothing more, and each warning is in the
+    /// list once.
+    #[test]
+    fn a_configurations_warnings_are_one_list_gathered_once() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(root.join(".ssh")).unwrap();
+        let config = parse(&format!(
+            r#"
+            [groups.dots]
+            alpha = "{root}"
+            mode = "two-way-safe"
+            betas = ["host:/dots", "other:/dots"]
+            ignores = ["vendor", "!vendor/*.patch"]
+            "#,
+            root = root.display()
+        ));
+        config.plans().expect("plans should build");
+        config.plans().expect("plans should build again");
+        let warnings = config.warnings();
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[0].contains("group 'dots': !vendor/*.patch has no effect"));
+        assert!(warnings[1].contains("group 'dots'") && warnings[1].contains(".ssh"));
+        // Gathered once: the same list, not a second pass.
+        assert!(std::ptr::eq(warnings, config.warnings()));
     }
 
     /// A home directory is warned about for every credential directory it

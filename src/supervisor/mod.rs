@@ -2173,6 +2173,9 @@ pub struct Shown {
     pub plans: Vec<SessionPlan>,
     /// The running supervisor's inventory, when the plans came from it.
     pub inventory: Option<control::Inventory>,
+    /// What to say about the configuration the plans came from, without
+    /// refusing it.
+    pub warnings: Vec<String>,
 }
 
 /// The sessions `status`, the shop and the tray show. When a supervisor
@@ -2183,9 +2186,12 @@ pub struct Shown {
 pub fn shown_plans(config_path: &Path, state_root: &Path) -> Result<Shown> {
     if let Some(inventory) = control::inventory(state_root) {
         let planned = inventory.configuration.as_deref().map(|text| {
-            crate::config::Config::parse(config_path, text).and_then(|config| config.plans())
+            crate::config::Config::parse(config_path, text).and_then(|config| {
+                let plans = config.plans()?;
+                Ok((plans, config.warnings().to_vec()))
+            })
         });
-        if let Some(Ok(plans)) = planned {
+        if let Some(Ok((plans, warnings))) = planned {
             let running: std::collections::HashSet<&str> = inventory
                 .sessions
                 .iter()
@@ -2198,13 +2204,16 @@ pub fn shown_plans(config_path: &Path, state_root: &Path) -> Result<Shown> {
             return Ok(Shown {
                 plans,
                 inventory: Some(inventory),
+                warnings,
             });
         }
     }
-    let plans = crate::config::Config::load(config_path)?.plans()?;
+    let config = crate::config::Config::load(config_path)?;
+    let plans = config.plans()?;
     Ok(Shown {
         plans,
         inventory: None,
+        warnings: config.warnings().to_vec(),
     })
 }
 

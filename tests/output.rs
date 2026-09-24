@@ -162,3 +162,50 @@ fn issues_for_a_path_in_nested_groups_scopes_each_group_to_it() {
         ]
     );
 }
+
+/// A configuration's warnings are said once by `status`, however many
+/// times it plans the sessions: the credentials warning on standard
+/// output, where the rest of the page is, and the ineffective negation
+/// with it.
+#[test]
+fn status_says_each_configuration_warning_once() {
+    let home = tempfile::tempdir().expect("a temporary directory");
+    let alpha = home.path().join("alpha");
+    let beta = home.path().join("beta");
+    std::fs::create_dir_all(alpha.join(".ssh")).unwrap();
+    std::fs::create_dir_all(&beta).unwrap();
+    let config = home.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[groups.g]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\
+             ignores = [\"vendor\", \"!vendor/*.patch\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_autobahn"))
+        .arg("status")
+        .arg("--config")
+        .arg(&config)
+        .arg("--state-root")
+        .arg(home.path().join("state"))
+        .env("HOME", home.path())
+        .env("AUTOBAHN_HOME", home.path().join(".autobahn"))
+        .output()
+        .expect("runs autobahn");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(stdout.matches(".ssh").count(), 1, "{stdout}\n{stderr}");
+    assert!(stdout.contains("acknowledge_secrets"), "{stdout}");
+    let both = format!("{stdout}{stderr}");
+    assert_eq!(
+        both.matches("!vendor/*.patch has no effect").count(),
+        1,
+        "{both}"
+    );
+}

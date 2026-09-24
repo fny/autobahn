@@ -37,6 +37,8 @@ pub struct Loaded {
     /// reports, so that `status` can plan the sessions it runs even after
     /// the file has been edited into something that does not load.
     pub text: String,
+    /// What to say about it without refusing it, once, as it loads.
+    pub warnings: Vec<String>,
 }
 
 /// Loads a configuration and derives everything the supervisor runs from,
@@ -66,6 +68,7 @@ pub fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Loaded> {
         log_level,
         reload: configuration.reload,
         text: text.to_owned(),
+        warnings: configuration.warnings().to_vec(),
     })
 }
 
@@ -252,6 +255,9 @@ impl Reloader {
             match load_bytes(&self.path, &current) {
                 Ok(loaded) => {
                     crate::note!("configuration reloaded from {}", self.path.display());
+                    for warning in &loaded.warnings {
+                        crate::complain!("warning: {warning}");
+                    }
                     self.set_applied(current);
                     clear_notice(state_root);
                     *self

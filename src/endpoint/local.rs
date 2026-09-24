@@ -1557,6 +1557,11 @@ impl Endpoint for LocalEndpoint {
             .collect();
         let helpers = AtomicUsize::new(apply_helpers());
         let swept = Mutex::new(HashSet::new());
+        // The generation of the scan this endpoint's lease came from. The
+        // fold offered at the end is built from that lease, so it is
+        // offered at that generation: a baseline some sharing session has
+        // advanced since must refuse it.
+        let lease_generation = self.seen_generation;
         // The observation is about to stop describing the tree, so it is
         // invalidated *before* the first write rather than after the last,
         // and the paths about to change ride along: the watcher's own
@@ -1655,11 +1660,7 @@ impl Endpoint for LocalEndpoint {
             missing_staged: transitioner.missing_staged,
         };
 
-        // The paths are announced *again* now that the writes are done —
-        // and the generation that leaves is the one this endpoint has seen:
-        // a wait from here wakes for the next change, not for the writes
-        // just made. (The next scan still re-reads these paths: the
-        // announcement marks them, and marks are not generations.)
+        // The paths are announced *again* now that the writes are done.
         // The pre-write announcement keeps a racing scan from adopting its
         // baseline; but such a scan consumes the announced dirty marks and
         // can still read the old bytes before they change, publishing them
@@ -1667,9 +1668,23 @@ impl Endpoint for LocalEndpoint {
         // deterministically outdates that publication — the kernel's own
         // events do the same job, but they arrive on their own schedule
         // and never arrive at all under the polling fallback.
-        self.observer
+        let announced = self
+            .observer
             .invalidate(transitions.iter().map(|change| change.path.as_str()));
-        self.seen_generation = self.observer.generation();
+        // The generation this endpoint has seen moves past its own two
+        // announcements, and only when nothing else advanced it since the
+        // lease was scanned: a wait from here then wakes for the next
+        // change, not for the writes just made. (The next scan still
+        // re-reads these paths: the announcements mark them, and marks
+        // are not generations.) Anything else that advanced it — a
+        // sharing session's writes, an external change, or the kernel's
+        // events for these very writes — was never scanned, so the
+        // generation stays at the lease's and the next wait wakes at once.
+        // For our own kernel events that costs one extra cycle, the one
+        // TODO-SPEED.md measured and accepted.
+        if announced == lease_generation + 2 {
+            self.seen_generation = announced;
+        }
 
         // A disagreement means the filesystem differed from the snapshot the
         // transition was validated against, so the snapshot is known to be
@@ -1703,9 +1718,12 @@ impl Endpoint for LocalEndpoint {
                     // generation, so the next scan still runs — it simply
                     // starts from a tree that already knows about this
                     // write instead of re-digesting what was just
-                    // published.
+                    // published. Offered at the lease's generation, which
+                    // is what it was built from: if a sharing session's
+                    // scan has moved the baseline past that, the offer is
+                    // refused rather than rolling back what that scan saw.
                     self.observer
-                        .offer_baseline(folded.clone(), self.seen_generation);
+                        .offer_baseline(folded.clone(), lease_generation);
                     self.last_snapshot = Some(folded);
                 }
                 // A graft failure (which real transition results shouldn't
@@ -5669,6 +5687,171 @@ mod tests {
             digest_of(&fresh),
             *blake3::hash(b"the new contents!!").as_bytes()
         );
+    }
+
+    /// Two endpoints over one root, sharing one observer, as two sessions
+    /// synchronizing the same source do. `watching` chooses between a
+    /// live watcher and the polling fallback.
+    fn sharing_pair(watching: bool) -> (TempDir, PathBuf, LocalEndpoint, LocalEndpoint) {
+        use std::sync::atomic::Ordering;
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        let first = endpoint(&root, &keep.path().join("staging-a"));
+        let second = endpoint(&root, &keep.path().join("staging-b"));
+        assert!(
+            Arc::ptr_eq(&first.observer, &second.observer),
+            "two endpoints over one root must share one observer"
+        );
+        first
+            .observer
+            .suppress_watching
+            .store(!watching, Ordering::SeqCst);
+        (keep, root, first, second)
+    }
+
+    /// The deletion of `path` as recorded in `endpoint`'s own lease.
+    fn deletion(endpoint: &LocalEndpoint, path: &str) -> Change {
+        let lease = endpoint.last_snapshot.as_ref().expect("a lease is held");
+        Change {
+            path: path.to_string(),
+            old: Some(node_at(lease, path)),
+            new: None,
+        }
+    }
+
+    fn records(snapshot: &Snapshot, path: &str) -> bool {
+        let mut current = snapshot.root.as_ref();
+        for component in path.split('/') {
+            current = current.and_then(|node| node.child(component));
+        }
+        current.is_some()
+    }
+
+    /// Scans until the observer is quiet: every event the kernel had in
+    /// flight has been consumed by a scan, so nothing still pending can
+    /// rescue a baseline that later forgets a change.
+    fn settle(endpoint: &mut LocalEndpoint) {
+        endpoint.scan().expect("the settling scan runs");
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if endpoint.observer.generation() == endpoint.seen_generation {
+                return;
+            }
+            endpoint.scan().expect("the settling scan runs");
+        }
+        panic!("the root never went quiet");
+    }
+
+    /// Finding H-3: a transition offered its fold labelled with the
+    /// observer's *current* generation, although the fold was built from
+    /// its older lease. A sharing session that had scanned since — and
+    /// consumed the dirty marks of its own deletion — then had that
+    /// deletion rolled back out of the baseline, and its next scan
+    /// reported the deleted path as present.
+    fn a_stale_lease_cannot_roll_back_a_sharing_sessions_deletion(watching: bool) {
+        let (_keep, root, mut first, mut second) = sharing_pair(watching);
+        write(&root, "left/x", "x");
+        write(&root, "right/y", "y");
+
+        // Both sessions see both paths.
+        first.scan().expect("the first session scans");
+        settle(&mut second);
+        let lease = first.last_snapshot.clone().expect("a lease is held");
+        assert!(records(&lease, "left/x") && records(&lease, "right/y"));
+
+        // The second session deletes right/y and refreshes the shared scan,
+        // consuming every mark its deletion left.
+        let removal = deletion(&second, "right/y");
+        let outcome = second.transition(vec![removal]).expect("deletes");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        settle(&mut second);
+        assert!(!records(
+            second.last_snapshot.as_ref().expect("scanned"),
+            "right/y"
+        ));
+
+        // The first session deletes the unrelated left/x from its older
+        // lease — which still records right/y.
+        let removal = deletion(&first, "left/x");
+        let outcome = first.transition(vec![removal]).expect("deletes");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+
+        let rescanned = second.scan().expect("the second session scans");
+        assert!(
+            !records(&rescanned, "right/y"),
+            "a deleted path came back from a stale lease's fold"
+        );
+        assert!(!records(&rescanned, "left/x"));
+        assert!(!root.join("right/y").exists() && !root.join("left/x").exists());
+    }
+
+    #[test]
+    fn a_stale_lease_cannot_roll_back_a_sharing_sessions_deletion_when_watched() {
+        a_stale_lease_cannot_roll_back_a_sharing_sessions_deletion(true);
+    }
+
+    #[test]
+    fn a_stale_lease_cannot_roll_back_a_sharing_sessions_deletion_when_polled() {
+        a_stale_lease_cannot_roll_back_a_sharing_sessions_deletion(false);
+    }
+
+    /// Finding H-3, second half: a change a sharing session announced
+    /// between this session's lease scan and its transition must still
+    /// wake this session — not be folded into the generation it has seen
+    /// along with its own writes. Polled, so no kernel event arrives to
+    /// wake it by accident.
+    #[test]
+    fn a_foreign_change_during_a_transition_still_wakes_the_session() {
+        let (_keep, root, mut first, mut second) = sharing_pair(false);
+        write(&root, "left/x", "x");
+        write(&root, "right/y", "y");
+        first.scan().expect("the first session scans");
+        second.scan().expect("the second session scans");
+
+        // The foreign change, after the first session's lease scan.
+        let removal = deletion(&second, "right/y");
+        second.transition(vec![removal]).expect("deletes");
+
+        let removal = deletion(&first, "left/x");
+        first.transition(vec![removal]).expect("deletes");
+        assert_eq!(
+            first.watch_poll().expect("polls"),
+            Some(true),
+            "a change this session never scanned was folded into what it has seen"
+        );
+
+        // With nothing foreign in between, a session's own writes leave
+        // it caught up: the wait is for the next change.
+        write(&root, "left/z", "z");
+        first.observer.invalidate(["left/z"]);
+        let lease = first.scan().expect("the first session scans");
+        let removal = Change {
+            path: "left/z".to_string(),
+            old: Some(node_at(&lease, "left/z")),
+            new: None,
+        };
+        first.transition(vec![removal]).expect("deletes");
+        assert_eq!(first.watch_poll().expect("polls"), Some(false));
+    }
+
+    /// The same, for a real external write under a live watcher.
+    #[test]
+    fn an_external_write_during_a_transition_still_wakes_the_session() {
+        let (_keep, root, mut first, _second) = sharing_pair(true);
+        write(&root, "left/x", "x");
+        settle(&mut first);
+
+        write(&root, "elsewhere.txt", "external");
+        assert!(
+            first
+                .observer
+                .await_change(first.seen_generation, std::time::Duration::from_secs(10)),
+            "the external write was never observed"
+        );
+        let removal = deletion(&first, "left/x");
+        first.transition(vec![removal]).expect("deletes");
+        assert_eq!(first.watch_poll().expect("polls"), Some(true));
     }
 
     /// Finding I3-A: the last-use publish path renames staged content

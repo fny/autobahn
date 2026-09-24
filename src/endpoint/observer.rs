@@ -96,9 +96,11 @@ struct EventSignal {
 }
 
 impl EventSignal {
-    fn advance(&self) {
+    /// Advances the generation, returning the one this advance produced.
+    fn advance(&self) -> u64 {
         let mut generation = self.generation.lock().unwrap_or_else(|e| e.into_inner());
         *generation += 1;
+        let produced = *generation;
         self.wake.notify_all();
         drop(generation);
         let mut sleepers = self.sleepers.lock().unwrap_or_else(|e| e.into_inner());
@@ -109,6 +111,7 @@ impl EventSignal {
             }
             None => false,
         });
+        produced
     }
 
     fn current(&self) -> u64 {
@@ -276,7 +279,9 @@ impl RootObserver {
             &self.key.root,
             self.ignores.clone(),
             self.key.ignore_mounts,
-            move || signal.advance(),
+            move || {
+                signal.advance();
+            },
         ) {
             Ok(watcher) => {
                 if state.watch_retry_after.take().is_some() {
@@ -490,7 +495,10 @@ impl RootObserver {
     /// order the watcher's own callback uses — so any walk old enough to
     /// miss them in its dirty set is also old enough for its publication to
     /// be refused as current.
-    pub fn invalidate<'a>(&self, paths: impl IntoIterator<Item = &'a str>) {
+    ///
+    /// Returns the generation this invalidation produced, so a caller can
+    /// tell whether anyone else advanced the generation around it.
+    pub fn invalidate<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> u64 {
         {
             let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(watcher) = state.watcher.as_ref() {
@@ -499,7 +507,7 @@ impl RootObserver {
                 watcher.mark_pending(paths.into_iter().map(|path| self.key.root.join(path)));
             }
         }
-        self.signal.advance();
+        self.signal.advance()
     }
 
     /// Offers what a transition achieved as the next scan's baseline.
@@ -735,7 +743,7 @@ mod tests {
             std::process::id(),
             root.file_name().and_then(|n| n.to_str()).unwrap_or("root")
         ));
-        observer_for(
+        let observer = observer_for(
             ObserverKey {
                 root: canonical_root(root),
                 ignores: String::new(),
@@ -745,7 +753,13 @@ mod tests {
             },
             IgnoreSet::new(&[]).expect("ignores"),
             cache,
-        )
+        );
+        // Watched, as a continuous session's root is: only then are scans
+        // incremental, and dirty marks — what a stale baseline can hide a
+        // change behind — come into play at all.
+        observer.want_watching();
+        assert!(observer.is_watching(), "the harness root is watched");
+        observer
     }
 
     fn digest_of(snapshot: &Snapshot, name: &str) -> crate::tree::Digest {
@@ -843,41 +857,70 @@ mod tests {
         /// disk's true content; whenever any session scans, the snapshot
         /// must agree with the model — regardless of what offers,
         /// distrusts, cache hits, or stale baselines came before.
+        ///
+        /// A transition offers its fold at the generation of the lease it
+        /// was built from, and that lease can be older than the baseline
+        /// another session's scan has since established (finding H-3): the
+        /// offering session writes one file while the other file's change
+        /// was seen, and consumed, by a scan the lease predates.
         #[test]
         fn every_interleaving_scans_the_truth(
-            operations in proptest::collection::vec(0u8..8, 1..12)
+            operations in proptest::collection::vec((0u8..9, 0usize..64), 1..14)
         ) {
             let keep = tempfile::tempdir().expect("tempdir");
             let root = keep.path().join("root");
             std::fs::create_dir(&root).expect("root");
             std::fs::write(root.join("file.txt"), b"v-000").expect("writes");
+            std::fs::write(root.join("own.txt"), b"o-000").expect("writes");
             let observer = harness_observer(&root);
             let mut truth = 0u32;
+            let mut own = 0u32;
             let mut folds: Vec<(Snapshot, u64)> = Vec::new();
+            let check = |snapshot: &Snapshot, truth: u32, own: u32, step: usize, what: &str|
+                -> Result<(), proptest::test_runner::TestCaseError> {
+                let expected = *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
+                proptest::prop_assert_eq!(
+                    digest_of(snapshot, "file.txt"),
+                    expected,
+                    "step {}: {} disagreed with the disk",
+                    step,
+                    what
+                );
+                let expected = *blake3::hash(format!("o-{own:03}").as_bytes()).as_bytes();
+                proptest::prop_assert_eq!(
+                    digest_of(snapshot, "own.txt"),
+                    expected,
+                    "step {}: {} disagreed with the disk about own.txt",
+                    step,
+                    what
+                );
+                Ok(())
+            };
 
-            for (step, operation) in operations.into_iter().enumerate() {
+            for (step, (operation, pick)) in operations.into_iter().enumerate() {
                 match operation {
                     // A write, correctly announced — the transition path.
+                    // The kernel's own events are let in before the
+                    // announcement, so the next scan consumes every mark
+                    // the write leaves: a late event would otherwise
+                    // rescue a baseline that forgot the write, and hide
+                    // exactly the roll-back this sweep looks for.
                     0..=1 => {
                         truth += 1;
+                        let before = observer.generation();
                         std::fs::write(
                             root.join("file.txt"),
                             format!("v-{truth:03}"),
                         )
                         .expect("writes");
+                        observer.await_change(before, Duration::from_secs(2));
+                        std::thread::sleep(Duration::from_millis(20));
                         observer.invalidate(["file.txt"]);
                     }
                     // A scan by either of two sessions.
                     2..=4 => {
                         let (snapshot, generation) = observer.scan(None, None).expect("scans");
-                        let expected =
-                            *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
-                        proptest::prop_assert_eq!(
-                            digest_of(&snapshot, "file.txt"),
-                            expected,
-                            "step {}: a scan disagreed with the disk",
-                            step
-                        );
+                        check(&snapshot, truth, own, step, "a scan")?;
                         folds.push((snapshot, generation));
                     }
                     // A stale fold offered as the next baseline.
@@ -888,17 +931,25 @@ mod tests {
                     }
                     // A transition problem: every session distrusts.
                     6 => observer.distrust_baseline(),
+                    // A transition from a lease of any age: announce, write
+                    // own.txt, announce again, and offer the lease — whose
+                    // record of own.txt the announcements mark for
+                    // re-reading — at the lease's own generation.
+                    7 => {
+                        if !folds.is_empty() {
+                            let (lease, generation) = folds[pick % folds.len()].clone();
+                            observer.invalidate(["own.txt"]);
+                            own += 1;
+                            std::fs::write(root.join("own.txt"), format!("o-{own:03}"))
+                                .expect("writes");
+                            observer.invalidate(["own.txt"]);
+                            observer.offer_baseline(lease, generation);
+                        }
+                    }
                     // A verified scan must agree with the disk too.
                     _ => {
                         let (snapshot, _) = observer.scan_rehash(None, None).expect("scans");
-                        let expected =
-                            *blake3::hash(format!("v-{truth:03}").as_bytes()).as_bytes();
-                        proptest::prop_assert_eq!(
-                            digest_of(&snapshot, "file.txt"),
-                            expected,
-                            "step {}: a verified scan disagreed with the disk",
-                            step
-                        );
+                        check(&snapshot, truth, own, step, "a verified scan")?;
                     }
                 }
             }

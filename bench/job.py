@@ -25,6 +25,7 @@ Usage:
 """
 
 import argparse
+import concurrent.futures
 import json
 import os
 import re
@@ -158,9 +159,21 @@ def peer(command, timeout=None, host="dest"):
 
 
 def on_every_destination(command, timeout=None):
-    """Runs a command on every destination, returning the results in order.
-    A failure anywhere is the caller's to notice — this only collects."""
-    return [peer(command, timeout=timeout, host=host) for host in destinations()]
+    """Runs a command on every destination at once, returning the results
+    in destination order. A failure anywhere is the caller's to notice —
+    this only collects.
+
+    At once, not in turn: the cold-sync poll runs this every round, and
+    ten destinations checked one after another made a round take seconds.
+    A fan-out that finished just after a round began was not seen until
+    the next, so a sync autobahn's own log put at six seconds measured ten
+    (bench-1790219288, coldsync-5k-fan), and both tools' fan-out numbers
+    were rounded up to the round's length."""
+    hosts = destinations()
+    if len(hosts) == 1:
+        return [peer(command, timeout=timeout, host=hosts[0])]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+        return list(pool.map(lambda host: peer(command, timeout=timeout, host=host), hosts))
 
 
 def peer_ip():

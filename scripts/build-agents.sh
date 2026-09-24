@@ -23,6 +23,13 @@ build() {
         return 0
     fi
     echo "building $platform..."
+    # aarch64 musl has no packaged C compiler for mimalloc: zig, when it
+    # is here (pip install ziglang, or zig on PATH).
+    if [ "$target" = aarch64-unknown-linux-musl ] \
+        && { command -v zig >/dev/null 2>&1 || python3 -m ziglang version >/dev/null 2>&1; }; then
+        export CC_aarch64_unknown_linux_musl="$PWD/scripts/zig-cc aarch64-linux-musl"
+        export AR_aarch64_unknown_linux_musl="$PWD/scripts/zig-ar"
+    fi
     if ! cargo build --profile dist --target "$target"; then
         echo "skipping $platform (build failed; a cross linker may be required)"
         return 0

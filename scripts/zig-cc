@@ -1,0 +1,24 @@
+#!/bin/sh
+# zig as a C compiler for a musl target, for the C in the static Linux
+# builds (mimalloc, blake3's SIMD) where no musl cross-compiler is packaged:
+# Ubuntu has one for x86_64 (musl-tools) and none for aarch64.
+#
+#   CC_aarch64_unknown_linux_musl="scripts/zig-cc aarch64-linux-musl"
+#
+# The cc crate passes Rust's target triple (--target=aarch64-unknown-linux-musl),
+# which zig does not parse, so it is dropped in favour of zig's own. zig comes
+# from PyPI (`pip install ziglang`) or a zig on PATH.
+set -eu
+target="$1"
+shift
+for argument in "$@"; do
+    shift
+    case "$argument" in
+        --target=*) ;;
+        *) set -- "$@" "$argument" ;;
+    esac
+done
+if command -v zig >/dev/null 2>&1; then
+    exec zig cc -target "$target" "$@"
+fi
+exec python3 -m ziglang cc -target "$target" "$@"

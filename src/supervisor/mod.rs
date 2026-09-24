@@ -539,6 +539,7 @@ impl Supervisor {
                         let mut worker =
                             Worker::new(plan, &self.state_root, &self.pool, self.verbose);
                         worker.peering = self.peering.as_ref();
+                        worker.one_shot = true;
                         let result = worker.attempt();
                         let recorded = worker.conclude(&result);
                         let result = match (result, recorded) {
@@ -798,6 +799,9 @@ struct Worker<'a> {
     /// Where the last recorded status is shared with the alerter. Absent
     /// when nothing is alerting, so a single pass costs nothing.
     published: Option<Arc<Mutex<Option<SessionStatus>>>>,
+    /// A single pass: nothing will wait for changes, so neither side
+    /// registers a watch — on 160k files, most of a one-shot run.
+    one_shot: bool,
     /// Peering, when the supervisor has it and this plan is in a peering
     /// mode.
     peering: Option<&'a PeeringContext>,
@@ -826,6 +830,7 @@ impl<'a> Worker<'a> {
             verify_pending: false,
             progress: Arc::default(),
             published: None,
+            one_shot: false,
             reported: None,
             peering: None,
             pushed: None,
@@ -1008,6 +1013,7 @@ impl<'a> Worker<'a> {
                     self.state_root,
                     self.pool,
                     self.peering.map(|peering| peering.directory()),
+                    self.one_shot,
                 )?;
                 crate::debug!(
                     "[{}] connected in {:.2}s",
@@ -1463,6 +1469,7 @@ fn connect(
     state_root: &Path,
     pool: &AgentPool,
     peering_directory: Option<&Path>,
+    one_shot: bool,
 ) -> Result<Session> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
@@ -1489,7 +1496,7 @@ fn connect(
     // pointed at different state directories cannot own the same trees.
     let pair_lock =
         crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
-    let (alpha, beta) = open_endpoints(plan, state_root, pool)?;
+    let (alpha, beta) = open_endpoints(plan, state_root, pool, one_shot)?;
     let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);
@@ -1509,6 +1516,7 @@ pub fn open_endpoints(
     plan: &SessionPlan,
     state_root: &Path,
     pool: &AgentPool,
+    one_shot: bool,
 ) -> Result<(Box<dyn Endpoint + Send>, Box<dyn Endpoint + Send>)> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
@@ -1582,7 +1590,7 @@ pub fn open_endpoints(
                         max_entry_count: plan.max_entry_count,
                         default_owner: plan.default_owner.clone(),
                         default_group: plan.default_group.clone(),
-                        one_shot: false,
+                        one_shot,
                         ignore_mounts: plan.ignore_mounts,
                     },
                 )?))
@@ -1606,6 +1614,7 @@ pub fn open_endpoints(
                     default_owner: plan.default_owner.clone(),
                     default_group: plan.default_group.clone(),
                     ignore_mounts: plan.ignore_mounts,
+                    one_shot,
                 };
                 // Peering: an endpoint reached by attachment is a
                 // connection the peer opened to this supervisor. None

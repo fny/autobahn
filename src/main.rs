@@ -944,6 +944,7 @@ fn run_sync(
         default_owner: None,
         default_group: None,
         ignore_mounts: true,
+        one_shot: !watch,
     };
     let endpoint = |spec: &str,
                     agent: Option<String>,
@@ -1065,7 +1066,7 @@ fn run_doctor(
         );
         let scanned = (|| -> Result<_> {
             let (mut alpha, mut beta) =
-                autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
+                autobahn::supervisor::open_endpoints(plan, &state_root, &pool, true)?;
             let alpha = alpha.scan().context("unable to scan alpha")?;
             let beta = beta.scan().context("unable to scan beta")?;
             Ok((alpha, beta))
@@ -2378,7 +2379,8 @@ fn run_diff(
     let scratch = Scratch(scratch);
     let mut shown = 0;
     for plan in &selection.plans {
-        let (mut alpha, mut beta) = autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
+        let (mut alpha, mut beta) =
+            autobahn::supervisor::open_endpoints(plan, &state_root, &pool, true)?;
         let a = alpha.read_file(&path)?;
         let b = beta.read_file(&path)?;
         if a == b {
@@ -2679,6 +2681,7 @@ fn run_resolve(
             plan,
             &state_root,
             &pool,
+            true,
         )?);
     }
 

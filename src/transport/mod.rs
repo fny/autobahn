@@ -1120,8 +1120,9 @@ fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
         max_entry_count: initialize.max_entry_count,
         default_owner: initialize.default_owner.clone(),
         default_group: initialize.default_group.clone(),
-        // An agent serves sessions that wait, so its roots are watched.
-        one_shot: false,
+        // A session that will wait for changes has its root watched; a
+        // single pass says so, and is spared the registration walk.
+        one_shot: initialize.one_shot,
         ignore_mounts: initialize.ignore_mounts,
     };
     LocalEndpoint::new(root, staging_root, options)

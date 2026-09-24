@@ -660,6 +660,7 @@ mod tests {
             max_file_size: None,
             max_entry_count: None,
             ignore_mounts: true,
+            one_shot: false,
             default_owner: None,
             default_group: None,
         }

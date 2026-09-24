@@ -63,6 +63,9 @@ pub struct Initialize {
     /// Whether mount points inside the root are left alone rather than
     /// walked.
     pub ignore_mounts: bool,
+    /// A single pass: the agent registers no watch on the root, since
+    /// nothing will wait for a change there.
+    pub one_shot: bool,
     /// The owner (name or `id:N`) for created entries, resolved on the
     /// agent's host (`None` to leave ownership alone).
     pub default_owner: Option<String>,

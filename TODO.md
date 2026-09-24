@@ -10,29 +10,43 @@ Each of these is either a way to lose data, a version mismatch that has already 
 
 - [ ] **`one_file_system = true`, and probably first.** Do not walk into a directory that sits on a different filesystem. `rsync -x`, `tar --one-file-system`, `find -xdev` and `du -x` all do this. It uses the same device number as the item that follows, but needs it only during the walk. It never has to remember one, so it needs no new field, no ancestor change, no carry-forward, and no epoch bump. It also removes the problem in both directions: a mount that appears copies nothing, and a mount that goes away deletes nothing. The mount guard is then only needed for people who turn this off. Decide the default. `true` matches every other tool. The agent needs the option too, so it goes in `Initialize`.
 
+  **Decided 2026-09-23:** named `ignore_mounts`, default `true`. The scan reports the mount points it skipped and the session excludes those paths on both sides, so a real directory on the other side is never copied into the mount. That list is also item 9's; one epoch bump covers both.
+
   *Why here:* a mount that appears or goes away must not copy or delete anything; the cheap half of the fix
 
 - [ ] **The agent bundle has no version, and nothing checks it.** Found by breaking every Linux session on 2026-09-03. The epoch went 5 -> 6, the installer uploaded `agents/autobahn-linux-x86_64` — a cross-build from Sep 1, holding epoch 5 — and named it `autobahn-0.4.0+e6`. The name carries the controller's version; the *content* is whatever file sits in `agents/`. macOS hosts were fine, because for the local platform the installer sends the running executable, which is always current. The handshake refused the mismatch, so nothing was corrupted and the sessions only errored — but the message blamed the remote host. The message now names the bundle and its age. The real fix is for the bundle to state its version: a manifest beside it, or a marker string the installer can find in the bytes, checked before upload. Failing closed there turns a ten-minute outage into a refusal to start. Related: agent bundles are moving to GitHub Actions, which removes the "built by hand somewhere, age unknown" problem at the source. The version check is still worth having — a release artifact can be stale in a workflow too — and CI is the natural place to stamp the bundle with the version the check reads.
+
+  **Decided 2026-09-23, with the next item:** the release writes `agents/MANIFEST` (platform, version, digest per line), and `ensure_agent` refuses to upload a bundle binary whose manifest version is not the controller's, before any ssh. No manifest (a local cross-build) falls back to the handshake message.
 
   *Why here:* this broke every Linux session once, and cost an hour again on 2026-09-17
 
 - [ ] **A rebuilt agent never reaches a host that already has that version.** `remote.rs:341` installs only when the first connect fails, and the binary is named `autobahn-<version>`. A rebuild at the same version runs the old agent forever. Found the hard way: the directory message added in 82976d3 did not appear on `boite`, whose agent is from Sep 2 02:15. It hid because the case I tested failed on alpha, which is local. Fix: name the remote binary by a digest of its content (`autobahn-<version>-<digest8>`), so a changed binary always deploys and an unchanged one never re-uploads. Hashing 4 MB costs a few milliseconds and only on connect. Prune old binaries in `clean`. Until then, remove `~/.autobahn/bin/autobahn-<version>` on the remote by hand after any agent-side change.
 
+  **Decided 2026-09-23:** the remote name carries the content digest, `autobahn-<version>+e<epoch>-<digest8>`: the beta always runs the controller's exact build, and identical bytes are never sent twice.
+
   *Why here:* the same class: a changed agent that never ships is a silent old version
 
 - [ ] **The control socket is not versioned.** Adding two fields to `ProgressSnapshot` made every new CLI read the still-healthy running supervisor as "reports running, but is not answering" until the service was restarted — the bincode frame no longer decoded, and the failure looked like an outage. Same class as the agent epoch, one hop closer to home. Either carry the version in the control request and answer a mismatch with "restart the service to match this build", or make the snapshot self-describing.
+
+  **Decided 2026-09-23:** the first frame carries `protocol::version()`; a mismatch is answered with a `Mismatch { supervisor }` both builds decode, and the CLI says to restart. The first build with it reads an older supervisor as "not answering; try `autobahn restart`".
 
   *Why here:* a new CLI reads a healthy supervisor as broken; one hop closer to home than the agent epoch
 
 - [ ] **Version the journal records too.** The checkpoint states its format; journal records do not. Today it does not matter, because an older checkpoint is converted at open and the journal is retired with it, so records never outlive the build that wrote them. A change that lands without a checkpoint rewrite would break that. Either state the version per record, or write down why the conversion at open is sufficient.
 
+  **Decided 2026-09-23:** no reader is kept for an old layout. A golden-bytes test pins the record encoding, so a change to it fails CI and must raise `CHECKPOINT_VERSION`. `read_journal` takes the checkpoint's version. `autobahn update` asks the new binary which formats it reads; if not this machine's, it upgrades only once every session is settled, and the new build rebuilds the ancestor from two matching sides (item 10). A hand-copied binary that finds an unreadable journal rebuilds when the sides match and otherwise refuses, naming the version to go back to.
+
   *Why here:* a format that v1 freezes should state its own version while that is still free
 
 - [ ] **`fold_transition` diverges on ~2% of transition-cycles.** The cause of every "baseline could not be reproduced" 21 MB re-send. Both sides run the same fold over the same transitions and outcome, and about one time in fifty the two encodings differ. Perfectly correlated with transitions (sessions with none never miss; five sessions with them missed at 1.2–2.4%). Dormant since the chown and the collision fix removed the perpetual transitions, so there is no live reproduction. To find it: on a miss, have the controller keep its folded encoding and request the agent's, and diff the two trees — the first differing node names the fold rule the two sides disagree on.
 
+  **Decided 2026-09-23:** parked until it recurs; diff-on-miss logging when it does.
+
   *Why here:* two sides encoding the same tree differently is the one open correctness question
 
-- [ ] **That nested case reports as *errored*, not *halted*.** The session stops and protects its peer, so the behaviour is right, but `alpha root ... does not exist` is a plain error — so `on_error` fires where `on_halt` belongs, and `status` says the wrong word. A vanished root is the definition of a safety halt. Deciding this changes which alert hook fires, so it is worth saying out loud before doing it.
+- [x] **That nested case reports as *errored*, not *halted*.** The session stops and protects its peer, so the behaviour is right, but `alpha root ... does not exist` is a plain error — so `on_error` fires where `on_halt` belongs, and `status` says the wrong word. A vanished root is the definition of a safety halt. Deciding this changes which alert hook fires, so it is worth saying out loud before doing it.
+
+  **Done 2026-09-24:** `SafetyHalt::AlphaRootMissing`, recorded `halted` with a message that says why and what to do. It alerts after two minutes, not at once, because a drive often returns with the laptop's wake, and it clears on its own when the folder is back.
 
   *Why here:* the wrong state word fires the wrong alert, and a vanished root is a halt
 

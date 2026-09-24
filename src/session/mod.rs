@@ -39,6 +39,25 @@ pub enum SafetyHalt {
     /// one side.
     #[error("halted: one side's synchronization root was emptied; propagate the deletion manually or restore the content, then run again")]
     RootEmptied,
+    /// The alpha root is not there at all. Nothing is synchronized, so the
+    /// destination is not emptied to match a source that only looks empty
+    /// — an unplugged drive, a dropped share, a mistyped path. Unlike the
+    /// others this clears on its own: the next attempt finds the folder
+    /// back and carries on.
+    #[error("halted: the alpha folder {0} is missing, so nothing was synchronized rather than emptying the other side to match; reconnect the drive or correct the path, and syncing resumes on its own")]
+    AlphaRootMissing(String),
+}
+
+impl SafetyHalt {
+    /// How long this halt must stand before it is worth waking someone,
+    /// when that differs from a halt's usual "at once". A missing alpha is
+    /// often a drive that comes back with the laptop's wake.
+    pub fn alert_after(&self) -> Option<std::time::Duration> {
+        match self {
+            SafetyHalt::AlphaRootMissing(_) => Some(std::time::Duration::from_secs(120)),
+            SafetyHalt::RootDeletion | SafetyHalt::RootEmptied => None,
+        }
+    }
 }
 
 /// A report of one synchronization cycle.

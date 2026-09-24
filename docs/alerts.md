@@ -52,7 +52,7 @@ A condition must hold before it counts, and how long is built in and tuned per s
 
 | state | holds for | why |
 | --- | --- | --- |
-| `halted` | 0s | a safety halt is never transient |
+| `halted` | 0s | a safety halt is never transient — except a missing alpha folder, which waits 2m, since a drive often returns with the laptop's wake |
 | `conflicts`, `blocked` | 30s | needs a person, but not this second |
 | `errored` | 2m | transient failures heal in a cycle or two |
 | `unreachable` | 5m | a sleeping laptop is the common case |

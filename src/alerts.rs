@@ -134,6 +134,9 @@ pub struct SessionAlerts {
     pub alerts: Vec<Alert>,
     /// How to describe it in one line ("741 conflicts, 20 blocked").
     pub summary: String,
+    /// How long its conditions must hold, when longer than their own
+    /// patience: a halt that clears on its own waits like an error.
+    pub after: Option<Duration>,
 }
 
 impl SessionAlerts {
@@ -205,9 +208,13 @@ impl Alerter {
     pub fn observe(&mut self, sessions: &[SessionAlerts], now: Instant) -> Option<Fire> {
         // What is true this instant.
         let mut present: BTreeSet<(String, Alert)> = BTreeSet::new();
+        let mut patience: BTreeMap<String, Duration> = BTreeMap::new();
         for session in sessions {
             for alert in &session.alerts {
                 present.insert((session.key(), *alert));
+            }
+            if let Some(after) = session.after {
+                patience.insert(session.key(), after);
             }
         }
 
@@ -223,9 +230,12 @@ impl Alerter {
         let confirmed: BTreeSet<(String, Alert)> = present
             .iter()
             .filter(|key| {
-                self.seen
-                    .get(*key)
-                    .is_some_and(|since| now.duration_since(*since) >= self.plan.after(key.1))
+                self.seen.get(*key).is_some_and(|since| {
+                    let after = patience.get(&key.0).map_or(self.plan.after(key.1), |own| {
+                        (*own).max(self.plan.after(key.1))
+                    });
+                    now.duration_since(*since) >= after
+                })
             })
             .cloned()
             .collect();
@@ -544,6 +554,7 @@ mod tests {
 
     fn session_in(group: &str, host: &str, alerts: &[Alert], summary: &str) -> SessionAlerts {
         SessionAlerts {
+            after: None,
             group: group.into(),
             host: host.into(),
             alerts: alerts.to_vec(),
@@ -1110,5 +1121,33 @@ mod tests {
             ),
             "a second hook must be skipped while the first runs"
         );
+    }
+
+    #[test]
+    fn a_session_that_asks_for_patience_waits_for_it() {
+        // A halt is announced at once; a missing alpha, which is a halt
+        // that clears on its own, waits as long as its session asks.
+        let mut alerter = Alerter::new(AlertPlan {
+            after: BTreeMap::from([(Alert::Halted, Duration::ZERO)]),
+            ..plan()
+        });
+        let mut waiting = session("a", &[Alert::Halted]);
+        waiting.after = Some(Duration::from_secs(120));
+        let start = Instant::now();
+        assert!(alerter.observe(&[waiting.clone()], start).is_none());
+        assert!(alerter
+            .observe(&[waiting.clone()], start + Duration::from_secs(119))
+            .is_none());
+        assert!(alerter
+            .observe(&[waiting], start + Duration::from_secs(120))
+            .is_some());
+
+        let mut alerter = Alerter::new(AlertPlan {
+            after: BTreeMap::from([(Alert::Halted, Duration::ZERO)]),
+            ..plan()
+        });
+        assert!(alerter
+            .observe(&[session("b", &[Alert::Halted])], start)
+            .is_some());
     }
 }

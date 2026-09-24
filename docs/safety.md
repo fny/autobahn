@@ -55,7 +55,7 @@ Two sessions writing overlapping trees from separate ancestors would each read t
 
 In the default mode, content is overwritten or deleted only when the ancestor proves the other side already had it. A deletion on one side against a modification on the other brings the content back.
 
-Disappearance of a whole root is **halted** rather than propagated. If a synchronization root is empty or gone on exactly one side, the session stops: an unmounted disk is far more likely than a deliberate wipe. A missing *source* root is an error, never an empty source, so a mistyped path in a mirroring mode cannot empty the destination. A halt needs a person; retrying never clears it.
+Disappearance of a whole root is **halted** rather than propagated. If a synchronization root is empty or gone on exactly one side, the session stops: an unmounted disk is far more likely than a deliberate wipe. A missing *alpha* root is a halt too, never an empty source, so a mistyped path in a mirroring mode cannot empty the destination. A halt needs a person, with one exception: a missing alpha clears on its own when the folder comes back — a drive reconnected, a share remounted — and it alerts only once it has been gone two minutes.
 
 Below the root, a directory emptied on one side is deletions and they propagate — except under `two-way-paranoid`, where a directory of eight or more synchronized entries emptied on one side is a conflict, and one gone on one side is restored. See [Large directories](./modes.md#large-directories).
 

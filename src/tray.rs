@@ -667,6 +667,7 @@ impl App {
                         host: session.host.clone(),
                         alerts: session.alerts.clone(),
                         summary: session.alert_summary.clone(),
+                        after: session.alert_after,
                     })
             })
             .collect();

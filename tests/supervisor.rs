@@ -641,14 +641,23 @@ fn a_missing_alpha_is_a_session_error_not_a_crash() {
         missing = world.path("never-created").display(),
         beta = beta.display(),
     ));
-    let outcomes = world.run_once(plans);
+    let outcomes = world.run_once(plans.clone());
     let error = outcomes[0]
         .result
         .as_ref()
         .expect_err("the session should fail");
     assert!(
-        error.contains("alpha root") && error.contains("does not exist"),
+        error.contains("halted") && error.contains("alpha folder") && error.contains("missing"),
         "{error}"
+    );
+    // Recorded as the safety stop it is, with the patience of one that
+    // clears on its own: a drive back with the wake never alerts.
+    let status = world.status(&plans[0]).expect("status should be recorded");
+    assert_eq!(status.state, "halted");
+    assert_eq!(status.alert_after_seconds, Some(120));
+    assert_eq!(
+        autobahn::supervisor::alerts_for(&status),
+        vec![autobahn::alerts::Alert::Halted]
     );
 }
 
@@ -1658,7 +1667,10 @@ fn a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted() {
     // The nested session refuses to carry that loss any further.
     let (ok, text) = cli(&world, &inner, &["sync"]);
     assert!(!ok, "the nested session must not succeed: {text}");
-    assert!(text.contains("does not exist"), "{text}");
+    assert!(
+        text.contains("halted") && text.contains("is missing"),
+        "{text}"
+    );
     assert_eq!(read(&inner_beta, "data.txt"), "precious");
 }
 

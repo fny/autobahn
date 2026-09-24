@@ -1662,6 +1662,7 @@ mod tests {
             error: None,
             progress: None,
             alerts: Vec::new(),
+            alert_after: None,
             alert_summary: String::new(),
         };
         assert!(baguette(&session("synchronized"), None, 0).contains("\x1b[32m"));
@@ -1693,6 +1694,7 @@ mod tests {
             error: None,
             progress: None,
             alerts: Vec::new(),
+            alert_after: None,
             alert_summary: String::new(),
         };
         let served = width(&baguette(&session("synchronized"), None, 0));
@@ -1816,6 +1818,7 @@ mod tests {
             error: None,
             progress: None,
             alerts: Vec::new(),
+            alert_after: None,
             alert_summary: String::new(),
         };
 
@@ -1922,6 +1925,7 @@ mod tests {
             error: None,
             progress: None,
             alerts: Vec::new(),
+            alert_after: None,
             alert_summary: String::new(),
         };
         let group = |role: &str| GroupReport {

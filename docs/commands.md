@@ -98,7 +98,7 @@ Both scroll, with the keys a pager has trained everyone to try: arrows and `j`/`
 Two questions, not one word list. **Did the cycle run?** If it did not:
 
 - `unreachable` — the host is not answering. Usually clears itself.
-- `halted` — a safety refusal. Retrying will *never* clear it. See the [safety rules](./safety.md).
+- `halted` — a safety refusal: the session stopped rather than carry out something that looks like an accident. Most clear only when you act, as the message says; a missing alpha folder (an unplugged drive, a dropped share, a mistyped path) clears on its own once the folder is back. See the [safety rules](./safety.md).
 - `errored` — it failed for some other reason; the message is the evidence, and [the log](./logging.md) has the rest.
 
 If it did run, the tree is in sync except for what the cycle could not carry:

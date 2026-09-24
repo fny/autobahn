@@ -161,6 +161,11 @@ pub struct SessionStatus {
     pub role: String,
     #[serde(default)]
     pub term: u64,
+    /// How long the failure recorded here must stand before it alerts,
+    /// when that differs from its state's usual patience: a halt that
+    /// clears on its own, like a missing alpha folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alert_after_seconds: Option<u64>,
 }
 
 /// The outcome of one session's participation in a single-pass run.
@@ -1224,6 +1229,7 @@ impl<'a> Worker<'a> {
             moved_bytes: self.progress.moved().1,
             role: self.role().label().to_owned(),
             term: self.role().term(),
+            alert_after_seconds: None,
         };
         self.publish(&status);
         if let Err(error) = write_status(self.state_root, &self.plan.identifier(), &status) {
@@ -1274,6 +1280,7 @@ impl<'a> Worker<'a> {
             moved_bytes: self.progress.moved().1,
             role: self.role().label().to_owned(),
             term: self.role().term(),
+            alert_after_seconds: None,
         };
         match result {
             Ok((digest, report)) => {
@@ -1322,7 +1329,11 @@ impl<'a> Worker<'a> {
                 // Decided from the error's *type*, once, here — not by
                 // searching its prose at display time, where rewording a
                 // message silently reclassified a session.
-                status.state = if error.downcast_ref::<crate::session::SafetyHalt>().is_some() {
+                let halt = error.downcast_ref::<crate::session::SafetyHalt>();
+                status.alert_after_seconds = halt
+                    .and_then(|halt| halt.alert_after())
+                    .map(|after| after.as_secs());
+                status.state = if halt.is_some() {
                     "halted"
                 } else if error.downcast_ref::<Following>().is_some()
                     || error.downcast_ref::<crate::peering::Fenced>().is_some()
@@ -1528,7 +1539,10 @@ pub fn open_endpoints(
             // source is empty" and empty the destination. A missing beta is
             // a legitimate state a transition resolves by creating it.
             if side == "alpha" && !resolved.exists() {
-                anyhow::bail!("alpha root {} does not exist", resolved.display());
+                return Err(crate::session::SafetyHalt::AlphaRootMissing(
+                    resolved.display().to_string(),
+                )
+                .into());
             }
             frozen[index] = Some(resolved);
         }
@@ -1700,6 +1714,9 @@ pub struct SessionReport {
     /// `error` already carry the facts, and this is their reading.
     #[serde(skip)]
     pub alerts: Vec<crate::alerts::Alert>,
+    /// The session's own patience, when its failure asks for one.
+    #[serde(skip)]
+    pub alert_after: Option<std::time::Duration>,
     /// How to describe the session in one line when it is alerting.
     #[serde(skip)]
     pub alert_summary: String,
@@ -1812,6 +1829,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 progress: progress.clone(),
                 // Not in trouble; it has simply not started.
                 alerts: Vec::new(),
+                alert_after: None,
                 alert_summary: String::new(),
             },
             Some(status) => SessionReport {
@@ -1826,6 +1844,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 error: status.error.clone(),
                 progress: progress.clone(),
                 alerts: alerts_for(&status),
+                alert_after: alert_after(&status),
                 alert_summary: alert_summary(&status),
             },
         };
@@ -1903,6 +1922,12 @@ pub fn alerts_for(status: &SessionStatus) -> Vec<crate::alerts::Alert> {
         }
     }
     alerts
+}
+
+/// The session's own alert patience, when its recorded failure asks for
+/// one longer than its state's.
+pub fn alert_after(status: &SessionStatus) -> Option<Duration> {
+    status.alert_after_seconds.map(Duration::from_secs)
 }
 
 /// How to describe a session's conditions in one line.
@@ -2121,15 +2146,20 @@ fn watch_alerts(
                 // A session that has not run yet is not in trouble; it has
                 // simply not started. Alerting on it would fire on every
                 // supervisor start.
-                let (alerts, summary) = match &status {
-                    Some(status) => (alerts_for(status), alert_summary(status)),
-                    None => (Vec::new(), String::new()),
+                let (alerts, summary, after) = match &status {
+                    Some(status) => (
+                        alerts_for(status),
+                        alert_summary(status),
+                        alert_after(status),
+                    ),
+                    None => (Vec::new(), String::new(), None),
                 };
                 SessionAlerts {
                     group: plan.group.clone(),
                     host: plan.host.clone(),
                     alerts,
                     summary,
+                    after,
                 }
             })
             .collect();
@@ -2705,6 +2735,7 @@ mod tests {
             moved_bytes: 0,
             role: String::new(),
             term: 0,
+            alert_after_seconds: None,
         };
         assert_eq!(alert_summary(&status), "errored: connection closed");
         status.error = None;
@@ -2740,6 +2771,7 @@ mod tests {
             moved_bytes: 0,
             role: String::new(),
             term: 0,
+            alert_after_seconds: None,
             beta_entries: 1_002,
         };
         write_status(directory.path(), "abc123", &status).expect("status should write");

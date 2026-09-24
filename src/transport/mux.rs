@@ -1243,6 +1243,16 @@ mod tests {
         }
         assert_eq!(std::fs::read(&outside).unwrap(), b"secret");
 
+        // So is reaching out through a symbolic link inside the root.
+        std::os::unix::fs::symlink(keep.path(), root.join("link")).expect("link");
+        match channel
+            .exchange(Request::ReadFile("link/outside.txt".into()))
+            .expect("exchange")
+        {
+            Response::Error(message) => assert!(message.contains("not a directory"), "{message}"),
+            other => panic!("unexpected {other:?}"),
+        }
+
         drop(channel);
         drop(connection);
         assert_clean_exit(&finished);

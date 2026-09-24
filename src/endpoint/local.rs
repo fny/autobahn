@@ -27,12 +27,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File, Metadata, Permissions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 use super::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
 use crate::rsync::{self, Signature};
@@ -78,6 +78,11 @@ fn frame_weight(frame: &TransferFrame) -> usize {
         _ => 24,
     }
 }
+
+/// The most a `ReadFile` request returns. It serves `diff`, which shows a
+/// person two versions of one file, so the cap sits far below the
+/// protocol's frame limit rather than at it.
+const MAXIMUM_READ_FILE_SIZE: u64 = 256 * 1024 * 1024;
 
 /// The counter that uniquifies temporary file names within a process.
 static TEMPORARY_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1353,42 +1358,72 @@ impl Endpoint for LocalEndpoint {
     }
 
     fn read_file(&mut self, path: &str) -> Result<Option<Vec<u8>>> {
-        let full = resolve_relative(&self.root, path)?;
-        match fs::symlink_metadata(&full) {
-            Ok(metadata) if metadata.file_type().is_file() => fs::read(&full)
-                .map(Some)
-                .with_context(|| format!("unable to read {}", full.display())),
-            Ok(_) => Ok(None),
-            Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error).with_context(|| format!("unable to read {}", full.display())),
+        let full = resolve_confined(&self.root, path)?;
+        // Opened before its type is checked, so the check describes the
+        // very file that is read. `O_NOFOLLOW` turns a symbolic link in
+        // the final component into ELOOP — not a file, so `None`, as
+        // before — and `O_NONBLOCK` keeps a FIFO from stalling the open.
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(&full)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.raw_os_error() == Some(libc::ELOOP) => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("unable to read {}", full.display()))
+            }
+        };
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("unable to read {}", full.display()))?;
+        if !metadata.file_type().is_file() {
+            return Ok(None);
         }
+        let mut bytes = Vec::new();
+        file.take(MAXIMUM_READ_FILE_SIZE + 1)
+            .read_to_end(&mut bytes)
+            .with_context(|| format!("unable to read {}", full.display()))?;
+        if bytes.len() as u64 > MAXIMUM_READ_FILE_SIZE {
+            bail!(
+                "{path} is larger than {} MiB, too large to read whole",
+                MAXIMUM_READ_FILE_SIZE / (1024 * 1024)
+            );
+        }
+        Ok(Some(bytes))
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
-        let source = resolve_relative(&self.root, from)?;
-        let target = resolve_relative(&self.root, to)?;
+        let source = resolve_confined(&self.root, from)?;
+        let target = create_confined_parents(&self.root, to, self.directory_mode)?;
         // Refused rather than overwritten. The caller is preserving
         // something, so a name that is already taken means the caller has
         // guessed wrong about what is free — and `fs::rename` would
-        // replace the occupant without a word.
+        // replace the occupant without a word. This check gives the
+        // common case its message; the no-replace rename below is what
+        // holds against a name taken after it.
         if fs::symlink_metadata(&target).is_ok() {
             bail!("{to} already exists; move it out of the way first");
         }
-        let parent = target
-            .parent()
-            .ok_or_else(|| anyhow::anyhow!("{to} has no parent directory"))?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("unable to create {}", parent.display()))?;
         // Both paths are announced before and after, exactly as a
         // transition's writes are: a scan racing this must not publish
         // either name's old state as current.
         self.observer.invalidate([from, to]);
-        let result = fs::rename(&source, &target).with_context(|| {
-            format!(
-                "unable to move {} to {}",
-                source.display(),
-                target.display()
-            )
+        #[cfg(test)]
+        if let Some(hook) = &self.between_announce_and_writes {
+            hook();
+        }
+        let result = publish_rename(&source, &target, false).map_err(|error| {
+            if error.kind() == ErrorKind::AlreadyExists {
+                anyhow!("{to} already exists; move it out of the way first")
+            } else {
+                anyhow::Error::new(error).context(format!(
+                    "unable to move {} to {}",
+                    source.display(),
+                    target.display()
+                ))
+            }
         });
         self.observer.invalidate([from, to]);
         result
@@ -2877,20 +2912,62 @@ fn warn_if_network_filesystem(root: &Path) {
     let _ = root;
 }
 
-/// Joins a root-relative path onto the root, refusing anything that would
-/// leave it: an absolute path, or a `..` component. These paths come from a
-/// controller, which is trusted — but a request that could not possibly be
-/// legitimate is refused rather than obeyed.
-fn resolve_relative(root: &Path, path: &str) -> Result<PathBuf> {
-    let relative = Path::new(path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|component| !matches!(component, std::path::Component::Normal(_)))
-    {
-        bail!("{path:?} is not a plain root-relative path");
+/// Resolves a root-relative path to its on-disk location, refusing any
+/// path that is not one scanning could have produced, or whose root or
+/// parent components are not real directories: a symbolic link along the
+/// way is a refusal, never a redirection out of the root. The final
+/// component is returned unresolved; callers decide whether to follow it.
+fn resolve_confined(root: &Path, path: &str) -> Result<PathBuf> {
+    validate_path(path)
+        .map_err(|error| anyhow!("{path:?} is not a plain root-relative path: {error}"))?;
+    if path.is_empty() {
+        bail!("the synchronization root itself cannot be named here");
     }
-    Ok(root.join(relative))
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let mut current = root.to_path_buf();
+    verify_directory(&current).map_err(|error| anyhow!("unable to resolve {path:?}: {error}"))?;
+    for component in parent.split('/').filter(|component| !component.is_empty()) {
+        current.push(component);
+        verify_directory(&current)
+            .map_err(|error| anyhow!("unable to resolve {path:?}: {error}"))?;
+    }
+    Ok(current.join(name))
+}
+
+/// Like [`resolve_confined`], but creates missing parent directories, one
+/// component at a time with the endpoint's directory mode, verifying each
+/// as it goes: `create_dir_all` would follow a symbolic link anywhere
+/// along the way.
+fn create_confined_parents(root: &Path, path: &str, directory_mode: u32) -> Result<PathBuf> {
+    validate_path(path)
+        .map_err(|error| anyhow!("{path:?} is not a plain root-relative path: {error}"))?;
+    if path.is_empty() {
+        bail!("the synchronization root itself cannot be named here");
+    }
+    let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+    let mut current = root.to_path_buf();
+    verify_directory(&current).map_err(|error| anyhow!("unable to resolve {path:?}: {error}"))?;
+    for component in parent.split('/').filter(|component| !component.is_empty()) {
+        current.push(component);
+        match fs::DirBuilder::new().mode(directory_mode).create(&current) {
+            Ok(()) => {
+                // The mode given at creation is narrowed by the umask; the
+                // configured mode is what every created directory gets.
+                fs::set_permissions(&current, Permissions::from_mode(directory_mode))
+                    .with_context(|| {
+                        format!("unable to set permissions on {}", current.display())
+                    })?;
+            }
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("unable to create {}", current.display()))
+            }
+        }
+        verify_directory(&current)
+            .map_err(|error| anyhow!("unable to resolve {path:?}: {error}"))?;
+    }
+    Ok(current.join(name))
 }
 
 /// Whether a staged file's bytes hash to the digest its name claims. Used
@@ -5144,5 +5221,176 @@ mod watch_tests {
                 .any(|path| path == &root.path().join("target/out")),
             "a write beneath an ignored directory that appeared later was recorded"
         );
+    }
+}
+
+/// The apply path's requests and publishing: what a peer can name, and
+/// what autobahn writes where.
+#[cfg(test)]
+mod apply_path_tests {
+    use super::*;
+
+    use std::sync::atomic::AtomicBool;
+    use tempfile::{tempdir, TempDir};
+
+    /// A root with a symbolic link inside it, `root/link`, pointing at a
+    /// directory outside it that holds `secret`.
+    struct Escape {
+        _keep: TempDir,
+        root: PathBuf,
+        outside: PathBuf,
+        endpoint: LocalEndpoint,
+    }
+
+    fn escape() -> Escape {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let outside = keep.path().join("outside");
+        fs::create_dir_all(&root).expect("root");
+        fs::create_dir_all(&outside).expect("outside");
+        fs::write(outside.join("secret"), b"secret").expect("secret");
+        symlink(&outside, root.join("link")).expect("link");
+        let endpoint = LocalEndpoint::new(
+            root.clone(),
+            keep.path().join("staging"),
+            EndpointOptions::default(),
+        )
+        .expect("endpoint");
+        Escape {
+            _keep: keep,
+            root,
+            outside,
+            endpoint,
+        }
+    }
+
+    #[test]
+    fn read_file_refuses_a_symlinked_parent() {
+        let mut fixture = escape();
+        let result = fixture.endpoint.read_file("link/secret");
+        let error = result.expect_err("reading through a symlinked parent must be refused");
+        assert!(
+            format!("{error:#}").contains("not a directory"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn read_file_of_a_final_symlink_is_none() {
+        let mut fixture = escape();
+        symlink(
+            fixture.outside.join("secret"),
+            fixture.root.join("to-secret"),
+        )
+        .expect("link");
+        assert_eq!(fixture.endpoint.read_file("to-secret").expect("read"), None);
+        assert_eq!(fixture.endpoint.read_file("link").expect("read"), None);
+    }
+
+    #[test]
+    fn read_file_of_a_fifo_is_none_without_hanging() {
+        let Escape {
+            _keep,
+            root,
+            mut endpoint,
+            ..
+        } = escape();
+        let fifo = root.join("fifo");
+        let path = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(endpoint.read_file("fifo").map_err(|e| e.to_string()));
+        });
+        let result = receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("reading a FIFO must not hang");
+        assert_eq!(result, Ok(None));
+    }
+
+    #[test]
+    fn read_file_reads_a_regular_file() {
+        let mut fixture = escape();
+        fs::create_dir(fixture.root.join("sub")).expect("sub");
+        fs::write(fixture.root.join("sub/a.txt"), b"hello").expect("a");
+        assert_eq!(
+            fixture.endpoint.read_file("sub/a.txt").expect("read"),
+            Some(b"hello".to_vec())
+        );
+        assert_eq!(
+            fixture.endpoint.read_file("sub/missing").expect("read"),
+            None
+        );
+    }
+
+    #[test]
+    fn rename_out_through_a_symlinked_parent_is_refused() {
+        let mut fixture = escape();
+        fs::write(fixture.root.join("a.txt"), b"a").expect("a");
+        fixture
+            .endpoint
+            .rename("a.txt", "link/a.txt")
+            .expect_err("moving out through a symlinked parent must be refused");
+        assert!(!fixture.outside.join("a.txt").exists());
+        assert!(fixture.root.join("a.txt").exists());
+        fixture
+            .endpoint
+            .rename("a.txt", "link/deeper/a.txt")
+            .expect_err("creating parents through a symlink must be refused");
+        assert!(!fixture.outside.join("deeper").exists());
+    }
+
+    #[test]
+    fn rename_in_from_a_symlinked_parent_is_refused() {
+        let mut fixture = escape();
+        fixture
+            .endpoint
+            .rename("link/secret", "stolen")
+            .expect_err("moving in from a symlinked parent must be refused");
+        assert!(fixture.outside.join("secret").exists());
+        assert!(!fixture.root.join("stolen").exists());
+    }
+
+    #[test]
+    fn rename_creates_missing_real_parents() {
+        let mut fixture = escape();
+        fs::write(fixture.root.join("a.txt"), b"a").expect("a");
+        fixture
+            .endpoint
+            .rename("a.txt", "new/dir/a.txt")
+            .expect("the move should succeed");
+        for directory in ["new", "new/dir"] {
+            let metadata = fs::symlink_metadata(fixture.root.join(directory)).expect("parent");
+            assert!(metadata.file_type().is_dir(), "{directory}");
+            assert_eq!(
+                metadata.mode() & 0o777,
+                DEFAULT_DIRECTORY_MODE,
+                "{directory}"
+            );
+        }
+        assert_eq!(fs::read(fixture.root.join("new/dir/a.txt")).unwrap(), b"a");
+    }
+
+    /// A name taken between the absence check and the move keeps its
+    /// occupant: the move is a no-replace rename, not a plain one.
+    #[test]
+    fn rename_does_not_overwrite_a_target_that_appears_after_the_check() {
+        let mut fixture = escape();
+        fs::write(fixture.root.join("a.txt"), b"moved").expect("a");
+        let target = fixture.root.join("b.txt");
+        let fired = Arc::new(AtomicBool::new(false));
+        let hook_fired = Arc::clone(&fired);
+        fixture.endpoint.between_announce_and_writes = Some(Box::new(move || {
+            fs::write(&target, b"occupant").expect("occupant");
+            hook_fired.store(true, Ordering::SeqCst);
+        }));
+        let error = fixture
+            .endpoint
+            .rename("a.txt", "b.txt")
+            .expect_err("the occupant must not be replaced");
+        assert!(fired.load(Ordering::SeqCst));
+        assert!(format!("{error:#}").contains("already exists"), "{error:#}");
+        assert_eq!(fs::read(fixture.root.join("b.txt")).unwrap(), b"occupant");
+        assert_eq!(fs::read(fixture.root.join("a.txt")).unwrap(), b"moved");
     }
 }

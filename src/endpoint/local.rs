@@ -1051,13 +1051,9 @@ impl LocalEndpoint {
         let base = if need.signature.is_empty() {
             PatchBase::empty()
         } else {
-            let target = self.root.join(&need.request.path);
-            match fs::symlink_metadata(&target) {
-                Ok(metadata) if metadata.file_type().is_file() => match File::open(&target) {
-                    Ok(file) => PatchBase::File(file),
-                    Err(_) => PatchBase::empty(),
-                },
-                _ => PatchBase::empty(),
+            match open_base(&self.root, &need.request.path) {
+                Some(file) => PatchBase::File(file),
+                None => PatchBase::empty(),
             }
         };
         Ok(ReceiveFile {
@@ -1194,13 +1190,38 @@ impl Endpoint for LocalEndpoint {
     }
 
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {
-        prepare_staging_root(&self.staging_root, &self.root)?;
-
         // Any receive state left over from a previous staging operation
-        // belongs to a stream that will never be continued.
+        // belongs to a stream that will never be continued, whether or not
+        // this one begins.
         if let Some(state) = self.receive.take() {
             state.discard();
         }
+
+        // A request's path names where its content will be published, and
+        // is used below to find a base to sign and, later, to patch
+        // against. A genuine controller builds requests from scans, which
+        // never produce these; one that sends them is broken or hostile,
+        // and nothing in its batch is worth salvaging.
+        for request in &files {
+            validate_path(&request.path).map_err(|error| {
+                anyhow::anyhow!("refusing a staging request for {:?}: {error}", request.path)
+            })?;
+            if request.path.is_empty() {
+                bail!("refusing a staging request for the synchronization root itself");
+            }
+            if request
+                .path
+                .split('/')
+                .any(|component| component.starts_with(TEMPORARY_PREFIX))
+            {
+                bail!(
+                    "refusing a staging request for {:?}: it uses a name reserved for autobahn",
+                    request.path
+                );
+            }
+        }
+
+        prepare_staging_root(&self.staging_root, &self.root)?;
 
         // One directory read inventories what previous cycles left staged,
         // replacing a per-request stat (on a cold destination, 40k stats
@@ -1276,7 +1297,9 @@ impl Endpoint for LocalEndpoint {
             // touching the filesystem (the common case on a cold
             // destination).
             let signature = if self.snapshot_records_file(&request.path) {
-                base_signature(&self.root.join(&request.path))
+                open_base(&self.root, &request.path)
+                    .map(base_signature)
+                    .unwrap_or_default()
             } else {
                 Signature::default()
             };
@@ -3588,20 +3611,44 @@ fn copy_into_private(
     Ok(hasher.finalize().as_bytes() == digest)
 }
 
-/// Computes the rsync signature of whatever base content exists at a path.
+/// Opens the regular file at a root-relative path as a delta base, or
+/// `None` when there is none to use.
 ///
-/// Anything other than a readable regular file yields an empty signature,
-/// which is exactly right: with no usable base, delta generation degenerates
-/// to streaming the content, and correctness never depends on the base being
-/// what the destination expected.
-fn base_signature(path: &Path) -> Signature {
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return Signature::default();
-    };
-    if !metadata.file_type().is_file() {
-        return Signature::default();
+/// The base's signature goes back to the supplier, so whatever this opens
+/// is readable, block by block, by the peer that named the path: it must be
+/// inside the root. Every parent must be a real directory, not a symbolic
+/// link to one, and the file opens with `O_NOFOLLOW | O_NONBLOCK` and is
+/// checked through its own descriptor, so a final symbolic link is refused
+/// and a FIFO neither blocks the open nor serves as a base. The path must
+/// already be validated: no `..`, not absolute.
+fn open_base(root: &Path, path: &str) -> Option<File> {
+    let mut parent = root.to_path_buf();
+    let mut components = path.split('/').peekable();
+    while let Some(component) = components.next() {
+        if components.peek().is_none() {
+            break;
+        }
+        parent.push(component);
+        if !fs::symlink_metadata(&parent).ok()?.file_type().is_dir() {
+            return None;
+        }
     }
-    let Ok(file) = File::open(path) else {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(root.join(path))
+        .ok()?;
+    file.metadata().ok()?.file_type().is_file().then_some(file)
+}
+
+/// Computes the rsync signature of an opened base (see [`open_base`]).
+///
+/// No base, or an unreadable one, yields an empty signature, which is
+/// exactly right: with no usable base, delta generation degenerates to
+/// streaming the content, and correctness never depends on the base being
+/// what the destination expected.
+fn base_signature(file: File) -> Signature {
+    let Ok(metadata) = file.metadata() else {
         return Signature::default();
     };
     rsync::signature(file, rsync::optimal_block_size(metadata.len())).unwrap_or_default()
@@ -6610,6 +6657,86 @@ mod confinement_tests {
             frames.last(),
             Some(TransferFrame::EndOfFile { .. })
         ));
+    }
+
+    /// A staging request naming a path no scan could produce refuses the
+    /// whole batch before anything is touched: no staging directory, no
+    /// receive state, no signature.
+    #[test]
+    fn staging_requests_for_unsafe_paths_are_refused() {
+        for path in [
+            "/etc/hosts",
+            "../outside.txt",
+            "",
+            ".autobahn-tmp-staging-x/y",
+            "a/../../outside.txt",
+        ] {
+            let (keep, root, mut endpoint) = scanned(EndpointOptions::default());
+            fs::write(root.join("a.txt"), b"inside").expect("file should be writable");
+            fs::write(keep.path().join("outside.txt"), b"secret").expect("file should be writable");
+            endpoint.scan().expect("scan should succeed");
+            let requests = vec![
+                FileRequest {
+                    path: "a.txt".into(),
+                    digest: digest_of(b"other"),
+                },
+                FileRequest {
+                    path: path.into(),
+                    digest: digest_of(b"secret"),
+                },
+            ];
+            let error = endpoint
+                .stage_begin(requests)
+                .expect_err("an unsafe staging path must be refused");
+            assert!(
+                format!("{error:#}").contains("refusing"),
+                "{path:?}: {error:#}"
+            );
+            assert!(endpoint.receive.is_none(), "{path:?} left receive state");
+            assert!(
+                !keep.path().join("staging").exists(),
+                "{path:?} created the staging directory"
+            );
+        }
+    }
+
+    /// Even if the snapshot claimed a file behind a symlinked parent —
+    /// a shape no real scan produces — the base signature is not computed
+    /// through the link.
+    #[test]
+    fn a_base_behind_a_symlinked_parent_yields_an_empty_signature() {
+        let (keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        let outside = keep.path().join("outside");
+        fs::create_dir_all(&outside).expect("directory should be creatable");
+        fs::write(outside.join("big.bin"), vec![7u8; 64 * 1024]).expect("file should be writable");
+        symlink(&outside, root.join("link")).expect("symlink should be creatable");
+        let mut snapshot = endpoint.scan().expect("scan should succeed");
+        let metadata = file_metadata(
+            &fs::metadata(outside.join("big.bin")).expect("file should be inspectable"),
+        );
+        snapshot.root = Some(Node {
+            name: String::new(),
+            content: Content::Directory(Arc::new(vec![Node {
+                name: "link".into(),
+                content: Content::Directory(Arc::new(vec![Node {
+                    name: "big.bin".into(),
+                    content: Content::File {
+                        digest: digest_of(&[7u8; 64 * 1024]),
+                        executable: false,
+                        metadata,
+                    },
+                }])),
+            }])),
+        });
+        endpoint.last_snapshot = Some(snapshot);
+        let needs = endpoint
+            .stage_begin(vec![FileRequest {
+                path: "link/big.bin".into(),
+                digest: digest_of(b"new content"),
+            }])
+            .expect("staging should begin");
+        assert_eq!(needs.len(), 1);
+        assert!(needs[0].signature.is_empty(), "a signature leaked");
     }
 
     /// The agent direction: a hostile controller asks a follower's agent

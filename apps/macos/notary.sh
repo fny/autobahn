@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Shared by release.sh and notarize-cli.sh: which identity signs, which
 # credential notarises, and a submission that fails loudly. Sourced, not
 # run, so a laptop and CI sign and notarise the same way.

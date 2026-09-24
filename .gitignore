@@ -1,4 +1,6 @@
 /target
+# Local agent builds; releases build and publish their own
+/dist/
 bench/verify/hosts-*.json
 apps/macos/Autobahn.app/
 

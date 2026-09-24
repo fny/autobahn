@@ -11,7 +11,11 @@
 # `autobahn tray`, not a second implementation of it.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
+source apps/macos/plist.sh
 APP="${1:-apps/macos/Autobahn.app}"
+# The version the app reports is Cargo.toml's, read before the build so a
+# manifest without one costs a second rather than a compile.
+VERSION=$(crate_version Cargo.toml)
 
 # Built into its own target directory, never the default one. The login
 # service runs the binary at target/release through a symlink, and a
@@ -23,7 +27,6 @@ TARGET="${AUTOBAHN_TRAY_TARGET:-target/tray}"
 CARGO_TARGET_DIR="$TARGET" cargo build --release --features tray
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp apps/macos/Info.plist "$APP/Contents/Info.plist"
 cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn"
 # The icon is compiled from assets/Autobahn.icon by Xcode's own asset
 # compiler, exactly as Xcode would build it: Assets.car carries the full
@@ -47,9 +50,7 @@ else
     cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
     ICON_NAME=autobahn
 fi
-/usr/libexec/PlistBuddy -c "Set :CFBundleIconFile $ICON_NAME" "$APP/Contents/Info.plist"
-/usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $ICON_NAME" "$APP/Contents/Info.plist" 2>/dev/null ||
-/usr/libexec/PlistBuddy -c "Set :CFBundleIconName $ICON_NAME" "$APP/Contents/Info.plist"
+render_info_plist apps/macos/Info.plist "$APP/Contents/Info.plist" "$VERSION" "$ICON_NAME"
 # macOS tags a copied executable with com.apple.provenance, and codesign
 # refuses a bundle carrying one — with errSecInternalComponent, which
 # says nothing about attributes and sends you looking at the key instead.

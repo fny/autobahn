@@ -10,14 +10,18 @@
 	<string>party.voltai.autobahn</string>
 	<key>CFBundleExecutable</key>
 	<string>autobahn</string>
+	<!-- Filled in by build.sh: the version from Cargo.toml, and the icon
+	     actool could compile. Never a number here, so none goes stale. -->
 	<key>CFBundleIconFile</key>
-	<string>autobahn</string>
+	<string>__AUTOBAHN_ICON__</string>
+	<key>CFBundleIconName</key>
+	<string>__AUTOBAHN_ICON__</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.4.0</string>
+	<string>__AUTOBAHN_VERSION__</string>
 	<key>CFBundleVersion</key>
-	<string>0.4.0</string>
+	<string>__AUTOBAHN_VERSION__</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>11.0</string>
 	<!-- A menu bar app: no dock icon, no window on launch. -->

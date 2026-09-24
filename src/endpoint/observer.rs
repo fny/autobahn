@@ -946,7 +946,9 @@ mod tests {
         }
     }
 
-    /// Waits for `condition`, polling, for up to ten seconds.
+    /// Waits for `condition`, polling, for up to ten seconds. Used only by
+    /// the Linux watch tests.
+    #[cfg(target_os = "linux")]
     fn eventually(mut condition: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {

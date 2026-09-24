@@ -641,12 +641,18 @@ fn select_agents(
 /// Builds an SSH command running `script` on the destination. The option
 /// terminator keeps a hostile destination (one beginning with `-`) from
 /// being parsed as an SSH option such as `ProxyCommand`.
+///
+/// ssh hands the remote command to the user's login shell, which may be
+/// fish or tcsh, and the scripts are POSIX. So the login shell is given
+/// only `sh -c` and the script quoted as one word, which every shell
+/// parses alike — so long as the script holds no backslash or newline,
+/// which fish and tcsh treat differently inside single quotes.
 fn ssh_command(destination: &str, script: &str) -> Command {
     let mut command = Command::new(super::ssh_binary());
     command.args(super::ssh_options());
     command.arg("--");
     command.arg(destination);
-    command.arg(script);
+    command.arg(format!("sh -c {}", crate::text::shell_quote(script)));
     command.stdout(Stdio::piped());
     // Captured rather than inherited: ssh's complaint is folded into the
     // error the caller returns, where it is attributed to a session and a
@@ -659,6 +665,55 @@ fn ssh_command(destination: &str, script: &str) -> Command {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What ssh would hand the login shell: the words after the
+    /// destination, joined by spaces.
+    fn remote_command_line(command: &Command) -> String {
+        let arguments: Vec<String> = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect();
+        let terminator = arguments
+            .iter()
+            .position(|argument| argument == "--")
+            .expect("an option terminator");
+        arguments[terminator + 2..].join(" ")
+    }
+
+    #[test]
+    fn every_remote_script_runs_under_sh_whatever_the_login_shell() {
+        // Each script autobahn sends, including ones holding quotes.
+        for script in [
+            "uname -sm",
+            "ls -t ~/.autobahn/bin/ 2>/dev/null | grep '^autobahn-' || true",
+            "tmp=x-$$ && { echo \"$tmp\" | grep -q x; } && echo 'it''s posix'",
+        ] {
+            let command = ssh_command("host", script);
+            let line = remote_command_line(&command);
+            assert!(line.starts_with("sh -c '"), "{line}");
+            // The login shell parses only `sh -c` and one quoted word, and
+            // sh then runs exactly the script.
+            let through_wrapper = Command::new("sh")
+                .arg("-c")
+                .arg(&line)
+                .output()
+                .expect("sh runs");
+            let direct = Command::new("sh")
+                .arg("-c")
+                .arg(script)
+                .output()
+                .expect("sh runs");
+            assert_eq!(through_wrapper.stdout, direct.stdout, "{script}");
+            assert_eq!(through_wrapper.status.code(), direct.status.code());
+            // Under a login shell that is not POSIX, when one is here.
+            for shell in ["fish", "tcsh"] {
+                let Ok(output) = Command::new(shell).arg("-c").arg(&line).output() else {
+                    continue;
+                };
+                assert_eq!(output.stdout, direct.stdout, "{shell}: {script}");
+            }
+        }
+    }
 
     #[test]
     fn a_remote_step_that_never_finishes_is_killed_at_its_deadline() {

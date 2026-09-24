@@ -1189,7 +1189,10 @@ fn agents_install_automatically_over_ssh() {
 
     // A fake `ssh` that runs the remote command locally under the fake
     // remote home — auth-free SSH semantics, faithful enough for the
-    // install flow (which streams the agent binary through stdin).
+    // install flow (which streams the agent binary through stdin). Every
+    // remote command must be wrapped in `sh -c`, since a real login shell
+    // may not be POSIX; one that is not here is refused, and the command
+    // runs under fish or tcsh when either is installed.
     let script_dir = world.directory("fake-bin");
     let script = script_dir.join("ssh");
     fs::write(
@@ -1198,7 +1201,10 @@ fn agents_install_automatically_over_ssh() {
             "#!/bin/sh\n\
              while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; *) break;; esac; done\n\
              shift\n\
-             HOME={home} exec /bin/sh -c \"$*\"\n",
+             case \"$*\" in 'sh -c '*) ;; *) echo \"not wrapped in sh -c: $*\" >&2; exit 99;; esac\n\
+             login=/bin/sh\n\
+             for shell in fish tcsh; do command -v $shell >/dev/null 2>&1 && login=$(command -v $shell) && break; done\n\
+             HOME={home} exec \"$login\" -c \"$*\"\n",
             home = remote_home.display()
         ),
     )

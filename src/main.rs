@@ -693,7 +693,11 @@ fn main() {
             host,
             state_root,
         } => run_control(
-            ControlRequest::Flush(Selector { group, host }),
+            ControlRequest::Flush(Selector {
+                group,
+                host,
+                session: None,
+            }),
             state_root,
             "flushed",
         ),
@@ -702,7 +706,11 @@ fn main() {
             host,
             state_root,
         } => run_control(
-            ControlRequest::Verify(Selector { group, host }),
+            ControlRequest::Verify(Selector {
+                group,
+                host,
+                session: None,
+            }),
             state_root,
             "verifying",
         ),
@@ -714,6 +722,7 @@ fn main() {
             ControlRequest::Reset(Selector {
                 group: Some(group),
                 host,
+                session: None,
             }),
             state_root,
             "reset",
@@ -3580,7 +3589,7 @@ fn run_resolve(
             &state_root,
             &ControlRequest::Flush(Selector {
                 group: Some(group),
-                host: None,
+                ..Selector::default()
             }),
         );
         if settled > 0 {
@@ -4330,7 +4339,7 @@ fn render_status(
     live: bool,
     out: &mut String,
 ) {
-    use autobahn::supervisor::control::progress_of;
+    use autobahn::supervisor::control::{progress_of, SessionKey};
     use std::fmt::Write;
 
     // One round trip answers both "is anything running" and "what is each
@@ -4431,7 +4440,7 @@ fn render_status(
         let live_progress = |plan: &autobahn::config::SessionPlan| {
             reported
                 .as_deref()
-                .and_then(|sessions| progress_of(sessions, &plan.identifier()))
+                .and_then(|sessions| progress_of(sessions, &SessionKey::of(plan)))
                 .cloned()
         };
         if !expand {
@@ -4454,7 +4463,7 @@ fn render_status(
         for (plan, status) in block {
             let progress = reported
                 .as_deref()
-                .and_then(|sessions| progress_of(sessions, &plan.identifier()));
+                .and_then(|sessions| progress_of(sessions, &SessionKey::of(plan)));
             render_status_entry(
                 &plan.beta_spec(),
                 plan.mode_name(),
@@ -5085,7 +5094,7 @@ mod tests {
     #[test]
     fn two_betas_on_one_host_show_their_own_progress() {
         use autobahn::progress::{Phase, ProgressSnapshot};
-        use autobahn::supervisor::control::{progress_of, SessionProgress};
+        use autobahn::supervisor::control::{progress_of, SessionKey, SessionProgress};
 
         let keep = tempfile::tempdir().expect("tempdir");
         let config = keep.path().join("config.toml");
@@ -5119,19 +5128,56 @@ mod tests {
             .iter()
             .zip([Phase::Scanning, Phase::Paused])
             .map(|(plan, phase)| SessionProgress {
-                session: plan.identifier(),
+                session: SessionKey::of(plan),
                 group: plan.group.clone(),
                 host: plan.host.clone(),
                 progress: snapshot(phase),
             })
             .collect();
         let phase = |index: usize| {
-            progress_of(&reported, &plans[index].identifier())
+            progress_of(&reported, &SessionKey::of(&plans[index]))
                 .expect("each session has progress")
                 .phase
         };
         assert_eq!(phase(0), Phase::Scanning);
         assert_eq!(phase(1), Phase::Paused);
+    }
+
+    /// Two betas on one host in one group are two lines in `status`, and
+    /// two sessions in its report: each keyed apart, and each named by its
+    /// path where the host alone would name both.
+    #[test]
+    fn two_betas_on_one_host_show_their_own_status_lines() {
+        use autobahn::supervisor::control::SessionKey;
+
+        let keep = tempfile::tempdir().expect("tempdir");
+        let config = keep.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\n\
+             betas = [\"host:/tree\", \"host:/other\"]\n",
+        )
+        .unwrap();
+        let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
+        let selected: Vec<_> = plans.iter().collect();
+        let state_root = keep.path().join("state");
+
+        let mut out = String::new();
+        super::render_status(&selected, &state_root, false, true, false, &mut out);
+        let lines: Vec<&str> = out.lines().filter(|line| line.contains("host:/")).collect();
+        assert_eq!(lines.len(), 2, "{out}");
+        assert!(lines[0].contains("host:/tree"), "{out}");
+        assert!(lines[1].contains("host:/other"), "{out}");
+
+        let report = autobahn::supervisor::status_report(&selected, &state_root);
+        let sessions = &report.groups[0].sessions;
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0].session, SessionKey::of(&plans[0]));
+        assert_eq!(sessions[1].session, SessionKey::of(&plans[1]));
+        assert_ne!(sessions[0].session, sessions[1].session);
+        assert_eq!(sessions[0].label(), "host:/tree");
+        assert_eq!(sessions[1].label(), "host:/other");
+        assert_eq!(sessions[1].selector(), "host:/other");
     }
 
     fn side() -> autobahn::progress::SideSnapshot {

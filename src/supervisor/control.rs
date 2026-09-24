@@ -63,21 +63,86 @@ pub enum ControlRequest {
     Sessions,
 }
 
-/// Selects sessions by group and destination.
+/// What tells one session from every other: its state identifier.
+///
+/// A session's group and host are not enough — two betas of one group on
+/// one host share both — and its display label is for people to read. So
+/// everything that keeps track of sessions (control requests, progress,
+/// alert state, the status inventory) keys them by this.
+#[derive(Clone, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SessionKey(String);
+
+impl SessionKey {
+    /// The key of the session a plan describes.
+    pub fn of(plan: &crate::config::SessionPlan) -> SessionKey {
+        SessionKey(plan.identifier())
+    }
+
+    /// The key of the session with this state identifier.
+    pub fn new(identifier: impl Into<String>) -> SessionKey {
+        SessionKey(identifier.into())
+    }
+
+    /// The state identifier.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// A plan's destination as people read it: its host, or `host:path` when
+/// another beta of its group is on the same host — its display label
+/// without the group.
+pub fn destination_of(plan: &crate::config::SessionPlan) -> String {
+    let display = plan.display();
+    display
+        .strip_prefix(&format!("{}@", plan.group))
+        .map(str::to_owned)
+        .unwrap_or_else(|| plan.host.clone())
+}
+
+/// Selects sessions by group and destination, or one session by its key.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Selector {
     /// The group to select (all groups when absent).
     pub group: Option<String>,
-    /// The destination host (or local beta path) within the group (all
+    /// The destination within the group, as `status` names it: a host,
+    /// which selects every beta on it, or a beta's specification (a local
+    /// beta's path, or `host:path`), which selects that one (all
     /// destinations when absent).
     pub host: Option<String>,
+    /// The one session to select, by key (any when absent).
+    pub session: Option<SessionKey>,
 }
 
 impl Selector {
+    /// Selects the one session `key` names.
+    pub fn session(key: SessionKey) -> Selector {
+        Selector {
+            session: Some(key),
+            ..Selector::default()
+        }
+    }
+
     /// Indicates whether or not a session matches this selector.
-    fn matches(&self, group: &str, host: &str) -> bool {
-        self.group.as_deref().is_none_or(|wanted| wanted == group)
-            && self.host.as_deref().is_none_or(|wanted| wanted == host)
+    fn matches(&self, entry: &Entry) -> bool {
+        self.group
+            .as_deref()
+            .is_none_or(|wanted| wanted == entry.group)
+            && self
+                .host
+                .as_deref()
+                .is_none_or(|wanted| wanted == entry.host || wanted == entry.beta)
+            && self
+                .session
+                .as_ref()
+                .is_none_or(|wanted| *wanted == entry.session)
     }
 }
 
@@ -124,7 +189,7 @@ pub struct Inventory {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SessionSummary {
     /// The session's key: its state identifier.
-    pub identifier: String,
+    pub identifier: SessionKey,
     /// `group@host`.
     pub display: String,
     /// The synchronization mode's name.
@@ -190,9 +255,9 @@ pub fn mismatch_message(supervisor: Option<&str>) -> String {
 /// One supervised session's live progress.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SessionProgress {
-    /// The session's identifier: what tells two sessions apart when they
-    /// share a group and a destination host.
-    pub session: String,
+    /// The session's key: what tells two sessions apart when they share a
+    /// group and a destination host.
+    pub session: SessionKey,
     /// The session's group.
     pub group: String,
     /// The session's destination.
@@ -201,16 +266,16 @@ pub struct SessionProgress {
     pub progress: crate::progress::ProgressSnapshot,
 }
 
-/// The live progress of the session `identifier` names, from a
-/// supervisor's answer. By identifier, not by group and host, which two
-/// betas on one host share.
+/// The live progress of the session `key` names, from a supervisor's
+/// answer. By key, not by group and host, which two betas on one host
+/// share.
 pub fn progress_of<'a>(
     sessions: &'a [SessionProgress],
-    identifier: &str,
+    key: &SessionKey,
 ) -> Option<&'a crate::progress::ProgressSnapshot> {
     sessions
         .iter()
-        .find(|session| session.session == identifier)
+        .find(|session| session.session == *key)
         .map(|session| &session.progress)
 }
 
@@ -231,16 +296,18 @@ pub(crate) struct WorkerControl {
 /// One registry entry: a session, its control flags, and its live
 /// progress.
 pub(crate) struct Entry {
-    /// The session's identifier.
-    pub session: String,
+    /// The session's key.
+    pub session: SessionKey,
     /// The session's name for people to read.
     pub display: String,
     /// The session's mode, by name.
     pub mode: String,
     /// The session's group.
     pub group: String,
-    /// The session's destination.
+    /// The session's destination host.
     pub host: String,
+    /// The session's beta, as its specification reads.
+    pub beta: String,
     /// The flags the control socket flips and the worker consumes.
     pub control: Arc<WorkerControl>,
     /// What the session is doing, updated by the worker as it works.
@@ -382,7 +449,7 @@ impl Registry {
         };
         let mut sessions = 0;
         for entry in entries.iter() {
-            if selector.matches(&entry.group, &entry.host) {
+            if selector.matches(entry) {
                 action(&entry.control);
                 sessions += 1;
             }
@@ -876,12 +943,13 @@ mod tests {
 
     fn entry(group: &str, host: &str) -> Entry {
         Entry {
-            session: format!("{group}-{host}"),
+            session: SessionKey::new(format!("{group}-{host}")),
             display: format!("{group}@{host}"),
             mode: "two-way-safe".into(),
             published: Arc::default(),
             group: group.into(),
             host: host.into(),
+            beta: format!("{host}:/tree"),
             control: Arc::default(),
             progress: Arc::default(),
         }
@@ -1060,6 +1128,7 @@ mod tests {
         let response = registry.apply(&ControlRequest::Pause(Selector {
             group: Some("work".into()),
             host: None,
+            session: None,
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 2 }));
         assert!(registry.entries.read().unwrap()[0]
@@ -1074,6 +1143,7 @@ mod tests {
         let response = registry.apply(&ControlRequest::Reset(Selector {
             group: Some("other".into()),
             host: Some("host1".into()),
+            session: None,
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
         assert!(registry.entries.read().unwrap()[2]
@@ -1084,8 +1154,56 @@ mod tests {
         let response = registry.apply(&ControlRequest::Flush(Selector {
             group: Some("absent".into()),
             host: None,
+            session: None,
         }));
         assert!(matches!(response, ControlResponse::Error(_)));
+    }
+
+    /// Two betas of one group on one host share the group and the host;
+    /// a selector tells them apart by the beta's specification, as status
+    /// names it, or by the session's key.
+    #[test]
+    fn two_betas_on_one_host_are_selected_apart() {
+        let beta = |path: &str| Entry {
+            session: SessionKey::new(format!("work-{path}")),
+            beta: format!("host:{path}"),
+            ..entry("work", "host")
+        };
+        let registry = Registry {
+            entries: RwLock::new(vec![beta("/tree"), beta("/tree/nested")]),
+            ..registry()
+        };
+        let paused = |index: usize| {
+            registry.entries.read().unwrap()[index]
+                .control
+                .paused
+                .load(Ordering::Relaxed)
+        };
+
+        // The host names both.
+        let response = registry.apply(&ControlRequest::Flush(Selector {
+            group: Some("work".into()),
+            host: Some("host".into()),
+            session: None,
+        }));
+        assert!(matches!(response, ControlResponse::Applied { sessions: 2 }));
+
+        // The beta's specification names one.
+        let response = registry.apply(&ControlRequest::Pause(Selector {
+            group: Some("work".into()),
+            host: Some("host:/tree/nested".into()),
+            session: None,
+        }));
+        assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
+        assert!(!paused(0));
+        assert!(paused(1));
+
+        // So does the key.
+        let response = registry.apply(&ControlRequest::Pause(Selector::session(SessionKey::new(
+            "work-/tree",
+        ))));
+        assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
+        assert!(paused(0));
     }
 
     fn versioned(version: &str, request: &ControlRequest) -> ControlRequest {

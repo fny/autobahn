@@ -1457,7 +1457,7 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
         // Pause: the state records, and further changes stop propagating.
         let selector = || Selector {
             group: Some("work".into()),
-            host: None,
+            ..Selector::default()
         };
         let response = control::send(&world.state_root(), &ControlRequest::Pause(selector()))
             .expect("pause should send");
@@ -1498,7 +1498,7 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
             &world.state_root(),
             &ControlRequest::Flush(Selector {
                 group: Some("absent".into()),
-                host: None,
+                ..Selector::default()
             }),
         )
         .expect("the request should send");

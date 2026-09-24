@@ -545,7 +545,7 @@ impl App {
                     Some(progress) => {
                         let mut line = format!(
                             "{}  —  {}, {}",
-                            session.host,
+                            session.label(),
                             progress.phase.label(),
                             format_elapsed(progress.seconds)
                         );
@@ -561,7 +561,7 @@ impl App {
                             .age_seconds
                             .map(format_age)
                             .unwrap_or_else(|| "never run".to_owned());
-                        format!("{}  —  {}, {}", session.host, session.state, age)
+                        format!("{}  —  {}, {}", session.label(), session.state, age)
                     }
                 };
                 entry.line.set_text(line);
@@ -605,15 +605,15 @@ impl App {
                         Action::Diff {
                             group: group.name.clone(),
                             path: conflict.path.clone(),
-                            host: session.host.clone(),
+                            host: session.selector().to_owned(),
                         },
                     );
                     let _ = item.append(&PredefinedMenuItem::separator());
                     for (label, keep) in [
                         ("Keep alpha's version".to_owned(), "alpha".to_owned()),
                         (
-                            format!("Keep {}'s version", session.host),
-                            session.host.clone(),
+                            format!("Keep {}'s version", session.label()),
+                            session.selector().to_owned(),
                         ),
                         ("Keep both".to_owned(), "both".to_owned()),
                     ] {
@@ -682,8 +682,10 @@ impl App {
                     .sessions
                     .iter()
                     .map(move |session| crate::alerts::SessionAlerts {
+                        session: session.session.clone(),
                         group: group.name.clone(),
                         host: session.host.clone(),
+                        destination: session.label().to_owned(),
                         alerts: session.alerts.clone(),
                         summary: session.alert_summary.clone(),
                         after: session.alert_after,
@@ -974,7 +976,9 @@ fn set_optional<M: Container>(
     }
 }
 
-/// The configuration's shape: group names and their destinations.
+/// The configuration's shape: group names and their sessions, by key —
+/// two betas on one host are two entries, and swapping one for another is
+/// a new shape.
 fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
     report
         .groups
@@ -982,7 +986,11 @@ fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
         .map(|group| {
             (
                 group.name.clone(),
-                group.sessions.iter().map(|s| s.host.clone()).collect(),
+                group
+                    .sessions
+                    .iter()
+                    .map(|s| s.session.to_string())
+                    .collect(),
             )
         })
         .collect()

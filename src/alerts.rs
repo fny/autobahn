@@ -29,6 +29,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::supervisor::control::SessionKey;
+
 /// A condition that warrants telling someone.
 ///
 /// These are exactly the states `status` prints, so the hook named in the
@@ -128,8 +130,14 @@ impl AlertPlan {
 /// One session's alerting conditions, as the supervisor sees them.
 #[derive(Clone, Debug)]
 pub struct SessionAlerts {
+    /// Which session: two betas of one group on one host share the group
+    /// and the host, and are still two sessions.
+    pub session: SessionKey,
     pub group: String,
     pub host: String,
+    /// The destination as people read it: the host, or `host:path` when
+    /// another beta of the group is on the same host.
+    pub destination: String,
     /// The conditions it is currently in. Empty means healthy.
     pub alerts: Vec<Alert>,
     /// How to describe it in one line ("741 conflicts, 20 blocked").
@@ -140,8 +148,8 @@ pub struct SessionAlerts {
 }
 
 impl SessionAlerts {
-    fn key(&self) -> String {
-        format!("{}@{}", self.group, self.host)
+    fn key(&self) -> SessionKey {
+        self.session.clone()
     }
 }
 
@@ -173,9 +181,9 @@ pub enum Fire {
 pub struct Alerter {
     plan: AlertPlan,
     /// When each session's alert was first seen, uninterrupted.
-    seen: HashMap<(String, Alert), Instant>,
+    seen: HashMap<(SessionKey, Alert), Instant>,
     /// The set most recently fired for, and when.
-    fired: BTreeSet<(String, Alert)>,
+    fired: BTreeSet<(SessionKey, Alert)>,
     fired_at: Option<Instant>,
     /// When the alerting set went empty, while the last firing is still
     /// remembered. `None` means either nothing has fired or it has settled.
@@ -207,8 +215,8 @@ impl Alerter {
     /// should run.
     pub fn observe(&mut self, sessions: &[SessionAlerts], now: Instant) -> Option<Fire> {
         // What is true this instant.
-        let mut present: BTreeSet<(String, Alert)> = BTreeSet::new();
-        let mut patience: BTreeMap<String, Duration> = BTreeMap::new();
+        let mut present: BTreeSet<(SessionKey, Alert)> = BTreeSet::new();
+        let mut patience: BTreeMap<SessionKey, Duration> = BTreeMap::new();
         for session in sessions {
             for alert in &session.alerts {
                 present.insert((session.key(), *alert));
@@ -227,7 +235,7 @@ impl Alerter {
         }
 
         // What has held long enough to be worth saying.
-        let confirmed: BTreeSet<(String, Alert)> = present
+        let confirmed: BTreeSet<(SessionKey, Alert)> = present
             .iter()
             .filter(|key| {
                 self.seen.get(*key).is_some_and(|since| {
@@ -318,10 +326,10 @@ impl Alerter {
     fn describe(
         &self,
         sessions: &[SessionAlerts],
-        confirmed: &BTreeSet<(String, Alert)>,
+        confirmed: &BTreeSet<(SessionKey, Alert)>,
         repeat: bool,
     ) -> Fire {
-        let keys: BTreeSet<&String> = confirmed.iter().map(|(key, _)| key).collect();
+        let keys: BTreeSet<&SessionKey> = confirmed.iter().map(|(key, _)| key).collect();
         let alerting: Vec<&SessionAlerts> = sessions
             .iter()
             .filter(|session| keys.contains(&session.key()))
@@ -341,11 +349,15 @@ impl Alerter {
                     .0 += 1;
             } else {
                 groups.insert(session.group.as_str());
+                // A host alone is cut short; a host with a path is what
+                // tells two betas on it apart, and is left whole.
+                let destination = match session.destination == session.host {
+                    true => short_host(&session.host, &hosts),
+                    false => session.destination.clone(),
+                };
                 lines.push(hook_line(&format!(
-                    "{} → {}: {}",
-                    session.group,
-                    short_host(&session.host, &hosts),
-                    session.summary
+                    "{} → {destination}: {}",
+                    session.group, session.summary
                 )));
             }
         }
@@ -944,11 +956,70 @@ mod tests {
     fn session_in(group: &str, host: &str, alerts: &[Alert], summary: &str) -> SessionAlerts {
         SessionAlerts {
             after: None,
+            session: SessionKey::new(format!("{group}@{host}")),
             group: group.into(),
             host: host.into(),
+            destination: host.into(),
             alerts: alerts.to_vec(),
             summary: summary.into(),
         }
+    }
+
+    /// Two betas of one group on one host are two sessions: each one's
+    /// trouble is its own, counted and named apart, and one that clears
+    /// does not take the other's with it.
+    #[test]
+    fn two_betas_on_one_host_alert_apart() {
+        let beta = |path: &str, alerts: &[Alert], summary: &str| SessionAlerts {
+            session: SessionKey::new(format!("work-{path}")),
+            destination: format!("host:{path}"),
+            ..session_in("work", "host", alerts, summary)
+        };
+        let mut alerter = Alerter::new(plan());
+        let start = Instant::now();
+        let both = [
+            beta("/tree", &[Alert::Conflicts], "1 conflict"),
+            beta("/tree/nested", &[Alert::Conflicts], "2 conflicts"),
+        ];
+        alerter.observe(&both, start);
+        let Some(Fire::Alert {
+            sessions, detail, ..
+        }) = alerter.observe(&both, start + Duration::from_secs(31))
+        else {
+            panic!("expected an alert");
+        };
+        assert_eq!(sessions, 2);
+        assert_eq!(
+            detail,
+            "  work → host:/tree: 1 conflict\n  work → host:/tree/nested: 2 conflicts"
+        );
+
+        // The first clears for good; the second, still in trouble, starts
+        // a new episode only when something new about it appears, and a
+        // fresh condition on the first is its own news.
+        let mut alerter = Alerter::new(plan());
+        let first = [
+            beta("/tree", &[Alert::Conflicts], "1 conflict"),
+            beta("/tree/nested", &[], ""),
+        ];
+        alerter.observe(&first, start);
+        assert!(alerter
+            .observe(&first, start + Duration::from_secs(31))
+            .is_some());
+        // The other beta's conflicts appear: news, not the same trouble.
+        let second = [
+            beta("/tree", &[Alert::Conflicts], "1 conflict"),
+            beta("/tree/nested", &[Alert::Conflicts], "2 conflicts"),
+        ];
+        alerter.observe(&second, start + Duration::from_secs(40));
+        let Some(Fire::Alert {
+            repeat, sessions, ..
+        }) = alerter.observe(&second, start + Duration::from_secs(71))
+        else {
+            panic!("the second beta's trouble is news");
+        };
+        assert!(!repeat);
+        assert_eq!(sessions, 2);
     }
 
     /// Five sessions on one sleeping laptop are one fact, not five.

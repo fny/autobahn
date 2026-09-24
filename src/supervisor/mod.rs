@@ -902,12 +902,13 @@ impl Supervisor {
             .unwrap_or_else(|error| error.into_inner()) = running
             .iter()
             .map(|session| control::Entry {
-                session: session.plan.identifier(),
+                session: control::SessionKey::of(&session.plan),
                 display: session.plan.display(),
                 mode: session.plan.mode_name().to_owned(),
                 published: session.published.clone(),
                 group: session.plan.group.clone(),
                 host: session.plan.host.clone(),
+                beta: session.plan.beta_spec(),
                 control: session.control.clone(),
                 progress: session.progress.clone(),
             })
@@ -2266,8 +2267,15 @@ pub struct GroupReport {
 /// One session's report: its plan, and its recorded status if any.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionReport {
+    /// Which session this is: its state identifier, the one thing two
+    /// betas of a group on one host do not share.
+    pub session: control::SessionKey,
     /// The destination label status prints (a host, or a local path).
     pub host: String,
+    /// The destination as people read it: the host, or `host:path` when
+    /// another beta of the group is on the same host.
+    #[serde(skip)]
+    pub destination: String,
     /// The full destination specification.
     pub beta: String,
     pub mode: String,
@@ -2299,6 +2307,27 @@ pub struct SessionReport {
     /// How to describe the session in one line when it is alerting.
     #[serde(skip)]
     pub alert_summary: String,
+}
+
+impl SessionReport {
+    /// The name that selects this destination alone among its group's, as
+    /// `--host` and `--keep` take it: the host, unless another beta of the
+    /// group is on it, and then the beta's specification.
+    pub fn selector(&self) -> &str {
+        match self.destination.is_empty() || self.destination == self.host {
+            true => &self.host,
+            false => &self.beta,
+        }
+    }
+
+    /// The destination as people read it: `destination`, or the host
+    /// when the report was built without one.
+    pub fn label(&self) -> &str {
+        match self.destination.is_empty() {
+            true => &self.host,
+            false => &self.destination,
+        }
+    }
 }
 
 /// Writes what changed about a session's conflicts and blocked paths.
@@ -2399,7 +2428,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         let status = read_status(state_root, &plan.identifier()).ok().flatten();
         let progress = live
             .as_deref()
-            .and_then(|sessions| control::progress_of(sessions, &plan.identifier()))
+            .and_then(|sessions| control::progress_of(sessions, &control::SessionKey::of(plan)))
             .cloned();
         let (role, term) = status
             .as_ref()
@@ -2407,7 +2436,9 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
             .unwrap_or_default();
         let session = match status {
             None => SessionReport {
+                session: control::SessionKey::of(plan),
                 host: plan.host.clone(),
+                destination: control::destination_of(plan),
                 beta: plan.beta_spec(),
                 mode: plan.mode_name().to_owned(),
                 state: "never-run".into(),
@@ -2423,7 +2454,9 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 alert_summary: String::new(),
             },
             Some(status) => SessionReport {
+                session: control::SessionKey::of(plan),
                 host: plan.host.clone(),
+                destination: control::destination_of(plan),
                 beta: plan.beta_spec(),
                 mode: plan.mode_name().to_owned(),
                 state: classify_state(&status),
@@ -2751,8 +2784,10 @@ fn watch_alerts(
                     None => (Vec::new(), String::new(), None),
                 };
                 SessionAlerts {
+                    session: control::SessionKey::of(plan),
                     group: plan.group.clone(),
                     host: plan.host.clone(),
+                    destination: control::destination_of(plan),
                     alerts,
                     summary,
                     after,

@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use autobahn::config::SessionPlan;
 use autobahn::progress::Phase;
+use autobahn::supervisor::control::SessionKey;
 use autobahn::supervisor::{status_report, SessionReport, StatusReport};
 use autobahn::text::display_safe;
 
@@ -91,8 +92,9 @@ struct Row {
 
 /// The counter, open on one order.
 struct Counter {
-    group: String,
-    host: String,
+    /// The order's session: its group and host are shared by every beta
+    /// of the group on that host.
+    session: SessionKey,
     cursor: usize,
 }
 
@@ -273,12 +275,22 @@ impl Shop {
         autobahn::alerts::short_host(host, &hosts)
     }
 
+    /// An order's destination as the rail names it: its host, cut short,
+    /// or the host and path when another beta of the group shares the
+    /// host.
+    fn destination_name(&self, session: &SessionReport) -> String {
+        match session.destination.is_empty() || session.destination == session.host {
+            true => self.host_name(&session.host),
+            false => session.destination.clone(),
+        }
+    }
+
     /// The order the counter is open on.
     fn at_counter(&self) -> Option<(&str, &SessionReport)> {
         let counter = self.counter.as_ref()?;
         self.orders()
             .into_iter()
-            .find(|(group, session)| *group == counter.group && session.host == counter.host)
+            .find(|(_, session)| session.session == counter.session)
     }
 
     fn press(&mut self, key: Key) -> bool {
@@ -362,12 +374,11 @@ impl Shop {
 
     fn open_counter(&mut self) {
         let orders = self.orders();
-        let Some((group, session)) = orders.get(self.cursor) else {
+        let Some((_, session)) = orders.get(self.cursor) else {
             return;
         };
         self.counter = Some(Counter {
-            group: (*group).to_owned(),
-            host: session.host.clone(),
+            session: session.session.clone(),
             cursor: 0,
         });
         self.expanded.clear();
@@ -399,7 +410,10 @@ impl Shop {
             self.say("still working — the last settlement is running".to_owned());
             return;
         }
-        let Some(host) = self.counter.as_ref().map(|counter| counter.host.clone()) else {
+        let Some(host) = self
+            .at_counter()
+            .map(|(_, session)| self.destination_name(session))
+        else {
             return;
         };
         let rows = self.rows();
@@ -428,13 +442,15 @@ impl Shop {
 
     /// Runs a settlement that has been approved.
     fn run_settlement(&mut self, pending: Pending) {
-        let Some(counter) = &self.counter else { return };
+        let Some((group, session)) = self.at_counter() else {
+            return;
+        };
         let keep = match pending.winner {
             Winner::Alpha => "alpha".to_owned(),
-            Winner::Beta => counter.host.clone(),
+            Winner::Beta => session.selector().to_owned(),
             Winner::Both => "both".to_owned(),
         };
-        let group = counter.group.clone();
+        let group = group.to_owned();
         let told = match pending.paths.len() {
             1 => format!("settled {}", pending.paths[0]),
             many => format!("settled {many} paths"),
@@ -680,7 +696,7 @@ impl Shop {
         let counter = self.counter.as_ref()?;
         self.plans
             .iter()
-            .find(|plan| plan.group == counter.group && plan.host == counter.host)
+            .find(|plan| SessionKey::of(plan) == counter.session)
     }
 
     /// Emits one heading and, when it is open, the places under it.
@@ -1053,7 +1069,7 @@ impl Shop {
             if here { "\x1b[7m▸\x1b[0m " } else { "  " },
             pad(&shorten(group, GROUP), GROUP),
             dim("→"),
-            pad(&shorten(&self.host_name(&session.host), HOST), HOST),
+            pad(&shorten(&self.destination_name(session), HOST), HOST),
             baguette(session, working.map(|progress| progress.phase), self.frame),
             pad(&format!("{colour}{word}\x1b[0m"), OUTCOME),
             dim(&shorten(&tail, room)),
@@ -1074,7 +1090,10 @@ impl Shop {
                 between(
                     &format!(
                         "\x1b[1mthe counter\x1b[0m {}",
-                        dim(&format!("{} → {}", counter.group, counter.host))
+                        dim(&self
+                            .at_counter()
+                            .map(|(group, session)| { format!("{group} → {}", session.label()) })
+                            .unwrap_or_default())
                     ),
                     // What is waiting is the number of things wrong, not
                     // the number of headings they group under.
@@ -1697,7 +1716,9 @@ mod tests {
     #[test]
     fn only_agreement_colours_the_loaf() {
         let session = |state: &str| SessionReport {
+            session: SessionKey::default(),
             host: "boite".into(),
+            destination: String::new(),
             beta: "boite".into(),
             mode: "two-way-conflict".into(),
             state: state.into(),
@@ -1729,7 +1750,9 @@ mod tests {
         // Every order sits on one rail. A bar whose width changed with its
         // state would make the column jump as sessions moved between them.
         let session = |state: &str| SessionReport {
+            session: SessionKey::default(),
             host: "beta".into(),
+            destination: String::new(),
             beta: "beta".into(),
             mode: "two-way-conflict".into(),
             state: state.into(),
@@ -1849,7 +1872,9 @@ mod tests {
         let gone = ConflictSide::default();
 
         let session = |alpha: ConflictSide, beta: ConflictSide| SessionReport {
+            session: SessionKey::default(),
             host: "boite".into(),
+            destination: String::new(),
             beta: "boite".into(),
             mode: "two-way-conflict".into(),
             state: "conflicts".into(),
@@ -1960,7 +1985,9 @@ mod tests {
         use autobahn::supervisor::{GroupReport, SessionReport, StatusReport};
 
         let session = SessionReport {
+            session: SessionKey::default(),
             host: "fny".into(),
+            destination: String::new(),
             beta: "ubuntu@fny:~/w".into(),
             mode: "peering-alpha-dangerously-experimental".into(),
             state: "synchronized".into(),
@@ -2020,6 +2047,68 @@ mod tests {
         );
     }
 
+    /// Two betas of one group on one host are two orders: each is named
+    /// by its path on the rail, the counter opens on the one chosen, and a
+    /// settlement there names that beta alone.
+    #[test]
+    fn two_betas_on_one_host_are_two_orders() {
+        use autobahn::supervisor::{GroupReport, StatusReport};
+        let session = |path: &str| SessionReport {
+            session: SessionKey::new(format!("g-{path}")),
+            host: "boite".into(),
+            destination: format!("boite:{path}"),
+            beta: format!("boite:{path}"),
+            mode: "two-way-conflict".into(),
+            state: "conflicts".into(),
+            cycles: 1,
+            age_seconds: Some(1),
+            conflicts: Vec::new(),
+            blocked: Vec::new(),
+            error: None,
+            progress: None,
+            alerts: Vec::new(),
+            alert_after: None,
+            alert_summary: String::new(),
+        };
+        let mut shop = Shop {
+            plans: Vec::new(),
+            state_root: std::path::PathBuf::new(),
+            config: None,
+            report: StatusReport {
+                version: 4,
+                supervisor_running: true,
+                service: "running".into(),
+                groups: vec![GroupReport {
+                    role: String::new(),
+                    term: 0,
+                    name: "g".into(),
+                    alpha: "~/w".into(),
+                    sessions: vec![session("/a"), session("/b")],
+                }],
+                config_notice: None,
+                supervisor_mismatch: None,
+            },
+            cursor: 1,
+            counter: None,
+            expanded: BTreeSet::new(),
+            marked: BTreeSet::new(),
+            working: Arc::default(),
+            rate: Rate::default(),
+            ticker: Vec::new(),
+            pending: None,
+            help: false,
+            frame: 0,
+        };
+        let sessions = shop.report.groups[0].sessions.clone();
+        assert!(shop.order(0, "g", &sessions[0], 120).contains("boite:/a"));
+        assert!(shop.order(1, "g", &sessions[1], 120).contains("boite:/b"));
+
+        shop.press(Key::Open);
+        let (_, open) = shop.at_counter().expect("the counter is open");
+        assert_eq!(open.beta, "boite:/b");
+        assert_eq!(open.selector(), "boite:/b");
+    }
+
     /// A conflicting name with control characters in it is drawn escaped
     /// in the counter, the heading and the footer, and the shop's own
     /// colours still draw.
@@ -2028,7 +2117,9 @@ mod tests {
         use autobahn::supervisor::{ConflictDetail, ConflictSide, GroupReport, StatusReport};
         let name = "evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jsettled";
         let session = SessionReport {
+            session: SessionKey::default(),
             host: "boite".into(),
+            destination: String::new(),
             beta: "boite:~/w".into(),
             mode: "two-way-conflict".into(),
             state: "conflicts".into(),
@@ -2066,8 +2157,7 @@ mod tests {
             },
             cursor: 0,
             counter: Some(Counter {
-                group: "g".into(),
-                host: "boite".into(),
+                session: SessionKey::default(),
                 cursor: 0,
             }),
             expanded: ["conflicts".to_owned()].into_iter().collect(),

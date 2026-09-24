@@ -157,6 +157,10 @@ impl RemoteEndpoint {
                 self.seen = Some(header.generation);
                 self.receive_snapshot(header, what)
             }
+            Response::ScanChanges(changes) => {
+                self.seen = Some(changes.generation);
+                self.receive_changes(changes, what)
+            }
             // The agent reports "unchanged" only against a snapshot it has
             // actually sent, so having nothing to reproduce means the two
             // sides disagree about what was transmitted. That is a protocol
@@ -202,6 +206,80 @@ impl RemoteEndpoint {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Applies a changed scan's changes to the snapshot last received, and
+    /// holds the result to the agent's digest: the encoding of what was
+    /// built here must be the encoding the agent scanned. A baseline that
+    /// is not the one named, changes that do not apply, or a result that
+    /// does not verify is a performance event, as a byte delta's is — the
+    /// snapshot is asked for in full.
+    fn receive_changes(
+        &mut self,
+        scan: crate::protocol::ScanChanges,
+        what: &str,
+    ) -> Result<Snapshot> {
+        match self.apply_changes(&scan) {
+            Ok((snapshot, encoding)) => {
+                self.last_snapshot = Some(snapshot.clone());
+                self.last_encoding = Some((encoding, scan.digest));
+                Ok(snapshot)
+            }
+            Err(error) => {
+                eprintln!(
+                    "note: the agent's snapshot changes could not be reproduced \
+                     ({error:#}); requesting it in full"
+                );
+                let header = match self.exchange(Request::ScanFull)? {
+                    Response::ScanDelta(header) => header,
+                    response => return Err(unexpected_response(&response, what)),
+                };
+                if header.baseline.is_some() {
+                    bail!("the agent answered a full-scan request with a delta");
+                }
+                let (snapshot, encoding) = self.reassemble(&header)?;
+                self.last_snapshot = Some(snapshot.clone());
+                self.last_encoding = Some((encoding, header.digest));
+                Ok(snapshot)
+            }
+        }
+    }
+
+    /// Builds the snapshot a changed scan describes, verified; see
+    /// [`receive_changes`](RemoteEndpoint::receive_changes).
+    fn apply_changes(
+        &mut self,
+        scan: &crate::protocol::ScanChanges,
+    ) -> Result<(Snapshot, Vec<u8>)> {
+        let last = self
+            .last_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow!("no previous snapshot to apply the changes to"))?;
+        let baseline = match &self.last_encoding {
+            Some((_, digest)) => *digest,
+            None => *blake3::hash(&crate::transport::encode_snapshot(last)?).as_bytes(),
+        };
+        if baseline != scan.baseline {
+            bail!("the changes apply to a baseline this side does not hold");
+        }
+        for change in &scan.changes {
+            if let Some(node) = &change.new {
+                node.validate(false).map_err(|message| {
+                    anyhow!("a changed entry is not a valid hierarchy: {message}")
+                })?;
+            }
+        }
+        let root = crate::tree::apply(last.root.as_ref(), &scan.changes)
+            .map_err(|message| anyhow!("the changes do not apply: {message}"))?;
+        let snapshot = Snapshot {
+            root,
+            ..scan.head.clone()
+        };
+        let encoding = crate::transport::encode_snapshot(&snapshot)?;
+        if *blake3::hash(&encoding).as_bytes() != scan.digest {
+            bail!("the snapshot built from the changes does not match the agent's digest");
+        }
+        Ok((snapshot, encoding))
     }
 
     /// Pulls a delta's operations and applies them to the baseline this
@@ -928,6 +1006,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Recorded { .. } => "recorded",
         Response::PeeringState(_) => "peering state",
         Response::ScanProgress { .. } => "scan progress",
+        Response::ScanChanges(_) => "scan changes",
     }
 }
 

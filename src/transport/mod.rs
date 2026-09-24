@@ -49,7 +49,7 @@ use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::protocol::{self, Handshake, Initialize, Request, Response};
 use crate::scan::IgnoreSet;
-use crate::tree::Snapshot;
+use crate::tree::{path_join, Change, Node, Snapshot};
 
 /// The remote command used by [`Connection::ssh_argv`] when no override is
 /// provided.
@@ -692,7 +692,7 @@ fn serve_channel<W: Write + Send>(
                             generation: endpoint.generation().unwrap_or(0),
                         });
                     }
-                    let (header, encoding) = snapshot_delta(
+                    let (answer, encoding) = changed_scan(
                         &snapshot,
                         last_sent.as_ref(),
                         last_sent_encoding.as_ref(),
@@ -701,14 +701,14 @@ fn serve_channel<W: Write + Send>(
                     )?;
                     anchor = Anchor::To(Some(snapshot));
                     anchor_encoding = Some(encoding);
-                    Ok(Response::ScanDelta(header))
+                    Ok(answer)
                 }),
             Request::ScanVerified => {
                 { reporting_scan(output, channel, &counted, || endpoint.scan_verified()) }.and_then(
                     |snapshot| {
                         // Never elided: the entire point is a full re-read whose
                         // result the controller sees in full.
-                        let (header, encoding) = snapshot_delta(
+                        let (answer, encoding) = changed_scan(
                             &snapshot,
                             last_sent.as_ref(),
                             last_sent_encoding.as_ref(),
@@ -717,7 +717,7 @@ fn serve_channel<W: Write + Send>(
                         )?;
                         anchor = Anchor::To(Some(snapshot));
                         anchor_encoding = Some(encoding);
-                        Ok(Response::ScanDelta(header))
+                        Ok(answer)
                     },
                 )
             }
@@ -842,6 +842,149 @@ fn anchor_after_transition(sent: Option<&Snapshot>, folded: Option<&Snapshot>) -
 /// snapshot this channel last sent, or `None` for a full stream), leaving
 /// the operations queued for `ScanPull` and returning the header.
 ///
+/// The largest change set sent as changes; a bigger one goes as a byte
+/// delta, which bounds what one answer can carry (a new subtree is sent
+/// whole) and suits a rewrite of much of the tree better anyway.
+const SCAN_CHANGES_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Answers a changed scan: as the changes from the snapshot last sent when
+/// the channel has that snapshot's encoding to name as the baseline and the
+/// changes are small, and as a byte delta otherwise. Returns the answer
+/// and the new snapshot's encoding, which becomes the next baseline.
+fn changed_scan(
+    snapshot: &Snapshot,
+    last_sent: Option<&Snapshot>,
+    last_sent_encoding: Option<&(Vec<u8>, crate::tree::Digest)>,
+    pending: &mut std::collections::VecDeque<crate::rsync::Op>,
+    generation: u64,
+) -> Result<(Response, (Vec<u8>, crate::tree::Digest))> {
+    if let Some(sent) = last_sent {
+        let changes = exact_changes(sent.root.as_ref(), snapshot.root.as_ref());
+        let small =
+            bincode::serialized_size(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
+        if small {
+            // The baseline's digest: kept from the scan that sent it, or —
+            // after a transition refolded it — encoded now, which is still
+            // far cheaper than the byte delta it would otherwise take.
+            let baseline = match last_sent_encoding {
+                Some((_, digest)) => *digest,
+                None => *blake3::hash(&encode_snapshot(sent)?).as_bytes(),
+            };
+            let target = encode_snapshot(snapshot)?;
+            let digest = *blake3::hash(&target).as_bytes();
+            let head = Snapshot {
+                root: None,
+                ..snapshot.clone()
+            };
+            let answer = Response::ScanChanges(protocol::ScanChanges {
+                generation,
+                baseline,
+                digest,
+                head,
+                changes,
+            });
+            return Ok((answer, (target, digest)));
+        }
+    }
+    let (header, encoding) =
+        snapshot_delta(snapshot, last_sent, last_sent_encoding, pending, generation)?;
+    Ok((Response::ScanDelta(header), encoding))
+}
+
+/// The changes that turn `base` into `target` *exactly* — scan metadata
+/// included, which `tree::diff` rightly ignores — so that applying them
+/// reproduces `target`'s encoding byte for byte. Each carries only its new
+/// content. Subtrees sharing storage are skipped without a walk, which is
+/// what makes this cost the size of the change: a scan adopts what it did
+/// not revisit.
+pub(crate) fn exact_changes(base: Option<&Node>, target: Option<&Node>) -> Vec<Change> {
+    fn same_leaf(a: &Node, b: &Node) -> bool {
+        use crate::tree::Content;
+        match (&a.content, &b.content) {
+            (
+                Content::File {
+                    digest: d1,
+                    executable: e1,
+                    metadata: m1,
+                },
+                Content::File {
+                    digest: d2,
+                    executable: e2,
+                    metadata: m2,
+                },
+            ) => d1 == d2 && e1 == e2 && m1 == m2,
+            (Content::Symlink { target: t1 }, Content::Symlink { target: t2 }) => t1 == t2,
+            (Content::Untracked, Content::Untracked) => true,
+            (Content::Problematic { message: m1 }, Content::Problematic { message: m2 }) => {
+                m1 == m2
+            }
+            _ => false,
+        }
+    }
+    fn walk(path: &str, base: Option<&Node>, target: Option<&Node>, changes: &mut Vec<Change>) {
+        use crate::tree::Content;
+        let replace = |changes: &mut Vec<Change>| {
+            changes.push(Change {
+                path: path.to_owned(),
+                old: None,
+                new: target.cloned(),
+            })
+        };
+        match (base, target) {
+            (None, None) => {}
+            (Some(b), Some(t)) => match (&b.content, &t.content) {
+                (Content::Directory(left), Content::Directory(right)) => {
+                    if std::sync::Arc::ptr_eq(left, right) {
+                        return;
+                    }
+                    let (mut i, mut j) = (0, 0);
+                    while i < left.len() || j < right.len() {
+                        let order = match (left.get(i), right.get(j)) {
+                            (Some(l), Some(r)) => l.name.cmp(&r.name),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => unreachable!(),
+                        };
+                        match order {
+                            std::cmp::Ordering::Less => {
+                                let child = &left[i];
+                                walk(&path_join(path, &child.name), Some(child), None, changes);
+                                i += 1;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                let child = &right[j];
+                                walk(&path_join(path, &child.name), None, Some(child), changes);
+                                j += 1;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                let child = &left[i];
+                                walk(
+                                    &path_join(path, &child.name),
+                                    Some(child),
+                                    Some(&right[j]),
+                                    changes,
+                                );
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
+                }
+                (Content::Directory(_), _) | (_, Content::Directory(_)) => replace(changes),
+                _ => {
+                    if !same_leaf(b, t) {
+                        replace(changes);
+                    }
+                }
+            },
+            _ => replace(changes),
+        }
+    }
+    let mut changes = Vec::new();
+    walk("", base, target, &mut changes);
+    changes
+}
+
 /// The baseline's encoding is the one the scan that produced it made, when
 /// the caller kept it (`baseline_encoding`), and is re-encoded otherwise —
 /// after a transition's fold. The new snapshot's encoding comes back for
@@ -2188,5 +2331,108 @@ pub(crate) mod tests {
             assert!(entries >= last && entries > 0 && bytes == entries * 10);
             last = entries;
         }
+    }
+
+    #[test]
+    fn exact_changes_reproduce_the_target_encoding() {
+        use crate::tree::{apply, Content, FileMetadata, Node};
+        use std::sync::Arc;
+        let file = |name: &str, byte: u8, mtime: i64| Node {
+            name: name.into(),
+            content: Content::File {
+                digest: [byte; 32],
+                executable: false,
+                metadata: FileMetadata {
+                    mtime_seconds: mtime,
+                    size: u64::from(byte),
+                    ..FileMetadata::default()
+                },
+            },
+        };
+        let shared = Node::directory(
+            "shared",
+            (0..50).map(|i| file(&format!("s{i:02}"), 1, 5)).collect(),
+        );
+        let base = Node::directory(
+            "",
+            vec![
+                Node::directory(
+                    "d",
+                    vec![file("a", 1, 10), file("b", 2, 10), file("c", 3, 10)],
+                ),
+                file("becomes-dir", 4, 10),
+                Node::directory("becomes-file", vec![file("x", 5, 10)]),
+                shared.clone(),
+                Node {
+                    name: "link".into(),
+                    content: Content::Symlink {
+                        target: "d/a".into(),
+                    },
+                },
+            ],
+        );
+        let target = Node::directory(
+            "",
+            vec![
+                // a: metadata only (a touch); b: content; c: removed; e: added.
+                Node::directory(
+                    "d",
+                    vec![file("a", 1, 11), file("b", 9, 10), file("e", 6, 10)],
+                ),
+                Node::directory("becomes-dir", vec![file("y", 7, 10)]),
+                file("becomes-file", 8, 10),
+                shared,
+                Node {
+                    name: "link".into(),
+                    content: Content::Symlink {
+                        target: "d/e".into(),
+                    },
+                },
+                Node {
+                    name: "skipped".into(),
+                    content: Content::Untracked,
+                },
+            ],
+        );
+        let changes = exact_changes(Some(&base), Some(&target));
+        // The shared subtree is not walked, and nothing unchanged is sent.
+        assert!(
+            changes
+                .iter()
+                .all(|change| !change.path.starts_with("shared")),
+            "{changes:?}"
+        );
+        assert!(changes.iter().all(|change| change.old.is_none()));
+        let paths: Vec<&str> = changes.iter().map(|change| change.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "becomes-dir",
+                "becomes-file",
+                "d/a",
+                "d/b",
+                "d/c",
+                "d/e",
+                "link",
+                "skipped"
+            ]
+        );
+        let built = apply(Some(&base), &changes).unwrap();
+        let snapshot = |root: Option<Node>| Snapshot {
+            root,
+            files: 9,
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            encode_snapshot(&snapshot(built)).unwrap(),
+            encode_snapshot(&snapshot(Some(target.clone()))).unwrap(),
+            "applying the changes must reproduce the encoding exactly"
+        );
+        // Identical storage: no changes at all.
+        assert!(exact_changes(Some(&target), Some(&target)).is_empty());
+        // From nothing, and to nothing: the root itself.
+        assert_eq!(exact_changes(None, Some(&target)).len(), 1);
+        assert_eq!(exact_changes(Some(&target), None).len(), 1);
+        let _ = Arc::<()>::default();
     }
 }

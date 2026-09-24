@@ -902,6 +902,17 @@ fn run_sync(
     let alpha_identity = identity_from(&alpha, &alpha_frozen);
     let beta_identity = identity_from(&beta, &beta_frozen);
     let identifier = session_identifier(&alpha_identity, &beta_identity);
+    // The topology a configured session is held to, before anything opens.
+    let target = |spec: &str, agent: &Option<String>, frozen: &Option<PathBuf>| {
+        autobahn::config::EndpointTarget::manual(spec, agent.as_deref(), frozen.as_deref())
+    };
+    autobahn::config::check_session_topology(
+        &target(&alpha, &alpha_agent, &alpha_frozen),
+        &target(&beta, &beta_agent, &beta_frozen),
+        &alpha_identity,
+        &beta_identity,
+    )
+    .map_err(|problem| anyhow::anyhow!("{alpha} and {beta}: {problem}"))?;
     let state_directory = match state_dir {
         Some(directory) => directory,
         None => paths::default_state_root()?

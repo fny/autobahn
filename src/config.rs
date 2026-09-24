@@ -206,7 +206,7 @@ read -r _
 "##;
 
 use std::collections::{BTreeMap, HashMap};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -630,6 +630,27 @@ pub enum EndpointTarget {
     },
 }
 
+impl EndpointTarget {
+    /// The target `autobahn sync ALPHA BETA` builds for one side: the
+    /// frozen resolution of a local root, or the remote root an agent
+    /// command or SSH reaches. What the topology checks compare.
+    pub fn manual(spec: &str, agent: Option<&str>, frozen: Option<&Path>) -> EndpointTarget {
+        if let Some(path) = frozen {
+            return EndpointTarget::Local(path.to_owned());
+        }
+        let (destination, path) = match agent {
+            Some(_) => ("", spec),
+            None => spec.split_once(':').unwrap_or(("", spec)),
+        };
+        EndpointTarget::Remote {
+            destination: destination.to_owned(),
+            path: path.to_owned(),
+            agent_command: agent
+                .map(|command| command.split_whitespace().map(str::to_owned).collect()),
+        }
+    }
+}
+
 impl SessionPlan {
     /// Returns the display name of the session (`group@host`).
     pub fn display(&self) -> String {
@@ -703,28 +724,95 @@ fn target_identity(target: &EndpointTarget) -> String {
     }
 }
 
-/// Reports how two endpoint identities overlap on disk, when that is
-/// determinable: equal, or one containing the other. Local identities are
-/// resolved physical paths, so containment is a path-prefix test on a
-/// component boundary. Remote identities can only be compared textually,
-/// and only against the same destination; a remote path that reaches the
-/// same tree through a different spelling is undetectable from here.
-fn overlap(alpha: &str, beta: &str) -> Option<&'static str> {
-    if alpha == beta {
-        return Some("the same tree");
+/// Where an endpoint's tree sits, for comparing it with another: the
+/// scope in which paths are comparable at all (`None` for this machine,
+/// the destination and transport for a remote), and the path split into
+/// components. Local identities are resolved physical paths, split by
+/// [`Path::components`]. Remote identities can only be compared
+/// textually, and only within one scope, so a remote path is normalized
+/// just enough that spelling never matters where it cannot mean
+/// anything: empty and `.` components are dropped, `..` is kept as it
+/// is, and a leading `/` is kept as a component of its own, since
+/// `/tree` and a home-relative `tree` are different trees.
+#[derive(Debug, PartialEq)]
+struct Place {
+    scope: Option<(String, Option<Vec<String>>)>,
+    components: Vec<String>,
+}
+
+impl Place {
+    fn of(target: &EndpointTarget, identity: &str) -> Place {
+        match target {
+            EndpointTarget::Local(_) => Place {
+                scope: None,
+                components: Path::new(identity)
+                    .components()
+                    .filter(|component| !matches!(component, Component::CurDir))
+                    .map(|component| component.as_os_str().to_string_lossy().into_owned())
+                    .collect(),
+            },
+            EndpointTarget::Remote {
+                destination,
+                path,
+                agent_command,
+            } => Place {
+                scope: Some((destination.clone(), agent_command.clone())),
+                components: path
+                    .starts_with('/')
+                    .then(|| "/".to_owned())
+                    .into_iter()
+                    .chain(
+                        path.split('/')
+                            .filter(|component| !component.is_empty() && *component != ".")
+                            .map(str::to_owned),
+                    )
+                    .collect(),
+            },
+        }
     }
-    let contains = |outer: &str, inner: &str| {
-        inner
-            .strip_prefix(outer)
-            .is_some_and(|rest| rest.starts_with('/'))
+
+    /// The path of `inner` relative to this place, when this place
+    /// strictly contains it: the question an ignore pattern answers.
+    fn contains(&self, inner: &Place) -> Option<String> {
+        (self.scope == inner.scope
+            && self.components.len() < inner.components.len()
+            && inner.components.starts_with(&self.components))
+        .then(|| inner.components[self.components.len()..].join("/"))
+    }
+}
+
+/// Refuses a session whose two sides are one tree, or one inside the
+/// other: the session would consume its own output. Reconciliation sees
+/// the copy as divergence and, in replica mode, deletes the alpha root
+/// through the beta path. This was reproduced, not hypothesized, first
+/// from a configuration and then from `autobahn sync ALPHA BETA`, so every
+/// way of building a session asks this before any endpoint opens.
+///
+/// The identities are the resolved ones the session is identified by, so
+/// a symlink alias or a trailing `/.` is the same tree. Relays, where one
+/// session's beta feeds another's alpha, are a different question and
+/// stay legal: only overlap within a single session is self-referential.
+pub fn check_session_topology(
+    alpha: &EndpointTarget,
+    beta: &EndpointTarget,
+    alpha_identity: &str,
+    beta_identity: &str,
+) -> Result<(), String> {
+    let alpha = Place::of(alpha, alpha_identity);
+    let beta = Place::of(beta, beta_identity);
+    let how = if alpha == beta {
+        "the same tree"
+    } else if alpha.contains(&beta).is_some() {
+        "a tree inside the alpha"
+    } else if beta.contains(&alpha).is_some() {
+        "a tree containing the alpha"
+    } else {
+        return Ok(());
     };
-    if contains(alpha, beta) {
-        return Some("a tree inside the alpha");
-    }
-    if contains(beta, alpha) {
-        return Some("a tree containing the alpha");
-    }
-    None
+    Err(format!(
+        "the beta is {how}; a session cannot synchronize a tree with itself or \
+         with a tree that contains it"
+    ))
 }
 
 fn default_reload() -> bool {
@@ -1300,34 +1388,11 @@ impl Config {
                     peering,
                     identifier,
                 };
-                // A beta that is the alpha, or nested either way around,
-                // makes the session consume its own output: reconciliation
-                // sees the copy as divergence and, in replica mode,
-                // deletes the alpha root through the beta path. This was
-                // reproduced, not hypothesized — the check is load-bearing.
-                // (Relays — one session's beta feeding another's alpha —
-                // remain legal: only overlap within a single session is
-                // self-referential.)
-                let comparable = matches!(
-                    (&plan.alpha, &plan.beta),
-                    (EndpointTarget::Local(_), EndpointTarget::Local(_))
-                ) || matches!(
-                    (&plan.alpha, &plan.beta),
-                    (
-                        EndpointTarget::Remote { destination: a, .. },
-                        EndpointTarget::Remote { destination: b, .. },
-                    ) if a == b
-                );
-                if comparable {
-                    if let Some(how) = overlap(&alpha_identity, &beta_identity) {
-                        errors.push(format!(
-                            "session '{}': the beta is {how}; a session cannot \
-                             synchronize a tree with itself or with a tree that \
-                             contains it",
-                            plan.display()
-                        ));
-                        continue;
-                    }
+                if let Err(problem) =
+                    check_session_topology(&plan.alpha, &plan.beta, &alpha_identity, &beta_identity)
+                {
+                    errors.push(format!("session '{}': {problem}", plan.display()));
+                    continue;
                 }
                 if let Some(previous) =
                     identities.insert((alpha_identity, beta_identity), plan.display())
@@ -1368,27 +1433,29 @@ impl Config {
                 true
             }
         };
-        let mut endpoints: Vec<(String, bool, String)> = Vec::new();
+        let mut endpoints: Vec<(String, Place, bool, String)> = Vec::new();
         for plan in &plans {
             endpoints.push((
                 plan.alpha_identity.clone(),
+                Place::of(&plan.alpha, &plan.alpha_identity),
                 writable(plan, true),
                 plan.display(),
             ));
             endpoints.push((
                 plan.beta_identity.clone(),
+                Place::of(&plan.beta, &plan.beta_identity),
                 writable(plan, false),
                 plan.display(),
             ));
         }
-        for (index, (identity, writes, owner)) in endpoints.iter().enumerate() {
-            for (offset, (other_identity, other_writes, other_owner)) in
+        for (index, (identity, place, writes, owner)) in endpoints.iter().enumerate() {
+            for (offset, (other_identity, other_place, other_writes, other_owner)) in
                 endpoints.iter().enumerate().skip(index + 1)
             {
                 if owner == other_owner {
                     continue; // within-session overlap is checked above
                 }
-                if identity == other_identity {
+                if place == other_place {
                     // Sessions sharing an endpoint *exactly* are the
                     // fan-out, star and relay topologies. They are not
                     // remarked on: they share one observer and one scan of
@@ -1401,20 +1468,16 @@ impl Config {
                     // mode, documented with the modes.
                     continue;
                 }
-                let contains = |outer: &str, inner: &str| {
-                    inner
-                        .strip_prefix(outer)
-                        .is_some_and(|rest| rest.starts_with('/'))
-                };
                 // Which one contains which decides both the message and,
                 // below, whose ignore patterns are consulted.
-                let (outer, inner, outer_index) = if contains(identity, other_identity) {
-                    (identity, other_identity, index)
-                } else if contains(other_identity, identity) {
-                    (other_identity, identity, offset)
-                } else {
-                    continue;
-                };
+                let (outer, inner, outer_index, relative) =
+                    if let Some(relative) = place.contains(other_place) {
+                        (identity, other_identity, index, relative)
+                    } else if let Some(relative) = other_place.contains(place) {
+                        (other_identity, identity, offset, relative)
+                    } else {
+                        continue;
+                    };
                 if !*writes && !*other_writes {
                     continue; // two read-only sources cannot disagree
                 }
@@ -1428,14 +1491,8 @@ impl Config {
                 // Endpoints are pushed two per plan, alpha then beta, so an
                 // endpoint at index i belongs to plan i / 2.
                 let outer_plan = &plans[outer_index / 2];
-                let excluded = std::path::Path::new(inner)
-                    .strip_prefix(outer)
-                    .ok()
-                    .and_then(|relative| relative.to_str())
-                    .is_some_and(|relative| {
-                        IgnoreSet::new(&outer_plan.ignores)
-                            .is_ok_and(|ignores| ignores.ignored(relative, true))
-                    });
+                let excluded = IgnoreSet::new(&outer_plan.ignores)
+                    .is_ok_and(|ignores| ignores.ignored(&relative, true));
                 if excluded {
                     continue;
                 }
@@ -2526,6 +2583,94 @@ betas = ["build.example.com:/tmp/beta"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);
+    }
+
+    /// Containment compares path components, so a root of `/` contains
+    /// everything, a trailing separator never matters, and a name that
+    /// merely begins with another is a different tree. Remote paths are
+    /// compared only within one destination.
+    #[test]
+    fn containment_is_decided_by_components() {
+        let local = |path: &str| EndpointTarget::Local(PathBuf::from(path));
+        let remote = |destination: &str, path: &str| EndpointTarget::Remote {
+            destination: destination.to_owned(),
+            path: path.to_owned(),
+            agent_command: None,
+        };
+        let check = |alpha: &EndpointTarget, beta: &EndpointTarget| {
+            let identity = |target: &EndpointTarget| match target {
+                EndpointTarget::Local(path) => path.to_string_lossy().into_owned(),
+                EndpointTarget::Remote {
+                    destination, path, ..
+                } => format!("{destination}:{path}"),
+            };
+            check_session_topology(alpha, beta, &identity(alpha), &identity(beta))
+        };
+        for (alpha, beta, how) in [
+            (local("/"), local("/srv/project"), "inside the alpha"),
+            (local("/srv/"), local("/srv/project"), "inside the alpha"),
+            (
+                local("/srv/project"),
+                local("/srv/"),
+                "containing the alpha",
+            ),
+            (
+                local("/srv/project/"),
+                local("/srv/project"),
+                "the same tree",
+            ),
+            (
+                remote("host", "/tree/"),
+                remote("host", "/tree/nested"),
+                "inside the alpha",
+            ),
+            (
+                remote("host", "/tree/./nested//"),
+                remote("host", "/tree/nested"),
+                "the same tree",
+            ),
+            (
+                remote("host", "/"),
+                remote("host", "/tree"),
+                "inside the alpha",
+            ),
+        ] {
+            let problem = check(&alpha, &beta).expect_err("an overlap");
+            assert!(problem.contains(how), "{alpha:?} vs {beta:?}: {problem}");
+        }
+        for (alpha, beta) in [
+            (local("/srv/pro"), local("/srv/project")),
+            (local("/srv/project"), local("/srv/pro")),
+            (remote("host", "/tree"), remote("other", "/tree/nested")),
+            // A home-relative remote path is not the absolute one.
+            (remote("host", "tree"), remote("host", "/tree/nested")),
+            // Nor is a remote root comparable with a local one.
+            (local("/tree"), remote("host", "/tree/nested")),
+            (remote("host", "/tree/.."), remote("host", "/other")),
+        ] {
+            assert!(check(&alpha, &beta).is_ok(), "{alpha:?} vs {beta:?}");
+        }
+    }
+
+    /// The same component rule holds across sessions: a writable endpoint
+    /// under a root of `/` is nested inside it.
+    #[test]
+    fn a_root_of_slash_contains_every_other_session() {
+        let config = parse(
+            r#"
+            [groups.everything]
+            alpha = "/"
+            mode = "one-way-safe"
+            betas = ["host:/backup"]
+
+            [groups.project]
+            alpha = "/srv/project"
+            mode = "two-way-safe"
+            betas = ["/laptop/project"]
+            "#,
+        );
+        let error = format!("{:#}", config.plans().expect_err("plans should fail"));
+        assert!(error.contains("/srv/project is nested inside /"), "{error}");
     }
 
     /// A nested endpoint the outer session ignores is not shared with it:

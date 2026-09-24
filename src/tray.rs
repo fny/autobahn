@@ -36,6 +36,7 @@ enum Wake {
 
 use crate::config::SessionPlan;
 use crate::supervisor::{status_report, StatusReport};
+use crate::text::display_safe;
 
 /// How often the report is refreshed.
 const POLL: Duration = Duration::from_secs(3);
@@ -491,18 +492,17 @@ impl App {
         let error_text = self
             .last_error
             .as_deref()
-            .map(|e| format!("⚠ {e}"))
+            .map(|e| format!("⚠ {}", display_safe(e)))
             .or_else(|| {
-                report
-                    .config_notice
-                    .as_ref()
-                    .map(|notice| format!("⚠ configuration refused: {}", notice.message))
+                report.config_notice.as_ref().map(|notice| {
+                    format!("⚠ configuration refused: {}", display_safe(&notice.message))
+                })
             })
             .or_else(|| {
                 report
                     .supervisor_mismatch
                     .as_ref()
-                    .map(|mismatch| format!("⚠ {mismatch}"))
+                    .map(|mismatch| format!("⚠ {}", display_safe(mismatch)))
             });
         set_optional(&model.menu, &model.summary, &mut model.error, error_text);
         if let Some(tray) = &self.tray {
@@ -559,10 +559,12 @@ impl App {
                     }
                 };
                 entry.line.set_text(line);
-                let detail_text = session
-                    .error
-                    .as_deref()
-                    .map(|error| format!("      {}", error.rsplit(": ").next().unwrap_or(error)));
+                let detail_text = session.error.as_deref().map(|error| {
+                    format!(
+                        "      {}",
+                        display_safe(error.rsplit(": ").next().unwrap_or(error))
+                    )
+                });
                 set_optional(&items.submenu, &entry.line, &mut entry.detail, detail_text);
 
                 // Conflicts: remove the ones that are gone, add the ones
@@ -584,7 +586,9 @@ impl App {
                     {
                         continue;
                     }
-                    let item = Submenu::new(format!("      ⚠ {}", conflict.path), true);
+                    // Shown escaped; the action keeps the name on disk.
+                    let item =
+                        Submenu::new(format!("      ⚠ {}", display_safe(&conflict.path)), true);
                     let mut add = |label: String, action: Action| {
                         let choice = MenuItem::new(label, true, None);
                         self.actions.insert(choice.id().clone(), action);
@@ -658,7 +662,7 @@ impl App {
             if let Some(notice) = &report.config_notice {
                 notify_with(
                     "autobahn",
-                    &format!("configuration refused: {}", notice.message),
+                    &format!("configuration refused: {}", display_safe(&notice.message)),
                     crate::icon::ensure(&self.state_root),
                 );
             }

@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use autobahn::text::display_safe;
 use clap::{Parser, Subcommand, ValueEnum};
 
 mod pager;
@@ -2020,6 +2021,29 @@ fn common_prefix(paths: &[&str]) -> String {
     prefix.join("/")
 }
 
+/// A root-relative path as it goes into a command to paste: bare when
+/// the shell and the command line would read it as itself, quoted as one
+/// word otherwise, and
+/// shown escaped rather than quoted when it holds a control character,
+/// since no quoting makes a newline safe to paste.
+fn pasteable(path: &str) -> String {
+    if path.chars().any(char::is_control) {
+        return display_safe(path).into_owned();
+    }
+    // A leading `-` would be read as a flag, quoted or not; `./` in front
+    // keeps it a path, and `resolve` takes the `./` off again.
+    let path = match path.starts_with('-') {
+        true => format!("./{path}"),
+        false => path.to_owned(),
+    };
+    let plain = |c: char| c.is_alphanumeric() || "._/-+@,:=%".contains(c);
+    if !path.is_empty() && path.chars().all(plain) {
+        path
+    } else {
+        autobahn::text::shell_quote(&path)
+    }
+}
+
 /// `path` quoted as one shell word, except that a leading `~` stays
 /// outside the quotes as `"$HOME"`, so a root written home-relative still
 /// expands on the side that runs the command.
@@ -2240,7 +2264,10 @@ fn run_issues(
             total += 1;
             println!("\n    \x1b[31m{state}\x1b[0m");
             if let Some(error) = &status.error {
-                println!("      {}", error.trim_start_matches("halted: "));
+                println!(
+                    "      {}",
+                    display_safe(error.trim_start_matches("halted: "))
+                );
             }
             if state == "halted" {
                 println!("      fix: make the two sides agree, then it resumes");
@@ -2265,10 +2292,11 @@ fn run_issues(
         // folder, and the reader drills in from there.
         if let Some(depth) = depth {
             for (prefix, count) in roll_up(&selected, depth + below) {
+                let shown = display_safe(&prefix);
                 match count {
-                    1 if selected.contains(&&prefix) => println!("    {prefix}"),
-                    1 => println!("    {prefix} — 1 conflict"),
-                    count => println!("    {prefix} — {count} conflicts"),
+                    1 if selected.contains(&&prefix) => println!("    {shown}"),
+                    1 => println!("    {shown} — 1 conflict"),
+                    count => println!("    {shown} — {count} conflicts"),
                 }
             }
             println!(
@@ -2284,7 +2312,7 @@ fn run_issues(
                 .conflict_details
                 .iter()
                 .find(|detail| &&detail.path == path);
-            println!("      {path}");
+            println!("      {}", display_safe(path));
             if let Some(detail) = detail {
                 let describe = |side: &autobahn::supervisor::ConflictSide| -> String {
                     if !side.present {
@@ -2319,14 +2347,20 @@ fn run_issues(
                         "        {name} holds {count} synchronization cannot carry, \
                          so neither side is overwritten"
                     );
-                    println!("          {} — {}", blocking.example, blocking.reason);
+                    println!(
+                        "          {} — {}",
+                        display_safe(&blocking.example),
+                        display_safe(&blocking.reason)
+                    );
                 }
             }
         }
         if !selected.is_empty() {
+            // A path to paste, so quoted where the shell would read it as
+            // something else, and never with a control character in it.
             let where_ = match &scope {
-                Some(scope) => scope.clone(),
-                None if selected.len() == 1 => selected[0].clone(),
+                Some(scope) => pasteable(scope),
+                None if selected.len() == 1 => pasteable(selected[0]),
                 None => "<path>".to_owned(),
             };
             println!(
@@ -2351,11 +2385,13 @@ fn run_issues(
         }
         for (side, cause, paths) in &causes {
             println!(
-                "\n    \x1b[33m{} on {side}\x1b[0m \x1b[2m— {cause}\x1b[0m",
+                "\n    \x1b[33m{} on {}\x1b[0m \x1b[2m— {}\x1b[0m",
                 match paths.len() {
                     1 => "1 blocked".to_owned(),
                     many => format!("{many} blocked"),
-                }
+                },
+                display_safe(side),
+                display_safe(cause)
             );
             // One cause can still cover unrelated places. These twenty
             // are one permission problem in `azure` and another in
@@ -2366,14 +2402,18 @@ fn run_issues(
                 match (count, prefix.as_str()) {
                     (1, _) => println!(
                         "      {}",
-                        paths
-                            .iter()
-                            .find(|path| path.starts_with(&prefix))
-                            .copied()
-                            .unwrap_or(&prefix)
+                        display_safe(
+                            paths
+                                .iter()
+                                .find(|path| path.starts_with(&prefix))
+                                .copied()
+                                .unwrap_or(&prefix)
+                        )
                     ),
                     (count, "") => println!("      {count} paths"),
-                    (count, prefix) => println!("      {count} under {prefix}/"),
+                    (count, prefix) => {
+                        println!("      {count} under {}/", display_safe(prefix))
+                    }
                 }
                 for (index, fix) in blocked_fix(side, cause, &prefix, plan).iter().enumerate() {
                     match index {
@@ -2386,7 +2426,7 @@ fn run_issues(
     }
     if total == 0 {
         match (&scope, &filter) {
-            (Some(scope), _) => println!("nothing needs you under {scope}"),
+            (Some(scope), _) => println!("nothing needs you under {}", display_safe(scope)),
             (None, Some(pattern)) => println!("nothing needs you matching {pattern:?}"),
             (None, None) => println!("nothing needs you"),
         }
@@ -2472,7 +2512,7 @@ fn confirmed(
         many => format!("{many} conflicts"),
     };
     match scope {
-        Some(scope) => println!("about to resolve {what} under {scope}:"),
+        Some(scope) => println!("about to resolve {what} under {}:", display_safe(scope)),
         None => println!("about to resolve {what}:"),
     }
 
@@ -2497,13 +2537,13 @@ fn confirmed(
     // do, because their conflicts differ.
     if targets.len() == 1 {
         for path in &targets[0].1 {
-            println!("  {path}");
+            println!("  {}", display_safe(path));
         }
     } else {
         for (plan, paths) in targets {
             println!("  {}", plan.beta_spec());
             for path in paths {
-                println!("    {path}");
+                println!("    {}", display_safe(path));
             }
         }
     }
@@ -3293,7 +3333,11 @@ fn run_resolve(
                     endpoint
                         .rename(&path, &aside)
                         .with_context(|| format!("unable to keep {side}'s {path}"))?;
-                    println!("  {side}: kept {path} as {aside}");
+                    println!(
+                        "  {side}: kept {} as {}",
+                        display_safe(&path),
+                        display_safe(&aside)
+                    );
                     settled += 1;
                 }
                 Action::Retire(expectation) => removals.push(autobahn::tree::Change {
@@ -3345,21 +3389,26 @@ fn run_resolve(
     // Nothing to do, and said so: the sides already hold one version.
     for path in agreed.iter().filter(|path| !acted.contains(*path)) {
         if !blocked.iter().any(|(blocked, ..)| blocked == path) {
-            println!("  {path}: already the same on every side");
+            println!("  {}: already the same on every side", display_safe(path));
         }
     }
 
     // Refused before anything was touched, because the next cycle would
     // not have kept what was asked for.
     for (path, reason) in &unsafe_paths {
-        println!("  {path}: not settled — {reason}.");
+        println!("  {}: not settled — {reason}.", display_safe(path));
     }
 
     // Blocked, and permanently: retiring this side would mean deleting
     // content synchronization never scanned, which it will not do. Saying
     // "try again" here would be a lie, so the ways out are named instead.
     for (path, side, example, reason) in &blocked {
-        println!("  {path}: not settled — {side} holds {example} ({reason}),");
+        let path = display_safe(path);
+        println!(
+            "  {path}: not settled — {side} holds {} ({}),",
+            display_safe(example),
+            display_safe(reason)
+        );
         println!("    which cannot be deleted on your behalf. Either:");
         println!("      · ignore {path} in this group, so it stops being compared, or");
         println!("      · `--keep both`, which moves the version aside instead of deleting it, or");
@@ -3369,7 +3418,11 @@ fn run_resolve(
     // Refused, and possibly transient: the entry moved between the scan
     // and the removal, which is the race the validation exists to catch.
     for (path, error) in &refused {
-        println!("  left alone: {path} — {error}");
+        println!(
+            "  left alone: {} — {}",
+            display_safe(path),
+            display_safe(error)
+        );
     }
     if !refused.is_empty() {
         println!(
@@ -4123,7 +4176,7 @@ fn render_status(
             out,
             "\x1b[33mthe configuration was refused\x1b[0m; the sessions run on under \
              the last one that loaded\n{}\n",
-            notice.message
+            display_safe(&notice.message)
         );
     }
 
@@ -4152,7 +4205,7 @@ fn render_status(
             .1
             .as_ref()
             .filter(|status| !status.role.is_empty())
-            .map(|status| format!("  {} (term {})", status.role, status.term))
+            .map(|status| format!("  {} (term {})", display_safe(&status.role), status.term))
             .unwrap_or_default();
         // A group with nothing to say is one line: every destination
         // synchronized, nothing waiting on anyone, and nothing going on long
@@ -4350,25 +4403,37 @@ fn render_status_entry(
     match (status.conflicts.len(), expand_conflicts) {
         (0, _) => {}
         (1, _) => {
-            let _ = writeln!(out, "    conflicts: 1, {}", status.conflicts[0]);
+            let _ = writeln!(
+                out,
+                "    conflicts: 1, {}",
+                display_safe(&status.conflicts[0])
+            );
         }
         (count, false) => {
-            let _ = writeln!(out, "    conflicts: {count}, first {}", status.conflicts[0]);
+            let _ = writeln!(
+                out,
+                "    conflicts: {count}, first {}",
+                display_safe(&status.conflicts[0])
+            );
         }
         (count, true) => {
             let _ = writeln!(out, "    conflicts: {count}");
             for root in &status.conflicts {
-                let _ = writeln!(out, "      {root}");
+                let _ = writeln!(out, "      {}", display_safe(root));
             }
         }
     }
     match status.blocked.len() {
         0 => {}
         1 => {
-            let _ = writeln!(out, "    blocked: 1, {}", status.blocked[0]);
+            let _ = writeln!(out, "    blocked: 1, {}", display_safe(&status.blocked[0]));
         }
         count => {
-            let _ = writeln!(out, "    blocked: {count}, first {}", status.blocked[0]);
+            let _ = writeln!(
+                out,
+                "    blocked: {count}, first {}",
+                display_safe(&status.blocked[0])
+            );
         }
     }
     if let Some(error) = &status.error {
@@ -4383,7 +4448,7 @@ fn render_status_entry(
         } else {
             "error"
         };
-        let _ = writeln!(out, "    {label}: {detail}");
+        let _ = writeln!(out, "    {label}: {}", display_safe(detail));
     }
 }
 

@@ -23,6 +23,7 @@ use anyhow::Result;
 use autobahn::config::SessionPlan;
 use autobahn::progress::Phase;
 use autobahn::supervisor::{status_report, SessionReport, StatusReport};
+use autobahn::text::display_safe;
 
 /// How often the shop repaints.
 const FRAME: Duration = Duration::from_millis(120);
@@ -559,7 +560,7 @@ impl Shop<'_> {
                     depth: 0,
                     key: format!("fact:{label}"),
                     label: label.to_owned(),
-                    detail,
+                    detail: display_safe(&detail).into_owned(),
                     children: false,
                     act: Act::Nothing,
                 });
@@ -671,13 +672,15 @@ impl Shop<'_> {
         act: &dyn Fn(Vec<String>) -> Act,
         describe: &dyn Fn(&str) -> String,
     ) {
+        // What a row *shows* is escaped; what it acts on stays the name on
+        // disk, since that is what `resolve` has to be given.
         let all: Vec<String> = paths.iter().map(|path| path.to_string()).collect();
         let open = self.expanded.contains(&key);
         rows.push(Row {
             depth: 0,
             key: key.clone(),
-            label,
-            detail,
+            label: display_safe(&label).into_owned(),
+            detail: display_safe(&detail).into_owned(),
             children: true,
             act: act(all),
         });
@@ -701,11 +704,11 @@ impl Shop<'_> {
                 depth: 1,
                 key: place.clone(),
                 label: match single {
-                    true => here[0].to_owned(),
-                    false => format!("{prefix}/"),
+                    true => display_safe(here[0]).into_owned(),
+                    false => format!("{}/", display_safe(&prefix)),
                 },
                 detail: match single {
-                    true => describe(here[0]),
+                    true => display_safe(&describe(here[0])).into_owned(),
                     false => format!("{count}"),
                 },
                 children: !single,
@@ -718,11 +721,9 @@ impl Shop<'_> {
                 rows.push(Row {
                     depth: 2,
                     key: format!("{place}//{path}"),
-                    label: path
-                        .strip_prefix(&format!("{prefix}/"))
-                        .unwrap_or(path)
-                        .to_owned(),
-                    detail: describe(path),
+                    label: display_safe(path.strip_prefix(&format!("{prefix}/")).unwrap_or(path))
+                        .into_owned(),
+                    detail: display_safe(&describe(path)).into_owned(),
                     children: false,
                     act: act(vec![path.to_owned()]),
                 });
@@ -843,14 +844,14 @@ impl Shop<'_> {
         if let Some(mismatch) = &self.report.supervisor_mismatch {
             lines.push(format!(
                 "  \x1b[33m⚠ another build\x1b[0m {}",
-                shorten(mismatch, width.saturating_sub(20))
+                shorten(&display_safe(mismatch), width.saturating_sub(20))
             ));
             lines.push(String::new());
         }
         if let Some(notice) = &self.report.config_notice {
             lines.push(format!(
                 "  \x1b[33m⚠ configuration refused\x1b[0m {}",
-                shorten(&notice.message, width.saturating_sub(28))
+                shorten(&display_safe(&notice.message), width.saturating_sub(28))
             ));
             lines.push(String::new());
         }
@@ -905,7 +906,7 @@ impl Shop<'_> {
             for line in &self.ticker {
                 lines.push(dim(&format!(
                     "  {}",
-                    shorten(line, width.saturating_sub(4))
+                    shorten(&display_safe(line), width.saturating_sub(4))
                 )));
             }
         }
@@ -1123,7 +1124,7 @@ impl Shop<'_> {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
         if let Some(pending) = &self.pending {
-            return format!("\x1b[33m{}\x1b[0m", pending.question);
+            return format!("\x1b[33m{}\x1b[0m", display_safe(&pending.question));
         }
         // The keys are the one part of the screen a reader acts on, so the
         // key itself is bold and its meaning is plain text. Dimming the
@@ -1172,7 +1173,7 @@ impl Shop<'_> {
         };
         match told.as_deref() {
             Some("running") => format!("{keys}{marked}   working…"),
-            Some(told) => format!("{keys}{marked}   {}", dim(told)),
+            Some(told) => format!("{keys}{marked}   {}", dim(&display_safe(told))),
             None => format!("{keys}{marked}"),
         }
     }
@@ -1190,7 +1191,10 @@ fn grid(mut lines: Vec<String>, height: usize, width: usize, footer: String) -> 
     lines.push(footer);
     lines
         .into_iter()
-        .map(|line| pad(&line, width))
+        // Every line of the frame, whatever built it: names are escaped
+        // where the rows are made, and this keeps anything that slipped
+        // past from reaching the terminal as more than text.
+        .map(|line| pad(&crate::pager::only_colour(&line), width))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1978,6 +1982,84 @@ mod tests {
         assert!(
             !plain.contains("leading") && !plain.contains("following"),
             "{plain:?}"
+        );
+    }
+
+    /// A conflicting name with control characters in it is drawn escaped
+    /// in the counter, the heading and the footer, and the shop's own
+    /// colours still draw.
+    #[test]
+    fn a_name_with_control_characters_is_drawn_escaped() {
+        use autobahn::supervisor::{ConflictDetail, ConflictSide, GroupReport, StatusReport};
+        let name = "evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jsettled";
+        let session = SessionReport {
+            host: "boite".into(),
+            beta: "boite:~/w".into(),
+            mode: "two-way-conflict".into(),
+            state: "conflicts".into(),
+            cycles: 1,
+            age_seconds: Some(1),
+            conflicts: vec![ConflictDetail {
+                path: name.into(),
+                alpha: ConflictSide::default(),
+                beta: ConflictSide::default(),
+            }],
+            blocked: vec![format!("beta {name}/x: Permission denied (os error 13)")],
+            error: Some(format!("unable to read {name}")),
+            progress: None,
+            alerts: Vec::new(),
+            alert_after: None,
+            alert_summary: String::new(),
+        };
+        let shop = Shop {
+            plans: Vec::new(),
+            state_root: std::path::PathBuf::new(),
+            config: None,
+            report: StatusReport {
+                version: 4,
+                supervisor_running: true,
+                service: "running".into(),
+                groups: vec![GroupReport {
+                    role: String::new(),
+                    term: 0,
+                    name: "g".into(),
+                    alpha: "~/w".into(),
+                    sessions: vec![session],
+                }],
+                config_notice: None,
+                supervisor_mismatch: None,
+            },
+            cursor: 0,
+            counter: Some(Counter {
+                group: "g".into(),
+                host: "boite".into(),
+                cursor: 0,
+            }),
+            expanded: ["conflicts".to_owned()].into_iter().collect(),
+            marked: BTreeSet::new(),
+            working: Arc::default(),
+            rate: Rate::default(),
+            ticker: vec![format!("settled {name}")],
+            pending: None,
+            help: false,
+            frame: 0,
+        };
+        shop.say(format!("could not settle: {name}"));
+        let frame = shop.draw();
+        assert!(frame.contains("evil\\x1b]52;c;"), "{frame:?}");
+        assert!(
+            frame.contains("\x1b[7m"),
+            "the cursor's own reverse video: {frame:?}"
+        );
+        let mut bare = frame.clone();
+        for colour in [
+            "\x1b[0m", "\x1b[1m", "\x1b[2m", "\x1b[7m", "\x1b[31m", "\x1b[32m", "\x1b[33m",
+        ] {
+            bare = bare.replace(colour, "");
+        }
+        assert!(
+            !bare.contains(|c: char| c.is_control() && c != '\n'),
+            "{bare:?}"
         );
     }
 

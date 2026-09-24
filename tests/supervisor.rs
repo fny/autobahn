@@ -2322,6 +2322,71 @@ fn settling_a_file_named_like_a_flag_settles_only_that_file() {
     assert!(after.contains("notes.txt"), "{after}");
 }
 
+/// Removes the colour sequences autobahn writes itself (`ESC [ … m`), so
+/// what is left can be checked for control characters that came from a
+/// name.
+fn without_colour(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("\x1b[") {
+        out.push_str(&rest[..start]);
+        let tail = &rest[start + 2..];
+        let end = tail.find(|c: char| !(c.is_ascii_digit() || c == ';'));
+        match end {
+            Some(end) if tail[end..].starts_with('m') => rest = &tail[end + 1..],
+            _ => {
+                out.push_str("\x1b[");
+                rest = tail;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// A name chosen by the other side reaches the terminal escaped. Printed
+/// raw, OSC 52 writes the reader's clipboard, and CR or CSI sequences
+/// repaint what `status` and `conflicts` appear to say. `--json` keeps the
+/// name exactly.
+#[test]
+fn a_name_with_control_characters_is_printed_escaped() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("b1");
+    write(&alpha, "seed", "seed");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.r]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+    assert!(cli(&world, &config, &["sync"]).0);
+    let name = "evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jsettled.txt";
+    write(&alpha, name, "a");
+    write(&beta, name, "b");
+    cli(&world, &config, &["sync"]);
+
+    for args in [&["status", "--all", "--conflicts"][..], &["conflicts"][..]] {
+        let (_, text) = cli(&world, &config, args);
+        assert!(text.contains("evil\\x1b]52;c;"), "{args:?}: {text:?}");
+        let bare = without_colour(&text);
+        assert!(
+            !bare.contains(|c: char| c.is_control() && c != '\n'),
+            "{args:?}: {bare:?}"
+        );
+    }
+
+    let (ok, json) = cli(&world, &config, &["conflicts", "--json"]);
+    assert!(ok, "{json}");
+    let report: serde_json::Value = serde_json::from_str(&json).expect("json");
+    let path = &report["groups"][0]["sessions"][0]["conflicts"][0]["path"];
+    assert_eq!(path.as_str(), Some(name), "{json}");
+}
+
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();

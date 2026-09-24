@@ -107,7 +107,7 @@ pub fn display(label: &str, mut content: impl FnMut() -> String) -> Result<()> {
 fn paint(lines: &[&str], offset: usize, window: usize, columns: usize, label: &str) -> String {
     let mut frame = String::new();
     for line in lines.iter().skip(offset).take(window) {
-        frame.push_str(&truncate(line, columns));
+        frame.push_str(&truncate(&only_colour(line), columns));
         frame.push_str("\x1b[K\n");
     }
     // The window is padded to its full height so that a shorter frame does
@@ -137,6 +137,52 @@ fn paint(lines: &[&str], offset: usize, window: usize, columns: usize, label: &s
     ));
     frame.push_str("\x1b[K");
     frame
+}
+
+/// `line` with every control character shown escaped, except the colour
+/// sequences — `ESC [`, digits and semicolons, `m` — that autobahn writes
+/// itself.
+///
+/// The content is rendered with names from the synchronized trees in it,
+/// and those are escaped where they are rendered. This is the backstop:
+/// [`truncate`] keeps escape sequences whole so the colours survive, and
+/// it would keep a sequence that came from a name just as faithfully — a
+/// clipboard write, a cleared screen, a line repainted by a carriage
+/// return. Colour is all a line here ever needs, so colour is all that
+/// passes.
+pub(crate) fn only_colour(line: &str) -> std::borrow::Cow<'_, str> {
+    if !line.contains(char::is_control) {
+        return std::borrow::Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len() + 8);
+    let mut rest = line;
+    while let Some(character) = rest.chars().next() {
+        if let Some(length) = colour_length(rest) {
+            out.push_str(&rest[..length]);
+            rest = &rest[length..];
+            continue;
+        }
+        let mut buffer = [0u8; 4];
+        out.push_str(&autobahn::text::display_safe(
+            character.encode_utf8(&mut buffer),
+        ));
+        rest = &rest[character.len_utf8()..];
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// The length of the colour sequence `text` starts with, if it starts with
+/// one.
+fn colour_length(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    if !bytes.starts_with(b"\x1b[") {
+        return None;
+    }
+    let parameters = bytes[2..]
+        .iter()
+        .take_while(|byte| byte.is_ascii_digit() || **byte == b';')
+        .count();
+    (bytes.get(2 + parameters) == Some(&b'm')).then_some(3 + parameters)
 }
 
 /// Truncates a line to a visible width, leaving its escape sequences
@@ -330,6 +376,41 @@ mod tests {
         assert!(frame.contains("4 lines"));
         assert!(frame.contains("q quit"));
         assert!(!frame.contains("PgUp"));
+    }
+
+    /// A line holding control characters from a name paints them escaped,
+    /// and autobahn's own colours still paint as colours.
+    #[test]
+    fn only_colour_reaches_the_terminal() {
+        let line =
+            "\x1b[33mconflicts\x1b[0m: evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jdone\x1b[1;32m!\x1b[0m";
+        let frame = paint(&[line], 0, 1, 200, "watching");
+        assert!(frame.contains("\x1b[33mconflicts\x1b[0m"), "{frame:?}");
+        assert!(frame.contains("\x1b[1;32m!"), "{frame:?}");
+        assert!(
+            frame.contains("evil\\x1b]52;c;cHduZWQ=\\x07\\r\\x1b[2Jdone"),
+            "{frame:?}"
+        );
+        let bare = frame
+            .replace("\x1b[33m", "")
+            .replace("\x1b[1;32m", "")
+            .replace("\x1b[2m", "")
+            .replace("\x1b[0m", "")
+            .replace("\x1b[K", "");
+        assert!(
+            !bare.contains(|c: char| c.is_control() && c != '\n'),
+            "{bare:?}"
+        );
+        // Only a line with no control character at all is passed through
+        // uncopied.
+        assert!(matches!(
+            only_colour("plain \x1b[2mdim\x1b[0m"),
+            std::borrow::Cow::Owned(_)
+        ));
+        assert!(matches!(
+            only_colour("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
     }
 
     #[test]

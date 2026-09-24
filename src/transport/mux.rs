@@ -179,7 +179,16 @@ impl AgentConnection {
                             .expect("the state lock is never poisoned");
                         match state.channels.get_mut(&channel) {
                             Some(slot) if slot.outstanding > 0 => {
-                                slot.outstanding -= 1;
+                                // A scan's progress report comes ahead of
+                                // its answer and does not answer it: the
+                                // request stays owed until the answer does.
+                                // Counted as an answer, the real one that
+                                // follows read as unsolicited and failed the
+                                // connection — every remote scan longer
+                                // than the report interval.
+                                if !matches!(response, Response::ScanProgress { .. }) {
+                                    slot.outstanding -= 1;
+                                }
                                 // A failed send means the channel handle is
                                 // being dropped; its close is on the way.
                                 let _ = slot.sender.send(response);
@@ -858,6 +867,67 @@ mod tests {
         );
         // Reaped: the pid no longer refers to a process (or zombie) of ours.
         assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+    }
+
+    #[test]
+    fn a_scan_reports_progress_before_its_answer_on_a_healthy_channel() {
+        let (scripted, agent_side) = connected_pair();
+        let script = std::thread::spawn(move || -> Result<()> {
+            let mut connection = scripted;
+            let _: Handshake = connection.receive()?;
+            connection.send(&crate::transport::local_handshake())?;
+            let MuxRequest::Open { channel, .. } = connection.receive()? else {
+                anyhow::bail!("expected an open");
+            };
+            connection.send(&MuxResponse {
+                channel,
+                response: Response::Initialized,
+            })?;
+            // Two scans, each answered after progress reports; then a push
+            // answered plainly, to show the channel is still in step.
+            for _ in 0..2 {
+                let _: MuxRequest = connection.receive()?;
+                for entries in [1_000, 2_000, 3_000] {
+                    connection.send(&MuxResponse {
+                        channel,
+                        response: Response::ScanProgress { entries, bytes: 0 },
+                    })?;
+                }
+                connection.send(&MuxResponse {
+                    channel,
+                    response: Response::ScanUnchanged { generation: 7 },
+                })?;
+            }
+            let _: MuxRequest = connection.receive()?;
+            connection.send(&MuxResponse {
+                channel,
+                response: Response::StagePushed,
+            })?;
+            let _: Result<MuxRequest> = connection.receive();
+            Ok(())
+        });
+
+        let connection = AgentConnection::connect(agent_side).expect("unable to connect");
+        let mut channel = connection
+            .open(initialize(std::path::Path::new("/unused")))
+            .expect("open");
+        for _ in 0..2 {
+            let mut response = channel.exchange(Request::Scan).expect("the scan exchange");
+            let mut reports = 0;
+            while let Response::ScanProgress { .. } = response {
+                reports += 1;
+                response = channel.receive_response().expect("the answer follows");
+            }
+            assert_eq!(reports, 3);
+            assert!(matches!(response, Response::ScanUnchanged { generation: 7 }));
+        }
+        let response = channel
+            .exchange(Request::StagePush(Vec::new()))
+            .expect("the channel is still in step");
+        assert!(matches!(response, Response::StagePushed));
+        drop(channel);
+        drop(connection);
+        let _ = script.join();
     }
 
     #[test]

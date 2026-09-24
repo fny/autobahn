@@ -33,6 +33,10 @@ pub struct Loaded {
     pub log_level: Option<crate::logging::Level>,
     /// Whether the configuration asks to be watched at all.
     pub reload: bool,
+    /// The configuration itself, as loaded: what a running supervisor
+    /// reports, so that `status` can plan the sessions it runs even after
+    /// the file has been edited into something that does not load.
+    pub text: String,
 }
 
 /// Loads a configuration and derives everything the supervisor runs from,
@@ -61,6 +65,7 @@ pub fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Loaded> {
         alerts,
         log_level,
         reload: configuration.reload,
+        text: text.to_owned(),
     })
 }
 

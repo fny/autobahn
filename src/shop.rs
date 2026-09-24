@@ -125,8 +125,9 @@ impl Rate {
 }
 
 /// The shop's state between frames.
-struct Shop<'a> {
-    plans: Vec<&'a SessionPlan>,
+struct Shop {
+    /// The sessions shown, refreshed with the report.
+    plans: Vec<SessionPlan>,
     state_root: PathBuf,
     config: Option<PathBuf>,
     report: StatusReport,
@@ -156,18 +157,23 @@ struct Pending {
     question: String,
 }
 
+/// What the shop says when every group is turned off.
+const NO_ACTIVE_SESSIONS: &str = "no active sessions (every group is disabled)";
+
 /// Runs the shop until the reader closes up.
-pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>) -> Result<()> {
+pub fn run(plans: Vec<SessionPlan>, state_root: &Path, config: Option<PathBuf>) -> Result<()> {
     if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         anyhow::bail!("the shop needs a terminal");
     }
     let _terminal = crate::pager::Terminal::enter()?;
 
+    let selected: Vec<&SessionPlan> = plans.iter().collect();
+    let report = status_report(&selected, state_root);
     let mut shop = Shop {
-        plans: selected.to_vec(),
+        plans,
         state_root: state_root.to_path_buf(),
         config,
-        report: status_report(selected, state_root),
+        report,
         cursor: 0,
         counter: None,
         expanded: BTreeSet::new(),
@@ -189,7 +195,8 @@ pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>
             }
         }
         if refreshed.elapsed() >= REFRESH {
-            let plans: Vec<&SessionPlan> = shop.plans.clone();
+            shop.refresh_plans();
+            let plans: Vec<&SessionPlan> = shop.plans.iter().collect();
             shop.report = status_report(&plans, &shop.state_root);
             shop.ticker = recent_log(TICKER);
             refreshed = Instant::now();
@@ -213,7 +220,7 @@ pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>
 
 // ── state ──────────────────────────────────────────────────────────────
 
-impl Shop<'_> {
+impl Shop {
     fn orders(&self) -> Vec<(&str, &SessionReport)> {
         self.report
             .groups
@@ -530,7 +537,7 @@ impl Shop<'_> {
 
 // ── the tree ───────────────────────────────────────────────────────────
 
-impl Shop<'_> {
+impl Shop {
     /// The counter's visible lines: the issue tree, with opened branches
     /// expanded.
     ///
@@ -650,13 +657,29 @@ impl Shop<'_> {
         rows
     }
 
+    /// Takes up the sessions as they are now: the running supervisor's,
+    /// so an edit it applied shows at the next poll, or the file's. A file
+    /// that does not load, with nothing answering, leaves the list as it
+    /// was.
+    fn refresh_plans(&mut self) {
+        let path = match &self.config {
+            Some(path) => path.clone(),
+            None => match autobahn::paths::default_config_path() {
+                Ok(path) => path,
+                Err(_) => return,
+            },
+        };
+        if let Ok(shown) = autobahn::supervisor::shown_plans(&path, &self.state_root) {
+            self.plans = shown.plans;
+        }
+    }
+
     /// The plan behind the open counter, for the commands that clear its
     /// blocked paths.
     fn plan_for_counter(&self) -> Option<&SessionPlan> {
         let counter = self.counter.as_ref()?;
         self.plans
             .iter()
-            .copied()
             .find(|plan| plan.group == counter.group && plan.host == counter.host)
     }
 
@@ -825,7 +848,7 @@ fn copy_to_clipboard(text: &str) -> bool {
 
 // ── drawing ────────────────────────────────────────────────────────────
 
-impl Shop<'_> {
+impl Shop {
     /// One frame, as exactly as many rows as the terminal has, each padded
     /// to its width.
     ///
@@ -862,6 +885,10 @@ impl Shop<'_> {
         }
         if !self.report.supervisor_running {
             lines.extend(self.shuttered(width));
+            return grid(lines, height, width, self.footer());
+        }
+        if self.report.groups.is_empty() {
+            lines.push(format!("  {NO_ACTIVE_SESSIONS}"));
             return grid(lines, height, width, self.footer());
         }
 

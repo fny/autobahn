@@ -1360,6 +1360,7 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
         // `run_control` sends only the verbs; progress is asked for by
         // `status`, which reads the answer itself.
         ControlResponse::Progress(_) => bail!("the supervisor answered with progress"),
+        ControlResponse::Sessions(_) => bail!("the supervisor answered with its sessions"),
         // `send` turns this into an error with the remedy; kept for the
         // match to be whole.
         ControlResponse::Mismatch { supervisor } => bail!(
@@ -1684,6 +1685,7 @@ fn run_watch(
                     Supervisor::new(loaded.plans.clone(), state_root.clone(), verbose)
                         .with_alerts(loaded.alerts.clone())
                         .with_log_level(loaded.log_level)
+                        .with_configuration(loaded.text.clone())
                         .with_shown(shown.clone())
                         .with_own_state(autobahn::config::OwnState::new(
                             &state_root,
@@ -2509,10 +2511,13 @@ fn conflict_filter(pattern: &str) -> Result<PathFilter> {
 
 /// Opens the shop.
 fn run_shop(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> {
-    let plans = load_config(config.clone())?.plans()?;
     let state_root = resolve_state_root(state_root)?;
-    let selected: Vec<&autobahn::config::SessionPlan> = plans.iter().collect();
-    shop::run(&selected, &state_root, config)
+    let path = match &config {
+        Some(path) => path.clone(),
+        None => paths::default_config_path()?,
+    };
+    let plans = autobahn::supervisor::shown_plans(&path, &state_root)?.plans;
+    shop::run(plans, &state_root, config)
 }
 
 /// Asks before resolving, and says what resolution will do.
@@ -4118,6 +4123,44 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+/// What `status` shows when no supervisor answers and the configuration
+/// does not load: the fault, and every session's state as last recorded,
+/// rather than the fault alone.
+fn show_recorded(state_root: &Path, error: &anyhow::Error) -> Result<()> {
+    style::emit(&format!(
+        "\x1b[33mthe configuration does not load\x1b[0m, so what follows is every \
+         session's state as last recorded\n{}\n\n",
+        autobahn::text::display_safe(&format!("{error:#}"))
+    ));
+    let statuses = autobahn::supervisor::recorded_statuses(state_root);
+    if statuses.is_empty() {
+        println!("no session has recorded a state");
+    }
+    for status in &statuses {
+        let state = autobahn::supervisor::classify_state(status);
+        // Betas of one group on one host are told apart by their paths,
+        // as the configuration would label them.
+        let shared = statuses
+            .iter()
+            .filter(|other| other.group == status.group && other.host == status.host)
+            .count()
+            > 1;
+        let display = match shared {
+            true => format!("{}@{} ({})", status.group, status.host, status.beta),
+            false => format!("{}@{}", status.group, status.host),
+        };
+        match &status.error {
+            Some(error) => println!(
+                "  {}  {state}: {}",
+                autobahn::text::display_safe(&display),
+                autobahn::text::display_safe(error)
+            ),
+            None => println!("  {}  {state}", autobahn::text::display_safe(&display)),
+        }
+    }
+    Ok(())
+}
+
 /// What `status` says when the configuration leaves nothing to run.
 const NO_ACTIVE_SESSIONS: &str = "no active sessions (every group is disabled)";
 
@@ -4133,6 +4176,10 @@ fn run_status(
     json: bool,
     expand: bool,
 ) -> Result<()> {
+    let state_root = resolve_state_root(state_root)?;
+    // A running supervisor says which sessions it runs; the file on disk
+    // may since have been edited into one it refused.
+    let mut inventory = None;
     let plans = match peer_plans(&config)? {
         Some((plans, header)) => {
             if !json {
@@ -4140,9 +4187,31 @@ fn run_status(
             }
             plans
         }
-        None => load_config(config)?.plans()?,
+        None => {
+            let path = match config {
+                Some(path) => path,
+                None => paths::default_config_path()?,
+            };
+            match autobahn::supervisor::shown_plans(&path, &state_root) {
+                Ok(shown) => {
+                    inventory = shown.inventory;
+                    shown.plans
+                }
+                Err(error) if !json => return show_recorded(&state_root, &error),
+                Err(error) => return Err(error),
+            }
+        }
     };
-    let state_root = resolve_state_root(state_root)?;
+    if !json
+        && inventory
+            .as_ref()
+            .is_some_and(|inventory| inventory.logging_failed)
+    {
+        style::emit(
+            "\x1b[33mthe supervisor could not write some of its log\x1b[0m (standard output \
+             closed, or the disk under the log full); the sessions are unaffected\n\n",
+        );
+    }
 
     // Every group turned off is a state, not an error: a running
     // supervisor applies it by stopping every session, and waits.

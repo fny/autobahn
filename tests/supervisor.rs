@@ -841,17 +841,18 @@ fn watch_mode_synchronizes_continuously_until_stopped() {
 /// that it was still running at the end: every edit made meanwhile was
 /// applied in place, not by winding the supervisor down.
 fn supervise_with_reload(world: &World, path: &Path, during: impl FnOnce()) {
-    use autobahn::supervisor::reload::Reloader;
+    use autobahn::supervisor::reload::{load_for_startup, Reloader};
     use std::sync::Arc;
-    let plans = Config::load(path)
-        .expect("configuration should load")
-        .plans()
-        .expect("plans should derive");
+    let loaded = load_for_startup(path).expect("configuration should load");
     let reloader =
         Arc::new(Reloader::new(path.to_path_buf()).with_interval(Duration::from_millis(20)));
     let stop = AtomicBool::new(false);
-    let supervisor =
-        Supervisor::new(plans, world.state_root(), false).with_reload(Some(reloader.clone()));
+    // As `watch` builds it.
+    let supervisor = Supervisor::new(loaded.plans, world.state_root(), false)
+        .with_alerts(loaded.alerts)
+        .with_log_level(loaded.log_level)
+        .with_configuration(loaded.text)
+        .with_reload(Some(reloader.clone()));
     std::thread::scope(|scope| {
         let _guard = StopGuard(&stop);
         let watcher = scope.spawn(|| supervisor.run_watch(&stop));
@@ -3871,5 +3872,93 @@ fn watch_keeps_synchronizing_after_its_standard_output_closes() {
     assert!(
         child.0.try_wait().expect("waitable").is_none(),
         "the supervisor is still running"
+    );
+}
+
+#[test]
+fn status_shows_the_running_sessions_and_the_refusal_when_the_file_breaks() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let notes = world.directory("notes");
+    let notes_mirror = world.path("notes-mirror");
+    write(&alpha, "file.txt", "file");
+    write(&notes, "todo.txt", "todo");
+    let path = world.path("config.toml");
+    let one = format!(
+        "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-safe\"\ninterval = 1\nbetas = [\"{}\"]\n",
+        alpha.display(),
+        beta.display()
+    );
+    world.plans(&one);
+    let shown_groups = || -> Vec<String> {
+        autobahn::supervisor::shown_plans(&path, &world.state_root())
+            .map(|shown| shown.plans.into_iter().map(|plan| plan.group).collect())
+            .unwrap_or_default()
+    };
+
+    supervise_with_reload(&world, &path, || {
+        assert!(wait_until(Duration::from_secs(15), || beta
+            .join("file.txt")
+            .exists()));
+        fs::write(&path, format!("{one}[groups.notes]\nmdoe = 1\n"))
+            .expect("configuration should be writable");
+        assert!(wait_until(Duration::from_secs(15), || {
+            autobahn::supervisor::reload::read_notice(&world.state_root()).is_some()
+        }));
+        let (succeeded, shown) = cli(&world, &path, &["status"]);
+        assert!(succeeded, "status does not fail on the file: {shown}");
+        assert!(
+            shown.contains("work"),
+            "the running session is listed: {shown}"
+        );
+        assert!(shown.contains("refused"), "the refusal is shown: {shown}");
+        assert!(shown.contains("mdoe"), "with what was wrong: {shown}");
+
+        // What the shop and the tray load on every poll: an edit the
+        // supervisor applies is there at the next one.
+        assert_eq!(shown_groups(), ["work"]);
+        fs::write(
+            &path,
+            format!(
+                "{one}[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                notes.display(),
+                notes_mirror.display()
+            ),
+        )
+        .expect("configuration should be writable");
+        assert!(
+            wait_until(Duration::from_secs(15), || shown_groups().len() == 2),
+            "the added group is shown: {:?}",
+            shown_groups()
+        );
+    });
+}
+
+#[test]
+fn status_with_nothing_running_and_a_broken_file_shows_what_was_recorded() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "file.txt", "file");
+    let path = world.path("config.toml");
+    let plans = world.plans(&format!(
+        "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-safe\"\nbetas = [\"{}\"]\n",
+        alpha.display(),
+        beta.display()
+    ));
+    assert_all_synchronized(&world.run_once(plans));
+    fs::write(&path, "[groups.work]\nmdoe = 1\n").expect("configuration should be writable");
+    let (succeeded, shown) = cli(&world, &path, &["status"]);
+    assert!(succeeded, "status does not fail on the file: {shown}");
+    assert!(shown.contains("does not load"), "{shown}");
+    assert!(shown.contains("mdoe"), "the parse error is shown: {shown}");
+    assert!(
+        shown.contains("work@"),
+        "the recorded session is listed: {shown}"
+    );
+    assert!(
+        shown.contains("synchronized"),
+        "with its recorded state: {shown}"
     );
 }

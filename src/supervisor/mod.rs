@@ -100,7 +100,7 @@ pub struct ConflictDetail {
     pub beta: ConflictSide,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SessionStatus {
     /// The group the session belongs to.
     pub group: String,
@@ -223,6 +223,9 @@ pub struct Supervisor {
     /// Autobahn's own directories, which no root may hold: an edit whose
     /// sessions would is complained about and not applied.
     own_state: Option<crate::config::OwnState>,
+    /// The configuration the plans came from, as loaded, for the control
+    /// socket to report.
+    configuration: Option<String>,
     /// How many times each session, by identifier, panics before its next
     /// attempts — for the tests that a panic stays in its session.
     #[cfg(test)]
@@ -491,6 +494,7 @@ impl Supervisor {
             log_level: None,
             shown: None,
             own_state: None,
+            configuration: None,
             #[cfg(test)]
             panics: Mutex::default(),
         }
@@ -511,6 +515,13 @@ impl Supervisor {
     /// it is handed back to the caller rather than applied in place.
     pub fn with_log_level(mut self, level: Option<crate::logging::Level>) -> Supervisor {
         self.log_level = level;
+        self
+    }
+
+    /// The configuration the plans came from, as loaded, so that `status`
+    /// can plan what runs even once the file no longer loads.
+    pub fn with_configuration(mut self, text: String) -> Supervisor {
+        self.configuration = Some(text);
         self
     }
 
@@ -664,6 +675,8 @@ impl Supervisor {
         let registry = control::Registry {
             yield_to: self.peering.as_ref().map(|peering| peering.yield_handle()),
             entries: Default::default(),
+            configuration: std::sync::RwLock::new(self.configuration.clone()),
+            state_root: self.state_root.clone(),
         };
         let listener = match control::bind(&self.state_root) {
             Ok(listener) => Some(listener),
@@ -747,15 +760,21 @@ impl Supervisor {
                             }
                             break;
                         }
-                        None => self.supervise(
-                            scope,
-                            &mut running,
-                            next.plans,
-                            &registry,
-                            &watched,
-                            true,
-                            &mut escaped,
-                        ),
+                        None => {
+                            self.supervise(
+                                scope,
+                                &mut running,
+                                next.plans,
+                                &registry,
+                                &watched,
+                                true,
+                                &mut escaped,
+                            );
+                            *registry
+                                .configuration
+                                .write()
+                                .unwrap_or_else(|error| error.into_inner()) = Some(next.text);
+                        }
                     }
                 }
                 sleep_interruptible(RELOAD_POLL_INTERVAL, stop);
@@ -878,6 +897,9 @@ impl Supervisor {
             .iter()
             .map(|session| control::Entry {
                 session: session.plan.identifier(),
+                display: session.plan.display(),
+                mode: session.plan.mode_name().to_owned(),
+                published: session.published.clone(),
                 group: session.plan.group.clone(),
                 host: session.plan.host.clone(),
                 control: session.control.clone(),
@@ -2117,6 +2139,66 @@ pub fn open_endpoints(
     let alpha = endpoint(&plan.alpha, "alpha")?;
     let beta = endpoint(&plan.beta, "beta")?;
     Ok((alpha, beta))
+}
+
+/// The sessions to show, and what the running supervisor said about them.
+pub struct Shown {
+    /// The sessions, in configuration order.
+    pub plans: Vec<SessionPlan>,
+    /// The running supervisor's inventory, when the plans came from it.
+    pub inventory: Option<control::Inventory>,
+}
+
+/// The sessions `status`, the shop and the tray show. When a supervisor
+/// answers with the configuration it runs, those are its sessions — even
+/// once the file at `config_path` has been edited into something it
+/// refused, and as soon as it applies an edit that loads. Otherwise they
+/// are the sessions the file describes.
+pub fn shown_plans(config_path: &Path, state_root: &Path) -> Result<Shown> {
+    if let Some(inventory) = control::inventory(state_root) {
+        let planned = inventory.configuration.as_deref().map(|text| {
+            crate::config::Config::parse(config_path, text).and_then(|config| config.plans())
+        });
+        if let Some(Ok(plans)) = planned {
+            let running: std::collections::HashSet<&str> = inventory
+                .sessions
+                .iter()
+                .map(|session| session.identifier.as_str())
+                .collect();
+            let plans = plans
+                .into_iter()
+                .filter(|plan| running.contains(plan.identifier().as_str()))
+                .collect();
+            return Ok(Shown {
+                plans,
+                inventory: Some(inventory),
+            });
+        }
+    }
+    let plans = crate::config::Config::load(config_path)?.plans()?;
+    Ok(Shown {
+        plans,
+        inventory: None,
+    })
+}
+
+/// Every status recorded under a state root, by session, for showing
+/// what is known when no configuration says which sessions there are.
+pub fn recorded_statuses(state_root: &Path) -> Vec<SessionStatus> {
+    let Ok(entries) = fs::read_dir(status_directory(state_root)) else {
+        return Vec::new();
+    };
+    let mut statuses: Vec<SessionStatus> = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension()? != "json" {
+                return None;
+            }
+            serde_json::from_slice(&fs::read(&path).ok()?).ok()
+        })
+        .collect();
+    statuses.sort_by(|a, b| (&a.group, &a.host).cmp(&(&b.group, &b.host)));
+    statuses
 }
 
 /// Everything `status` knows, as one document — the seam any user

@@ -57,6 +57,10 @@ pub enum ControlRequest {
         /// The request, encoded.
         request: Vec<u8>,
     },
+    /// Report which sessions are running, the configuration they were
+    /// planned from, and any refused edit — so a caller shows what runs
+    /// rather than what the file on disk says now.
+    Sessions,
 }
 
 /// Selects sessions by group and destination.
@@ -97,6 +101,36 @@ pub enum ControlResponse {
         /// The running supervisor's `protocol::version()`.
         supervisor: String,
     },
+    /// What the supervisor is running.
+    Sessions(Inventory),
+}
+
+/// What a running supervisor is running.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Inventory {
+    /// Every session running, in supervision order.
+    pub sessions: Vec<SessionSummary>,
+    /// The configuration the sessions were planned from, as it loaded —
+    /// absent for a supervisor that did not start from a file of its own,
+    /// such as a peer's.
+    pub configuration: Option<String>,
+    /// The edit the supervisor refused, while it stands.
+    pub notice: Option<super::reload::Notice>,
+    /// Whether the supervisor has failed to write a log line.
+    pub logging_failed: bool,
+}
+
+/// One running session, as the inventory lists it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SessionSummary {
+    /// The session's key: its state identifier.
+    pub identifier: String,
+    /// `group@host`.
+    pub display: String,
+    /// The synchronization mode's name.
+    pub mode: String,
+    /// The state its last attempt recorded, empty before the first.
+    pub state: String,
 }
 
 /// What asking the running supervisor came to.
@@ -199,6 +233,10 @@ pub(crate) struct WorkerControl {
 pub(crate) struct Entry {
     /// The session's identifier.
     pub session: String,
+    /// The session's name for people to read.
+    pub display: String,
+    /// The session's mode, by name.
+    pub mode: String,
     /// The session's group.
     pub group: String,
     /// The session's destination.
@@ -207,6 +245,8 @@ pub(crate) struct Entry {
     pub control: Arc<WorkerControl>,
     /// What the session is doing, updated by the worker as it works.
     pub progress: Arc<crate::progress::Progress>,
+    /// The status the session last recorded.
+    pub published: Arc<std::sync::Mutex<Option<super::SessionStatus>>>,
 }
 
 /// Peering: what the control socket calls to hand the lead on.
@@ -220,6 +260,11 @@ pub(crate) struct Registry {
     pub entries: RwLock<Vec<Entry>>,
     /// Peering: how to hand the lead on, when this supervisor leads.
     pub yield_to: Option<YieldHandle>,
+    /// The configuration the sessions were planned from, replaced with
+    /// the entries.
+    pub configuration: RwLock<Option<String>>,
+    /// The state root, where a refused edit's notice is kept.
+    pub state_root: PathBuf,
 }
 
 impl Registry {
@@ -269,6 +314,32 @@ impl Registry {
                 Err(error) => ControlResponse::Error(format!("undecodable request: {error}")),
             };
         }
+        if let ControlRequest::Sessions = request {
+            return ControlResponse::Sessions(Inventory {
+                sessions: entries
+                    .iter()
+                    .map(|entry| SessionSummary {
+                        identifier: entry.session.clone(),
+                        display: entry.display.clone(),
+                        mode: entry.mode.clone(),
+                        state: entry
+                            .published
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .as_ref()
+                            .map(super::classify_state)
+                            .unwrap_or_default(),
+                    })
+                    .collect(),
+                configuration: self
+                    .configuration
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .clone(),
+                notice: super::reload::read_notice(&self.state_root),
+                logging_failed: crate::logging::failed(),
+            });
+        }
         if let ControlRequest::Progress = request {
             return ControlResponse::Progress(
                 entries
@@ -303,6 +374,7 @@ impl Registry {
                 control.wake.store(true, Ordering::Relaxed);
             }),
             ControlRequest::Progress
+            | ControlRequest::Sessions
             | ControlRequest::Yield { .. }
             | ControlRequest::Versioned { .. } => {
                 unreachable!("answered above")
@@ -706,6 +778,25 @@ fn probe_within(state_root: &Path, timeout: Duration) -> Probe {
     }
 }
 
+/// Asks the supervisor owning `state_root` what it is running. None when
+/// no supervisor answers — none is running, or one of another build is.
+pub fn inventory(state_root: &Path) -> Option<Inventory> {
+    let stream = UnixStream::connect(socket_path(state_root)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut reader = stream.try_clone().ok()?;
+    let mut writer = stream;
+    let versioned = ControlRequest::Versioned {
+        version: crate::protocol::version(),
+        request: bincode::serialize(&ControlRequest::Sessions).ok()?,
+    };
+    crate::transport::send_control_frame(&mut writer, &versioned).ok()?;
+    match crate::transport::receive_control_frame(&mut reader) {
+        Ok(ControlResponse::Sessions(inventory)) => Some(inventory),
+        _ => None,
+    }
+}
+
 /// Asks the supervisor owning `state_root` what its sessions are doing.
 ///
 /// Absent when no supervisor is running — which is the honest answer, since
@@ -723,6 +814,9 @@ mod tests {
     fn entry(group: &str, host: &str) -> Entry {
         Entry {
             session: format!("{group}-{host}"),
+            display: format!("{group}@{host}"),
+            mode: "two-way-safe".into(),
+            published: Arc::default(),
             group: group.into(),
             host: host.into(),
             control: Arc::default(),
@@ -733,6 +827,8 @@ mod tests {
     fn registry() -> Registry {
         Registry {
             yield_to: None,
+            configuration: RwLock::new(Some("[groups.work]".into())),
+            state_root: PathBuf::from("/nonexistent/state"),
             entries: RwLock::new(vec![
                 entry("work", "host1"),
                 entry("work", "host2"),
@@ -840,6 +936,56 @@ mod tests {
         })
         .unwrap();
         assert_eq!(mismatch[..4], 3u32.to_le_bytes());
+        // Later requests come after them.
+        let sessions = bincode::serialize(&ControlRequest::Sessions).unwrap();
+        assert_eq!(sessions[..4], 8u32.to_le_bytes());
+        let inventory = bincode::serialize(&ControlResponse::Sessions(Inventory {
+            sessions: Vec::new(),
+            configuration: None,
+            notice: None,
+            logging_failed: false,
+        }))
+        .unwrap();
+        assert_eq!(inventory[..4], 4u32.to_le_bytes());
+    }
+
+    #[test]
+    fn the_inventory_lists_the_sessions_and_what_they_were_planned_from() {
+        let registry = registry();
+        *registry.entries.read().unwrap()[1]
+            .published
+            .lock()
+            .unwrap() = Some(crate::supervisor::SessionStatus {
+            state: "errored".into(),
+            ..Default::default()
+        });
+        let ControlResponse::Sessions(inventory) = registry.apply(&versioned(
+            &crate::protocol::version(),
+            &ControlRequest::Sessions,
+        )) else {
+            panic!("expected an inventory");
+        };
+        let shown: Vec<(&str, &str, &str)> = inventory
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.identifier.as_str(),
+                    session.display.as_str(),
+                    session.state.as_str(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("work-host1", "work@host1", ""),
+                ("work-host2", "work@host2", "errored"),
+                ("other-host1", "other@host1", ""),
+            ]
+        );
+        assert_eq!(inventory.configuration.as_deref(), Some("[groups.work]"));
+        assert_eq!(inventory.notice, None);
     }
 
     /// A control socket whose supervisor is wedged: bound and listening,

@@ -331,6 +331,10 @@ impl App {
                 return;
             }
         };
+        if report.supervisor_running && report.groups.is_empty() {
+            self.set_menu_error("no active sessions (every group is disabled)");
+            return;
+        }
         self.notify(&report);
         let health = health_of(&report);
         let ink = menu_bar_ink(self.tray.as_ref());
@@ -358,7 +362,9 @@ impl App {
             Some(path) => path.clone(),
             None => crate::paths::default_config_path()?,
         };
-        let plans = crate::config::Config::load(&path)?.plans()?;
+        // The running supervisor's sessions when it answers, so a refused
+        // edit hides nothing and an applied one shows at the next refresh.
+        let plans = crate::supervisor::shown_plans(&path, &self.state_root)?.plans;
         let selected: Vec<&SessionPlan> = plans.iter().collect();
         Ok(status_report(&selected, &self.state_root))
     }

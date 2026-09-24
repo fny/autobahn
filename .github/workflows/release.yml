@@ -245,12 +245,15 @@ jobs:
     permissions:
       contents: write
     steps:
-      # Only for the epoch, which the manifest states beside the version.
+      # Only for the epoch, which the manifest states beside the version,
+      # and the installer, which the release serves.
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
           path: source
-          sparse-checkout: src/protocol.rs
+          sparse-checkout: |
+            src/protocol.rs
+            scripts/install.sh
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
@@ -282,7 +285,10 @@ jobs:
           PY
           cat agents/MANIFEST
           tar czf autobahn-agents.tar.gz agents
-          sha256sum autobahn-* Autobahn-macos-aarch64.zip > SHA256SUMS
+          # The installer as of this tag, so releases/latest/download/install.sh
+          # installs the release it came with, not whatever main holds.
+          cp source/scripts/install.sh install.sh
+          sha256sum autobahn-* Autobahn-macos-aarch64.zip install.sh > SHA256SUMS
       - name: Publish release
         # A tag with a hyphen in it is a prerelease, which is what
         # semantic versioning means by v0.5.0-dev.1. Marking it as one
@@ -308,4 +314,5 @@ jobs:
             autobahn-darwin-x86_64 \
             autobahn-agents.tar.gz \
             Autobahn-macos-aarch64.zip \
+            install.sh \
             SHA256SUMS

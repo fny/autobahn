@@ -104,7 +104,7 @@ Outgoing messages above the maximum message size are refused before the write bu
 
 **Enforced by**: `src/transport/mod.rs` (`read_chunk` validates each frame's length and decompressed size against `MAXIMUM_FRAME_SIZE` before allocating; `read_frame` caps reassembly at `MAXIMUM_MESSAGE_SIZE`), `src/endpoint/remote.rs` (`check_delta_header`, `apply_delta_ops`, `check_hierarchy`), `src/rsync/mod.rs` (`Signature::validate`).
 
-**Checked by**: `an_oversized_length_prefix_is_refused_not_allocated`, `oversized_frames_are_rejected_on_receive`, `a_decompression_bomb_is_refused`, `an_unknown_frame_flag_is_refused`, `a_message_larger_than_a_frame_is_split_and_reassembled` (`src/transport/mod.rs`); `a_scan_delta_declaring_an_impossible_length_is_refused`, `a_scan_delta_with_an_out_of_range_block_size_is_refused`, `delta_operations_that_expand_past_the_declared_length_are_refused_before_applying`, `a_scan_answered_whole_with_an_invalid_hierarchy_is_refused` (`src/endpoint/remote.rs`); `validation_bounds_the_block_size_and_the_hash_count` (`src/rsync/mod.rs`).
+**Checked by**: `an_oversized_length_prefix_is_refused_not_allocated`, `oversized_frames_are_rejected_on_receive`, `a_decompression_bomb_is_refused`, `an_unknown_frame_flag_is_refused`, `a_message_larger_than_a_frame_is_split_and_reassembled` (`src/transport/mod.rs`); `a_scan_delta_declaring_an_impossible_length_is_refused`, `a_scan_delta_with_an_out_of_range_block_size_is_refused`, `delta_operations_that_expand_past_the_declared_length_are_refused_before_applying`, `a_scan_with_an_invalid_hierarchy_is_refused` (`src/endpoint/remote.rs`); `validation_bounds_the_block_size_and_the_hash_count` (`src/rsync/mod.rs`).
 
 ## I10. Persisted state is atomic or absent
 

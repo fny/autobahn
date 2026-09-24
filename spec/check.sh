@@ -8,18 +8,51 @@
 #   spec/check.sh peering_conflict_safety   the failover protocol (Peering.tla)
 #   spec/check.sh --traces DIR validate replay traces (see tests/spec_replay.rs)
 #
-# Needs Java 11+ and tla2tools.jar: set TLA2TOOLS, or it is fetched into
-# ~/.local/lib on first use.
+# Needs Java 11+ and the tla2tools.jar that spec/tla2tools.version pins.
+# It is fetched into ~/.local/lib on first use, or set TLA2TOOLS to a copy
+# of your own. Either way a jar whose SHA-256 is not the pinned one is
+# refused; TLA2TOOLS_TRUST=1 runs the one TLA2TOOLS names regardless.
+#
+#   spec/check.sh --fetch      only fetch and verify the jar, and say which
 #
 # A mode passes only if TLC exits 0, prints no violation, error or
 # deadlock, and says it finished: TLC exits 0 on some failures (a missing
 # config, for one), and prints "Error" on others that exit nonzero.
 set -u -o pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-JAR="${TLA2TOOLS:-$HOME/.local/lib/tla2tools.jar}"
+pin() { sed -n "s/^$1=//p" "$HERE/tla2tools.version"; }
+VERSION="$(pin version)"; URL="$(pin url)"; SHA256="$(pin sha256)"
+if [ -z "$VERSION" ] || [ -z "$URL" ] || [ -z "$SHA256" ]; then
+    echo "spec/tla2tools.version must give version, url and sha256" >&2; exit 2
+fi
+sha256() {
+    if command -v sha256sum > /dev/null; then sha256sum "$1"; else shasum -a 256 "$1"; fi | cut -d' ' -f1
+}
+# verify JAR — whether JAR holds the pinned bytes. Says why when it does not.
+verify() {
+    local got
+    got="$(sha256 "$1")"
+    [ "$got" = "$SHA256" ] && return 0
+    echo "refusing $1: its sha256 is $got," >&2
+    echo "  but spec/tla2tools.version pins tla2tools $VERSION at $SHA256." >&2
+    echo "  Delete it to fetch the pinned jar, or run it anyway with TLA2TOOLS=$1 TLA2TOOLS_TRUST=1." >&2
+    return 1
+}
+JAR="${TLA2TOOLS:-$HOME/.local/lib/tla2tools-$VERSION.jar}"
 if [ ! -f "$JAR" ]; then
-    mkdir -p "$(dirname "$JAR")"
-    curl -fsSL -o "$JAR" https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar || exit 1
+    mkdir -p "$(dirname "$JAR")" || exit 1
+    part="$(mktemp "$JAR.XXXXXX")" || exit 1
+    if ! curl -fsSL -o "$part" "$URL"; then rm -f "$part"; exit 1; fi
+    verify "$part" || { rm -f "$part"; exit 1; }
+    mv "$part" "$JAR" || exit 1
+elif [ -n "${TLA2TOOLS:-}" ] && [ "${TLA2TOOLS_TRUST:-}" = 1 ]; then
+    echo "running $JAR unverified: TLA2TOOLS_TRUST=1" >&2
+else
+    verify "$JAR" || exit 1
+fi
+if [ "${1:-}" = "--fetch" ]; then
+    echo "tla2tools $VERSION ($SHA256) at $JAR"
+    exit 0
 fi
 tlc() { java -XX:+UseParallelGC -Xmx2g -cp "$JAR" tlc2.TLC -workers auto -cleanup "$@"; }
 # judge LOG CODE — whether a TLC run that exited CODE, with its output in

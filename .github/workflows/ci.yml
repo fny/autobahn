@@ -77,10 +77,9 @@ jobs:
           java-version: '17'
       - name: check.sh fails when TLC fails
         run: spec/check-test.sh
-      - name: TLC
-        run: |
-          mkdir -p ~/.local/lib
-          curl -fsSL -o ~/.local/lib/tla2tools.jar https://github.com/tlaplus/tlaplus/releases/latest/download/tla2tools.jar
+      - name: TLC, the release spec/tla2tools.version pins
+        # Fetched and checked against the pinned SHA-256; the log names it.
+        run: spec/check.sh --fetch
       - name: The star spec, quick bound
         run: spec/check.sh quick
       - name: The implementation against the spec

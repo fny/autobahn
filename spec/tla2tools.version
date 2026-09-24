@@ -1,0 +1,9 @@
+# The TLA+ tools that spec/check.sh runs, here and in CI: one release, and
+# the SHA-256 of its tla2tools.jar. check.sh downloads the jar from this URL
+# and refuses it, or any jar it is given, whose bytes differ.
+#
+# To upgrade: pick a tlaplus release, download its tla2tools.jar, run
+# `sha256sum` on it, change all three lines, and run `spec/check.sh quick`.
+version=v1.7.4
+url=https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar
+sha256=936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88

@@ -37,7 +37,7 @@ failures=0
 expect() {
     local want=$1 what=$2 output=$3 code=$4; shift 4
     local got
-    if PATH="$WORK/bin:$PATH" TLA2TOOLS="$WORK/tla2tools.jar" \
+    if PATH="$WORK/bin:$PATH" TLA2TOOLS="$WORK/tla2tools.jar" TLA2TOOLS_TRUST=1 \
         STUB_OUTPUT="$output" STUB_EXIT="$code" \
         "$HERE/check.sh" "$@" > "$WORK/out" 2>&1; then
         got=pass
@@ -69,6 +69,32 @@ touch "$WORK/traces/Trace0.tla" "$WORK/traces/Trace0.cfg"
 expect pass "--traces with an accepted trace passes" "$FINISHED" 0 --traces "$WORK/traces"
 expect fail "--traces with a violating trace at exit 0 fails" "$VIOLATED" 0 --traces "$WORK/traces"
 expect fail "--traces with a nonzero exit fails" "$FINISHED" 12 --traces "$WORK/traces"
+
+# The pinned jar (CI-03): one whose bytes differ from the pin is never run,
+# whether it was named by TLA2TOOLS or cached at the default path, unless
+# TLA2TOOLS_TRUST says to. The stub would pass if it ran.
+# refuses <description> <env...>
+refuses() {
+    local what=$1; shift
+    if env PATH="$WORK/bin:$PATH" HOME="$WORK/home" STUB_OUTPUT="$FINISHED" STUB_EXIT=0 \
+        "$@" "$HERE/check.sh" quick > "$WORK/out" 2>&1; then
+        echo "WRONG $what: check.sh ran it"
+        sed 's/^/      | /' "$WORK/out"
+        failures=$((failures + 1))
+    elif ! grep -q "sha256" "$WORK/out"; then
+        echo "WRONG $what: check.sh failed without saying why"
+        sed 's/^/      | /' "$WORK/out"
+        failures=$((failures + 1))
+    else
+        echo "ok    $what"
+    fi
+}
+version=$(sed -n 's/^version=//p' "$HERE/tla2tools.version")
+mkdir -p "$WORK/home/.local/lib"
+printf 'corrupted\n' > "$WORK/home/.local/lib/tla2tools-$version.jar"
+refuses "a corrupted cached jar is refused" env -u TLA2TOOLS -u TLA2TOOLS_TRUST
+refuses "a corrupted jar named by TLA2TOOLS is refused" env -u TLA2TOOLS_TRUST TLA2TOOLS="$WORK/tla2tools.jar"
+expect pass "a jar named by TLA2TOOLS runs when trusted" "$FINISHED" 0 quick
 
 if [ $failures -ne 0 ]; then
     echo "$failures case(s) wrong"

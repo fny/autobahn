@@ -67,6 +67,14 @@ const CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNANC";
 const VERSIONED_CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNAN2";
 
 /// The format this build writes.
+///
+/// It is also the journal's format. Replay runs *before* an old checkpoint
+/// is rewritten, so the records a previous build left are decoded by this
+/// one: a change to how a record, a node or anything inside one encodes
+/// must raise this number and teach `decode_record` the old layout, or
+/// every upgraded session misreads its journal — refused at best, a wrong
+/// ancestor at worst. `the_encodings_this_format_promises_are_unchanged`
+/// holds the bytes still, so such a change fails until it does.
 const CHECKPOINT_VERSION: u16 = 2;
 
 /// The oldest format this build reads.
@@ -132,7 +140,7 @@ impl AncestorStore {
         let _ = fs::remove_file(normalization_path(&journal_path));
         let (mut generation, mut ancestor, checkpoint_bytes, version) = read_checkpoint(path)?;
 
-        let (records, physical_bytes) = read_journal(&journal_path)?;
+        let (records, physical_bytes) = read_journal(&journal_path, version)?;
         // Replay applies every record that continues the lineage in hand and
         // skips the rest: spent records from a checkpoint that already
         // absorbed them (a crash can land between publishing the checkpoint
@@ -526,6 +534,18 @@ const RECORD_HEADER_SIZE: usize = 8 + 8 + 8;
 /// length can make the loader allocate.
 const MAXIMUM_RECORD_SIZE: u64 = 1 << 30;
 
+/// Decodes one journal record written under the checkpoint format
+/// `version` — the build that wrote the checkpoint wrote the journal
+/// beside it. Every format this build reads shares one record layout; a
+/// format that changes it adds its predecessor's decoder here.
+fn decode_record(version: u16, payload: &[u8]) -> Result<JournalEntry> {
+    match version {
+        OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION => bincode::deserialize(payload)
+            .context("unable to decode a record of the ancestor journal"),
+        newer => Err(unreadable_checkpoint(newer)),
+    }
+}
+
 /// What one journal record carries.
 #[derive(serde::Serialize, serde::Deserialize)]
 enum JournalEntry {
@@ -712,7 +732,7 @@ pub fn readable(path: &Path) -> Result<()> {
 /// payload does not match its digest is a different matter — something
 /// claimed to be durable and is not — and fails the load rather than being
 /// skipped.
-fn read_journal(path: &Path) -> Result<(Vec<Record>, u64)> {
+fn read_journal(path: &Path, version: u16) -> Result<(Vec<Record>, u64)> {
     let mut file = match File::open(path) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
@@ -741,8 +761,7 @@ fn read_journal(path: &Path) -> Result<(Vec<Record>, u64)> {
         if digest(base_generation, payload) != header[16..24] {
             bail!("the ancestor journal is corrupt at offset {offset}");
         }
-        let entry: JournalEntry = bincode::deserialize(payload)
-            .context("unable to decode a record of the ancestor journal")?;
+        let entry = decode_record(version, payload)?;
         records.push(Record {
             base_generation,
             entry,
@@ -1713,4 +1732,89 @@ mod tests {
             );
         }
     }
+
+    /// One of every shape a record or a checkpoint can hold.
+    fn every_shape() -> Node {
+        Node {
+            name: String::new(),
+            content: Content::Directory(Arc::new(vec![
+                Node {
+                    name: "file".into(),
+                    content: Content::File {
+                        digest: [7; std::mem::size_of::<Digest>()],
+                        executable: true,
+                        metadata: FileMetadata {
+                            mtime_seconds: -2,
+                            mtime_nanos: 3,
+                            size: 4,
+                            inode: 5,
+                            mode: 0o100755,
+                        },
+                    },
+                },
+                Node {
+                    name: "link".into(),
+                    content: Content::Symlink {
+                        target: "file".into(),
+                    },
+                },
+                Node {
+                    name: "odd".into(),
+                    content: Content::Problematic {
+                        message: "no".into(),
+                    },
+                },
+                Node {
+                    name: "skipped".into(),
+                    content: Content::Untracked,
+                },
+            ])),
+        }
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    /// The bytes a journal record and a checkpoint payload encode to, held
+    /// still. A build reads the journal a previous build left *before* it
+    /// rewrites anything, so a changed encoding under the same
+    /// `CHECKPOINT_VERSION` is a misread on every upgraded session. When
+    /// this fails: raise `CHECKPOINT_VERSION`, teach `decode_record` (and
+    /// `read_checkpoint`) the old layout, and only then update the bytes.
+    #[test]
+    fn the_encodings_this_format_promises_are_unchanged() {
+        assert_eq!(
+            CHECKPOINT_VERSION, 2,
+            "a new format: record its bytes below, beside the old ones"
+        );
+        let achieved = JournalEntry::Achieved(vec![
+            Change {
+                path: "a/b".into(),
+                old: None,
+                new: Some(every_shape()),
+            },
+            Change {
+                path: String::new(),
+                old: Some(every_shape()),
+                new: None,
+            },
+        ]);
+        let intent = JournalEntry::Intent(vec!["x".into(), "y/z".into()]);
+        let checkpoint: Option<Node> = Some(every_shape());
+        assert_eq!(hex(&bincode::serialize(&achieved).unwrap()), ACHIEVED_V2);
+        assert_eq!(hex(&bincode::serialize(&intent).unwrap()), INTENT_V2);
+        assert_eq!(
+            hex(&bincode::serialize(&checkpoint).unwrap()),
+            CHECKPOINT_V2
+        );
+        // And they decode as what they were.
+        let decoded = decode_record(CHECKPOINT_VERSION, &bincode::serialize(&intent).unwrap())
+            .expect("decodes");
+        assert!(matches!(decoded, JournalEntry::Intent(paths) if paths == ["x", "y/z"]));
+    }
+
+    const ACHIEVED_V2: &str = "0000000002000000000000000300000000000000612f6200010000000000000000000000000400000000000000040000000000000066696c6501000000070707070707070707070707070707070707070707070707070707070707070701feffffffffffffff0300000004000000000000000500000000000000ed81000004000000000000006c696e6b02000000040000000000000066696c6503000000000000006f64640400000002000000000000006e6f0700000000000000736b6970706564030000000000000000000000010000000000000000000000000400000000000000040000000000000066696c6501000000070707070707070707070707070707070707070707070707070707070707070701feffffffffffffff0300000004000000000000000500000000000000ed81000004000000000000006c696e6b02000000040000000000000066696c6503000000000000006f64640400000002000000000000006e6f0700000000000000736b69707065640300000000";
+    const INTENT_V2: &str = "0100000002000000000000000100000000000000780300000000000000792f7a";
+    const CHECKPOINT_V2: &str = "010000000000000000000000000400000000000000040000000000000066696c6501000000070707070707070707070707070707070707070707070707070707070707070701feffffffffffffff0300000004000000000000000500000000000000ed81000004000000000000006c696e6b02000000040000000000000066696c6503000000000000006f64640400000002000000000000006e6f0700000000000000736b697070656403000000";
 }

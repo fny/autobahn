@@ -4159,6 +4159,7 @@ fn run_clean(
 
     let verb = if dry_run { "would remove" } else { "removed" };
     let mut removed = 0usize;
+    let mut locks_removed = 0usize;
     let mut bytes = 0u64;
     let mut in_use = 0usize;
 
@@ -4166,12 +4167,21 @@ fn run_clean(
         let size = directory_size(path);
         println!("{verb} {what} {} ({})", path.display(), format_size(size));
         if !dry_run {
-            if path.is_dir() {
+            let result = if path.is_dir() {
                 std::fs::remove_dir_all(path)
             } else {
                 std::fs::remove_file(path)
+            };
+            match result {
+                Ok(()) => {}
+                // Gone already: another `clean` removed it while this one
+                // waited for its lock. What was asked for is true.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("unable to remove {}", path.display()))
+                }
             }
-            .with_context(|| format!("unable to remove {}", path.display()))?;
         }
         removed += 1;
         bytes += size;
@@ -4243,7 +4253,36 @@ fn run_clean(
             continue;
         }
         match SessionLock::acquire(path.clone()) {
-            Ok(_lock) => remove(&path, "endpoint lock")?,
+            Ok(_lock) => {
+                // Only the lock file this clean holds goes, then the
+                // directory if nothing else is in it. A remove_dir_all
+                // could delete a lock file another process has just
+                // created and locked; the lock itself rechecks its file
+                // (SessionLock::acquire), so removing the held one is safe.
+                println!("{verb} endpoint lock {}", path.display());
+                if !dry_run {
+                    for result in [
+                        std::fs::remove_file(path.join("lock")),
+                        std::fs::remove_dir(&path),
+                    ] {
+                        match result {
+                            Ok(()) => {}
+                            Err(error)
+                                if matches!(
+                                    error.kind(),
+                                    std::io::ErrorKind::NotFound
+                                        | std::io::ErrorKind::DirectoryNotEmpty
+                                ) => {}
+                            Err(error) => {
+                                return Err(error).with_context(|| {
+                                    format!("unable to remove {}", path.display())
+                                })
+                            }
+                        }
+                    }
+                }
+                locks_removed += 1;
+            }
             Err(_) => {
                 println!("skipped endpoint lock {} (in use)", path.display());
                 in_use += 1;
@@ -4363,6 +4402,7 @@ fn run_clean(
         println!("{verb} {agents_removed} superseded agent binary(ies) from the remote hosts");
     }
 
+    let removed = removed + locks_removed;
     if removed == 0 && in_use == 0 && agents_removed == 0 {
         println!("nothing to clean");
     } else {

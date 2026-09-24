@@ -1624,31 +1624,50 @@ impl SessionLock {
     /// back-to-back release-and-reacquire can land inside it. A lock still
     /// held after the timeout is a real concurrent session, not that window.
     pub fn acquire(state_directory: PathBuf) -> Result<SessionLock> {
-        fs::create_dir_all(&state_directory).with_context(|| {
-            format!(
-                "unable to create session state directory {}",
-                state_directory.display()
-            )
-        })?;
         let path = state_directory.join("lock");
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .with_context(|| format!("unable to open session lock {}", path.display()))?;
         let deadline = std::time::Instant::now() + LOCK_ACQUISITION_TIMEOUT;
         loop {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            fs::create_dir_all(&state_directory).with_context(|| {
+                format!(
+                    "unable to create session state directory {}",
+                    state_directory.display()
+                )
+            })?;
+            let file = File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&path)
+                .with_context(|| format!("unable to open session lock {}", path.display()))?;
+            // Waits for the lock on this file, or gives up at the deadline.
+            loop {
+                if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(error).with_context(|| {
+                        format!("unable to lock session state {}", path.display())
+                    });
+                }
+                if std::time::Instant::now() >= deadline {
+                    return Err(SessionLockHeld {
+                        state_directory: state_directory.display().to_string(),
+                    }
+                    .into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            // The lock is on the file this handle opened. Whoever held it
+            // before may have removed that file (as `clean` does) while
+            // this waited, and a lock on a removed file excludes nobody: a
+            // newcomer would create a fresh file and lock that too. So the
+            // lock counts only while the path still names the locked file.
+            if lock_still_named(&file, &path) {
                 return Ok(SessionLock {
                     state_directory,
                     _file: file,
                 });
-            }
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::WouldBlock {
-                return Err(error)
-                    .with_context(|| format!("unable to lock session state {}", path.display()));
             }
             if std::time::Instant::now() >= deadline {
                 return Err(SessionLockHeld {
@@ -1656,13 +1675,22 @@ impl SessionLock {
                 }
                 .into());
             }
-            std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
 
     /// Returns the locked state directory.
     pub fn state_directory(&self) -> &Path {
         &self.state_directory
+    }
+}
+
+/// Whether `path` still names the file `file` was opened from: same device
+/// and inode. False when the file was removed or replaced since.
+fn lock_still_named(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
     }
 }
 
@@ -1680,6 +1708,30 @@ mod tests {
                 metadata: FileMetadata::default(),
             },
         }
+    }
+
+    /// A lock whose file is removed while another waits for it is not
+    /// handed to the waiter: the waiter ends up holding the lock on the file
+    /// the path names now. Otherwise two holders could coexist, one on the
+    /// removed file and one on a fresh one.
+    #[test]
+    fn a_lock_removed_while_waited_for_is_taken_afresh() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let directory = keep.path().join("pair");
+        let first = SessionLock::acquire(directory.clone()).expect("first lock");
+        let waiter = {
+            let directory = directory.clone();
+            std::thread::spawn(move || SessionLock::acquire(directory))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        // What `clean` does: remove the lock's file while holding it.
+        fs::remove_file(directory.join("lock")).expect("remove the lock file");
+        drop(first);
+        let second = waiter
+            .join()
+            .expect("the waiter finishes")
+            .expect("the waiter gets the lock");
+        assert!(lock_still_named(&second._file, &directory.join("lock")));
     }
 
     #[test]

@@ -86,7 +86,7 @@ jobs:
           linker = "${{ matrix.linker }}"
           EOF
       - name: Build
-        run: cargo build --release --target ${{ matrix.target }}
+        run: cargo build --release --locked --target ${{ matrix.target }}
       - name: Stage artifact
         run: cp target/${{ matrix.target }}/release/autobahn autobahn-${{ matrix.platform }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -128,7 +128,7 @@ jobs:
         run: |
           for pair in aarch64-apple-darwin:darwin-aarch64 x86_64-apple-darwin:darwin-x86_64; do
             target=${pair%%:*}; platform=${pair##*:}
-            cargo build --release --target "$target"
+            cargo build --release --locked --target "$target"
             cp "target/$target/release/autobahn" "autobahn-$platform"
           done
       - name: Import the Developer ID certificate

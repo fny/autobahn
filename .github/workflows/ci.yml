@@ -60,9 +60,9 @@ jobs:
       - name: Formatting
         run: cargo fmt --check
       - name: Lints
-        run: cargo clippy --release --all-targets -- -D warnings
+        run: cargo clippy --release --locked --all-targets -- -D warnings
       - name: Tests
-        run: cargo test --release
+        run: cargo test --release --locked
 
   spec:
     # The specification, checked at its quick bound, and the implementation
@@ -90,7 +90,7 @@ jobs:
       - name: The star spec, quick bound
         run: spec/check.sh quick
       - name: The implementation against the spec
-        run: AUTOBAHN_TLC=1 cargo test --release --test spec_replay --test spec_peering_replay
+        run: AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_peering_replay
 
   mac:
     # A job with `needs` runs only if what it needs succeeded, and that
@@ -116,7 +116,7 @@ jobs:
           if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
           xcodebuild -version
       - name: Tests
-        run: cargo test --release
+        run: cargo test --release --locked
       - name: Build the app
         # Signed ad-hoc: this job holds no certificate and needs none to
         # prove the app still compiles, bundles its icon, and signs. Real
@@ -142,4 +142,4 @@ jobs:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Tests
-        run: cargo test --release
+        run: cargo test --release --locked

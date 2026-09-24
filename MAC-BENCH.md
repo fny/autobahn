@@ -448,6 +448,8 @@ It fails identically without `--features tray`, so the tray feature is not the c
 
 So the launcher behaves correctly on both; only the test's expectation is Linux-only. This matters for CI-09, which proposes adding these tests to CI — a macOS runner would go red on arrival. Filed as [`MAC-5`](REVIEWS/fixes/MAC-5-sh-exit-code-assertion.md).
 
+Two more tests fail on macOS for the same kind of reason, found while running the suite in full: `a_wedged_supervisor_is_unresponsive_within_the_client_timeout` and `a_status_report_against_a_wedged_supervisor_returns` both panic with *the backlog never filled* (`src/supervisor/control.rs:1586`). The fixture wedges a supervisor with `listen(fd, 0)`; macOS keeps its own minimum backlog, so the queue never fills. Both reproduce on untouched `main`. Filed as [`MAC-6`](REVIEWS/fixes/MAC-6-control-socket-backlog-test.md) (L-44). With MAC-5 fixed, the suite on macOS is **604 passed, 2 failed**, and those two are MAC-6.
+
 Steps 2 and 3 (the diff scratch path, and `--all` as a filename) still need the menu, and a person to click it.
 
 ### 7j. Escape sequences in file names — F-M-OUT

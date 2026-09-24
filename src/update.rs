@@ -134,6 +134,12 @@ pub fn run(options: Options) -> Result<()> {
     let reported = run_reports_version(&staged_binary)?;
     println!("  the downloaded binary reports {reported}");
 
+    // 3b. Whether it can read every session's baseline. A build that
+    //     cannot rebuilds one from the two sides, which is safe only where
+    //     they already match — so where they might not, stop here, before
+    //     anything is replaced, and say which to settle.
+    check_baselines(&staged_binary, &state_root)?;
+
     // 4. The bundle, before the restart. A controller that comes back new
     //    while the bundle is old installs agents that fail every
     //    handshake on every host of another platform.
@@ -472,6 +478,99 @@ fn run_reports_version(binary: &Path) -> Result<String> {
             )
         }
     }
+}
+
+/// Refuses an upgrade to a build that cannot read some session's baseline
+/// while that session is not settled.
+///
+/// Asked of the downloaded build itself (`autobahn formats`), since only it
+/// knows what it reads. A build from before the question existed cannot
+/// answer, and is let through as before.
+fn check_baselines(binary: &Path, state_root: &Path) -> Result<()> {
+    let Some((oldest, newest)) = Command::new(binary)
+        .arg("formats")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| parse_formats(&String::from_utf8_lossy(&output.stdout)))
+    else {
+        return Ok(());
+    };
+    let (unreadable, unsettled) = baselines_needing_rebuild(state_root, oldest, newest);
+    if unreadable == 0 {
+        return Ok(());
+    }
+    if !unsettled.is_empty() {
+        bail!(
+            "the new build reads baseline formats {oldest} to {newest}, and {unreadable} \
+             session(s) here were written in another. It rebuilds those from their two \
+             sides, which is safe only where the sides match, and these do not yet:\n{}\n\
+             Settle them (`autobahn doctor <group>` shows how they differ), then run \
+             `autobahn update` again. Nothing was installed.",
+            unsettled
+                .iter()
+                .map(|line| format!("  {line}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+    println!(
+        "  {unreadable} session(s) will rebuild their baseline on first start; \
+         their two sides match, so nothing moves"
+    );
+    Ok(())
+}
+
+/// Reads `ancestor <oldest> <newest>` as `autobahn formats` prints it.
+fn parse_formats(text: &str) -> Option<(u16, u16)> {
+    let mut words = text.split_whitespace();
+    (words.next()? == "ancestor").then_some(())?;
+    Some((words.next()?.parse().ok()?, words.next()?.parse().ok()?))
+}
+
+/// How many sessions' baselines fall outside `oldest..=newest`, and a line
+/// for each of those not settled — anything but synchronized with nothing
+/// waiting, or never recorded at all.
+fn baselines_needing_rebuild(state_root: &Path, oldest: u16, newest: u16) -> (usize, Vec<String>) {
+    let mut unreadable = 0;
+    let mut unsettled = Vec::new();
+    let Ok(entries) = std::fs::read_dir(state_root.join("sessions")) else {
+        return (0, unsettled);
+    };
+    for entry in entries.flatten() {
+        let identifier = entry.file_name().to_string_lossy().into_owned();
+        let format = crate::session::ancestor::format_of(&entry.path().join("ancestor"));
+        let Ok(Some(format)) = format else {
+            continue;
+        };
+        if (oldest..=newest).contains(&format) {
+            continue;
+        }
+        unreadable += 1;
+        match crate::supervisor::read_status(state_root, &identifier) {
+            Ok(Some(status))
+                if status.state == "synchronized"
+                    && status.conflicts.is_empty()
+                    && status.blocked.is_empty() => {}
+            Ok(Some(status)) => {
+                let mut why = vec![status.state.clone()];
+                if !status.conflicts.is_empty() {
+                    why.push(crate::alerts::plural(status.conflicts.len(), "conflict"));
+                }
+                if !status.blocked.is_empty() {
+                    why.push(crate::alerts::plural(status.blocked.len(), "blocked path"));
+                }
+                unsettled.push(format!(
+                    "{} → {}: {}",
+                    status.group,
+                    status.host,
+                    why.join(", ")
+                ));
+            }
+            _ => unsettled.push(format!("session {identifier}: no status recorded")),
+        }
+    }
+    (unreadable, unsettled)
 }
 
 /// Picks the version out of what `autobahn --version` prints.
@@ -1081,5 +1180,75 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
             gh: false,
         };
         assert!(latest.base().ends_with("/releases/latest/download"));
+    }
+
+    #[test]
+    fn formats_parse_as_printed() {
+        assert_eq!(parse_formats("ancestor 0 2\n"), Some((0, 2)));
+        assert_eq!(parse_formats("something else"), None);
+        assert_eq!(parse_formats(""), None);
+    }
+
+    #[test]
+    fn a_baseline_the_new_build_cannot_read_blocks_only_while_unsettled() {
+        use crate::supervisor::SessionStatus;
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let session = root.path().join("sessions").join("abc");
+        std::fs::create_dir_all(&session).unwrap();
+        // Format 2, which a build reading 3 to 3 cannot.
+        let mut checkpoint = b"ABAHNAN2".to_vec();
+        checkpoint.extend_from_slice(&2u16.to_le_bytes());
+        std::fs::write(session.join("ancestor"), &checkpoint).unwrap();
+        let status = |state: &str, conflicts: Vec<String>| SessionStatus {
+            group: "work".into(),
+            host: "boite".into(),
+            alpha: "~/a".into(),
+            beta: "boite:~/a".into(),
+            mode: "two-way-conflict".into(),
+            state: state.into(),
+            cycles: 3,
+            last_alpha_transitions: 0,
+            last_beta_transitions: 0,
+            conflicts,
+            conflict_details: Vec::new(),
+            blocked: Vec::new(),
+            error: None,
+            updated_at: 1,
+            alpha_entries: 0,
+            beta_entries: 0,
+            moved_files: 0,
+            moved_bytes: 0,
+            role: String::new(),
+            term: 0,
+            alert_after_seconds: None,
+        };
+
+        // A build that reads it: nothing to say.
+        assert_eq!(
+            baselines_needing_rebuild(root.path(), 0, 2),
+            (0, Vec::new())
+        );
+
+        // One that does not, with the session settled: through.
+        crate::supervisor::write_status(root.path(), "abc", &status("synchronized", Vec::new()))
+            .unwrap();
+        assert_eq!(
+            baselines_needing_rebuild(root.path(), 3, 3),
+            (1, Vec::new())
+        );
+
+        // Unsettled: named, with why.
+        crate::supervisor::write_status(
+            root.path(),
+            "abc",
+            &status("conflicts", vec!["a.txt".into(), "b.txt".into()]),
+        )
+        .unwrap();
+        let (count, unsettled) = baselines_needing_rebuild(root.path(), 3, 3);
+        assert_eq!(count, 1);
+        assert_eq!(
+            unsettled,
+            vec!["work → boite: conflicts, 2 conflicts".to_owned()]
+        );
     }
 }

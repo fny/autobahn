@@ -32,7 +32,7 @@ Each of these is either a way to lose data, a version mismatch that has already 
 
   *Why here:* a new CLI reads a healthy supervisor as broken; one hop closer to home than the agent epoch
 
-- [ ] **Version the journal records too.** The checkpoint states its format; journal records do not. Today it does not matter, because an older checkpoint is converted at open and the journal is retired with it, so records never outlive the build that wrote them. A change that lands without a checkpoint rewrite would break that. Either state the version per record, or write down why the conversion at open is sufficient.
+- [x] **Version the journal records too.** The checkpoint states its format; journal records do not. Today it does not matter, because an older checkpoint is converted at open and the journal is retired with it, so records never outlive the build that wrote them. A change that lands without a checkpoint rewrite would break that. Either state the version per record, or write down why the conversion at open is sufficient.
 
   **Decided 2026-09-23:** no reader is kept for an old layout. A golden-bytes test pins the record encoding, so a change to it fails CI and must raise `CHECKPOINT_VERSION`. `read_journal` takes the checkpoint's version. `autobahn update` asks the new binary which formats it reads; if not this machine's, it upgrades only once every session is settled, and the new build rebuilds the ancestor from two matching sides (item 10). A hand-copied binary that finds an unreadable journal rebuilds when the sides match and otherwise refuses, naming the version to go back to. The golden-bytes test and the version plumbing are in (2026-09-24); the pre-update check and the rebuild land with `doctor`.
 
@@ -56,6 +56,8 @@ Each of these is either a way to lose data, a version mismatch that has already 
 
   *Why here:* config shape: decide before v1, even if the decision is to leave it
 
+- [ ] **The `fan_out_races` e2e tests fail about a third of the time.** Found 2026-09-24: 5 of 10 runs at `5d47b4e`, 3 of 10 after the doctor work, so it predates it. Two of the three race tests (`two_betas_edit_one_file_and_the_later_write_is_refused`, `an_edit_landing_on_alpha_between_a_scan_and_its_transition_is_carried_next_cycle`) assert an outcome that depends on whether the second session's watcher has seen the first session's write by the time it cycles; `events_delivered()` waits a fixed 250 ms. Either wait on the observer's generation instead of a sleep, or find which change since `cbdca75` made the window matter — the settle (`SETTLE`/`QUIET` 25/5) and the standing-watch scan skip are the suspects. CI will see it.
+
 ## Can wait
 
 Real work, none of it load-bearing for a first release.
@@ -66,13 +68,13 @@ Real work, none of it load-bearing for a first release.
 
   *Why here:* the proper fix; needs a snapshot field and an epoch bump
 
-- [ ] **Rebuild an ancestor that cannot be read, when it is safe.** Now justified by corruption alone — versioning covers planned changes. Scan both sides. If they hold identical content, adopt it and carry on: nothing can be resurrected when the two sides already agree, so the fix is provably a no-op. If they differ, do not act. Halt and name `autobahn reset`, because rebuilding then resurrects deletions. Make it loud either way, and refuse a second rebuild on the same session — a disk that corrupts one ancestor will corrupt another, and a silent retry turns a hardware fault into a mystery.
+- [x] **Rebuild an ancestor that cannot be read, when it is safe.** Now justified by corruption alone — versioning covers planned changes. Scan both sides. If they hold identical content, adopt it and carry on: nothing can be resurrected when the two sides already agree, so the fix is provably a no-op. If they differ, do not act. Halt and name `autobahn reset`, because rebuilding then resurrects deletions. Make it loud either way, and refuse a second rebuild on the same session — a disk that corrupts one ancestor will corrupt another, and a silent retry turns a hardware fault into a mystery.
 
   **Decided 2026-09-24:** built with `doctor` (next item), which shares its "do the two sides match?" check; it also serves the journal plan (item 5).
 
   *Why here:* today it halts and names `reset`, which is correct if unkind
 
-- [ ] **`autobahn doctor <group>`** — promote `examples/probe.rs` to a real command. Read-only: opens both endpoints, scans, and reports what each root looks like plus every directory populated on one side and empty/absent on the other. It answered a question the product could not answer about itself, which is the argument for shipping it. Delete the example when it lands.
+- [x] **`autobahn doctor <group>`** — promote `examples/probe.rs` to a real command. Read-only: opens both endpoints, scans, and reports what each root looks like plus every directory populated on one side and empty/absent on the other. It answered a question the product could not answer about itself, which is the argument for shipping it. Delete the example when it lands.
 
   **Decided 2026-09-24:** do it, together with item 10. Also reports whether the ancestor loads and how far each side has drifted from it, so it says before a `reset` whether the reset is free.
 

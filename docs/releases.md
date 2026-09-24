@@ -81,7 +81,7 @@ The order of the steps is the point of the command:
 
 1. Download the platform binary, the agent bundle and `SHA256SUMS` into a temporary directory.
 2. Verify every file against `SHA256SUMS`.
-3. Run the downloaded binary from the temporary directory and read the version it reports.
+3. Run the downloaded binary from the temporary directory and read the version it reports. Ask it which baseline formats it reads: if some session's baseline is in another, the new build will rebuild it from the two sides, which is safe only where they match — so if any such session is not settled (synchronized, no conflicts, nothing blocked), stop here and name it.
 4. Replace the agent bundle. Write a temporary directory, then rename it into place.
 5. Rename the new binary into place. Keep the old one as `autobahn.previous`.
 6. Restart the login service, if one is installed.
@@ -90,7 +90,7 @@ The order of the steps is the point of the command:
 Each step guards against one failure:
 
 - Step 2 runs before anything moves. A checksum that you check after the file is in place is a report, not a guard.
-- Step 3 catches a release that published the wrong asset under this platform's name. Such an asset matches its own checksum.
+- Step 3 catches a release that published the wrong asset under this platform's name. Such an asset matches its own checksum. Its second half catches an upgrade across a baseline format while two sides still differ: rebuilt then, a baseline would bring back deletions. A build from before the question existed cannot answer it and is let through.
 - Step 4 runs before step 6, always. If the controller restarts on a new version while the bundle still holds the old binaries, it uploads an agent named for the new version whose bytes are the old one. Every host on another platform then fails its handshake.
 - Step 5 renames, and never writes over the binary in place. A running process holds the inode of the file it started from. A write into that file kills the running service. A rename leaves the old inode alone until the service restarts.
 - Step 7 is the only proof that the new version runs here. A restart command returns as soon as the service manager accepts it.

@@ -1792,7 +1792,16 @@ pub fn unreadable_ancestors(plans: &[SessionPlan], state_root: &Path) -> Vec<(St
                 .join("ancestor");
             crate::session::ancestor::readable(&checkpoint)
                 .err()
-                .map(|error| (plan.display(), format!("{error:#}")))
+                .map(|error| {
+                    (
+                        plan.display(),
+                        format!(
+                            "{error:#}; the first cycle rebuilds it if both sides match, \
+                         and halts otherwise (`autobahn doctor {}` shows which)",
+                            plan.group
+                        ),
+                    )
+                })
         })
         .collect()
 }
@@ -2316,7 +2325,11 @@ static STATUS_TEMPORARY_COUNTER: std::sync::atomic::AtomicU64 =
 /// same session — which the session lock makes rare but a crashed lock
 /// holder's final write can still overlap — publish whole files in
 /// last-writer-wins order rather than tearing each other's temporaries.
-fn write_status(state_root: &Path, identifier: &str, status: &SessionStatus) -> Result<()> {
+pub(crate) fn write_status(
+    state_root: &Path,
+    identifier: &str,
+    status: &SessionStatus,
+) -> Result<()> {
     let directory = status_directory(state_root);
     fs::create_dir_all(&directory).context("unable to create the status directory")?;
     let path = directory.join(format!("{identifier}.json"));

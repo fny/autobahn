@@ -23,6 +23,8 @@ autobahn status --json     # the same, as one versioned document
 
 autobahn sync              # one pass over every session, then exit
 autobahn flush             # sync everything right now
+autobahn doctor project    # look, change nothing: both sides, how they
+                           # differ, the baseline, and what a reset would do
 autobahn reset project     # forget the baseline; next cycle merges both
                            # sides additively (resurrects deletions)
 autobahn verify project    # next cycle re-reads every byte, catching
@@ -35,7 +37,7 @@ autobahn mi                # the shop: watch it work, and clear the queue
                            # (? explains every word on the screen)
 ```
 
-`reset` requires the group name. A reset is deliberate, never a default. `clean` is described in [State](./state.md); the conflict commands in [Conflicts](./conflicts.md).
+`reset` requires the group name. A reset is deliberate, never a default. Run `doctor` first: it scans both sides and says whether they already match — in which case a reset is free — and if not, exactly what it would copy where, which is what a reset brings back. It changes neither folder nor the baseline, and runs beside a supervisor. `clean` is described in [State](./state.md); the conflict commands in [Conflicts](./conflicts.md).
 
 Turning things off and on, without opening the file:
 

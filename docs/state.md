@@ -62,4 +62,4 @@ A *stale bundle* — an `agents/` binary left over from an older build — is re
 - [Commands](./commands.md) — `clean`, `reset`, `verify`
 - [Ignores](./ignores.md) — the `ignores/` directory
 - [The log](./logging.md) — `service.log`
-- [Safety](./safety.md) — why a corrupt ancestor is an error, not a reset
+- [Safety](./safety.md) — why an unreadable ancestor is rebuilt only when both sides match, and never reset

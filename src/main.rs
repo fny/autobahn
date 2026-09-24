@@ -406,6 +406,27 @@ enum Command {
         #[command(subcommand)]
         verb: PeeringVerb,
     },
+    /// A look at a group's sessions: what each side holds, how the two
+    /// differ, whether the baseline reads, what the next cycle would do,
+    /// and what a reset would do. Changes neither folder nor the baseline
+    /// (a scan refreshes its scan cache, as every scan does), and runs
+    /// beside a supervisor.
+    Doctor {
+        /// The group to look at, by its name or by its folder.
+        group: String,
+        /// Filter to a destination within the group.
+        host: Option<String>,
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+    },
+    /// Prints the baseline formats this build reads, for `autobahn update`
+    /// to ask a downloaded build before installing it.
+    #[command(hide = true)]
+    Formats,
     /// Reset sessions in a running supervisor: their synchronization
     /// baselines are discarded, so the next cycle merges both sides
     /// additively (resurrecting deletions). The group is required — a
@@ -627,6 +648,17 @@ fn main() {
             run_status(
                 config, state_root, group, host, conflicts, live, json, expand,
             )
+        }
+        Command::Doctor {
+            group,
+            host,
+            config,
+            state_root,
+        } => run_doctor(config, state_root, &group, host.as_deref()),
+        Command::Formats => {
+            let (oldest, newest) = autobahn::session::ancestor::readable_formats();
+            println!("ancestor {oldest} {newest}");
+            Ok(())
         }
         Command::Flush {
             group,
@@ -995,6 +1027,241 @@ fn run_sync(
         }
     }
     Ok(())
+}
+
+/// Looks at a group's sessions without changing anything.
+///
+/// Built for the moment something looks wrong, and for the moment before a
+/// `reset`: it answers whether the two sides already match, which is
+/// whether a reset is free — and when they do not, what it would bring
+/// back or overwrite.
+fn run_doctor(
+    config: Option<PathBuf>,
+    state_root: Option<PathBuf>,
+    group: &str,
+    host: Option<&str>,
+) -> Result<()> {
+    use autobahn::tree::reconcile;
+    let plans = load_config(config)?.plans()?;
+    let state_root = resolve_state_root(state_root)?;
+    let selection = select(&plans, Some(group), host)?;
+    let pool = autobahn::transport::mux::AgentPool::default();
+    let mut failures = 0usize;
+    for plan in selection.plans {
+        println!(
+            "\x1b[1m{}\x1b[0m → {}  \x1b[2m{} · {}\x1b[0m",
+            plan.alpha_spec,
+            plan.beta_spec(),
+            plan.group,
+            plan.mode_name()
+        );
+        let scanned = (|| -> Result<_> {
+            let (mut alpha, mut beta) =
+                autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
+            let alpha = alpha.scan().context("unable to scan alpha")?;
+            let beta = beta.scan().context("unable to scan beta")?;
+            Ok((alpha, beta))
+        })();
+        let (alpha, beta) = match scanned {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                println!("  \x1b[31mcannot look\x1b[0m: {error:#}\n");
+                failures += 1;
+                continue;
+            }
+        };
+        for (side, snapshot) in [("alpha", &alpha), ("beta", &beta)] {
+            match &snapshot.root {
+                None => println!("  {side}: \x1b[33mmissing\x1b[0m"),
+                Some(_) => {
+                    let count = |value: u64, word: &str| {
+                        let plural = if value == 1 { "" } else { "s" };
+                        format!("{} {word}{plural}", thousands(value))
+                    };
+                    println!(
+                        "  {side}: {}, {}, {}, {}",
+                        count(snapshot.files, "file"),
+                        count(snapshot.directories, "folder"),
+                        count(snapshot.symlinks, "link"),
+                        format_bytes(snapshot.total_file_size)
+                    )
+                }
+            }
+        }
+
+        // The baseline, read without writing: a supervisor may be running.
+        let checkpoint = state_root
+            .join("sessions")
+            .join(plan.identifier())
+            .join("ancestor");
+        let ancestor = autobahn::session::ancestor::peek(&checkpoint);
+        match &ancestor {
+            Ok((None, _)) => println!("  baseline: none yet — no cycle has completed"),
+            Ok((Some(_), generation)) => {
+                println!(
+                    "  baseline: readable, generation {}",
+                    thousands(*generation)
+                )
+            }
+            Err(error) => println!("  baseline: \x1b[31munreadable\x1b[0m — {error:#}"),
+        }
+
+        let describe = |reconciliation: &autobahn::tree::Reconciliation| -> Vec<String> {
+            let mut lines = Vec::new();
+            for (change, direction) in reconciliation
+                .alpha_transitions
+                .iter()
+                .map(|change| (change, "to alpha"))
+                .chain(
+                    reconciliation
+                        .beta_transitions
+                        .iter()
+                        .map(|change| (change, "to beta")),
+                )
+            {
+                let verb = match (&change.old, &change.new) {
+                    (None, Some(_)) => "copy",
+                    (Some(_), None) => "delete",
+                    _ => "replace",
+                };
+                let path = if change.path.is_empty() {
+                    "(the root)"
+                } else {
+                    &change.path
+                };
+                lines.push(format!("{verb} {path} {direction}"));
+            }
+            for conflict in &reconciliation.conflicts {
+                let path = if conflict.root.is_empty() {
+                    "(the root)"
+                } else {
+                    &conflict.root
+                };
+                lines.push(format!("conflict at {path}"));
+            }
+            lines
+        };
+        let show = |heading: &str, lines: &[String]| {
+            println!("  {heading}");
+            for line in lines.iter().take(8) {
+                println!("    {line}");
+            }
+            if lines.len() > 8 {
+                println!("    … {} more", thousands((lines.len() - 8) as u64));
+            }
+        };
+
+        // What the next cycle would do: the baseline against both sides.
+        let mode = plan.mode;
+        if let Ok((baseline, _)) = &ancestor {
+            let next = describe(&reconcile(
+                baseline.as_ref(),
+                alpha.root.as_ref(),
+                beta.root.as_ref(),
+                mode,
+            ));
+            if next.is_empty() {
+                println!("  the next cycle: nothing to do — in sync");
+            } else {
+                show(&format!("the next cycle would ({}):", next.len()), &next);
+            }
+        }
+
+        // What a reset would do: the same, with no history at all.
+        let reset = describe(&reconcile(
+            None,
+            alpha.root.as_ref(),
+            beta.root.as_ref(),
+            mode,
+        ));
+        if reset.is_empty() {
+            println!("  a reset: \x1b[32mfree\x1b[0m — the two sides match");
+        } else {
+            show(
+                &format!(
+                    "a reset would ({}) — with no baseline, whatever is on one side only is \
+                     copied to the other, including what was deleted on purpose:",
+                    reset.len()
+                ),
+                &reset,
+            );
+        }
+
+        // Folders populated on one side and empty or gone on the other: the
+        // shape of a vanished mount, and of an emptied tree.
+        let mut lopsided = Vec::new();
+        lopsided_folders(alpha.root.as_ref(), beta.root.as_ref(), "", &mut lopsided);
+        if lopsided.is_empty() {
+            println!("  folders full on one side and empty on the other: none");
+        } else {
+            show(
+                "folders full on one side and empty on the other:",
+                &lopsided,
+            );
+        }
+        println!();
+    }
+    if failures > 0 {
+        bail!("{failures} session(s) could not be looked at");
+    }
+    Ok(())
+}
+
+/// Walks two trees together, collecting the folders that hold eight or
+/// more entries on one side and are empty or absent on the other.
+fn lopsided_folders(
+    alpha: Option<&autobahn::tree::Node>,
+    beta: Option<&autobahn::tree::Node>,
+    path: &str,
+    found: &mut Vec<String>,
+) {
+    use autobahn::tree::{Content, Node};
+    fn below(node: &Node) -> usize {
+        node.children().iter().map(|child| 1 + below(child)).sum()
+    }
+    let directory = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Directory(_)));
+    let empty =
+        |node: Option<&Node>| !directory(node) || node.is_some_and(|n| n.children().is_empty());
+    if !path.is_empty() && empty(alpha) != empty(beta) {
+        let (populated, side) = if empty(alpha) {
+            (beta, "beta")
+        } else {
+            (alpha, "alpha")
+        };
+        let count = populated.map(below).unwrap_or(0);
+        if count >= 8 {
+            found.push(format!(
+                "{path} — {} entries on {side}, empty or gone on the other",
+                thousands(count as u64)
+            ));
+            return;
+        }
+    }
+    if !directory(alpha) || !directory(beta) {
+        return;
+    }
+    let left = alpha.map(Node::children).unwrap_or(&[]);
+    let right = beta.map(Node::children).unwrap_or(&[]);
+    let mut names: Vec<&str> = left
+        .iter()
+        .chain(right.iter())
+        .map(|child| child.name.as_str())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        let child_path = if path.is_empty() {
+            name.to_owned()
+        } else {
+            format!("{path}/{name}")
+        };
+        lopsided_folders(
+            alpha.and_then(|node| node.child(name)),
+            beta.and_then(|node| node.child(name)),
+            &child_path,
+            found,
+        );
+    }
 }
 
 /// Sends a control request to the running supervisor and reports the result.

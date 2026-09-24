@@ -46,6 +46,15 @@ pub enum SafetyHalt {
     /// back and carries on.
     #[error("halted: the alpha folder {0} is missing, so nothing was synchronized rather than emptying the other side to match; reconnect the drive or correct the path, and syncing resumes on its own")]
     AlphaRootMissing(String),
+    /// The session's ancestor cannot be read, and the two sides differ, so
+    /// there is no safe way to tell a deletion from a creation or an edit
+    /// from a stale copy. When they match it is rebuilt instead.
+    #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and the two sides differ, so nothing was synchronized; without that record deletions would come back and edits could be overwritten. `autobahn doctor <group>` shows how they differ. Once they match it rebuilds on its own, or `autobahn reset <group>` merges them")]
+    AncestorUnreadable(String),
+    /// The ancestor is damaged again after being rebuilt once. A disk that
+    /// damages one will damage another; it is not rebuilt twice.
+    #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and it was rebuilt once already after the same kind of damage; a disk that damages one will damage another, so it is not rebuilt again. Check the disk, then `autobahn reset <group>`")]
+    AncestorDamagedAgain(String),
 }
 
 impl SafetyHalt {
@@ -55,7 +64,10 @@ impl SafetyHalt {
     pub fn alert_after(&self) -> Option<std::time::Duration> {
         match self {
             SafetyHalt::AlphaRootMissing(_) => Some(std::time::Duration::from_secs(120)),
-            SafetyHalt::RootDeletion | SafetyHalt::RootEmptied => None,
+            SafetyHalt::RootDeletion
+            | SafetyHalt::RootEmptied
+            | SafetyHalt::AncestorUnreadable(_)
+            | SafetyHalt::AncestorDamagedAgain(_) => None,
         }
     }
 }
@@ -194,6 +206,16 @@ pub struct Session {
     /// The exclusive lock on the session state directory, held for the
     /// session's lifetime (released when the file closes on drop).
     _lock: SessionLock,
+    /// Where the ancestor lives, for a rebuild to set it aside.
+    ancestor_path: std::path::PathBuf,
+    /// The ancestor could not be read when the session opened: why, and
+    /// whether it was a format another build wrote rather than damage. The
+    /// first cycle either rebuilds it — when the two sides already match,
+    /// which no history could change — or halts.
+    unreadable: Option<(String, bool)>,
+    /// Whether appends sync before acknowledging, remembered so a rebuilt
+    /// store keeps what the configuration asked for.
+    power_durability: bool,
 }
 
 /// The error raised when a session's state directory is locked by another
@@ -248,6 +270,7 @@ impl Session {
     /// Opts the ancestor store into power-loss durability: every journal
     /// append syncs before the cycle is acknowledged.
     pub fn set_power_durability(&mut self, enabled: bool) {
+        self.power_durability = enabled;
         self.ancestor_store.set_power_durability(enabled);
     }
 
@@ -272,8 +295,24 @@ impl Session {
         lock: SessionLock,
     ) -> Result<Session> {
         let ancestor_path = lock.state_directory().join("ancestor");
-        let (mut ancestor_store, mut ancestor, unresolved) =
-            ancestor::AncestorStore::open(&ancestor_path)?;
+        // An ancestor that cannot be read is never discarded silently —
+        // starting from nothing would bring deletions back — but it need
+        // not stop the session either: when the two sides already match
+        // there is nothing a history could change, and the first cycle
+        // rebuilds it from them. Until it has looked, nothing is written.
+        let (mut ancestor_store, mut ancestor, unresolved, unreadable) =
+            match ancestor::AncestorStore::open(&ancestor_path) {
+                Ok((store, ancestor, unresolved)) => (store, ancestor, unresolved, None),
+                Err(error) => (
+                    ancestor::AncestorStore::blank(&ancestor_path),
+                    None,
+                    Vec::new(),
+                    Some((
+                        format!("{error:#}"),
+                        error.downcast_ref::<ancestor::UnknownFormat>().is_some(),
+                    )),
+                ),
+            };
         if !unresolved.is_empty() {
             // A previous run crashed between announcing transitions and
             // recording what they achieved, so provenance at these paths is
@@ -346,7 +385,60 @@ impl Session {
             peer_side: crate::peering::PeerSide::Beta,
             copy_checked: false,
             _lock: lock,
+            ancestor_path,
+            unreadable,
+            power_durability: false,
         })
+    }
+
+    /// Answers an ancestor that could not be read, with both sides scanned.
+    ///
+    /// When the two sides already match — reconciling them with no history
+    /// at all changes nothing and conflicts nowhere — the ancestor can only
+    /// ever have said the same, so it is set aside (kept, never deleted)
+    /// and this cycle records a fresh one from what both sides hold. That
+    /// is a reset, taken only where a reset is free.
+    ///
+    /// When they differ it halts, and says how to make them match. Damage,
+    /// as opposed to a format another build wrote, is rebuilt once per
+    /// session: a disk that damages one ancestor will damage another, and a
+    /// quiet retry would turn a hardware fault into a mystery.
+    fn rebuild_or_halt(
+        &mut self,
+        problem: String,
+        format: bool,
+        alpha: Option<&Node>,
+        beta: Option<&Node>,
+    ) -> Result<()> {
+        let untouched = reconcile(None, alpha, beta, self.mode);
+        let matching = untouched.conflicts.is_empty()
+            && untouched.alpha_transitions.is_empty()
+            && untouched.beta_transitions.is_empty();
+        let marker = self.ancestor_path.with_file_name("ancestor.rebuilt");
+        if !matching {
+            self.unreadable = Some((problem.clone(), format));
+            bail!(SafetyHalt::AncestorUnreadable(problem));
+        }
+        if !format && marker.exists() {
+            self.unreadable = Some((problem.clone(), format));
+            bail!(SafetyHalt::AncestorDamagedAgain(problem));
+        }
+        ancestor::AncestorStore::set_aside(&self.ancestor_path)?;
+        if !format {
+            std::fs::write(&marker, format!("{problem}\n"))
+                .with_context(|| format!("unable to write {}", marker.display()))?;
+        }
+        let (mut store, ancestor, _) = ancestor::AncestorStore::open(&self.ancestor_path)?;
+        store.set_power_durability(self.power_durability);
+        self.ancestor_store = store;
+        self.ancestor = ancestor;
+        crate::complain!(
+            "the record of what the two sides last agreed on could not be read ({problem}); \
+             both sides match, so it was rebuilt from them. The old one is kept beside it \
+             as {}.unreadable-*",
+            self.ancestor_path.display()
+        );
+        Ok(())
     }
 
     /// Peering: adopts (or drops) the leadership this session presents to
@@ -644,6 +736,10 @@ impl Session {
                 .flatten();
             propagate_executability(self.ancestor.as_ref(), peer, beta_snapshot.root.as_ref())
         };
+
+        if let Some((problem, format)) = self.unreadable.take() {
+            self.rebuild_or_halt(problem, format, alpha_root.as_ref(), beta_root.as_ref())?;
+        }
 
         // Safety: if the ancestor root was a directory with non-trivial
         // content and exactly one side now presents an empty (or absent)

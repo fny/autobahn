@@ -1946,3 +1946,121 @@ mod fan_out_races {
         }
     }
 }
+
+/// What an unreadable ancestor comes to, by whether the two sides match.
+mod unreadable_ancestor {
+    use super::*;
+
+    /// An ancestor in this build's own format whose bytes no longer match
+    /// their digest: damage, not a format another build wrote. Early on the
+    /// ancestor is all journal, so the journal's last byte is the one
+    /// flipped when there is a journal.
+    fn damage(harness: &Harness) {
+        let journal = harness.state.join("ancestor.journal");
+        let path = match fs::metadata(&journal) {
+            Ok(metadata) if metadata.len() > 0 => journal,
+            _ => harness.state.join("ancestor"),
+        };
+        let mut bytes = fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        fs::write(&path, bytes).unwrap();
+    }
+
+    fn set_aside(harness: &Harness) -> usize {
+        fs::read_dir(&harness.state)
+            .unwrap()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().contains(".unreadable-"))
+            .count()
+    }
+
+    #[test]
+    fn matching_sides_rebuild_it_and_keep_the_old_one() {
+        let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
+        build_tree(&harness.alpha);
+        harness.cycle_ok();
+        damage(&harness);
+
+        let report = harness.cycle().expect("matching sides rebuild");
+        assert!(!report.changed(), "nothing to carry: {report:?}");
+        assert!(set_aside(&harness) >= 1, "the unreadable one is kept");
+        assert!(harness.state.join("ancestor.rebuilt").exists());
+
+        // The rebuilt ancestor is a real one: a deletion propagates as a
+        // deletion, not as a file to bring back.
+        fs::remove_file(harness.alpha.join("dir0/nested/file0.txt")).unwrap();
+        harness.cycle_ok();
+        assert!(!harness.beta.join("dir0/nested/file0.txt").exists());
+        harness.assert_trees_equal("after the rebuild");
+    }
+
+    #[test]
+    fn differing_sides_halt_and_nothing_moves() {
+        let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
+        build_tree(&harness.alpha);
+        harness.cycle_ok();
+        damage(&harness);
+        // A deletion the lost ancestor knew about: without it, the file on
+        // beta would look new and come back.
+        fs::remove_file(harness.alpha.join("dir0/nested/file0.txt")).unwrap();
+
+        let error = harness.cycle().expect_err("differing sides must halt");
+        assert!(
+            matches!(
+                error.downcast_ref::<SafetyHalt>(),
+                Some(SafetyHalt::AncestorUnreadable(_))
+            ),
+            "{error:#}"
+        );
+        assert!(
+            !harness.alpha.join("dir0/nested/file0.txt").exists(),
+            "not resurrected"
+        );
+        assert!(
+            harness.beta.join("dir0/nested/file0.txt").exists(),
+            "not deleted either"
+        );
+        assert_eq!(set_aside(&harness), 0, "nothing set aside while it halts");
+
+        // Settled by hand, it rebuilds on its own.
+        fs::remove_file(harness.beta.join("dir0/nested/file0.txt")).unwrap();
+        harness.cycle_ok();
+        assert!(set_aside(&harness) >= 1);
+    }
+
+    #[test]
+    fn damage_a_second_time_is_not_rebuilt_until_a_reset() {
+        let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
+        build_tree(&harness.alpha);
+        harness.cycle_ok();
+        damage(&harness);
+        harness.cycle_ok();
+        damage(&harness);
+        let error = harness.cycle().expect_err("damaged twice");
+        assert!(
+            matches!(
+                error.downcast_ref::<SafetyHalt>(),
+                Some(SafetyHalt::AncestorDamagedAgain(_))
+            ),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn a_format_from_another_build_rebuilds_without_counting_as_damage() {
+        let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
+        build_tree(&harness.alpha);
+        harness.cycle_ok();
+        // A checkpoint stating a format no build has written yet.
+        let mut future = b"ABAHNAN2".to_vec();
+        future.extend_from_slice(&999u16.to_le_bytes());
+        future.extend_from_slice(&[0; 32]);
+        for _ in 0..2 {
+            fs::write(harness.state.join("ancestor"), &future).unwrap();
+            let _ = fs::remove_file(harness.state.join("ancestor.journal"));
+            harness.cycle().expect("a format is rebuilt, every time");
+        }
+        assert!(!harness.state.join("ancestor.rebuilt").exists());
+    }
+}

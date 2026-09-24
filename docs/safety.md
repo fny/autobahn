@@ -31,7 +31,7 @@ So every scan is tagged with a *generation*, and a scan is never used as current
 
 The ancestor is updated only after both sides confirm their writes. Before the first write of a cycle, autobahn records its *intent* — the paths it is about to touch — and, whenever a remote machine is involved, forces that record to disk first. If anything crashes mid-cycle, the next start finds the unfinished intent and marks those paths as unknown.
 
-Unknown provenance surfaces as a conflict, never as an overwrite. A crash can remove what the ancestor knows; it can never make it claim an agreement that did not happen. And a corrupt ancestor is an error, never a silent reset — a reset would bring deleted files back.
+Unknown provenance surfaces as a conflict, never as an overwrite. A crash can remove what the ancestor knows; it can never make it claim an agreement that did not happen. And an ancestor that cannot be read — damaged, or written by another build — is never silently reset, since a reset would bring deleted files back. The first cycle scans both sides: if they already match, reconciling them with no history changes nothing, so the ancestor is rebuilt from them and the old one kept beside it as evidence. If they differ, the session halts and says so, and `autobahn doctor` shows how. Damage is rebuilt once per session; a second time halts until a `reset`, because a disk that damages one ancestor will damage another.
 
 ### Content is what its digest says (I3)
 

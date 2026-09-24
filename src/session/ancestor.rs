@@ -260,6 +260,52 @@ impl AncestorStore {
         self.sync_appends = enabled;
     }
 
+    /// A store at `path` that holds nothing and has read nothing: what a
+    /// session holds while the ancestor there cannot be read, until it
+    /// either rebuilds (`set_aside`, then a fresh `open`) or halts. It must
+    /// not be written through; the session never cycles far enough to.
+    pub(crate) fn blank(path: &Path) -> AncestorStore {
+        AncestorStore {
+            checkpoint_path: path.to_path_buf(),
+            journal_path: journal_path(path),
+            generation: 0,
+            checkpoint_bytes: 0,
+            journal_bytes: 0,
+            sync_appends: false,
+            #[cfg(test)]
+            append_syncs: 0,
+            #[cfg(test)]
+            fail_directory_sync: false,
+            journal: None,
+        }
+    }
+
+    /// Moves an unreadable ancestor out of the way, checkpoint and journal,
+    /// keeping both as `<name>.unreadable-<seconds>` beside it: evidence,
+    /// never deleted. After this `open` finds no ancestor.
+    pub(crate) fn set_aside(path: &Path) -> Result<()> {
+        let seconds = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        // The journal first: a checkpoint left without its journal is a
+        // state that was acknowledged once; a journal left without its
+        // checkpoint would be replayed onto nothing.
+        for source in [journal_path(path), path.to_path_buf()] {
+            let mut name = source.file_name().unwrap_or_default().to_os_string();
+            name.push(format!(".unreadable-{seconds}"));
+            match fs::rename(&source, source.with_file_name(name)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("unable to set aside {}", source.display()))
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The generation the stored ancestor stands at: zero before any
     /// record, and one more after each.
     pub(crate) fn generation(&self) -> u64 {
@@ -347,6 +393,10 @@ impl AncestorStore {
     /// base-zero delta applied to nothing reconstructs a hierarchy that
     /// never existed on either side.
     pub(crate) fn reset(path: &Path) -> Result<()> {
+        // A reset is the person's answer to a damaged ancestor, so it also
+        // forgets that one was rebuilt: the next damage is rebuilt again
+        // rather than refused forever.
+        let _ = fs::remove_file(path.with_file_name("ancestor.rebuilt"));
         for path in [journal_path(path), path.to_path_buf()] {
             match fs::remove_file(&path) {
                 Ok(()) => {}
@@ -635,12 +685,60 @@ fn checkpoint_version(data: &[u8]) -> u16 {
 /// stopped session and nothing to do about it, and `reset` is not a safe
 /// thing to suggest without saying that it brings deletions back.
 fn unreadable_checkpoint(found: u16) -> anyhow::Error {
-    anyhow::anyhow!(
-        "the ancestor is format {found}, and this build reads formats \
-         {OLDEST_READABLE_CHECKPOINT} to {CHECKPOINT_VERSION}. Run \
-         `autobahn reset <group>` for this session to rebuild it. That merges \
-         both sides and brings back files deleted while the other version ran"
-    )
+    anyhow::Error::new(UnknownFormat { found })
+}
+
+/// An ancestor written in a format this build does not read — by another
+/// build, not by a failing disk. Typed, because the two are answered
+/// differently: a format is expected across upgrades, corruption twice on
+/// one session is a disk to distrust.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "the ancestor is format {found}, and this build reads formats \
+     {OLDEST_READABLE_CHECKPOINT} to {CHECKPOINT_VERSION}"
+)]
+pub struct UnknownFormat {
+    pub found: u16,
+}
+
+/// The formats this build reads, oldest and newest — what `autobahn
+/// update` asks a downloaded build before installing it.
+pub fn readable_formats() -> (u16, u16) {
+    (OLDEST_READABLE_CHECKPOINT, CHECKPOINT_VERSION)
+}
+
+/// The format the checkpoint at `path` is written in, from its header
+/// alone; `None` when there is no checkpoint.
+pub fn format_of(path: &Path) -> Result<Option<u16>> {
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("unable to read ancestor"),
+    };
+    let mut header = [0u8; 16];
+    let read = file.read(&mut header).context("unable to read ancestor")?;
+    Ok(Some(checkpoint_version(&header[..read])))
+}
+
+/// Reads the ancestor at `path` without writing anything: the checkpoint
+/// with its journal replayed, and the generation it stands at. Unlike
+/// `AncestorStore::open`, which normalizes the journal and rewrites an old
+/// format, this touches nothing, so `doctor` can run beside a supervisor.
+pub fn peek(path: &Path) -> Result<(Option<Node>, u64)> {
+    let (mut generation, mut ancestor, _, version) = read_checkpoint(path)?;
+    let (records, _) = read_journal(&journal_path(path), version)?;
+    for record in records {
+        if record.base_generation != generation {
+            continue;
+        }
+        if let JournalEntry::Achieved(changes) = record.entry {
+            ancestor = apply(ancestor.as_ref(), &changes).map_err(|message| {
+                anyhow::anyhow!("unable to replay ancestor journal: {message}")
+            })?;
+            generation += 1;
+        }
+    }
+    Ok((ancestor, generation))
 }
 
 /// Reads the checkpoint, returning its generation, hierarchy, size, and the
@@ -1522,7 +1620,7 @@ mod tests {
     /// session — and a stopped session with no stated remedy is how a
     /// planned change becomes an outage.
     #[test]
-    fn a_checkpoint_states_its_format_and_an_unknown_one_names_the_remedy() {
+    fn a_checkpoint_states_its_format_and_an_unknown_one_is_told_apart_from_damage() {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
         let state = Some(directory(vec![file("a", 1)]));
@@ -1536,22 +1634,24 @@ mod tests {
         let bytes = fs::read(&path).expect("reads");
         assert_eq!(checkpoint_version(&bytes), CHECKPOINT_VERSION);
 
-        // A format from the future is refused, and the refusal carries the
-        // versions, the command, and what the command costs.
+        // A format from the future is refused, naming the versions, and
+        // typed as a format rather than damage: the session answers the two
+        // differently (a format is rebuilt whenever the sides match; damage
+        // once), and says what to do in its own halt.
         let mut future = bytes.clone();
         let start = VERSIONED_CHECKPOINT_MAGIC.len();
         future[start..start + 2].copy_from_slice(&(CHECKPOINT_VERSION + 1).to_le_bytes());
         fs::write(&path, &future).expect("writes");
         let error = match AncestorStore::open(&path) {
             Ok(_) => panic!("an unknown format must not load"),
-            Err(error) => format!("{error:#}"),
+            Err(error) => error,
         };
+        assert!(error.downcast_ref::<UnknownFormat>().is_some(), "{error:#}");
+        let error = format!("{error:#}");
         assert!(
             error.contains(&format!("format {}", CHECKPOINT_VERSION + 1)),
             "{error}"
         );
-        assert!(error.contains("autobahn reset"), "{error}");
-        assert!(error.contains("brings back files"), "{error}");
 
         // The cheap check reaches the same conclusion without decoding.
         assert!(readable(&path).is_err());

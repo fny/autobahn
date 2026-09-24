@@ -2520,3 +2520,78 @@ fn a_healthy_group_is_one_line_in_status_and_trouble_is_shown_in_full() {
     let (_, text) = cli(&world, &config, &["status", "quiet"]);
     assert!(text.contains(&quiet_mirror.display().to_string()), "{text}");
 }
+
+#[test]
+fn doctor_says_whether_a_reset_is_free_and_writes_nothing() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "keep.txt", "keep");
+    write(&alpha, "gone.txt", "gone");
+    let config = world.path("config.toml");
+    let plans = world.plans(&format!(
+        r#"
+        [groups.work]
+        mode = "two-way-conflict"
+        alpha = "{alpha}"
+        betas = ["{beta}"]
+        "#,
+        alpha = alpha.display(),
+        beta = beta.display(),
+    ));
+    assert_all_synchronized(&world.run_once(plans));
+
+    let (ok, text) = cli(&world, &config, &["doctor", "work"]);
+    assert!(ok, "{text}");
+    assert!(text.contains("baseline: readable"), "{text}");
+    assert!(text.contains("nothing to do"), "{text}");
+    assert!(
+        text.contains("a reset: ") && text.contains("free"),
+        "{text}"
+    );
+
+    // A deletion the baseline knows about, not yet carried across.
+    fs::remove_file(alpha.join("gone.txt")).unwrap();
+    let sessions = world.state_root().join("sessions");
+    let before: Vec<(PathBuf, std::time::SystemTime)> = walk_files(&sessions);
+    let (ok, text) = cli(&world, &config, &["doctor", "work"]);
+    assert!(ok, "{text}");
+    assert!(
+        text.contains("delete gone.txt to beta"),
+        "the next cycle: {text}"
+    );
+    assert!(
+        text.contains("copy gone.txt to alpha"),
+        "what a reset would bring back: {text}"
+    );
+    // The baseline is untouched. (A scan refreshes its scan cache, as any
+    // scan does; that is a cache, written by rename, and nothing else.)
+    let baseline = |files: Vec<(PathBuf, std::time::SystemTime)>| -> Vec<_> {
+        files
+            .into_iter()
+            .filter(|(path, _)| !path.to_string_lossy().ends_with(".scancache"))
+            .collect()
+    };
+    assert_eq!(
+        baseline(walk_files(&sessions)),
+        baseline(before),
+        "doctor changed session state"
+    );
+}
+
+fn walk_files(root: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
+    let mut found = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in fs::read_dir(&directory).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if let Ok(modified) = entry.metadata().and_then(|m| m.modified()) {
+                found.push((path, modified));
+            }
+        }
+    }
+    found.sort();
+    found
+}

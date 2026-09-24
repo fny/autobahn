@@ -75,6 +75,8 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+      - name: check.sh fails when TLC fails
+        run: spec/check-test.sh
       - name: TLC
         run: |
           mkdir -p ~/.local/lib

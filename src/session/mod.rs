@@ -1002,11 +1002,12 @@ impl Session {
         // Fold transition results into ancestor changes: each transition's
         // achieved content becomes the ancestor's new content at that path.
         let mut ancestor_changes = reconciliation.ancestor_changes;
-        let mut fold = |transitions: &[Change], outcome: &TransitionOutcome| {
-            ancestor_changes.extend(crate::endpoint::achieved_changes(transitions, outcome));
+        let mut fold = |transitions: &[Change], outcome: &TransitionOutcome| -> Result<()> {
+            ancestor_changes.extend(crate::endpoint::achieved_changes(transitions, outcome)?);
+            Ok(())
         };
         if let Some(outcome) = &beta_outcome {
-            fold(&reconciliation.beta_transitions, outcome);
+            fold(&reconciliation.beta_transitions, outcome).context("beta transition failed")?;
             report.beta_transitions = reconciliation.beta_transitions.len();
             report.beta_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
@@ -1015,7 +1016,7 @@ impl Session {
                 .extend(outcome.missing_staged.iter().cloned());
         }
         if let Some(outcome) = &alpha_outcome {
-            fold(&reconciliation.alpha_transitions, outcome);
+            fold(&reconciliation.alpha_transitions, outcome).context("alpha transition failed")?;
             report.alpha_transitions = reconciliation.alpha_transitions.len();
             report.alpha_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
@@ -1849,6 +1850,80 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.transition(transitions)
         }
+    }
+
+    /// Finding L-19: an endpoint — a remote one, or a buggy one — that
+    /// reports fewer results than it was given transitions used to have
+    /// the rest dropped by a `zip`, and the ancestor recorded less than was
+    /// attempted. The mismatch fails the cycle, and the ancestor stands.
+    #[test]
+    fn an_endpoint_short_of_results_fails_the_cycle_and_leaves_the_ancestor() {
+        struct ShortOfResults(ScriptedEndpoint);
+        impl Endpoint for ShortOfResults {
+            fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+                self.0.scan()
+            }
+            fn stage_begin(
+                &mut self,
+                files: Vec<FileRequest>,
+            ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+                self.0.stage_begin(files)
+            }
+            fn supply_open(&mut self, needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+                self.0.supply_open(needs)
+            }
+            fn supply_pull(
+                &mut self,
+                max_frames: usize,
+            ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+                self.0.supply_pull(max_frames)
+            }
+            fn stage_push(&mut self, frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+                self.0.stage_push(frames)
+            }
+            fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+                let mut outcome = self.0.transition(transitions)?;
+                outcome.results.truncate(1);
+                Ok(outcome)
+            }
+        }
+
+        let keep = tempfile::tempdir().unwrap();
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let base = || Node::directory("", vec![file("x", 1)]);
+        let grown = || Node::directory("", vec![file("a", 2), file("b", 3), file("x", 1)]);
+        let alpha = ScriptedEndpoint::new(vec![scripted(base()), scripted(grown())]);
+        let beta = ShortOfResults(ScriptedEndpoint::new(vec![scripted(base())]));
+        let mut session = Session::new(
+            Box::new(alpha),
+            Box::new(beta),
+            SyncMode::TwoWaySafe,
+            state.clone(),
+        )
+        .unwrap();
+        session.run_cycle().expect("the first cycle converges");
+
+        let error = match session.run_cycle() {
+            Ok(report) => panic!(
+                "two transitions and one result must fail the cycle, not record {} \
+                 beta transitions",
+                report.beta_transitions
+            ),
+            Err(error) => error,
+        };
+        assert!(format!("{error:#}").contains("results"), "{error:#}");
+        let held = session.ancestor.clone().expect("the ancestor stands");
+        assert!(held.content_equal(&base(), true), "the ancestor moved");
+        drop(session);
+        let (_, stored, unresolved) =
+            ancestor::AncestorStore::open(&state.join("ancestor")).unwrap();
+        assert!(stored.expect("stored").content_equal(&base(), true));
+        assert_eq!(
+            unresolved.len(),
+            2,
+            "both transitions keep their taint: neither is known to have landed"
+        );
     }
 
     /// Builds a snapshot around a root, sharing the root's storage across

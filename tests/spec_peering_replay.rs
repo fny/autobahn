@@ -384,7 +384,7 @@ impl Game {
                 missing_staged_files: false,
                 missing_staged: Vec::new(),
             };
-            achieved_changes(t, &outcome)
+            achieved_changes(t, &outcome).expect("one result per transition")
         };
         let x2 = from_node(
             apply(x.as_ref(), &r.alpha_transitions)

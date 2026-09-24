@@ -127,6 +127,15 @@ pub(crate) struct AncestorStore {
     journal_bytes: u64,
     /// Whether appends sync before acknowledging (power-loss durability).
     sync_appends: bool,
+    /// Whether the journal's directory entry needs no further sync. A
+    /// synced record in a file whose entry is not durable can vanish with
+    /// the file, so whichever way this store creates the journal, the
+    /// first durable append after that syncs the directory once. A journal
+    /// found at open was created by an earlier run and counts as settled:
+    /// the rule is the creator's to keep, and holding every run to it
+    /// again would fail every durable append on filesystems whose
+    /// directories cannot be synced.
+    journal_entry_durable: bool,
     /// How many appends actually synced, so a test can hold the durability
     /// contract without a way to cut the power.
     #[cfg(test)]
@@ -135,6 +144,20 @@ pub(crate) struct AncestorStore {
     /// the compaction ordering on filesystems where it cannot really fail.
     #[cfg(test)]
     pub(crate) fail_directory_sync: bool,
+    /// How many directory syncs happened while the journal existed — the
+    /// only ones that can make its directory entry durable.
+    #[cfg(test)]
+    pub(crate) journal_entry_syncs: u64,
+    /// How many compactions were attempted, and how many failures were
+    /// reported, so a test can hold the retry and the single log line.
+    #[cfg(test)]
+    pub(crate) compaction_attempts: u64,
+    #[cfg(test)]
+    pub(crate) compaction_warnings: u64,
+    /// Consecutive failed compactions, and how many more records to append
+    /// before the next attempt: the back-off after repeated failures.
+    compaction_failures: u32,
+    compaction_deferred: u32,
     /// The journal, held open across appends. An intent and an achieved
     /// record per cycle would otherwise cost two opens per cycle, which
     /// measured as two to four milliseconds of p50 on the edit path. The
@@ -242,6 +265,7 @@ impl AncestorStore {
                 .map_err(|message| anyhow::anyhow!("persisted ancestor is invalid: {message}"))?;
         }
 
+        let journal_entry_durable = journal_path.exists();
         let mut store = AncestorStore {
             checkpoint_path: path.to_path_buf(),
             journal_path,
@@ -249,10 +273,19 @@ impl AncestorStore {
             checkpoint_bytes,
             journal_bytes,
             sync_appends: false,
+            journal_entry_durable,
             #[cfg(test)]
             append_syncs: 0,
             #[cfg(test)]
             fail_directory_sync: false,
+            #[cfg(test)]
+            journal_entry_syncs: 0,
+            #[cfg(test)]
+            compaction_attempts: 0,
+            #[cfg(test)]
+            compaction_warnings: 0,
+            compaction_failures: 0,
+            compaction_deferred: 0,
             journal: None,
         };
 
@@ -273,8 +306,15 @@ impl AncestorStore {
         // rule that reads them lasts one open rather than until the next
         // compaction — which on a quiet session, or one whose history
         // fits in the journal alone, may never come.
+        //
+        // Unresolved intents go through the rewrite with it: they are the
+        // taint of a transition that may or may not have landed, and
+        // clearing them would let the next cycle overwrite such a path
+        // rather than raise a conflict.
         if version != CHECKPOINT_VERSION || legacy {
-            if let Err(error) = store.checkpoint(generation, ancestor.as_ref()) {
+            if let Err(error) =
+                store.checkpoint_carrying(generation, ancestor.as_ref(), &unresolved)
+            {
                 eprintln!("unable to rewrite the ancestor in the current format: {error:#}");
             }
         }
@@ -302,10 +342,19 @@ impl AncestorStore {
             checkpoint_bytes: 0,
             journal_bytes: 0,
             sync_appends: false,
+            journal_entry_durable: false,
             #[cfg(test)]
             append_syncs: 0,
             #[cfg(test)]
             fail_directory_sync: false,
+            #[cfg(test)]
+            journal_entry_syncs: 0,
+            #[cfg(test)]
+            compaction_attempts: 0,
+            #[cfg(test)]
+            compaction_warnings: 0,
+            compaction_failures: 0,
+            compaction_deferred: 0,
             journal: None,
         }
     }
@@ -342,14 +391,18 @@ impl AncestorStore {
         self.generation
     }
 
-    /// The generation a store on disk stands at, by opening it. Zero for a
+    /// The generation a store on disk stands at, by reading it. Zero for a
     /// store that does not exist yet.
+    ///
+    /// It reads without writing — no normalization, no format rewrite —
+    /// because the store may be someone else's: peering asks this of a
+    /// leader's copy and of the session's own store alike, and neither
+    /// question is a reason to change what the owner finds next.
     pub(crate) fn stored_generation(path: &Path) -> Result<u64> {
         if !path.exists() && !journal_path(path).exists() {
             return Ok(0);
         }
-        let (store, _, _) = AncestorStore::open(path)?;
-        Ok(store.generation)
+        Ok(peek(path)?.1)
     }
 
     /// Replaces the store at `to` with the one at `from`: the journal is
@@ -455,19 +508,65 @@ impl AncestorStore {
         // the hierarchy would be written twice. The first cycle of a session
         // is exactly this case — its single change carries the whole tree —
         // as is any bulk change, such as switching branches.
+        //
+        // If that checkpoint fails, the record is journalled after all.
+        // Whether or not the failed checkpoint's rename landed, that is
+        // consistent: landed, the record is spent against it; not landed,
+        // the record applies to the checkpoint before. Failing the cycle
+        // instead would fail every first cycle on a filesystem whose
+        // directories cannot be synced.
         if record.len() as u64 > self.compaction_threshold() {
-            self.checkpoint(self.generation + 1, ancestor)?;
-            self.generation += 1;
-            return Ok(());
+            match self.checkpoint(self.generation + 1, ancestor) {
+                Ok(()) => {
+                    self.generation += 1;
+                    self.compaction_failures = 0;
+                    return Ok(());
+                }
+                Err(error) => self.compaction_failed(&error),
+            }
         }
 
         self.append(&record, self.sync_appends)?;
         self.generation += 1;
 
+        // Compaction only saves reading: the record above is written and
+        // the cycle stands whatever happens here. A failure leaves the
+        // journal whole — replay skips whatever a half-done checkpoint
+        // absorbed — and is retried, less often while it keeps failing.
         if self.journal_bytes > self.compaction_threshold() {
-            self.checkpoint(self.generation, ancestor)?;
+            if self.compaction_deferred > 0 {
+                self.compaction_deferred -= 1;
+            } else {
+                #[cfg(test)]
+                {
+                    self.compaction_attempts += 1;
+                }
+                match self.checkpoint(self.generation, ancestor) {
+                    Ok(()) => self.compaction_failures = 0,
+                    Err(error) => self.compaction_failed(&error),
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Notes a failed compaction: logged on the first of a run of failures
+    /// only, and the next attempt deferred by a number of records that
+    /// doubles with each failure after the first, to a cap. The first
+    /// retry is the next cycle's.
+    fn compaction_failed(&mut self, error: &anyhow::Error) {
+        if self.compaction_failures == 0 {
+            eprintln!(
+                "unable to compact the ancestor journal, which keeps growing until a \
+                 later attempt succeeds: {error:#}"
+            );
+            #[cfg(test)]
+            {
+                self.compaction_warnings += 1;
+            }
+        }
+        self.compaction_failures = self.compaction_failures.saturating_add(1);
+        self.compaction_deferred = (1u32 << (self.compaction_failures - 1).min(10)) - 1;
     }
 
     /// Encodes one journal record at the current generation.
@@ -477,9 +576,7 @@ impl AncestorStore {
 
     /// Appends one encoded record, rolling back a partial write.
     fn append(&mut self, record: &[u8], sync: bool) -> Result<()> {
-        let mut created = false;
         if self.journal.is_none() {
-            created = !self.journal_path.exists();
             self.journal = Some(
                 OpenOptions::new()
                     .create(true)
@@ -503,19 +600,17 @@ impl AncestorStore {
             journal
                 .sync_data()
                 .context("unable to sync the ancestor journal")?;
-            // A synced record in a journal file this very append created is
-            // still not durable: the file's directory entry needs its own
+            // A synced record in a journal file whose directory entry is not
+            // yet durable is still not durable: the entry needs its own
             // sync, or the whole file — record included — can vanish with
-            // the power. Failure to confirm that is failure, not a shrug:
-            // the caller is about to act on the record's durability.
-            if created {
-                let parent = self
-                    .journal_path
-                    .parent()
-                    .context("the ancestor journal has no parent directory")?;
-                File::open(parent)
-                    .and_then(|directory| directory.sync_all())
+            // the power. Whoever created the file (an earlier append that
+            // did not sync, a checkpoint, a previous process), that is
+            // settled here, once. Failure to confirm it is failure, not a
+            // shrug: the caller is about to act on the record's durability.
+            if !self.journal_entry_durable {
+                self.sync_directory()
                     .context("unable to sync the ancestor journal's directory")?;
+                self.journal_entry_durable = true;
             }
             #[cfg(test)]
             {
@@ -523,6 +618,21 @@ impl AncestorStore {
             }
         }
         self.journal_bytes += record.len() as u64;
+        Ok(())
+    }
+
+    /// Syncs the directory holding the checkpoint and the journal, which
+    /// makes their directory entries — a rename, a creation — durable.
+    fn sync_directory(&mut self) -> Result<()> {
+        let parent = self
+            .checkpoint_path
+            .parent()
+            .context("the ancestor store has no parent directory")?;
+        File::open(parent).and_then(|directory| directory.sync_all())?;
+        #[cfg(test)]
+        if self.journal_path.exists() {
+            self.journal_entry_syncs += 1;
+        }
         Ok(())
     }
 
@@ -546,6 +656,23 @@ impl AncestorStore {
     /// compaction is rare enough that the sync costs nothing anyone waits
     /// on.
     fn checkpoint(&mut self, generation: u64, ancestor: Option<&Node>) -> Result<()> {
+        self.checkpoint_carrying(generation, ancestor, &[])
+    }
+
+    /// Writes a checkpoint as `checkpoint` does, but leaves the journal
+    /// holding an intent for `intents` at `generation` rather than empty.
+    ///
+    /// The journal is replaced whole, by a synced temporary renamed over
+    /// it. Until the rename lands, the old journal still holds the intents
+    /// at the same generation, and they replay against the new checkpoint
+    /// exactly as they would have against the old one; so no crash point
+    /// loses them.
+    fn checkpoint_carrying(
+        &mut self,
+        generation: u64,
+        ancestor: Option<&Node>,
+        intents: &[String],
+    ) -> Result<()> {
         let payload =
             bincode::serialize(&ancestor).context("unable to encode the ancestor checkpoint")?;
         let mut data = Vec::with_capacity(payload.len() + 26);
@@ -578,25 +705,54 @@ impl AncestorStore {
         // it after an unconfirmed rename lets a power loss persist the
         // truncation, drop the rename, and silently roll the ancestor back
         // to the previous checkpoint.
-        let parent = self
-            .checkpoint_path
-            .parent()
-            .context("the ancestor checkpoint has no parent directory")?;
+        // A journal that does not exist yet is created now, empty, so the
+        // one directory sync below covers its entry as well as the rename.
+        // An empty journal means nothing to replay, so it is harmless at
+        // any point; created after the sync instead, as truncation used to
+        // create it, its entry was never synced at all.
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.journal_path)
+            .context("unable to create the ancestor journal")?;
         #[cfg(test)]
         if self.fail_directory_sync {
             anyhow::bail!("test seam: the checkpoint directory sync failed");
         }
-        File::open(parent)
-            .and_then(|directory| directory.sync_all())
+        self.sync_directory()
             .context("unable to sync the ancestor checkpoint's directory")?;
+        self.journal_entry_durable = true;
 
-        // Truncation rather than removal: an empty journal and a missing one
-        // mean the same thing to replay, and truncating cannot race a reader
-        // into seeing the path vanish.
-        File::create(&self.journal_path).context("unable to clear the ancestor journal")?;
+        if intents.is_empty() {
+            // Truncation rather than removal: an empty journal and a missing
+            // one mean the same thing to replay, and truncating cannot race
+            // a reader into seeing the path vanish.
+            File::create(&self.journal_path).context("unable to clear the ancestor journal")?;
+            self.journal_bytes = 0;
+        } else {
+            let carried = encode_record(generation, &JournalEntry::Intent(intents.to_vec()))?;
+            let temporary = normalization_path(&self.journal_path);
+            {
+                let mut file = File::create(&temporary)
+                    .context("unable to carry intents into the ancestor journal")?;
+                file.write_all(&carried)
+                    .context("unable to carry intents into the ancestor journal")?;
+                file.sync_all()
+                    .context("unable to sync the ancestor journal's intents")?;
+            }
+            fs::rename(&temporary, &self.journal_path)
+                .context("unable to publish the ancestor journal's intents")?;
+            // A handle held across the rename would append to the old inode.
+            self.journal = None;
+            // The renamed journal is a new directory entry. Until it is
+            // durable the old journal may come back in its place, which
+            // holds the same intents; so a failure here is only a reason
+            // for the next durable append to sync again.
+            self.journal_entry_durable = self.sync_directory().is_ok();
+            self.journal_bytes = carried.len() as u64;
+        }
 
         self.checkpoint_bytes = data.len() as u64;
-        self.journal_bytes = 0;
         Ok(())
     }
 }
@@ -1945,18 +2101,56 @@ mod tests {
         );
     }
 
+    /// Finding L-16: a journal first created by a checkpoint, or by an
+    /// append that did not sync, never had its directory entry synced, and
+    /// a later durable append skipped the sync because the file already
+    /// existed — so after a power loss the file, synced record and all,
+    /// could vanish. Whichever way the journal comes to exist, its entry is
+    /// synced exactly once before anything durable relies on it.
+    #[test]
+    fn the_journal_directory_entry_is_synced_once_whoever_creates_it() {
+        let tree = Some(Node::directory("", vec![file("a", 1)]));
+
+        // Created by a checkpoint.
+        let keep = tempfile::tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+        store.checkpoint(0, tree.as_ref()).expect("checkpoints");
+        assert!(journal_path(&path).exists());
+        store.intend(&["p".to_owned()], true).expect("intends");
+        store.intend(&["q".to_owned()], true).expect("intends");
+        assert_eq!(store.journal_entry_syncs, 1, "created by a checkpoint");
+
+        // Created by an append that did not sync.
+        let keep = tempfile::tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+        store
+            .record(&[change("", tree.clone())], tree.as_ref())
+            .expect("records");
+        assert_eq!(store.journal_entry_syncs, 0, "nothing durable asked yet");
+        store.intend(&["p".to_owned()], true).expect("intends");
+        store.intend(&["q".to_owned()], true).expect("intends");
+        assert_eq!(store.journal_entry_syncs, 1, "created by a plain append");
+    }
+
     /// Finding I10-B: compaction must not clear the journal — the only
     /// other copy of the acknowledged generations — until the checkpoint
-    /// rename's durability is confirmed. A failed directory sync is an
-    /// error that leaves the journal intact, and everything acknowledged
-    /// must survive a reopen.
+    /// rename's durability is confirmed. A failed directory sync leaves
+    /// the journal intact, and everything acknowledged must survive a
+    /// reopen.
+    ///
+    /// Finding L-18: and that failure is not the cycle's. The record it
+    /// follows was appended and acknowledged, so the cycle succeeds, the
+    /// failure is logged once, the journal grows, and compaction is tried
+    /// again — backing off while it keeps failing, as it does every time
+    /// on filesystems whose directories cannot be synced.
     #[test]
-    fn an_unconfirmed_checkpoint_never_clears_the_journal() {
+    fn a_failed_compaction_fails_no_cycle_and_never_clears_the_journal() {
         let keep = tempfile::tempdir().unwrap();
         let path = keep.path().join("ancestor");
         let mut store = AncestorStore::open(&path).expect("the store opens").0;
 
-        // The first record carries the whole tree and checkpoints cleanly.
         let mut children = vec![file("seed", 0)];
         let tree = |children: &Vec<Node>| Some(Node::directory("", children.clone()));
         let first = tree(&children);
@@ -1964,43 +2158,49 @@ mod tests {
             .record(&[change("", first.clone())], first.as_ref())
             .expect("the seed record lands");
 
-        // Journal records accumulate until compaction fires — into a
-        // directory sync that "fails". The checkpoint bytes are saved
-        // first: after the failure, the power loss the ordering guards
+        // Records accumulate well past the compaction threshold, every
+        // compaction failing its directory sync. The checkpoint bytes are
+        // saved first: afterwards, the power loss the ordering guards
         // against is simulated by putting them back, dropping the
         // unconfirmed rename while keeping whatever happened to the
         // journal — which must therefore still hold the records.
         let saved_checkpoint = std::fs::read(&path).ok();
         store.fail_directory_sync = true;
         let mut acknowledged = first;
-        let mut failed = false;
-        for index in 1..10_000u32 {
-            let name = format!("f{index}");
-            children.push(file(&name, (index % 250) as u8));
+        let mut records = 0u64;
+        while store.journal_bytes < 3 * store.compaction_threshold() {
+            records += 1;
+            let name = format!("f{records}");
+            children.push(file(&name, (records % 250) as u8));
             let next = tree(&children);
-            match store.record(
-                &[change(&name, Some(file(&name, (index % 250) as u8)))],
-                next.as_ref(),
-            ) {
-                Ok(()) => acknowledged = next,
-                Err(error) => {
-                    assert!(format!("{error:#}").contains("test seam"), "{error:#}");
-                    failed = true;
-                    break;
-                }
-            }
+            store
+                .record(
+                    &[change(&name, Some(file(&name, (records % 250) as u8)))],
+                    next.as_ref(),
+                )
+                .unwrap_or_else(|error| panic!("record {records} failed its cycle: {error:#}"));
+            acknowledged = next;
         }
-        assert!(failed, "compaction never triggered the seam");
+        assert!(
+            store.compaction_attempts >= 2,
+            "a failed compaction is retried"
+        );
+        assert!(
+            store.compaction_attempts < records / 4,
+            "repeated failures back off: {} attempts over {records} records",
+            store.compaction_attempts
+        );
+        assert_eq!(store.compaction_warnings, 1, "the failure is logged once");
         drop(store);
 
         // The simulated power loss: the unconfirmed checkpoint rename is
-        // dropped; the journal's state stays as the crash left it.
+        // dropped; the journal's state stays as the failures left it.
         match saved_checkpoint {
             Some(bytes) => std::fs::write(&path, bytes).unwrap(),
             None => std::fs::remove_file(&path).unwrap(),
         }
 
-        // Everything acknowledged survives the failed compaction.
+        // Everything acknowledged survives the failed compactions.
         let (_, node, unresolved) = AncestorStore::open(&path).expect("the store reopens");
         assert!(unresolved.is_empty());
         let expected = acknowledged.expect("the acknowledged tree exists");
@@ -2012,6 +2212,36 @@ mod tests {
                 child.name
             );
         }
+    }
+
+    /// A record too large to journal is written as a checkpoint instead.
+    /// If that checkpoint fails, the record is journalled after all, so
+    /// the cycle stands — and whether or not the failed checkpoint's
+    /// rename landed, the store reopens to the acknowledged state.
+    #[test]
+    fn a_failed_checkpoint_of_a_large_record_journals_it_instead() {
+        let keep = tempfile::tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+        let small = Some(Node::directory("", vec![file("seed", 0)]));
+        store
+            .record(&[change("", small.clone())], small.as_ref())
+            .expect("records");
+
+        let mut children: Vec<Node> = (0..30_000).map(|i| file(&format!("f{i:06}"), 1)).collect();
+        children.sort_by(|a, b| a.name.cmp(&b.name));
+        let large = Some(directory(children));
+        store.fail_directory_sync = true;
+        store
+            .record(&[change("", large.clone())], large.as_ref())
+            .expect("a failed checkpoint does not fail the cycle");
+        assert_eq!(store.generation, 2);
+        drop(store);
+
+        // The rename landed (the seam fails after it): the checkpoint
+        // holds the record and the journal's copy is spent.
+        let (_, loaded, _) = AncestorStore::open(&path).expect("reopens");
+        assert!(same(&loaded, &large));
     }
 
     /// Records five cycles and returns the journal's bytes with the offset
@@ -2244,6 +2474,65 @@ mod tests {
                 .unwrap_or_else(|error| panic!("legacy cut at {cut}: {error:#}"));
             assert!(same(&loaded, expected), "legacy cut at {cut}");
         }
+    }
+
+    /// Finding L-17: the open that rewrites an old format used to clear
+    /// the journal with an intent still unresolved, so a path that crashed
+    /// mid-transition lost its taint and could be overwritten rather than
+    /// raise a conflict. The intent is carried into the new journal.
+    #[test]
+    fn an_unresolved_intent_survives_the_format_upgrade() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut journal, _, states) = legacy_store(&path);
+        journal.extend(legacy_record(5, &JournalEntry::Intent(vec!["x".into()])));
+        fs::write(journal_path(&path), &journal).expect("writes");
+
+        let (store, loaded, unresolved) = AncestorStore::open(&path).expect("opens");
+        assert!(same(&loaded, &states[4]));
+        assert_eq!(unresolved, vec!["x".to_string()]);
+        assert_eq!(store.generation, 5);
+        drop(store);
+        assert_eq!(
+            checkpoint_version(&fs::read(&path).expect("reads")),
+            CHECKPOINT_VERSION,
+            "the open upgraded the store"
+        );
+
+        let (mut store, loaded, unresolved) = AncestorStore::open(&path).expect("reopens");
+        assert!(same(&loaded, &states[4]));
+        assert_eq!(
+            unresolved,
+            vec!["x".to_string()],
+            "the upgrade must not resolve the intent"
+        );
+        // And the cycle that completes resolves it, as ever.
+        store
+            .record(&[change("f0", Some(file("f0", 9)))], loaded.as_ref())
+            .expect("records");
+        let (_, _, unresolved) = AncestorStore::open(&path).expect("reopens");
+        assert!(unresolved.is_empty());
+    }
+
+    /// Reading a store's generation — which peering does to a store it
+    /// does not own — writes nothing: no normalization, no upgrade, and so
+    /// no chance to drop what the store's owner still needs.
+    #[test]
+    fn reading_the_stored_generation_writes_nothing() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut journal, _, _) = legacy_store(&path);
+        journal.extend(legacy_record(5, &JournalEntry::Intent(vec!["x".into()])));
+        // A torn tail, which an open would normalize away.
+        journal.extend_from_slice(&[1, 2, 3]);
+        fs::write(journal_path(&path), &journal).expect("writes");
+        let checkpoint = fs::read(&path).expect("reads");
+
+        assert_eq!(AncestorStore::stored_generation(&path).expect("reads"), 5);
+        assert_eq!(fs::read(&path).expect("reads"), checkpoint);
+        assert_eq!(fs::read(journal_path(&path)).expect("reads"), journal);
+        let (_, _, unresolved) = AncestorStore::open(&path).expect("opens");
+        assert_eq!(unresolved, vec!["x".to_string()]);
     }
 
     /// An upgrade whose checkpoint was published but whose journal was

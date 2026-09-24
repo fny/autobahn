@@ -355,7 +355,7 @@ impl Game {
                 missing_staged_files: false,
                 missing_staged: Vec::new(),
             };
-            achieved_changes(transitions, &outcome)
+            achieved_changes(transitions, &outcome).expect("one result per transition")
         };
         let alpha_after = apply(alpha.as_ref(), &r.alpha_transitions).expect("alpha applies");
         let beta_after = apply(beta.as_ref(), &r.beta_transitions).expect("beta applies");

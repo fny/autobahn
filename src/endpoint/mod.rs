@@ -116,8 +116,24 @@ pub struct TransitionOutcome {
 ///
 /// Both the endpoints' own records and the ancestor are updated from this
 /// one rendering, so they cannot disagree about what a cycle accomplished.
-pub fn achieved_changes(transitions: &[Change], outcome: &TransitionOutcome) -> Vec<Change> {
-    transitions
+///
+/// An outcome must carry exactly one result per transition. One that does
+/// not — from a remote endpoint, a protocol error; from a local one, a
+/// defect — is refused whole: pairing what there is would leave the rest
+/// recorded as never attempted, and the transitions that matter are
+/// exactly those whose outcome is unknown.
+pub fn achieved_changes(
+    transitions: &[Change],
+    outcome: &TransitionOutcome,
+) -> Result<Vec<Change>> {
+    if outcome.results.len() != transitions.len() {
+        anyhow::bail!(
+            "the endpoint reported {} results for {} transitions",
+            outcome.results.len(),
+            transitions.len()
+        );
+    }
+    Ok(transitions
         .iter()
         .zip(outcome.results.iter())
         .map(|(transition, result)| Change {
@@ -125,7 +141,7 @@ pub fn achieved_changes(transitions: &[Change], outcome: &TransitionOutcome) -> 
             old: None,
             new: result.clone(),
         })
-        .collect()
+        .collect())
 }
 
 /// Folds a transition's achieved results into a snapshot of the endpoint
@@ -145,7 +161,7 @@ pub fn fold_transition(
 ) -> Option<Snapshot> {
     let root = crate::tree::apply(
         snapshot.root.as_ref(),
-        &achieved_changes(transitions, outcome),
+        &achieved_changes(transitions, outcome).ok()?,
     )
     .ok()?;
     let mut folded = snapshot.clone();

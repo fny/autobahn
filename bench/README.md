@@ -244,4 +244,6 @@ bench/ab.sh target/release/autobahn-before target/release/autobahn-after
 
 It runs the two binaries in interleaved legs over a generated 40,000-file corpus (`bench/corpus.py`), each leg a cold sync and then a window of simulated editing agents, and reports p50/p90/p99 side by side with a verdict against the run-to-run spread. Interleaving is what makes it honest on a shared machine. The raw reports of every gate run that shaped a decision are in `bench/ab-reports/`.
 
+`--corpus DIR` runs the legs over DIR instead of the generated corpus. DIR is only ever read: each leg copies it into a working corpus under the script's own work directory, and that working copy is the one the agents edit and the next leg deletes. The script refuses to delete anything outside its work directory.
+
 Three lessons are built into the script rather than left to be relearned: processes are tracked by PID, because a variant binary with a different name once survived every cleanup and contaminated the next leg; the harness is rebuilt if the one present cannot execute, because a build tree synchronized from another platform leaves one that cannot; and one leg each yields no verdict, because it measures nothing about the machine's own variance.

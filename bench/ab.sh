@@ -27,9 +27,11 @@
 # ~/.autobahn/bin — where a real controller's agent may already live.
 #
 # The corpus is generated on first use (bench/corpus.py, the `code` shape,
-# 40,000 files at scale 1) and reused. Needs python3, rsync, and a Rust
-# toolchain for the harness. Runs on macOS and Linux; a leg is roughly two
-# minutes at the defaults.
+# 40,000 files at scale 1) and reused. `--corpus DIR` uses DIR instead, as
+# the pristine source: it is only ever read, and each leg copies it into a
+# working corpus of its own under the script's work directory. Needs
+# python3, rsync, and a Rust toolchain for the harness. Runs on macOS and
+# Linux; a leg is roughly two minutes at the defaults.
 #
 set -u
 
@@ -37,16 +39,16 @@ A=""; B=""; LEGS=2; SECONDS_PER_LEG=60; AGENTS=10; SCALE=1; REMOTE=""
 LABEL_A="a"; LABEL_B="b"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 WORK="${AB_WORK:-${TMPDIR:-/tmp}/autobahn-ab}"
-CORPUS=""
+SOURCE=""
 
-usage() { sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { awk 'NR == 1 { next } /^#/ { sub(/^# ?/, ""); print; next } { exit }' "${BASH_SOURCE[0]}"; }
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --legs) LEGS="$2"; shift 2 ;;
         --seconds) SECONDS_PER_LEG="$2"; shift 2 ;;
         --agents) AGENTS="$2"; shift 2 ;;
-        --corpus) CORPUS="$2"; shift 2 ;;
+        --corpus) SOURCE="$2"; shift 2 ;;
         --scale) SCALE="$2"; shift 2 ;;
         --label-a) LABEL_A="$2"; shift 2 ;;
         --label-b) LABEL_B="$2"; shift 2 ;;
@@ -56,15 +58,49 @@ while [ $# -gt 0 ]; do
         *) if [ -z "$A" ]; then A="$1"; elif [ -z "$B" ]; then B="$1"; else echo "too many arguments" >&2; exit 2; fi; shift ;;
     esac
 done
-[ -n "$A" ] && [ -n "$B" ] || { usage >&2; exit 2; }
+if [ -z "$A" ] || [ -z "$B" ]; then usage >&2; exit 2; fi
 [ -x "$A" ] || { echo "not executable: $A" >&2; exit 2; }
 [ -x "$B" ] || { echo "not executable: $B" >&2; exit 2; }
 A="$(cd "$(dirname "$A")" && pwd)/$(basename "$A")"
 B="$(cd "$(dirname "$B")" && pwd)/$(basename "$B")"
 
 mkdir -p "$WORK"
-CORPUS="${CORPUS:-$WORK/corpus-code-$SCALE}"
-PRISTINE="$WORK/pristine-code-$SCALE"
+WORK="$(cd "$WORK" && pwd)"
+# The working corpus the legs edit. It is always under $WORK, whatever
+# --corpus says: a leg deletes and refills it.
+CORPUS="$WORK/corpus"
+if [ -n "$SOURCE" ]; then
+    [ -d "$SOURCE" ] || { echo "not a directory: $SOURCE" >&2; exit 2; }
+    PRISTINE="$(cd "$SOURCE" && pwd)"
+    case "$PRISTINE/" in "$WORK"/*)
+        echo "--corpus $SOURCE is inside the work directory $WORK, which legs delete" >&2; exit 2 ;;
+    esac
+    case "$WORK/" in "$PRISTINE"/*)
+        echo "the work directory $WORK is inside --corpus $SOURCE, which is only read" >&2; exit 2 ;;
+    esac
+    PARTITIONS="$WORK/partitions-given.json"
+    rm -f "$PARTITIONS"
+else
+    PRISTINE="$WORK/pristine-code-$SCALE"
+    PARTITIONS="$WORK/partitions-$SCALE.json"
+fi
+
+# Deletes scratch paths, and refuses anything not strictly inside $WORK:
+# a backstop, so no future edit can turn a leg's cleanup on a directory
+# the script did not make.
+scrub() {
+    local path
+    for path in "$@"; do
+        case "$path" in
+            "$WORK"/*) ;;
+            *) echo "refusing to delete $path: it is not under $WORK" >&2; exit 1 ;;
+        esac
+        case "/$path/" in
+            */../*) echo "refusing to delete $path: it climbs out with .." >&2; exit 1 ;;
+        esac
+        rm -rf -- "$path"
+    done
+}
 
 # The harness: the measurement plane, compiled so its own overhead is
 # small and measured rather than large and guessed.
@@ -83,8 +119,8 @@ if [ ! -d "$PRISTINE" ]; then
     echo "generating the corpus (code shape, scale $SCALE)..."
     python3 "$HERE/corpus.py" code "$PRISTINE" --scale "$SCALE" >/dev/null || exit 1
 fi
-if [ ! -f "$WORK/partitions-$SCALE.json" ]; then
-    "$BM" partitions "$PRISTINE" "$WORK/partitions-$SCALE.json" >/dev/null || exit 1
+if [ ! -f "$PARTITIONS" ]; then
+    "$BM" partitions "$PRISTINE" "$PARTITIONS" >/dev/null || exit 1
 fi
 
 # Every autobahn this script started, and nothing else. A leg's binaries
@@ -103,7 +139,7 @@ trap cleanup EXIT INT TERM
 leg() {
     local name="$1" binary="$2" port="$3"
     local dest="$WORK/dest-$name" state="$WORK/state-$name"
-    rm -rf "$dest" "$state" "$CORPUS"
+    scrub "$dest" "$state" "$CORPUS"
     mkdir -p "$dest" "$state"
     rsync -a "$PRISTINE/" "$CORPUS/"
     local expected
@@ -136,7 +172,7 @@ leg() {
 
     local report
     report=$("$BM" agents --root "$CORPUS" --peer-root "$dest" \
-        --observer "127.0.0.1:$port" --partitions "$WORK/partitions-$SCALE.json" \
+        --observer "127.0.0.1:$port" --partitions "$PARTITIONS" \
         --side a --agents "$AGENTS" --seconds "$SECONDS_PER_LEG" \
         --label "$name" --nonce $((RANDOM * 7919 + $$)) 2> "$WORK/agents-$name.err")
 
@@ -155,7 +191,7 @@ PY
 
 echo "A = $A"
 echo "B = $B"
-echo "corpus: $CORPUS  agents: $AGENTS  window: ${SECONDS_PER_LEG}s  legs: $LEGS each, interleaved${REMOTE:+  destination: over ssh to $REMOTE}"
+echo "corpus: $PRISTINE  agents: $AGENTS  window: ${SECONDS_PER_LEG}s  legs: $LEGS each, interleaved${REMOTE:+  destination: over ssh to $REMOTE}"
 echo
 port=7400
 for i in $(seq 1 "$LEGS"); do

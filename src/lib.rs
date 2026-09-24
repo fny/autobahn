@@ -22,6 +22,7 @@
 pub mod alerts;
 pub mod config;
 pub mod endpoint;
+pub mod fsutil;
 pub mod icon;
 pub mod logging;
 pub mod ownership;

@@ -906,9 +906,11 @@ fn run_sync(
     let target = |spec: &str, agent: &Option<String>, frozen: &Option<PathBuf>| {
         autobahn::config::EndpointTarget::manual(spec, agent.as_deref(), frozen.as_deref())
     };
+    let alpha_target = target(&alpha, &alpha_agent, &alpha_frozen);
+    let beta_target = target(&beta, &beta_agent, &beta_frozen);
     autobahn::config::check_session_topology(
-        &target(&alpha, &alpha_agent, &alpha_frozen),
-        &target(&beta, &beta_agent, &beta_frozen),
+        &alpha_target,
+        &beta_target,
         &alpha_identity,
         &beta_identity,
     )
@@ -919,6 +921,13 @@ fn run_sync(
             .join("sessions")
             .join(&identifier),
     };
+    autobahn::config::OwnState::new(&state_directory, None)
+        .check_session(
+            (&alpha_target, &alpha_identity),
+            (&beta_target, &beta_identity),
+            &ignores,
+        )
+        .map_err(|problem| anyhow::anyhow!(problem))?;
 
     // Construct the endpoints: an agent connection (SSH or explicit
     // command) for remote specifications, a local endpoint otherwise.
@@ -1429,9 +1438,11 @@ fn check_startable(config: Option<PathBuf>) -> Result<()> {
     };
     // The same checks the supervisor makes: at startup, and again on
     // every edit while it runs.
-    autobahn::supervisor::reload::load(&path)
+    let loaded = autobahn::supervisor::reload::load(&path)
         .context("the configuration would stop the supervisor at startup")?;
-    Ok(())
+    autobahn::config::OwnState::new(&paths::default_state_root()?, Some(&path))
+        .check_plans(&loaded.plans)
+        .context("the configuration would stop the supervisor at startup")
 }
 
 fn load_config(path: Option<PathBuf>) -> Result<Config> {
@@ -1456,11 +1467,13 @@ fn resolve_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
 /// One pass over every configured session, then exit — non-zero if any
 /// session failed.
 fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Result<()> {
-    let plans = load_config(config)?.plans()?;
+    let config = config.map_or_else(paths::default_config_path, Ok)?;
+    let plans = load_config(Some(config.clone()))?.plans()?;
     if plans.is_empty() {
         bail!("the configuration describes no sessions");
     }
     let state_root = resolve_state_root(state_root)?;
+    autobahn::config::OwnState::new(&state_root, Some(&config)).check_plans(&plans)?;
     let supervisor = Supervisor::new(plans, state_root, false);
     let outcomes = supervisor.run_once();
     let mut failures = 0usize;
@@ -1548,6 +1561,8 @@ fn run_watch(
         false => loaded.log_level,
     });
     let state_root = resolve_state_root(state_root)?;
+    let own_state = autobahn::config::OwnState::new(&state_root, Some(&config_path));
+    own_state.check_plans(&loaded.plans)?;
 
     // Said before the first cycle, while someone is still looking at the
     // terminal. These sessions will stop on their own anyway; the point is
@@ -1598,6 +1613,10 @@ fn run_watch(
                 let Some(next) = reloader.as_ref().and_then(|reloader| reloader.take()) else {
                     return Ok(());
                 };
+                if let Err(error) = own_state.check_plans(&next.plans) {
+                    autobahn::complain!("the edited configuration is not applied: {error:#}");
+                    continue;
+                }
                 autobahn::logging::set_level(match debug {
                     true => Some(autobahn::logging::Level::Debug),
                     false => next.log_level,

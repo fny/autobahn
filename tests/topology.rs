@@ -143,3 +143,161 @@ fn a_manual_sync_refuses_a_tree_and_itself() {
         "precious"
     );
 }
+
+/// Writes the configuration at the world home's default location.
+fn default_config(world: &World, text: &str) -> PathBuf {
+    let path = world.home().join(".autobahn/config.toml");
+    write(&world.home(), ".autobahn/config.toml", text);
+    path
+}
+
+/// A root of `~` holds `~/.autobahn`: the configuration, the alert hook,
+/// the ancestors and the installed agents. Synchronized, a peer that
+/// edits its copy of `config.toml` chooses the next `agent_command` run
+/// here. The root is refused unless the group ignores the state root.
+#[test]
+fn a_home_root_holding_the_state_root_is_refused_unless_ignored() {
+    let world = World::new();
+    let home = world.home();
+    write(&home, "notes.txt", "mine");
+    let beta = world.keep.path().join("beta");
+    let config = |ignores: &str| {
+        format!(
+            r#"
+            [groups.home]
+            alpha = "~"
+            mode = "two-way-safe"
+            betas = ["{beta}"]
+            {ignores}
+            "#,
+            beta = beta.display()
+        )
+    };
+
+    default_config(&world, &config(""));
+    let (ok, text) = world.cli(&["sync"]);
+    assert!(!ok, "{text}");
+    let state = home.join(".autobahn");
+    assert!(
+        text.contains(&format!(
+            "the root {} contains autobahn's own state at {}; add it to ignores, or choose a \
+             narrower root",
+            fs::canonicalize(&home).unwrap().display(),
+            fs::canonicalize(&state).unwrap().display()
+        )),
+        "{text}"
+    );
+    assert!(!beta.exists(), "a refused sync wrote the beta");
+
+    // The same refusal from `watch`, at startup rather than never.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_autobahn"))
+        .args(["watch", "--log"])
+        .env("HOME", &home)
+        .env_remove("AUTOBAHN_HOME")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("watch runs");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("watch can be waited for") {
+            break status;
+        }
+        if std::time::Instant::now() > deadline {
+            let _ = child.kill();
+            panic!("watch ran over a root holding its own state");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let output = child.wait_with_output().expect("watch output");
+    assert!(!status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("contains autobahn's own state"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!beta.exists(), "a refused watch wrote the beta");
+
+    // Ignored, the home directory synchronizes without its state.
+    default_config(&world, &config(r#"ignores = [".autobahn"]"#));
+    let (ok, text) = world.cli(&["sync"]);
+    assert!(ok, "{text}");
+    assert_eq!(fs::read_to_string(beta.join("notes.txt")).unwrap(), "mine");
+    assert!(!beta.join(".autobahn").exists());
+}
+
+/// A state root moved with `--state-root` is refused inside a root just
+/// the same, and so is a root holding the configuration file.
+#[test]
+fn a_root_holding_a_custom_state_root_or_the_configuration_is_refused() {
+    let world = World::new();
+    let tree = world.directory("tree");
+    write(&tree, "file.txt", "content");
+    let beta = world.keep.path().join("beta");
+    let text = format!(
+        r#"
+        [groups.tree]
+        alpha = "{tree}"
+        mode = "two-way-safe"
+        betas = ["{beta}"]
+        "#,
+        tree = tree.display(),
+        beta = beta.display()
+    );
+    let outside = world.keep.path().join("config.toml");
+    fs::write(&outside, &text).unwrap();
+    let state = tree.join("state");
+    let (ok, output) = world.cli(&[
+        "sync",
+        "--config",
+        path(&outside),
+        "--state-root",
+        path(&state),
+    ]);
+    assert!(!ok, "{output}");
+    assert!(output.contains("contains autobahn's own state"), "{output}");
+    assert!(
+        !beta.exists() && !state.exists(),
+        "a refused sync wrote something"
+    );
+
+    let inside = tree.join("settings/config.toml");
+    write(&tree, "settings/config.toml", &text);
+    let elsewhere = world.keep.path().join("state");
+    let (ok, output) = world.cli(&[
+        "sync",
+        "--config",
+        path(&inside),
+        "--state-root",
+        path(&elsewhere),
+    ]);
+    assert!(!ok, "{output}");
+    assert!(
+        output.contains("contains autobahn's configuration"),
+        "{output}"
+    );
+    assert!(
+        !beta.exists() && !elsewhere.exists(),
+        "a refused sync wrote something"
+    );
+}
+
+/// `autobahn sync ALPHA BETA` is held to the same rule, with `--ignore`
+/// as the way through.
+#[test]
+fn a_manual_sync_of_the_home_directory_needs_the_state_root_ignored() {
+    let world = World::new();
+    let home = world.home();
+    write(&home, "notes.txt", "mine");
+    write(&home, ".autobahn/config.toml", "");
+    let beta = world.keep.path().join("beta");
+    let (ok, text) = world.cli(&["sync", path(&home), path(&beta)]);
+    assert!(!ok, "{text}");
+    assert!(text.contains("contains autobahn's own state"), "{text}");
+    assert!(!beta.exists());
+
+    let (ok, text) = world.cli(&["sync", path(&home), path(&beta), "--ignore", ".autobahn"]);
+    assert!(ok, "{text}");
+    assert_eq!(fs::read_to_string(beta.join("notes.txt")).unwrap(), "mine");
+    assert!(!beta.join(".autobahn").exists());
+}

@@ -815,6 +815,127 @@ pub fn check_session_topology(
     ))
 }
 
+/// Whether a root-relative directory is kept out of the synchronization by
+/// these ignore patterns: it, or a directory above it, is ignored, and no
+/// negation reaches back inside what is ignored.
+fn excluded_by(ignores: &IgnoreSet, relative: &str) -> bool {
+    let mut prefix = String::new();
+    relative.split('/').any(|component| {
+        if !prefix.is_empty() {
+            prefix.push('/');
+        }
+        prefix.push_str(component);
+        ignores.ignored(&prefix, true) && !ignores.holds_a_re_inclusion(&prefix)
+    })
+}
+
+/// Autobahn's own directories on this machine, which no local root may
+/// hold: the state root (the ancestors, locks, status and installed
+/// agents, and by default the configuration and the alert hook), the
+/// default state root when another is in use (the endpoint-pair locks
+/// live there whatever the override), and the directory the
+/// configuration file really lives in. Synchronized, they change under
+/// the session that is using them, and a peer that edits its copy of
+/// `config.toml` or `on-alert.sh` chooses what runs here next.
+///
+/// Only local endpoints are checked: the controller cannot see a remote
+/// host's resolved state root, and the agent guards its own.
+pub struct OwnState {
+    /// Each directory as resolved, with what it holds.
+    places: Vec<(String, &'static str)>,
+}
+
+impl OwnState {
+    /// The directories for a run over this state root, and this
+    /// configuration file when there is one.
+    pub fn new(state_root: &Path, config: Option<&Path>) -> OwnState {
+        let mut places: Vec<(String, &'static str)> = Vec::new();
+        let mut add = |path: &Path, what: &'static str| {
+            let identity = resolve_for_identity(path).to_string_lossy().into_owned();
+            if !places.iter().any(|(known, _)| *known == identity) {
+                places.push((identity, what));
+            }
+        };
+        add(state_root, "own state");
+        if let Ok(default) = crate::paths::default_state_root() {
+            add(&default, "own state");
+        }
+        if let Some(directory) =
+            config.and_then(|path| resolve_for_identity(path).parent().map(Path::to_owned))
+        {
+            add(&directory, "configuration");
+        }
+        OwnState { places }
+    }
+
+    /// Refuses a local root that is, or holds, one of the directories,
+    /// unless the root's ignore patterns keep that directory out of the
+    /// synchronization, as `ignores = [".autobahn"]` does for a root of
+    /// `~`.
+    pub fn check(
+        &self,
+        target: &EndpointTarget,
+        identity: &str,
+        ignores: &[String],
+    ) -> Result<(), String> {
+        if !matches!(target, EndpointTarget::Local(_)) {
+            return Ok(());
+        }
+        let root = Place::of(target, identity);
+        for (own, what) in &self.places {
+            let place = Place::of(&EndpointTarget::Local(PathBuf::from(own)), own);
+            if root == place {
+                return Err(format!(
+                    "the root {identity} is autobahn's {what}; choose another root"
+                ));
+            }
+            let Some(relative) = root.contains(&place) else {
+                continue;
+            };
+            if IgnoreSet::new(ignores).is_ok_and(|ignores| excluded_by(&ignores, &relative)) {
+                continue;
+            }
+            return Err(format!(
+                "the root {identity} contains autobahn's {what} at {own}; add it to \
+                 ignores, or choose a narrower root"
+            ));
+        }
+        Ok(())
+    }
+
+    /// Checks both sides of a session.
+    pub fn check_session(
+        &self,
+        (alpha, alpha_identity): (&EndpointTarget, &str),
+        (beta, beta_identity): (&EndpointTarget, &str),
+        ignores: &[String],
+    ) -> Result<(), String> {
+        self.check(alpha, alpha_identity, ignores)?;
+        self.check(beta, beta_identity, ignores)
+    }
+
+    /// Checks every planned session, reporting each offending root once.
+    pub fn check_plans(&self, plans: &[SessionPlan]) -> Result<()> {
+        let mut problems: Vec<String> = Vec::new();
+        for plan in plans {
+            if let Err(problem) = self.check_session(
+                (&plan.alpha, &plan.alpha_identity),
+                (&plan.beta, &plan.beta_identity),
+                &plan.ignores,
+            ) {
+                let problem = format!("group '{}': {problem}", plan.group);
+                if !problems.contains(&problem) {
+                    problems.push(problem);
+                }
+            }
+        }
+        if !problems.is_empty() {
+            bail!("invalid configuration:\n  {}", problems.join("\n  "));
+        }
+        Ok(())
+    }
+}
+
 fn default_reload() -> bool {
     true
 }
@@ -2671,6 +2792,60 @@ betas = ["build.example.com:/tmp/beta"]
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(error.contains("/srv/project is nested inside /"), "{error}");
+    }
+
+    /// A local root may not be, or hold, autobahn's own directories,
+    /// unless its ignores keep them out — and a negation reaching back
+    /// inside what is ignored puts them back in.
+    #[test]
+    fn a_root_holding_autobahns_own_state_is_refused_unless_ignored() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let base = resolve_for_identity(keep.path());
+        let own = OwnState::new(&base.join("home/.autobahn"), None);
+        let check = |root: &Path, ignores: &[&str]| {
+            let ignores: Vec<String> = ignores.iter().map(|&p| p.to_owned()).collect();
+            let target = EndpointTarget::Local(root.to_owned());
+            own.check(&target, &root.to_string_lossy(), &ignores)
+        };
+        let home = base.join("home");
+        let problem = check(&home, &[]).expect_err("the home holds the state root");
+        assert!(
+            problem.contains("contains autobahn's own state"),
+            "{problem}"
+        );
+        assert!(check(&home, &[".autobahn"]).is_ok());
+        assert!(check(&home, &[".autobahn/"]).is_ok());
+        assert!(
+            check(&base, &["home"]).is_ok(),
+            "an ignored parent keeps it out"
+        );
+        assert!(
+            check(&home, &[".autobahn", "!.autobahn/config.toml"]).is_err(),
+            "a re-inclusion inside the state root puts it back"
+        );
+        let problem = check(&home.join(".autobahn"), &[]).expect_err("the state root itself");
+        assert!(problem.contains("is autobahn's own state"), "{problem}");
+        assert!(check(&home.join("project"), &[]).is_ok(), "a narrower root");
+        assert!(check(&base.join("hom"), &[]).is_ok());
+
+        // A remote root is the agent's to guard.
+        let remote = EndpointTarget::Remote {
+            destination: "host".to_owned(),
+            path: home.to_string_lossy().into_owned(),
+            agent_command: None,
+        };
+        assert!(own.check(&remote, "host:/", &[]).is_ok());
+
+        // The configuration's own directory, when it is not the state root.
+        let own = OwnState::new(
+            &base.join("state"),
+            Some(&base.join("dotfiles/config.toml")),
+        );
+        let target = EndpointTarget::Local(base.clone());
+        let problem = own
+            .check(&target, &base.to_string_lossy(), &["state".to_owned()])
+            .expect_err("the configuration's directory");
+        assert!(problem.contains("autobahn's configuration"), "{problem}");
     }
 
     /// A nested endpoint the outer session ignores is not shared with it:

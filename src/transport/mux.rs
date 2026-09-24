@@ -919,7 +919,10 @@ mod tests {
                 response = channel.receive_response().expect("the answer follows");
             }
             assert_eq!(reports, 3);
-            assert!(matches!(response, Response::ScanUnchanged { generation: 7 }));
+            assert!(matches!(
+                response,
+                Response::ScanUnchanged { generation: 7 }
+            ));
         }
         let response = channel
             .exchange(Request::StagePush(Vec::new()))

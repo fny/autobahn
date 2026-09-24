@@ -39,8 +39,20 @@ const PROGRESS_BLOCK: u64 = 512;
 /// further cut to the cores actually present.
 const SCAN_THREADS_MAX: usize = 8;
 
+#[cfg(test)]
+thread_local! {
+    /// A test's choice of helper budget for scans on this thread, so the
+    /// serial and parallel paths can both be exercised on any machine —
+    /// a one-core CI runner otherwise never takes the parallel one.
+    static HELPERS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// How many threads a scan may add beside the one it runs on.
 fn scan_helpers() -> usize {
+    #[cfg(test)]
+    if let Some(helpers) = HELPERS.with(|helpers| helpers.get()) {
+        return helpers;
+    }
     std::thread::available_parallelism()
         .map(|cores| cores.get())
         .unwrap_or(1)
@@ -2216,5 +2228,127 @@ mod tests {
                 "{point} walked"
             );
         }
+    }
+
+    /// A tree wide and deep enough that the parallel walk actually spreads.
+    fn wide_tree(root: &Path) {
+        for a in 0..6 {
+            for b in 0..5 {
+                for c in 0..4 {
+                    write(root, &format!("d{a}/e{b}/f{c}.txt"), &format!("{a}{b}{c}"));
+                }
+                std::os::unix::fs::symlink("f0.txt", root.join(format!("d{a}/e{b}/link"))).unwrap();
+            }
+            write(root, &format!("d{a}/top.txt"), "top");
+        }
+        write(root, "excluded/skip.txt", "skip");
+        std::fs::create_dir_all(root.join("empty/deeper")).unwrap();
+    }
+
+    /// Asserts two hierarchies are the same in every recorded respect —
+    /// names, order, content, metadata — and share storage with `baseline`
+    /// at exactly the same places.
+    fn assert_identical(serial: &Node, parallel: &Node, baseline: Option<&Node>, path: &str) {
+        assert_eq!(serial.name, parallel.name, "at {path}");
+        assert!(serial.content_equal(parallel, false), "at {path}");
+        if let (Content::File { metadata: a, .. }, Content::File { metadata: b, .. }) =
+            (&serial.content, &parallel.content)
+        {
+            assert_eq!(a, b, "metadata at {path}");
+        }
+        assert_eq!(
+            crate::tree::nodes_share_storage(Some(serial), baseline),
+            crate::tree::nodes_share_storage(Some(parallel), baseline),
+            "storage sharing at {path}"
+        );
+        let (left, right) = (serial.children(), parallel.children());
+        assert_eq!(left.len(), right.len(), "children at {path}");
+        for (a, b) in left.iter().zip(right) {
+            let child = format!("{path}/{}", a.name);
+            assert_identical(a, b, baseline.and_then(|node| node.child(&a.name)), &child);
+        }
+    }
+
+    #[test]
+    fn a_parallel_scan_builds_exactly_the_serial_one() {
+        let root = fixture();
+        wide_tree(root.path());
+        let with_helpers =
+            |helpers: usize, baseline: Option<&Snapshot>, dirty: Option<&DirtyPaths>| {
+                HELPERS.with(|cell| cell.set(Some(helpers)));
+                let snapshot = scan(
+                    root.path(),
+                    baseline,
+                    &ignores(&["excluded/"]),
+                    &FilesystemBehavior::default(),
+                    SymlinkMode::default(),
+                    None,
+                    dirty,
+                    false,
+                    None,
+                    true,
+                )
+                .expect("scan");
+                HELPERS.with(|cell| cell.set(None));
+                snapshot
+            };
+
+        // Full scans, from nothing.
+        let serial = with_helpers(0, None, None);
+        let parallel = with_helpers(7, None, None);
+        assert_identical(
+            serial.root.as_ref().unwrap(),
+            parallel.root.as_ref().unwrap(),
+            None,
+            "",
+        );
+        assert_eq!(
+            (
+                serial.directories,
+                serial.files,
+                serial.symlinks,
+                serial.total_file_size
+            ),
+            (
+                parallel.directories,
+                parallel.files,
+                parallel.symlinks,
+                parallel.total_file_size
+            )
+        );
+
+        // Incremental scans against one baseline, after edits in a few
+        // subtrees: the same content, and the same subtrees adopted.
+        age(root.path(), "d0/e0/f0.txt");
+        write(root.path(), "d1/e2/f3.txt", "changed");
+        write(root.path(), "d4/new.txt", "new");
+        std::fs::remove_file(root.path().join("d5/e4/f1.txt")).unwrap();
+        let mut dirty = DirtyPaths::default();
+        for path in ["d1/e2/f3.txt", "d4/new.txt", "d5/e4/f1.txt"] {
+            dirty.mark(path);
+        }
+        let baseline = serial;
+        let serial = with_helpers(0, Some(&baseline), Some(&dirty));
+        let parallel = with_helpers(7, Some(&baseline), Some(&dirty));
+        assert_identical(
+            serial.root.as_ref().unwrap(),
+            parallel.root.as_ref().unwrap(),
+            baseline.root.as_ref(),
+            "",
+        );
+        assert_eq!(
+            (
+                serial.directories,
+                serial.files,
+                serial.symlinks,
+                serial.total_file_size
+            ),
+            (
+                parallel.directories,
+                parallel.files,
+                parallel.symlinks,
+                parallel.total_file_size
+            )
+        );
     }
 }

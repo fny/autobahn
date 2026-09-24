@@ -49,7 +49,8 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 
 - [x] Measured 2026-09-23. On the 0.4.0 matrix (separate machines), ten destinations cost 1.3× (Chromium, 420 → 564 s) to 1.5× (50k, 49 → 75 s) the single-destination first sync, and 2.8× on the 5k tree where per-session startup dominates (6.8 → 19 s; mutagen 9 s). Not superlinear; not worth a shared-supply redesign. Ten betas on *one* box take 35× — one disk and eight cores — and that is the same with the 0.4.0 binary and with the thread caps forced to 1, so it is not the parallel walk or apply either.
 - [ ] Per-session startup on small trees is where a fan-out is behind mutagen (5k-fan). Measure what the first cycle of each session spends on first contact before guessing.
-- [ ] The scan and apply thread budgets are per call, not per process, so N sessions can start 8N threads; the local 10-beta run says it does not matter on 8 cores, since capping at 1 changed nothing. Leave it until a measurement says otherwise.
+- [x] ~~The scan and apply thread budgets are per call, not per process~~ Closed 2026-09-24: measured already — capping at one thread changed nothing on the local 10-beta run — so there is nothing to fix without a measurement that says otherwise.
+  The scan and apply thread budgets are per call, not per process, so N sessions can start 8N threads; the local 10-beta run says it does not matter on 8 cores, since capping at 1 changed nothing. Leave it until a measurement says otherwise.
 
 ## Idle
 
@@ -60,5 +61,5 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 
 - [x] Burst cells `50k-burst` and `chromium-burst`: a module copied in, five times a job, wall time by manifest and autobahn's cycle seconds beside it. Smoke-tested locally; not yet run on AWS.
 - [x] `aggregate.py` taints and reports a job whose recorded `destinations` do not match its cell's `betas`.
-- [ ] A scan test that walks one tree serially and in parallel and asserts identical hierarchies and identical storage sharing. The parallel path is exercised by the existing tests on an 8-core box and by nothing at all on a 1-core CI runner.
+- [x] A scan test that walks one tree serially and in parallel and asserts identical hierarchies and identical storage sharing. Done 2026-09-24: `a_parallel_scan_builds_exactly_the_serial_one` forces the helper budget (0 against 7, per thread, test-only) so the parallel path runs on any machine, full and incremental against one baseline; names, order, content, metadata, counts, and where storage is shared must all match. Checked by breaking the parallel count merge, which it catches.
 - [ ] Re-run the five cells the width leak contaminated (`50k-10`, `chromium-1-bidir`, `chromium-1-patch`, `chromium-10`, `chromium-10-bidir`) with the fixed harness, and correct `docs/benchmarks.md` and `docs/benchmark-matrix.md`. Corrected pooled p90s from the clean repeats, for reference: `chromium-10` 4,264 → 425 ms; `chromium-1-bidir` 9,273 → 1,616; `chromium-10-bidir` 8,226 → 1,944; `chromium-1-patch` 3,038 → 292; `50k-10` 636 → 96.

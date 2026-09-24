@@ -648,7 +648,9 @@ fn serve_channel<W: Write + Send>(
     // other channels.
     // What a scan has counted so far, for the reports a long one sends.
     let counted = std::sync::Arc::new(crate::progress::SideProgress::default());
-    let mut endpoint = match create_endpoint(&initialize, state_root) {
+    let created = crate::root::check_agent(crate::root::Identity::current(), &initialize)
+        .and_then(|()| create_endpoint(&initialize, state_root));
+    let mut endpoint = match created {
         Ok(mut endpoint) => {
             if serve_send(output, channel, Response::Initialized).is_err() {
                 return;

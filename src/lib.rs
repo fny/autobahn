@@ -32,6 +32,7 @@ pub mod peering;
 pub mod persist;
 pub mod progress;
 pub mod protocol;
+pub mod root;
 pub mod rsync;
 pub mod scan;
 pub mod service;

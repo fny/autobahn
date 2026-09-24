@@ -54,6 +54,7 @@ Eight keys. Unknown keys are refused at startup, not ignored — here and in eve
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
 | `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
 | `[advanced.peering-dangerously-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
+| `advanced.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
 
 Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
@@ -76,7 +77,7 @@ Fourteen keys live in both `[defaults]` and any group, with the group winning. F
 | `max_entry_count` | both | unlimited | If a scan finds more entries than this, the cycle fails — a guard against pointing a session at the wrong directory. |
 | `ignore_mounts` | both | `true` | Leave alone any directory mounted inside a root — another disk, a network share, a `tmpfs` — as `rsync -x` and `du -x` do. It is left out on *both* sides, so a real directory at the same path on the other side is neither filled from the mount nor emptied to match it; and when the mount goes away (a drive unplugged) its empty mount point stays left out, so nothing moves. `false` synchronizes what is mounted as part of the tree, and halts rather than deletes when a mount that held content comes back empty. |
 | `staging` | both | `"state"` | Where in-flight content lives: `state`, `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
-| `default_owner` / `default_group` | both | — | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights. |
+| `default_owner` / `default_group` | both | — | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights, which in practice means an agent running as root — the one case an agent accepts root. That turns the scanner and transition races in [RETAINED §2](./correctness/RETAINED.md) into privilege escalation, so set it only where root is really meant. |
 | `durability` | both | `"process"` | `process` survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
 | `agent_command` | group | ssh | Advanced: reach remote endpoints through this command (whitespace-split argv) instead of SSH. Testing and custom transports. |
 

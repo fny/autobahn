@@ -48,6 +48,10 @@ const HELP_STYLES: clap::builder::Styles = clap::builder::Styles::styled()
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Run `watch`, `sync`, `resolve`, `install` or `start` as root, which
+    /// is refused otherwise (as is `advanced.allow_root = true`).
+    #[arg(long, global = true)]
+    allow_root: bool,
 }
 
 /// The peering verbs.
@@ -611,9 +615,14 @@ fn main() {
                 config: None,
                 state_root: None,
             },
+            allow_root: false,
         },
         false => Cli::parse(),
     };
+    if let Err(error) = refuse_root(&cli.command, cli.allow_root) {
+        eprintln!("autobahn: {error:#}");
+        std::process::exit(1);
+    }
     let result = match cli.command {
         Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
         Command::Peering { verb } => run_peering(verb),
@@ -857,6 +866,30 @@ impl std::fmt::Display for Unsettled {
 }
 
 impl std::error::Error for Unsettled {}
+
+/// Refuses the commands that write state or run a configuration's
+/// commands when this is root and nobody said root was meant: by
+/// `--allow-root`, or `advanced.allow_root` in the configuration the
+/// command would read. See `autobahn::root`.
+fn refuse_root(command: &Command, allow_root: bool) -> Result<()> {
+    let identity = autobahn::root::Identity::current();
+    if identity.euid != 0 {
+        return Ok(());
+    }
+    let config = match command {
+        Command::Watch { config, .. }
+        | Command::Sync { config, .. }
+        | Command::Resolve { config, .. }
+        | Command::Install { config, .. } => config.clone(),
+        Command::Start => autobahn::service::installed_config().ok().flatten(),
+        _ => return Ok(()),
+    };
+    let allowed = allow_root
+        || config
+            .or_else(|| paths::default_config_path().ok())
+            .is_some_and(|path| autobahn::root::config_allows_root(&path));
+    autobahn::root::check_controller(identity, allowed)
+}
 
 /// Parses an scp-style beta specification into (host, path) if it denotes a
 /// remote root. A specification is remote when it contains a colon before

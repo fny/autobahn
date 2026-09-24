@@ -332,6 +332,10 @@ pub struct Advanced {
     /// name gets an answer rather than "unknown field".
     #[serde(default, rename = "peering-experimental")]
     pub retired_peering: Option<toml::Value>,
+    /// Let the controller run as root (see `autobahn::root`). Read by
+    /// `root::config_allows_root`; here so that the key is known.
+    #[serde(default)]
+    pub allow_root: bool,
 }
 
 /// The `[advanced.peering-dangerously-experimental]` section: how long a lease lives,

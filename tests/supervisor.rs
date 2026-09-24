@@ -2764,8 +2764,17 @@ fn a_name_with_control_characters_is_printed_escaped() {
         );
     }
 
-    let (ok, json) = cli(&world, &config, &["conflicts", "--json"]);
-    assert!(ok, "{json}");
+    // Standard output alone: a warning on standard error (a configuration
+    // group-writable under umask 002, say) is not part of the report.
+    let output = std::process::Command::new(agent_binary())
+        .args(["conflicts", "--json", "--config"])
+        .arg(&config)
+        .arg("--state-root")
+        .arg(world.state_root())
+        .output()
+        .expect("the CLI runs");
+    let json = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{json}");
     let report: serde_json::Value = serde_json::from_str(&json).expect("json");
     let path = &report["groups"][0]["sessions"][0]["conflicts"][0]["path"];
     assert_eq!(path.as_str(), Some(name), "{json}");

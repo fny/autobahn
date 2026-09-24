@@ -1525,12 +1525,20 @@ fn load_config(path: Option<PathBuf>) -> Result<Config> {
 /// Resolves the state root from an explicit override or the default, and
 /// makes it private (see `paths::prepare_state_root`).
 fn resolve_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
+    let root = locate_state_root(state_root)?;
+    paths::prepare_state_root(&root)?;
+    Ok(root)
+}
+
+/// Resolves the state root like [`resolve_state_root`], without creating
+/// or changing it: for a command that checks its roots against the state
+/// root first, so that a refused run leaves nothing behind.
+fn locate_state_root(state_root: Option<PathBuf>) -> Result<PathBuf> {
     let root = match state_root {
         Some(root) => root,
         None => paths::default_state_root()?,
     };
     autobahn::scan::exclude_state_root(&root);
-    paths::prepare_state_root(&root)?;
     Ok(root)
 }
 
@@ -1543,8 +1551,9 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
     if plans.is_empty() {
         bail!("the configuration describes no sessions");
     }
-    let state_root = resolve_state_root(state_root)?;
+    let state_root = locate_state_root(state_root)?;
     autobahn::config::OwnState::new(&state_root, Some(&config)).check_plans(&plans)?;
+    paths::prepare_state_root(&state_root)?;
     for warning in autobahn::config::secret_warnings(&plans) {
         eprintln!("warning: {warning}");
     }
@@ -1644,9 +1653,10 @@ fn run_watch(
         true => Some(autobahn::logging::Level::Debug),
         false => loaded.log_level,
     });
-    let state_root = resolve_state_root(state_root)?;
+    let state_root = locate_state_root(state_root)?;
     let own_state = autobahn::config::OwnState::new(&state_root, Some(&config_path));
     own_state.check_plans(&loaded.plans)?;
+    paths::prepare_state_root(&state_root)?;
     for warning in autobahn::config::secret_warnings(&loaded.plans) {
         eprintln!("warning: {warning}");
     }

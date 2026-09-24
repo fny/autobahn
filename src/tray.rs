@@ -451,65 +451,10 @@ impl App {
             return;
         };
 
-        let sessions: Vec<_> = report
-            .groups
-            .iter()
-            .flat_map(|group| group.sessions.iter())
-            .collect();
-        let count = |state: &str| sessions.iter().filter(|s| s.state == state).count();
-        let mut parts = Vec::new();
-        match self.queued.load(std::sync::atomic::Ordering::SeqCst) {
-            0 => {}
-            one => parts.push(format!("{one} queued")),
-        }
-        if !report.supervisor_running {
-            parts.push(
-                match report.service.as_str() {
-                    "stopped" => "Not running (service stopped)",
-                    "not-installed" => "Not running (no service installed)",
-                    _ => "Not running",
-                }
-                .to_owned(),
-            );
-        }
-        if report.config_notice.is_some() {
-            parts.push("configuration refused".to_owned());
-        }
-        if report.supervisor_mismatch.is_some() {
-            parts.push("restart needed".to_owned());
-        }
-        parts.push(format!("{} synchronized", count("synchronized")));
-        for (state, word) in [
-            ("conflicts", "in conflict"),
-            ("halted", "halted"),
-            ("unreachable", "unreachable"),
-            ("errored", "failing"),
-            ("blocked", "blocked"),
-        ] {
-            let n = count(state);
-            if n > 0 {
-                parts.push(format!("{n} {word}"));
-            }
-        }
-        let summary = parts.join(", ");
+        let queued = self.queued.load(std::sync::atomic::Ordering::SeqCst);
+        let summary = summary_of(report, queued);
         model.summary.set_text(&summary);
-        // The refused edit takes the same line, under an action's failure
-        // when there is one: both are things the person did.
-        let error_text = self
-            .last_error
-            .as_deref()
-            .map(|e| format!("⚠ {}", display_safe(e)))
-            .or_else(|| {
-                report.config_notice.as_ref().map(|notice| {
-                    format!("⚠ configuration refused: {}", display_safe(&notice.message))
-                })
-            })
-            .or_else(|| {
-                report
-                    .supervisor_mismatch
-                    .as_ref()
-                    .map(|mismatch| format!("⚠ {}", display_safe(mismatch)))
-            });
+        let error_text = warning_of(report, self.last_error.as_deref());
         set_optional(&model.menu, &model.summary, &mut model.error, error_text);
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
@@ -976,6 +921,81 @@ fn set_optional<M: Container>(
     }
 }
 
+/// The menu's first line: what is queued, whether a supervisor is there
+/// to answer, and how many sessions are in each state.
+fn summary_of(report: &StatusReport, queued: usize) -> String {
+    let sessions: Vec<_> = report
+        .groups
+        .iter()
+        .flat_map(|group| group.sessions.iter())
+        .collect();
+    let count = |state: &str| sessions.iter().filter(|s| s.state == state).count();
+    let mut parts = Vec::new();
+    match queued {
+        0 => {}
+        one => parts.push(format!("{one} queued")),
+    }
+    if !report.supervisor_running {
+        parts.push(
+            match report.service.as_str() {
+                "stopped" => "Not running (service stopped)",
+                "not-installed" => "Not running (no service installed)",
+                _ => "Not running",
+            }
+            .to_owned(),
+        );
+    }
+    if report.supervisor_unresponsive {
+        parts.push(crate::supervisor::control::UNRESPONSIVE.to_owned());
+    }
+    if report.config_notice.is_some() {
+        parts.push("configuration refused".to_owned());
+    }
+    if report.supervisor_mismatch.is_some() {
+        parts.push("restart needed".to_owned());
+    }
+    parts.push(format!("{} synchronized", count("synchronized")));
+    for (state, word) in [
+        ("conflicts", "in conflict"),
+        ("halted", "halted"),
+        ("unreachable", "unreachable"),
+        ("errored", "failing"),
+        ("blocked", "blocked"),
+    ] {
+        let n = count(state);
+        if n > 0 {
+            parts.push(format!("{n} {word}"));
+        }
+    }
+    parts.join(", ")
+}
+
+/// The menu's warning line, if any. The refused edit takes the same line,
+/// under an action's failure when there is one: both are things the
+/// person did. A supervisor that does not answer, or is another build,
+/// comes after.
+fn warning_of(report: &StatusReport, last_error: Option<&str>) -> Option<String> {
+    last_error
+        .map(|e| format!("⚠ {}", display_safe(e)))
+        .or_else(|| {
+            report
+                .config_notice
+                .as_ref()
+                .map(|notice| format!("⚠ configuration refused: {}", display_safe(&notice.message)))
+        })
+        .or_else(|| {
+            report
+                .supervisor_unresponsive
+                .then(|| format!("⚠ {}", crate::supervisor::control::unresponsive_message()))
+        })
+        .or_else(|| {
+            report
+                .supervisor_mismatch
+                .as_ref()
+                .map(|mismatch| format!("⚠ {}", display_safe(mismatch)))
+        })
+}
+
 /// The configuration's shape: group names and their sessions, by key —
 /// two betas on one host are two entries, and swapping one for another is
 /// a new shape.
@@ -1320,6 +1340,35 @@ fn format_age(seconds: u64) -> String {
         format!("{}m ago", seconds / 60)
     } else {
         format!("{}h ago", seconds / 3600)
+    }
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    /// A supervisor that is running but does not answer is said to be
+    /// not responding, not passed over or taken for another build.
+    #[test]
+    fn an_unresponsive_supervisor_is_said_to_be_not_responding() {
+        let report = |unresponsive: bool| StatusReport {
+            version: 4,
+            supervisor_running: true,
+            service: "running".into(),
+            groups: Vec::new(),
+            config_notice: None,
+            supervisor_mismatch: None,
+            supervisor_unresponsive: unresponsive,
+        };
+        let summary = summary_of(&report(true), 0);
+        assert!(summary.contains("supervisor not responding"), "{summary}");
+        assert!(!summary.contains("restart needed"), "{summary}");
+        let warning = warning_of(&report(true), None).expect("a warning");
+        assert!(warning.contains("answered nothing"), "{warning}");
+        assert!(!warning.contains("another build"), "{warning}");
+
+        assert!(!summary_of(&report(false), 0).contains("not responding"));
+        assert_eq!(warning_of(&report(false), None), None);
     }
 }
 

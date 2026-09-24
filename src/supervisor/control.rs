@@ -228,6 +228,11 @@ impl Probe {
         }
     }
 
+    /// Whether a supervisor is running but did not answer in time.
+    pub fn is_unresponsive(&self) -> bool {
+        matches!(self, Probe::Unresponsive)
+    }
+
     /// What to tell someone about a supervisor of another build.
     pub fn mismatch_message(&self) -> Option<String> {
         match self {
@@ -235,6 +240,19 @@ impl Probe {
             _ => None,
         }
     }
+}
+
+/// What `status`, the shop and the tray say about a supervisor that is
+/// running but answered nothing within the client timeout.
+pub const UNRESPONSIVE: &str = "supervisor not responding";
+
+/// Says what a supervisor that does not answer means, and what to do.
+pub fn unresponsive_message() -> String {
+    format!(
+        "a supervisor is running but answered nothing within {} s; \
+         `autobahn restart` if it stays so",
+        CLIENT_TIMEOUT.as_secs()
+    )
 }
 
 /// Says that the running supervisor is another build, and what to do.
@@ -1371,6 +1389,11 @@ mod tests {
         let report = crate::supervisor::status_report(&[], root.path());
         assert!(started.elapsed() < CLIENT_TIMEOUT + Duration::from_secs(5));
         assert!(report.supervisor_running);
+        // And says so, rather than nothing or "another build".
+        assert!(report.supervisor_unresponsive);
+        assert!(report.supervisor_mismatch.is_none());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["supervisor_unresponsive"], true);
     }
 
     #[test]

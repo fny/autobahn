@@ -887,6 +887,18 @@ impl Shop {
             ));
             lines.push(String::new());
         }
+        // Running but wedged: the orders below are what was last recorded.
+        if self.report.supervisor_unresponsive {
+            lines.push(format!(
+                "  \x1b[33m⚠ {}\x1b[0m {}",
+                autobahn::supervisor::control::UNRESPONSIVE,
+                dim(&shorten(
+                    "what follows was last recorded; `autobahn restart` if it stays so",
+                    width.saturating_sub(32)
+                ))
+            ));
+            lines.push(String::new());
+        }
         if let Some(notice) = &self.report.config_notice {
             lines.push(format!(
                 "  \x1b[33m⚠ configuration refused\x1b[0m {}",
@@ -2015,6 +2027,7 @@ mod tests {
             groups: vec![group(role)],
             config_notice: None,
             supervisor_mismatch: None,
+            supervisor_unresponsive: false,
         };
 
         let rail = |role: &str| {
@@ -2087,6 +2100,7 @@ mod tests {
                 }],
                 config_notice: None,
                 supervisor_mismatch: None,
+                supervisor_unresponsive: false,
             },
             cursor: 1,
             counter: None,
@@ -2107,6 +2121,41 @@ mod tests {
         let (_, open) = shop.at_counter().expect("the counter is open");
         assert_eq!(open.beta, "boite:/b");
         assert_eq!(open.selector(), "boite:/b");
+    }
+
+    /// A supervisor that is running but does not answer is said to be so
+    /// under the sign.
+    #[test]
+    fn an_unresponsive_supervisor_is_said_to_be_not_responding() {
+        use autobahn::supervisor::StatusReport;
+        let shop = |unresponsive: bool| Shop {
+            plans: Vec::new(),
+            state_root: std::path::PathBuf::new(),
+            config: None,
+            report: StatusReport {
+                version: 4,
+                supervisor_running: true,
+                service: "running".into(),
+                groups: Vec::new(),
+                config_notice: None,
+                supervisor_mismatch: None,
+                supervisor_unresponsive: unresponsive,
+            },
+            cursor: 0,
+            counter: None,
+            expanded: BTreeSet::new(),
+            marked: BTreeSet::new(),
+            working: Arc::default(),
+            rate: Rate::default(),
+            ticker: Vec::new(),
+            pending: None,
+            help: false,
+            frame: 0,
+        };
+        let drawn = shop(true).draw();
+        assert!(drawn.contains("supervisor not responding"), "{drawn:?}");
+        assert!(!drawn.contains("another build"), "{drawn:?}");
+        assert!(!shop(false).draw().contains("not responding"));
     }
 
     /// A conflicting name with control characters in it is drawn escaped
@@ -2154,6 +2203,7 @@ mod tests {
                 }],
                 config_notice: None,
                 supervisor_mismatch: None,
+                supervisor_unresponsive: false,
             },
             cursor: 0,
             counter: Some(Counter {

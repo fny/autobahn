@@ -4339,15 +4339,38 @@ fn render_status(
     live: bool,
     out: &mut String,
 ) {
-    use autobahn::supervisor::control::{progress_of, SessionKey};
-    use std::fmt::Write;
-
     // One round trip answers both "is anything running" and "what is each
     // session doing"; the recorded status on disk answers "how did the last
     // cycle end". A session is described by the first when it is working
     // and by the second when it is not.
     let probe = autobahn::supervisor::control::probe(state_root);
+    render_probed_status(
+        selected,
+        state_root,
+        probe,
+        expand_conflicts,
+        expand,
+        live,
+        out,
+    );
+}
+
+/// Renders the status of the selected sessions given what asking the
+/// supervisor came to.
+fn render_probed_status(
+    selected: &[&autobahn::config::SessionPlan],
+    state_root: &Path,
+    probe: autobahn::supervisor::control::Probe,
+    expand_conflicts: bool,
+    expand: bool,
+    live: bool,
+    out: &mut String,
+) {
+    use autobahn::supervisor::control::{progress_of, SessionKey};
+    use std::fmt::Write;
+
     let mismatch = probe.mismatch_message();
+    let unresponsive = probe.is_unresponsive();
     let running = probe.is_running();
     let reported = probe.progress();
     let rows: Vec<(&autobahn::config::SessionPlan, Option<SessionStatus>)> = selected
@@ -4372,6 +4395,15 @@ fn render_status(
             out,
             "\x1b[33ma supervisor of another build is running\x1b[0m; what follows is \
              the state last recorded, not what is happening now\n{mismatch}\n"
+        );
+    } else if unresponsive {
+        // Running, but wedged: it cannot say what it is doing either.
+        let _ = writeln!(
+            out,
+            "\x1b[33m{}\x1b[0m; what follows is the state last recorded, not what \
+             is happening now\n{}\n",
+            autobahn::supervisor::control::UNRESPONSIVE,
+            autobahn::supervisor::control::unresponsive_message()
         );
     } else if !running {
         let remedy = match autobahn::service::state() {
@@ -5178,6 +5210,41 @@ mod tests {
         assert_eq!(sessions[0].label(), "host:/tree");
         assert_eq!(sessions[1].label(), "host:/other");
         assert_eq!(sessions[1].selector(), "host:/other");
+    }
+
+    /// A supervisor that is running but does not answer is said to be
+    /// not responding, rather than passed over in silence or taken for
+    /// another build.
+    #[test]
+    fn status_says_an_unresponsive_supervisor_is_not_responding() {
+        use autobahn::supervisor::control::Probe;
+
+        let keep = tempfile::tempdir().expect("tempdir");
+        let config = keep.path().join("config.toml");
+        std::fs::write(
+            &config,
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\n\
+             betas = [\"host:/tree\"]\n",
+        )
+        .unwrap();
+        let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
+        let selected: Vec<_> = plans.iter().collect();
+        let state_root = keep.path().join("state");
+
+        let mut out = String::new();
+        super::render_probed_status(
+            &selected,
+            &state_root,
+            Probe::Unresponsive,
+            false,
+            true,
+            false,
+            &mut out,
+        );
+        assert!(out.contains("supervisor not responding"), "{out}");
+        assert!(!out.contains("another build"), "{out}");
+        assert!(!out.contains("no supervisor is running"), "{out}");
+        assert!(out.contains("host:/tree"), "{out}");
     }
 
     fn side() -> autobahn::progress::SideSnapshot {

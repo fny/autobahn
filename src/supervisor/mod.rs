@@ -2249,6 +2249,10 @@ pub struct StatusReport {
     /// what it is doing; what to tell someone about it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub supervisor_mismatch: Option<String>,
+    /// A supervisor is running but answered nothing within the client
+    /// timeout: wedged, so it cannot say what it is doing either.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub supervisor_unresponsive: bool,
 }
 
 /// One group's report.
@@ -2418,6 +2422,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
     let probe = control::probe(state_root);
     let running = probe.is_running();
     let mismatch = probe.mismatch_message();
+    let unresponsive = probe.is_unresponsive();
     let live = probe.progress();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -2486,6 +2491,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
         version: 4,
         supervisor_running: running,
         supervisor_mismatch: mismatch,
+        supervisor_unresponsive: unresponsive,
         // Only a running supervisor's refusal is news: the one that wrote
         // it is gone otherwise, and `start` checks the file itself.
         config_notice: running.then(|| reload::read_notice(state_root)).flatten(),

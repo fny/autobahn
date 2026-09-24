@@ -2037,7 +2037,7 @@ fn pasteable(path: &str) -> String {
         true => format!("./{path}"),
         false => path.to_owned(),
     };
-    let plain = |c: char| c.is_alphanumeric() || "._/-+@,:=%".contains(c);
+    let plain = |c: char| c.is_alphanumeric() || "._/-+@,:%".contains(c);
     if !path.is_empty() && path.chars().all(plain) {
         path
     } else {
@@ -2377,7 +2377,7 @@ fn run_issues(
             };
             say!(
                 "      fix: autobahn resolve {} {where_} --keep alpha|{}|both",
-                plan.group,
+                pasteable(&plan.group),
                 plan.host
             );
         }
@@ -2957,6 +2957,17 @@ fn run_resolve(
         .iter()
         .flat_map(|(_, paths)| paths.iter().cloned())
         .collect();
+    // A path inside another one named is settled with it; retiring both
+    // would retire the inner one twice.
+    let paths: std::collections::BTreeSet<String> = paths
+        .iter()
+        .filter(|path| {
+            !paths
+                .iter()
+                .any(|outer| path.starts_with(&format!("{outer}/")))
+        })
+        .cloned()
+        .collect();
 
     let mut settled = 0usize;
     let mut refused: Vec<(String, String)> = Vec::new();
@@ -3136,6 +3147,15 @@ fn run_resolve(
         }
     }
 
+    // A path blocked on one side is not settled on any: retiring the
+    // other copies around content that cannot be removed would leave the
+    // two sides disagreeing in a new way.
+    for loser in &mut losers {
+        loser
+            .actions
+            .retain(|(path, _)| !blocked.iter().any(|(blocked, ..)| blocked == path));
+    }
+
     // Retiring the loser settles a path only if the next cycle then
     // carries the winner over the gap. It does not when the winner is what
     // the last sync recorded — the gap then reads as a deletion against an
@@ -3204,51 +3224,76 @@ fn run_resolve(
             // other session the worst order is assumed, the one in which
             // alpha already holds the winner's version when that session
             // next runs.
-            let (alpha_after, beta_after) = match winner {
-                Winner::Alpha | Winner::Both => {
-                    let loser = beta_loser.expect("an acting session has a losing beta");
-                    (
-                        winner_root.clone(),
-                        apply(loser.root.as_ref(), &removals_of(loser)),
-                    )
+            let scanned = match (winner, beta_loser) {
+                (Winner::Beta(w), None) if w != index => {
+                    Some(scan(&mut endpoints[index].1, &plan.host)?)
                 }
-                Winner::Beta(w) => {
-                    let alpha_loser = alpha_loser.expect("the winning session retires alpha");
-                    let alpha_after = if w == index {
-                        apply(alpha_loser.root.as_ref(), &removals_of(alpha_loser))
-                    } else {
-                        let replaced: Vec<Change> = alpha_loser
-                            .actions
-                            .iter()
-                            .map(|(path, _)| Change {
-                                path: path.clone(),
-                                old: None,
-                                new: node_at(winner_root.as_ref(), path).cloned(),
-                            })
-                            .collect();
-                        apply(alpha_loser.root.as_ref(), &replaced)
-                    };
-                    let beta_after = if w == index {
-                        Ok(winner_root.clone())
-                    } else if let Some(loser) = beta_loser {
-                        apply(loser.root.as_ref(), &removals_of(loser))
-                    } else {
-                        Ok(scan(&mut endpoints[index].1, &plan.host)?)
-                    };
-                    (alpha_after.map_err(anyhow::Error::msg)?, beta_after)
+                _ => None,
+            };
+            let simulated = (|| -> std::result::Result<_, String> {
+                let (alpha_after, beta_after) = match winner {
+                    Winner::Alpha | Winner::Both => {
+                        let loser = beta_loser.expect("an acting session has a losing beta");
+                        (
+                            winner_root.clone(),
+                            apply(loser.root.as_ref(), &removals_of(loser))?,
+                        )
+                    }
+                    Winner::Beta(w) => {
+                        let alpha_loser = alpha_loser.expect("the winning session retires alpha");
+                        let alpha_after = if w == index {
+                            apply(alpha_loser.root.as_ref(), &removals_of(alpha_loser))?
+                        } else {
+                            // Alpha as the winning session leaves it: holding
+                            // the winner's version at every path decided,
+                            // whether or not alpha had a copy to retire.
+                            let replaced: Vec<Change> = decided
+                                .iter()
+                                .map(|path| Change {
+                                    path: (*path).clone(),
+                                    old: None,
+                                    new: node_at(winner_root.as_ref(), path).cloned(),
+                                })
+                                .collect();
+                            apply(alpha_loser.root.as_ref(), &replaced)?
+                        };
+                        let beta_after = if w == index {
+                            winner_root.clone()
+                        } else if let Some(loser) = beta_loser {
+                            apply(loser.root.as_ref(), &removals_of(loser))?
+                        } else {
+                            scanned.clone().flatten()
+                        };
+                        (alpha_after, beta_after)
+                    }
+                };
+                let outcome = reconcile(
+                    ancestor.as_ref(),
+                    alpha_after.as_ref(),
+                    beta_after.as_ref(),
+                    plan.mode,
+                );
+                Ok((
+                    apply(alpha_after.as_ref(), &outcome.alpha_transitions)?,
+                    apply(beta_after.as_ref(), &outcome.beta_transitions)?,
+                ))
+            })();
+            // A tree the changes do not fit — a parent that is not there —
+            // refuses the paths rather than guessing at them.
+            let (alpha_final, beta_final) = match simulated {
+                Ok(trees) => trees,
+                Err(message) => {
+                    for path in decided {
+                        unsafe_paths.entry(path.clone()).or_insert_with(|| {
+                            format!(
+                                "whether keeping {winner_name} here would delete it cannot \
+                                 be worked out ({message})"
+                            )
+                        });
+                    }
+                    continue;
                 }
             };
-            let beta_after = beta_after.map_err(anyhow::Error::msg)?;
-            let outcome = reconcile(
-                ancestor.as_ref(),
-                alpha_after.as_ref(),
-                beta_after.as_ref(),
-                plan.mode,
-            );
-            let alpha_final = apply(alpha_after.as_ref(), &outcome.alpha_transitions)
-                .map_err(anyhow::Error::msg)?;
-            let beta_final = apply(beta_after.as_ref(), &outcome.beta_transitions)
-                .map_err(anyhow::Error::msg)?;
 
             for path in decided {
                 let kept = node_at(winner_root.as_ref(), path);

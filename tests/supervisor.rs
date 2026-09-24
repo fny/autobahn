@@ -2448,6 +2448,55 @@ fn no_color_on_a_terminal_takes_the_colour_away() {
     assert!(plain.contains("\x1b[1m"), "{plain:?}");
 }
 
+/// Keeping one destination's version where alpha has no copy at all:
+/// alpha's side has nothing to retire, and the other destination must
+/// still be checked as though alpha already holds the winner's version,
+/// which is what it will hold once the winning session has run.
+#[test]
+fn keeping_a_destination_where_alpha_has_no_copy_settles_the_fan_out() {
+    let world = World::new();
+    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    write(&alpha, "fresh.txt", "seed");
+    cli(&world, &config, &["sync"]);
+    fs::remove_file(alpha.join("fresh.txt")).unwrap();
+    write(&b1, "fresh.txt", "v-b1");
+    write(&b2, "fresh.txt", "v-b2");
+    let b1_spec = b1.to_string_lossy().to_string();
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "fresh.txt", "--keep", &b1_spec, "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert!(!text.contains("not settled"), "{text}");
+    for _ in 0..3 {
+        cli(&world, &config, &["sync"]);
+    }
+    for root in [&alpha, &b1, &b2] {
+        assert_eq!(read(root, "fresh.txt"), "v-b1");
+    }
+}
+
+/// A folder and a path inside it, named together, are one resolution.
+#[test]
+fn naming_a_folder_and_a_path_inside_it_settles_the_folder_once() {
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
+    write(&alpha, "d/f", "alpha");
+    write(&beta, "d/f", "beta");
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", "d", "d/f", "--keep", "alpha", "--yes"],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("settled 1 of 1"), "{text}");
+    for _ in 0..2 {
+        cli(&world, &config, &["sync"]);
+    }
+    assert_eq!(read(&beta, "d/f"), "alpha");
+}
+
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();

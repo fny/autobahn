@@ -126,7 +126,7 @@ Conflicts and blocked paths co-occur, so both counts are reported rather than on
 
 ## One-off syncs and scripting
 
-Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code. A one-off pass registers no filesystem watchers — it never waits for anything — so on a large tree it starts in a fraction of the time a `watch` does (a 160,000-file pair, already in sync: under a second):
+Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code. A one-off pass registers no filesystem watchers on either side, local or remote — it never waits for anything — so on a large tree it starts in a fraction of the time a `watch` does (a 160,000-file pair, already in sync: 0.7 s locally, 1.4 s over SSH):
 
 ```sh
 # One bidirectional pass, then exit:
@@ -134,6 +134,9 @@ autobahn sync ~/project /mnt/backup/project
 
 # Local ↔ remote over SSH:
 autobahn sync ~/project user@host:/srv/project
+
+# Every session in the configuration, once each:
+autobahn sync
 
 # Keep watching, like a one-group `watch`:
 autobahn sync ~/project user@host:/srv/project --watch

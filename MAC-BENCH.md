@@ -137,7 +137,7 @@ On Linux the watcher never watches an ignored directory, and the kernel merges r
 
 1. A synced Rust project with `target` in its ignores, and `autobahn watch --debug`.
 2. `cargo build` (a clean one, so it writes thousands of files), and count cycles in the log whose `cycle finished in` is as long as a full walk of the tree.
-3. If they appear: the fix is to filter each FSEvents path through the ignore set before recording it, and to deduplicate, in `PendingChanges::record` (`src/endpoint/local.rs`).
+3. The fix is built (`290ad1e`, branch `speed-review`): each FSEvents path strictly beneath a directory the scanner prunes is left out, and a path is recorded once however often it is reported. Run the build with and without it (the commit before it is the baseline) to confirm the full walks go. It compiles for macOS and its logic is tested on Linux, but it has never run against real FSEvents.
 
-**Record:** full walks during the build, and the tree's size.
+**Record:** full walks during the build, with and without the fix, and the tree's size.
 

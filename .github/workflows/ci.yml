@@ -35,6 +35,10 @@ on:
       - '.github/workflows/release.yml'
   workflow_dispatch:
 
+# Read-only, whatever the repository's default says: nothing here writes.
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

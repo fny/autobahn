@@ -17,8 +17,11 @@ on:
   push:
     tags: ["v*"]
 
+# Read-only for every job, whatever the repository's default says. Only
+# the release job, the last, which holds no signing secret and runs no
+# build, can write: it publishes the release.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # The tag is what names the agent on every remote host: the controller
@@ -170,6 +173,8 @@ jobs:
   release:
     needs: [linux, mac]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       # Only for the epoch, which the manifest states beside the version.
       - uses: actions/checkout@v4

@@ -8,6 +8,10 @@ name: Spec (full)
 on:
   workflow_dispatch:
 
+# Read-only, whatever the repository's default says: nothing here writes.
+permissions:
+  contents: read
+
 jobs:
   tlc:
     runs-on: ubuntu-latest

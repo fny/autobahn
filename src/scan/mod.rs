@@ -7,7 +7,7 @@ pub mod probes;
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
 use std::io::{ErrorKind, Read};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -22,6 +22,17 @@ pub use probes::{probe, recompose, FilesystemBehavior};
 /// The size of the fixed buffer used to stream file contents through the
 /// digester.
 const DIGEST_BUFFER_SIZE: usize = 64 * 1024;
+
+/// How far past its `lstat` size a file may grow while it is digested
+/// before the read is abandoned as racing a writer. Room for an appended
+/// log line or two, which is what a live file usually sees in the time one
+/// read takes; a file growing faster than that is recorded as changed and
+/// read again by the next scan.
+const DIGEST_GROWTH_ALLOWANCE: u64 = 1024 * 1024;
+
+/// The problem recorded for a file that was not the same file, or not the
+/// same size within [`DIGEST_GROWTH_ALLOWANCE`], by the time it was read.
+const CHANGED_DURING_SCAN: &str = "changed during scan; it will be read again";
 
 /// How many entries a scan counts before publishing them. Large enough
 /// that the atomic add disappears against the filesystem work, small
@@ -45,6 +56,18 @@ thread_local! {
     /// serial and parallel paths can both be exercised on any machine —
     /// a one-core CI runner otherwise never takes the parallel one.
     static HELPERS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// A test's action on a path, run by the scan at a chosen moment.
+#[cfg(test)]
+type PathHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    /// A test's action between a file's `lstat` and its open, on this
+    /// thread, to swap something else in under the name.
+    static BEFORE_OPEN: std::cell::RefCell<Option<PathHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// How many threads a scan may add beside the one it runs on.
@@ -1061,8 +1084,11 @@ impl<'a> Scanner<'a> {
         let digest = match reusable {
             Some(digest) => digest,
             None => {
-                let (digest, read) = match self.digest_file(disk_path) {
-                    Ok(result) => result,
+                let (digest, read) = match self.digest_file(disk_path, metadata) {
+                    Ok(Some(result)) => result,
+                    // Rescanned next time, like any problem, rather than
+                    // failing this scan.
+                    Ok(None) => return problematic(CHANGED_DURING_SCAN),
                     Err(error) => return problematic(format!("unable to read file: {error:#}")),
                 };
                 // A file that changed size between the stat and the read is
@@ -1117,10 +1143,52 @@ impl<'a> Scanner<'a> {
     }
 
     /// Streams the file at `disk_path` through BLAKE3, returning its digest
-    /// and the number of bytes read.
-    fn digest_file(&mut self, disk_path: &Path) -> Result<(Digest, u64)> {
-        let mut file = fs::File::open(disk_path)
-            .with_context(|| format!("unable to open {}", disk_path.display()))?;
+    /// and the number of bytes read — or `None` when what is there now is
+    /// not the file `metadata` (its `lstat`) described, or is being written
+    /// faster than it can be read.
+    ///
+    /// The name is opened without following a symbolic link and without
+    /// blocking, and the handle must be the same regular file the `lstat`
+    /// saw. So a name swapped in between can neither hang the scan (a
+    /// FIFO), feed it forever (a link to `/dev/zero`), nor have a file
+    /// outside the root digested and later supplied (a link out).
+    fn digest_file(
+        &mut self,
+        disk_path: &Path,
+        metadata: &Metadata,
+    ) -> Result<Option<(Digest, u64)>> {
+        #[cfg(test)]
+        BEFORE_OPEN.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().as_mut() {
+                hook(disk_path);
+            }
+        });
+        let mut file = match fs::File::options()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(disk_path)
+        {
+            Ok(file) => file,
+            // A symbolic link (`ELOOP`), a socket (`ENXIO`), or nothing at
+            // all where a regular file was a moment ago.
+            Err(error)
+                if error.kind() == ErrorKind::NotFound
+                    || matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENXIO)) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("unable to open {}", disk_path.display()))
+            }
+        };
+        let opened = file
+            .metadata()
+            .with_context(|| format!("unable to probe {}", disk_path.display()))?;
+        if !opened.is_file() || opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
+            return Ok(None);
+        }
+        let limit = metadata.size().saturating_add(DIGEST_GROWTH_ALLOWANCE);
         let mut hasher = blake3::Hasher::new();
         let mut read = 0u64;
         loop {
@@ -1132,8 +1200,11 @@ impl<'a> Scanner<'a> {
             }
             hasher.update(&self.buffer[..count]);
             read += count as u64;
+            if read > limit {
+                return Ok(None);
+            }
         }
-        Ok((*hasher.finalize().as_bytes(), read))
+        Ok(Some((*hasher.finalize().as_bytes(), read)))
     }
 
     /// Scans the symbolic link at `disk_path` (root-relative path `path`).
@@ -1635,6 +1706,120 @@ mod tests {
                 &baseline,
                 &[&at("one"), &at("two"), &at("spare")],
             );
+        }
+    }
+
+    /// Scans `root` with `action` run between each file's `lstat` and its
+    /// open, on a thread of its own so that a scan that hangs is reported
+    /// rather than hanging the suite.
+    fn scan_with_swap(root: &Path, action: impl FnMut(&Path) + Send + 'static) -> Option<Snapshot> {
+        let root = root.to_path_buf();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            HELPERS.with(|helpers| helpers.set(Some(0)));
+            BEFORE_OPEN.with(|hook| *hook.borrow_mut() = Some(Box::new(action)));
+            let _ = sender.send(scan_fixture(&root, None));
+        });
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .ok()
+    }
+
+    /// Reproduced before the fix: a FIFO swapped in after the `lstat`
+    /// blocked the open forever, and the session never finished a scan.
+    #[test]
+    fn a_file_swapped_for_a_fifo_does_not_hang_the_scan() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path().join("root");
+        write(&root, "file.txt", "contents");
+        let fifo = root.join("file.txt");
+        let snapshot = scan_with_swap(&root, move |path| {
+            if path == fifo {
+                fs::remove_file(path).expect("remove");
+                let name =
+                    std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).expect("path");
+                assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0, "mkfifo");
+            }
+        });
+        let Some(snapshot) = snapshot else {
+            // Unblock the stuck open so the thread can end.
+            let _ = fs::OpenOptions::new()
+                .write(true)
+                .open(root.join("file.txt"));
+            panic!("the scan hung on a FIFO");
+        };
+        let root_node = snapshot.root.as_ref().expect("root");
+        match &child(root_node, "file.txt").content {
+            Content::Problematic { message } => assert!(
+                message.contains("changed during scan"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a changed-during-scan entry, found {other:?}"),
+        }
+    }
+
+    /// Reproduced before the fix: the open followed a symbolic link
+    /// swapped in after the `lstat`, and a file outside the root was
+    /// digested — and later supplied to the peer.
+    #[test]
+    fn a_file_swapped_for_a_symlink_outside_is_not_digested() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path().join("root");
+        write(&root, "file.txt", "contents");
+        write(directory.path(), "outside.txt", "secret");
+        let outside = directory.path().join("outside.txt");
+        let target = root.join("file.txt");
+        let snapshot = scan_with_swap(&root, move |path| {
+            if path == target {
+                fs::remove_file(path).expect("remove");
+                symlink(&outside, path).expect("symlink");
+            }
+        })
+        .expect("the scan should finish");
+        let root_node = snapshot.root.as_ref().expect("root");
+        match &child(root_node, "file.txt").content {
+            Content::File { digest, .. } => assert_ne!(
+                *digest,
+                digest_of("secret"),
+                "a file outside the root was digested"
+            ),
+            Content::Problematic { message } => assert!(
+                message.contains("changed during scan"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("unexpected content {other:?}"),
+        }
+    }
+
+    /// A file growing well past its `lstat` size while it is read is being
+    /// written: the scan stops reading and records it as changed, rather
+    /// than digesting whatever the writer has produced so far — or, for a
+    /// file that never stops growing, reading forever.
+    #[test]
+    fn a_file_that_grows_during_the_read_is_changed_during_scan() {
+        let directory = tempdir().expect("temporary directory should be creatable");
+        let root = directory.path().join("root");
+        write(&root, "file.txt", "small");
+        let target = root.join("file.txt");
+        let snapshot = scan_with_swap(&root, move |path| {
+            if path == target {
+                use std::io::Write;
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(path)
+                    .expect("open");
+                file.write_all(&vec![b'x'; 4 * 1024 * 1024])
+                    .expect("append");
+            }
+        })
+        .expect("the scan should finish");
+        let root_node = snapshot.root.as_ref().expect("root");
+        match &child(root_node, "file.txt").content {
+            Content::Problematic { message } => assert!(
+                message.contains("changed during scan"),
+                "unexpected message: {message}"
+            ),
+            other => panic!("expected a changed-during-scan entry, found {other:?}"),
         }
     }
 

@@ -755,9 +755,11 @@ fn run_action(
             ));
             match command.output() {
                 Ok(output) => {
-                    let file = std::env::temp_dir()
-                        .join(format!("autobahn-diff-{}.diff", path.replace('/', "_")));
-                    let _ = std::fs::write(&file, &output.stdout);
+                    // Private, under the state root, and named so two
+                    // conflicts never share it.
+                    let file = crate::paths::tray_diff_file(state_root, &group, &host, &path)?;
+                    crate::persist::write_atomically(&file, &output.stdout)
+                        .with_context(|| format!("unable to write {}", file.display()))?;
                     open_path(&file)
                 }
                 Err(error) => Err(error.into()),

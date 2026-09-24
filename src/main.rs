@@ -2617,17 +2617,6 @@ fn run_diff(
     relative_in(&selection, 0, path.clone())?;
     let pool = autobahn::transport::mux::AgentPool::default();
 
-    // A scratch directory of our own, removed on exit; the dev-dependency
-    // on tempfile is not available to the binary.
-    let scratch = std::env::temp_dir().join(format!("autobahn-diff-{}", std::process::id()));
-    std::fs::create_dir_all(&scratch).context("unable to create a scratch directory")?;
-    struct Scratch(PathBuf);
-    impl Drop for Scratch {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let scratch = Scratch(scratch);
     let mut shown = 0;
     for (index, plan) in selection.plans.iter().enumerate() {
         let path = relative_in(&selection, index, path.clone())?;
@@ -2639,14 +2628,22 @@ fn run_diff(
             continue;
         }
         shown += 1;
+        // Both sides go into a private directory of their own under the
+        // state root, never the shared temporary directory, where another
+        // user could read them, redirect the writes or swap what is
+        // compared. It is removed once the diff has run.
+        let scratch = autobahn::fsutil::private_tempdir_in(&state_root)?;
         let write = |name: &str, content: &Option<Vec<u8>>| -> Result<PathBuf> {
-            let file = scratch.0.join(name);
-            std::fs::write(&file, content.as_deref().unwrap_or(b""))
+            use std::io::Write;
+            let file = scratch.path().join(name);
+            autobahn::fsutil::private_file(&file)?
+                .write_all(content.as_deref().unwrap_or(b""))
                 .with_context(|| format!("unable to write {}", file.display()))?;
             Ok(file)
         };
         let left = write("alpha", &a)?;
-        let right = write(&plan.host.replace('/', "_"), &b)?;
+        // Named by side, not by host: a host is not a file name.
+        let right = write("beta", &b)?;
         // The labels name the sides, not the scratch files.
         let status = std::process::Command::new("diff")
             .args(["-u", "--label", &format!("alpha/{path}"), "--label"])

@@ -149,6 +149,30 @@ pub fn loose_write_permissions(path: &std::path::Path) -> Option<String> {
     })
 }
 
+/// Returns where the menu bar app writes the diff it opens for one
+/// conflict: `<state root>/tmp/diff-<digest>.diff`, making the state root
+/// and its `tmp` private first (see [`crate::fsutil::private_tmp_root`]).
+///
+/// Named by a digest of the group, host and path, so no two conflicts
+/// share a file — `a/b` and `a_b` among them — and nothing in the name
+/// comes from the synchronized tree. The viewer opens it after the app
+/// has moved on, so it is left for the startup sweep to remove.
+pub fn tray_diff_file(
+    state_root: &std::path::Path,
+    group: &str,
+    host: &str,
+    path: &str,
+) -> Result<PathBuf> {
+    let tmp = crate::fsutil::private_tmp_root(state_root)?;
+    let mut hasher = blake3::Hasher::new();
+    for part in [group, host, path] {
+        hasher.update(&(part.len() as u64).to_le_bytes());
+        hasher.update(part.as_bytes());
+    }
+    let digest = hasher.finalize().to_hex();
+    Ok(tmp.join(format!("diff-{}.diff", &digest[..32])))
+}
+
 /// Resolves a path to its physical identity: fully canonicalized when it
 /// exists, and otherwise the canonicalized deepest *existing* ancestor with
 /// the missing suffix reappended (lexically normalized).
@@ -337,5 +361,20 @@ mod tests {
             warning.contains(&directory.display().to_string()),
             "{warning}"
         );
+    }
+
+    #[test]
+    fn tray_diffs_of_different_conflicts_do_not_share_a_file() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join(".autobahn");
+        let slashed = tray_diff_file(&root, "g", "h", "a/b").unwrap();
+        let underscored = tray_diff_file(&root, "g", "h", "a_b").unwrap();
+        assert_ne!(slashed, underscored);
+        assert_eq!(slashed, tray_diff_file(&root, "g", "h", "a/b").unwrap());
+        assert_ne!(slashed, tray_diff_file(&root, "g", "other", "a/b").unwrap());
+        assert_ne!(slashed, tray_diff_file(&root, "g/h", "", "a/b").unwrap());
+        assert_eq!(slashed.parent().unwrap(), root.join("tmp"));
+        assert_eq!(mode(&root.join("tmp")), 0o700);
+        assert!(!slashed.to_string_lossy().contains("a_b"));
     }
 }

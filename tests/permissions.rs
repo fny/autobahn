@@ -18,14 +18,22 @@ fn mode(path: &Path) -> u32 {
 /// Runs the binary with `arguments` under umask `022`, with its state root
 /// at `home`.
 fn autobahn(home: &Path, arguments: &[&str]) -> Output {
-    Command::new("/bin/sh")
+    autobahn_with(home, arguments, &[])
+}
+
+/// As [`autobahn`], with more of the child's environment set.
+fn autobahn_with(home: &Path, arguments: &[&str], environment: &[(&str, &Path)]) -> Output {
+    let mut command = Command::new("/bin/sh");
+    command
         .arg("-c")
         .arg("umask 022 && exec \"$0\" \"$@\"")
         .arg(env!("CARGO_BIN_EXE_autobahn"))
         .args(arguments)
-        .env("AUTOBAHN_HOME", home)
-        .output()
-        .expect("the binary should run")
+        .env("AUTOBAHN_HOME", home);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command.output().expect("the binary should run")
 }
 
 fn succeeded(output: &Output) -> &Output {
@@ -152,4 +160,78 @@ fn a_manual_sync_keeps_its_session_state_private() {
         .collect();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert_eq!(mode(&sessions[0]), 0o700);
+}
+
+/// `diff` never touches the shared temporary directory — here one it
+/// cannot write, standing in for an `autobahn-diff-<pid>` another user
+/// made first — and hands the diff tool both sides as `0600` files in a
+/// `0700` directory of their own, gone once the tool has exited.
+#[test]
+fn diff_compares_private_copies_outside_the_shared_temporary_directory() {
+    let scratch = tempfile::tempdir().unwrap();
+    let home = scratch.path().join(".autobahn");
+    let alpha = scratch.path().join("alpha");
+    let beta = scratch.path().join("beta");
+    std::fs::create_dir(&alpha).unwrap();
+    std::fs::create_dir(&beta).unwrap();
+    std::fs::write(alpha.join("f"), b"one\n").unwrap();
+    std::fs::write(beta.join("f"), b"two\n").unwrap();
+    let config = scratch.path().join("config.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[groups.g]\nalpha = \"{}\"\nbetas = [\"{}\"]\nmode = \"two-way-conflict\"\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .unwrap();
+
+    let shared = scratch.path().join("shared-tmp");
+    std::fs::create_dir(&shared).unwrap();
+    std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o500)).unwrap();
+    // A stand-in diff tool that records what it was handed.
+    let bin = scratch.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let record = scratch.path().join("record");
+    let tool = bin.join("diff");
+    std::fs::write(
+        &tool,
+        "#!/bin/sh\n\
+         shift 5\n\
+         for file in \"$1\" \"$2\" \"$(dirname \"$1\")\"; do\n\
+         printf '%s %s\\n' \"$(stat -c %a \"$file\")\" \"$file\" >> \"$RECORD\"\n\
+         done\n\
+         exit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+
+    let output = autobahn_with(
+        &home,
+        &["diff", "g", "f", "--config", config.to_str().unwrap()],
+        &[
+            ("TMPDIR", &shared),
+            ("RECORD", &record),
+            ("PATH", Path::new(&path)),
+        ],
+    );
+    succeeded(&output);
+    let recorded = std::fs::read_to_string(&record).expect("the diff tool ran");
+    let lines: Vec<(&str, &str)> = recorded
+        .lines()
+        .map(|line| line.split_once(' ').unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3, "{recorded}");
+    assert_eq!(lines[0].0, "600", "{recorded}");
+    assert_eq!(lines[1].0, "600", "{recorded}");
+    assert_eq!(lines[2].0, "700", "{recorded}");
+    let directory = Path::new(lines[2].1);
+    assert!(directory.starts_with(home.join("tmp")), "{recorded}");
+    assert!(
+        !directory.exists(),
+        "the scratch directory outlived the diff"
+    );
+    assert_eq!(std::fs::read_dir(&shared).unwrap().count(), 0);
 }

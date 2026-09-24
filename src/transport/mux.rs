@@ -33,7 +33,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Mutex, PoisonError, Weak};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
@@ -393,10 +393,7 @@ impl AgentConnection {
                     // report for a channel owed nothing is the benign race
                     // of a report crossing its answer.
                     Ok(MuxResponse::Progress { channel, counter }) => {
-                        let mut state = router
-                            .state
-                            .lock()
-                            .expect("the state lock is never poisoned");
+                        let mut state = router.state.lock().unwrap_or_else(PoisonError::into_inner);
                         if let Some(slot) = state.channels.get_mut(&channel) {
                             if !slot.owed.is_empty() && slot.counter != Some(counter) {
                                 slot.heard = Instant::now();
@@ -405,10 +402,7 @@ impl AgentConnection {
                         }
                     }
                     Ok(MuxResponse::Response { channel, response }) => {
-                        let mut state = router
-                            .state
-                            .lock()
-                            .expect("the state lock is never poisoned");
+                        let mut state = router.state.lock().unwrap_or_else(PoisonError::into_inner);
                         match state.channels.get_mut(&channel) {
                             Some(slot) if !slot.owed.is_empty() => {
                                 // A scan's progress report comes ahead of
@@ -489,7 +483,7 @@ impl AgentConnection {
                 .shared
                 .state
                 .lock()
-                .expect("the state lock is never poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(reason) = &state.dead {
                 return Err(ConnectionFailed::new(reason).into());
             }
@@ -560,7 +554,7 @@ impl AgentConnection {
             .shared
             .state
             .lock()
-            .expect("the state lock is never poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         state.dead.is_none() && !state.shutdown
     }
 }
@@ -570,7 +564,7 @@ impl Clone for AgentConnection {
         self.shared
             .state
             .lock()
-            .expect("the state lock is never poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .handles += 1;
         AgentConnection {
             shared: self.shared.clone(),
@@ -605,7 +599,7 @@ impl AgentChannel {
                 .shared
                 .state
                 .lock()
-                .expect("the state lock is never poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
             if let Some(reason) = &state.dead {
                 return Err(ConnectionFailed::new(reason).into());
             }
@@ -676,10 +670,7 @@ impl Drop for AgentChannel {
 impl Shared {
     /// Sends one frame through the shared writer.
     fn send(&self, frame: &MuxRequest) -> Result<()> {
-        let mut writer = self
-            .writer
-            .lock()
-            .expect("the writer lock is never poisoned");
+        let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         self.wire.writing.store(true, Ordering::Relaxed);
         let sent = super::send_frame(&mut *writer, frame);
         self.wire.writing.store(false, Ordering::Relaxed);
@@ -691,7 +682,7 @@ impl Shared {
     /// `None` too while a frame is crossing the stream: nothing else can be
     /// heard meanwhile, so every owed channel's silence starts over.
     fn silence(&self) -> Option<String> {
-        let mut state = self.state.lock().expect("the state lock is never poisoned");
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         let now = Instant::now();
         if self.wire.busy_within(self.silence_limit) {
             for slot in state.channels.values_mut() {
@@ -719,7 +710,7 @@ impl Shared {
 
     /// Whether the connection is finished with, dead or shut down.
     fn finished(&self) -> bool {
-        let state = self.state.lock().expect("the state lock is never poisoned");
+        let state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
         state.dead.is_some() || state.shutdown
     }
 
@@ -727,7 +718,7 @@ impl Shared {
     fn death_reason(&self) -> String {
         self.state
             .lock()
-            .expect("the state lock is never poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .dead
             .clone()
             .unwrap_or_else(|| "the connection closed".to_owned())
@@ -737,7 +728,7 @@ impl Shared {
     /// reaps the agent process.
     fn fail(&self, reason: String) {
         let already_down = {
-            let mut state = self.state.lock().expect("the state lock is never poisoned");
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             let already_down = state.dead.is_some();
             state.dead.get_or_insert(reason);
             // Dropping the senders is what unblocks the receivers.
@@ -756,7 +747,7 @@ impl Shared {
     /// keeps it alive any longer.
     fn release_channel(&self, channel: u32) -> Result<()> {
         let shut_down = {
-            let mut state = self.state.lock().expect("the state lock is never poisoned");
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.channels.remove(&channel);
             state.open = state.open.saturating_sub(1);
             Self::begin_shutdown(&mut state)
@@ -772,7 +763,7 @@ impl Shared {
     /// nothing keeps it alive any longer.
     fn release_handle(&self) -> Result<()> {
         let shut_down = {
-            let mut state = self.state.lock().expect("the state lock is never poisoned");
+            let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
             state.handles = state.handles.saturating_sub(1);
             Self::begin_shutdown(&mut state)
         };
@@ -803,10 +794,7 @@ impl Shared {
             // Dropping the real writer closes the agent's stdin; the agent
             // exits on end-of-stream regardless of the shutdown frame's
             // fate.
-            let mut writer = self
-                .writer
-                .lock()
-                .expect("the writer lock is never poisoned");
+            let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
             *writer = Box::new(std::io::sink());
         }
         let reaped = self.reap(true);
@@ -820,7 +808,7 @@ impl Shared {
         let Some(mut child) = self
             .child
             .lock()
-            .expect("the child lock is never poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take()
         else {
             return Ok(());
@@ -889,7 +877,7 @@ impl AgentPool {
     pub fn retain(&self, keep: impl Fn(&[String]) -> bool) {
         self.slots
             .lock()
-            .expect("the pool lock is never poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .retain(|key, _| keep(key));
     }
 
@@ -1010,7 +998,7 @@ impl AgentPool {
         establish: impl FnOnce() -> Result<AgentConnection>,
     ) -> Result<AgentChannel> {
         let slot = {
-            let mut slots = self.slots.lock().expect("the pool lock is never poisoned");
+            let mut slots = self.slots.lock().unwrap_or_else(PoisonError::into_inner);
             slots.entry(key.to_vec()).or_default().clone()
         };
         let wait = self.wait_timeout.unwrap_or(POOL_WAIT_TIMEOUT);

@@ -12,7 +12,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
-use crate::tree::{Change, Digest, Snapshot};
+use crate::tree::{Change, Digest};
 
 /// The protocol magic, checked during the handshake.
 pub const MAGIC: u32 = 0x4142_4E31; // "ABN1"
@@ -215,8 +215,6 @@ pub struct ScanDelta {
 pub enum Response {
     /// The result of initialization.
     Initialized,
-    /// A scan result.
-    Scan(Snapshot),
     /// The staging needs resulting from StageBegin.
     StageBegin(Vec<StagingNeed>),
     /// Acknowledgement of SupplyOpen.

@@ -500,7 +500,9 @@ fn serve_agent_with<R: Read, W: Write + Send>(
     // Exchange handshakes. Ours goes out first so that a version mismatch is
     // diagnosable from either side.
     {
-        let mut output = output.lock().expect("the output lock is never poisoned");
+        let mut output = output
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         send_frame(&mut *output, &local_handshake()).context("unable to send handshake")?;
     }
     let peer: Handshake = receive_frame(&mut input).context("unable to receive handshake")?;
@@ -647,7 +649,9 @@ fn report_progress<W: Write>(
     while let Err(std::sync::mpsc::RecvTimeoutError::Timeout) = stop.recv_timeout(PROGRESS_INTERVAL)
     {
         for (channel, counter) in moved_counters(counters, &mut reported) {
-            let mut output = output.lock().expect("the output lock is never poisoned");
+            let mut output = output
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let frame = protocol::MuxResponse::Progress { channel, counter };
             if send_frame(&mut *output, &frame).is_err() {
                 return;
@@ -1105,7 +1109,9 @@ fn serve_send<W: Write>(
     channel: u32,
     response: Response,
 ) -> Result<()> {
-    let mut output = output.lock().expect("the output lock is never poisoned");
+    let mut output = output
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     send_frame(
         &mut *output,
         &protocol::MuxResponse::Response { channel, response },

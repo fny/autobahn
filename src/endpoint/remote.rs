@@ -142,15 +142,6 @@ impl RemoteEndpoint {
             };
         }
         match response {
-            // Every scan now answers as a delta or "unchanged"; this arm
-            // goes at the next epoch bump. Until then what arrives whole is
-            // held to the same hierarchy check as what is reassembled.
-            Response::Scan(snapshot) => {
-                check_hierarchy(&snapshot)?;
-                self.seen = None;
-                self.last_snapshot = Some(snapshot.clone());
-                Ok(snapshot)
-            }
             Response::ScanDelta(header) => {
                 self.seen = Some(header.generation);
                 self.receive_snapshot(header, what)
@@ -891,7 +882,6 @@ fn unexpected_response(response: &Response, expected: &str) -> anyhow::Error {
 fn response_kind(response: &Response) -> &'static str {
     match response {
         Response::Initialized => "initialized",
-        Response::Scan(_) => "scan",
         Response::ScanUnchanged { .. } => "scan (unchanged)",
         Response::StageBegin(_) => "stage begin",
         Response::SupplyOpened => "supply opened",
@@ -1071,16 +1061,19 @@ mod tests {
         let (client, agent) = connected_pair();
         let agent = scripted_agent(
             agent,
-            vec![
-                Response::Scan(Snapshot {
+            [
+                whole(&Snapshot {
                     files: 3,
                     directories: 1,
                     ..Snapshot::default()
                 }),
-                Response::Error("permission denied".into()),
-                // An answer that doesn't correspond to the request.
-                Response::StagePushed,
-            ],
+                vec![
+                    Response::Error("permission denied".into()),
+                    // An answer that doesn't correspond to the request.
+                    Response::StagePushed,
+                ],
+            ]
+            .concat(),
         );
 
         let mut endpoint = RemoteEndpoint::connect(client, initialize("/home/user/project"))
@@ -1132,11 +1125,14 @@ mod tests {
         };
         let agent = scripted_agent(
             agent,
-            vec![
-                Response::Scan(snapshot.clone()),
-                Response::ScanUnchanged { generation: 1 },
-                Response::ScanUnchanged { generation: 1 },
-            ],
+            [
+                whole(&snapshot),
+                vec![
+                    Response::ScanUnchanged { generation: 1 },
+                    Response::ScanUnchanged { generation: 1 },
+                ],
+            ]
+            .concat(),
         );
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
@@ -1167,7 +1163,7 @@ mod tests {
     }
 
     #[test]
-    fn a_scan_answered_whole_with_an_invalid_hierarchy_is_refused() {
+    fn a_scan_with_an_invalid_hierarchy_is_refused() {
         let link = |name: &str| Node {
             name: name.into(),
             content: crate::tree::Content::Symlink {
@@ -1187,10 +1183,11 @@ mod tests {
         let (client, agent) = connected_pair();
         let agent = scripted_agent(
             agent,
-            vec![
-                Response::Scan(unsorted),
-                Response::ScanUnchanged { generation: 1 },
-            ],
+            [
+                whole(&unsorted),
+                vec![Response::ScanUnchanged { generation: 1 }],
+            ]
+            .concat(),
         );
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
@@ -1213,6 +1210,11 @@ mod tests {
         };
         let encoded = transport::encode_snapshot(&snapshot).expect("encodes");
         (snapshot, encoded)
+    }
+
+    /// A snapshot as an agent sends it with no baseline: a full delta.
+    fn whole(snapshot: &Snapshot) -> Vec<Response> {
+        full_delta(&transport::encode_snapshot(snapshot).expect("encodes"))
     }
 
     /// A full (baseline-free) scan delta carrying the encoding whole.
@@ -1264,16 +1266,14 @@ mod tests {
             // next request is the fallback's full scan, answered in full.
             // Had the header been accepted, the endpoint's pull would have
             // been answered by the full stream's header, a protocol error.
-            let mut script = vec![
-                Response::Scan(snapshot.clone()),
-                Response::ScanDelta(ScanDelta {
-                    baseline: Some(*blake3::hash(&encoded).as_bytes()),
-                    digest: *blake3::hash(&encoded).as_bytes(),
-                    length: encoded.len() as u64,
-                    block_size,
-                    generation: 1,
-                }),
-            ];
+            let mut script = whole(&snapshot);
+            script.extend([Response::ScanDelta(ScanDelta {
+                baseline: Some(*blake3::hash(&encoded).as_bytes()),
+                digest: *blake3::hash(&encoded).as_bytes(),
+                length: encoded.len() as u64,
+                block_size,
+                generation: 1,
+            })]);
             script.extend(full_delta(&encoded));
             let agent = scripted_agent(agent, script);
             let mut endpoint =
@@ -1424,11 +1424,11 @@ mod tests {
         };
         let agent = scripted_agent(
             agent,
-            vec![
-                Response::StagePushed,
-                Response::StagePushed,
-                Response::Scan(snapshot),
-            ],
+            [
+                vec![Response::StagePushed, Response::StagePushed],
+                whole(&snapshot),
+            ]
+            .concat(),
         );
         let mut endpoint =
             RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");

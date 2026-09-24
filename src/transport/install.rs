@@ -719,6 +719,22 @@ fn ssh_command(destination: &str, script: &str) -> Command {
 mod tests {
     use super::*;
 
+    /// The remote command places the version, unquoted, inside a quoted
+    /// `sh -c` script and in a path under `$HOME`. That is safe only while
+    /// the version holds nothing a shell or a path treats specially, so a
+    /// change that would break it fails here rather than on a remote host.
+    #[test]
+    fn the_version_is_safe_unquoted_in_the_remote_command() {
+        let version = protocol::version();
+        assert!(!version.is_empty());
+        assert!(
+            version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')),
+            "{version:?}"
+        );
+    }
+
     /// What ssh would hand the login shell: the words after the
     /// destination, joined by spaces.
     fn remote_command_line(command: &Command) -> String {

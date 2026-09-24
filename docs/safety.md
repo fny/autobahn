@@ -65,11 +65,15 @@ The controller and the remote agent must report exactly the same version, includ
 
 ### The network is not trusted (I9)
 
-Lengths, flags and compressed sizes arriving over the connection are checked before anything is allocated. Oversized frames and decompression bombs are refused, and unknown flags are errors. Large messages travel as a sequence of 16 MiB frames and may reassemble to at most 4 GiB.
+Lengths, flags and compressed sizes arriving over the connection are checked before anything is allocated. Each frame's length is checked against the 64 MiB frame cap before its buffer exists; decompression bombs are refused, and unknown flags are errors. Large messages travel as a sequence of 16 MiB frames and may reassemble to at most 4 GiB, a cap checked as each frame arrives, so memory follows the bytes actually received rather than a size the peer declared. A remote scan's delta is held to the same rule: its declared length is capped at 4 GiB and never trusted to size a buffer, its block size must be one autobahn itself would choose, and each operation is refused before it is applied if it would outgrow the declared length.
 
 ### Saved state is whole or absent (I10)
 
 The ancestor journal and its checkpoints, the scan cache, and the status files are all written to a temporary and renamed into place, with syncs where a power loss would matter. A torn final journal record is discarded on replay. `durability = "power"` syncs every journal append, trading a little latency for power-loss durability of the journal's tail.
+
+### A peer stays inside the root, genuine or not (I11)
+
+Nothing the other end sends — whether it runs a genuine autobahn or anything else that speaks the protocol — can make this side read, write or delete outside the synchronization root or the session's own state. A peer can ask for only content this side's own scan recorded, by the digest it recorded; every path it names is checked component by component, with no `..`, no absolute path, no name autobahn reserves for itself, and no symbolic link on the way; and the session identifier that names the staging directory must be one autobahn generates. This is the one guarantee that does not assume genuine binaries on both ends. It is a pathname check, so a local process racing writes into the tree is RETAINED §2's boundary, and peering is outside it: a peer that can lead is trusted like a shell (see [Peering](./peering.md)).
 
 ## Before anything runs
 
@@ -103,7 +107,7 @@ Staging is also swept at the end of every cycle, of anything no request named �
 
 These are deliberate boundaries, each with its reasoning in [`correctness/RETAINED.md`](./correctness/RETAINED.md):
 
-- **Both endpoints must run genuine autobahn binaries.** A hostile agent that speaks the protocol correctly could fabricate results. Defending against the machine you synchronize with is a different product.
+- **Integrity and availability assume both endpoints run genuine autobahn binaries.** A hostile agent that speaks the protocol correctly could fabricate results — and so steer reconciliation into overwriting or deleting content inside the root — or exhaust the controller's memory. Defending the tree's contents against the machine you synchronize with is a different product. What such a peer cannot do is reach outside the root (I11).
 - **Exclusion is per machine, per user, per state root.** The same pair of trees driven from two machines is not detected (§4).
 - **Network filesystems** may never deliver change events and may cache attributes (§3). If a root must live on one, treat this client as its only writer.
 - **A same-length rewrite that restores the modification time** evades change detection. Unchanged-file detection compares modification time, size, inode and file type; the change time (ctime) is not consulted, so restoring the modification time is enough. `autobahn verify` re-reads every byte (§5).

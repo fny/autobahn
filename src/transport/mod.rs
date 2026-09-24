@@ -1095,7 +1095,7 @@ const FRAME_MORE: u8 = 2;
 const FRAME_CHUNK_SIZE: usize = 16 * 1024 * 1024;
 
 /// The largest message a sequence of frames may reassemble to.
-const MAXIMUM_MESSAGE_SIZE: usize = 4 * 1024 * 1024 * 1024;
+pub(crate) const MAXIMUM_MESSAGE_SIZE: usize = 4 * 1024 * 1024 * 1024;
 
 /// The encoded size below which compression isn't attempted: tiny frames
 /// (bare requests, acknowledgements) can't compress meaningfully and would

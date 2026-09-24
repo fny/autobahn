@@ -201,6 +201,8 @@ impl RemoteEndpoint {
     fn reassemble(&mut self, header: &ScanDelta) -> Result<Snapshot> {
         use std::io::Cursor;
 
+        check_delta_header(header)?;
+
         // The base is the encoding of the snapshot this endpoint last
         // received — re-encoded now, so nothing is held between scans. Its
         // digest must be the one the agent computed the delta against.
@@ -225,7 +227,7 @@ impl RemoteEndpoint {
             None => (Vec::new(), crate::rsync::Signature::default()),
         };
 
-        let mut output = Vec::with_capacity(header.length as usize);
+        let mut output = Vec::with_capacity(header.length.min(REASSEMBLY_PREALLOCATION) as usize);
         let mut base = Cursor::new(base);
         loop {
             let ops = match self.exchange(Request::ScanPull)? {
@@ -235,13 +237,7 @@ impl RemoteEndpoint {
             if ops.is_empty() {
                 break;
             }
-            for op in &ops {
-                crate::rsync::patch(&mut base, &signature, op, &mut output)
-                    .context("unable to apply a snapshot delta operation")?;
-            }
-            if output.len() as u64 > header.length {
-                bail!("the snapshot delta reassembled to more than its declared length");
-            }
+            apply_delta_ops(&mut base, &signature, &ops, &mut output, header.length)?;
         }
         if *blake3::hash(&output).as_bytes() != header.digest {
             bail!("the reassembled snapshot does not match the agent's digest");
@@ -914,6 +910,71 @@ fn response_kind(response: &Response) -> &'static str {
     }
 }
 
+/// The most a reassembly buffer is sized for up front. The declared length
+/// is the agent's word, so beyond this the buffer grows as data arrives.
+const REASSEMBLY_PREALLOCATION: u64 = 8 * 1024 * 1024;
+
+/// Refuses a scan delta header whose values could not have come from a
+/// genuine agent, before any of them sizes an allocation or a signature.
+fn check_delta_header(header: &ScanDelta) -> Result<()> {
+    let maximum = transport::MAXIMUM_MESSAGE_SIZE as u64;
+    if header.length > maximum {
+        bail!(
+            "the snapshot delta's declared length ({}) exceeds the largest message ({maximum})",
+            header.length
+        );
+    }
+    let range = crate::rsync::MINIMUM_BLOCK_SIZE..=crate::rsync::MAXIMUM_BLOCK_SIZE;
+    if header.baseline.is_some() && !range.contains(&header.block_size) {
+        bail!(
+            "the snapshot delta's block size ({}) is outside {}..={}",
+            header.block_size,
+            range.start(),
+            range.end()
+        );
+    }
+    Ok(())
+}
+
+/// Applies one batch of snapshot delta operations, refusing each one that
+/// would take the output past the declared length before it is applied —
+/// a single `Blocks` operation can otherwise expand enormously.
+fn apply_delta_ops(
+    base: &mut std::io::Cursor<Vec<u8>>,
+    signature: &crate::rsync::Signature,
+    ops: &[crate::rsync::Op],
+    output: &mut Vec<u8>,
+    length: u64,
+) -> Result<()> {
+    for op in ops {
+        let adds = match op {
+            crate::rsync::Op::Data(data) => data.len() as u64,
+            crate::rsync::Op::Blocks { start, count } => {
+                // An out-of-range run adds nothing here; `patch` refuses it.
+                let blocks = signature.hashes.len() as u64;
+                match start.checked_add(*count) {
+                    Some(end) if *count > 0 && end <= blocks => {
+                        let block_size = u64::from(signature.block_size);
+                        let short = if end == blocks {
+                            block_size - u64::from(signature.last_block_size)
+                        } else {
+                            0
+                        };
+                        count.saturating_mul(block_size) - short
+                    }
+                    _ => 0,
+                }
+            }
+        };
+        if (output.len() as u64).saturating_add(adds) > length {
+            bail!("the snapshot delta reassembles to more than its declared length ({length})");
+        }
+        crate::rsync::patch(base, signature, op, output)
+            .context("unable to apply a snapshot delta operation")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1090,6 +1151,147 @@ mod tests {
         assert!(error.contains("unchanged scan before"), "{error}");
         drop(endpoint);
         let _ = agent.join();
+    }
+
+    /// A snapshot small enough to script, with a file so its encoding
+    /// spans more than one block.
+    fn delta_fixture() -> (Snapshot, Vec<u8>) {
+        let snapshot = Snapshot {
+            files: 9,
+            directories: 2,
+            ..Snapshot::default()
+        };
+        let encoded = transport::encode_snapshot(&snapshot).expect("encodes");
+        (snapshot, encoded)
+    }
+
+    /// A full (baseline-free) scan delta carrying the encoding whole.
+    fn full_delta(encoded: &[u8]) -> Vec<Response> {
+        vec![
+            Response::ScanDelta(ScanDelta {
+                baseline: None,
+                digest: *blake3::hash(encoded).as_bytes(),
+                length: encoded.len() as u64,
+                block_size: 0,
+                generation: 1,
+            }),
+            Response::ScanOps(vec![crate::rsync::Op::Data(encoded.to_vec())]),
+            Response::ScanOps(Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn a_scan_delta_declaring_an_impossible_length_is_refused() {
+        let (client, agent) = connected_pair();
+        let agent = scripted_agent(
+            agent,
+            vec![Response::ScanDelta(ScanDelta {
+                baseline: None,
+                digest: [0; 32],
+                length: u64::MAX,
+                block_size: 0,
+                generation: 1,
+            })],
+        );
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        // Refused from the header alone, before any allocation sized by it
+        // (which would abort the process) and before any operation is pulled.
+        let error = format!("{:#}", endpoint.scan().expect_err("the scan must fail"));
+        assert!(error.contains("declared length"), "{error}");
+        drop(endpoint);
+        let _ = agent.join();
+    }
+
+    #[test]
+    fn a_scan_delta_with_an_out_of_range_block_size_is_refused() {
+        let (snapshot, encoded) = delta_fixture();
+        for block_size in [0, 1, u32::MAX] {
+            let (client, agent) = connected_pair();
+            // The first scan establishes the baseline. The delta against
+            // it names a block size outside the rsync module's range; it
+            // must be refused before a single operation is pulled, so the
+            // next request is the fallback's full scan, answered in full.
+            // Had the header been accepted, the endpoint's pull would have
+            // been answered by the full stream's header, a protocol error.
+            let mut script = vec![
+                Response::Scan(snapshot.clone()),
+                Response::ScanDelta(ScanDelta {
+                    baseline: Some(*blake3::hash(&encoded).as_bytes()),
+                    digest: *blake3::hash(&encoded).as_bytes(),
+                    length: encoded.len() as u64,
+                    block_size,
+                    generation: 1,
+                }),
+            ];
+            script.extend(full_delta(&encoded));
+            let agent = scripted_agent(agent, script);
+            let mut endpoint =
+                RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+            endpoint.scan().expect("the first scan should succeed");
+            let second = endpoint
+                .scan()
+                .unwrap_or_else(|error| panic!("block size {block_size}: {error:#}"));
+            assert_eq!(second.files, 9);
+            drop(endpoint);
+            agent.join().expect("agent thread panicked").expect("agent");
+        }
+    }
+
+    #[test]
+    fn delta_operations_that_expand_past_the_declared_length_are_refused_before_applying() {
+        let base = vec![7u8; 64 * 1024];
+        let signature = crate::rsync::signature(std::io::Cursor::new(&base), 1024).unwrap();
+        let blocks = signature.hashes.len() as u64;
+        let mut cursor = std::io::Cursor::new(base.clone());
+        // One batch: the whole base, many times over, against a declared
+        // length of one copy and a little.
+        let ops = vec![
+            crate::rsync::Op::Blocks {
+                start: 0,
+                count: blocks,
+            };
+            1000
+        ];
+        let length = base.len() as u64 + 10;
+        let mut output = Vec::new();
+        let error = apply_delta_ops(&mut cursor, &signature, &ops, &mut output, length)
+            .expect_err("the batch must be refused");
+        assert!(
+            format!("{error:#}").contains("declared length"),
+            "{error:#}"
+        );
+        assert!(
+            output.len() as u64 <= length,
+            "the refused operation was applied ({} bytes)",
+            output.len()
+        );
+
+        // Data counts too, and an exact fit is accepted.
+        let mut output = Vec::new();
+        let exact = vec![
+            crate::rsync::Op::Blocks {
+                start: 0,
+                count: blocks,
+            },
+            crate::rsync::Op::Data(vec![1; 10]),
+        ];
+        apply_delta_ops(&mut cursor, &signature, &exact, &mut output, length)
+            .expect("an exact fit is accepted");
+        assert_eq!(output.len() as u64, length);
+        let error = apply_delta_ops(
+            &mut cursor,
+            &signature,
+            &[crate::rsync::Op::Data(vec![1])],
+            &mut output,
+            length,
+        )
+        .expect_err("one byte more is refused");
+        assert!(
+            format!("{error:#}").contains("declared length"),
+            "{error:#}"
+        );
+        assert_eq!(output.len() as u64, length);
     }
 
     #[test]

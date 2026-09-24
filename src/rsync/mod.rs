@@ -76,6 +76,15 @@ impl Signature {
             return Ok(());
         }
 
+        // The block size is one this module would choose: a peer's tiny
+        // block size means a hash per byte, a huge one a huge buffer.
+        if !(MINIMUM_BLOCK_SIZE..=MAXIMUM_BLOCK_SIZE).contains(&self.block_size) {
+            bail!(
+                "block size {} is outside {MINIMUM_BLOCK_SIZE}..={MAXIMUM_BLOCK_SIZE}",
+                self.block_size
+            );
+        }
+
         // A non-empty base has at least one block, the last of which is
         // non-empty and no larger than the nominal block size.
         if self.last_block_size == 0 || self.last_block_size > self.block_size {
@@ -87,6 +96,25 @@ impl Signature {
         }
         if self.hashes.is_empty() {
             bail!("non-empty signature carries no block hashes");
+        }
+        Ok(())
+    }
+
+    /// Validates the signature as one of a base of a known length: its
+    /// structure, and no more block hashes than such a base has blocks.
+    /// A signature carries its own block count, so only a caller that knows
+    /// the base's length can bound it.
+    pub fn validate_for_base(&self, base_length: u64) -> Result<()> {
+        self.validate()?;
+        if self.is_empty() {
+            return Ok(());
+        }
+        let blocks = base_length / u64::from(self.block_size) + 1;
+        if self.hashes.len() as u64 > blocks {
+            bail!(
+                "signature carries {} block hashes for a base of {base_length} bytes",
+                self.hashes.len()
+            );
         }
         Ok(())
     }
@@ -671,10 +699,47 @@ mod tests {
         assert!(Signature {
             block_size: 1024,
             last_block_size: 1024,
-            hashes: vec![hash],
+            hashes: vec![hash.clone()],
         }
         .validate()
         .is_ok());
+    }
+
+    #[test]
+    fn validation_bounds_the_block_size_and_the_hash_count() {
+        let hash = BlockHash {
+            weak: 0,
+            strong: [0u8; DIGEST_SIZE],
+        };
+        // A block size outside the module's own range is refused, however
+        // well-formed the rest.
+        for block_size in [1, MINIMUM_BLOCK_SIZE - 1, MAXIMUM_BLOCK_SIZE + 1, u32::MAX] {
+            let signature = Signature {
+                block_size,
+                last_block_size: 1,
+                hashes: vec![hash.clone()],
+            };
+            assert!(signature.validate().is_err(), "block size {block_size}");
+        }
+        for block_size in [MINIMUM_BLOCK_SIZE, MAXIMUM_BLOCK_SIZE] {
+            let signature = Signature {
+                block_size,
+                last_block_size: 1,
+                hashes: vec![hash.clone()],
+            };
+            assert!(signature.validate().is_ok(), "block size {block_size}");
+        }
+
+        // Against a known base length, no more hashes than it has blocks.
+        let base = vec![3u8; 4096 + 7];
+        let genuine = super::signature(Cursor::new(&base), 1024).unwrap();
+        genuine.validate_for_base(base.len() as u64).unwrap();
+        let mut padded = genuine.clone();
+        padded.hashes.extend(vec![hash.clone(); 1000]);
+        assert!(padded.validate().is_ok(), "structurally it is fine");
+        assert!(padded.validate_for_base(base.len() as u64).is_err());
+        assert!(Signature::default().validate_for_base(0).is_ok());
+        assert!(genuine.validate_for_base(0).is_err());
     }
 
     #[test]

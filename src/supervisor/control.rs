@@ -401,12 +401,13 @@ impl Registry {
 /// Connecting is the only honest test. The socket *file* outlives the
 /// process that made it — a supervisor killed with SIGKILL leaves one
 /// behind — so its presence proves nothing, while a refused connection
-/// proves nobody is listening.
+/// proves nobody is listening. One served by another user is not this
+/// user's supervisor, whatever it answers.
 pub fn supervisor_is_running(state_root: &Path) -> bool {
     // A connection that cannot even be queued within the timeout is a
     // supervisor too wedged to accept, not an absent one.
     match connect_client(&socket_path(state_root), CLIENT_TIMEOUT) {
-        Ok(_) => true,
+        Ok(stream) => matches!(peer_is_same_user(&stream), Ok(true)),
         Err(error) => error.kind() == std::io::ErrorKind::TimedOut,
     }
 }
@@ -533,8 +534,34 @@ fn timed_out(error: &anyhow::Error) -> bool {
 /// deeply nested state root can't hold its own socket. In that case the
 /// socket falls back to a short per-user directory, named by the *resolved*
 /// state root's digest — both the supervisor and the CLI derive the same
-/// path from the same state root, wherever it lives.
+/// path from the same state root, wherever it lives. The directory is
+/// `$XDG_RUNTIME_DIR/autobahn` on Linux when the system provides one (it
+/// is already the user's own, and `0700`), and `autobahn-<uid>` in the
+/// temporary directory otherwise, which [`bind`] makes private or refuses.
 pub fn socket_path(state_root: &Path) -> PathBuf {
+    socket_path_with(
+        state_root,
+        runtime_directory().as_deref(),
+        &std::env::temp_dir(),
+    )
+}
+
+/// `$XDG_RUNTIME_DIR`, on Linux, when it is set to an absolute path.
+fn runtime_directory() -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::env::var_os("XDG_RUNTIME_DIR")
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// [`socket_path`], given the runtime and temporary directories.
+fn socket_path_with(state_root: &Path, runtime: Option<&Path>, temporary: &Path) -> PathBuf {
     const MAXIMUM_SOCKET_PATH: usize = 100;
     let direct = state_root.join("control.sock");
     if direct.as_os_str().len() <= MAXIMUM_SOCKET_PATH {
@@ -547,49 +574,80 @@ pub fn socket_path(state_root: &Path) -> PathBuf {
         use std::fmt::Write;
         let _ = write!(name, "{byte:02x}");
     }
+    let name = format!("{name}.sock");
+    if let Some(runtime) = runtime {
+        let fallback = runtime.join("autobahn").join(&name);
+        if fallback.as_os_str().len() <= MAXIMUM_SOCKET_PATH {
+            return fallback;
+        }
+    }
     let directory = format!("autobahn-{}", unsafe { libc::getuid() });
-    let fallback = std::env::temp_dir()
-        .join(&directory)
-        .join(format!("{name}.sock"));
+    let fallback = temporary.join(&directory).join(&name);
     if fallback.as_os_str().len() <= MAXIMUM_SOCKET_PATH {
         return fallback;
     }
     // An over-length TMPDIR would defeat the fallback too; /tmp is short by
     // construction.
-    PathBuf::from("/tmp")
-        .join(directory)
-        .join(format!("{name}.sock"))
+    PathBuf::from("/tmp").join(directory).join(name)
 }
 
 /// Binds the control socket, replacing any stale socket file left by a
 /// previous supervisor (the state lock already guarantees no *live* one
 /// shares this state root's sessions).
 pub(crate) fn bind(state_root: &Path) -> Result<UnixListener> {
-    std::fs::create_dir_all(state_root)
-        .with_context(|| format!("unable to create the state root {}", state_root.display()))?;
-    let path = socket_path(state_root);
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("unable to create {}", parent.display()))?;
-        // The fallback directory lives in the shared temporary directory;
-        // keep it private to the user (best-effort — it may already exist
-        // with these permissions).
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+    bind_at(state_root, &socket_path(state_root))
+}
+
+/// [`bind`], at a given socket path.
+///
+/// The state root, and a fallback directory the socket is in instead, are
+/// made private with [`crate::fsutil::private_dir`] before anything is
+/// bound or removed there: a fallback directory in the shared temporary
+/// directory that another user made first — who could then replace the
+/// socket and answer for this user's supervisor — is refused with an error
+/// naming it, and a loose one of this user's is tightened.
+fn bind_at(state_root: &Path, path: &Path) -> Result<UnixListener> {
+    if let Some(parent) = state_root.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("unable to create {}", parent.display()))?;
+        }
     }
-    let _ = std::fs::remove_file(&path);
-    let listener = UnixListener::bind(&path)
+    crate::fsutil::private_dir(state_root)
+        .with_context(|| format!("unable to prepare the state root {}", state_root.display()))?;
+    if let Some(parent) = path.parent() {
+        if parent != state_root {
+            crate::fsutil::private_dir(parent).with_context(|| {
+                format!("unable to use {} for the control socket", parent.display())
+            })?;
+        }
+    }
+    let _ = std::fs::remove_file(path);
+    let listener = UnixListener::bind(path)
         .with_context(|| format!("unable to bind control socket {}", path.display()))?;
     // Restrict the socket itself as a second layer under the peer
     // credential check performed per connection.
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
     }
     listener
         .set_nonblocking(true)
         .context("unable to configure the control socket")?;
     Ok(listener)
+}
+
+/// Refuses a control socket served by another user: whoever serves it
+/// answers `status`, `flush` and the rest, so a socket someone else put
+/// there must not be spoken to.
+fn refuse_another_user(path: &Path, stream: &UnixStream) -> Result<()> {
+    if !peer_is_same_user(stream)? {
+        anyhow::bail!(
+            "the control socket {} is served by another user; refusing to send it a request",
+            path.display()
+        );
+    }
+    Ok(())
 }
 
 /// Serves control requests until `stop` becomes true.
@@ -714,6 +772,7 @@ fn send_within(
             )));
         }
     };
+    refuse_another_user(&path, &stream)?;
     let mut reader = stream
         .try_clone()
         .context("unable to clone the control connection")?;
@@ -753,6 +812,10 @@ fn probe_within(state_root: &Path, timeout: Duration) -> Probe {
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Probe::Unresponsive,
         Err(_) => return Probe::Absent,
     };
+    // One served by another user is not this user's supervisor.
+    if !matches!(peer_is_same_user(&stream), Ok(true)) {
+        return Probe::Absent;
+    }
     let Ok(mut reader) = stream.try_clone() else {
         return Probe::Absent;
     };
@@ -850,6 +913,141 @@ mod tests {
         assert!(fallback.as_os_str().len() <= 108, "{fallback:?}");
         assert_eq!(fallback, socket_path(&deep));
         assert_ne!(fallback, socket_path(Path::new("/other/equally/deep/root")));
+    }
+
+    fn mode(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::symlink_metadata(path)
+            .expect("the path should exist")
+            .permissions()
+            .mode()
+            & 0o7777
+    }
+
+    fn is_root() -> bool {
+        // SAFETY: `geteuid` has no preconditions.
+        unsafe { libc::geteuid() == 0 }
+    }
+
+    /// A state root too deep to hold its own socket, under `base`.
+    fn deep_state_root(base: &Path) -> PathBuf {
+        base.join("long-component/".repeat(8)).join("state")
+    }
+
+    #[test]
+    fn with_a_runtime_directory_the_socket_is_placed_there() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let runtime = keep.path().join("run");
+        std::fs::create_dir(&runtime).unwrap();
+        let temporary = keep.path().join("tmp");
+        std::fs::create_dir(&temporary).unwrap();
+        let state_root = deep_state_root(keep.path());
+        let path = socket_path_with(&state_root, Some(&runtime), &temporary);
+        assert_eq!(path.parent().unwrap(), runtime.join("autobahn"));
+        assert_eq!(
+            path,
+            socket_path_with(&state_root, Some(&runtime), &temporary)
+        );
+        // Without one, the temporary directory's per-user one.
+        let without = socket_path_with(&state_root, None, &temporary);
+        assert!(without.starts_with(&temporary), "{without:?}");
+
+        let _listener = bind_at(&state_root, &path).expect("binds");
+        assert_eq!(mode(&runtime.join("autobahn")), 0o700);
+        assert_eq!(mode(&state_root), 0o700);
+        // This user's own supervisor is spoken to.
+        let stream = connect_client(&path, CLIENT_TIMEOUT).expect("connects");
+        refuse_another_user(&path, &stream).expect("the same user's socket is accepted");
+    }
+
+    #[test]
+    fn a_loose_fallback_directory_is_tightened() {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state_root = deep_state_root(keep.path());
+        let path = socket_path_with(&state_root, None, keep.path());
+        let directory = path.parent().unwrap();
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let _listener = bind_at(&state_root, &path).expect("binds");
+        assert_eq!(mode(directory), 0o700);
+    }
+
+    #[test]
+    fn a_fallback_directory_that_is_a_link_is_refused() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state_root = deep_state_root(keep.path());
+        let path = socket_path_with(&state_root, None, keep.path());
+        let elsewhere = keep.path().join("elsewhere");
+        std::fs::create_dir(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, path.parent().unwrap()).unwrap();
+        let error = format!("{:#}", bind_at(&state_root, &path).unwrap_err());
+        assert!(error.contains("symbolic link"), "{error}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_fallback_directory_owned_by_another_user_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        if !is_root() {
+            eprintln!("skipped: giving a directory to another uid needs root");
+            return;
+        }
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state_root = deep_state_root(keep.path());
+        let path = socket_path_with(&state_root, None, keep.path());
+        let directory = path.parent().unwrap();
+        std::fs::create_dir(directory).unwrap();
+        std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o777)).unwrap();
+        std::os::unix::fs::chown(directory, Some(65534), Some(65534)).unwrap();
+        let error = format!("{:#}", bind_at(&state_root, &path).unwrap_err());
+        assert!(error.contains(&directory.display().to_string()), "{error}");
+        assert!(error.contains("owned by uid 65534"), "{error}");
+        assert!(!path.exists());
+        assert_eq!(mode(directory), 0o777);
+    }
+
+    #[test]
+    fn a_client_refuses_a_server_run_by_another_user() {
+        use std::io::BufRead;
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        if !is_root() {
+            eprintln!("skipped: serving as another uid needs root");
+            return;
+        }
+        let keep = tempfile::tempdir().expect("temporary directory");
+        std::fs::set_permissions(keep.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let path = keep.path().join("control.sock");
+        let mut server = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(
+                "import socket, sys\n\
+                 s = socket.socket(socket.AF_UNIX)\n\
+                 s.bind(sys.argv[1])\n\
+                 s.listen(1)\n\
+                 print('ready', flush=True)\n\
+                 c, _ = s.accept()\n\
+                 c.recv(1)\n",
+            )
+            .arg(&path)
+            .uid(65534)
+            .gid(65534)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("python3 should run");
+        let mut ready = String::new();
+        std::io::BufReader::new(server.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        assert_eq!(ready.trim(), "ready");
+        let error = format!(
+            "{:#}",
+            send(keep.path(), &ControlRequest::Flush(Selector::default())).unwrap_err()
+        );
+        assert!(error.contains("another user"), "{error}");
+        let _ = server.kill();
+        let _ = server.wait();
     }
 
     #[test]

@@ -184,8 +184,12 @@ const MAXIMUM_PENDING_PATHS: usize = 8192;
 /// The changed paths accumulated by a watcher since the last scan.
 #[derive(Default)]
 struct PendingChanges {
-    /// The absolute paths reported as changed.
+    /// The absolute paths reported as changed, each once.
     paths: Vec<PathBuf>,
+    /// The members of `paths`, so a path reported again — a file written
+    /// in many small appends — takes one place against the cap, not one
+    /// per event.
+    seen: std::collections::HashSet<PathBuf>,
     /// Whether the record is incomplete — too many paths, an event the
     /// backend flagged for rescan, or a watcher error. The next scan must
     /// then read everything.
@@ -199,7 +203,73 @@ impl PendingChanges {
         self.incomplete = true;
         self.paths.clear();
         self.paths.shrink_to_fit();
+        self.seen.clear();
+        self.seen.shrink_to_fit();
     }
+
+    /// Adds a path, once; gives up when the record outgrows its cap.
+    fn add(&mut self, path: PathBuf) {
+        if self.incomplete || self.seen.contains(&path) {
+            return;
+        }
+        if self.paths.len() >= MAXIMUM_PENDING_PATHS {
+            self.give_up();
+            return;
+        }
+        self.seen.insert(path.clone());
+        self.paths.push(path);
+    }
+}
+
+/// How the scanner treats a directory at a root-relative path, given
+/// whether its parent is in an ignored region (`probe_entry` in
+/// src/scan/mod.rs): `None` where it is pruned — ignored, and nothing
+/// inside re-included — and otherwise whether it is itself in an ignored
+/// region, walked only for what a negation re-includes.
+fn directory_region(
+    ignores: &crate::scan::IgnoreSet,
+    relative: &str,
+    within_ignored: bool,
+) -> Option<bool> {
+    let ignored = match within_ignored {
+        true => !ignores.re_included(relative, true),
+        false => ignores.ignored(relative, true),
+    };
+    match ignored && !ignores.holds_a_re_inclusion(relative) {
+        true => None,
+        false => Some(ignored),
+    }
+}
+
+/// Whether a path lies strictly beneath a directory the scanner prunes, so
+/// that no scan could ever read it. The pruned directory itself is not
+/// beneath one: its appearing or going changes its parent's listing. A path
+/// that cannot be expressed is not beneath one — kept, the safe direction.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn beneath_a_pruned_directory(root: &Path, ignores: &crate::scan::IgnoreSet, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut names = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        // Patterns match the hierarchy's names, which are NFC; FSEvents
+        // reports a decomposing volume's NFD ones.
+        names.push(scan::recompose(name));
+    }
+    let mut region = false;
+    for depth in 1..names.len() {
+        match directory_region(ignores, &names[..depth].join("/"), region) {
+            Some(inner) => region = inner,
+            None => return true,
+        }
+    }
+    false
 }
 
 /// Watches `start` and every directory beneath it that the scanner would
@@ -238,16 +308,9 @@ fn watch_tree(
     // is pruned. A name that cannot be expressed cannot be matched, and is
     // watched — the safe direction.
     let enter = |relative: Option<&str>, within_ignored: bool| -> Option<bool> {
-        let Some(relative) = relative else {
-            return Some(within_ignored);
-        };
-        let ignored = match within_ignored {
-            true => !ignores.re_included(relative, true),
-            false => ignores.ignored(relative, true),
-        };
-        match ignored && !ignores.holds_a_re_inclusion(relative) {
-            true => None,
-            false => Some(ignored),
+        match relative {
+            Some(relative) => directory_region(ignores, relative, within_ignored),
+            None => Some(within_ignored),
         }
     };
     // A start below the root is in whatever region its ancestors make.
@@ -330,18 +393,18 @@ pub(crate) struct ChangeWatcher {
 }
 
 impl PendingChanges {
-    /// Records one backend event: its paths, or the fact that the record
-    /// can no longer be trusted.
-    fn record(&mut self, event: notify::Result<notify::Event>) {
+    /// Records one backend event: its paths that `keep` accepts, or the
+    /// fact that the record can no longer be trusted.
+    fn record(&mut self, event: notify::Result<notify::Event>, keep: impl Fn(&Path) -> bool) {
         match event {
             // A backend that lost events (a kernel queue overflow) flags the
             // fact rather than reporting the paths.
             Ok(event) if event.need_rescan() => self.give_up(),
             Ok(event) => {
-                if self.paths.len() + event.paths.len() > MAXIMUM_PENDING_PATHS {
-                    self.give_up();
-                } else if !self.incomplete {
-                    self.paths.extend(event.paths);
+                for path in event.paths {
+                    if keep(&path) {
+                        self.add(path);
+                    }
                 }
             }
             Err(_) => self.give_up(),
@@ -361,19 +424,27 @@ impl ChangeWatcher {
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn new(
         root: &Path,
-        _ignores: crate::scan::IgnoreSet,
+        ignores: crate::scan::IgnoreSet,
         _ignore_mounts: bool,
         notify: impl Fn() + Send + 'static,
     ) -> Result<ChangeWatcher> {
         use notify::Watcher;
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
+        let base = root.to_path_buf();
+        // FSEvents reports everything under the root, ignored or not, so a
+        // build writing into an ignored `target/` would fill the record and
+        // force a full walk each cycle. What lies beneath a directory the
+        // scanner prunes can never be read by a scan; it is left out here,
+        // as the Linux watch leaves it unwatched.
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 recorder
                     .lock()
                     .expect("the pending lock is never poisoned")
-                    .record(event);
+                    .record(event, |path| {
+                        !beneath_a_pruned_directory(&base, &ignores, path)
+                    });
                 notify();
             })
             .context("unable to create a filesystem watcher")?;
@@ -454,10 +525,12 @@ impl ChangeWatcher {
                             }
                         }
                     }
+                    // Nothing beneath an ignored directory is watched here,
+                    // so there is nothing to filter.
                     recorder
                         .lock()
                         .expect("the pending lock is never poisoned")
-                        .record(event);
+                        .record(event, |_| true);
                     notify();
                 }
             })
@@ -490,13 +563,7 @@ impl ChangeWatcher {
             .lock()
             .expect("the pending lock is never poisoned");
         for path in paths {
-            if pending.paths.len() >= MAXIMUM_PENDING_PATHS {
-                pending.give_up();
-                return;
-            }
-            if !pending.incomplete {
-                pending.paths.push(path);
-            }
+            pending.add(path);
         }
     }
 
@@ -5265,5 +5332,70 @@ mod watch_tests {
                 .any(|path| path == &root.path().join("target/out")),
             "a write beneath an ignored directory that appeared later was recorded"
         );
+    }
+}
+
+#[cfg(test)]
+mod change_record_tests {
+    use super::*;
+    use crate::scan::IgnoreSet;
+
+    fn event(paths: &[&str]) -> notify::Result<notify::Event> {
+        let mut event = notify::Event::new(notify::EventKind::Any);
+        for path in paths {
+            event = event.add_path(PathBuf::from(path));
+        }
+        Ok(event)
+    }
+
+    /// What is strictly beneath a pruned directory is left out; the pruned
+    /// directory itself, anything outside one, and what a negation reaches
+    /// are kept — as the scanner reads them.
+    #[test]
+    fn only_what_no_scan_can_read_is_left_out() {
+        let ignores = IgnoreSet::new(&[
+            "target".to_string(),
+            "node_modules".to_string(),
+            "!node_modules/keep".to_string(),
+        ])
+        .unwrap();
+        let root = Path::new("/r");
+        let beneath = |path: &str| beneath_a_pruned_directory(root, &ignores, Path::new(path));
+        assert!(beneath("/r/target/debug/out"));
+        assert!(beneath("/r/src/target/x"));
+        assert!(!beneath("/r/target"));
+        assert!(!beneath("/r/src/main.rs"));
+        assert!(!beneath("/r/node_modules/keep/a"));
+        assert!(!beneath("/r/node_modules/keep/sub/b"));
+        assert!(!beneath("/r/node_modules/other"));
+        assert!(beneath("/r/node_modules/other/x"));
+        assert!(!beneath("/elsewhere/target/x"));
+    }
+
+    /// A path reported many times takes one place, so a file written in a
+    /// burst of appends cannot fill the record; distinct paths past the cap
+    /// still give it up.
+    #[test]
+    fn a_path_reported_again_is_recorded_once() {
+        let mut pending = PendingChanges::default();
+        for _ in 0..(2 * MAXIMUM_PENDING_PATHS) {
+            pending.record(event(&["/r/a", "/r/b"]), |_| true);
+        }
+        assert!(!pending.incomplete);
+        assert_eq!(
+            pending.paths,
+            vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")]
+        );
+
+        let mut pending = PendingChanges::default();
+        for index in 0..=MAXIMUM_PENDING_PATHS {
+            pending.record(event(&[&format!("/r/{index}")]), |_| true);
+        }
+        assert!(pending.incomplete);
+        assert!(pending.paths.is_empty() && pending.seen.is_empty());
+
+        let mut pending = PendingChanges::default();
+        pending.record(event(&["/r/a", "/r/skip"]), |path| !path.ends_with("skip"));
+        assert_eq!(pending.paths, vec![PathBuf::from("/r/a")]);
     }
 }

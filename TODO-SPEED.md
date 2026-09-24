@@ -98,5 +98,5 @@ The six code reviews in `REVIEWS/` proposed these. They are estimates from readi
 
 ### Skipped unless a measurement says otherwise
 
-- [x] ~~Reconcile walks the whole tree on every changed cycle, allocating a path per node.~~ Closed 2026-09-24 without building: 16 ms at 500k files in the review's probe — small next to the snapshot exchange above. Memoizing on pointer identity would have to preserve unresolved conflicts and problems.
+- [x] ~~Reconcile walks the whole tree on every changed cycle, allocating a path per node.~~ Closed 2026-09-24 without building: 16 ms at 500k files in the review's probe — small next to the snapshot exchange above. Memoizing on pointer identity would have to preserve unresolved conflicts and problems. **Reopened and done 2026-09-24:** once the snapshot exchange was fixed, profiling put reconcile (with its compares) at about a third of the controller's time per changed cycle at 420k files, and the scan-problems walk at 9%. `reconcile_since` and `problems_since` skip storage-identical subtrees where last cycle produced nothing, with a randomized equivalence test: remote-side edits 235/198 → 114/112 ms.
 - [x] ~~`propagate_executability` rebuilds the tree every cycle on exFAT/FAT.~~ Closed 2026-09-24 without building: only roots on those volumes; revisit on a report.

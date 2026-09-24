@@ -2775,6 +2775,124 @@ impl<'a> Transitioner<'a> {
                 .any(|(index, _)| self.ignores.ignored(&path[..index], true))
     }
 
+    /// Gives a validated file new permission bits, returning its achieved
+    /// metadata.
+    ///
+    /// In place when the file has one link, through the handle this opens
+    /// (checked to be the file validated as `seen`). A file with more than
+    /// one link is published anew instead — copied beside itself, given
+    /// the mode, renamed over — because a chmod changes the inode, and the
+    /// inode's other names may lie outside the root: a local user could
+    /// hardlink a file they cannot change into the tree, and a sync would
+    /// then change that file's mode for them. Breaking the link leaves the
+    /// outside name as it was.
+    fn change_mode(
+        &mut self,
+        path: &str,
+        parent: &Path,
+        target: &Path,
+        seen: &Metadata,
+        digest: &Digest,
+        mode: u32,
+    ) -> Option<FileMetadata> {
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(target);
+        let mut file = match opened {
+            Ok(file) => file,
+            // A file this user may not read can still be theirs to chmod,
+            // as it always could; with a single link, nothing else shares
+            // the inode.
+            Err(error) if error.kind() == ErrorKind::PermissionDenied && seen.nlink() == 1 => {
+                if let Err(error) = fs::set_permissions(target, Permissions::from_mode(mode)) {
+                    self.problem(path, format!("unable to set file permissions: {error}"));
+                    return None;
+                }
+                return Some(match fs::symlink_metadata(target) {
+                    Ok(metadata) => file_metadata(&metadata),
+                    Err(error) => {
+                        self.problem(path, format!("unable to probe the modified file: {error}"));
+                        FileMetadata::default()
+                    }
+                });
+            }
+            Err(error) => {
+                self.problem(
+                    path,
+                    format!("unable to open the file to set its permissions: {error}"),
+                );
+                return None;
+            }
+        };
+        let opened = match file.metadata() {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.problem(path, format!("unable to probe content: {error}"));
+                return None;
+            }
+        };
+        if (opened.dev(), opened.ino()) != (seen.dev(), seen.ino()) {
+            self.disagreement(
+                path,
+                "refusing to set this file's permissions: it was replaced as it was checked",
+            );
+            return None;
+        }
+
+        if opened.nlink() <= 1 {
+            if let Err(error) = file.set_permissions(Permissions::from_mode(mode)) {
+                self.problem(path, format!("unable to set file permissions: {error}"));
+                return None;
+            }
+            return Some(match file.metadata() {
+                Ok(metadata) => file_metadata(&metadata),
+                Err(error) => {
+                    self.problem(path, format!("unable to probe the modified file: {error}"));
+                    FileMetadata::default()
+                }
+            });
+        }
+
+        let temporary = parent.join(temporary_name("apply"));
+        match copy_into_private(&mut file, target, &temporary, digest) {
+            Ok(true) => {}
+            Ok(false) => {
+                let _ = fs::remove_file(&temporary);
+                self.disagreement(
+                    path,
+                    "refusing to set this file's permissions: the file has been modified since \
+                     the last scan",
+                );
+                return None;
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                self.problem(
+                    path,
+                    format!("unable to copy a linked file to set its permissions: {error:#}"),
+                );
+                return None;
+            }
+        }
+        let published = fs::set_permissions(&temporary, Permissions::from_mode(mode))
+            .and_then(|()| fs::symlink_metadata(&temporary))
+            .and_then(|metadata| {
+                publish_rename(&temporary, target, true).map(|()| file_metadata(&metadata))
+            });
+        match published {
+            Ok(metadata) => {
+                self.apply_ownership(path, target);
+                Some(metadata)
+            }
+            Err(error) => {
+                let _ = fs::remove_file(&temporary);
+                self.problem(path, format!("unable to set file permissions: {error}"));
+                None
+            }
+        }
+    }
+
     /// Applies a replacement.
     fn replace_change(&mut self, path: &str, old: &Node, new: &Node) -> Option<Node> {
         if path.is_empty() {
@@ -2826,16 +2944,10 @@ impl<'a> Transitioner<'a> {
                 // Only executability differs, so the content is left entirely
                 // alone: this is a permission change, not a rewrite.
                 let mode = creation_mode(self.file_mode, *executable);
-                if let Err(error) = fs::set_permissions(&target, Permissions::from_mode(mode)) {
-                    self.problem(path, format!("unable to set file permissions: {error}"));
+                let Some(metadata) =
+                    self.change_mode(path, &parent, &target, &metadata, new_digest, mode)
+                else {
                     return Some(old.clone());
-                }
-                let metadata = match fs::symlink_metadata(&target) {
-                    Ok(metadata) => file_metadata(&metadata),
-                    Err(error) => {
-                        self.problem(path, format!("unable to probe the modified file: {error}"));
-                        FileMetadata::default()
-                    }
                 };
                 return Some(Node {
                     name: name.to_owned(),
@@ -6164,5 +6276,89 @@ mod apply_path_tests {
             .collect();
         assert_eq!(stale.len(), 1, "{stale:?}");
         assert!(stale[0].ends_with("-2"), "{stale:?}");
+    }
+
+    /// Makes `path`, as the endpoint just scanned it, executable.
+    fn make_executable(endpoint: &mut LocalEndpoint, path: &str) -> TransitionOutcome {
+        let snapshot = endpoint.scan().expect("scan");
+        let old = snapshot
+            .root
+            .as_ref()
+            .and_then(|root| root.child(path))
+            .expect("scanned")
+            .clone();
+        let Content::File {
+            digest, metadata, ..
+        } = old.content.clone()
+        else {
+            panic!("{path} is not a file");
+        };
+        let new = Node {
+            name: old.name.clone(),
+            content: Content::File {
+                digest,
+                executable: true,
+                metadata,
+            },
+        };
+        endpoint
+            .transition(vec![Change {
+                path: path.into(),
+                old: Some(old),
+                new: Some(new),
+            }])
+            .expect("transition")
+    }
+
+    /// A file hardlinked into the root from outside it: changing its
+    /// executable bit breaks the link, and the outside name keeps its
+    /// mode.
+    #[test]
+    fn a_mode_change_never_reaches_a_hardlink_outside_the_root() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(&root).expect("root");
+        let outside = keep.path().join("outside");
+        fs::write(&outside, b"shared inode").expect("outside");
+        fs::set_permissions(&outside, Permissions::from_mode(0o640)).expect("mode");
+        fs::hard_link(&outside, root.join("linked")).expect("hardlink");
+        let mut endpoint = endpoint_with(&root, EndpointOptions::default());
+        let outcome = make_executable(&mut endpoint, "linked");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+
+        let outside_metadata = fs::metadata(&outside).expect("outside");
+        assert_eq!(outside_metadata.mode() & 0o777, 0o640);
+        let inside = fs::metadata(root.join("linked")).expect("inside");
+        assert_ne!(
+            inside.ino(),
+            outside_metadata.ino(),
+            "the link was not broken"
+        );
+        assert_eq!(
+            inside.mode() & 0o777,
+            creation_mode(DEFAULT_FILE_MODE, true)
+        );
+        assert_eq!(fs::read(root.join("linked")).unwrap(), b"shared inode");
+        let achieved = outcome.results[0].as_ref().expect("achieved");
+        let Content::File { metadata, .. } = &achieved.content else {
+            panic!("not a file");
+        };
+        assert_eq!(metadata.inode, inside.ino());
+    }
+
+    /// A file with one link keeps its inode: the mode changes in place.
+    #[test]
+    fn a_mode_change_on_a_single_link_is_in_place() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(&root).expect("root");
+        fs::write(root.join("tool"), b"#!/bin/sh").expect("tool");
+        let before = fs::metadata(root.join("tool")).expect("tool").ino();
+        let mut endpoint = endpoint_with(&root, EndpointOptions::default());
+        let outcome = make_executable(&mut endpoint, "tool");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        let after = fs::metadata(root.join("tool")).expect("tool");
+        assert_eq!(after.ino(), before);
+        assert_eq!(after.mode() & 0o777, creation_mode(DEFAULT_FILE_MODE, true));
     }
 }

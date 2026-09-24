@@ -41,16 +41,22 @@ fn non_deletion_changes(changes: &[Change]) -> Vec<Change> {
 }
 
 /// The part of a side's unsynchronizable content that must block the change
-/// about to be propagated onto it.
+/// about to be propagated onto it at `path`, where the ancestor recorded
+/// `ancestor`.
 ///
 /// What blocks depends on the change, not only on the content. Excluded
 /// content must never be *overwritten* — "do not synchronize this" cannot
-/// mean "replace it with the peer's copy" — but it need not block a
-/// *deletion*, which leaves it exactly where it is. Treating it as an
-/// obstacle in both directions made an ordinary action impossible: a
-/// project directory almost always holds a `.git` or a `node_modules`, so
-/// deleting one turned into a conflict that no resolution could settle.
-fn blocking(incoming: Option<&Node>, unsynchronizable: Vec<Change>) -> Vec<Change> {
+/// mean "replace it with the peer's copy" — but an entry synchronization
+/// never carried need not block a *deletion*. Treating it as an obstacle
+/// in both directions made an ordinary action impossible: a project
+/// directory almost always holds a `.git` or a `node_modules`, so deleting
+/// one turned into a conflict that no resolution could settle.
+fn blocking(
+    path: &str,
+    ancestor: Option<&Node>,
+    incoming: Option<&Node>,
+    unsynchronizable: Vec<Change>,
+) -> Vec<Change> {
     fn unreadable(node: &Node) -> bool {
         match &node.content {
             Content::Problematic { .. } => true,
@@ -65,21 +71,45 @@ fn blocking(incoming: Option<&Node>, unsynchronizable: Vec<Change>) -> Vec<Chang
     if incoming.is_some() {
         return unsynchronizable;
     }
-    // A deletion is different. It removes what synchronization knows about
-    // and leaves the excluded entries where they are, so nothing excluded
-    // is destroyed by letting it through — while blocking it makes an
+    // A deletion is different. It is the directory around an excluded
+    // entry that goes, and the endpoint takes a pattern-ignored entry with
+    // it, as `docs/ignores.md` describes; an entry excluded only by size,
+    // type or symlink mode it refuses to remove, and leaves standing with
+    // a problem reported. Blocking the deletion for either would make an
     // ordinary action impossible, since a project directory almost always
     // holds a `.git` or a `node_modules` and could then never be deleted
     // through synchronization at all.
     //
-    // Unreadable content still blocks even a deletion: there the objection
-    // is not policy but ignorance. Nobody has seen what is there, so
-    // removing the directory around it is not a decision anyone made.
+    // Two kinds of content still block even a deletion, because what
+    // stands behind them is a change nobody has weighed. Unreadable
+    // content: nobody has seen what is there, so removing the directory
+    // around it is not a decision anyone made. And an entry excluded where
+    // the ancestor recorded content: the file was synchronized, and since
+    // then it grew past the size limit, became a FIFO, or started to match
+    // an ignore — an edit reconciliation cannot see. Letting a deletion of
+    // its directory through would destroy it; it is a conflict instead.
+    let recorded = |change: &Change| {
+        let relative = if path.is_empty() {
+            Some(change.path.as_str())
+        } else if change.path == path {
+            Some("")
+        } else {
+            change
+                .path
+                .strip_prefix(path)
+                .and_then(|rest| rest.strip_prefix('/'))
+        };
+        relative.is_some_and(|relative| super::node_at(ancestor, relative).is_some())
+    };
     unsynchronizable
         .into_iter()
         .filter(|change| {
             change.new.as_ref().is_some_and(unreadable)
                 || change.old.as_ref().is_some_and(unreadable)
+                || (matches!(
+                    change.new.as_ref().map(|n| &n.content),
+                    Some(Content::Untracked)
+                ) && recorded(change))
         })
         .collect()
 }
@@ -369,8 +399,12 @@ impl Reconciler {
         }
 
         if beta_diff.is_empty() {
-            let beta_unsynchronizable =
-                blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
+            let beta_unsynchronizable = blocking(
+                path,
+                ancestor,
+                alpha_sync.as_ref(),
+                diff_at(path, beta_sync.as_ref(), beta),
+            );
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -387,6 +421,8 @@ impl Reconciler {
             return;
         } else if alpha_diff.is_empty() {
             let alpha_unsynchronizable = blocking(
+                path,
+                ancestor,
                 beta_sync.as_ref(),
                 diff_at(path, alpha_sync.as_ref(), alpha),
             );
@@ -415,7 +451,12 @@ impl Reconciler {
         // side with the partial deletion.
         if alpha_non_deletion.is_empty() && beta_non_deletion.is_empty() {
             if alpha_sync.is_none() {
-                let beta_unsynchronizable = blocking(None, diff_at(path, beta_sync.as_ref(), beta));
+                let beta_unsynchronizable = blocking(
+                    path,
+                    ancestor,
+                    None,
+                    diff_at(path, beta_sync.as_ref(), beta),
+                );
                 if !beta_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
@@ -430,8 +471,12 @@ impl Reconciler {
                     });
                 }
             } else {
-                let alpha_unsynchronizable =
-                    blocking(None, diff_at(path, alpha_sync.as_ref(), alpha));
+                let alpha_unsynchronizable = blocking(
+                    path,
+                    ancestor,
+                    None,
+                    diff_at(path, alpha_sync.as_ref(), alpha),
+                );
                 if !alpha_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
@@ -453,8 +498,12 @@ impl Reconciler {
         // content over it (this is also what enables manual conflict
         // resolution by deleting the losing side).
         if beta_non_deletion.is_empty() {
-            let beta_unsynchronizable =
-                blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
+            let beta_unsynchronizable = blocking(
+                path,
+                ancestor,
+                alpha_sync.as_ref(),
+                diff_at(path, beta_sync.as_ref(), beta),
+            );
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -475,8 +524,12 @@ impl Reconciler {
             // letting it win would destroy the only copy. In the strict
             // mode alpha's deletion is final, and beta is made to match.
             if self.mode == SyncMode::TwoWayStrict {
-                let beta_unsynchronizable =
-                    blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
+                let beta_unsynchronizable = blocking(
+                    path,
+                    ancestor,
+                    alpha_sync.as_ref(),
+                    diff_at(path, beta_sync.as_ref(), beta),
+                );
                 if !beta_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
@@ -493,6 +546,8 @@ impl Reconciler {
                 return;
             }
             let alpha_unsynchronizable = blocking(
+                path,
+                ancestor,
                 beta_sync.as_ref(),
                 diff_at(path, alpha_sync.as_ref(), alpha),
             );
@@ -521,8 +576,12 @@ impl Reconciler {
                 beta_changes: beta_non_deletion,
             });
         } else {
-            let beta_unsynchronizable =
-                blocking(alpha_sync.as_ref(), diff_at(path, beta_sync.as_ref(), beta));
+            let beta_unsynchronizable = blocking(
+                path,
+                ancestor,
+                alpha_sync.as_ref(),
+                diff_at(path, beta_sync.as_ref(), beta),
+            );
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -553,7 +612,12 @@ impl Reconciler {
         let beta_sync = beta.and_then(Node::synchronizable_subtree);
         let beta_non_deletion = non_deletion_changes(&diff_at(path, ancestor, beta_sync.as_ref()));
         if beta_non_deletion.is_empty() {
-            let beta_unsynchronizable = blocking(alpha, diff_at(path, beta_sync.as_ref(), beta));
+            let beta_unsynchronizable = blocking(
+                path,
+                ancestor,
+                alpha,
+                diff_at(path, beta_sync.as_ref(), beta),
+            );
             if !beta_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
@@ -643,7 +707,12 @@ impl Reconciler {
         // content, unless beta carries unsynchronizable content (which can't
         // be removed), in which case indicate a conflict.
         let beta_sync = beta.and_then(Node::synchronizable_subtree);
-        let beta_unsynchronizable = blocking(alpha, diff_at(path, beta_sync.as_ref(), beta));
+        let beta_unsynchronizable = blocking(
+            path,
+            ancestor,
+            alpha,
+            diff_at(path, beta_sync.as_ref(), beta),
+        );
         if !beta_unsynchronizable.is_empty() {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
@@ -1198,6 +1267,79 @@ mod tests {
         assert!(updated.content_equal(&both, true));
     }
 
+    /// An entry the ancestor recorded that one side now excludes — a file
+    /// grown past `max_file_size`, turned into a FIFO, a symlink under the
+    /// `ignore` mode — is a change reconciliation cannot see, and it
+    /// blocks the deletion of the directory around it. Reproduced before
+    /// the fix in `two-way-conflict`: alpha grew `d/a` past the limit, beta
+    /// deleted `d`, and the "both purely deletions" branch deleted alpha's
+    /// edited file.
+    #[test]
+    fn an_entry_excluded_since_the_ancestor_blocks_the_deletion_around_it() {
+        let ancestor = dir(
+            "",
+            vec![dir("d", vec![file("a", 1, false), file("b", 1, false)])],
+        );
+        let excluded = dir(
+            "",
+            vec![dir(
+                "d",
+                vec![
+                    Node {
+                        name: "a".into(),
+                        content: Content::Untracked,
+                    },
+                    file("b", 1, false),
+                ],
+            )],
+        );
+        let deleted = dir("", vec![]);
+        let removes_d =
+            |changes: &[Change]| changes.iter().any(|c| c.path == "d" && c.new.is_none());
+
+        // Beta excluded `a`, alpha deleted `d`: a conflict in every mode.
+        for mode in MODES {
+            let result = reconcile(Some(&ancestor), Some(&deleted), Some(&excluded), mode);
+            assert_eq!(result.conflicts.len(), 1, "{mode:?}: {result:?}");
+            assert_eq!(result.conflicts[0].root, "d", "{mode:?}");
+            assert!(!removes_d(&result.beta_transitions), "{mode:?}: {result:?}");
+        }
+        // Alpha excluded `a`, beta deleted `d`: a conflict in the two-way
+        // modes, and alpha is never touched.
+        for mode in MODES {
+            let result = reconcile(Some(&ancestor), Some(&excluded), Some(&deleted), mode);
+            assert!(
+                !removes_d(&result.alpha_transitions),
+                "{mode:?}: {result:?}"
+            );
+            if !matches!(mode, SyncMode::OneWaySafe | SyncMode::OneWayReplica) {
+                assert_eq!(result.conflicts.len(), 1, "{mode:?}: {result:?}");
+            }
+        }
+
+        // An ignored entry the ancestor never held does not block: a `.git`
+        // goes with the project directory around it, in every mode.
+        let with_git = dir(
+            "",
+            vec![dir(
+                "d",
+                vec![
+                    Node {
+                        name: ".git".into(),
+                        content: Content::Untracked,
+                    },
+                    file("a", 1, false),
+                    file("b", 1, false),
+                ],
+            )],
+        );
+        for mode in MODES {
+            let result = reconcile(Some(&ancestor), Some(&deleted), Some(&with_git), mode);
+            assert!(result.conflicts.is_empty(), "{mode:?}: {result:?}");
+            assert!(removes_d(&result.beta_transitions), "{mode:?}: {result:?}");
+        }
+    }
+
     #[test]
     fn untracked_beta_content_blocks_replica_with_conflict() {
         let ancestor = dir("", vec![]);
@@ -1465,11 +1607,6 @@ mod tests {
                     continue;
                 }
                 if untracked && recorded.is_none() && now.is_none() {
-                    continue;
-                }
-                // H-8, fixed in the next commit: an entry excluded where
-                // the ancestor held content is removed with its parent.
-                if untracked && now.is_none() {
                     continue;
                 }
                 losses.push(format!("{side} lost '{path}'"));

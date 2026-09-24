@@ -45,6 +45,14 @@ tempfile = "3"
 [profile.release]
 lto = true
 
+# The binaries that ship: release, compiled as one unit. It answered a
+# remote-side edit at 420k files 10% faster (221 → 198 ms) and takes 40%
+# longer to build (85 → 120 s), so it is kept out of the release profile
+# that tests and development builds use.
+[profile.dist]
+inherits = "release"
+codegen-units = 1
+
 # musl's allocator is slow and takes a global lock: a remote-side edit at
 # 420k files took 264 ms with it, 208 with mimalloc, 164 on glibc. The
 # static Linux release binaries are musl, so they get mimalloc — on x86_64

@@ -23,11 +23,11 @@ build() {
         return 0
     fi
     echo "building $platform..."
-    if ! cargo build --release --target "$target"; then
+    if ! cargo build --profile dist --target "$target"; then
         echo "skipping $platform (build failed; a cross linker may be required)"
         return 0
     fi
-    cp "target/$target/release/autobahn" "$OUT/autobahn-$platform"
+    cp "target/$target/dist/autobahn" "$OUT/autobahn-$platform"
     echo "  -> $OUT/autobahn-$platform"
 }
 

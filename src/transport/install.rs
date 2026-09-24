@@ -102,8 +102,13 @@ fn file_digest(path: &std::path::Path) -> Option<String> {
 /// binary it would install — the same search `locate_agent_binary` makes,
 /// the first place holding a platform winning.
 fn agent_candidates() -> Vec<(String, PathBuf)> {
+    agent_candidates_in(agent_directories())
+}
+
+/// [`agent_candidates`] over an explicit list of bundle directories.
+fn agent_candidates_in(directories: Vec<PathBuf>) -> Vec<(String, PathBuf)> {
     let mut found: Vec<(String, PathBuf)> = Vec::new();
-    for directory in agent_directories() {
+    for directory in directories {
         let Ok(entries) = fs::read_dir(&directory) else {
             continue;
         };
@@ -136,11 +141,20 @@ fn agent_candidates() -> Vec<(String, PathBuf)> {
 
 /// Where agent bundles are looked for, in order.
 fn agent_directories() -> Vec<PathBuf> {
+    agent_directories_from(
+        std::env::var("AUTOBAHN_AGENTS_DIR").ok().map(PathBuf::from),
+        crate::paths::default_state_root().ok(),
+    )
+}
+
+/// [`agent_directories`] for an explicit `AUTOBAHN_AGENTS_DIR` and state
+/// root, so a test can name its own without changing the environment.
+fn agent_directories_from(named: Option<PathBuf>, state_root: Option<PathBuf>) -> Vec<PathBuf> {
     let mut directories = Vec::new();
-    if let Ok(directory) = std::env::var("AUTOBAHN_AGENTS_DIR") {
-        directories.push(PathBuf::from(directory));
+    if let Some(directory) = named {
+        directories.push(directory);
     }
-    if let Ok(state_root) = crate::paths::default_state_root() {
+    if let Some(state_root) = state_root {
         directories.push(state_root.join("agents"));
     }
     if let Ok(executable) = std::env::current_exe() {
@@ -343,7 +357,12 @@ fn local_platform() -> String {
 /// and — for the local platform — the running executable itself, since it
 /// *is* an agent for its own platform.
 fn locate_agent_binary(platform: &str) -> Option<PathBuf> {
-    agent_candidates()
+    locate_agent_binary_in(platform, agent_directories())
+}
+
+/// [`locate_agent_binary`] over an explicit list of bundle directories.
+fn locate_agent_binary_in(platform: &str, directories: Vec<PathBuf>) -> Option<PathBuf> {
+    agent_candidates_in(directories)
         .into_iter()
         .find(|(candidate, path)| candidate == platform && path.is_file())
         .map(|(_, path)| path)
@@ -556,25 +575,27 @@ mod tests {
     /// the controller ignores.
     #[test]
     fn a_bundle_in_the_state_root_is_found() {
-        // HOME is process-global, so this test owns it for its duration and
-        // restores it, rather than running beside another that reads it.
+        // The state root is passed in rather than planted through HOME:
+        // the environment is global to the process, and tests run in
+        // parallel.
         let keep = tempfile::tempdir().expect("temporary directory");
-        let agents = keep.path().join(".autobahn").join("agents");
+        let state_root = keep.path().join(".autobahn");
+        let agents = state_root.join("agents");
         std::fs::create_dir_all(&agents).expect("directories");
         // A platform this machine certainly is not, so the local-executable
         // fallback cannot satisfy the lookup and mask the failure.
         let planted = agents.join("autobahn-linux-mips64");
         std::fs::write(&planted, b"an agent").expect("writes");
 
-        let previous = std::env::var("HOME").ok();
-        std::env::set_var("HOME", keep.path());
-        let found = locate_agent_binary("linux-mips64");
-        match previous {
-            Some(home) => std::env::set_var("HOME", home),
-            None => std::env::remove_var("HOME"),
-        }
-
+        let found = locate_agent_binary_in(
+            "linux-mips64",
+            agent_directories_from(None, Some(state_root)),
+        );
         assert_eq!(found.as_deref(), Some(planted.as_path()));
+
+        // And the state root searched is the one everything else uses.
+        let default = crate::paths::default_state_root().expect("a state root");
+        assert!(agent_directories().contains(&default.join("agents")));
     }
 
     /// The probe's naming and the local constant's naming must agree, or

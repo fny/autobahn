@@ -922,11 +922,12 @@ mod tests {
     use crate::scan::SymlinkMode;
     use crate::transport::tests::connected_pair;
 
-    /// Builds a test initialization for the specified root.
+    /// Builds a test initialization for the specified root, under a
+    /// session identifier of the form a genuine controller sends.
     fn initialize(root: &str) -> Initialize {
         Initialize {
             root: root.into(),
-            session: "session-1".into(),
+            session: crate::session::session_identifier(root, "remote-test"),
             ignores: vec!["*.tmp".into()],
             symlink_mode: SymlinkMode::Raw,
             file_mode: None,
@@ -1041,7 +1042,10 @@ mod tests {
             .expect("agent thread panicked")
             .expect("agent failed");
         assert_eq!(received.root, "/home/user/project");
-        assert_eq!(received.session, "session-1");
+        assert_eq!(
+            received.session,
+            crate::session::session_identifier("/home/user/project", "remote-test")
+        );
         assert_eq!(received.ignores, vec!["*.tmp".to_owned()]);
     }
 

@@ -646,11 +646,14 @@ mod tests {
     use crate::scan::SymlinkMode;
     use crate::transport::tests::connected_pair;
 
-    /// Builds a test initialization for the specified root.
+    /// Builds a test initialization for the specified root, under a
+    /// session identifier of the root's own: tests running in parallel
+    /// never share a session's staging or scan cache.
     fn initialize(root: &std::path::Path) -> Initialize {
+        let root = root.to_string_lossy().into_owned();
         Initialize {
-            root: root.to_string_lossy().into_owned(),
-            session: format!("mux-test-{}", root.to_string_lossy().len()),
+            session: crate::session::session_identifier(&root, "mux-test"),
+            root,
             ignores: Vec::new(),
             symlink_mode: SymlinkMode::Raw,
             file_mode: None,
@@ -665,14 +668,17 @@ mod tests {
         }
     }
 
-    /// Starts a real agent over in-memory pipes, returning the client end
-    /// and a receiver that yields the agent's exit result.
-    fn spawned_agent() -> (Connection, mpsc::Receiver<Result<()>>) {
+    /// Starts a real agent over in-memory pipes, keeping its state under
+    /// `state` (the test's own directory, never the real `~/.autobahn`),
+    /// and returns the client end and a receiver that yields the agent's
+    /// exit result.
+    fn spawned_agent(state: &std::path::Path) -> (Connection, mpsc::Receiver<Result<()>>) {
         let (client, agent) = connected_pair();
         let (agent_reader, agent_writer, _) = agent.into_parts();
         let (finished_sender, finished) = mpsc::channel();
+        let state = state.to_path_buf();
         std::thread::spawn(move || {
-            let result = crate::transport::serve_agent(agent_reader, agent_writer);
+            let result = crate::transport::serve_agent_in(agent_reader, agent_writer, &state);
             let _ = finished_sender.send(result);
         });
         (client, finished)
@@ -686,6 +692,41 @@ mod tests {
             .expect("the agent must exit cleanly");
     }
 
+    /// An agent keeps a channel's staging and scan cache in the state area
+    /// it was given, under the channel's own session and side — the state
+    /// area is what moves a test's agent out of the real `~/.autobahn`.
+    #[test]
+    fn a_channel_keeps_its_state_in_the_agents_state_area() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&root).expect("root should be creatable");
+        std::fs::write(root.join("file.txt"), b"content").expect("file should be writable");
+        // The cache writer does not create directories; an agent's staging
+        // area already exists by the time a real session scans.
+        std::fs::create_dir_all(state.join("staging")).expect("staging should be creatable");
+
+        let (client, finished) = spawned_agent(&state);
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        let initialize = initialize(&root);
+        let session = initialize.session.clone();
+        let mut channel = connection.open(initialize).expect("open");
+        channel.exchange(Request::Scan).expect("the scan exchanges");
+        // The cache is written in the background while the channel's
+        // endpoint lives, so it is waited for before the channel closes.
+        let cache = state
+            .join("staging")
+            .join(format!("{session}-beta.scancache"));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !cache.is_file() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(cache.is_file(), "no scan cache at {}", cache.display());
+        drop(channel);
+        drop(connection);
+        assert_clean_exit(&finished);
+    }
+
     #[test]
     fn channels_multiplex_without_blocking_each_other() {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
@@ -695,7 +736,7 @@ mod tests {
         std::fs::create_dir_all(&root_b).expect("root should be creatable");
         std::fs::write(root_a.join("file.txt"), b"content").expect("file should be writable");
 
-        let (client, finished) = spawned_agent();
+        let (client, finished) = spawned_agent(&keep.path().join("state"));
         let connection = AgentConnection::connect(client).expect("unable to connect");
         let mut channel_a = connection.open(initialize(&root_a)).expect("open a");
         let mut channel_b = connection.open(initialize(&root_b)).expect("open b");
@@ -789,7 +830,7 @@ mod tests {
         let root = keep.path().join("root");
         std::fs::create_dir_all(&root).expect("root should be creatable");
 
-        let (client, finished) = spawned_agent();
+        let (client, finished) = spawned_agent(&keep.path().join("state"));
 
         // The protocol is spoken by hand so that the transport can be
         // severed with the channel still open (the real client would send a
@@ -820,7 +861,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let root = keep.path().join("root");
         std::fs::create_dir_all(&root).expect("root should be creatable");
-        let (client, finished) = spawned_agent();
+        let (client, finished) = spawned_agent(&keep.path().join("state"));
         let connection = AgentConnection::connect(client).expect("unable to connect");
         let mut channel = connection.open(initialize(&root)).expect("open");
         // The agent goes away: its end of the pipes is dropped when its
@@ -842,7 +883,8 @@ mod tests {
 
     #[test]
     fn a_handleless_connection_shuts_down_without_ever_opening_a_channel() {
-        let (client, finished) = spawned_agent();
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let (client, finished) = spawned_agent(keep.path());
         let connection = AgentConnection::connect(client).expect("unable to connect");
         // No channel is ever opened; dropping the last handle must still
         // shut the agent down (and end the router) rather than leaking
@@ -1009,7 +1051,7 @@ mod tests {
         let root = keep.path().join("root");
         std::fs::create_dir_all(&root).expect("root should be creatable");
 
-        let (client, finished) = spawned_agent();
+        let (client, finished) = spawned_agent(&keep.path().join("state"));
 
         let pool = AgentPool::default();
         let key = vec!["test-host".to_owned()];
@@ -1059,7 +1101,7 @@ mod tests {
         let outside = keep.path().join("outside.txt");
         std::fs::write(&outside, b"secret").expect("writes");
 
-        let (client, finished) = spawned_agent();
+        let (client, finished) = spawned_agent(&keep.path().join("state"));
         let connection = AgentConnection::connect(client).expect("unable to connect");
         let mut channel = connection.open(initialize(&root)).expect("open");
 

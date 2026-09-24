@@ -111,6 +111,47 @@ impl Drop for StopGuard<'_> {
     }
 }
 
+/// Serializes the tests that must set a process-wide environment variable.
+/// The environment is global to the process and the tests run in parallel,
+/// so a test that cannot pass a value any other way holds this for as long
+/// as the value is set.
+static ENVIRONMENT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Sets an environment variable for as long as it lives, holding
+/// [`ENVIRONMENT`], and restores the previous value when dropped — on a
+/// panic as well, so a failing test leaks nothing into the next.
+struct EnvironmentGuard {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+    _held: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvironmentGuard {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> EnvironmentGuard {
+        // A test that panicked while holding the lock still restored its
+        // variable on the way out, so the poison carries no meaning here.
+        let held = ENVIRONMENT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        EnvironmentGuard {
+            name,
+            previous,
+            _held: held,
+        }
+    }
+}
+
+impl Drop for EnvironmentGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 /// Asserts that every outcome succeeded.
 fn assert_all_synchronized(outcomes: &[SessionOutcome]) {
     for outcome in outcomes {
@@ -1180,24 +1221,47 @@ fn agents_install_automatically_over_ssh() {
     );
     fs::copy(agent_binary(), agents.join(platform)).expect("bundle copy");
 
-    // These variables are consulted only by the SSH connection path, which
-    // only this test exercises (every other test connects via
-    // agent_command); tests in this binary can therefore run in parallel.
-    std::env::set_var("AUTOBAHN_SSH", &script);
-    std::env::set_var("AUTOBAHN_AGENTS_DIR", &agents);
-
-    let plans = world.plans(&format!(
-        r#"
-        [groups.work]
-        alpha = "{alpha}"
-        mode = "two-way-safe"
-        betas = ["fake-host:{remote_mirror}"]
-        "#,
-        alpha = alpha.display(),
-        remote_mirror = remote_mirror.display(),
-    ));
-    let outcomes = world.run_once(plans.clone());
-    assert_all_synchronized(&outcomes);
+    // The fake ssh and the bundle reach the controller through its
+    // environment, so the controller runs as a child process with them set
+    // on it alone: setting them here would change them for every test in
+    // this process, which run in parallel.
+    let configuration = world.path("config.toml");
+    fs::write(
+        &configuration,
+        format!(
+            r#"
+            [groups.work]
+            alpha = "{alpha}"
+            mode = "two-way-safe"
+            betas = ["fake-host:{remote_mirror}"]
+            "#,
+            alpha = alpha.display(),
+            remote_mirror = remote_mirror.display(),
+        ),
+    )
+    .expect("the configuration should be writable");
+    let controller_home = world.directory("controller-home");
+    let sync_once = || {
+        let output = std::process::Command::new(agent_binary())
+            .arg("sync")
+            .arg("--config")
+            .arg(&configuration)
+            .arg("--state-root")
+            .arg(world.state_root())
+            .env("HOME", &controller_home)
+            .env_remove("AUTOBAHN_HOME")
+            .env("AUTOBAHN_SSH", &script)
+            .env("AUTOBAHN_AGENTS_DIR", &agents)
+            .output()
+            .expect("the controller should run");
+        assert!(
+            output.status.success(),
+            "the sync should succeed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    sync_once();
 
     // The content synchronized, and the versioned agent was installed into
     // the (fake) remote home along the way.
@@ -1212,7 +1276,7 @@ fn agents_install_automatically_over_ssh() {
     );
 
     // A second pass reuses the installed agent.
-    assert_all_synchronized(&world.run_once(plans));
+    sync_once();
 }
 
 #[test]
@@ -2367,8 +2431,8 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     )
     .unwrap();
     // The alpha remembers leading at term 3, and reaches the peer's attach
-    // socket directly rather than over ssh. This variable is process-wide;
-    // this is the one test that sets it.
+    // socket directly rather than over ssh. The alpha runs in this process,
+    // so the variable is set process-wide, under the guard that restores it.
     let alpha_directory = peering::directory().expect("the alpha's peering directory");
     peering::write_lease(
         &alpha_directory,
@@ -2376,7 +2440,7 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     )
     .unwrap();
     let socket = peering_directory.join(peering::ATTACH_SOCKET);
-    std::env::set_var(
+    let _attach = EnvironmentGuard::set(
         peering::ATTACH_COMMAND_VARIABLE,
         format!(
             "{} peering attach --socket {}",
@@ -2462,7 +2526,6 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
             .expect("the alpha thread")
             .expect("the alpha ran");
     });
-    std::env::remove_var(peering::ATTACH_COMMAND_VARIABLE);
 }
 
 #[test]

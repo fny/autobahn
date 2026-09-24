@@ -387,6 +387,30 @@ impl Drop for Connection {
 /// controller going away without a shutdown frame) is a successful
 /// exit.
 pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> {
+    serve_agent_with(input, output, crate::paths::default_state_root())
+}
+
+/// [`serve_agent`] over an explicit state area, so that a test's agent
+/// keeps its staging, scan caches and peering files in the test's own
+/// directory rather than in the real `~/.autobahn`.
+#[cfg(test)]
+pub(crate) fn serve_agent_in<R: Read, W: Write + Send>(
+    input: R,
+    output: W,
+    state_root: &std::path::Path,
+) -> Result<()> {
+    serve_agent_with(input, output, Ok(state_root.to_path_buf()))
+}
+
+/// The agent's side of the protocol, keeping its state under `state_root`.
+/// A state root that cannot be determined fails each channel's open, not
+/// the connection, as it did when it was read at each open.
+fn serve_agent_with<R: Read, W: Write + Send>(
+    input: R,
+    output: W,
+    state_root: Result<PathBuf>,
+) -> Result<()> {
+    let state_root = &state_root;
     let mut input = input;
     let output = std::sync::Mutex::new(output);
 
@@ -441,7 +465,9 @@ pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> 
                         let (sender, receiver) = std::sync::mpsc::channel::<Request>();
                         channels.insert(channel, sender);
                         let output = &output;
-                        scope.spawn(move || serve_channel(channel, initialize, receiver, output));
+                        scope.spawn(move || {
+                            serve_channel(channel, initialize, state_root, receiver, output)
+                        });
                     }
                     protocol::MuxRequest::Request { channel, request } => {
                         match channels.get(&channel) {
@@ -530,6 +556,7 @@ fn reporting_scan<W: Write + Send, T>(
 fn serve_channel<W: Write + Send>(
     channel: u32,
     initialize: Initialize,
+    state_root: &Result<PathBuf>,
     requests: std::sync::mpsc::Receiver<Request>,
     output: &std::sync::Mutex<W>,
 ) {
@@ -538,7 +565,7 @@ fn serve_channel<W: Write + Send>(
     // other channels.
     // What a scan has counted so far, for the reports a long one sends.
     let counted = std::sync::Arc::new(crate::progress::SideProgress::default());
-    let mut endpoint = match create_endpoint(&initialize) {
+    let mut endpoint = match create_endpoint(&initialize, state_root) {
         Ok(mut endpoint) => {
             if serve_send(output, channel, Response::Initialized).is_err() {
                 return;
@@ -573,7 +600,10 @@ fn serve_channel<W: Write + Send>(
     // It is per channel, not per connection, because each channel is one
     // controller's session and presents its own term. The ancestor copy
     // is opened on first use — most channels never see a peering request.
-    let peering_directory = crate::peering::directory();
+    let peering_directory = state_root
+        .as_ref()
+        .map(|root| root.join(crate::peering::DIRECTORY))
+        .map_err(|error| anyhow!("{error:#}"));
     let mut fence: Option<crate::peering::Lease> = None;
     let mut copy: Option<crate::peering::AncestorCopy> = None;
     while let Ok(request) = requests.recv() {
@@ -915,14 +945,18 @@ enum Anchor {
 /// interrupted cycles, and the two sides of one session) never share
 /// staging space; the root-relative placements follow the controller's
 /// staging mode.
-fn create_endpoint(initialize: &Initialize) -> Result<LocalEndpoint> {
-    let home = std::env::var("HOME")
-        .context("unable to determine the agent's home directory (HOME is not set)")?;
+/// Creates a channel's endpoint, its staging kept under the agent's state
+/// area — `crate::paths::default_state_root()` in production, so that
+/// `AUTOBAHN_HOME` moves it with everything else autobahn keeps.
+fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Result<LocalEndpoint> {
+    let state_root = state_root
+        .as_ref()
+        .map_err(|error| anyhow!("unable to determine the agent's state directory: {error:#}"))?;
     // Expand a home-relative root against this agent's home directory, so
     // that a configuration like `alpha = "~/project"` fanned out to several
     // hosts lands in each host's own home rather than a literal `~`.
     let root = crate::paths::expand_tilde(&initialize.root)?;
-    let staging_area = PathBuf::from(home).join(".autobahn").join("staging");
+    let staging_area = state_root.join("staging");
     // Earlier versions keyed staging by session alone; such a directory can
     // only belong to this same session under an older agent, so it is
     // retired (best-effort) rather than left to hold stale content forever.

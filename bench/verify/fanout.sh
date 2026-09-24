@@ -4,7 +4,9 @@
 # agent finished an edit on the first acknowledgement it would report fast
 # samples. Waiting for every destination means every edit must be censored.
 set -u
-BM=/home/ubuntu/Workspace/autobahn/bench/harness/target/release/benchmark
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+BM=${BM:-$REPO/bench/harness/target/release/benchmark}
+[ -x "$BM" ] || { echo "no benchmark harness at $BM" >&2; exit 1; }
 W=$(mktemp -d); PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill -CONT "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
             for j in $(jobs -p); do kill "$j" 2>/dev/null; done; rm -rf "$W"; }

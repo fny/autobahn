@@ -87,6 +87,14 @@ The estimate is withheld unless the phase has been running long enough to have a
 
 A session between cycles is described by how its last cycle ended; so is a paused one, and one backing off from an error, both of which the recorded status names.
 
+A group with nothing to say is one line — every destination synchronized, nothing waiting on anyone, nothing going on long enough to earn a line:
+
+```
+~/Workspace/notes notes  ✓ 2 synchronized · last cycle 4s ago
+```
+
+Anything else — a conflict, a blocked path, a halt, an unreachable host, a pause, a long scan — shows the group in full, so what needs you is never folded away. `status <group>` shows that group in full regardless, and `status --all` shows everything. `--json` is unaffected.
+
 ## `--live`
 
 To watch it happen rather than sample it, `autobahn status --live` repaints twice a second and shows every phase however brief. It is a read-only window onto whatever supervisor is already running — the login service, or a `watch` in another terminal. (`watch` is the same display, but it also does the synchronizing.)

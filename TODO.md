@@ -96,7 +96,7 @@ Real work, none of it load-bearing for a first release.
 
   *Why here:* needs a protocol response and an epoch bump
 
-- [ ] Collapse fully-synchronized groups to one line in `status`, so 15 healthy sessions don't cost 45 lines of scrolling.
+- [x] Collapse fully-synchronized groups to one line in `status`, so 15 healthy sessions don't cost 45 lines of scrolling.
 
   **Decided 2026-09-24:** a group whose destinations are all synchronized and idle is one line (`✓ 3 synchronized · last cycle 4s ago`); any trouble or visible work expands it. `status <group>` and `status --all` expand everything; `--live` and `watch` collapse too; `--json` unchanged.
 

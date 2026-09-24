@@ -2464,3 +2464,59 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     });
     std::env::remove_var(peering::ATTACH_COMMAND_VARIABLE);
 }
+
+#[test]
+fn a_healthy_group_is_one_line_in_status_and_trouble_is_shown_in_full() {
+    let world = World::new();
+    let quiet = world.directory("quiet");
+    let quiet_mirror = world.directory("quiet-mirror");
+    let noisy = world.directory("noisy");
+    let noisy_mirror = world.directory("noisy-mirror");
+    write(&quiet, "a.txt", "a");
+    write(&noisy, "b.txt", "b");
+    let config = world.path("config.toml");
+    let plans = world.plans(&format!(
+        r#"
+        [defaults]
+        mode = "two-way-conflict"
+
+        [groups.quiet]
+        alpha = "{quiet}"
+        betas = ["{quiet_mirror}"]
+
+        [groups.noisy]
+        alpha = "{noisy}"
+        betas = ["{noisy_mirror}"]
+        "#,
+        quiet = quiet.display(),
+        quiet_mirror = quiet_mirror.display(),
+        noisy = noisy.display(),
+        noisy_mirror = noisy_mirror.display(),
+    ));
+    assert_all_synchronized(&world.run_once(plans.clone()));
+    // A conflict in one group only.
+    write(&noisy, "b.txt", "alpha's");
+    write(&noisy_mirror, "b.txt", "beta's");
+    world.run_once(plans);
+
+    let (ok, text) = cli(&world, &config, &["status"]);
+    assert!(ok, "{text}");
+    let quiet_line = text
+        .lines()
+        .find(|line| line.contains("quiet") && !line.contains("mirror"))
+        .expect("the quiet group is listed");
+    assert!(quiet_line.contains("✓ 1 synchronized"), "{text}");
+    assert!(
+        !text.contains(&quiet_mirror.display().to_string()),
+        "the healthy group's destinations are folded into its line: {text}"
+    );
+    assert!(
+        text.contains(&noisy_mirror.display().to_string()) && text.contains("conflicts"),
+        "the group in trouble is in full: {text}"
+    );
+
+    let (_, text) = cli(&world, &config, &["status", "--all"]);
+    assert!(text.contains(&quiet_mirror.display().to_string()), "{text}");
+    let (_, text) = cli(&world, &config, &["status", "quiet"]);
+    assert!(text.contains(&quiet_mirror.display().to_string()), "{text}");
+}

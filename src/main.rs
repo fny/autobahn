@@ -165,6 +165,10 @@ enum Command {
         /// interface reads.
         #[arg(long)]
         json: bool,
+        /// Show every destination in full, including groups that are all
+        /// synchronized (which otherwise take one line each).
+        #[arg(long)]
+        all: bool,
     },
     /// Start the installed login service. With none installed, this
     /// refuses and points at `install` (or `watch`, to run here instead).
@@ -616,7 +620,14 @@ fn main() {
             conflicts,
             live,
             json,
-        } => run_status(config, state_root, group, host, conflicts, live, json),
+            all,
+        } => {
+            // Naming a group is asking about it: shown in full.
+            let expand = all || group.is_some();
+            run_status(
+                config, state_root, group, host, conflicts, live, json, expand,
+            )
+        }
         Command::Flush {
             group,
             host,
@@ -1348,7 +1359,14 @@ fn run_watch(
         let plans = shown.lock().unwrap_or_else(|error| error.into_inner());
         let selected: Vec<&autobahn::config::SessionPlan> = plans.iter().collect();
         let mut frame = String::new();
-        render_status(&selected, &display_root, expand_conflicts, true, &mut frame);
+        render_status(
+            &selected,
+            &display_root,
+            expand_conflicts,
+            false,
+            true,
+            &mut frame,
+        );
         frame
     })?;
     // Taken into a binding of its own, so the lock is released before the
@@ -1374,11 +1392,19 @@ fn run_live_display(
     selected: &[&autobahn::config::SessionPlan],
     state_root: &Path,
     expand_conflicts: bool,
+    expand: bool,
     label: &str,
 ) -> Result<()> {
     pager::display(label, || {
         let mut frame = String::new();
-        render_status(selected, state_root, expand_conflicts, true, &mut frame);
+        render_status(
+            selected,
+            state_root,
+            expand_conflicts,
+            expand,
+            true,
+            &mut frame,
+        );
         frame
     })
 }
@@ -3107,6 +3133,7 @@ fn run_status(
     expand_conflicts: bool,
     live: bool,
     json: bool,
+    expand: bool,
 ) -> Result<()> {
     let plans = match peer_plans(&config)? {
         Some((plans, header)) => {
@@ -3131,7 +3158,7 @@ fn run_status(
                  run `autobahn status` on a timer instead"
             );
         }
-        return run_live_display(&selected, &state_root, expand_conflicts, "live");
+        return run_live_display(&selected, &state_root, expand_conflicts, expand, "live");
     }
     if json {
         let report = autobahn::supervisor::status_report(&selected, &state_root);
@@ -3140,7 +3167,14 @@ fn run_status(
     }
 
     let mut out = String::new();
-    render_status(&selected, &state_root, expand_conflicts, live, &mut out);
+    render_status(
+        &selected,
+        &state_root,
+        expand_conflicts,
+        expand,
+        live,
+        &mut out,
+    );
     print!("{out}");
     Ok(())
 }
@@ -3151,6 +3185,7 @@ fn render_status(
     selected: &[&autobahn::config::SessionPlan],
     state_root: &Path,
     expand_conflicts: bool,
+    expand: bool,
     live: bool,
     out: &mut String,
 ) {
@@ -3236,6 +3271,29 @@ fn render_status(
             .filter(|status| !status.role.is_empty())
             .map(|status| format!("  {} (term {})", status.role, status.term))
             .unwrap_or_default();
+        // A group with nothing to say is one line: every destination
+        // synchronized, nothing waiting on anyone, and nothing going on long
+        // enough to be worth a line. Fifteen healthy sessions were forty-five
+        // lines, and the one that needed a person scrolled off the top.
+        let live_progress = |plan: &autobahn::config::SessionPlan| {
+            reported.as_ref().and_then(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.group == plan.group && session.host == plan.host)
+                    .map(|session| session.progress.clone())
+            })
+        };
+        if !expand {
+            if let Some(line) = collapsed_group(block, &live_progress, live) {
+                let _ = writeln!(
+                    out,
+                    "\x1b[1m{}\x1b[0m \x1b[2m{}{role}\x1b[0m  {line}",
+                    plan.alpha_spec, plan.group
+                );
+                index = end;
+                continue;
+            }
+        }
         let _ = writeln!(
             out,
             "\x1b[1m{}\x1b[0m \x1b[2m{}{role}\x1b[0m",
@@ -3261,6 +3319,53 @@ fn render_status(
         }
         index = end;
     }
+}
+
+/// The one line a group is shown as when there is nothing to say about any
+/// of its destinations, or `None` when there is: any state but
+/// synchronized, anything waiting on a person, a paused session, or work
+/// that has gone on long enough to earn its own line. `--live` wants every
+/// phase however brief, so a brief one rides on the line instead of
+/// expanding the group and moving the page.
+fn collapsed_group(
+    block: &[(&autobahn::config::SessionPlan, Option<SessionStatus>)],
+    progress_of: &dyn Fn(&autobahn::config::SessionPlan) -> Option<ProgressSnapshot>,
+    live: bool,
+) -> Option<String> {
+    use autobahn::progress::Phase;
+    let mut newest = 0u64;
+    let mut doing: Option<&'static str> = None;
+    for (plan, status) in block {
+        let status = status.as_ref()?;
+        let healthy = autobahn::supervisor::classify_state(status) == "synchronized"
+            && status.conflicts.is_empty()
+            && status.blocked.is_empty()
+            && status.error.is_none()
+            && status.cycles > 0;
+        if !healthy {
+            return None;
+        }
+        newest = newest.max(status.updated_at);
+        if let Some(progress) = progress_of(plan) {
+            if progress.phase == Phase::Paused {
+                return None;
+            }
+            if progress.phase.is_working() {
+                if progress.working_seconds >= SLOW_PHASE_SECONDS {
+                    return None;
+                }
+                if live {
+                    doing = Some(progress.phase.label());
+                }
+            }
+        }
+    }
+    let count = block.len();
+    let mut line = format!("✓ {count} synchronized · last cycle {}", format_age(newest));
+    if let Some(phase) = doing {
+        line.push_str(&format!(" · \x1b[2m{phase}\x1b[0m"));
+    }
+    Some(line)
 }
 
 /// Renders one destination and the labelled facts about it.

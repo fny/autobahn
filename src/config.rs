@@ -1061,8 +1061,18 @@ impl Config {
     /// Parses a configuration already read from `path`, which only names
     /// it in errors.
     pub fn parse(path: &std::path::Path, text: &str) -> Result<Config> {
-        toml::from_str(text)
-            .with_context(|| format!("unable to parse configuration {}", path.display()))
+        let config: Config = toml::from_str(text)
+            .with_context(|| format!("unable to parse configuration {}", path.display()))?;
+        // A group is named on command lines — its own, and the ones
+        // autobahn suggests — where a leading dash reads as an option.
+        if let Some(name) = config.groups.keys().find(|name| name.starts_with('-')) {
+            bail!(
+                "invalid configuration {}:\n  group {name:?}: a group name cannot start with \
+                 '-', which commands would read as an option",
+                path.display()
+            );
+        }
+        Ok(config)
     }
 
     /// Every host this configuration names, in configuration order: each
@@ -2069,6 +2079,28 @@ fn host_of(destination: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group name that starts with `-` reads as an option to every
+    /// command that takes one, and to every command autobahn suggests.
+    #[test]
+    fn a_group_name_starting_with_a_dash_is_refused() {
+        let path = std::path::Path::new("config.toml");
+        let error = Config::parse(
+            path,
+            "[groups.\"-rf\"]\nmode = \"two-way-safe\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
+        )
+        .expect_err("a dash-led group name is refused");
+        let message = format!("{error:#}");
+        assert!(message.contains("\"-rf\""), "{message}");
+        assert!(message.contains("cannot start with '-'"), "{message}");
+
+        // A dash elsewhere in the name is fine.
+        Config::parse(
+            path,
+            "[groups.my-group]\nmode = \"two-way-safe\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
+        )
+        .expect("a dash inside a name is accepted");
+    }
 
     /// The template `autobahn init` writes has to satisfy the schema in
     /// this file, and say only true things about it.

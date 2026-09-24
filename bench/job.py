@@ -562,19 +562,32 @@ def collect_series():
     parsed = [parse(text) for text in remotes]
     if len(parsed) == 1:
         return {"local": parse(local), "remote": parsed[0]}
-    # Several destinations: sum them per second, so "remote" is the whole
-    # cost of serving this source rather than one arbitrary machine's share.
-    # Rows are aligned by their own timestamps, to the nearest second.
-    merged = {}
-    for series in parsed:
-        for epoch, rss, jiffies, count in series:
-            slot = merged.setdefault(round(epoch), [round(epoch), 0, 0, 0])
-            slot[1] += rss
-            slot[2] += jiffies
-            slot[3] += count
-    return {"local": parse(local),
-            "remote": [merged[key] for key in sorted(merged)],
-            "remote_hosts": len(parsed)}
+    return {"local": parse(local), **merge_remote(parsed)}
+
+
+def merge_remote(parsed):
+    """Several destinations' series as one "remote" series — the whole cost
+    of serving this source rather than one arbitrary machine's share — and
+    each host's own series beside it.
+
+    CPU is cumulative per host, so it is summed only over each host's
+    *latest* sample: a row is emitted at every sample any host takes, with
+    every other host's last value carried forward, and only once every host
+    has reported. Summing whatever landed in a rounded time bucket made the
+    total dip whenever one host skipped a bucket. The aggregator computes
+    CPU from the per-host series (each host's own first and last samples in
+    the window); the merged series serves peak RSS and older readers.
+    """
+    events = sorted((row[0], host, row) for host, series in enumerate(parsed)
+                    for row in series)
+    latest, merged = {}, []
+    for epoch, host, row in events:
+        latest[host] = row
+        if len(latest) == len(parsed):
+            rows = latest.values()
+            merged.append([epoch, sum(r[1] for r in rows), sum(r[2] for r in rows),
+                           sum(r[3] for r in rows)])
+    return {"remote": merged, "remote_by_host": parsed, "remote_hosts": len(parsed)}
 
 
 # ── tools ────────────────────────────────────────────────────────────

@@ -17,6 +17,8 @@ Per single-file edit:
 
 The 63k total lines up with the 16ms difference seen over the network, so these five phases account for the per-entry term.
 
+*Note (2026-09-24):* the total includes encode and write, a full synchronous ancestor write, which every cycle did when this was measured. Production cycles now append to the ancestor journal instead, and the example labels its total accordingly. Without the ancestor write the totals above are 0.9, 2.6, 8.2 and 61.1ms.
+
 **At Chromium scale a single saved file costs 227ms of whole-tree work and writes a 40.6 MB file.** Note that this was measured, not extrapolated: a linear projection from the smaller trees predicted ~145ms and would have understated it, because the write cost grows faster than entry count once the ancestor stops fitting comfortably in the page cache. The write column is the most disk-dependent number here and varies between runs; the encode column does not.
 
 ## Where it goes, and what the data already knows

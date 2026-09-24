@@ -12,6 +12,13 @@
 //! they do, a three-way walk could skip them by pointer comparison instead
 //! of descending into them.
 //!
+//! The encode and write columns, and so TOTAL, are a full synchronous
+//! ancestor serialization and write. Production cycles no longer do that:
+//! they append the cycle's changes to the ancestor journal, and rewrite the
+//! whole ancestor only at compaction. TOTAL is therefore what a cycle cost
+//! before the journal, not what one costs now; the `no anc` column is the
+//! same cycle without the full ancestor write.
+//!
 //! Usage: cargo run --release --example cycle_cost -- <root> [root...]
 
 use std::path::PathBuf;
@@ -32,10 +39,18 @@ fn main() {
     }
 
     println!(
-        "{:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12}",
-        "entries", "rescan", "reconc", "validate", "encode", "write", "TOTAL", "shared dirs"
+        "{:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>12}",
+        "entries",
+        "rescan",
+        "reconc",
+        "validate",
+        "encode",
+        "write",
+        "TOTAL",
+        "no anc",
+        "shared dirs"
     );
-    println!("{}", "-".repeat(84));
+    println!("{}", "-".repeat(93));
 
     for root in &roots {
         let staging = std::env::temp_dir().join(format!("cycle-cost-{}", std::process::id()));
@@ -130,21 +145,23 @@ fn main() {
         std::fs::rename(&temporary, &ancestor_path).expect("ancestor publishes");
         let write_ms = started.elapsed().as_secs_f64() * 1000.0;
 
+        let without_ancestor = rescan + reconcile_ms + validate_ms;
         println!(
-            "{:>9} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>7}/{:<4}",
+            "{:>9} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>8.1} {:>7}/{:<4}",
             entries,
             rescan,
             reconcile_ms,
             validate_ms,
             encode_ms,
             write_ms,
-            rescan + reconcile_ms + validate_ms + encode_ms + write_ms,
+            without_ancestor + encode_ms + write_ms,
+            without_ancestor,
             shared,
             total
         );
 
         println!(
-            "{:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8.1} {:>12}",
+            "{:>9} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8.1} {:>8} {:>12}",
             "",
             "",
             "",
@@ -152,12 +169,17 @@ fn main() {
             "",
             "ancestor",
             data.len() as f64 / 1_048_576.0,
-            "MB"
+            "MB",
+            ""
         );
         let _ = std::fs::remove_file(&ancestor_path);
         let _ = std::fs::remove_dir_all(&staging);
     }
 
+    println!();
+    println!("TOTAL includes encode and write: a full synchronous ancestor write,");
+    println!("which production cycles do not do (they append to the ancestor journal).");
+    println!("'no anc' is the same cycle without it.");
     println!();
     println!("'shared dirs' counts directories whose children vector is the same");
     println!("allocation in both snapshots, over the directories compared. A high");

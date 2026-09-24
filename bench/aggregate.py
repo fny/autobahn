@@ -6,9 +6,11 @@ The rules, each answering a way a summary can lie:
 - Delivered results are compared against the *plan* (plan.json in the
   results directory): a job that never reported is listed as missing, not
   silently absent from averages.
-- A tool-run whose tree diverged (failed reconvergence) or errored is
-  *tainted*: its latency is excluded from headline statistics and listed
-  under problems, never quietly blended in.
+- A tool-run whose tree diverged (failed reconvergence) or errored, or
+  whose job ran a different cell than it claims, is *tainted*: one rule
+  (`excluded`) keeps it out of every headline figure — latency, cold sync,
+  resources, bursts — and each table lists what it left out and why,
+  never quietly blending it in.
 - Latency percentiles are computed two ways: pooled over every raw sample
   across repeats (the primary), and median-of-per-run-percentiles (shown
   for comparison). Censored attempts are carried into pooled percentiles
@@ -54,8 +56,26 @@ def run_key(record):
     return (record.get("job"), record.get("tool"))
 
 
-def find_tainted(records):
-    """Tool-runs whose latency must not enter headline statistics, and
+def destination_count(record, plan):
+    """How many destinations a job actually ran with: recorded in its
+    job_start, or, for runs from before the record existed, the width of
+    the group the plan put it on — the driver then used every destination
+    its group offered, whatever the cell asked for."""
+    if "destinations" in record:
+        return len(record["destinations"])
+    pair = record.get("pair") or record.get("spec", {}).get("pair")
+    groups = (plan or {}).get("groups")
+    if not groups or not isinstance(pair, str) or not pair.startswith("pair-"):
+        return None
+    try:
+        width = groups[int(pair[len("pair-"):])][0]
+    except (ValueError, IndexError, TypeError):
+        return None
+    return width - 1  # one source, the rest destinations
+
+
+def find_tainted(records, plan=None):
+    """Tool-runs whose records must not enter headline statistics, and
     why."""
     tainted = {}
     for record in records:
@@ -75,14 +95,15 @@ def find_tainted(records):
             # The offered load was not what the report claims; every
             # latency sample this tool-run produced is suspect.
             tainted.setdefault(key, "background_load_failure")
-        elif kind == "job_start" and "destinations" in record:
+        elif kind == "job_start":
             # A job that ran with more destinations than its cell asked
             # for was a different cell — a fan-out under a pairwise name.
             # This is what turned six jobs of bench-1789947877 into 10x
-            # anomalies before the record existed to say so.
+            # anomalies before the record existed to say so; for that run
+            # the count comes from the plan's groups.
             wanted = record.get("spec", {}).get("cell", {}).get("betas")
-            got = len(record["destinations"])
-            if wanted is not None and got != wanted:
+            got = destination_count(record, plan)
+            if wanted is not None and got is not None and got != wanted:
                 for tool in record.get("spec", {}).get("tools", []):
                     tainted[(record.get("job"), tool)] = (
                         f"destination_width_mismatch:{got}_of_{wanted}")
@@ -97,6 +118,13 @@ def find_tainted(records):
                               "unsettled_idle"):
                     tainted.setdefault((record.get("job"), tool), status)
     return tainted
+
+
+def excluded(record, tainted):
+    """Why this tool-run's record stays out of every headline figure, or
+    None. The single exclusion rule: every aggregation asks it, so no table
+    can admit a run another table dropped."""
+    return tainted.get(run_key(record))
 
 
 def percentile_from_pool(samples, censored, fraction, deadline_ms):
@@ -122,29 +150,53 @@ def median_spread(values):
             "n": len(values)}
 
 
-def windowed(resources, phase, host):
-    """Peak RSS and mean CPU inside one phase window for one host, with
-    the CPU baseline taken from the last sample at or before the window's
-    start and remote timestamps shifted by the measured clock offset."""
-    window = resources.get("phases", {}).get(phase)
-    if not window or "start" not in window or "end" not in window:
-        return None
-    start, end = window["start"], window["end"]
-    series = resources.get("series", {}).get(host, [])
-    if host == "remote":
-        offset = resources.get("clock_offset", {}).get("offset_s", 0.0)
-        series = [[row[0] - offset, row[1], row[2], row[3]] for row in series]
+def window_rows(series, start, end):
+    """The rows inside [start, end], and the CPU baseline: the last row at
+    or before the start (so startup work inside the window is counted), or
+    the first row inside."""
     inside = [row for row in series if start <= row[0] <= end]
-    if len(inside) < 2:
-        return None
     baseline = None
     for row in series:
         if row[0] <= start:
             baseline = row
         else:
             break
-    baseline = baseline or inside[0]
+    return inside, (baseline or (inside[0] if inside else None))
+
+
+def windowed(resources, phase, host):
+    """Peak RSS and mean CPU inside one phase window for one host, with
+    the CPU baseline taken from the last sample at or before the window's
+    start and remote timestamps shifted by the measured clock offset.
+
+    Several destinations' CPU is the sum of each one's own change over the
+    window, from its own samples: cumulative counters from different hosts
+    are never differenced across a merged series."""
+    window = resources.get("phases", {}).get(phase)
+    if not window or "start" not in window or "end" not in window:
+        return None
+    start, end = window["start"], window["end"]
+    offset = resources.get("clock_offset", {}).get("offset_s", 0.0) if host == "remote" else 0.0
+
+    def shifted(series):
+        return [[row[0] - offset, row[1], row[2], row[3]] for row in series]
+
+    series = shifted(resources.get("series", {}).get(host, []))
+    inside, baseline = window_rows(series, start, end)
+    if len(inside) < 2:
+        return None
     peak_rss = max(row[1] for row in inside)
+    per_host = resources.get("series", {}).get("remote_by_host") if host == "remote" else None
+    if per_host:
+        rate = 0.0
+        for own in per_host:
+            own_inside, own_baseline = window_rows(shifted(own), start, end)
+            if len(own_inside) < 2:
+                continue
+            seconds = own_inside[-1][0] - own_baseline[0]
+            if seconds > 0:
+                rate += (own_inside[-1][2] - own_baseline[2]) / 100 / seconds
+        return {"peak_rss_kb": peak_rss, "cpu_percent_of_core": round(rate * 100, 1)}
     jiffies = inside[-1][2] - baseline[2]
     seconds = inside[-1][0] - baseline[0]
     cpu = round(jiffies / 100 / seconds * 100, 1) if seconds > 0 else None
@@ -153,20 +205,20 @@ def windowed(resources, phase, host):
 
 def main():
     records, plan = load(sys.argv[1])
-    tainted = find_tainted(records)
+    tainted = find_tainted(records, plan)
 
     problems = []
     for record in records:
         kind = record.get("measurement")
         if kind in ("tool_error", "hygiene_failure", "abort", "corrupt_line"):
             problems.append(record)
-        elif kind == "job_start" and "destinations" in record and (
-            len(record["destinations"])
-            != record.get("spec", {}).get("cell", {}).get("betas")
+        elif kind == "job_start" and destination_count(record, plan) not in (
+            None, record.get("spec", {}).get("cell", {}).get("betas")
         ):
             problems.append({"measurement": "destination_width_mismatch",
                              "cell": record.get("cell"), "job": record.get("job"),
-                             "destinations": record["destinations"],
+                             "destinations": record.get("destinations",
+                                                        destination_count(record, plan)),
                              "betas": record.get("spec", {}).get("cell", {}).get("betas")})
         elif kind == "workload" and (
             "error" in record or record.get("censored")
@@ -210,14 +262,16 @@ def main():
     pools = defaultdict(lambda: {"samples": [], "censored": 0,
                                  "skipped_ticks": 0,
                                  "per_run_p50": [], "runs": 0, "tainted": 0,
-                                 "deadline_ms": 120000})
+                                 "excluded": [], "deadline_ms": 120000})
     for record in records:
         if record.get("measurement") != "workload":
             continue
         key = (record.get("cell"), record.get("tool"), record.get("direction"))
         pool = pools[key]
-        if run_key(record) in tainted:
+        reason = excluded(record, tainted)
+        if reason:
             pool["tainted"] += 1
+            pool["excluded"].append({"job": record.get("job"), "reason": reason})
             continue
         if "error" in record:
             continue  # already under problems
@@ -235,6 +289,7 @@ def main():
         latency[f"{cell}/{tool}/{direction}"] = {
             "runs": pool["runs"],
             "tainted_runs_excluded": pool["tainted"],
+            "excluded": pool["excluded"],
             "pooled_samples": len(pool["samples"]),
             "censored": pool["censored"],
             # Ticks the measuring agent skipped — at full in-flight
@@ -250,13 +305,20 @@ def main():
         }
 
     # Cold sync: the digest-verified time is the headline; the cheap match
-    # is context. Tainted runs are excluded automatically because
-    # unverified timings never carry digest_verified_s.
-    cold = defaultdict(lambda: {"verified": [], "count_matched": []})
+    # is context. A run the exclusion rule drops is left out even when its
+    # own timing verified: a job that ran with the wrong number of
+    # destinations synchronized a different cell, and its time belongs to
+    # no row.
+    cold = defaultdict(lambda: {"verified": [], "count_matched": [], "excluded": []})
     for record in records:
         if record.get("measurement") != "cold_sync":
             continue
+        reason = excluded(record, tainted)
         for corpus, timing in record.get("timings", {}).items():
+            if reason:
+                key = (record["cell"], record["tool"], corpus)
+                cold[key]["excluded"].append({"job": record.get("job"), "reason": reason})
+                continue
             # A pre-seeded cell starts converged, so there is no cold sync
             # to time: it reports `verified` with no duration at all. The
             # guard below used to read `verified` as proof that a duration
@@ -276,7 +338,7 @@ def main():
     for record in records:
         if record.get("measurement") != "resources":
             continue
-        if run_key(record) in tainted:
+        if excluded(record, tainted):
             continue  # a run that misbehaved yields no headline resources
         if not any(row[3] for host in ("local", "remote")
                    for row in record.get("series", {}).get(host, [])):
@@ -295,7 +357,7 @@ def main():
     # the median of its bursts, and autobahn's own cycle seconds beside it.
     bursts = defaultdict(lambda: {"wall": [], "cycle": [], "files": 0})
     for record in records:
-        if record.get("measurement") != "burst" or run_key(record) in tainted:
+        if record.get("measurement") != "burst" or excluded(record, tainted):
             continue
         walls = [w for w in record.get("walls_s", []) if isinstance(w, (int, float))]
         key = (record["cell"], record["tool"])
@@ -319,6 +381,7 @@ def main():
             f"{cell}/{tool}/{corpus}": {
                 "digest_verified": median_spread(values["verified"]),
                 "count_matched": median_spread(values["count_matched"]),
+                "excluded": values["excluded"],
             }
             for (cell, tool, corpus), values in sorted(cold.items())
         },

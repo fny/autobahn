@@ -908,7 +908,7 @@ impl Shop {
         }
 
         if self.help {
-            lines.extend(help_page(width));
+            lines.extend(help_page());
             return grid(lines, height, width, self.footer());
         }
         if !self.report.supervisor_running {
@@ -1372,8 +1372,7 @@ fn baguette(session: &SessionReport, phase: Option<Phase>, frame: u64) -> String
 /// and "kitchen closed" are good jokes and poor documentation, and a reader
 /// who cannot map them back to scanning and a halted session is reading
 /// decoration.
-fn help_page(width: usize) -> Vec<String> {
-    let inner = width.saturating_sub(4);
+fn help_page() -> Vec<String> {
     let mut lines = vec![
         "  \x1b[1mthe shop\x1b[0m".to_owned(),
         String::new(),
@@ -1456,7 +1455,6 @@ fn help_page(width: usize) -> Vec<String> {
             dim(what)
         ));
     }
-    let _ = inner;
     lines
 }
 

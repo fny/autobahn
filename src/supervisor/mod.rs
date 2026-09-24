@@ -1482,98 +1482,96 @@ impl<'a> Worker<'a> {
     /// One attempt, as [`attempt`](Worker::attempt) makes it: connect if
     /// not connected, then run a cycle.
     fn attempt_once(&mut self) -> Result<(CycleDigest, CycleReport)> {
-        (|| {
-            // Peering first: a handoff is handed on, and a follower
-            // connects nothing.
-            self.hand_on()?;
-            let leadership = self.leadership()?;
-            if self.session.is_none() {
-                // Connecting is its own phase because it is its own wait:
-                // the first connection to a host installs the agent there,
-                // and an unreachable one is where a session sits until it
-                // times out.
-                self.progress.enter(crate::progress::Phase::Connecting);
-                crate::debug!("[{}] connecting", self.plan.display());
-                let connecting = std::time::Instant::now();
-                let mut session = connect(
-                    self.plan,
-                    self.state_root,
-                    self.pool,
-                    self.peering.map(|peering| peering.directory()),
-                    self.one_shot,
-                )?;
-                crate::debug!(
-                    "[{}] connected in {:.2}s",
-                    self.plan.display(),
-                    connecting.elapsed().as_secs_f64()
-                );
-                session.set_progress(self.progress.clone());
-                self.session = Some(session);
+        // Peering first: a handoff is handed on, and a follower
+        // connects nothing.
+        self.hand_on()?;
+        let leadership = self.leadership()?;
+        if self.session.is_none() {
+            // Connecting is its own phase because it is its own wait:
+            // the first connection to a host installs the agent there,
+            // and an unreachable one is where a session sits until it
+            // times out.
+            self.progress.enter(crate::progress::Phase::Connecting);
+            crate::debug!("[{}] connecting", self.plan.display());
+            let connecting = std::time::Instant::now();
+            let mut session = connect(
+                self.plan,
+                self.state_root,
+                self.pool,
+                self.peering.map(|peering| peering.directory()),
+                self.one_shot,
+            )?;
+            crate::debug!(
+                "[{}] connected in {:.2}s",
+                self.plan.display(),
+                connecting.elapsed().as_secs_f64()
+            );
+            session.set_progress(self.progress.clone());
+            self.session = Some(session);
+        }
+        let leading = leadership.is_some();
+        let side = self.peer_side();
+        let session = self.session.as_mut().expect("the session was just created");
+        session.set_leadership(leadership, side);
+        if leading {
+            // The lease before anything else: a host another leader
+            // holds refuses it here, and this attempt ends without
+            // having written a byte — not even the follower's files,
+            // which would otherwise overwrite the real leader's. The
+            // attached alpha gets no files: it has its own.
+            session.present_lease()?;
+            if side == crate::peering::PeerSide::Beta {
+                self.push_files()?;
             }
-            let leading = leadership.is_some();
-            let side = self.peer_side();
-            let session = self.session.as_mut().expect("the session was just created");
-            session.set_leadership(leadership, side);
-            if leading {
-                // The lease before anything else: a host another leader
-                // holds refuses it here, and this attempt ends without
-                // having written a byte — not even the follower's files,
-                // which would otherwise overwrite the real leader's. The
-                // attached alpha gets no files: it has its own.
-                session.present_lease()?;
-                if side == crate::peering::PeerSide::Beta {
-                    self.push_files()?;
+        }
+        let session = self.session.as_mut().expect("the session was just created");
+        if std::mem::take(&mut self.verify_pending) {
+            session.request_verify();
+        }
+        let started = std::time::Instant::now();
+        let outcome = run_cycles(session, &self.plan.display());
+        let elapsed = started.elapsed();
+        // A cycle that found nothing is not worth a line even here.
+        // At a five-second interval an idle session would otherwise
+        // write seventeen thousand lines a day saying so, and the log
+        // rotates on size — debug would evict the very evidence it was
+        // turned on to collect. Anything that did work, took long
+        // enough to be interesting, or failed still gets its line.
+        let worth_saying = match &outcome {
+            Err(_) => true,
+            Ok((digest, _)) => {
+                digest.alpha_transitions > 0
+                    || digest.beta_transitions > 0
+                    || digest.conflicts > 0
+                    || digest.problems > 0
+                    || digest.cycles > 1
+                    || elapsed >= QUIET_CYCLE_CEILING
+            }
+        };
+        if worth_saying {
+            crate::debug!(
+                "[{}] cycle {} in {:.2}s{}",
+                self.plan.display(),
+                match &outcome {
+                    Ok(_) => "finished",
+                    Err(_) => "failed",
+                },
+                elapsed.as_secs_f64(),
+                match &outcome {
+                    Ok((digest, _)) => format!(
+                        ": {} inner cycle(s), {} to alpha, {} to beta, {} conflict(s), \
+                         {} blocked",
+                        digest.cycles,
+                        digest.alpha_transitions,
+                        digest.beta_transitions,
+                        digest.conflicts,
+                        digest.problems
+                    ),
+                    Err(error) => format!(": {error:#}"),
                 }
-            }
-            let session = self.session.as_mut().expect("the session was just created");
-            if std::mem::take(&mut self.verify_pending) {
-                session.request_verify();
-            }
-            let started = std::time::Instant::now();
-            let outcome = run_cycles(session, &self.plan.display());
-            let elapsed = started.elapsed();
-            // A cycle that found nothing is not worth a line even here.
-            // At a five-second interval an idle session would otherwise
-            // write seventeen thousand lines a day saying so, and the log
-            // rotates on size — debug would evict the very evidence it was
-            // turned on to collect. Anything that did work, took long
-            // enough to be interesting, or failed still gets its line.
-            let worth_saying = match &outcome {
-                Err(_) => true,
-                Ok((digest, _)) => {
-                    digest.alpha_transitions > 0
-                        || digest.beta_transitions > 0
-                        || digest.conflicts > 0
-                        || digest.problems > 0
-                        || digest.cycles > 1
-                        || elapsed >= QUIET_CYCLE_CEILING
-                }
-            };
-            if worth_saying {
-                crate::debug!(
-                    "[{}] cycle {} in {:.2}s{}",
-                    self.plan.display(),
-                    match &outcome {
-                        Ok(_) => "finished",
-                        Err(_) => "failed",
-                    },
-                    elapsed.as_secs_f64(),
-                    match &outcome {
-                        Ok((digest, _)) => format!(
-                            ": {} inner cycle(s), {} to alpha, {} to beta, {} conflict(s), \
-                             {} blocked",
-                            digest.cycles,
-                            digest.alpha_transitions,
-                            digest.beta_transitions,
-                            digest.conflicts,
-                            digest.problems
-                        ),
-                        Err(error) => format!(": {error:#}"),
-                    }
-                );
-            }
-            outcome
-        })()
+            );
+        }
+        outcome
     }
 
     /// Concludes an attempt: records its status (while any held lock is

@@ -362,10 +362,7 @@ impl Session {
                     continue;
                 }
                 let exists = match &ancestor {
-                    Some(root) if path.is_empty() => {
-                        let _ = root;
-                        true
-                    }
+                    Some(_) if path.is_empty() => true,
                     Some(root) => {
                         let mut node = Some(root);
                         for part in path.split('/') {
@@ -982,7 +979,6 @@ impl Session {
             if !intent_recorded {
                 self.ancestor_store
                     .intend(&intended, self.remote_involved)?;
-                intent_recorded = true;
             }
             self.progress
                 .begin_applying(reconciliation.alpha_transitions.len() as u64);
@@ -996,7 +992,6 @@ impl Session {
                 .applied_reached(reconciliation.alpha_transitions.len() as u64);
             Some(outcome)
         };
-        let _ = intent_recorded;
         self.at(CyclePoint::BeforeRecord);
 
         #[cfg(test)]

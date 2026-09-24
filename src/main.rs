@@ -2730,7 +2730,6 @@ fn run_diff(
     relative_in(&selection, 0, path.clone())?;
     let pool = autobahn::transport::mux::AgentPool::default();
 
-    let mut shown = 0;
     for (index, plan) in selection.plans.iter().enumerate() {
         let path = relative_in(&selection, index, path.clone())?;
         let (mut alpha, mut beta) = autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
@@ -2740,7 +2739,6 @@ fn run_diff(
             println!("{}: identical on alpha and {}", path, plan.host);
             continue;
         }
-        shown += 1;
         // Both sides go into a private directory of their own under the
         // state root, never the shared temporary directory, where another
         // user could read them, redirect the writes or swap what is
@@ -2778,7 +2776,6 @@ fn run_diff(
             );
         }
     }
-    let _ = shown;
     Ok(())
 }
 
@@ -3902,7 +3899,7 @@ fn run_clean(
         for group in &unclear {
             println!("  whatever belongs to group '{group}', whose settings do not validate");
         }
-        if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
             bail!("nothing to answer the prompt; pass --yes to remove it without asking");
         }
         print!("proceed? [y/N] ");

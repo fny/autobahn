@@ -350,6 +350,22 @@ pub fn version() -> String {
 mod tests {
     use super::*;
 
+    /// The version goes unquoted into the home-relative remote command
+    /// that runs the agent (`transport::install`). That is safe only while
+    /// it holds nothing a shell would interpret, so any change that lets
+    /// it hold more fails here rather than on some remote host.
+    #[test]
+    fn the_version_holds_nothing_a_shell_would_interpret() {
+        let version = version();
+        assert!(!version.is_empty());
+        assert!(
+            version
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._+-".contains(&byte)),
+            "the version {version:?} holds characters outside [0-9A-Za-z._+-]"
+        );
+    }
+
     /// An initialization that differs from a genuine one only where a
     /// test says.
     fn initialize(session: &str, side: &str) -> Initialize {

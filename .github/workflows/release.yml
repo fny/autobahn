@@ -35,7 +35,9 @@ jobs:
   version:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
       - name: The tag must match the package version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -62,10 +64,16 @@ jobs:
             packages: gcc-aarch64-linux-gnu
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: ${{ matrix.target }}
+          persist-credentials: false
+      - name: Rust
+        # rustup is on every hosted runner; no third-party action runs here.
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          rustup toolchain install stable --profile minimal --target "$TARGET"
+          rustup default stable
       - name: Install cross toolchain
         if: matrix.packages
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
@@ -81,7 +89,7 @@ jobs:
         run: cargo build --release --target ${{ matrix.target }}
       - name: Stage artifact
         run: cp target/${{ matrix.target }}/release/autobahn autobahn-${{ matrix.platform }}
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autobahn-${{ matrix.platform }}
           path: autobahn-${{ matrix.platform }}
@@ -98,10 +106,16 @@ jobs:
     runs-on: macos-15
     environment: release
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          persist-credentials: false
+      - name: Rust
+        # rustup is on every hosted runner; no third-party action runs in
+        # the job that holds the signing secrets.
+        run: |
+          rustup toolchain install stable --profile minimal \
+            --target aarch64-apple-darwin --target x86_64-apple-darwin
+          rustup default stable
       - name: Use Xcode 26 if the runner has it
         # Only Xcode 26's actool compiles the Icon Composer bundle. Without
         # it, build.sh falls back to the committed .icns: still the real
@@ -161,7 +175,7 @@ jobs:
         run: |
           security delete-keychain "$RUNNER_TEMP/signing.keychain-db" 2>/dev/null || true
           rm -f "$RUNNER_TEMP/notary.p8" "$RUNNER_TEMP/certificate.p12"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mac
           path: |
@@ -177,11 +191,12 @@ jobs:
       contents: write
     steps:
       # Only for the epoch, which the manifest states beside the version.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
+          persist-credentials: false
           path: source
           sparse-checkout: src/protocol.rs
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
       - name: Assemble the agents bundle and checksums

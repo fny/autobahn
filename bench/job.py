@@ -429,7 +429,7 @@ def clean(summary_text):
     return "<error" not in summary_text and summary_text.endswith("errors=0")
 
 
-def await_cold_sync(corpora, emitter, tool, pre_seeded=False):
+def await_cold_sync(corpora, emitter, tool, pre_seeded=False, started=None):
     """Cheap match first, then the full digest summary as the arbiter.
     Both timestamps are reported; the *verified* one is the headline.
 
@@ -440,7 +440,14 @@ def await_cold_sync(corpora, emitter, tool, pre_seeded=False):
     if pre_seeded:
         return {corpus: {"verified": True, "pre_seeded": True} for corpus in corpora}
     expectations = {c: summary("cheap", f"{CORPUS}/{c}", remote=False) for c in corpora}
-    started = time.monotonic()
+    # From before the tool was started, not after: starting mutagen runs
+    # `mutagen sync create` once per destination, each connecting,
+    # installing its agent and beginning to sync, all before start_tool
+    # returns — ten of them in a row, for a fan-out — while starting
+    # autobahn only launches the process. A clock started afterwards hid
+    # mutagen's setup and counted all of autobahn's: coldsync-5k-fan
+    # measured mutagen at 1.7 s for ten destinations against 3.5 s for one.
+    started = started if started is not None else time.monotonic()
     timings = {}
     remaining = set(corpora)
     while remaining and time.monotonic() - started < COLD_SYNC_TIMEOUT_SECONDS:
@@ -850,8 +857,10 @@ def run_tool(tool, cell, emitter, nonce):
 
         status = "ok"
         phase("cold_sync")
+        started = time.monotonic()
         start_tool(tool, corpora)
-        timings = await_cold_sync(corpora, emitter, tool, pre_seeded=pre_seeded)
+        timings = await_cold_sync(corpora, emitter, tool, pre_seeded=pre_seeded,
+                                  started=started)
         phase_end("cold_sync")
         emitter.emit({"measurement": "cold_sync", "tool": tool, "timings": timings})
         if not all(t.get("verified") for t in timings.values()):

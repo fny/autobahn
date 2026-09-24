@@ -132,7 +132,7 @@ pub enum Stream {
 /// wrote it, which is a session's worker.
 #[doc(hidden)]
 pub fn emit(stream: Stream, marker: &str, arguments: std::fmt::Arguments) {
-    let line = format!("{} {marker}{arguments}\n", timestamp());
+    let line = log_line(&timestamp(), marker, &arguments.to_string());
     let written = match stream {
         Stream::Out => write_line(&mut std::io::stdout().lock(), &line),
         Stream::Err => write_line(&mut std::io::stderr().lock(), &line),
@@ -140,6 +140,14 @@ pub fn emit(stream: Stream, marker: &str, arguments: std::fmt::Arguments) {
     if !written {
         FAILED.store(true, Ordering::Relaxed);
     }
+}
+
+/// One log line: the stamp, the marker, and the message with its control
+/// characters escaped. A message carries names and errors from elsewhere —
+/// a file name may hold a newline or an escape sequence — and one event is
+/// always one line, which nothing in it can split, forge or repaint.
+fn log_line(stamp: &str, marker: &str, message: &str) -> String {
+    format!("{stamp} {marker}{}\n", crate::text::display_safe(message))
 }
 
 /// Writes a line and flushes it, saying whether both worked.
@@ -242,6 +250,27 @@ mod tests {
         let mut kept = Vec::new();
         assert!(write_line(&mut kept, "kept\n"));
         assert_eq!(kept, b"kept\n");
+    }
+
+    #[test]
+    fn one_event_is_one_line_whatever_its_names_hold() {
+        let name = "report\n2026-09-24 07:00:00 [work@host] synchronized\x1b]52;c;cHduZWQ=\x07.txt";
+        let line = log_line(
+            "2026-09-24 07:00:01",
+            "",
+            &format!("[work@host] conflict: {name}"),
+        );
+        assert_eq!(line.matches('\n').count(), 1, "{line:?}");
+        assert!(line.ends_with('\n'));
+        assert!(!line.contains('\x1b') && !line.contains('\x07'), "{line:?}");
+        assert!(
+            line.contains("report\\n2026"),
+            "the newline reads as an escape: {line:?}"
+        );
+        assert_eq!(
+            log_line("2026-09-24 07:00:01", "debug: ", "plain"),
+            "2026-09-24 07:00:01 debug: plain\n"
+        );
     }
 
     #[test]

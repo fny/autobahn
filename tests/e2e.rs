@@ -537,6 +537,45 @@ fn root_deletion_halts_for_safety() {
     assert!(harness.beta.join("dir0/nested/file0.txt").exists());
 }
 
+/// M-33: the one-way modes built a deletion's expected old content from
+/// beta's raw scan, ignored entries included. The endpoint refused to
+/// remove the untracked `.git` it was told to expect, the directory
+/// survived, and the next cycle proposed the same deletion, forever.
+#[test]
+fn a_one_way_deletion_goes_through_ignored_content_on_beta() {
+    for mode in [SyncMode::OneWayReplica, SyncMode::OneWaySafe] {
+        let mut harness = Harness::new(mode, Transport::Local).with_ignores(&[".git"]);
+        fs::create_dir_all(harness.alpha.join("d")).unwrap();
+        fs::write(harness.alpha.join("d/f.txt"), "content").unwrap();
+        fs::write(harness.alpha.join("keep.txt"), "stays").unwrap();
+        harness.settle("initial");
+        assert!(harness.beta.join("d/f.txt").exists(), "{mode:?}");
+        fs::create_dir_all(harness.beta.join("d/.git")).unwrap();
+        fs::write(harness.beta.join("d/.git/HEAD"), "ref: refs/heads/main").unwrap();
+        harness.settle("beta's ignored content");
+
+        fs::remove_dir_all(harness.alpha.join("d")).unwrap();
+        let mut proposed = 0;
+        for _ in 0..2 {
+            let report = harness.cycle_ok();
+            proposed += report.beta_transitions;
+            if !harness.beta.join("d").exists() {
+                break;
+            }
+        }
+        assert!(
+            !harness.beta.join("d").exists(),
+            "{mode:?}: the deletion did not go through within two cycles"
+        );
+        let report = harness.cycle_ok();
+        proposed += report.beta_transitions;
+        assert!(
+            proposed < 3,
+            "{mode:?}: the deletion was proposed {proposed} times"
+        );
+    }
+}
+
 #[test]
 fn emptied_root_halts_for_safety() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);

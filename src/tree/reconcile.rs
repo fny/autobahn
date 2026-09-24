@@ -114,6 +114,16 @@ fn blocking(
         .collect()
 }
 
+/// The synchronizable part of a side's content at a path: what a
+/// transition on that side carries as `new`, and what it must name as
+/// `old`. The endpoint checks every entry it finds against `old` before
+/// it acts, and it never removes an untracked entry it was told to
+/// expect, so an `old` taken from the raw scan, ignored entries and all,
+/// is refused every cycle and the transition comes back forever (M-33).
+fn synchronized(side: Option<&Node>) -> Option<Node> {
+    side.and_then(Node::synchronizable_subtree)
+}
+
 /// Indicates whether or not optional content is nil-or-untracked.
 fn nil_or_untracked(node: Option<&Node>) -> bool {
     match node {
@@ -243,7 +253,7 @@ impl Reconciler {
                     let change = |side: Option<&Node>| Change {
                         path: path.to_owned(),
                         old: ancestor.cloned(),
-                        new: side.and_then(Node::synchronizable_subtree),
+                        new: synchronized(side),
                     };
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
@@ -351,8 +361,8 @@ impl Reconciler {
         beta: Option<&Node>,
     ) {
         // Extract the synchronizable portion of each side.
-        let alpha_sync = alpha.and_then(Node::synchronizable_subtree);
-        let beta_sync = beta.and_then(Node::synchronizable_subtree);
+        let alpha_sync = synchronized(alpha);
+        let beta_sync = synchronized(beta);
 
         // Classic three-way merge: if one side is unmodified, propagate the
         // other side's synchronizable content (unless the unmodified side
@@ -609,7 +619,7 @@ impl Reconciler {
         // overwrite it with alpha's content (unless beta carries
         // unsynchronizable content, which indicates a conflict, reported
         // with a synthetic alpha change).
-        let beta_sync = beta.and_then(Node::synchronizable_subtree);
+        let beta_sync = synchronized(beta);
         let beta_non_deletion = non_deletion_changes(&diff_at(path, ancestor, beta_sync.as_ref()));
         if beta_non_deletion.is_empty() {
             let beta_unsynchronizable = blocking(
@@ -631,8 +641,8 @@ impl Reconciler {
             } else {
                 self.result.beta_transitions.push(Change {
                     path: path.to_owned(),
-                    old: beta.cloned(),
-                    new: alpha.and_then(Node::synchronizable_subtree),
+                    old: beta_sync,
+                    new: synchronized(alpha),
                 });
             }
             return;
@@ -706,7 +716,7 @@ impl Reconciler {
         // Exact mirroring: overwrite beta with alpha's synchronizable
         // content, unless beta carries unsynchronizable content (which can't
         // be removed), in which case indicate a conflict.
-        let beta_sync = beta.and_then(Node::synchronizable_subtree);
+        let beta_sync = synchronized(beta);
         let beta_unsynchronizable = blocking(
             path,
             ancestor,
@@ -726,8 +736,8 @@ impl Reconciler {
         } else {
             self.result.beta_transitions.push(Change {
                 path: path.to_owned(),
-                old: beta.cloned(),
-                new: alpha.and_then(Node::synchronizable_subtree),
+                old: beta_sync,
+                new: synchronized(alpha),
             });
         }
     }
@@ -1797,6 +1807,40 @@ mod tests {
                 show_changes(&result.beta_transitions),
                 result.conflicts.iter().map(|c| c.root.as_str()).collect::<Vec<_>>(),
             );
+        }
+
+        /// A transition expects exactly what its side's synchronizable
+        /// content holds at its path, which is what the endpoint validates
+        /// before it acts. An expectation that names an untracked entry is
+        /// refused there every time, and the same transition comes back
+        /// every cycle (M-33).
+        #[test]
+        fn a_transition_expects_what_its_side_synchronizes(
+            ancestor_spec in instructions(),
+            alpha_spec in instructions(),
+            beta_spec in instructions(),
+            mode_index in 0usize..6,
+        ) {
+            let mode = MODES[mode_index];
+            let (ancestor, alpha, beta) =
+                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
+            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            for (side, root, transitions) in [
+                ("alpha", alpha.as_ref(), &result.alpha_transitions),
+                ("beta", beta.as_ref(), &result.beta_transitions),
+            ] {
+                for change in transitions {
+                    let held = crate::tree::node_at(root, &change.path)
+                        .and_then(Node::synchronizable_subtree);
+                    proptest::prop_assert!(
+                        trees_equal(change.old.as_ref(), held.as_ref()),
+                        "{mode:?}: {side} transition at '{}' expects {} but the side holds {}",
+                        change.path,
+                        show(change.old.as_ref()),
+                        show(held.as_ref())
+                    );
+                }
+            }
         }
 
         /// The one-way modes never write to alpha, whatever they see.

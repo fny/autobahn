@@ -1071,8 +1071,12 @@ fn serve_send<W: Write>(
     channel: u32,
     response: Response,
 ) -> Result<()> {
+    let bytes = encode_frame(&protocol::MuxResponse { channel, response })
+        .context("unable to send response")?;
     let mut output = output.lock().expect("the output lock is never poisoned");
-    send_frame(&mut *output, &protocol::MuxResponse { channel, response })
+    output
+        .write_all(&bytes)
+        .and_then(|()| output.flush())
         .context("unable to send response")
 }
 
@@ -1268,6 +1272,17 @@ const SCRATCH_RETENTION_LIMIT: usize = 16 * 1024 * 1024;
 struct FrameScratch {
     encoded: Vec<u8>,
     compressed: Vec<u8>,
+}
+
+/// Encodes a message into the exact bytes `send_frame` would write, so a
+/// caller sharing its writer can encode and compress *before* taking the
+/// writer's lock and hold it only to write. Held across the encoding, the
+/// lock made every small request to a host wait out the compression of
+/// whatever 8 MiB transfer batch was ahead of it.
+pub(crate) fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    send_frame(&mut bytes, message)?;
+    Ok(bytes)
 }
 
 fn send_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {

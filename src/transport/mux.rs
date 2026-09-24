@@ -397,11 +397,18 @@ impl Drop for AgentChannel {
 impl Shared {
     /// Sends one frame through the shared writer.
     fn send(&self, frame: &MuxRequest) -> Result<()> {
+        // Encoded and compressed before the lock is taken: see
+        // `encode_frame`.
+        let bytes = super::encode_frame(frame)?;
         let mut writer = self
             .writer
             .lock()
             .expect("the writer lock is never poisoned");
-        super::send_frame(&mut *writer, frame)
+        use std::io::Write;
+        writer
+            .write_all(&bytes)
+            .and_then(|()| writer.flush())
+            .context("unable to write frame")
     }
 
     /// Returns the recorded death reason (or a generic disconnection).

@@ -434,9 +434,7 @@ impl Shop<'_> {
         // One command for the whole row, not one per path. Resolution reads
         // each losing side once for every path it is given, so a row of
         // twenty conflicts costs one scan this way and twenty the other.
-        let mut command = vec!["resolve".to_owned(), group.clone()];
-        command.extend(pending.paths.iter().cloned());
-        command.extend(["--keep".to_owned(), keep, "--yes".to_owned()]);
+        let command = autobahn::invocation::resolve_command(&group, &keep, &pending.paths);
         self.spawn(vec![command], told, "could not settle".to_owned());
         // The marks named this settlement; they do not carry into the next.
         self.marked.clear();
@@ -497,13 +495,15 @@ impl Shop<'_> {
         *working.lock().unwrap_or_else(|error| error.into_inner()) = Some("running".into());
         std::thread::spawn(move || {
             let mut told = done;
-            for mut arguments in commands {
-                arguments.push("--state-root".into());
-                arguments.push(state_root.clone());
+            for arguments in commands {
+                // Straight after the subcommand's name: a command may end
+                // in `--` and paths, after which these would be paths.
+                let mut options = vec!["--state-root".to_owned(), state_root.clone()];
                 if let Some(config) = &config {
-                    arguments.push("--config".into());
-                    arguments.push(config.to_string_lossy().into_owned());
+                    options.push("--config".into());
+                    options.push(config.to_string_lossy().into_owned());
                 }
+                let arguments = autobahn::invocation::with_options(&arguments, &options);
                 match std::process::Command::new(&executable)
                     .args(&arguments)
                     .output()

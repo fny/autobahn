@@ -5169,6 +5169,65 @@ mod tests {
         );
     }
 
+    /// A path that looks like a flag, built into a `resolve` by the shop
+    /// or the tray, reaches the command as a path. Checked against the
+    /// real command-line definition, with the shared options put where
+    /// both callers put them.
+    #[test]
+    fn a_path_named_like_a_flag_is_passed_as_a_path() {
+        use clap::Parser;
+        let paths = vec![
+            "--all".to_owned(),
+            "-k".to_owned(),
+            "-y".to_owned(),
+            "--keep=alpha".to_owned(),
+        ];
+        let command = autobahn::invocation::resolve_command("-g", "b1", &paths);
+        let command = autobahn::invocation::with_options(
+            &command,
+            &["--state-root".to_owned(), "/tmp/state".to_owned()],
+        );
+        let cli = super::Cli::try_parse_from(std::iter::once("autobahn".to_owned()).chain(command))
+            .expect("parses");
+        match cli.command {
+            super::Command::Resolve {
+                selector,
+                paths: parsed,
+                keep,
+                all,
+                yes,
+                state_root,
+                ..
+            } => {
+                assert_eq!(selector, "-g");
+                assert_eq!(parsed, paths);
+                assert_eq!(keep, "b1");
+                assert!(!all, "a file named --all set the flag");
+                assert!(yes);
+                assert_eq!(state_root, Some(std::path::PathBuf::from("/tmp/state")));
+            }
+            _ => panic!("not a resolve"),
+        }
+
+        // And `diff` from the tray the same way.
+        let command = autobahn::invocation::diff_command("g", "--host", "h");
+        let cli = super::Cli::try_parse_from(std::iter::once("autobahn".to_owned()).chain(command))
+            .expect("parses");
+        match cli.command {
+            super::Command::Diff {
+                selector,
+                path,
+                host,
+                ..
+            } => {
+                assert_eq!(selector, "g");
+                assert_eq!(path.as_deref(), Some("--host"));
+                assert_eq!(host.as_deref(), Some("h"));
+            }
+            _ => panic!("not a diff"),
+        }
+    }
+
     /// The ignore suggestion has to name something generated.
     #[test]
     fn an_ignore_is_suggested_only_for_a_generated_directory() {

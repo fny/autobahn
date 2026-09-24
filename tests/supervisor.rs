@@ -2284,6 +2284,44 @@ fn keeping_beta_in_the_strict_mode_is_refused() {
     assert_eq!(read(&beta, "keep.txt"), "beta's edit");
 }
 
+/// A file named `--all`, settled the way the shop and the tray settle a
+/// row, settles that file and nothing else. Passed without a separator,
+/// the name was parsed as the flag and every conflict in the group was
+/// settled.
+#[test]
+fn settling_a_file_named_like_a_flag_settles_only_that_file() {
+    let world = World::new();
+    let (config, alpha, b1, _) = three_way_conflict(&world);
+    write(&alpha, "--all", "a");
+    write(&b1, "--all", "b");
+    cli(&world, &config, &["sync"]);
+    let (_, listed) = cli(&world, &config, &["conflicts"]);
+    assert!(listed.contains("--all"), "{listed}");
+
+    let command = autobahn::invocation::resolve_command("r", "alpha", &["--all".to_owned()]);
+    let command = autobahn::invocation::with_options(
+        &command,
+        &[
+            "--config".to_owned(),
+            config.to_string_lossy().into_owned(),
+            "--state-root".to_owned(),
+            world.state_root().to_string_lossy().into_owned(),
+        ],
+    );
+    let output = std::process::Command::new(agent_binary())
+        .args(&command)
+        .output()
+        .expect("the CLI runs");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{text}");
+    cli(&world, &config, &["sync"]);
+    assert_eq!(read(&b1, "--all"), "a");
+    // The other conflict is untouched.
+    assert_eq!(read(&b1, "notes.txt"), "v-b1");
+    let (_, after) = cli(&world, &config, &["conflicts"]);
+    assert!(after.contains("notes.txt"), "{after}");
+}
+
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();

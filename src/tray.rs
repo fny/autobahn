@@ -728,15 +728,21 @@ fn run_action(
         Action::Resolve { group, path, keep } => {
             // The menu item is the confirmation, and nothing here could
             // answer a prompt.
-            command.args(["resolve", &group, &path, "--keep", &keep, "--yes"]);
-            command.args(&common);
+            let resolve = crate::invocation::resolve_command(&group, &keep, &[path]);
+            command.args(crate::invocation::with_options(
+                &resolve.into_iter().map(Into::into).collect::<Vec<_>>(),
+                &common,
+            ));
             run_quiet(command)
         }
         Action::Diff { group, path, host } => {
             // The diff is written to a file and opened with whatever the
             // desktop opens text with — a menu cannot show one.
-            command.args(["diff", &group, &path, "--host", &host]);
-            command.args(&common);
+            let diff = crate::invocation::diff_command(&group, &path, &host);
+            command.args(crate::invocation::with_options(
+                &diff.into_iter().map(Into::into).collect::<Vec<_>>(),
+                &common,
+            ));
             match command.output() {
                 Ok(output) => {
                     let file = std::env::temp_dir()

@@ -592,6 +592,7 @@ impl Supervisor {
                         let mut worker =
                             Worker::new(plan, &self.state_root, &self.pool, self.verbose);
                         worker.peering = self.peering.as_ref();
+                        worker.one_shot = true;
                         let result = worker.attempt();
                         let recorded = worker.conclude(&result);
                         let result = match (result, recorded) {
@@ -1292,6 +1293,9 @@ struct Worker<'a> {
     pushed: Option<[u8; 32]>,
     /// The handoff this worker has already handed on, if any.
     handed: Option<(String, u64)>,
+    /// Whether this worker runs a single pass, which never waits for a
+    /// change, so its endpoints watch nothing.
+    one_shot: bool,
 }
 
 impl<'a> Worker<'a> {
@@ -1316,6 +1320,7 @@ impl<'a> Worker<'a> {
             peering: None,
             pushed: None,
             handed: None,
+            one_shot: false,
         }
     }
 
@@ -1494,6 +1499,7 @@ impl<'a> Worker<'a> {
                     self.state_root,
                     self.pool,
                     self.peering.map(|peering| peering.directory()),
+                    self.one_shot,
                 )?;
                 crate::debug!(
                     "[{}] connected in {:.2}s",
@@ -1959,6 +1965,7 @@ fn connect(
     state_root: &Path,
     pool: &AgentPool,
     peering_directory: Option<&Path>,
+    one_shot: bool,
 ) -> Result<Session> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
@@ -1985,7 +1992,7 @@ fn connect(
     // pointed at different state directories cannot own the same trees.
     let pair_lock =
         crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
-    let (alpha, beta) = open_endpoints(plan, state_root, pool)?;
+    let (alpha, beta) = open_session_endpoints(plan, state_root, pool, one_shot)?;
     let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);
@@ -2005,6 +2012,18 @@ pub fn open_endpoints(
     plan: &SessionPlan,
     state_root: &Path,
     pool: &AgentPool,
+) -> Result<(Box<dyn Endpoint + Send>, Box<dyn Endpoint + Send>)> {
+    open_session_endpoints(plan, state_root, pool, false)
+}
+
+/// Opens a plan's two endpoints as [`open_endpoints`] does. `one_shot`
+/// says the session will never wait for a change — a single pass — so
+/// neither endpoint, local or on an agent, watches its root.
+fn open_session_endpoints(
+    plan: &SessionPlan,
+    state_root: &Path,
+    pool: &AgentPool,
+    one_shot: bool,
 ) -> Result<(Box<dyn Endpoint + Send>, Box<dyn Endpoint + Send>)> {
     let identifier = plan.identifier();
     let state_directory = state_root.join("sessions").join(&identifier);
@@ -2078,7 +2097,7 @@ pub fn open_endpoints(
                         max_entry_count: plan.max_entry_count,
                         default_owner: plan.default_owner.clone(),
                         default_group: plan.default_group.clone(),
-                        one_shot: false,
+                        one_shot,
                         ignore_mounts: plan.ignore_mounts,
                     },
                 )?))
@@ -2102,6 +2121,7 @@ pub fn open_endpoints(
                     default_owner: plan.default_owner.clone(),
                     default_group: plan.default_group.clone(),
                     ignore_mounts: plan.ignore_mounts,
+                    one_shot,
                 };
                 // Peering: an endpoint reached by attachment is a
                 // connection the peer opened to this supervisor. None
@@ -2925,6 +2945,75 @@ pub fn read_status(state_root: &Path, identifier: &str) -> Result<Option<Session
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plans one session whose beta is reached by attachment, and offers
+    /// it a scripted agent that reports the initialization it is sent.
+    fn attached_session(
+        keep: &Path,
+    ) -> (
+        Vec<SessionPlan>,
+        crate::transport::Connection,
+        std::sync::mpsc::Receiver<crate::protocol::Initialize>,
+    ) {
+        let alpha = keep.join("alpha");
+        std::fs::create_dir_all(&alpha).expect("alpha should be creatable");
+        let text = format!(
+            "[groups.once]\nalpha = \"{}\"\nmode = \"two-way-safe\"\nbetas = [\"alpha@attached:{}\"]\n",
+            alpha.display(),
+            keep.join("beta").display()
+        );
+        let plans = crate::config::Config::parse(Path::new("config.toml"), &text)
+            .and_then(|config| config.plans())
+            .expect("the plan loads");
+        let (client, mut scripted) = crate::transport::tests::connected_pair();
+        let (sent, initialized) = std::sync::mpsc::channel();
+        std::thread::spawn(move || -> Result<()> {
+            let _: crate::protocol::Handshake = scripted.receive()?;
+            scripted.send(&crate::transport::local_handshake())?;
+            let crate::protocol::MuxRequest::Open {
+                channel,
+                initialize,
+            } = scripted.receive()?
+            else {
+                anyhow::bail!("expected an open");
+            };
+            let _ = sent.send(initialize);
+            scripted.send(&crate::protocol::MuxResponse::Response {
+                channel,
+                response: crate::protocol::Response::Error("scripted".into()),
+            })?;
+            while scripted.receive::<crate::protocol::MuxRequest>().is_ok() {}
+            Ok(())
+        });
+        (plans, client, initialized)
+    }
+
+    /// A single pass never waits for a change, so it asks its agents not
+    /// to watch their roots; `resolve` and `diff`, which open endpoints
+    /// through `open_endpoints`, are left as they were.
+    #[test]
+    fn a_single_pass_asks_its_agents_not_to_watch() {
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let (plans, client, initialized) = attached_session(keep.path());
+        let supervisor = Supervisor::new(plans, keep.path().join("state"), false);
+        supervisor.offer_attachment("alpha", client);
+        let outcomes = supervisor.run_once();
+        assert!(outcomes[0].result.is_err(), "the scripted agent refuses");
+        let initialize = initialized
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the agent was sent an initialization");
+        assert!(initialize.one_shot, "a single pass asked for a watch");
+
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let (plans, client, initialized) = attached_session(keep.path());
+        let pool = AgentPool::default();
+        pool.offer_attachment("alpha", client);
+        let _ = open_endpoints(&plans[0], &keep.path().join("state"), &pool);
+        let initialize = initialized
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the agent was sent an initialization");
+        assert!(!initialize.one_shot);
+    }
 
     #[test]
     fn a_rejected_key_is_not_a_sleeping_laptop() {

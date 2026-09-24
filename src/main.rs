@@ -1061,6 +1061,8 @@ fn run_sync(
         default_owner: None,
         default_group: None,
         ignore_mounts: true,
+        // As for the local endpoints above.
+        one_shot: !watch,
     };
     let endpoint = |spec: &str,
                     agent: Option<String>,

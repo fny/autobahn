@@ -1160,8 +1160,8 @@ fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Res
         max_entry_count: initialize.max_entry_count,
         default_owner: initialize.default_owner.clone(),
         default_group: initialize.default_group.clone(),
-        // An agent serves sessions that wait, so its roots are watched.
-        one_shot: false,
+        // A session that waits has its root watched; a single pass does not.
+        one_shot: initialize.one_shot,
         ignore_mounts: initialize.ignore_mounts,
     };
     LocalEndpoint::new(root, staging_root, options)
@@ -1701,6 +1701,7 @@ pub(crate) mod tests {
                 ignore_mounts: true,
                 default_owner: None,
                 default_group: None,
+                one_shot: false,
             };
             let error = create_endpoint(&initialize, &Ok(state.clone()))
                 .err()
@@ -1741,6 +1742,7 @@ pub(crate) mod tests {
             ignore_mounts: true,
             default_owner: None,
             default_group: None,
+            one_shot: false,
         };
         create_endpoint(&initialize, &Ok(keep.path().join("state")))
             .expect("a genuine initialization is served");
@@ -2524,6 +2526,7 @@ pub(crate) mod tests {
                     ignore_mounts: true,
                     default_owner: None,
                     default_group: None,
+                    one_shot: false,
                 },
             })
             .expect("open");

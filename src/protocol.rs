@@ -69,6 +69,10 @@ pub struct Initialize {
     /// The group (name or `id:N`) for created entries, resolved on the
     /// agent's host (`None` to leave ownership alone).
     pub default_group: Option<String>,
+    /// Whether the session will never wait for a change — a single pass —
+    /// so the agent registers no watcher for the root. Registering one
+    /// walks the whole tree once more, for nothing.
+    pub one_shot: bool,
 }
 
 /// Whether a string is a session identifier as
@@ -362,6 +366,7 @@ mod tests {
             ignore_mounts: true,
             default_owner: None,
             default_group: None,
+            one_shot: false,
         }
     }
 

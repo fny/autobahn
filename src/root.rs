@@ -138,6 +138,7 @@ mod tests {
             ignore_mounts: true,
             default_owner: None,
             default_group: None,
+            one_shot: false,
         }
     }
 

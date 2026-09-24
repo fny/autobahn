@@ -172,6 +172,7 @@ impl Harness {
                             ignore_mounts: true,
                             default_owner: None,
                             default_group: None,
+                            one_shot: false,
                         },
                     )
                     .expect("connect agent"),
@@ -832,6 +833,7 @@ impl Harness {
                     ignore_mounts: true,
                     default_owner: None,
                     default_group: None,
+                    one_shot: false,
                 },
             )?);
             let alpha: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
@@ -982,6 +984,7 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
                 ignore_mounts: true,
                 default_owner: None,
                 default_group: None,
+                one_shot: false,
             },
         )
         .expect("connect agent")

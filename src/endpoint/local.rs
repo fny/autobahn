@@ -7431,6 +7431,7 @@ mod supply_receive_tests {
                 ignore_mounts: true,
                 default_owner: None,
                 default_group: None,
+                one_shot: false,
             })
             .expect("open");
         channel.exchange(Request::Scan).expect("the scan exchanges");

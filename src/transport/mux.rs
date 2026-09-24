@@ -1124,6 +1124,7 @@ mod tests {
             ignore_mounts: true,
             default_owner: None,
             default_group: None,
+            one_shot: false,
         }
     }
 
@@ -1267,6 +1268,42 @@ mod tests {
         drop(channel);
         drop(connection);
         assert_clean_exit(&finished);
+    }
+
+    /// A channel opened for a single pass registers no watcher, so its
+    /// change wait says the root is not watched; a channel for a session
+    /// that waits does.
+    #[test]
+    fn a_one_shot_channel_watches_nothing() {
+        for one_shot in [true, false] {
+            let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+            let root = keep.path().join("root");
+            std::fs::create_dir_all(&root).expect("root should be creatable");
+            std::fs::create_dir_all(keep.path().join("state").join("staging"))
+                .expect("staging should be creatable");
+            let (client, finished) = spawned_agent(&keep.path().join("state"));
+            let connection = AgentConnection::connect(client).expect("unable to connect");
+            let mut channel = connection
+                .open(Initialize {
+                    one_shot,
+                    ..initialize(&root)
+                })
+                .expect("open");
+            channel.exchange(Request::Scan).expect("the scan exchanges");
+            let Response::AwaitChanges { watching, .. } = channel
+                .exchange(Request::AwaitChanges {
+                    milliseconds: 50,
+                    since: None,
+                })
+                .expect("the wait exchanges")
+            else {
+                panic!("expected a change wait's answer");
+            };
+            assert_eq!(watching, !one_shot, "one_shot {one_shot}");
+            drop(channel);
+            drop(connection);
+            assert_clean_exit(&finished);
+        }
     }
 
     #[test]

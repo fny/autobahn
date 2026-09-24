@@ -959,7 +959,7 @@ impl LocalEndpoint {
             .open_scanned(source, digest)
             .map_err(|error| anyhow::anyhow!(error))?;
         let (temporary, output) = self.staging_temporary("copy")?;
-        let copied = match copy_verifying(&mut input, output, digest) {
+        let copied = match copy_verifying(&mut input, output, digest, self.progress.as_deref()) {
             Ok(copied) => copied,
             Err(failure) => {
                 let _ = fs::remove_file(&temporary);
@@ -3923,7 +3923,7 @@ fn copy_into_private(
     progress: Option<&crate::progress::SideProgress>,
 ) -> Result<bool> {
     let output = crate::fsutil::private_file(temporary)?;
-    copy_verifying(input, output, digest).map_err(|failure| match failure {
+    copy_verifying(input, output, digest, progress).map_err(|failure| match failure {
         CopyFailure::Read(error) => {
             anyhow::Error::new(error).context(format!("unable to read {}", source.display()))
         }
@@ -3948,6 +3948,7 @@ fn copy_verifying(
     input: &mut impl Read,
     mut output: File,
     digest: &Digest,
+    progress: Option<&crate::progress::SideProgress>,
 ) -> Result<bool, CopyFailure> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];

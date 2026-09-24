@@ -25,7 +25,7 @@
 //!   abandoned) transition is never mistaken for synchronizable content.
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fs::{self, File, Metadata, Permissions};
+use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Cursor, ErrorKind, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{symlink, DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -761,21 +761,36 @@ impl LocalEndpoint {
     /// begins after changes that may already have happened), when the
     /// watcher's record is incomplete, and periodically regardless — see
     /// [`FULL_SCAN_INTERVAL`].
+    /// The digest and scan metadata the last scan recorded for a regular
+    /// file at a root-relative path, or `None` when it recorded anything
+    /// else, or nothing.
+    ///
+    /// The scanner records a file only after `lstat` shows a regular file,
+    /// and never descends through a symbolic link or into an ignored
+    /// directory, so a path this answers for lies inside the root, holds no
+    /// `..`, crosses no symlinked parent and is not ignored. That makes it
+    /// the gate for anything a peer names: supply, and base signatures.
+    fn snapshot_file(&self, path: &str) -> Option<(&Digest, &FileMetadata)> {
+        let mut node = self.last_snapshot.as_ref()?.root.as_ref()?;
+        if path.is_empty() {
+            return None;
+        }
+        for component in path.split('/') {
+            node = node.child(component)?;
+        }
+        match &node.content {
+            Content::File {
+                digest, metadata, ..
+            } => Some((digest, metadata)),
+            _ => None,
+        }
+    }
+
     /// Reports whether the last scan recorded a regular file at a
     /// root-relative path — the gate for base-signature computation, saving
     /// a filesystem probe for every path known to hold nothing usable.
     fn snapshot_records_file(&self, path: &str) -> bool {
-        let mut node = match self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
-            Some(root) => root,
-            None => return false,
-        };
-        for component in path.split('/') {
-            match node.child(component) {
-                Some(child) => node = child,
-                None => return false,
-            }
-        }
-        matches!(node.content, Content::File { .. })
+        self.snapshot_file(path).is_some()
     }
 
     /// Attempts to satisfy a content request from a file that already exists
@@ -824,14 +839,15 @@ impl LocalEndpoint {
         pending.push_back(TransferFrame::Begin {
             digest: need.request.digest,
         });
-        let error = match self.try_supply(&need.request.path, &need.signature, pending) {
+        let digest = &need.request.digest;
+        let error = match self.try_supply(&need.request.path, digest, &need.signature, pending) {
             Ok(()) => None,
             Err(primary_error) => {
                 let recovered = self
-                    .digest_paths(&need.request.digest, &need.request.path)
+                    .digest_paths(digest, &need.request.path)
                     .into_iter()
                     .any(|candidate| {
-                        self.try_supply(&candidate, &need.signature, pending)
+                        self.try_supply(&candidate, digest, &need.signature, pending)
                             .is_ok()
                     });
                 (!recovered).then_some(primary_error)
@@ -849,11 +865,12 @@ impl LocalEndpoint {
     fn try_supply(
         &self,
         path: &str,
+        digest: &Digest,
         signature: &Signature,
         pending: &mut VecDeque<TransferFrame>,
     ) -> Result<(), String> {
         let mark = pending.len();
-        let result = self.supply_from(path, signature, pending);
+        let result = self.supply_from(path, digest, signature, pending);
         if result.is_err() {
             pending.truncate(mark);
         }
@@ -861,21 +878,31 @@ impl LocalEndpoint {
     }
 
     /// The single-path supply attempt behind [`try_supply`](Self::try_supply).
+    ///
+    /// A peer names the path, so it is supplied only if this side's last
+    /// scan recorded a regular file there with exactly the requested
+    /// digest (see [`snapshot_file`](Self::snapshot_file)): nothing outside
+    /// the root, through a symbolic link, ignored, or other than what was
+    /// asked for can leave. The file is then opened without following a
+    /// final symbolic link and without blocking on a FIFO, and must still
+    /// be the regular file of the scanned inode and size; at most the
+    /// scanned size is read, however the file grows.
     fn supply_from(
         &self,
         path: &str,
+        digest: &Digest,
         signature: &Signature,
         pending: &mut VecDeque<TransferFrame>,
     ) -> Result<(), String> {
-        let disk_path = self.root.join(path);
-        match File::open(&disk_path) {
-            Err(error) => Err(format!("unable to open {path}: {error}")),
+        let file = self.open_scanned(path, digest)?;
+        if signature.is_empty() {
             // With no base to delta against the file streams through whole,
             // read directly into owned operation-sized chunks — no shared
             // scratch buffer to zero, no copy out of it, and no size probe.
             // Files within the operation size limit (the vast majority)
             // arrive as a single chunk.
-            Ok(mut file) if signature.is_empty() => loop {
+            let mut file = file;
+            loop {
                 let mut chunk = Vec::with_capacity(rsync::MAXIMUM_DATA_OPERATION_SIZE);
                 match Read::by_ref(&mut file)
                     .take(rsync::MAXIMUM_DATA_OPERATION_SIZE as u64)
@@ -892,13 +919,45 @@ impl LocalEndpoint {
                         pending.push_back(TransferFrame::Op(rsync::Op::Data(chunk)));
                     }
                 }
-            },
-            Ok(file) => rsync::deltify(file, signature, &mut |op| {
+            }
+        } else {
+            rsync::deltify(file, signature, &mut |op| {
                 pending.push_back(TransferFrame::Op(op));
                 Ok(())
             })
-            .map_err(|error| format!("unable to compute a delta for {path}: {error:#}")),
+            .map_err(|error| format!("unable to compute a delta for {path}: {error:#}"))
         }
+    }
+
+    /// Opens a file a peer asked for, if and only if the last scan recorded
+    /// a regular file at `path` with `digest`, and it is still that file:
+    /// the gate and checks [`supply_from`](Self::supply_from) describes.
+    /// The reader stops at the scanned size.
+    fn open_scanned(&self, path: &str, digest: &Digest) -> Result<io::Take<File>, String> {
+        validate_path(path).map_err(|error| format!("refused {path:?}: {error}"))?;
+        let (recorded, scanned) = self
+            .snapshot_file(path)
+            .ok_or_else(|| format!("refused {path:?}: not a file the last scan recorded"))?;
+        if recorded != digest {
+            return Err(format!(
+                "refused {path:?}: its scanned content is not the requested content"
+            ));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.root.join(path))
+            .map_err(|error| format!("unable to open {path}: {error}"))?;
+        let now = file
+            .metadata()
+            .map_err(|error| format!("unable to inspect {path}: {error}"))?;
+        if !now.file_type().is_file()
+            || (scanned.inode != 0 && now.ino() != scanned.inode)
+            || now.len() != scanned.size
+        {
+            return Err(format!("{path} changed since the scan"));
+        }
+        Ok(file.take(scanned.size))
     }
 
     /// Collects every root-relative path (other than the excluded one) whose
@@ -6360,5 +6419,259 @@ mod apply_path_tests {
         let after = fs::metadata(root.join("tool")).expect("tool");
         assert_eq!(after.ino(), before);
         assert_eq!(after.mode() & 0o777, creation_mode(DEFAULT_FILE_MODE, true));
+    }
+}
+
+/// What a peer may name in a supply or staging request: only content this
+/// side's own scan recorded, inside its root (T1-1, T1-5).
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
+
+    use std::os::unix::fs::symlink;
+    use std::sync::mpsc;
+    use std::time::Duration;
+    use tempfile::{tempdir, TempDir};
+
+    /// A scanned endpoint over `<keep>/root`, with staging beside it.
+    fn scanned(options: EndpointOptions) -> (TempDir, PathBuf, LocalEndpoint) {
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        let endpoint = LocalEndpoint::new(root.clone(), keep.path().join("staging"), options)
+            .expect("endpoint should be creatable");
+        (keep, root, endpoint)
+    }
+
+    fn digest_of(bytes: &[u8]) -> Digest {
+        *blake3::hash(bytes).as_bytes()
+    }
+
+    fn need(path: &str, digest: Digest) -> StagingNeed {
+        StagingNeed {
+            request: FileRequest {
+                path: path.into(),
+                digest,
+            },
+            signature: Signature::default(),
+        }
+    }
+
+    /// Supplies `needs` to exhaustion and returns every frame.
+    fn supply_all(endpoint: &mut LocalEndpoint, needs: Vec<StagingNeed>) -> Vec<TransferFrame> {
+        endpoint.supply_open(needs).expect("supply should open");
+        let mut frames = Vec::new();
+        loop {
+            let batch = endpoint.supply_pull(64).expect("supply should pull");
+            if batch.is_empty() {
+                return frames;
+            }
+            frames.extend(batch);
+        }
+    }
+
+    /// Asserts that a single-need stream carried no content: its begin,
+    /// then an end of file with an error.
+    fn assert_refused(frames: &[TransferFrame]) {
+        assert!(
+            matches!(
+                frames,
+                [
+                    TransferFrame::Begin { .. },
+                    TransferFrame::EndOfFile { error: Some(_) }
+                ]
+            ),
+            "content left the root: {frames:?}"
+        );
+    }
+
+    fn data_bytes(frames: &[TransferFrame]) -> Vec<u8> {
+        frames
+            .iter()
+            .filter_map(|frame| match frame {
+                TransferFrame::Op(crate::rsync::Op::Data(data)) => Some(data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[test]
+    fn an_absolute_supply_path_is_refused() {
+        let (_keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        fs::write(root.join("a.txt"), b"inside").expect("file should be writable");
+        endpoint.scan().expect("scan should succeed");
+        let outside = tempdir().expect("temporary directory should be creatable");
+        let secret = outside.path().join("secret.txt");
+        fs::write(&secret, b"secret").expect("file should be writable");
+        let frames = supply_all(
+            &mut endpoint,
+            vec![need(&secret.to_string_lossy(), digest_of(b"secret"))],
+        );
+        assert_refused(&frames);
+    }
+
+    #[test]
+    fn a_dot_dot_supply_path_is_refused() {
+        let (keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        fs::write(root.join("a.txt"), b"inside").expect("file should be writable");
+        fs::write(keep.path().join("outside.txt"), b"secret").expect("file should be writable");
+        endpoint.scan().expect("scan should succeed");
+        let frames = supply_all(
+            &mut endpoint,
+            vec![need("../outside.txt", digest_of(b"secret"))],
+        );
+        assert_refused(&frames);
+    }
+
+    #[test]
+    fn a_supply_path_through_a_symlinked_parent_is_refused() {
+        let (keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        let outside = keep.path().join("outside");
+        fs::create_dir_all(&outside).expect("directory should be creatable");
+        fs::write(outside.join("secret.txt"), b"secret").expect("file should be writable");
+        symlink(&outside, root.join("link")).expect("symlink should be creatable");
+        endpoint.scan().expect("scan should succeed");
+        let frames = supply_all(
+            &mut endpoint,
+            vec![need("link/secret.txt", digest_of(b"secret"))],
+        );
+        assert_refused(&frames);
+    }
+
+    #[test]
+    fn content_other_than_the_requested_digest_is_refused() {
+        let (_keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        fs::write(root.join("a.txt"), b"inside").expect("file should be writable");
+        endpoint.scan().expect("scan should succeed");
+        let frames = supply_all(&mut endpoint, vec![need("a.txt", [0u8; 32])]);
+        assert_refused(&frames);
+    }
+
+    #[test]
+    fn an_ignored_file_is_never_supplied() {
+        let options = EndpointOptions {
+            ignores: IgnoreSet::new(&[".env".to_string()]).expect("ignores"),
+            ..EndpointOptions::default()
+        };
+        let (_keep, root, mut endpoint) = scanned(options);
+        fs::write(root.join(".env"), b"TOKEN=secret").expect("file should be writable");
+        endpoint.scan().expect("scan should succeed");
+        let frames = supply_all(
+            &mut endpoint,
+            vec![need(".env", digest_of(b"TOKEN=secret"))],
+        );
+        assert_refused(&frames);
+    }
+
+    #[test]
+    fn a_fifo_swapped_in_after_the_scan_is_refused_without_hanging() {
+        let (_keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        let path = root.join("a.txt");
+        fs::write(&path, b"content").expect("file should be writable");
+        endpoint.scan().expect("scan should succeed");
+        fs::remove_file(&path).expect("file should be removable");
+        let name = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
+            .expect("the path has no NUL");
+        // SAFETY: `name` is a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+        let (sender, receiver) = mpsc::channel();
+        std::thread::spawn(move || {
+            let frames = supply_all(&mut endpoint, vec![need("a.txt", digest_of(b"content"))]);
+            let _ = sender.send(frames);
+        });
+        let frames = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("supplying a FIFO must not hang");
+        assert_refused(&frames);
+    }
+
+    #[test]
+    fn a_file_grown_since_the_scan_never_supplies_more_than_was_scanned() {
+        let (_keep, root, mut endpoint) = scanned(EndpointOptions::default());
+        let path = root.join("a.txt");
+        fs::write(&path, b"scanned").expect("file should be writable");
+        endpoint.scan().expect("scan should succeed");
+        let mut file = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("file should open");
+        file.write_all(&vec![b'x'; 1 << 20])
+            .expect("file should grow");
+        let frames = supply_all(&mut endpoint, vec![need("a.txt", digest_of(b"scanned"))]);
+        let data = data_bytes(&frames);
+        assert!(
+            data.len() <= b"scanned".len(),
+            "{} bytes supplied",
+            data.len()
+        );
+        assert!(matches!(
+            frames.last(),
+            Some(TransferFrame::EndOfFile { .. })
+        ));
+    }
+
+    /// The agent direction: a hostile controller asks a follower's agent
+    /// for a file outside its root, and no content comes back.
+    #[test]
+    fn an_agent_supplies_nothing_outside_its_root() {
+        use crate::protocol::{Initialize, Request, Response};
+        use crate::transport::mux::AgentConnection;
+
+        let keep = tempdir().expect("temporary directory should be creatable");
+        let root = keep.path().join("root");
+        let state = keep.path().join("state");
+        fs::create_dir_all(&root).expect("root should be creatable");
+        fs::create_dir_all(state.join("staging")).expect("staging should be creatable");
+        fs::write(root.join("a.txt"), b"inside").expect("file should be writable");
+        let secret = keep.path().join("secret.txt");
+        fs::write(&secret, b"secret").expect("file should be writable");
+
+        let (client, agent) = crate::transport::tests::connected_pair();
+        let (agent_reader, agent_writer, _) = agent.into_parts();
+        let agent_state = state.clone();
+        std::thread::spawn(move || {
+            let _ = crate::transport::serve_agent_in(agent_reader, agent_writer, &agent_state);
+        });
+        let connection = AgentConnection::connect(client).expect("unable to connect");
+        let root_text = root.to_string_lossy().into_owned();
+        let mut channel = connection
+            .open(Initialize {
+                session: crate::session::session_identifier(&root_text, "confinement"),
+                root: root_text,
+                ignores: Vec::new(),
+                symlink_mode: SymlinkMode::Raw,
+                file_mode: None,
+                directory_mode: None,
+                side: "alpha".into(),
+                staging: Default::default(),
+                max_file_size: None,
+                max_entry_count: None,
+                ignore_mounts: true,
+                default_owner: None,
+                default_group: None,
+            })
+            .expect("open");
+        channel.exchange(Request::Scan).expect("the scan exchanges");
+        let opened = channel
+            .exchange(Request::SupplyOpen(vec![need(
+                &secret.to_string_lossy(),
+                digest_of(b"secret"),
+            )]))
+            .expect("the supply opens");
+        assert!(matches!(opened, Response::SupplyOpened), "{opened:?}");
+        let mut frames = Vec::new();
+        loop {
+            match channel
+                .exchange(Request::SupplyPull(64))
+                .expect("the supply pulls")
+            {
+                Response::SupplyPull(batch) if batch.is_empty() => break,
+                Response::SupplyPull(batch) => frames.extend(batch),
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        assert_refused(&frames);
     }
 }

@@ -9,7 +9,7 @@
 //! simulated clock, and the reconciler makes every cycle's move. The same
 //! invariants the spec checks are asserted in Rust over random games, and
 //! the games are written out as traces that TLC validates against the spec
-//! (`AUTOBAHN_TLC=1`).
+//! (`#[ignore]`d: run with `AUTOBAHN_TLC=1` and `-- --ignored`).
 //!
 //! Not replayed: the follower/leader loop in `supervisor/peer.rs`, which is
 //! sleeps and ssh around these decisions, and the ancestor copy's files.
@@ -717,11 +717,15 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
 }
 
 #[test]
+#[ignore = "needs TLC: set AUTOBAHN_TLC=1 and run with --ignored"]
 fn traces_are_behaviors_of_the_peering_spec() {
-    if std::env::var("AUTOBAHN_TLC").is_err() {
-        eprintln!("skipped: set AUTOBAHN_TLC=1 to validate traces with TLC");
-        return;
-    }
+    // Ignored, so that a run without TLC lists it as ignored rather than
+    // passed; asked for explicitly without TLC, it fails for the same
+    // reason.
+    assert!(
+        std::env::var("AUTOBAHN_TLC").is_ok(),
+        "needs TLC: set AUTOBAHN_TLC=1 to validate traces with TLC"
+    );
     let dir = tempfile::tempdir().unwrap();
     let per_mode: usize = std::env::var("AUTOBAHN_TLC_TRACES")
         .ok()

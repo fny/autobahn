@@ -2482,6 +2482,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(target_os = "macos", ignore = "APFS refuses non-UTF-8 names")]
     fn non_utf8_names_are_marked_and_deduplicated() {
         use std::os::unix::ffi::OsStrExt;
 
@@ -2491,12 +2492,12 @@ mod tests {
         // name, plus an ordinary file for company.
         for raw in [b"\xff\xfe".as_slice(), b"\xfe\xff".as_slice()] {
             let name = std::ffi::OsStr::from_bytes(raw);
-            if let Err(error) = fs::write(root_path.join(name), "bytes") {
-                // APFS refuses invalid UTF-8 names outright, so the
-                // condition this test guards against cannot exist there.
-                eprintln!("skipping: this filesystem refuses invalid UTF-8 names ({error})");
-                return;
-            }
+            // APFS refuses invalid UTF-8 names outright, so the condition
+            // this test guards against cannot exist there, and the test is
+            // ignored on macOS. Anywhere else a refusal is a failure: a
+            // test that returns early would report a pass it never ran.
+            fs::write(root_path.join(name), "bytes")
+                .expect("this filesystem should accept invalid UTF-8 names");
         }
         write(root_path, "plain.txt", "plain");
 

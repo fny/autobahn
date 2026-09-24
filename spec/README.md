@@ -18,9 +18,9 @@ It needs Java 11+; `tla2tools.jar` is fetched into `~/.local/lib` on first use, 
 The implementation is held to the spec by `tests/spec_replay.rs`. It plays the same game with the real `reconcile()` making every cycle's move, asserts the same properties in Rust on thousands of random games (always on), and writes games out as traces that TLC validates against the spec — a step the spec does not allow is a deadlock, and a rejection:
 
 ```sh
-AUTOBAHN_TLC=1 cargo test --test spec_replay
-AUTOBAHN_TLC=1 AUTOBAHN_TLC_TRACES=50 AUTOBAHN_TLC_KEEP=1 cargo test --test spec_replay   # more, and keep them
-spec/check.sh --traces DIR                                                                  # validate kept traces again
+AUTOBAHN_TLC=1 cargo test --test spec_replay -- --include-ignored
+AUTOBAHN_TLC=1 AUTOBAHN_TLC_TRACES=50 AUTOBAHN_TLC_KEEP=1 cargo test --test spec_replay -- --include-ignored   # more, and keep them
+spec/check.sh --traces DIR                                                                                      # validate kept traces again
 ```
 
 ## Peering

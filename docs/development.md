@@ -55,7 +55,7 @@ A change that breaks the wire protocol, or that makes two versions disagree abou
 
 ## The specification
 
-The reconciliation rules, for files and directories across one alpha and any number of betas, and the peering protocol are written in TLA+ under `spec/` and checked exhaustively by TLC. CI's `spec` job runs `spec/check.sh quick` — the small configurations, safety only — and then `AUTOBAHN_TLC=1 cargo test --release --test spec_replay --test spec_peering_replay`, which drives the real `reconcile()` and the real lease code through TLC's own traces and holds them to the spec's `Match`. The full set, with liveness and three betas, is `spec/check.sh` with no argument, or the dispatch-only `spec-full.yml` workflow; the peering liveness configurations take hours and want a large machine. `spec/README.md` has the modes, the sizes, and what TLC taught us about writing them.
+The reconciliation rules, for files and directories across one alpha and any number of betas, and the peering protocol are written in TLA+ under `spec/` and checked exhaustively by TLC. CI's `spec` job runs `spec/check.sh quick` — the small configurations, safety only — and then `AUTOBAHN_TLC=1 cargo test --release --test spec_replay --test spec_peering_replay -- --include-ignored` (the TLC tests are `#[ignore]`d, so a run without TLC lists them as ignored), which drives the real `reconcile()` and the real lease code through TLC's own traces and holds them to the spec's `Match`. The full set, with liveness and three betas, is `spec/check.sh` with no argument, or the dispatch-only `spec-full.yml` workflow; the peering liveness configurations take hours and want a large machine. `spec/README.md` has the modes, the sizes, and what TLC taught us about writing them.
 
 ## Correctness
 

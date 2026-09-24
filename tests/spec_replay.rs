@@ -11,8 +11,8 @@
 //! Two tests: `random_runs_keep_the_invariants` always runs (a few
 //! thousand random games, milliseconds each). `traces_are_behaviors_of_the_spec`
 //! also writes the games out and runs TLC over them; it needs Java and
-//! `tla2tools.jar` (see `spec/check.sh`), so it is skipped unless
-//! `AUTOBAHN_TLC=1`.
+//! `tla2tools.jar` (see `spec/check.sh`), so it is `#[ignore]`d: run it
+//! with `AUTOBAHN_TLC=1` and `-- --ignored`, as CI's spec job does.
 
 use std::collections::BTreeSet;
 
@@ -690,11 +690,15 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, board: &Board, 
 }
 
 #[test]
+#[ignore = "needs TLC: set AUTOBAHN_TLC=1 and run with --ignored"]
 fn traces_are_behaviors_of_the_spec() {
-    if std::env::var("AUTOBAHN_TLC").is_err() {
-        eprintln!("skipped: set AUTOBAHN_TLC=1 to validate traces with TLC");
-        return;
-    }
+    // Ignored, so that a run without TLC lists it as ignored rather than
+    // passed; asked for explicitly without TLC, it fails for the same
+    // reason.
+    assert!(
+        std::env::var("AUTOBAHN_TLC").is_ok(),
+        "needs TLC: set AUTOBAHN_TLC=1 to validate traces with TLC"
+    );
     let dir = tempfile::tempdir().unwrap();
     // The spec's configured board, so the trace constants match its.
     let board = Board::small();

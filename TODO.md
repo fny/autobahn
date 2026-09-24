@@ -92,6 +92,8 @@ Real work, none of it load-bearing for a first release.
 
 - [ ] Remote scans report no progress counts: the agent scans inside one request and the protocol carries no frame for progress. Needs a new response variant and a compatibility-epoch bump.
 
+  **Decided 2026-09-24:** bundled into the `ignore_mounts` epoch bump. The agent sends a count only while a scan is still running after ~500 ms, from a side thread that stops before the reply; A/B a cold scan and the 1-editor cell before committing.
+
   *Why here:* needs a protocol response and an epoch bump
 
 - [ ] Collapse fully-synchronized groups to one line in `status`, so 15 healthy sessions don't cost 45 lines of scrolling.

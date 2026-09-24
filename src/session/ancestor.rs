@@ -35,12 +35,20 @@
 //! generation it represents. A checkpoint written by a build that predates
 //! the journal has no magic and is read as generation zero.
 //!
-//! The journal is a sequence of records, each carrying the generation it
-//! applies *to*, its length, a digest of its payload, and the payload: the
-//! changes that advance the ancestor by one cycle. Replay stops at the first
-//! record that does not follow the generation it holds, which is how a
-//! journal left behind by a crash between publishing a checkpoint and
-//! clearing the journal is recognised as spent rather than replayed twice.
+//! The journal is a sequence of records, each carrying a marker, the
+//! generation it applies *to*, its length, a digest of its payload, a
+//! digest of the header itself, and the payload: the changes that advance
+//! the ancestor by one cycle. Replay skips every record that does not
+//! follow the generation it holds, which is how a journal left behind by a
+//! crash between publishing a checkpoint and clearing the journal is
+//! recognised as spent rather than replayed twice.
+//!
+//! The header's own digest is what tells a torn tail from damage. A record
+//! whose header checks out but whose payload runs past the end of the file
+//! was cut short by a crash mid-append and was never acknowledged; a header
+//! that fails its check is corruption, and the load fails. Records written
+//! before headers were checksummed carry no marker and still read, under a
+//! narrower rule (see `read_journal`).
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -75,12 +83,24 @@ const VERSIONED_CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNAN2";
 /// every upgraded session misreads its journal — refused at best, a wrong
 /// ancestor at worst. `the_encodings_this_format_promises_are_unchanged`
 /// holds the bytes still, so such a change fails until it does.
-const CHECKPOINT_VERSION: u16 = 2;
+const CHECKPOINT_VERSION: u16 = 3;
+
+/// The first format whose journal records carry a checksummed header.
+///
+/// A record's header layout is told by its marker, not by the checkpoint:
+/// a format-3 checkpoint can sit in front of legacy records, left when an
+/// upgrade's rename landed but its journal was never cleared. What the
+/// checkpoint's format decides is how far a legacy record that runs past
+/// the end is trusted to be a torn tail — the build that wrote a format-3
+/// checkpoint normalized its journal first, so under one nothing legacy is
+/// ever torn.
+const CHECKSUMMED_JOURNAL: u16 = 3;
 
 /// The oldest format this build reads.
 ///
-/// Formats 0 (a bare hierarchy, before journalling) and 1 (a generation
-/// and digest, before versions were stated) both still read. Raising this
+/// Formats 0 (a bare hierarchy, before journalling), 1 (a generation and
+/// digest, before versions were stated) and 2 (journal records without a
+/// checksummed header) all still read. Raising this
 /// drops support for what it passes, and the message that refuses them
 /// names the command that recovers.
 const OLDEST_READABLE_CHECKPOINT: u16 = 0;
@@ -140,7 +160,11 @@ impl AncestorStore {
         let _ = fs::remove_file(normalization_path(&journal_path));
         let (mut generation, mut ancestor, checkpoint_bytes, version) = read_checkpoint(path)?;
 
-        let (records, physical_bytes) = read_journal(&journal_path, version)?;
+        let JournalRead {
+            records,
+            physical_bytes,
+            legacy,
+        } = read_journal(&journal_path, version, checkpoint_bytes == 0)?;
         // Replay applies every record that continues the lineage in hand and
         // skips the rest: spent records from a checkpoint that already
         // absorbed them (a crash can land between publishing the checkpoint
@@ -243,7 +267,13 @@ impl AncestorStore {
         // the journal, whose records were decoded by the same build that
         // just read them. A failure here is not fatal: the old checkpoint
         // is still readable, and the next open tries again.
-        if version != CHECKPOINT_VERSION {
+        //
+        // A journal still holding records in the format before headers
+        // were checksummed is rewritten on the same terms, so the weaker
+        // rule that reads them lasts one open rather than until the next
+        // compaction — which on a quiet session, or one whose history
+        // fits in the journal alone, may never come.
+        if version != CHECKPOINT_VERSION || legacy {
             if let Err(error) = store.checkpoint(generation, ancestor.as_ref()) {
                 eprintln!("unable to rewrite the ancestor in the current format: {error:#}");
             }
@@ -442,13 +472,7 @@ impl AncestorStore {
 
     /// Encodes one journal record at the current generation.
     fn encode(&self, entry: &JournalEntry) -> Result<Vec<u8>> {
-        let payload = bincode::serialize(entry).context("unable to encode a journal record")?;
-        let mut record = Vec::with_capacity(payload.len() + RECORD_HEADER_SIZE);
-        record.extend_from_slice(&self.generation.to_le_bytes());
-        record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
-        record.extend_from_slice(&digest(self.generation, &payload));
-        record.extend_from_slice(&payload);
-        Ok(record)
+        encode_record(self.generation, entry)
     }
 
     /// Appends one encoded record, rolling back a partial write.
@@ -577,17 +601,30 @@ impl AncestorStore {
     }
 }
 
-/// The generation, length, and digest that precede each record's payload.
-const RECORD_HEADER_SIZE: usize = 8 + 8 + 8;
+/// Opens every record with a checksummed header. A legacy record opens
+/// with its generation instead, and no generation reaches this value.
+const RECORD_MARKER: [u8; 8] = *b"ABAHNJR3";
+
+/// The marker, generation, length, payload digest and header digest that
+/// precede each record's payload.
+const RECORD_HEADER_SIZE: usize = 8 + 8 + 8 + 8 + 8;
+
+/// Where the length sits within a record's header.
+const RECORD_LENGTH_OFFSET: usize = 16;
+
+/// The generation, length and payload digest that preceded a record's
+/// payload before headers were checksummed.
+const LEGACY_RECORD_HEADER_SIZE: usize = 8 + 8 + 8;
 
 /// The largest payload a record may claim, which bounds what a corrupt
 /// length can make the loader allocate.
 const MAXIMUM_RECORD_SIZE: u64 = 1 << 30;
 
-/// Decodes one journal record written under the checkpoint format
-/// `version` — the build that wrote the checkpoint wrote the journal
-/// beside it. Every format this build reads shares one record layout; a
-/// format that changes it adds its predecessor's decoder here.
+/// Decodes one journal record's payload, written under the checkpoint
+/// format `version` — the build that wrote the checkpoint wrote the
+/// journal beside it. Every format this build reads shares one payload
+/// encoding (headers differ, and are told apart by their marker); a format
+/// that changes the encoding adds its predecessor's decoder here.
 fn decode_record(version: u16, payload: &[u8]) -> Result<JournalEntry> {
     match version {
         OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION => bincode::deserialize(payload)
@@ -620,6 +657,21 @@ struct Record {
     raw: Vec<u8>,
 }
 
+/// Encodes one journal record: the checksummed header, then the payload.
+fn encode_record(generation: u64, entry: &JournalEntry) -> Result<Vec<u8>> {
+    let payload = bincode::serialize(entry).context("unable to encode a journal record")?;
+    let length = payload.len() as u64;
+    let payload_digest = digest(generation, &payload);
+    let mut record = Vec::with_capacity(payload.len() + RECORD_HEADER_SIZE);
+    record.extend_from_slice(&RECORD_MARKER);
+    record.extend_from_slice(&generation.to_le_bytes());
+    record.extend_from_slice(&length.to_le_bytes());
+    record.extend_from_slice(&payload_digest);
+    record.extend_from_slice(&header_digest(generation, length, &payload_digest));
+    record.extend_from_slice(&payload);
+    Ok(record)
+}
+
 /// The sibling temporary a journal normalization writes before renaming
 /// over the journal. Distinct from every other temporary name the store
 /// uses.
@@ -644,6 +696,22 @@ fn digest(generation: u64, payload: &[u8]) -> [u8; 8] {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&generation.to_le_bytes());
     hasher.update(payload);
+    let hash = hasher.finalize();
+    let mut digest = [0u8; 8];
+    digest.copy_from_slice(&hash.as_bytes()[..8]);
+    digest
+}
+
+/// Eight bytes of BLAKE3 over everything in a record's header before it.
+/// The payload digest never covered the length, so a flipped bit that sent
+/// a middle record's length past the end of the file read as a torn tail,
+/// and every acknowledged record after it was dropped for good.
+fn header_digest(generation: u64, length: u64, payload_digest: &[u8; 8]) -> [u8; 8] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&RECORD_MARKER);
+    hasher.update(&generation.to_le_bytes());
+    hasher.update(&length.to_le_bytes());
+    hasher.update(payload_digest);
     let hash = hasher.finalize();
     let mut digest = [0u8; 8];
     digest.copy_from_slice(&hash.as_bytes()[..8]);
@@ -725,8 +793,8 @@ pub fn format_of(path: &Path) -> Result<Option<u16>> {
 /// `AncestorStore::open`, which normalizes the journal and rewrites an old
 /// format, this touches nothing, so `doctor` can run beside a supervisor.
 pub fn peek(path: &Path) -> Result<(Option<Node>, u64)> {
-    let (mut generation, mut ancestor, _, version) = read_checkpoint(path)?;
-    let (records, _) = read_journal(&journal_path(path), version)?;
+    let (mut generation, mut ancestor, checkpoint_bytes, version) = read_checkpoint(path)?;
+    let records = read_journal(&journal_path(path), version, checkpoint_bytes == 0)?.records;
     for record in records {
         if record.base_generation != generation {
             continue;
@@ -781,7 +849,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
                 bincode::deserialize(payload).context("unable to decode ancestor")?;
             Ok((generation, ancestor, size, 1))
         }
-        // Format 2 states its version, and the digest covers it.
+        // Format 2 and later state their version, and the digest covers it.
         _ => {
             let body = &data[VERSIONED_CHECKPOINT_MAGIC.len() + 2..];
             if body.len() < 16 {
@@ -821,45 +889,125 @@ pub fn readable(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Reads every intact record from the journal, in order, and reports how
-/// many bytes of it are usable.
+/// What reading the journal found.
+struct JournalRead {
+    /// Every intact record, in order.
+    records: Vec<Record>,
+    /// The journal's *physical* length, not the parsed one: the caller
+    /// compares it against what replay applied to decide whether the file
+    /// needs normalizing.
+    physical_bytes: u64,
+    /// Whether any record is in the format before headers were checksummed.
+    legacy: bool,
+}
+
+/// Reads every intact record from the journal, in order.
 ///
 /// A record left incomplete by a crash mid-append can only be the last one,
 /// and is discarded: it was never acknowledged, so the cycle that would have
 /// produced it never completed either. A record that is complete but whose
 /// payload does not match its digest is a different matter — something
 /// claimed to be durable and is not — and fails the load rather than being
-/// skipped.
-fn read_journal(path: &Path, version: u16) -> Result<(Vec<Record>, u64)> {
+/// skipped. So does a header that fails its own digest: its length cannot
+/// be trusted to say where the record ends, so it cannot be trusted to say
+/// the record is torn.
+///
+/// A legacy record has no header digest, so a length running past the end
+/// cannot tell a torn tail from a flipped bit on its own. It is read as
+/// torn only where a torn legacy record could exist at all — under a
+/// checkpoint older than `CHECKSUMMED_JOURNAL`, or none (`uncheckpointed`) —
+/// and only if nothing well-formed can be found in the bytes after it: a
+/// torn record is the last thing in the file, and acknowledged records
+/// behind a "torn" one mean its length is what is broken. Anything else
+/// fails closed.
+fn read_journal(path: &Path, version: u16, uncheckpointed: bool) -> Result<JournalRead> {
     let mut file = match File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(JournalRead {
+                records: Vec::new(),
+                physical_bytes: 0,
+                legacy: false,
+            })
+        }
         Err(error) => return Err(error).context("unable to read the ancestor journal")?,
     };
     let mut data = Vec::new();
     file.read_to_end(&mut data)
         .context("unable to read the ancestor journal")?;
+    let legacy_tails = version < CHECKSUMMED_JOURNAL || uncheckpointed;
 
     let mut records = Vec::new();
+    let mut legacy = false;
+    let mut checksummed = false;
     let mut offset = 0usize;
-    while offset + RECORD_HEADER_SIZE <= data.len() {
-        let header = &data[offset..offset + RECORD_HEADER_SIZE];
-        let base_generation = u64::from_le_bytes(header[..8].try_into().expect("eight bytes"));
-        let length = u64::from_le_bytes(header[8..16].try_into().expect("eight bytes"));
-        if length > MAXIMUM_RECORD_SIZE {
-            bail!("the ancestor journal declares a record of {length} bytes");
-        }
-        let start = offset + RECORD_HEADER_SIZE;
-        let end = start + length as usize;
-        if end > data.len() {
-            // A torn tail. Everything before it stands.
-            break;
-        }
-        let payload = &data[start..end];
-        if digest(base_generation, payload) != header[16..24] {
-            bail!("the ancestor journal is corrupt at offset {offset}");
-        }
-        let entry = decode_record(version, payload)?;
+    while offset < data.len() {
+        let rest = &data[offset..];
+        let (base_generation, start, end) = if rest.starts_with(&RECORD_MARKER) {
+            checksummed = true;
+            if rest.len() < RECORD_HEADER_SIZE {
+                // A header cut short. Everything before it stands.
+                break;
+            }
+            let field = |at: usize| u64::from_le_bytes(rest[at..at + 8].try_into().expect("eight"));
+            let base_generation = field(8);
+            let length = field(RECORD_LENGTH_OFFSET);
+            let payload_digest: [u8; 8] = rest[24..32].try_into().expect("eight bytes");
+            if header_digest(base_generation, length, &payload_digest) != rest[32..40] {
+                bail!("the ancestor journal is corrupt at offset {offset}: a record header fails its digest");
+            }
+            if length > MAXIMUM_RECORD_SIZE {
+                bail!("the ancestor journal declares a record of {length} bytes");
+            }
+            let start = offset + RECORD_HEADER_SIZE;
+            let end = start + length as usize;
+            if end > data.len() {
+                // A torn tail: the header is genuine, the payload is not
+                // all there. Everything before it stands.
+                break;
+            }
+            if payload_digest != digest(base_generation, &data[start..end]) {
+                bail!("the ancestor journal is corrupt at offset {offset}");
+            }
+            (base_generation, start, end)
+        } else {
+            if rest.len() < LEGACY_RECORD_HEADER_SIZE {
+                // Too short to hold a record in either format: a tail cut
+                // before its header was complete, which holds nothing
+                // that was acknowledged.
+                break;
+            }
+            if checksummed {
+                // A legacy record is only ever followed by others, never
+                // preceded by a checksummed one: this is a checksummed
+                // record whose marker is damaged.
+                bail!("the ancestor journal is corrupt at offset {offset}: a record has no marker");
+            }
+            legacy = true;
+            let field = |at: usize| u64::from_le_bytes(rest[at..at + 8].try_into().expect("eight"));
+            let base_generation = field(0);
+            let length = field(8);
+            if length > MAXIMUM_RECORD_SIZE {
+                bail!("the ancestor journal declares a record of {length} bytes");
+            }
+            let start = offset + LEGACY_RECORD_HEADER_SIZE;
+            let end = start + length as usize;
+            if end > data.len() {
+                if legacy_tails && !(offset + 1..data.len()).any(|at| well_formed_at(&data, at)) {
+                    // A torn tail, as far as a legacy header can tell.
+                    break;
+                }
+                bail!(
+                    "the ancestor journal is corrupt at offset {offset}: a record runs past \
+                     the end with more records behind it"
+                );
+            }
+            if rest[16..24] != digest(base_generation, &data[start..end]) {
+                bail!("the ancestor journal is corrupt at offset {offset}");
+            }
+            (base_generation, start, end)
+        };
+        let entry = decode_record(version, &data[start..end])?;
         records.push(Record {
             base_generation,
             entry,
@@ -867,10 +1015,36 @@ fn read_journal(path: &Path, version: u16) -> Result<(Vec<Record>, u64)> {
         });
         offset = end;
     }
-    // The *physical* length goes back, not the parsed one: the caller
-    // compares it against what replay applied to decide whether the file
-    // needs normalizing.
-    Ok((records, data.len() as u64))
+    Ok(JournalRead {
+        records,
+        physical_bytes: data.len() as u64,
+        legacy,
+    })
+}
+
+/// Whether a record that checks out, in either format, starts at `at`: a
+/// checksummed header whose digest holds, or a legacy record whose payload
+/// is all there and matches its digest. Either is evidence that bytes
+/// before it were not a torn tail.
+fn well_formed_at(data: &[u8], at: usize) -> bool {
+    let rest = &data[at..];
+    let field = |at: usize| u64::from_le_bytes(rest[at..at + 8].try_into().expect("eight"));
+    if rest.starts_with(&RECORD_MARKER) && rest.len() >= RECORD_HEADER_SIZE {
+        let payload_digest: [u8; 8] = rest[24..32].try_into().expect("eight bytes");
+        return header_digest(field(8), field(RECORD_LENGTH_OFFSET), &payload_digest)
+            == rest[32..40];
+    }
+    if rest.len() < LEGACY_RECORD_HEADER_SIZE {
+        return false;
+    }
+    let length = field(8);
+    // Checked before the digest, so a scan of arbitrary bytes only ever
+    // hashes a payload that fits in what remains.
+    if length > (rest.len() - LEGACY_RECORD_HEADER_SIZE) as u64 {
+        return false;
+    }
+    let payload = &rest[LEGACY_RECORD_HEADER_SIZE..LEGACY_RECORD_HEADER_SIZE + length as usize];
+    digest(field(0), payload) == rest[16..24]
 }
 
 #[cfg(test)]
@@ -967,7 +1141,8 @@ mod tests {
     }
 
     /// A crash part-way through an append leaves a record that was never
-    /// acknowledged. It must be discarded, not replayed and not fatal.
+    /// acknowledged. It must be discarded, not replayed and not fatal —
+    /// wherever the cut lands in it, header included.
     #[test]
     fn a_torn_final_record_is_discarded() {
         let keep = tempdir().expect("temporary directory");
@@ -977,20 +1152,26 @@ mod tests {
         store
             .record(&[change("", first.clone())], first.as_ref())
             .expect("records");
+        let intact = fs::read(journal_path(&path)).expect("reads");
+        let second = Some(directory(vec![file("a", 1), file("b", 2)]));
+        store
+            .record(&[change("b", Some(file("b", 2)))], second.as_ref())
+            .expect("records");
+        let whole = fs::read(journal_path(&path)).expect("reads");
 
-        let journal = journal_path(&path);
-        let mut data = fs::read(&journal).expect("reads");
-        data.extend_from_slice(&7u64.to_le_bytes());
-        data.extend_from_slice(&4096u64.to_le_bytes());
-        data.extend_from_slice(&[0u8; 8]);
-        data.extend_from_slice(b"partial");
-        fs::write(&journal, &data).expect("writes");
-
-        let (_, reloaded, _) = AncestorStore::open(&path).expect("opens despite the torn tail");
-        assert!(
-            same(&reloaded, &first),
-            "the intact record must still apply"
-        );
+        for cut in [
+            intact.len() + 1,
+            intact.len() + RECORD_HEADER_SIZE - 1,
+            intact.len() + RECORD_HEADER_SIZE,
+            whole.len() - 1,
+        ] {
+            let (_, reloaded, _) = open_cut(&path, &whole, cut)
+                .unwrap_or_else(|error| panic!("cut at {cut} must open: {error:#}"));
+            assert!(
+                same(&reloaded, &first),
+                "cut at {cut}: the intact record must still apply, and only it"
+            );
+        }
     }
 
     /// A complete record whose payload does not match its digest claimed to
@@ -1833,6 +2014,261 @@ mod tests {
         }
     }
 
+    /// Records five cycles and returns the journal's bytes with the offset
+    /// at which each record starts.
+    fn five_records(path: &Path) -> (Vec<u8>, Vec<usize>, Vec<Option<Node>>) {
+        let (mut store, _, _) = AncestorStore::open(path).expect("opens");
+        let mut starts = Vec::new();
+        let mut states = Vec::new();
+        let mut children = Vec::new();
+        for index in 0..5u8 {
+            starts.push(fs::metadata(journal_path(path)).map_or(0, |m| m.len() as usize));
+            let name = format!("f{index}");
+            children.push(file(&name, index + 1));
+            let next = Some(directory(children.clone()));
+            let advance = if index == 0 {
+                change("", next.clone())
+            } else {
+                change(&name, Some(file(&name, index + 1)))
+            };
+            store.record(&[advance], next.as_ref()).expect("records");
+            states.push(next);
+        }
+        (fs::read(journal_path(path)).expect("reads"), starts, states)
+    }
+
+    /// Finding M-32: the digest never covered a record's length, so a
+    /// flipped bit that sent a middle record's length past the end of the
+    /// file read exactly like a torn tail. Every later record — each one
+    /// acknowledged — was dropped, and normalization made the loss
+    /// permanent. The header now carries its own checksum, and a header
+    /// that fails it is corruption.
+    #[test]
+    fn a_middle_length_pointing_past_the_end_is_corruption_not_a_torn_tail() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut journal, starts, _) = five_records(&path);
+        // Bit 20 of the length: a megabyte more than the record holds —
+        // past the end of the file, yet under the size limit.
+        journal[starts[1] + RECORD_LENGTH_OFFSET + 2] ^= 0x10;
+        fs::write(journal_path(&path), &journal).expect("writes");
+
+        match AncestorStore::open(&path) {
+            Ok((_, loaded, _)) => panic!(
+                "a corrupt length must fail closed, not load {} records",
+                loaded.map_or(0, |root| root.children().len())
+            ),
+            Err(error) => assert!(format!("{error:#}").contains("corrupt"), "{error:#}"),
+        }
+        assert_eq!(
+            fs::read(journal_path(&path)).expect("reads"),
+            journal,
+            "a journal that fails closed is left exactly as found"
+        );
+    }
+
+    /// Every bit of a middle record's header is covered: whichever one
+    /// flips, the load fails rather than dropping or skipping anything.
+    #[test]
+    fn every_flipped_header_bit_fails_closed() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (journal, starts, _) = five_records(&path);
+        for byte in starts[1]..starts[1] + RECORD_HEADER_SIZE {
+            for bit in 0..8 {
+                let mut damaged = journal.clone();
+                damaged[byte] ^= 1 << bit;
+                let keep = tempdir().expect("temporary directory");
+                let target = keep.path().join("ancestor");
+                fs::write(journal_path(&target), &damaged).expect("writes");
+                assert!(
+                    AncestorStore::open(&target).is_err(),
+                    "bit {bit} of header byte {} loaded",
+                    byte - starts[1]
+                );
+            }
+        }
+    }
+
+    /// A checksummed record whose marker is damaged reads as a legacy one,
+    /// and in a store with no checkpoint yet — where a legacy torn tail
+    /// could genuinely exist — its generation, misread as a length, can
+    /// point past the end. It must not pass for a torn tail: nothing legacy
+    /// ever follows a checksummed record.
+    #[test]
+    fn a_final_record_with_a_damaged_marker_fails_closed() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+        let mut state = None;
+        let mut last_start = 0;
+        for index in 0..200u32 {
+            last_start = fs::metadata(journal_path(&path)).map_or(0, |m| m.len() as usize);
+            let leaf = file("f", (index % 250) as u8);
+            let next = Some(directory(vec![leaf.clone()]));
+            let advance = if state.is_none() {
+                change("", next.clone())
+            } else {
+                change("f", Some(leaf))
+            };
+            store.record(&[advance], next.as_ref()).expect("records");
+            state = next;
+        }
+        assert!(!path.exists(), "the history must fit in the journal alone");
+        let mut journal = fs::read(journal_path(&path)).expect("reads");
+        assert!(
+            last_start + LEGACY_RECORD_HEADER_SIZE + 199 > journal.len(),
+            "the generation, misread as a length, must point past the end"
+        );
+        journal[last_start] ^= 0x01;
+        fs::write(journal_path(&path), &journal).expect("writes");
+        assert!(
+            AncestorStore::open(&path).is_err(),
+            "a damaged final record must not be discarded as torn"
+        );
+    }
+
+    /// A record in the format before headers were checksummed: the base
+    /// generation, the length, the payload digest, and the payload.
+    fn legacy_record(generation: u64, entry: &JournalEntry) -> Vec<u8> {
+        let payload = bincode::serialize(entry).expect("encodes");
+        let mut record = Vec::new();
+        record.extend_from_slice(&generation.to_le_bytes());
+        record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        record.extend_from_slice(&digest(generation, &payload));
+        record.extend_from_slice(&payload);
+        record
+    }
+
+    /// A format-2 checkpoint, as the build before checksummed record
+    /// headers wrote it.
+    fn format_two_checkpoint(path: &Path, generation: u64, ancestor: &Option<Node>) {
+        let payload = bincode::serialize(ancestor).expect("encodes");
+        let mut data = Vec::new();
+        data.extend_from_slice(&VERSIONED_CHECKPOINT_MAGIC);
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&generation.to_le_bytes());
+        data.extend_from_slice(&checkpoint_digest(2, generation, &payload));
+        data.extend_from_slice(&payload);
+        fs::write(path, data).expect("writes");
+    }
+
+    /// A format-2 store: an empty checkpoint at generation zero and a
+    /// legacy journal of five records. Returns the journal, where each
+    /// record starts, and the state after each.
+    fn legacy_store(path: &Path) -> (Vec<u8>, Vec<usize>, Vec<Option<Node>>) {
+        format_two_checkpoint(path, 0, &None);
+        let mut journal = Vec::new();
+        let mut starts = Vec::new();
+        let mut states = Vec::new();
+        let mut children = Vec::new();
+        for index in 0..5u8 {
+            starts.push(journal.len());
+            let name = format!("f{index}");
+            children.push(file(&name, index + 1));
+            let next = Some(directory(children.clone()));
+            let advance = if index == 0 {
+                change("", next.clone())
+            } else {
+                change(&name, Some(file(&name, index + 1)))
+            };
+            journal.extend(legacy_record(
+                index as u64,
+                &JournalEntry::Achieved(vec![advance]),
+            ));
+            states.push(next);
+        }
+        fs::write(journal_path(path), &journal).expect("writes");
+        (journal, starts, states)
+    }
+
+    /// A journal written before record headers were checksummed still
+    /// reads, and the open that reads it rewrites the store in the
+    /// current format.
+    #[test]
+    fn a_legacy_journal_reads_and_is_rewritten() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (_, _, states) = legacy_store(&path);
+        let (store, loaded, _) = AncestorStore::open(&path).expect("a legacy journal opens");
+        assert!(same(&loaded, &states[4]));
+        assert_eq!(store.generation, 5);
+        drop(store);
+        assert_eq!(
+            checkpoint_version(&fs::read(&path).expect("reads")),
+            CHECKPOINT_VERSION
+        );
+        let (_, reloaded, _) = AncestorStore::open(&path).expect("reopens");
+        assert!(same(&reloaded, &states[4]));
+    }
+
+    /// In the legacy format a record running past the end is a torn tail
+    /// only when nothing well-formed follows it. Here four acknowledged
+    /// records follow, so it is corruption, and the load fails closed.
+    #[test]
+    fn a_legacy_middle_length_pointing_past_the_end_fails_closed() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut journal, starts, _) = legacy_store(&path);
+        journal[starts[1] + 8 + 2] ^= 0x10;
+        fs::write(journal_path(&path), &journal).expect("writes");
+        match AncestorStore::open(&path) {
+            Ok((_, loaded, _)) => panic!(
+                "a corrupt legacy length must fail closed, not load {} records",
+                loaded.map_or(0, |root| root.children().len())
+            ),
+            Err(error) => assert!(format!("{error:#}").contains("corrupt"), "{error:#}"),
+        }
+    }
+
+    /// A legacy journal cut at any byte — the torn tail an old build's
+    /// crash leaves — still opens to exactly the acknowledged state.
+    #[test]
+    fn every_legacy_journal_cut_reopens() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (journal, starts, states) = legacy_store(&path);
+        let mut boundaries: Vec<(usize, Option<Node>)> = vec![(0, None)];
+        for (index, state) in states.iter().enumerate() {
+            let end = starts.get(index + 1).copied().unwrap_or(journal.len());
+            boundaries.push((end, state.clone()));
+        }
+        for cut in 0..=journal.len() {
+            let expected = &boundaries
+                .iter()
+                .rev()
+                .find(|(length, _)| *length <= cut)
+                .expect("a boundary")
+                .1;
+            let (_, loaded, _) = open_cut(&path, &journal, cut)
+                .unwrap_or_else(|error| panic!("legacy cut at {cut}: {error:#}"));
+            assert!(same(&loaded, expected), "legacy cut at {cut}");
+        }
+    }
+
+    /// An upgrade whose checkpoint was published but whose journal was
+    /// never cleared leaves legacy records, spent, in front of records in
+    /// the current format. The two read together.
+    #[test]
+    fn spent_legacy_records_read_ahead_of_current_ones() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (journal, _, states) = legacy_store(&path);
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+        // The upgrade's checkpoint stands; the crash put the journal back.
+        fs::write(journal_path(&path), &journal).expect("restores the spent journal");
+        store.journal = None;
+        store.journal_bytes = journal.len() as u64;
+        let mut children = states[4].as_ref().expect("a root").children().to_vec();
+        children.push(file("g", 9));
+        let next = Some(directory(children));
+        store
+            .record(&[change("g", Some(file("g", 9)))], next.as_ref())
+            .expect("records");
+        let (_, loaded, _) = AncestorStore::open(&path).expect("a mixed journal opens");
+        assert!(same(&loaded, &next));
+    }
+
     /// One of every shape a record or a checkpoint can hold.
     fn every_shape() -> Node {
         Node {
@@ -1884,8 +2320,10 @@ mod tests {
     /// `read_checkpoint`) the old layout, and only then update the bytes.
     #[test]
     fn the_encodings_this_format_promises_are_unchanged() {
+        // Format 3 changed the record header, not the payload encoding:
+        // the payload bytes below are format 2's, unchanged.
         assert_eq!(
-            CHECKPOINT_VERSION, 2,
+            CHECKPOINT_VERSION, 3,
             "a new format: record its bytes below, beside the old ones"
         );
         let achieved = JournalEntry::Achieved(vec![
@@ -1908,6 +2346,11 @@ mod tests {
             hex(&bincode::serialize(&checkpoint).unwrap()),
             CHECKPOINT_V2
         );
+        // A whole record: the checksummed header, then the payload.
+        assert_eq!(
+            hex(&encode_record(7, &intent).unwrap()),
+            format!("{RECORD_V3_HEADER}{INTENT_V2}")
+        );
         // And they decode as what they were.
         let decoded = decode_record(CHECKPOINT_VERSION, &bincode::serialize(&intent).unwrap())
             .expect("decodes");
@@ -1915,6 +2358,8 @@ mod tests {
     }
 
     const ACHIEVED_V2: &str = "0000000002000000000000000300000000000000612f6200010000000000000000000000000400000000000000040000000000000066696c6501000000070707070707070707070707070707070707070707070707070707070707070701feffffffffffffff0300000004000000000000000500000000000000ed81000004000000000000006c696e6b02000000040000000000000066696c6503000000000000006f64640400000002000000000000006e6f0700000000000000736b6970706564030000000000000000000000010000000000000000000000000400000000000000040000000000000066696c6501000000070707070707070707070707070707070707070707070707070707070707070701feffffffffffffff0300000004000000000000000500000000000000ed81000004000000000000006c696e6b02000000040000000000000066696c6503000000000000006f64640400000002000000000000006e6f0700000000000000736b69707065640300000000";
+    const RECORD_V3_HEADER: &str =
+        "414241484e4a52330700000000000000200000000000000066e8bde40501dbe11ebfe90cca28e876";
     const INTENT_V2: &str = "0100000002000000000000000100000000000000780300000000000000792f7a";
     const CHECKPOINT_V2: &str = "010000000000000000000000000400000000000000040000000000000066696c6501000000070707070707070707070707070707070707070707070707070707070707070701feffffffffffffff0300000004000000000000000500000000000000ed81000004000000000000006c696e6b02000000040000000000000066696c6503000000000000006f64640400000002000000000000006e6f0700000000000000736b697070656403000000";
 }

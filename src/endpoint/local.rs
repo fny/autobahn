@@ -1462,6 +1462,9 @@ impl Endpoint for LocalEndpoint {
         let mut transitioner = Transitioner {
             root: &self.root,
             staging_root: &self.staging_root,
+            staging_device: fs::metadata(&self.staging_root)
+                .ok()
+                .map(|metadata| metadata.dev()),
             // Validation runs against this endpoint's own lease: the exact
             // scan these transitions were reconciled from, not whatever the
             // observer has published since. That is what keeps "matches the
@@ -1758,6 +1761,10 @@ struct Transitioner<'a> {
     root: &'a Path,
     /// The staging directory holding content to be applied.
     staging_root: &'a Path,
+    /// The device the staging directory is on, when it could be read: a
+    /// staged file on another device than its target cannot be renamed
+    /// into place, and trying costs a read and a hash of it first.
+    staging_device: Option<u64>,
     /// The last scan's hierarchy, which all validation is performed against.
     scanned: Option<&'a Node>,
     /// The behavior of the root's filesystem, governing how on-disk names
@@ -1798,6 +1805,7 @@ impl<'a> Transitioner<'a> {
         Transitioner {
             root: self.root,
             staging_root: self.staging_root,
+            staging_device: self.staging_device,
             scanned: self.scanned,
             behavior: self.behavior,
             symlink_mode: self.symlink_mode,
@@ -2271,7 +2279,16 @@ impl<'a> Transitioner<'a> {
         // Anything doubtful falls through to the copy path, which digests
         // what it moves and turns a mismatch into a retransfer.
         let mut published: Option<FileMetadata> = None;
+        // Across devices a rename cannot work, and the check before it
+        // reads and hashes the whole staged file: straight to the copy,
+        // which hashes it once as it moves it. A device that cannot be
+        // read is tried as before.
+        let same_device = match (self.staging_device, fs::metadata(parent)) {
+            (Some(staging), Ok(metadata)) => metadata.dev() == staging,
+            _ => true,
+        };
         let moved = last_use
+            && same_device
             && fs::set_permissions(&staged, Permissions::from_mode(mode)).is_ok()
             && {
                 published = fs::symlink_metadata(&staged)

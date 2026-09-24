@@ -7,7 +7,7 @@ set -u
 BM=/home/ubuntu/Workspace/autobahn/bench/harness/target/release/benchmark
 W=$(mktemp -d); PIDS=()
 cleanup() { for p in "${PIDS[@]:-}"; do kill -CONT "$p" 2>/dev/null; kill "$p" 2>/dev/null; done
-            kill $(jobs -p) 2>/dev/null; rm -rf "$W"; }
+            for j in $(jobs -p); do kill "$j" 2>/dev/null; done; rm -rf "$W"; }
 trap cleanup EXIT
 mkdir -p "$W/src" "$W/dst"
 for d in $(seq 0 29); do

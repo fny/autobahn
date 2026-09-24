@@ -75,15 +75,15 @@ for width in $WIDTHS; do
 
   # CPU over a five-second idle window: the tree is converged, so whatever
   # is burned here is the cost of merely watching it.
-  j0=$(awk '{print $14+$15}' /proc/$pid/stat)
+  j0=$(awk '{print $14+$15}' /proc/"$pid"/stat)
   sleep 5
-  j1=$(awk '{print $14+$15}' /proc/$pid/stat)
+  j1=$(awk '{print $14+$15}' /proc/"$pid"/stat)
   cpu=$(awk -v a="$j0" -v b="$j1" 'BEGIN{printf "%.1f", (b-a)/100/5*100}')
 
-  rss=$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/$pid/status)
+  rss=$(awk '/VmRSS/{printf "%.1f", $2/1024}' /proc/"$pid"/status)
   # Actual inotify watches, one line per watch descriptor.
-  watches=$(cat /proc/$pid/fdinfo/* 2>/dev/null | grep -c '^inotify wd:')
-  fds=$(ls /proc/$pid/fd 2>/dev/null | wc -l)
+  watches=$(cat /proc/"$pid"/fdinfo/* 2>/dev/null | grep -c '^inotify wd:')
+  fds=$(find /proc/"$pid"/fd -mindepth 1 -maxdepth 1 2>/dev/null | wc -l)
   caches=$(find "$WORK/state" -name '*.scancache' 2>/dev/null | wc -l)
   cache_kb=$(find "$WORK/state" -name '*.scancache' -printf '%s\n' 2>/dev/null \
              | awk '{s+=$1} END {printf "%.1f", s/1048576}')

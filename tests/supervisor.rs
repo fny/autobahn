@@ -2387,6 +2387,67 @@ fn a_name_with_control_characters_is_printed_escaped() {
     assert_eq!(path.as_str(), Some(name), "{json}");
 }
 
+/// A report read by a script is text: `status` and `conflicts` written to
+/// a pipe carry no escape codes, and the same words.
+#[test]
+fn a_report_to_a_pipe_carries_no_escape_codes() {
+    let world = World::new();
+    let (config, _, _, _) = three_way_conflict(&world);
+    for args in [&["status", "--all"][..], &["conflicts"][..]] {
+        let (_, text) = cli(&world, &config, args);
+        assert!(
+            text.contains("notes.txt") || text.contains("conflicts"),
+            "{text}"
+        );
+        assert!(!text.contains('\x1b'), "{args:?}: {text:?}");
+    }
+}
+
+/// On a terminal, `status` is coloured — unless `NO_COLOR` asks otherwise,
+/// which takes the colour and leaves the words. Run through a
+/// pseudo-terminal, by `script`, so the terminal check is the real one.
+#[cfg(target_os = "linux")]
+#[test]
+fn no_color_on_a_terminal_takes_the_colour_away() {
+    if std::process::Command::new("script")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no `script` to make a pseudo-terminal with");
+        return;
+    }
+    let world = World::new();
+    let (config, _, _, _) = three_way_conflict(&world);
+    let on_a_terminal = |no_color: Option<&str>| {
+        let line = format!(
+            "{} status --all --config '{}' --state-root '{}'",
+            agent_binary(),
+            config.display(),
+            world.state_root().display()
+        );
+        let mut command = std::process::Command::new("script");
+        command
+            .args(["-qec", &line, "/dev/null"])
+            .env("TERM", "xterm")
+            .env_remove("NO_COLOR");
+        if let Some(value) = no_color {
+            command.env("NO_COLOR", value);
+        }
+        let output = command.output().expect("script runs");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let coloured = on_a_terminal(None);
+    assert!(coloured.contains("\x1b[33m"), "{coloured:?}");
+    let plain = on_a_terminal(Some("1"));
+    assert!(plain.contains("conflicts"), "{plain:?}");
+    for colour in ["\x1b[31m", "\x1b[32m", "\x1b[33m"] {
+        assert!(!plain.contains(colour), "{plain:?}");
+    }
+    // Emphasis is not colour, and stays.
+    assert!(plain.contains("\x1b[1m"), "{plain:?}");
+}
+
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();

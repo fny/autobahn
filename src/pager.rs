@@ -107,7 +107,11 @@ pub fn display(label: &str, mut content: impl FnMut() -> String) -> Result<()> {
 fn paint(lines: &[&str], offset: usize, window: usize, columns: usize, label: &str) -> String {
     let mut frame = String::new();
     for line in lines.iter().skip(offset).take(window) {
-        frame.push_str(&truncate(&only_colour(line), columns));
+        let line = only_colour(line);
+        frame.push_str(&truncate(
+            &crate::style::apply(&line, crate::style::screen_level()),
+            columns,
+        ));
         frame.push_str("\x1b[K\n");
     }
     // The window is padded to its full height so that a shorter frame does

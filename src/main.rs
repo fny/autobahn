@@ -10,6 +10,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 mod pager;
 mod shop;
+mod style;
 
 use autobahn::config::Config;
 use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
@@ -2162,6 +2163,16 @@ fn run_issues(
     filter: Option<String>,
     json: bool,
 ) -> Result<()> {
+    // Every line goes out through `style`, so a pipe or `NO_COLOR` gets
+    // the same words without the colour.
+    macro_rules! say {
+        () => {
+            style::emit("\n")
+        };
+        ($($argument:tt)*) => {
+            style::emit(&format!("{}\n", format_args!($($argument)*)))
+        };
+    }
     let plans = load_config(config)?.plans()?;
     let state_root = resolve_state_root(state_root)?;
     let selection = select(&plans, selector.as_deref(), host.as_deref())?;
@@ -2219,7 +2230,7 @@ fn run_issues(
             });
         }
         report.groups.retain(|group| !group.sessions.is_empty());
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        say!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
     }
 
@@ -2249,28 +2260,29 @@ fn run_issues(
         // filter: a heading over nothing reads as a group in trouble.
         if current_group != Some(plan.group.as_str()) {
             if current_group.is_some() {
-                println!();
+                say!();
             }
             current_group = Some(plan.group.as_str());
-            println!(
+            say!(
                 "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
-                plan.alpha_spec, plan.group
+                plan.alpha_spec,
+                plan.group
             );
         }
-        println!("  {}", plan.beta_spec());
+        say!("  {}", plan.beta_spec());
         total += selected.len() + blocked.len();
 
         if failed {
             total += 1;
-            println!("\n    \x1b[31m{state}\x1b[0m");
+            say!("\n    \x1b[31m{state}\x1b[0m");
             if let Some(error) = &status.error {
-                println!(
+                say!(
                     "      {}",
                     display_safe(error.trim_start_matches("halted: "))
                 );
             }
             if state == "halted" {
-                println!("      fix: make the two sides agree, then it resumes");
+                say!("      fix: make the two sides agree, then it resumes");
             }
         }
 
@@ -2278,7 +2290,7 @@ fn run_issues(
             continue;
         }
         if !selected.is_empty() {
-            println!(
+            say!(
                 "\n    \x1b[33m{}\x1b[0m",
                 match selected.len() {
                     1 => "1 conflict".to_owned(),
@@ -2294,12 +2306,12 @@ fn run_issues(
             for (prefix, count) in roll_up(&selected, depth + below) {
                 let shown = display_safe(&prefix);
                 match count {
-                    1 if selected.contains(&&prefix) => println!("    {shown}"),
-                    1 => println!("    {shown} — 1 conflict"),
-                    count => println!("    {shown} — {count} conflicts"),
+                    1 if selected.contains(&&prefix) => say!("    {shown}"),
+                    1 => say!("    {shown} — 1 conflict"),
+                    count => say!("    {shown} — {count} conflicts"),
                 }
             }
-            println!(
+            say!(
                 "    → `autobahn conflicts {} --depth {}` opens the next level",
                 plan.group,
                 depth + 1
@@ -2312,7 +2324,7 @@ fn run_issues(
                 .conflict_details
                 .iter()
                 .find(|detail| &&detail.path == path);
-            println!("      {}", display_safe(path));
+            say!("      {}", display_safe(path));
             if let Some(detail) = detail {
                 let describe = |side: &autobahn::supervisor::ConflictSide| -> String {
                     if !side.present {
@@ -2327,8 +2339,8 @@ fn run_issues(
                         kind => kind.to_owned(),
                     }
                 };
-                println!("        alpha  {}", describe(&detail.alpha));
-                println!("        {:<6} {}", plan.host, describe(&detail.beta));
+                say!("        alpha  {}", describe(&detail.alpha));
+                say!("        {:<6} {}", plan.host, describe(&detail.beta));
                 // Why it is a conflict at all. Two sides that merely
                 // differ are reconciled; a side holding content that was
                 // never scanned is not overwritten, and that refusal is
@@ -2343,11 +2355,11 @@ fn run_issues(
                         1 => "1 entry".to_owned(),
                         many => format!("{many} entries"),
                     };
-                    println!(
+                    say!(
                         "        {name} holds {count} synchronization cannot carry, \
                          so neither side is overwritten"
                     );
-                    println!(
+                    say!(
                         "          {} — {}",
                         display_safe(&blocking.example),
                         display_safe(&blocking.reason)
@@ -2363,9 +2375,10 @@ fn run_issues(
                 None if selected.len() == 1 => pasteable(selected[0]),
                 None => "<path>".to_owned(),
             };
-            println!(
+            say!(
                 "      fix: autobahn resolve {} {where_} --keep alpha|{}|both",
-                plan.group, plan.host
+                plan.group,
+                plan.host
             );
         }
 
@@ -2384,7 +2397,7 @@ fn run_issues(
             }
         }
         for (side, cause, paths) in &causes {
-            println!(
+            say!(
                 "\n    \x1b[33m{} on {}\x1b[0m \x1b[2m— {}\x1b[0m",
                 match paths.len() {
                     1 => "1 blocked".to_owned(),
@@ -2400,7 +2413,7 @@ fn run_issues(
             // directory they share is named.
             for (prefix, count) in clusters(paths) {
                 match (count, prefix.as_str()) {
-                    (1, _) => println!(
+                    (1, _) => say!(
                         "      {}",
                         display_safe(
                             paths
@@ -2410,15 +2423,15 @@ fn run_issues(
                                 .unwrap_or(&prefix)
                         )
                     ),
-                    (count, "") => println!("      {count} paths"),
+                    (count, "") => say!("      {count} paths"),
                     (count, prefix) => {
-                        println!("      {count} under {}/", display_safe(prefix))
+                        say!("      {count} under {}/", display_safe(prefix))
                     }
                 }
                 for (index, fix) in blocked_fix(side, cause, &prefix, plan).iter().enumerate() {
                     match index {
-                        0 => println!("        fix: {fix}"),
-                        _ => println!("             {fix}"),
+                        0 => say!("        fix: {fix}"),
+                        _ => say!("             {fix}"),
                     }
                 }
             }
@@ -2426,9 +2439,9 @@ fn run_issues(
     }
     if total == 0 {
         match (&scope, &filter) {
-            (Some(scope), _) => println!("nothing needs you under {}", display_safe(scope)),
-            (None, Some(pattern)) => println!("nothing needs you matching {pattern:?}"),
-            (None, None) => println!("nothing needs you"),
+            (Some(scope), _) => say!("nothing needs you under {}", display_safe(scope)),
+            (None, Some(pattern)) => say!("nothing needs you matching {pattern:?}"),
+            (None, None) => say!("nothing needs you"),
         }
     }
     Ok(())
@@ -2549,7 +2562,7 @@ fn confirmed(
     }
     println!();
 
-    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         bail!("nothing to answer the prompt; pass --yes to resolve without asking");
     }
     print!("proceed? [y/N] ");
@@ -2985,7 +2998,7 @@ fn run_resolve(
     let scan = |endpoint: &mut Box<dyn autobahn::endpoint::Endpoint + Send>,
                 side: &str|
      -> Result<Option<autobahn::tree::Node>> {
-        let transient = unsafe { libc::isatty(libc::STDERR_FILENO) } == 1;
+        let transient = std::io::IsTerminal::is_terminal(&std::io::stderr());
         if transient {
             eprint!("  reading {side}\r");
         }
@@ -4076,7 +4089,7 @@ fn run_status(
         if json {
             bail!("--live repaints a display; --json prints one document. Pick one");
         }
-        if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+        if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
             bail!(
                 "--live repaints a terminal display, and this output is not a terminal; \
                  run `autobahn status` on a timer instead"
@@ -4099,7 +4112,7 @@ fn run_status(
         live,
         &mut out,
     );
-    print!("{out}");
+    style::emit(&out);
     Ok(())
 }
 

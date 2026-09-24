@@ -158,7 +158,7 @@ struct Pending {
 
 /// Runs the shop until the reader closes up.
 pub fn run(selected: &[&SessionPlan], state_root: &Path, config: Option<PathBuf>) -> Result<()> {
-    if unsafe { libc::isatty(libc::STDOUT_FILENO) } != 1 {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdout()) {
         anyhow::bail!("the shop needs a terminal");
     }
     let _terminal = crate::pager::Terminal::enter()?;
@@ -1194,7 +1194,15 @@ fn grid(mut lines: Vec<String>, height: usize, width: usize, footer: String) -> 
         // Every line of the frame, whatever built it: names are escaped
         // where the rows are made, and this keeps anything that slipped
         // past from reaching the terminal as more than text.
-        .map(|line| pad(&crate::pager::only_colour(&line), width))
+        .map(|line| {
+            pad(
+                &crate::style::apply(
+                    &crate::pager::only_colour(&line),
+                    crate::style::screen_level(),
+                ),
+                width,
+            )
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }

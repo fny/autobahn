@@ -31,9 +31,11 @@ Usage:
 import argparse
 import base64
 import concurrent.futures
+import ipaddress
 import json
 import os
 import random
+import re
 import shlex
 import subprocess
 import sys
@@ -349,17 +351,80 @@ def plan_groups(selected, repeats, budget_vcpus):
     return groups
 
 
-def run(command, check=True, capture=True):
+def run(arguments, check=True, capture=True, input=None):
+    """Runs a command given as an argument list, never through a local
+    shell. Values read back from the fleet reach these commands, and an
+    instance is not trusted with the operator's workstation, which holds
+    the AWS credentials. A command that needs a shell on the *remote* side
+    passes it to ssh as one string, built with `shlex.quote` on every
+    value (see `ssh`)."""
+    if isinstance(arguments, str):
+        raise TypeError("run() takes an argument list, not a shell string")
     return subprocess.run(
-        command, shell=True, check=check,
+        list(arguments), check=check, input=input,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.STDOUT, text=True,
     )
 
 
-def aws(profile, region, arguments):
-    result = run(f"aws --profile {profile} --region {region} {arguments}")
+def aws(profile, region, *arguments):
+    result = run(["aws", "--profile", profile, "--region", region, *arguments])
     return result.stdout.strip()
+
+
+def ssh(key, host, command, *options):
+    """The argument list that runs `command` on `host`. The command is a
+    shell string for the remote side; every value in it must already have
+    been through `shlex.quote`."""
+    return ["ssh", "-o", "StrictHostKeyChecking=accept-new", *options,
+            "-i", key_path(key), f"ubuntu@{host}", command]
+
+
+def scp(key, source, target, *options):
+    return ["scp", "-o", "StrictHostKeyChecking=accept-new", *options,
+            "-i", key_path(key), source, target]
+
+
+# ── values read back from instances ──────────────────────────────────
+#
+# An instance's answers are data, and are checked against the shape they
+# must have before anything uses them: a tampered instance should get an
+# error, not a say in what the next command does.
+
+PUBLIC_KEY = re.compile(
+    r"(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com)"
+    r" [A-Za-z0-9+/]+={0,3}( [A-Za-z0-9@._-]+)?")
+
+
+def checked_public_key(text):
+    """One SSH public key line, or ValueError."""
+    key = text.strip()
+    if not PUBLIC_KEY.fullmatch(key):
+        raise ValueError(f"not an SSH public key: {key[:80]!r}")
+    return key
+
+
+def checked_address(text):
+    """An IP address, or ValueError."""
+    return str(ipaddress.ip_address(text.strip()))
+
+
+def checked_commit(text):
+    """A git commit id, or None."""
+    commit = text.strip()
+    return commit if re.fullmatch(r"[0-9a-f]{40}", commit) else None
+
+
+def authorize_source_key(key, source, destinations):
+    """Gives `source` its own SSH key and authorizes it on every host in
+    `destinations` (all public addresses). The key is read back from the
+    source, so it is checked before any destination sees it."""
+    run(ssh(key, source, "ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519 -q || true"))
+    public_key = checked_public_key(run(ssh(key, source, "cat ~/.ssh/id_ed25519.pub")).stdout)
+    for destination in destinations:
+        run(ssh(key, destination,
+                f"printf '%s\\n' {shlex.quote(public_key)} >> ~/.ssh/authorized_keys"))
+    return public_key
 
 
 # ── bake ─────────────────────────────────────────────────────────────
@@ -377,8 +442,7 @@ def bake(options):
     address, _ = wait_for_address(options, [instance])[instance]
     wait_for_ssh(address, key)
 
-    ssh = f"ssh -o StrictHostKeyChecking=accept-new -i {key_path(key)} ubuntu@{address}"
-    run(f"{ssh} 'mkdir -p ~/bench'")
+    run(ssh(key, address, "mkdir -p ~/bench"))
     for source, target in [
         (f"{HERE}/harness/target/x86_64-unknown-linux-musl/release/benchmark", "~/bench/benchmark"),
         (f"{HERE}/job.py", "~/bench/job.py"),
@@ -390,13 +454,14 @@ def bake(options):
          "~/mutagen-agents.tar.gz"),
         (f"{HERE}/toysync.py", "~/bench/toysync.py"),
     ]:
-        run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} {source} ubuntu@{address}:{target}")
-    run(f"{ssh} 'chmod +x ~/bench/benchmark ~/autobahn ~/mutagen; "
-        f"mkdir -p ~/agents && cp ~/autobahn ~/agents/autobahn-linux-x86_64'")
+        run(scp(key, source, f"ubuntu@{address}:{target}"))
+    run(ssh(key, address, "chmod +x ~/bench/benchmark ~/autobahn ~/mutagen; "
+                          "mkdir -p ~/agents && cp ~/autobahn ~/agents/autobahn-linux-x86_64"))
 
     script = base64.b64encode(BAKE_SCRIPT.encode()).decode()
     print("baking (chromium clone + subsets + partitions; ~15 minutes)...")
-    run(f"{ssh} 'echo {script} | base64 -d > ~/bake.sh && chmod +x ~/bake.sh && ~/bake.sh'",
+    run(ssh(key, address, f"echo {shlex.quote(script)} | base64 -d > ~/bake.sh "
+                          "&& chmod +x ~/bake.sh && ~/bake.sh"),
         capture=False)
 
     # The harness and the subject binary leave the image before it is
@@ -410,14 +475,14 @@ def bake(options):
     # them came from the same build tree the run will push from, so the
     # two still agree. Only mutagen stays in the image: it is a stock
     # release that does not move between runs.
-    run(f"{ssh} 'rm -f ~/bench/benchmark ~/autobahn ~/agents/autobahn-linux-x86_64'")
+    run(ssh(key, address, "rm -f ~/bench/benchmark ~/autobahn ~/agents/autobahn-linux-x86_64"))
 
     print("creating image...")
     ami = aws(options.profile, options.region,
-              f"ec2 create-image --instance-id {instance} --name {run_id}-golden "
-              f"--query ImageId --output text")
-    aws(options.profile, options.region, f"ec2 wait image-available --image-ids {ami}")
-    aws(options.profile, options.region, f"ec2 terminate-instances --instance-ids {instance}")
+              "ec2", "create-image", "--instance-id", instance, "--name", f"{run_id}-golden",
+              "--query", "ImageId", "--output", "text")
+    aws(options.profile, options.region, "ec2", "wait", "image-available", "--image-ids", ami)
+    aws(options.profile, options.region, "ec2", "terminate-instances", "--instance-ids", instance)
     print(f"AMI ready: {ami}")
     print(f"dispatch with: run --run {run_id} --ami {ami}   "
           f"(the run's key and security group are found by name)")
@@ -476,24 +541,26 @@ REPAIR_EOF
 def provision_network(options, run_id):
     key = f"{run_id}-key"
     material = aws(options.profile, options.region,
-                   f"ec2 create-key-pair --key-name {key} --query KeyMaterial --output text")
+                   "ec2", "create-key-pair", "--key-name", key,
+                   "--query", "KeyMaterial", "--output", "text")
     with open(key_path(key), "w") as handle:
         handle.write(material + "\n")
     os.chmod(key_path(key), 0o600)
     vpc = aws(options.profile, options.region,
-              "ec2 describe-vpcs --filters Name=is-default,Values=true "
-              "--query 'Vpcs[0].VpcId' --output text")
+              "ec2", "describe-vpcs", "--filters", "Name=is-default,Values=true",
+              "--query", "Vpcs[0].VpcId", "--output", "text")
     group = aws(options.profile, options.region,
-                f"ec2 create-security-group --group-name {run_id}-sg "
-                f"--description 'temporary benchmark {run_id}' --vpc-id {vpc} "
-                f"--query GroupId --output text")
-    my_ip = run("curl -s --max-time 10 https://checkip.amazonaws.com").stdout.strip()
+                "ec2", "create-security-group", "--group-name", f"{run_id}-sg",
+                "--description", f"temporary benchmark {run_id}", "--vpc-id", vpc,
+                "--query", "GroupId", "--output", "text")
+    my_ip = checked_address(
+        run(["curl", "-s", "--max-time", "10", "https://checkip.amazonaws.com"]).stdout)
     aws(options.profile, options.region,
-        f"ec2 authorize-security-group-ingress --group-id {group} "
-        f"--protocol tcp --port 22 --cidr {my_ip}/32")
+        "ec2", "authorize-security-group-ingress", "--group-id", group,
+        "--protocol", "tcp", "--port", "22", "--cidr", f"{my_ip}/32")
     aws(options.profile, options.region,
-        f"ec2 authorize-security-group-ingress --group-id {group} "
-        f"--protocol -1 --source-group {group}")
+        "ec2", "authorize-security-group-ingress", "--group-id", group,
+        "--protocol", "-1", "--source-group", group)
     return key, group
 
 
@@ -510,40 +577,45 @@ def default_subnets(options):
     not what any cell is asking about.
     """
     output = aws(options.profile, options.region,
-                 "ec2 describe-subnets --filters Name=default-for-az,Values=true "
-                 "--query 'Subnets[].[AvailabilityZone,SubnetId]' --output json")
+                 "ec2", "describe-subnets", "--filters", "Name=default-for-az,Values=true",
+                 "--query", "Subnets[].[AvailabilityZone,SubnetId]", "--output", "json")
     return {zone: subnet for zone, subnet in json.loads(output)}
 
 
 def launch(options, run_id, instance_type, group, key, count, ami=None, subnet=None):
     image = ami or aws(options.profile, options.region,
-                       "ssm get-parameter --name /aws/service/canonical/ubuntu/server/24.04/"
-                       "stable/current/amd64/hvm/ebs-gp3/ami-id "
-                       "--query Parameter.Value --output text")
-    placement = f"--subnet-id {subnet} " if subnet else ""
+                       "ssm", "get-parameter", "--name",
+                       "/aws/service/canonical/ubuntu/server/24.04/"
+                       "stable/current/amd64/hvm/ebs-gp3/ami-id",
+                       "--query", "Parameter.Value", "--output", "text")
+    placement = ["--subnet-id", subnet] if subnet else []
+    devices = [{"DeviceName": "/dev/sda1",
+                "Ebs": {"VolumeSize": VOLUME_GB, "VolumeType": "gp3", "Iops": 6000,
+                        "Throughput": 500, "DeleteOnTermination": True}}]
     identifiers = aws(
         options.profile, options.region,
-        f"ec2 run-instances --image-id {image} --instance-type {instance_type} "
-        f"--count {count} --key-name {key} --security-group-ids {group} {placement}"
-        f"--instance-initiated-shutdown-behavior terminate "
-        f"--block-device-mappings '[{{\"DeviceName\":\"/dev/sda1\",\"Ebs\":"
-        f"{{\"VolumeSize\":{VOLUME_GB},\"VolumeType\":\"gp3\",\"Iops\":6000,"
-        f"\"Throughput\":500,\"DeleteOnTermination\":true}}}}]' "
-        f"--tag-specifications 'ResourceType=instance,"
-        f"Tags=[{{Key=Name,Value={run_id}}},{{Key=bench-run,Value={run_id}}}]' "
-        f"--query 'Instances[].InstanceId' --output text",
+        "ec2", "run-instances", "--image-id", image, "--instance-type", instance_type,
+        "--count", str(count), "--key-name", key, "--security-group-ids", group, *placement,
+        "--instance-initiated-shutdown-behavior", "terminate",
+        "--block-device-mappings", json.dumps(devices),
+        "--tag-specifications",
+        f"ResourceType=instance,Tags=[{{Key=Name,Value={run_id}}},"
+        f"{{Key=bench-run,Value={run_id}}}]",
+        "--query", "Instances[].InstanceId", "--output", "text",
     ).split()
     aws(options.profile, options.region,
-        f"ec2 wait instance-running --instance-ids {' '.join(identifiers)}")
+        "ec2", "wait", "instance-running", "--instance-ids", *identifiers)
     return identifiers
 
 
 def wait_for_address(options, instances):
     output = aws(options.profile, options.region,
-                 f"ec2 describe-instances --instance-ids {' '.join(instances)} "
-                 "--query 'Reservations[].Instances[].[InstanceId,PublicIpAddress,PrivateIpAddress]' "
-                 "--output json")
-    return {row[0]: (row[1], row[2]) for row in json.loads(output)}
+                 "ec2", "describe-instances", "--instance-ids", *instances,
+                 "--query",
+                 "Reservations[].Instances[].[InstanceId,PublicIpAddress,PrivateIpAddress]",
+                 "--output", "json")
+    return {row[0]: (checked_address(row[1]), checked_address(row[2]))
+            for row in json.loads(output)}
 
 
 def _ssh_ready(address, key, attempts=48):
@@ -551,8 +623,8 @@ def _ssh_ready(address, key, attempts=48):
     which instances to replace rather than which run to abandon."""
     public = address[0] if isinstance(address, tuple) else address
     for _ in range(attempts):
-        if run(f"ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "
-               f"-i {key_path(key)} ubuntu@{public} true", check=False).returncode == 0:
+        if run(ssh(key, public, "true", "-o", "ConnectTimeout=5"),
+               check=False).returncode == 0:
             return True
         time.sleep(5)
     return False
@@ -561,8 +633,8 @@ def _ssh_ready(address, key, attempts=48):
 def wait_for_ssh(address, key):
     public = address[0] if isinstance(address, tuple) else address
     for _ in range(60):
-        if run(f"ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 "
-               f"-i {key_path(key)} ubuntu@{public} true", check=False).returncode == 0:
+        if run(ssh(key, public, "true", "-o", "ConnectTimeout=5"),
+               check=False).returncode == 0:
             return
         time.sleep(5)
     raise RuntimeError(f"ssh to {public} never came up")
@@ -615,9 +687,9 @@ def _dispatch_body(options):
         # for this run id is reused rather than re-created (which would
         # fail on the duplicate key pair).
         existing = aws(options.profile, options.region,
-                       f"ec2 describe-security-groups --filters "
-                       f"Name=group-name,Values={run_id}-sg "
-                       "--query 'SecurityGroups[0].GroupId' --output text")
+                       "ec2", "describe-security-groups", "--filters",
+                       f"Name=group-name,Values={run_id}-sg",
+                       "--query", "SecurityGroups[0].GroupId", "--output", "text")
         if existing and existing != "None" and os.path.exists(key_path(f"{run_id}-key")):
             key, group = f"{run_id}-key", existing
         else:
@@ -703,7 +775,7 @@ def _dispatch_body(options):
         print(f"{len(failed)} instance(s) never came up; replacing them "
               f"(attempt {attempt + 1} of 3)")
         aws(options.profile, options.region,
-            f"ec2 terminate-instances --instance-ids {' '.join(failed)}")
+            "ec2", "terminate-instances", "--instance-ids", *failed)
         for dead in failed:
             pool_key = next(k for k, members in pools.items() if dead in members)  # noqa: B023
             zone, instance_type = pool_key
@@ -732,15 +804,11 @@ def _dispatch_body(options):
         source = members[0]
         followers = members[1:]
         a_public, a_private = addresses[source]
-        ssh_a = f"ssh -i {key_path(key)} ubuntu@{a_public}"
-        run(f"{ssh_a} 'ssh-keygen -t ed25519 -N \"\" -f ~/.ssh/id_ed25519 -q || true'")
-        public_key = run(f"{ssh_a} 'cat ~/.ssh/id_ed25519.pub'").stdout.strip()
+        authorize_source_key(key, a_public, [addresses[f][0] for f in followers])
 
         aliases, privates, config = [], [], []
         for position, follower in enumerate(followers, start=1):
-            b_public, b_private = addresses[follower]
-            run(f"ssh -i {key_path(key)} ubuntu@{b_public} "
-                f"'echo {json.dumps(public_key)} >> ~/.ssh/authorized_keys'")
+            _, b_private = addresses[follower]
             alias = f"dest{position}"
             aliases.append(alias)
             privates.append(b_private)
@@ -761,12 +829,12 @@ def _dispatch_body(options):
             f"printf %s {shlex.quote(a_private + chr(10))} > ~/bench/self-ip; "
             f"printf %s {shlex.quote(','.join(aliases))} > ~/bench/destinations"
         )
-        result = run(f"ssh -n -i {key_path(key)} ubuntu@{a_public} {shlex.quote(wiring)}",
-                     check=False)
+        result = run(ssh(key, a_public, wiring, "-n"), check=False)
         if result.returncode != 0:
             raise RuntimeError(f"group {index}: wiring failed: {result.stdout[-400:]}")
         for alias in aliases:
-            reachable = run(f"{ssh_a} 'ssh -o ConnectTimeout=5 {alias} true && echo OK'")
+            reachable = run(ssh(key, a_public,
+                                f"ssh -o ConnectTimeout=5 {shlex.quote(alias)} true && echo OK"))
             if "OK" not in reachable.stdout:
                 raise RuntimeError(f"group {index}: source cannot reach {alias}")
 
@@ -800,11 +868,9 @@ def _dispatch_body(options):
                  "~/bench/benchmark"),
                 (AUTOBAHN_BINARY, "~/autobahn"),
             ]:
-                run(f"scp -o StrictHostKeyChecking=accept-new -i {key_path(key)} "
-                    f"{source} ubuntu@{host}:{target}")
-            run(f"ssh -o StrictHostKeyChecking=accept-new -i {key_path(key)} ubuntu@{host} "
-                f"'chmod +x ~/bench/benchmark ~/autobahn && mkdir -p ~/agents && "
-                f"cp ~/autobahn ~/agents/autobahn-linux-x86_64'")
+                run(scp(key, source, f"ubuntu@{host}:{target}"))
+            run(ssh(key, host, "chmod +x ~/bench/benchmark ~/autobahn && mkdir -p ~/agents && "
+                               "cp ~/autobahn ~/agents/autobahn-linux-x86_64"))
 
         hosts = [addresses[member][0] for member in members]
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(hosts)) as pool:
@@ -840,15 +906,15 @@ def _dispatch_body(options):
         listeners = [(addresses[f][0], "9911 9912") for f in followers]
         listeners.append((a_public, "10011 10012"))
         for host, ports in listeners:
-            run(f"ssh -i {key_path(key)} ubuntu@{host} "
-                f"'for p in {ports}; do setsid nohup ~/bench/benchmark observer $p "
-                f"--listen 0.0.0.0 --root ~/dest > ~/observer-$p.log 2>&1 < /dev/null & done'")
+            run(ssh(key, host,
+                    f"for p in {ports}; do setsid nohup ~/bench/benchmark observer $p "
+                    f"--listen 0.0.0.0 --root ~/dest > ~/observer-$p.log 2>&1 < /dev/null & done"))
         for host, ports in listeners:
-            ready = run(
-                f"ssh -i {key_path(key)} ubuntu@{host} "
-                f"'for i in $(seq 1 20); do "
+            ready = run(ssh(
+                key, host,
+                f"for i in $(seq 1 20); do "
                 f"ok=1; for p in {ports}; do ss -ltn | grep -q :$p || ok=0; done; "
-                f"[ $ok = 1 ] && echo READY && exit; sleep 1; done; echo NOT-READY'")
+                f"[ $ok = 1 ] && echo READY && exit; sleep 1; done; echo NOT-READY"))
             if "READY" not in ready.stdout or "NOT-READY" in ready.stdout:
                 raise RuntimeError(f"observers on {host} never came up: {ready.stdout}")
 
@@ -908,9 +974,8 @@ def _dispatch_body(options):
     # instead of trusting whatever happened to come back.
     os.makedirs(f"results-{run_id}", exist_ok=True)
     a0_public, _ = addresses[groups[0][0]]
-    chromium_commit = run(
-        f"ssh -i {key_path(key)} ubuntu@{a0_public} 'cat ~/corpus/chromium.commit'",
-        check=False).stdout.strip() or None
+    chromium_commit = checked_commit(run(
+        ssh(key, a0_public, "cat ~/corpus/chromium.commit"), check=False).stdout)
     plan = {"run": run_id, "seed": seed, "ami": options.ami,
             "chromium_commit": chromium_commit,
             "groups": [[width, instance] for width, instance in planned],
@@ -925,8 +990,8 @@ def _dispatch_body(options):
         a_public, _ = addresses[members[0]]
         with open(f"results-{run_id}/assignment-pair-{pair_index}.json", "w") as handle:
             json.dump(assignments[pair_index], handle)
-        run(f"scp -i {key_path(key)} results-{run_id}/assignment-pair-{pair_index}.json "
-            f"ubuntu@{a_public}:~/assignment.json")
+        run(scp(key, f"results-{run_id}/assignment-pair-{pair_index}.json",
+                f"ubuntu@{a_public}:~/assignment.json"))
         script_lines = [
             "set -u",
             "rm -f ~/results.jsonl ~/driver.log",
@@ -935,15 +1000,14 @@ def _dispatch_body(options):
             'export BENCH_DESTINATIONS="$(cat ~/bench/destinations)"',
         ]
         for job in assignments[pair_index]:
-            spec = json.dumps(json.dumps(job))  # shell-quoted JSON
             script_lines.append(
-                f"python3 ~/bench/job.py --spec {spec} --output ~/results.jsonl"
-                f" >> ~/driver.log 2>&1"
-                f" || echo {json.dumps(job['job'])} >> ~/results.err"
+                f"python3 ~/bench/job.py --spec {shlex.quote(json.dumps(job))}"
+                f" --output ~/results.jsonl >> ~/driver.log 2>&1"
+                f" || echo {shlex.quote(job['job'])} >> ~/results.err"
             )
         script = "; ".join(script_lines)
         processes.append((pair_index, a_public, subprocess.Popen(
-            ["ssh", "-n", "-i", key_path(key), f"ubuntu@{a_public}", script],
+            ssh(key, a_public, script, "-n"),
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)))
 
     def collect_pair(pair_index, a_public, logs=False):
@@ -951,14 +1015,15 @@ def _dispatch_body(options):
         # host wedged in a half-open connection would otherwise stall the
         # collection of every other pair behind it.
         for artifact in ("results.jsonl", "results.err", "driver.log"):
-            run(f"scp -o ConnectTimeout=15 -i {key_path(key)} ubuntu@{a_public}:~/{artifact} "
-                f"results-{run_id}/pair-{pair_index}-{artifact}", check=False)
+            run(scp(key, f"ubuntu@{a_public}:~/{artifact}",
+                    f"results-{run_id}/pair-{pair_index}-{artifact}", "-o", "ConnectTimeout=15"),
+                check=False)
         if logs:
             # Per-job tool logs come back too, at the end. An intermittent
             # failure that leaves no log is far more expensive to chase
             # than the transfer of a few megabytes of text.
-            run(f"scp -r -i {key_path(key)} ubuntu@{a_public}:~/logs "
-                f"results-{run_id}/pair-{pair_index}-logs", check=False)
+            run(scp(key, f"ubuntu@{a_public}:~/logs",
+                    f"results-{run_id}/pair-{pair_index}-logs", "-r"), check=False)
 
     def samples_so_far():
         total = 0
@@ -999,37 +1064,40 @@ def _dispatch_body(options):
 
 def destroy(options):
     instances = aws(options.profile, options.region,
-                    f"ec2 describe-instances --filters Name=tag:bench-run,Values={options.run} "
-                    "Name=instance-state-name,Values=pending,running,stopping,stopped "
-                    "--query 'Reservations[].Instances[].InstanceId' --output text").split()
+                    "ec2", "describe-instances", "--filters",
+                    f"Name=tag:bench-run,Values={options.run}",
+                    "Name=instance-state-name,Values=pending,running,stopping,stopped",
+                    "--query", "Reservations[].Instances[].InstanceId",
+                    "--output", "text").split()
     if instances:
         aws(options.profile, options.region,
-            f"ec2 terminate-instances --instance-ids {' '.join(instances)}")
+            "ec2", "terminate-instances", "--instance-ids", *instances)
         aws(options.profile, options.region,
-            f"ec2 wait instance-terminated --instance-ids {' '.join(instances)}")
+            "ec2", "wait", "instance-terminated", "--instance-ids", *instances)
     for group in aws(options.profile, options.region,
-                     f"ec2 describe-security-groups --filters Name=group-name,Values={options.run}-sg "
-                     "--query 'SecurityGroups[].GroupId' --output text").split():
-        aws(options.profile, options.region, f"ec2 delete-security-group --group-id {group}")
-    run(f"aws --profile {options.profile} --region {options.region} "
-        f"ec2 delete-key-pair --key-name {options.run}-key", check=False)
+                     "ec2", "describe-security-groups", "--filters",
+                     f"Name=group-name,Values={options.run}-sg",
+                     "--query", "SecurityGroups[].GroupId", "--output", "text").split():
+        aws(options.profile, options.region, "ec2", "delete-security-group", "--group-id", group)
+    run(["aws", "--profile", options.profile, "--region", options.region,
+         "ec2", "delete-key-pair", "--key-name", f"{options.run}-key"], check=False)
     if os.path.exists(key_path(f"{options.run}-key")):
         os.remove(key_path(f"{options.run}-key"))
     # The golden AMI and its snapshots are billed storage; a destroyed run
     # leaves nothing behind unless --keep-ami was given.
     if not getattr(options, "keep_ami", False):
         for image in aws(options.profile, options.region,
-                         f"ec2 describe-images --owners self "
-                         f"--filters Name=name,Values={options.run}-golden "
-                         "--query 'Images[].ImageId' --output text").split():
+                         "ec2", "describe-images", "--owners", "self",
+                         "--filters", f"Name=name,Values={options.run}-golden",
+                         "--query", "Images[].ImageId", "--output", "text").split():
             snapshots = aws(options.profile, options.region,
-                            f"ec2 describe-images --image-ids {image} "
-                            "--query 'Images[].BlockDeviceMappings[].Ebs.SnapshotId' "
-                            "--output text").split()
-            aws(options.profile, options.region, f"ec2 deregister-image --image-id {image}")
+                            "ec2", "describe-images", "--image-ids", image,
+                            "--query", "Images[].BlockDeviceMappings[].Ebs.SnapshotId",
+                            "--output", "text").split()
+            aws(options.profile, options.region, "ec2", "deregister-image", "--image-id", image)
             for snapshot in snapshots:
                 aws(options.profile, options.region,
-                    f"ec2 delete-snapshot --snapshot-id {snapshot}")
+                    "ec2", "delete-snapshot", "--snapshot-id", snapshot)
     print("destroyed")
 
 

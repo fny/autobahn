@@ -55,7 +55,7 @@ Profiled 2026-09-23 (`perf`, `sync` on a converged 160k-file pair, 2.27 s wall, 
 ## Idle
 
 - [x] Idle measured 2026-09-23, one session with a remote beta over ssh, 60 s: controller 0.33% → 0.30% of a core, agent 0.03% → 0.02% (old alternating wait → standing watch). Unchanged, and consistent with the README's figure.
-- [ ] The 120 s full walk on the beta host is now an 8-thread burst every two minutes. Fine on a build box, worth a look on a laptop on battery: measure with `powermetrics` on the Mac.
+- [x] The 120 s full walk on the beta host is now an 8-thread burst every two minutes. Fine on a build box, worth a look on a laptop on battery: measure with `powermetrics` on the Mac. **CPU measured on Linux 2026-09-24 and the battery question handed to MAC-BENCH.md §2: an idle 420k-file session (both sides on one c6i.8xlarge) used 12 CPU-seconds in 240 s, four full walks, ~3 CPU-seconds per walk, 2.5% of a core on average; at 160k files roughly 1% per side. Nothing to change on a build box; whether it matters on battery is the Mac measurement.**
 
 ## The harness — so the above can be measured honestly
 

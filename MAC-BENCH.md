@@ -36,6 +36,8 @@ Write results under each section's **Record** as you go, with the commit you tes
 
 A running session walks both trees in full every 120 seconds (`FULL_SCAN_INTERVAL`, `src/endpoint/observer.rs`), because events can be lost. Since the walk went parallel, each one is a short burst on up to eight threads. On a build box nobody cares; on a laptop on battery it may matter. It isn't configurable, so this compares two builds.
 
+For scale, measured on Linux (c6i.8xlarge, 2026-09-24): a 420,000-file session with both sides on one machine used 12 CPU-seconds in 240 idle seconds, four full walks, so about 3 CPU-seconds per walk of 420k files, or 2.5% of one core on average. A 160,000-file tree should cost roughly 1.2 CPU-seconds a walk, 1% of a core per side.
+
 1. A tree the size of a real one: `python3 bench/corpus.py code ~/bench-160k/a --scale 4` (160,000 files), then `cp -R ~/bench-160k/a ~/bench-160k/b`.
 2. A config with just that group, `two-way-conflict`, both sides local.
 3. Unplug the charger. Leave the machine idle: no edits, lid open, display may sleep.

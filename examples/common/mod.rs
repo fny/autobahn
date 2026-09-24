@@ -26,9 +26,9 @@ use std::path::PathBuf;
 /// the one that does not reach the end: an `.expect()` on an unreadable
 /// file, an assertion about the tree, a tree that changed underneath.
 /// That is exactly when a stray edit would be left behind to propagate
-/// with nobody watching, and on macOS today it is not hypothetical, since
-/// the transition assertion below fails whenever the watcher has not
-/// delivered the edit before the rescan reads it.
+/// with nobody watching — and not hypothetical: `cycle_cost`'s transition
+/// assertion used to fail whenever the watcher had not delivered the edit
+/// before the rescan read it, which is how this guard came about.
 pub struct Restore {
     path: PathBuf,
     content: Vec<u8>,

@@ -22,14 +22,19 @@
 //! Usage: cargo run --release --example cycle_cost -- <root> [root...]
 
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 mod common;
 use common::Restore;
 
 use autobahn::endpoint::local::{EndpointOptions, LocalEndpoint};
 use autobahn::endpoint::Endpoint;
-use autobahn::tree::{nodes_share_storage, reconcile, Content, Node, SyncMode};
+use autobahn::tree::{nodes_share_storage, reconcile, Content, Digest, Node, SyncMode};
+
+/// How long to wait for the watcher to report the edit. FSEvents batches
+/// its reports, so this is generous; a healthy watch answers in
+/// milliseconds.
+const WATCHER_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn main() {
     let roots: Vec<PathBuf> = std::env::args().skip(1).map(PathBuf::from).collect();
@@ -74,9 +79,28 @@ fn main() {
         content.extend_from_slice(b"\nedited\n");
         std::fs::write(&path, &content).expect("victim should be writable");
 
-        let started = Instant::now();
-        let edited = endpoint.scan().expect("rescan should succeed");
-        let rescan = started.elapsed().as_secs_f64() * 1000.0;
+        // A watched root's observer serves its published snapshot until the
+        // watcher reports a change, and the watcher reports asynchronously:
+        // a rescan the instant after the write can be served the settled
+        // snapshot, see no edit, and reconcile to nothing. A cycle is only
+        // ever woken by that report, so the rescan measured is the one it
+        // would run: after the report. An unrelated event can wake the
+        // wait first, so a rescan that missed the edit waits again, and
+        // only the one that saw it is timed.
+        let (edited, rescan) = (0..10)
+            .find_map(|_| {
+                let (_, watching) = endpoint
+                    .await_change_since(None, WATCHER_TIMEOUT)
+                    .expect("waiting for the watcher should succeed");
+                let started = Instant::now();
+                let edited = endpoint.scan().expect("rescan should succeed");
+                let rescan = started.elapsed().as_secs_f64() * 1000.0;
+                let seen = !watching
+                    || digest_at(edited.root.as_ref(), &victim)
+                        != digest_at(settled.root.as_ref(), &victim);
+                seen.then_some((edited, rescan))
+            })
+            .expect("the watcher should report the edit");
 
         // Put back immediately, not at the end of the run. Everything below
         // works from the in-memory snapshot, so every millisecond the edit
@@ -211,6 +235,21 @@ fn first_file(node: Option<&Node>, path: String) -> Option<String> {
             };
             first_file(Some(child), child_path)
         }),
+        _ => None,
+    }
+}
+
+/// The digest the snapshot records for the file at `path`, if it holds one.
+fn digest_at(node: Option<&Node>, path: &str) -> Option<Digest> {
+    let mut node = node?;
+    for name in path.split('/') {
+        let Content::Directory(children) = &node.content else {
+            return None;
+        };
+        node = children.iter().find(|child| child.name == name)?;
+    }
+    match &node.content {
+        Content::File { digest, .. } => Some(*digest),
         _ => None,
     }
 }

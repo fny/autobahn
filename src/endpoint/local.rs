@@ -178,6 +178,10 @@ pub struct LocalEndpoint {
     /// never referenced again. Nothing else ever removed those, and a busy
     /// tree with large files accumulated gigabytes of them.
     requested: HashSet<String>,
+    /// The sweep for crash leftovers this endpoint's first scan started,
+    /// if it started one, so a test can wait for it.
+    #[cfg(test)]
+    leftover_sweep: Option<std::thread::JoinHandle<()>>,
 }
 
 /// The number of changed paths a watcher will accumulate before giving up
@@ -739,6 +743,8 @@ impl LocalEndpoint {
             last_snapshot: None,
             supply: None,
             receive: None,
+            #[cfg(test)]
+            leftover_sweep: None,
         })
     }
 
@@ -760,6 +766,41 @@ impl LocalEndpoint {
     /// Where this endpoint's observation persists its scan cache.
     pub fn scan_cache_path(&self) -> PathBuf {
         self.observer.cache_path().to_path_buf()
+    }
+
+    /// Starts, once per root in this process, a background sweep of every
+    /// directory `snapshot` records for crash leftovers (see
+    /// [`sweep_recorded_directories`]).
+    ///
+    /// A transition sweeps only the directories it publishes into, so a
+    /// leftover in a directory nothing changes again would otherwise stay
+    /// for good, holding a large file's size in disk. It runs after the
+    /// first scan, off the cycle's path, and walks what the scan recorded
+    /// rather than the disk: nothing ignored, untracked or on another
+    /// device is listed, and autobahn's own state root never is.
+    fn sweep_leftovers_once(&mut self, snapshot: &Snapshot) {
+        static SWEPT: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+        let Some(tree) = snapshot.root.clone() else {
+            return;
+        };
+        if !SWEPT
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get_or_insert_with(HashSet::new)
+            .insert(self.root.clone())
+        {
+            return;
+        }
+        let root = self.root.clone();
+        let sweep = std::thread::Builder::new()
+            .name("autobahn-leftovers".into())
+            .spawn(move || sweep_recorded_directories(root, tree));
+        #[cfg(test)]
+        {
+            self.leftover_sweep = sweep.ok();
+        }
+        #[cfg(not(test))]
+        drop(sweep);
     }
 
     /// Overrides the probed filesystem behavior for tests.
@@ -1326,6 +1367,7 @@ impl Endpoint for LocalEndpoint {
             .scan(self.max_entry_count, self.progress.as_deref())?;
         self.seen_generation = generation;
         self.last_snapshot = Some(snapshot.clone());
+        self.sweep_leftovers_once(&snapshot);
         Ok(snapshot)
     }
 
@@ -1335,6 +1377,7 @@ impl Endpoint for LocalEndpoint {
             .scan_rehash(self.max_entry_count, self.progress.as_deref())?;
         self.seen_generation = generation;
         self.last_snapshot = Some(snapshot.clone());
+        self.sweep_leftovers_once(&snapshot);
         Ok(snapshot)
     }
 
@@ -3708,6 +3751,36 @@ fn stale_publish_leftover(name: &str, entry: &fs::DirEntry) -> bool {
     metadata.file_type().is_file()
         && age >= LEFTOVER_MINIMUM_AGE
         && (!process_running(pid) || age >= crate::fsutil::TMP_MAX_AGE)
+}
+
+/// Removes stale copy-publish leftovers (see [`stale_publish_leftover`])
+/// from `root` and every directory beneath it that `tree`, a scan of it,
+/// records. Iterative, so a deep tree needs no deep stack. A directory
+/// that is gone, or is no longer a real directory, is not listed.
+fn sweep_recorded_directories(root: PathBuf, tree: Node) {
+    let mut pending = vec![(root, tree)];
+    while let Some((directory, node)) = pending.pop() {
+        let Content::Directory(children) = &node.content else {
+            continue;
+        };
+        if !fs::symlink_metadata(&directory).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&directory) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else { continue };
+                if stale_publish_leftover(name, &entry) {
+                    let _ = fs::remove_file(entry.path());
+                }
+            }
+        }
+        for child in children.iter() {
+            if matches!(child.content, Content::Directory(_)) {
+                pending.push((directory.join(&child.name), child.clone()));
+            }
+        }
+    }
 }
 
 /// Whether a process with this identifier exists on this host.
@@ -6849,6 +6922,42 @@ mod apply_path_tests {
         assert_eq!(fs::read(root.join("d/new")).unwrap(), b"new");
         assert!(!stale.exists(), "the stale leftover was kept");
         assert!(fresh.exists(), "a leftover still being written was removed");
+    }
+
+    /// A crash's leftover in a directory no transition publishes into
+    /// again would otherwise stay for good: the first scan starts a sweep
+    /// of every directory it recorded, which removes the stale ones and
+    /// leaves one a copy may still be writing.
+    #[test]
+    fn the_first_scan_sweeps_the_whole_root_for_stale_leftovers() {
+        let keep = tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        fs::create_dir_all(root.join("d/e")).expect("d/e");
+        fs::write(root.join("d/e/a.txt"), b"a").expect("a");
+        let hour = std::time::Duration::from_secs(3600);
+        let at_root = leftover(&root, 1, hour);
+        let nested = leftover(&root.join("d/e"), 2, hour);
+        let fresh = leftover(&root.join("d"), 3, std::time::Duration::ZERO);
+        let mut endpoint = endpoint_with(&root, EndpointOptions::default());
+        endpoint.scan().expect("scan");
+        endpoint
+            .leftover_sweep
+            .take()
+            .expect("the first scan starts a sweep")
+            .join()
+            .expect("the sweep finishes");
+        assert!(!at_root.exists(), "the root's stale leftover was kept");
+        assert!(!nested.exists(), "a nested stale leftover was kept");
+        assert!(fresh.exists(), "a leftover still being written was removed");
+        assert_eq!(fs::read(root.join("d/e/a.txt")).unwrap(), b"a");
+
+        // Once per root: a later scan, or another endpoint on the same
+        // root, starts no second sweep.
+        endpoint.scan().expect("scan");
+        assert!(endpoint.leftover_sweep.is_none());
+        let mut other = endpoint_with(&root, EndpointOptions::default());
+        other.scan().expect("scan");
+        assert!(other.leftover_sweep.is_none());
     }
 
     #[test]

@@ -142,7 +142,11 @@ impl RemoteEndpoint {
             };
         }
         match response {
+            // Every scan now answers as a delta or "unchanged"; this arm
+            // goes at the next epoch bump. Until then what arrives whole is
+            // held to the same hierarchy check as what is reassembled.
             Response::Scan(snapshot) => {
+                check_hierarchy(&snapshot)?;
                 self.seen = None;
                 self.last_snapshot = Some(snapshot.clone());
                 Ok(snapshot)
@@ -244,11 +248,7 @@ impl RemoteEndpoint {
         }
         let snapshot: Snapshot =
             bincode::deserialize(&output).context("unable to decode the reassembled snapshot")?;
-        if let Some(root) = snapshot.root.as_ref() {
-            root.validate(false).map_err(|message| {
-                anyhow!("the reassembled snapshot is not a valid hierarchy: {message}")
-            })?;
-        }
+        check_hierarchy(&snapshot)?;
         Ok(snapshot)
     }
 
@@ -911,6 +911,17 @@ fn response_kind(response: &Response) -> &'static str {
     }
 }
 
+/// Refuses a snapshot from the agent whose hierarchy breaks the ordering
+/// and naming every merge relies on.
+fn check_hierarchy(snapshot: &Snapshot) -> Result<()> {
+    if let Some(root) = snapshot.root.as_ref() {
+        root.validate(false).map_err(|message| {
+            anyhow!("the agent's snapshot is not a valid hierarchy: {message}")
+        })?;
+    }
+    Ok(())
+}
+
 /// The most a reassembly buffer is sized for up front. The declared length
 /// is the agent's word, so beyond this the buffer grows as data arrives.
 const REASSEMBLY_PREALLOCATION: u64 = 8 * 1024 * 1024;
@@ -1149,6 +1160,43 @@ mod tests {
         // sides disagree about what was transmitted; that must be loud
         // rather than silently resolved by rescanning.
         let error = format!("{:#}", endpoint.scan().expect_err("the scan must fail"));
+        assert!(error.contains("unchanged scan before"), "{error}");
+        drop(endpoint);
+        let _ = agent.join();
+    }
+
+    #[test]
+    fn a_scan_answered_whole_with_an_invalid_hierarchy_is_refused() {
+        let link = |name: &str| Node {
+            name: name.into(),
+            content: crate::tree::Content::Symlink {
+                target: "elsewhere".into(),
+            },
+        };
+        let unsorted = Snapshot {
+            root: Some(Node {
+                name: String::new(),
+                content: crate::tree::Content::Directory(std::sync::Arc::new(vec![
+                    link("b"),
+                    link("a"),
+                ])),
+            }),
+            ..Snapshot::default()
+        };
+        let (client, agent) = connected_pair();
+        let agent = scripted_agent(
+            agent,
+            vec![
+                Response::Scan(unsorted),
+                Response::ScanUnchanged { generation: 1 },
+            ],
+        );
+        let mut endpoint =
+            RemoteEndpoint::connect(client, initialize("/root")).expect("unable to connect");
+        let error = format!("{:#}", endpoint.scan().expect_err("the scan must fail"));
+        assert!(error.contains("not a valid hierarchy"), "{error}");
+        // Nor is it kept as the baseline an unchanged report reproduces.
+        let error = format!("{:#}", endpoint.scan().expect_err("nothing was kept"));
         assert!(error.contains("unchanged scan before"), "{error}");
         drop(endpoint);
         let _ = agent.join();

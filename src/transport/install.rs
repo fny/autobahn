@@ -401,21 +401,40 @@ fn upload_agent(destination: &str, binary: &std::path::Path) -> Result<()> {
          mv \"$tmp\" ~/.autobahn/bin/autobahn-{version}-{digest}",
         length = content.len()
     );
+    stream_agent(ssh_command(destination, &script), content)
+}
+
+/// Runs the installation command, streaming the binary to it, and reports
+/// its failure in its own words.
+fn stream_agent(command: Command, content: Vec<u8>) -> Result<()> {
     let timeout = upload_timeout(content.len());
-    let output = run_within(
-        ssh_command(destination, &script),
-        Some(content),
-        timeout,
-        "the agent upload",
-    )?;
+    let output = run_within(command, Some(content), timeout, "the agent upload")?;
     if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        let detail = last_lines(&output.stderr);
         match detail.is_empty() {
             false => bail!("the installation command failed: {detail}"),
             true => bail!("the installation command exited with {}", output.status),
         }
     }
     Ok(())
+}
+
+/// The last few lines a command wrote, each capped, for an error message:
+/// the cause is at the end, after any login banner.
+fn last_lines(output: &[u8]) -> String {
+    const LINES: usize = 5;
+    const LINE_BYTES: usize = 512;
+    let text = String::from_utf8_lossy(output);
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines[lines.len().saturating_sub(LINES)..]
+        .iter()
+        .map(|line| crate::text::cap_line(line, LINE_BYTES))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// How long each remote step of an installation may take: the probe, and
@@ -506,13 +525,19 @@ fn run_within(
         stdout: joined(stdout),
         stderr: joined(stderr),
     };
+    // A command that failed stopped reading, so its input broke: the
+    // failure is its status and what it wrote, not the broken pipe. The
+    // stream's own failure matters only when the command claims success.
     if let Some(feeding) = feeding {
-        match feeding.join() {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                return Err(error).context("unable to stream the agent binary");
+        let fed = feeding.join();
+        if output.status.success() {
+            match fed {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    return Err(error).context("unable to stream the agent binary");
+                }
+                Err(_) => bail!("the thread streaming the agent binary panicked"),
             }
-            Err(_) => bail!("the thread streaming the agent binary panicked"),
         }
     }
     Ok(output)
@@ -741,6 +766,22 @@ mod tests {
                 assert_eq!(output.stdout, direct.stdout, "{shell}: {script}");
             }
         }
+    }
+
+    #[test]
+    fn a_failed_upload_says_what_the_remote_said() {
+        // The remote script gives up before reading the binary, so the
+        // stream breaks; the cause is what it wrote, not the broken pipe.
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("echo 'a login banner' >&2; echo 'mkdir: disk full' >&2; exit 1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let error = stream_agent(command, vec![0; 8 << 20]).expect_err("the upload fails");
+        let message = format!("{error:#}");
+        assert!(message.contains("disk full"), "{message}");
+        assert!(!message.contains("Broken pipe"), "{message}");
     }
 
     #[test]

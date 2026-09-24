@@ -61,6 +61,105 @@ pub enum ControlRequest {
     /// planned from, and any refused edit — so a caller shows what runs
     /// rather than what the file on disk says now.
     Sessions,
+    /// Settle conflicts: each named session applies its part — its
+    /// ancestor forgets the paths, and the losing copies on its sides are
+    /// retired — between two of its cycles, under its own lock, and then
+    /// cycles. `resolve` sends this while a supervisor owns the sessions,
+    /// since only the owner may write an ancestor.
+    Resolve {
+        /// What the answers to [`ControlRequest::Resolved`] are asked by.
+        id: u64,
+        /// One part per session.
+        parts: Vec<ResolutionPart>,
+    },
+    /// How the resolution `id` names has gone so far.
+    Resolved {
+        /// The resolution's identifier.
+        id: u64,
+    },
+}
+
+/// One session's part in a resolution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResolutionPart {
+    /// The session.
+    pub session: SessionKey,
+    /// What it applies.
+    pub settlement: crate::session::Settlement,
+    /// Whether this part waits for every other part of its resolution.
+    ///
+    /// The part that retires alpha's copy, when a destination's version
+    /// is kept, is applied last: until every other destination's ancestor
+    /// has forgotten the path and its losing copy is gone, alpha's gap
+    /// would read there as a deletion against an edited copy — and an edit
+    /// beats a deletion, so the losing version would come back to alpha
+    /// and win. It is not applied at all if another part failed, and it
+    /// leaves alone a path another part's copy was refused at.
+    pub last: bool,
+}
+
+/// Where one part of a resolution stands.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub enum PartState {
+    /// Not yet applied: the session is mid-cycle, not connected, paused,
+    /// or waiting for the other parts.
+    Pending,
+    /// Applied, with what it came to.
+    Applied(crate::session::SettlementOutcome),
+    /// Not applied, or applied only in part, and why.
+    Failed(String),
+}
+
+/// A resolution, as the supervisor tracks it: every part's state, shared
+/// by the workers applying them and the socket answering for them.
+#[derive(Debug)]
+pub(crate) struct Resolution {
+    /// Its identifier.
+    pub id: u64,
+    /// Every part's session and state, in the order sent.
+    pub parts: std::sync::Mutex<Vec<(SessionKey, PartState)>>,
+    /// The workers applying parts, woken whenever one reports, so a part
+    /// waiting on the others is applied as soon as it may be.
+    pub workers: Vec<Arc<WorkerControl>>,
+}
+
+impl Resolution {
+    /// Records the state `session`'s part reached, and wakes every worker
+    /// with a part in it.
+    pub fn report(&self, session: &SessionKey, state: PartState) {
+        let mut parts = self.parts.lock().unwrap_or_else(|error| error.into_inner());
+        if let Some((_, slot)) = parts.iter_mut().find(|(key, _)| key == session) {
+            *slot = state;
+        }
+        drop(parts);
+        for worker in &self.workers {
+            worker.wake.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Every other part's state, when `session`'s part may go: `None`
+    /// while another is pending.
+    pub fn others(&self, session: &SessionKey) -> Option<Vec<PartState>> {
+        let parts = self.parts.lock().unwrap_or_else(|error| error.into_inner());
+        let others: Vec<PartState> = parts
+            .iter()
+            .filter(|(key, _)| key != session)
+            .map(|(_, state)| state.clone())
+            .collect();
+        (!others
+            .iter()
+            .any(|state| matches!(state, PartState::Pending)))
+        .then_some(others)
+    }
+}
+
+/// One part waiting in a worker's control flags.
+#[derive(Debug)]
+pub(crate) struct PendingPart {
+    /// The resolution it belongs to.
+    pub resolution: Arc<Resolution>,
+    /// The part.
+    pub part: ResolutionPart,
 }
 
 /// What tells one session from every other: its state identifier.
@@ -168,6 +267,8 @@ pub enum ControlResponse {
     },
     /// What the supervisor is running.
     Sessions(Inventory),
+    /// Where each part of a resolution stands, in the order sent.
+    Resolution(Vec<(SessionKey, PartState)>),
 }
 
 /// What a running supervisor is running.
@@ -309,6 +410,8 @@ pub(crate) struct WorkerControl {
     pub reset: AtomicBool,
     /// Re-read every file's content on the next cycle.
     pub verify: AtomicBool,
+    /// Parts of resolutions to apply before the next cycle.
+    pub resolutions: std::sync::Mutex<Vec<PendingPart>>,
 }
 
 /// One registry entry: a session, its control flags, and its live
@@ -350,7 +453,14 @@ pub(crate) struct Registry {
     pub configuration: RwLock<Option<String>>,
     /// The state root, where a refused edit's notice is kept.
     pub state_root: PathBuf,
+    /// The resolutions sent lately, for `Resolved` to answer from.
+    pub resolutions: std::sync::Mutex<Vec<Arc<Resolution>>>,
 }
+
+/// How many resolutions the registry remembers. `resolve` asks after its
+/// own within moments; this only bounds what a long-running supervisor
+/// keeps.
+const REMEMBERED_RESOLUTIONS: usize = 64;
 
 impl Registry {
     /// Applies a control request, returning the number of affected sessions.
@@ -425,6 +535,69 @@ impl Registry {
                 logging_failed: crate::logging::failed(),
             });
         }
+        if let ControlRequest::Resolve { id, parts } = request {
+            // Every part's session must be running here, or none is
+            // queued: half a resolution is worse than none.
+            let mut workers = Vec::new();
+            for part in parts {
+                match entries.iter().find(|entry| entry.session == part.session) {
+                    Some(entry) => workers.push(entry.control.clone()),
+                    None => {
+                        return ControlResponse::Error(format!(
+                            "session {} is not supervised here",
+                            part.session
+                        ))
+                    }
+                }
+            }
+            let resolution = Arc::new(Resolution {
+                id: *id,
+                parts: std::sync::Mutex::new(
+                    parts
+                        .iter()
+                        .map(|part| (part.session.clone(), PartState::Pending))
+                        .collect(),
+                ),
+                workers: workers.clone(),
+            });
+            for (part, worker) in parts.iter().zip(&workers) {
+                worker
+                    .resolutions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .push(PendingPart {
+                        resolution: resolution.clone(),
+                        part: part.clone(),
+                    });
+                worker.wake.store(true, Ordering::Relaxed);
+            }
+            let mut remembered = self
+                .resolutions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            remembered.push(resolution);
+            let excess = remembered.len().saturating_sub(REMEMBERED_RESOLUTIONS);
+            remembered.drain(..excess);
+            return ControlResponse::Applied {
+                sessions: parts.len(),
+            };
+        }
+        if let ControlRequest::Resolved { id } = request {
+            let remembered = self
+                .resolutions
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            return match remembered.iter().find(|resolution| resolution.id == *id) {
+                Some(resolution) => ControlResponse::Resolution(
+                    resolution
+                        .parts
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .clone(),
+                ),
+                None => ControlResponse::Error(format!("no resolution {id} is known here")),
+            };
+        }
         if let ControlRequest::Progress = request {
             return ControlResponse::Progress(
                 entries
@@ -460,6 +633,8 @@ impl Registry {
             }),
             ControlRequest::Progress
             | ControlRequest::Sessions
+            | ControlRequest::Resolve { .. }
+            | ControlRequest::Resolved { .. }
             | ControlRequest::Yield { .. }
             | ControlRequest::Versioned { .. } => {
                 unreachable!("answered above")
@@ -978,11 +1153,77 @@ mod tests {
             yield_to: None,
             configuration: RwLock::new(Some("[groups.work]".into())),
             state_root: PathBuf::from("/nonexistent/state"),
+            resolutions: Default::default(),
             entries: RwLock::new(vec![
                 entry("work", "host1"),
                 entry("work", "host2"),
                 entry("other", "host1"),
             ]),
+        }
+    }
+
+    /// A resolution names sessions by key. One the supervisor does not run
+    /// refuses the whole request, queueing nothing; the rest are queued,
+    /// each worker woken, and `Resolved` answers for them until they
+    /// report. A part that goes last may go only once the others have.
+    #[test]
+    fn a_resolution_is_queued_whole_or_not_at_all() {
+        let registry = registry();
+        let part = |session: &str, last: bool| ResolutionPart {
+            session: SessionKey::new(session),
+            settlement: crate::session::Settlement::default(),
+            last,
+        };
+        let response = registry.apply(&ControlRequest::Resolve {
+            id: 1,
+            parts: vec![part("work-host1", false), part("work-absent", true)],
+        });
+        assert!(
+            matches!(response, ControlResponse::Error(_)),
+            "{response:?}"
+        );
+        let entries = registry.entries.read().unwrap();
+        assert!(entries
+            .iter()
+            .all(|entry| entry.control.resolutions.lock().unwrap().is_empty()));
+        drop(entries);
+        assert!(matches!(
+            registry.apply(&ControlRequest::Resolved { id: 1 }),
+            ControlResponse::Error(_)
+        ));
+
+        let response = registry.apply(&ControlRequest::Resolve {
+            id: 2,
+            parts: vec![part("work-host1", false), part("work-host2", true)],
+        });
+        assert!(
+            matches!(response, ControlResponse::Applied { sessions: 2 }),
+            "{response:?}"
+        );
+        let entries = registry.entries.read().unwrap();
+        let queued = |index: usize| {
+            let control = &entries[index].control;
+            assert!(control.wake.load(Ordering::Relaxed), "the worker is woken");
+            control.resolutions.lock().unwrap()[0].resolution.clone()
+        };
+        let resolution = queued(0);
+        assert!(
+            Arc::ptr_eq(&resolution, &queued(1)),
+            "one resolution, shared"
+        );
+        let last = SessionKey::new("work-host2");
+        assert!(resolution.others(&last).is_none(), "the last part waits");
+        resolution.report(
+            &SessionKey::new("work-host1"),
+            PartState::Applied(Default::default()),
+        );
+        assert!(resolution.others(&last).is_some(), "and then may go");
+        match registry.apply(&ControlRequest::Resolved { id: 2 }) {
+            ControlResponse::Resolution(states) => {
+                assert!(matches!(states[0].1, PartState::Applied(_)));
+                assert!(matches!(states[1].1, PartState::Pending));
+            }
+            other => panic!("{other:?}"),
         }
     }
 

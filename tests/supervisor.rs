@@ -2592,11 +2592,12 @@ fn resolving_the_root_is_refused() {
     assert_eq!(read(&beta, "other.txt"), "other");
 }
 
-/// Keeping a side that has not changed since the last sync would delete
-/// it: removing the other copy reads as a deletion against an untouched
-/// file, and a deletion against an untouched file propagates.
+/// Keeping a side that has not changed since the last sync makes every
+/// side match it. Stage 1 refused this: removing the other copy read as a
+/// deletion against an untouched file, and the deletion propagated.
+/// Forgetting the path in the ancestor makes the kept version a creation.
 #[test]
-fn keeping_an_unchanged_side_is_refused_as_a_deletion() {
+fn keeping_an_unchanged_side_makes_every_side_match_it() {
     let world = World::new();
     let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
     write(&beta, "keep.txt", "beta's edit");
@@ -2606,27 +2607,30 @@ fn keeping_an_unchanged_side_is_refused_as_a_deletion() {
         &["resolve", "r", "keep.txt", "--keep", "alpha", "--yes"],
     );
     assert!(ok, "{text}");
-    assert!(
-        text.contains("keeping alpha here would delete it"),
-        "{text}"
-    );
-    assert!(text.contains("settled 0 of 1"), "{text}");
-    assert_eq!(read(&alpha, "keep.txt"), "original");
-    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
-    // The same holds for `--keep both`: alpha's copy would be deleted by
-    // the rename aside of beta's.
+    assert!(text.contains("settled 1 of 1"), "{text}");
+    for _ in 0..3 {
+        assert!(cli(&world, &config, &["sync"]).0);
+        assert_eq!(read(&alpha, "keep.txt"), "original");
+        assert_eq!(read(&beta, "keep.txt"), "original");
+    }
+
+    // `--keep both` keeps the unchanged name, and the copy moved aside.
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
+    write(&beta, "keep.txt", "beta's edit");
     let (ok, text) = cli(
         &world,
         &config,
         &["resolve", "r", "keep.txt", "--keep", "both", "--yes"],
     );
     assert!(ok, "{text}");
-    assert!(
-        text.contains("keeping alpha here would delete it"),
-        "{text}"
-    );
-    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
-    assert!(!beta.join("keep.txt.b1").exists());
+    for _ in 0..3 {
+        assert!(cli(&world, &config, &["sync"]).0);
+        for root in [&alpha, &beta] {
+            assert_eq!(read(root, "keep.txt"), "original");
+            assert_eq!(read(root, "keep.txt.b1"), "beta's edit");
+        }
+    }
 }
 
 /// A one-way mode never carries beta's content to alpha, so retiring
@@ -2648,13 +2652,14 @@ fn keeping_beta_in_a_one_way_mode_is_refused() {
     assert_eq!(read(&beta, "keep.txt"), "original");
 }
 
-/// In two-way-alpha-strict alpha's deletion beats beta's edit, so
-/// retiring alpha's copy to keep beta's would delete beta's too.
+/// In two-way-alpha-strict alpha's deletion beats beta's edit, so stage 1
+/// refused to keep beta there. With the path forgotten, beta's version is
+/// a creation, which flows to alpha in that mode like any other.
 #[test]
-fn keeping_beta_in_the_strict_mode_is_refused() {
+fn keeping_beta_in_the_strict_mode_wins() {
     let world = World::new();
     let (config, alpha, beta) = one_pair(&world, "two-way-alpha-strict");
-    write(&beta, "keep.txt", "beta's edit");
+    write(&alpha, "keep.txt", "alpha's edit");
     let beta_spec = beta.to_string_lossy().to_string();
     let (ok, text) = cli(
         &world,
@@ -2662,10 +2667,273 @@ fn keeping_beta_in_the_strict_mode_is_refused() {
         &["resolve", "r", "keep.txt", "--keep", &beta_spec, "--yes"],
     );
     assert!(ok, "{text}");
-    assert!(text.contains("two-way-alpha-strict"), "{text}");
-    assert!(text.contains("settled 0 of 1"), "{text}");
-    assert_eq!(read(&alpha, "keep.txt"), "original");
-    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
+    assert!(text.contains("settled 1 of 1"), "{text}");
+    for _ in 0..3 {
+        assert!(cli(&world, &config, &["sync"]).0);
+        assert_eq!(read(&alpha, "keep.txt"), "original");
+        assert_eq!(read(&beta, "keep.txt"), "original");
+    }
+}
+
+/// What a path holds on the two sides when it is resolved.
+#[derive(Clone, Copy, Debug)]
+enum Shape {
+    /// The same file on both sides, as last synchronized.
+    Agreed,
+    /// The losing side edited the file; the winner's is as last synced.
+    LoserEdited,
+    /// Both sides edited the file, differently.
+    Conflict,
+    /// A directory both sides edited: a file inside it differently, and
+    /// the loser added one.
+    Directory,
+}
+
+/// Resolves `shape` in `mode`, keeping `keep` (`alpha`, `beta` or `both`),
+/// and checks the outcome over three more cycles.
+fn resolve_in(mode: &str, keep: &str, shape: Shape) {
+    let label = format!("{mode}, keeping {keep}, {shape:?}");
+    let world = World::new();
+    let (config, alpha, beta) = one_pair(&world, mode);
+    let path = match shape {
+        Shape::Directory => {
+            for n in 0..9 {
+                write(&alpha, &format!("tree/f{n}"), "original");
+            }
+            assert!(cli(&world, &config, &["sync"]).0, "{label}");
+            assert_eq!(read(&beta, "tree/f8"), "original", "{label}");
+            "tree"
+        }
+        _ => "keep.txt",
+    };
+    let (winner, loser) = match keep {
+        "beta" => (&beta, &alpha),
+        _ => (&alpha, &beta),
+    };
+    match shape {
+        Shape::Agreed => {}
+        Shape::LoserEdited => write(loser, "keep.txt", "loser's edit"),
+        Shape::Conflict => {
+            write(winner, "keep.txt", "winner's edit");
+            write(loser, "keep.txt", "loser's edit");
+        }
+        Shape::Directory => {
+            write(winner, "tree/f0", "winner's edit");
+            write(loser, "tree/f0", "loser's edit");
+            write(loser, "tree/extra", "loser's own");
+        }
+    }
+
+    let beta_spec = beta.to_string_lossy().to_string();
+    let argument = match keep {
+        "beta" => beta_spec.as_str(),
+        other => other,
+    };
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &["resolve", "r", path, "--keep", argument, "--yes"],
+    );
+    let one_way = mode.starts_with("one-way");
+    if (one_way && keep == "beta") || (mode == "one-way-alpha" && keep == "both") {
+        assert!(!ok, "{label}: {text}");
+        assert!(text.contains(mode), "{label}: {text}");
+        assert!(text.contains("Nothing was changed"), "{label}: {text}");
+        return;
+    }
+    assert!(ok, "{label}: {text}");
+    match shape {
+        Shape::Agreed => assert!(text.contains("already the same"), "{label}: {text}"),
+        _ => assert!(text.contains("settled 1 of 1"), "{label}: {text}"),
+    }
+
+    // The loser's version, kept aside, reaches alpha too — except in the
+    // one mode that never carries beta's additions.
+    let aside_roots: Vec<&PathBuf> = match mode {
+        "one-way-conflict" => vec![&beta],
+        _ => vec![&alpha, &beta],
+    };
+    for cycle in 1..=3 {
+        let (ok, synced) = cli(&world, &config, &["sync"]);
+        assert!(ok, "{label}, cycle {cycle}: {synced}");
+        let context = format!("{label}, cycle {cycle}");
+        for root in [&alpha, &beta] {
+            assert_eq!(read(root, "other.txt"), "other", "{context}");
+            match shape {
+                Shape::Agreed | Shape::LoserEdited => {
+                    assert_eq!(read(root, "keep.txt"), "original", "{context}")
+                }
+                Shape::Conflict => {
+                    assert_eq!(read(root, "keep.txt"), "winner's edit", "{context}")
+                }
+                Shape::Directory => {
+                    assert_eq!(read(root, "tree/f0"), "winner's edit", "{context}");
+                    assert_eq!(read(root, "tree/f8"), "original", "{context}");
+                    assert!(!root.join("tree/extra").exists(), "{context}");
+                }
+            }
+        }
+        if keep != "both" {
+            continue;
+        }
+        for root in [&alpha, &beta] {
+            let expected = aside_roots.contains(&root);
+            let (aside, content) = match shape {
+                Shape::Agreed => {
+                    assert!(!root.join("keep.txt.b1").exists(), "{context}");
+                    continue;
+                }
+                Shape::Directory => ("tree.b1/extra", "loser's own"),
+                _ => ("keep.txt.b1", "loser's edit"),
+            };
+            match expected {
+                true => assert_eq!(read(root, aside), content, "{context}"),
+                false => assert!(!root.join(aside).exists(), "{context}"),
+            }
+        }
+    }
+}
+
+/// Every mode, every winner, one shape: the stage 2 matrix.
+fn resolve_in_every_mode(shape: Shape) {
+    for mode in [
+        "two-way-conflict",
+        "two-way-paranoid",
+        "two-way-alpha",
+        "two-way-alpha-strict",
+        "one-way-conflict",
+        "one-way-alpha",
+    ] {
+        for keep in ["alpha", "beta", "both"] {
+            resolve_in(mode, keep, shape);
+        }
+    }
+}
+
+#[test]
+fn resolving_an_agreed_file_keeps_it_in_every_mode() {
+    resolve_in_every_mode(Shape::Agreed);
+}
+
+#[test]
+fn resolving_toward_an_unchanged_winner_works_in_every_mode() {
+    resolve_in_every_mode(Shape::LoserEdited);
+}
+
+#[test]
+fn resolving_a_conflict_works_in_every_mode() {
+    resolve_in_every_mode(Shape::Conflict);
+}
+
+#[test]
+fn resolving_a_directory_works_in_every_mode() {
+    resolve_in_every_mode(Shape::Directory);
+}
+
+/// Keeping a destination that has not changed since the last sync, named
+/// alone, while alpha and the other destination edited: every side ends
+/// with the winner's version, the unnamed destination included.
+#[test]
+fn keeping_an_unchanged_destination_reaches_every_other_one() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let b1 = world.directory("b1");
+    let b2 = world.directory("b2");
+    write(&alpha, "notes.txt", "original");
+    write(&alpha, "other.txt", "other");
+    let config = world.path("config.toml");
+    fs::write(
+        &config,
+        format!(
+            "[groups.r]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
+            alpha.display(),
+            b1.display(),
+            b2.display()
+        ),
+    )
+    .unwrap();
+    assert!(cli(&world, &config, &["sync"]).0);
+    write(&alpha, "notes.txt", "v-alpha");
+    write(&b2, "notes.txt", "v-b2");
+    let b1_spec = b1.to_string_lossy().to_string();
+    let (ok, text) = cli(
+        &world,
+        &config,
+        &[
+            "resolve",
+            "r",
+            "notes.txt",
+            "--keep",
+            &b1_spec,
+            "--host",
+            &b1_spec,
+            "--yes",
+        ],
+    );
+    assert!(ok, "{text}");
+    assert!(text.contains("settled 1 of 1"), "{text}");
+    // Two cycles to reach b2 through alpha, then one more to be sure.
+    for _ in 0..3 {
+        assert!(cli(&world, &config, &["sync"]).0);
+    }
+    for root in [&alpha, &b1, &b2] {
+        assert_eq!(read(root, "notes.txt"), "original");
+        assert_eq!(read(root, "other.txt"), "other");
+    }
+    let (_, after) = cli(&world, &config, &["conflicts"]);
+    assert!(after.contains("nothing needs you"), "{after}");
+}
+
+/// With a supervisor running, `resolve` hands the resolution to it: each
+/// session applies its part between its cycles, under its own lock, and
+/// cycles. A fan-out whose winner is one destination ends with the
+/// winner's version on every side, without a `sync`.
+#[test]
+fn a_running_supervisor_applies_a_resolution_across_the_fan_out() {
+    let world = World::new();
+    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    let text = fs::read_to_string(&config).unwrap();
+    let plans = world.plans(&text);
+    fs::write(&config, &text).unwrap();
+    let stop = AtomicBool::new(false);
+    std::thread::scope(|scope| {
+        let supervisor = Supervisor::new(plans, world.state_root(), false);
+        let stop_ref = &stop;
+        let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
+        let _guard = StopGuard(stop_ref);
+        assert!(
+            wait_until(Duration::from_secs(15), || {
+                autobahn::supervisor::control::supervisor_is_running(&world.state_root())
+            }),
+            "the supervisor listens"
+        );
+
+        let b1_spec = b1.to_string_lossy().to_string();
+        let (ok, text) = cli(
+            &world,
+            &config,
+            &["resolve", "r", "notes.txt", "--keep", &b1_spec, "--yes"],
+        );
+        assert!(ok, "{text}");
+        assert!(text.contains("settled 1 of 1"), "{text}");
+        assert!(text.contains("copying the kept version across"), "{text}");
+        assert!(
+            wait_until(Duration::from_secs(20), || {
+                [&alpha, &b1, &b2].iter().all(|root| {
+                    fs::read_to_string(root.join("notes.txt")).ok().as_deref() == Some("v-b1")
+                })
+            }),
+            "every side ends with b1's version"
+        );
+
+        stop.store(true, Ordering::Relaxed);
+        watcher
+            .join()
+            .expect("the watcher should stop cleanly")
+            .expect("supervision should succeed");
+    });
+    let (_, after) = cli(&world, &config, &["conflicts"]);
+    assert!(after.contains("nothing needs you"), "{after}");
 }
 
 /// A file named `--all`, settled the way the shop and the tray settle a

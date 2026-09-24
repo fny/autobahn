@@ -1445,6 +1445,7 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
         // `status`, which reads the answer itself.
         ControlResponse::Progress(_) => bail!("the supervisor answered with progress"),
         ControlResponse::Sessions(_) => bail!("the supervisor answered with its sessions"),
+        ControlResponse::Resolution(_) => bail!("the supervisor answered with a resolution"),
         // `send` turns this into an error with the remedy; kept for the
         // match to be whole.
         ControlResponse::Mismatch { supervisor } => bail!(
@@ -2856,6 +2857,84 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// How long `resolve` waits for a running supervisor to apply its parts.
+/// A session applies its part after the cycle it is in, and a first scan
+/// of a large tree can take a while; past this the command says which are
+/// still to come rather than wait on.
+const RESOLUTION_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Hands a resolution to the running supervisor, which owns the sessions
+/// and their ancestors, and waits for its parts to be applied — each after
+/// the cycle its session is in. The parts' states, by plan index.
+fn resolve_through_supervisor(
+    state_root: &std::path::Path,
+    group_plans: &[&autobahn::config::SessionPlan],
+    parts: &[(usize, autobahn::session::Settlement, bool)],
+) -> Result<Vec<(usize, autobahn::supervisor::control::PartState)>> {
+    use autobahn::supervisor::control::{self, ResolutionPart, SessionKey};
+    let id = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_nanos() as u64)
+            .unwrap_or_default();
+        nanos ^ (u64::from(std::process::id()) << 40)
+    };
+    let request = ControlRequest::Resolve {
+        id,
+        parts: parts
+            .iter()
+            .map(|(index, settlement, last)| ResolutionPart {
+                session: SessionKey::of(group_plans[*index]),
+                settlement: settlement.clone(),
+                last: *last,
+            })
+            .collect(),
+    };
+    match control::send(state_root, &request)? {
+        ControlResponse::Applied { .. } => {}
+        ControlResponse::Error(message) => {
+            bail!("the supervisor refused the resolution ({message}); nothing was changed")
+        }
+        other => bail!("unexpected answer from the supervisor: {other:?}"),
+    }
+    let index_of = |key: &SessionKey| {
+        group_plans
+            .iter()
+            .position(|plan| SessionKey::of(plan) == *key)
+            .expect("the supervisor answers for the parts it was sent")
+    };
+    let transient = std::io::IsTerminal::is_terminal(&std::io::stderr());
+    let deadline = std::time::Instant::now() + RESOLUTION_WAIT;
+    let mut waiting = false;
+    let states = loop {
+        let states = match control::send(state_root, &ControlRequest::Resolved { id })? {
+            ControlResponse::Resolution(states) => states,
+            ControlResponse::Error(message) => {
+                bail!("the supervisor lost the resolution: {message}")
+            }
+            other => bail!("unexpected answer from the supervisor: {other:?}"),
+        };
+        let pending = states
+            .iter()
+            .any(|(_, state)| matches!(state, control::PartState::Pending));
+        if !pending || std::time::Instant::now() >= deadline {
+            break states;
+        }
+        if transient && !waiting {
+            eprint!("  waiting for the supervisor to finish its current cycle\r");
+            waiting = true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    if waiting {
+        eprint!("\r\x1b[2K");
+    }
+    Ok(states
+        .into_iter()
+        .map(|(key, state)| (index_of(&key), state))
+        .collect())
+}
+
 /// Resolves conflicts by putting the winner's version on every other side.
 #[allow(clippy::too_many_arguments)] // one parameter per command-line flag
 fn run_resolve(
@@ -3047,6 +3126,8 @@ fn run_resolve(
                 .map(|(plan, _)| plan.beta_spec())
                 .collect::<Vec<_>>(),
         ),
+        // A destination's version reaches every other destination through
+        // alpha, so every one of them is overwritten where it differs.
         Winner::Beta(index) => (
             format!(
                 "{}  ({})",
@@ -3055,10 +3136,11 @@ fn run_resolve(
             ),
             std::iter::once(format!("{alpha_spec}  (alpha)"))
                 .chain(
-                    targets
+                    group_plans
                         .iter()
-                        .filter(|(plan, _)| plan.identifier() != group_plans[index].identifier())
-                        .map(|(plan, _)| plan.beta_spec()),
+                        .enumerate()
+                        .filter(|(other, _)| *other != index)
+                        .map(|(_, plan)| plan.beta_spec()),
                 )
                 .collect(),
         ),
@@ -3080,6 +3162,24 @@ fn run_resolve(
     )? {
         println!("nothing done");
         return Ok(());
+    }
+
+    // Whoever owns the sessions writes their ancestors. A running
+    // supervisor does, and is sent the resolution to apply between its
+    // cycles; otherwise this command takes every session's lock itself,
+    // before reading anything, so no `sync` can cycle between what is
+    // read here and what is written.
+    let supervised = autobahn::supervisor::control::supervisor_is_running(&state_root);
+    let mut locks = Vec::new();
+    if !supervised {
+        for plan in &group_plans {
+            let directory = state_root.join("sessions").join(plan.identifier());
+            locks.push(
+                autobahn::session::SessionLock::acquire(directory).with_context(|| {
+                    format!("unable to settle {}; nothing was changed", plan.display())
+                })?,
+            );
+        }
     }
 
     // Every session in the group is opened, because the winner's content
@@ -3112,8 +3212,6 @@ fn run_resolve(
         .cloned()
         .collect();
 
-    let mut settled = 0usize;
-    let mut refused: Vec<(String, String)> = Vec::new();
     // Paths that cannot be settled this way at all, as opposed to ones
     // that lost a race. The two need different words: one says try again,
     // the other says this will never work.
@@ -3171,14 +3269,16 @@ fn run_resolve(
             Winner::Beta(w) if w == index => (true, "alpha".to_owned()),
             _ => (false, plan.host.clone()),
         };
-        // Only paths that actually conflict on this session are touched;
-        // a destination that already agrees is left alone. Alpha is the
-        // exception: its copy must go for the winning content to reach it,
-        // whichever session reported the conflict.
+        // When alpha's version or both are kept, only paths that conflict
+        // on this session are touched. When a destination's is, every side
+        // of the group is: alpha's copy must go for the winning content to
+        // reach it, and every other destination's ancestor forgets the
+        // path, so whatever it holds there that differs goes too, or the
+        // winner would arrive there as a conflict.
         let here: Vec<String> = paths
             .iter()
             .filter(|path| {
-                alpha
+                matches!(winner, Winner::Beta(_))
                     || targets.iter().any(|(target, paths)| {
                         target.identifier() == plan.identifier() && paths.contains(*path)
                     })
@@ -3299,14 +3399,35 @@ fn run_resolve(
             .retain(|(path, _)| !blocked.iter().any(|(blocked, ..)| blocked == path));
     }
 
+    // The paths each session's ancestor forgets, as the retirements stand:
+    // every one a loser is retired at on that session's sides — alpha's
+    // copy is on every session's — with the name a copy is moved aside to.
+    let forgets_of = |losers: &[Loser], index: usize| -> Vec<String> {
+        let mut forget = std::collections::BTreeSet::new();
+        for loser in losers
+            .iter()
+            .filter(|loser| loser.alpha || loser.index == index)
+        {
+            for (path, action) in &loser.actions {
+                forget.insert(path.clone());
+                if let Action::Aside(aside, _) = action {
+                    forget.insert(aside.clone());
+                }
+            }
+        }
+        forget.into_iter().collect()
+    };
+
     // Retiring the loser settles a path only if the next cycle then
-    // carries the winner over the gap. It does not when the winner is what
-    // the last sync recorded — the gap then reads as a deletion against an
-    // untouched copy, and the deletion propagates — nor in a mode that
-    // never carries that side's content, nor where alpha's deletion is
-    // final. So before anything is touched, each affected session's next
-    // cycle is worked out against its ancestor, read without writing, and
-    // a path whose kept version would not survive it is refused.
+    // carries the winner over the gap. Forgetting the path in the ancestor
+    // is what makes it do so whether or not the winner changed since the
+    // last sync: the winner is then a creation. It still does not in a
+    // mode that never carries that side's content, or when the name a copy
+    // is moved aside to is taken on the other side. So before anything is
+    // touched, each affected session's next cycle is worked out against
+    // its ancestor as it will be — read without writing, the paths
+    // forgotten — and a path whose kept version would not survive it is
+    // refused.
     let mut unsafe_paths: std::collections::BTreeMap<String, String> =
         std::collections::BTreeMap::new();
     let acted: std::collections::BTreeSet<String> = losers
@@ -3361,6 +3482,28 @@ fn run_resolve(
                         plan.display()
                     )
                 })?;
+            let forget = forgets_of(&losers, index);
+            let drops: Vec<Change> = forget
+                .iter()
+                .filter(|path| {
+                    node_at(ancestor.as_ref(), path).is_some()
+                        && !forget
+                            .iter()
+                            .any(|outer| path.starts_with(&format!("{outer}/")))
+                })
+                .map(|path| Change {
+                    path: path.clone(),
+                    old: None,
+                    new: None,
+                })
+                .collect();
+            let ancestor = match apply(ancestor.as_ref(), &drops) {
+                Ok(ancestor) => ancestor,
+                Err(message) => bail!(
+                    "unable to work out what {} would forget ({message}); nothing was changed",
+                    plan.display()
+                ),
+            };
 
             // Both sides as the retirement leaves them. When a destination
             // wins, alpha's copy is gone on the winning session; on every
@@ -3459,29 +3602,11 @@ fn run_resolve(
                     })
                 });
                 let reason = if !survives {
-                    if matches!(winner, Winner::Beta(w) if w == index)
-                        && plan.mode == autobahn::tree::SyncMode::TwoWayStrict
-                    {
-                        format!(
-                            "keeping {winner_name} here would delete it: in {} alpha's \
-                             deletion beats {winner_name}'s edit, so removing alpha's copy \
-                             removes {winner_name}'s too",
-                            plan.mode_name()
-                        )
-                    } else if kept.is_some() && same(node_at(ancestor.as_ref(), path), kept) {
-                        format!(
-                            "keeping {winner_name} here would delete it: {winner_name} has \
-                             not changed since the last sync, so removing the other copy \
-                             reads as a deletion. Edit the file on {winner_name} first, or \
-                             wait for the fix to forcing a match"
-                        )
-                    } else {
-                        format!(
-                            "keeping {winner_name} here would not carry it to {} in {}",
-                            plan.host,
-                            plan.mode_name()
-                        )
-                    }
+                    format!(
+                        "keeping {winner_name} here would not carry it to {} in {}",
+                        plan.host,
+                        plan.mode_name()
+                    )
                 } else if let Some(aside) = aside_lost {
                     format!(
                         "{}'s copy, moved aside to {aside}, would not survive in {}",
@@ -3501,19 +3626,21 @@ fn run_resolve(
             .retain(|(path, _)| !unsafe_paths.contains_key(path));
     }
 
-    // Resolution retires the *losing* version and lets the ordinary cycle
-    // carry the winner's, rather than copying bytes across by hand.
+    // Resolution retires the *losing* version, has the ancestor forget the
+    // path, and lets the ordinary cycle carry the winner's, rather than
+    // copying bytes across by hand.
     //
     // That is not a shortcut, it is the only approach that works for
     // everything a filesystem holds. Copying bytes can settle a file and
     // nothing else: a directory has no bytes to read, and "write no bytes"
     // means removing it, which `remove_file` refuses. Reconciliation, on
-    // the other hand, already resolves this shape — when one side's change
-    // is purely a deletion, the other side's content propagates over it,
-    // for a file, a symbolic link, or a whole tree alike (see the comment
-    // at `tree/reconcile.rs:375`, which names manual conflict resolution as
-    // the reason). So the smallest honest edit is to make the losing side's
-    // change a pure deletion and let the engine do what it already does.
+    // the other hand, already carries a creation to the side that lacks
+    // it, for a file, a symbolic link, or a whole tree alike. So the
+    // smallest honest edit is to make the winner a creation — the loser
+    // gone, the ancestor silent there — and let the engine do what it
+    // already does. Forgetting is what makes that hold when the winner has
+    // not changed since the last sync; without it the gap reads as a
+    // deletion against an untouched copy, and the deletion is carried.
     //
     // The removal itself goes through `transition`, not through a raw
     // recursive delete. A transition removes a directory bottom-up and
@@ -3521,69 +3648,122 @@ fn run_resolve(
     // so content that appeared while this command was running is never
     // destroyed by it. That validation is the whole reason to route through
     // the engine here rather than call `remove_dir_all`.
+    //
+    // One part per session: what its ancestor forgets, and which losing
+    // copies on its sides go. The part that retires alpha's copy goes last
+    // (see `ResolutionPart::last`).
+    use autobahn::session::{Retirement, Settlement, Side};
+    use autobahn::supervisor::control::PartState;
+    let mut parts: Vec<(usize, Settlement, bool)> = Vec::new();
     // The sessions whose trees this command changes, and so the ones
     // whose next cycle carries the result.
-    let mut touched: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
-    for loser in losers {
-        if !loser.actions.is_empty() {
-            touched.insert(loser.index);
-        }
-        let endpoint = match loser.alpha {
-            true => &mut endpoints[loser.index].0,
-            false => &mut endpoints[loser.index].1,
-        };
-        let side = loser.side;
-        let mut removals = Vec::new();
-        for (path, action) in loser.actions {
-            match action {
-                Action::Aside(aside, _) => {
-                    endpoint
-                        .rename(&path, &aside)
-                        .with_context(|| format!("unable to keep {side}'s {path}"))?;
-                    println!(
-                        "  {side}: kept {} as {}",
-                        display_safe(&path),
-                        display_safe(&aside)
-                    );
-                    settled += 1;
-                }
-                Action::Retire(expectation) => removals.push(autobahn::tree::Change {
-                    path,
-                    old: Some(expectation),
-                    new: None,
-                }),
+    let touched: std::collections::BTreeSet<usize> = losers
+        .iter()
+        .filter(|loser| !loser.actions.is_empty())
+        .map(|loser| loser.index)
+        .collect();
+    for index in 0..group_plans.len() {
+        let forget = forgets_of(&losers, index);
+        let mut retire = Vec::new();
+        let mut last = false;
+        for loser in losers.iter().filter(|loser| loser.index == index) {
+            let side = match loser.alpha {
+                true => Side::Alpha,
+                false => Side::Beta,
+            };
+            last |= loser.alpha && !loser.actions.is_empty();
+            for (path, action) in &loser.actions {
+                let retirement = match action {
+                    Action::Retire(expectation) => Retirement::Remove(expectation.clone()),
+                    Action::Aside(aside, _) => Retirement::Aside(aside.clone()),
+                };
+                retire.push((side, path.clone(), retirement));
             }
         }
-
-        if removals.is_empty() {
-            continue;
+        if !forget.is_empty() || !retire.is_empty() {
+            parts.push((index, Settlement { forget, retire }, last));
         }
-        let outcome = endpoint
-            .transition(removals)
-            .with_context(|| format!("unable to retire {side}'s version"))?;
-        // A refusal is not an error: the transition reports it and leaves
-        // the content alone. It means the path moved between the scan and
-        // the removal, which is exactly the case the validation exists to
-        // catch — so it is reported, by path, and the conflict stays.
-        for problem in &outcome.problems {
-            refused.push((problem.path.clone(), problem.message.clone()));
-        }
-        // A removal succeeded when nothing synchronization knew about
-        // survived it. Usually that means the path is gone; where the tree
-        // held excluded entries the directory itself necessarily remains,
-        // holding only them, and it is then invisible — so the conflict is
-        // settled even though something is still on disk. Counting only
-        // outright disappearance reports "settled 0" for a resolution that
-        // fully worked.
-        settled += outcome
-            .results
-            .iter()
-            .filter(|result| match result {
-                None => true,
-                Some(node) => node.children().is_empty(),
-            })
-            .count();
     }
+
+    let mut outcomes: Vec<(usize, PartState)> = Vec::new();
+    if parts.is_empty() {
+        // Nothing to retire and nothing to forget.
+    } else if supervised {
+        outcomes = resolve_through_supervisor(&state_root, &group_plans, &parts)?;
+    } else {
+        // This command owns every session: their locks are held. The parts
+        // go in the order the supervisor would apply them, each through a
+        // session opened on the endpoints already read.
+        let mut endpoints: Vec<Option<_>> = endpoints.into_iter().map(Some).collect();
+        let mut locks: Vec<Option<_>> = locks.into_iter().map(Some).collect();
+        parts.sort_by_key(|(_, _, last)| *last);
+        let mut refused_paths: Vec<String> = Vec::new();
+        let mut failed: Option<String> = None;
+        for (index, mut settlement, last) in parts {
+            if last {
+                if let Some(message) = &failed {
+                    outcomes.push((
+                        index,
+                        PartState::Failed(format!(
+                            "not applied, since another destination's part failed: {message}"
+                        )),
+                    ));
+                    continue;
+                }
+                settlement.spare(&refused_paths);
+            }
+            let (alpha, beta) = endpoints[index].take().expect("one part per session");
+            let lock = locks[index].take().expect("one part per session");
+            let applied =
+                autobahn::session::Session::with_lock(alpha, beta, group_plans[index].mode, lock)
+                    .and_then(|mut session| session.apply_settlement(&settlement));
+            let state = match applied {
+                Ok(outcome) => {
+                    refused_paths.extend(outcome.refused.iter().map(|(path, _)| path.clone()));
+                    PartState::Applied(outcome)
+                }
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    failed = Some(message.clone());
+                    PartState::Failed(message)
+                }
+            };
+            outcomes.push((index, state));
+        }
+    }
+
+    let mut settled_paths: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut refused: Vec<(String, String)> = Vec::new();
+    let mut failures: Vec<(String, String)> = Vec::new();
+    let mut pending: Vec<String> = Vec::new();
+    for (index, state) in &outcomes {
+        let plan = group_plans[*index];
+        match state {
+            PartState::Applied(outcome) => {
+                for (path, aside) in &outcome.aside {
+                    println!(
+                        "  {}: kept {} as {}",
+                        plan.host,
+                        display_safe(path),
+                        display_safe(aside)
+                    );
+                }
+                settled_paths.extend(outcome.settled.iter().cloned());
+                refused.extend(outcome.refused.iter().cloned());
+            }
+            PartState::Failed(message) => failures.push((plan.display(), message.clone())),
+            PartState::Pending => pending.push(plan.display()),
+        }
+    }
+    let settled = paths
+        .iter()
+        .filter(|path| {
+            settled_paths.contains(*path)
+                && !refused
+                    .iter()
+                    .any(|(at, _)| at == *path || at.starts_with(&format!("{path}/")))
+        })
+        .count();
     // Always said, including "settled 0". A command that reports nothing
     // reads as a command that worked, and this one can legitimately settle
     // none of what it was asked to.
@@ -3639,10 +3819,13 @@ fn run_resolve(
         );
     }
 
-    // The winning version has not moved yet: this command only retired the
-    // losing one. The cycle carries the winner across, which is what makes
-    // a directory work at all — so the flush is part of the resolution
-    // here, not a courtesy to make `status` catch up sooner.
+    for (session, message) in &failures {
+        println!("  {session}: not settled — {}", display_safe(message));
+    }
+
+    // Applied by a supervisor, each part is followed by that session's
+    // own cycle, which carries the kept version; the flush makes sure of
+    // it once the parts are in.
     //
     // Only the sessions touched are flushed. One that agreed already has
     // nothing to carry; and where alpha was retired, the winning session
@@ -3658,11 +3841,18 @@ fn run_resolve(
         .collect();
     #[cfg(test)]
     RESOLVE_FLUSHES.with(|sent| sent.borrow_mut().extend(flushes.iter().cloned()));
-    if autobahn::supervisor::control::supervisor_is_running(&state_root) {
-        for flush in &flushes {
-            let _ = autobahn::supervisor::control::send(&state_root, flush);
+    if supervised {
+        if !pending.is_empty() {
+            println!(
+                "not applied yet on {}: a session applies its part after the cycle it is in, \
+                 or once it connects; `autobahn conflicts` shows when it has",
+                pending.join(", ")
+            );
         }
         if settled > 0 {
+            for flush in &flushes {
+                let _ = autobahn::supervisor::control::send(&state_root, flush);
+            }
             println!("copying the kept version across now");
         }
     } else if settled > 0 {
@@ -3670,6 +3860,12 @@ fn run_resolve(
             "the supervisor is not running, so the kept version has not \
              moved yet. Start it with `autobahn start`, or run \
              `autobahn sync` once."
+        );
+    }
+    if !failures.is_empty() {
+        bail!(
+            "{} session(s) could not apply the resolution",
+            failures.len()
         );
     }
     Ok(())

@@ -230,6 +230,11 @@ pub struct Supervisor {
     /// attempts — for the tests that a panic stays in its session.
     #[cfg(test)]
     panics: Mutex<std::collections::HashMap<String, u32>>,
+    /// A hook to install in a session's cycles, by identifier, taken by
+    /// the session's worker before its next attempt — for the tests that
+    /// hold a cycle still.
+    #[cfg(test)]
+    cycle_hooks: Mutex<std::collections::HashMap<String, crate::session::CycleHook>>,
 }
 
 /// Peering, from the supervisor's side: the role, and what the leader
@@ -502,6 +507,8 @@ impl Supervisor {
             configuration: None,
             #[cfg(test)]
             panics: Mutex::default(),
+            #[cfg(test)]
+            cycle_hooks: Mutex::default(),
         }
     }
 
@@ -683,6 +690,7 @@ impl Supervisor {
             entries: Default::default(),
             configuration: std::sync::RwLock::new(self.configuration.clone()),
             state_root: self.state_root.clone(),
+            resolutions: Default::default(),
         };
         let listener = match control::bind(&self.state_root) {
             Ok(listener) => Some(listener),
@@ -959,8 +967,24 @@ impl Supervisor {
             if flags.verify.swap(false, Ordering::Relaxed) {
                 worker.verify_pending = true;
             }
+            worker.resolutions.extend(
+                flags
+                    .resolutions
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .drain(..),
+            );
             #[cfg(test)]
             self.panic_if_asked(&identifier);
+            #[cfg(test)]
+            if let Some(hook) = self
+                .cycle_hooks
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .remove(&identifier)
+            {
+                worker.cycle_hook = Some(hook);
+            }
             let result = worker.attempt();
             let failed = result.is_err();
             if let Err(error) = worker.conclude(&result) {
@@ -1297,6 +1321,11 @@ struct Worker<'a> {
     /// Whether this worker runs a single pass, which never waits for a
     /// change, so its endpoints watch nothing.
     one_shot: bool,
+    /// Parts of resolutions not yet applied (they survive reconnection).
+    resolutions: Vec<control::PendingPart>,
+    /// A test's hand in the next session's cycles.
+    #[cfg(test)]
+    cycle_hook: Option<crate::session::CycleHook>,
 }
 
 impl<'a> Worker<'a> {
@@ -1322,7 +1351,76 @@ impl<'a> Worker<'a> {
             pushed: None,
             handed: None,
             one_shot: false,
+            resolutions: Vec::new(),
+            #[cfg(test)]
+            cycle_hook: None,
         }
+    }
+
+    /// Applies the parts of resolutions this worker holds that may go
+    /// now, between cycles and with the session connected: what the
+    /// session's ancestor forgets and which losing copies go. The cycle
+    /// that follows carries the kept versions.
+    ///
+    /// A part that waits for the others stays until they have reported;
+    /// it is dropped, reported as not applied, if one of them failed, and
+    /// it leaves alone any path whose copy another part could not retire.
+    fn apply_resolutions(&mut self) {
+        let session = self.session.as_mut().expect("the session is connected");
+        let key = control::SessionKey::of(self.plan);
+        let mut waiting = Vec::new();
+        for pending in std::mem::take(&mut self.resolutions) {
+            let mut settlement = pending.part.settlement.clone();
+            if pending.part.last {
+                let Some(others) = pending.resolution.others(&key) else {
+                    waiting.push(pending);
+                    continue;
+                };
+                let mut refused: Vec<String> = Vec::new();
+                let mut failed = None;
+                for state in others {
+                    match state {
+                        control::PartState::Applied(outcome) => {
+                            refused.extend(outcome.refused.into_iter().map(|(path, _)| path))
+                        }
+                        control::PartState::Failed(message) => failed = Some(message),
+                        control::PartState::Pending => {}
+                    }
+                }
+                if let Some(message) = failed {
+                    pending.resolution.report(
+                        &key,
+                        control::PartState::Failed(format!(
+                            "not applied, since another destination's part failed: {message}"
+                        )),
+                    );
+                    continue;
+                }
+                settlement.spare(&refused);
+            }
+            let state = match session.apply_settlement(&settlement) {
+                Ok(outcome) => {
+                    if self.verbose {
+                        crate::note!(
+                            "[{}] resolution applied: {} path(s) settled, {} left alone",
+                            self.plan.display(),
+                            outcome.settled.len(),
+                            outcome.refused.len()
+                        );
+                    }
+                    control::PartState::Applied(outcome)
+                }
+                Err(error) => {
+                    crate::complain!(
+                        "[{}] unable to apply a resolution: {error:#}",
+                        self.plan.display()
+                    );
+                    control::PartState::Failed(format!("{error:#}"))
+                }
+            };
+            pending.resolution.report(&key, state);
+        }
+        self.resolutions = waiting;
     }
 
     /// Peering: which side of this plan the peer is.
@@ -1523,6 +1621,16 @@ impl<'a> Worker<'a> {
             if side == crate::peering::PeerSide::Beta {
                 self.push_files()?;
             }
+        }
+        #[cfg(test)]
+        if let Some(hook) = self.cycle_hook.take() {
+            self.session
+                .as_mut()
+                .expect("the session was just created")
+                .set_cycle_hook(hook);
+        }
+        if !self.resolutions.is_empty() {
+            self.apply_resolutions();
         }
         let session = self.session.as_mut().expect("the session was just created");
         if std::mem::take(&mut self.verify_pending) {
@@ -3727,5 +3835,143 @@ mod tests {
             !mirror.join("custom-state").exists(),
             "the supervisor's own state was synchronized"
         );
+    }
+
+    /// A resolution sent while its session is mid-cycle waits for that
+    /// cycle to end, and is applied — and cycled — after it, never inside
+    /// it: the running cycle planned from scans the retirement would make
+    /// stale.
+    #[test]
+    fn a_resolution_sent_mid_cycle_is_applied_after_the_cycle() {
+        use crate::session::{CyclePoint, Retirement, Settlement, Side};
+        use control::{ControlRequest, ControlResponse, PartState, ResolutionPart, SessionKey};
+
+        let keep = tempfile::tempdir().expect("temporary directory should be creatable");
+        let alpha = keep.path().join("alpha");
+        let beta = keep.path().join("beta");
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&beta).unwrap();
+        std::fs::write(alpha.join("keep.txt"), "original").unwrap();
+        std::fs::write(alpha.join("other.txt"), "other").unwrap();
+        let text = format!(
+            "[groups.r]\nalpha = \"{}\"\nmode = \"two-way-safe\"\ninterval = 3600\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        );
+        let plans = crate::config::Config::parse(Path::new("config.toml"), &text)
+            .and_then(|config| config.plans())
+            .expect("the plan loads");
+        let plan = plans[0].clone();
+        let state = keep.path().join("state");
+        let outcomes = Supervisor::new(plans.clone(), state.clone(), false).run_once();
+        assert!(outcomes[0].result.is_ok(), "the first pass converges");
+        std::fs::write(alpha.join("keep.txt"), "alpha's edit").unwrap();
+        std::fs::write(beta.join("keep.txt"), "beta's edit").unwrap();
+        Supervisor::new(plans.clone(), state.clone(), false).run_once();
+
+        // The first cycle under watch is held still after its scans.
+        let hold = Arc::new(AtomicBool::new(true));
+        let (entered, cycling) = std::sync::mpsc::channel();
+        let supervisor = Supervisor::new(plans, state.clone(), false);
+        {
+            let hold = hold.clone();
+            supervisor.cycle_hooks.lock().unwrap().insert(
+                plan.identifier(),
+                Box::new(move |point| {
+                    if point == CyclePoint::AfterScans && hold.load(Ordering::Relaxed) {
+                        let _ = entered.send(());
+                        while hold.load(Ordering::Relaxed) {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }),
+            );
+        }
+        let wait = |mut condition: Box<dyn FnMut() -> bool + '_>| {
+            let end = std::time::Instant::now() + Duration::from_secs(20);
+            while std::time::Instant::now() < end {
+                if condition() {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        let resolved = || match control::send(&state, &ControlRequest::Resolved { id: 7 }) {
+            Ok(ControlResponse::Resolution(states)) => states,
+            other => panic!("unexpected answer: {other:?}"),
+        };
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let watcher = scope.spawn(|| supervisor.run_watch(&stop));
+            cycling
+                .recv_timeout(Duration::from_secs(20))
+                .expect("a cycle starts");
+
+            // Beta's copy as `resolve` reads it.
+            let pool = AgentPool::default();
+            let (_, mut reader) = open_endpoints(&plan, &state, &pool).expect("endpoints open");
+            let root = reader.scan().expect("beta scans").root;
+            let expectation = crate::tree::node_at(root.as_ref(), "keep.txt")
+                .and_then(crate::tree::Node::synchronizable_subtree)
+                .expect("beta holds the file");
+            let request = ControlRequest::Resolve {
+                id: 7,
+                parts: vec![ResolutionPart {
+                    session: SessionKey::of(&plan),
+                    settlement: Settlement {
+                        forget: vec!["keep.txt".into()],
+                        retire: vec![(
+                            Side::Beta,
+                            "keep.txt".into(),
+                            Retirement::Remove(expectation),
+                        )],
+                    },
+                    last: true,
+                }],
+            };
+            let response = control::send(&state, &request).expect("the request is sent");
+            assert!(
+                matches!(response, ControlResponse::Applied { sessions: 1 }),
+                "{response:?}"
+            );
+
+            // Held mid-cycle, the session has applied nothing.
+            std::thread::sleep(Duration::from_millis(300));
+            assert!(matches!(resolved()[0].1, PartState::Pending));
+            assert_eq!(
+                std::fs::read_to_string(beta.join("keep.txt")).unwrap(),
+                "beta's edit"
+            );
+
+            // Released, the cycle ends, and then the resolution lands.
+            hold.store(false, Ordering::Relaxed);
+            assert!(
+                wait(Box::new(|| !matches!(resolved()[0].1, PartState::Pending))),
+                "the resolution is applied"
+            );
+            match &resolved()[0].1 {
+                PartState::Applied(outcome) => {
+                    assert_eq!(outcome.settled, vec!["keep.txt".to_string()], "{outcome:?}")
+                }
+                other => panic!("not applied: {other:?}"),
+            }
+            assert!(
+                wait(Box::new(|| {
+                    [&alpha, &beta].iter().all(|root| {
+                        std::fs::read_to_string(root.join("keep.txt"))
+                            .ok()
+                            .as_deref()
+                            == Some("alpha's edit")
+                    })
+                })),
+                "the kept version reaches beta"
+            );
+            stop.store(true, Ordering::Relaxed);
+            watcher
+                .join()
+                .expect("the watcher stops cleanly")
+                .expect("supervision succeeds");
+        });
     }
 }

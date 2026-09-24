@@ -158,6 +158,69 @@ pub enum CyclePoint {
 /// What [`Session::set_cycle_hook`] installs.
 pub type CycleHook = Box<dyn FnMut(CyclePoint) + Send>;
 
+/// One of a session's two sides.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Side {
+    Alpha,
+    Beta,
+}
+
+/// What resolution does with one losing copy.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub enum Retirement {
+    /// Remove it, provided it still holds this — its synchronizable
+    /// content as `resolve` scanned it. A transition removes it, so
+    /// anything changed since is refused rather than destroyed.
+    Remove(Node),
+    /// Move it aside to this free name, keeping it.
+    Aside(String),
+}
+
+/// One session's part in a resolution: the paths its ancestor forgets,
+/// and the losing copies on its sides that are retired.
+///
+/// Forgetting is what makes retiring enough. With the ancestor silent at a
+/// path, the next cycle sees the kept version as a creation and carries it
+/// to every side, in every two-way mode, for a file, a link or a whole
+/// tree; the gap the loser leaves can no longer read as a deletion against
+/// an untouched copy.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct Settlement {
+    /// Root-relative paths the ancestor forgets.
+    pub forget: Vec<String>,
+    /// The losing copies, by side and path.
+    pub retire: Vec<(Side, String, Retirement)>,
+}
+
+impl Settlement {
+    /// Leaves out every path at, inside or around one in `refused`: where
+    /// another part could not retire its copy, forgetting the path and
+    /// retiring this one would hand that copy the win.
+    pub fn spare(&mut self, refused: &[String]) {
+        let spared = |path: &String| {
+            refused.iter().any(|at| {
+                at == path
+                    || at.starts_with(&format!("{path}/"))
+                    || path.starts_with(&format!("{at}/"))
+            })
+        };
+        self.forget.retain(|path| !spared(path));
+        self.retire.retain(|(_, path, _)| !spared(path));
+    }
+}
+
+/// What applying a [`Settlement`] came to.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct SettlementOutcome {
+    /// Paths whose losing copy was retired or moved aside.
+    pub settled: Vec<String>,
+    /// Losing copies kept under another name: the path, and the name.
+    pub aside: Vec<(String, String)>,
+    /// Paths left alone, and why: a copy that changed since `resolve`
+    /// scanned it is refused by the transition, not destroyed.
+    pub refused: Vec<(String, String)>,
+}
+
 /// A synchronization session between two endpoints.
 pub struct Session {
     /// The alpha endpoint.
@@ -312,6 +375,94 @@ impl Session {
         self.verify_next = true;
         // The quiesced shortcut would skip the very walk being requested.
         self.quiesced = false;
+    }
+
+    /// Applies this session's part in a resolution, between cycles and
+    /// under the session's lock like any cycle: the ancestor forgets the
+    /// paths, durably, and the losing copies are retired after.
+    ///
+    /// That order is the crash story. Stopped between the two, the
+    /// ancestor is silent where both sides still hold their own versions,
+    /// and the next cycle reports a conflict or records agreement. The
+    /// other order, stopped between, leaves a gap against an ancestor that
+    /// still records the kept version — read as a deletion, and carried.
+    ///
+    /// A side is scanned before its copies are removed (and after any are
+    /// moved aside): a transition validates against its endpoint's own
+    /// last scan, which a worker's may predate or not have at all. A copy
+    /// that changed since `resolve` read it is then refused, by path, and
+    /// left where it is.
+    pub fn apply_settlement(&mut self, settlement: &Settlement) -> Result<SettlementOutcome> {
+        if let Some((problem, _)) = &self.unreadable {
+            bail!("the ancestor cannot be read, so nothing can be forgotten in it: {problem}");
+        }
+        self.ancestor = self
+            .ancestor_store
+            .forget(self.ancestor.as_ref(), &settlement.forget)?;
+        // Both sides are about to change under the last settled cycle.
+        self.quiesced = false;
+        self.settled_alpha = None;
+        self.settled_beta = None;
+
+        let mut outcome = SettlementOutcome::default();
+        for side in [Side::Alpha, Side::Beta] {
+            let retire: Vec<&(Side, String, Retirement)> = settlement
+                .retire
+                .iter()
+                .filter(|(at, ..)| *at == side)
+                .collect();
+            if retire.is_empty() {
+                continue;
+            }
+            let endpoint = match side {
+                Side::Alpha => &mut self.alpha,
+                Side::Beta => &mut self.beta,
+            };
+            let mut removals = Vec::new();
+            for (_, path, retirement) in retire {
+                match retirement {
+                    Retirement::Aside(to) => {
+                        endpoint
+                            .rename(path, to)
+                            .with_context(|| format!("unable to move {path} aside"))?;
+                        outcome.settled.push(path.clone());
+                        outcome.aside.push((path.clone(), to.clone()));
+                    }
+                    Retirement::Remove(expectation) => removals.push(Change {
+                        path: path.clone(),
+                        old: Some(expectation.clone()),
+                        new: None,
+                    }),
+                }
+            }
+            endpoint
+                .scan()
+                .context("unable to read the side being settled")?;
+            if removals.is_empty() {
+                continue;
+            }
+            let paths: Vec<String> = removals.iter().map(|change| change.path.clone()).collect();
+            let result = endpoint
+                .transition(removals)
+                .context("unable to retire the losing version")?;
+            // A refusal is not an error: the transition leaves the content
+            // alone and says where. Excluded content a removal steps over
+            // is no refusal — what remains is invisible, and settled.
+            for problem in &result.problems {
+                outcome
+                    .refused
+                    .push((problem.path.clone(), problem.message.clone()));
+            }
+            for path in paths {
+                let refused = result.problems.iter().any(|problem| {
+                    problem.path == path || problem.path.starts_with(&format!("{path}/"))
+                });
+                if !refused {
+                    outcome.settled.push(path);
+                }
+            }
+        }
+        Ok(outcome)
     }
 
     /// Creates a session between the provided endpoints under an
@@ -2154,6 +2305,137 @@ mod tests {
         let report = session.run_cycle().expect("cycle 3");
         assert!(!report.changed(), "{report:?}");
         assert!(report.conflicts.is_empty(), "{report:?}");
+    }
+
+    /// Keeping a version that has not changed since the last sync: the
+    /// losing copy is retired, and the ancestor forgets the path, so the
+    /// next cycle carries the kept version as a creation. Without the
+    /// forgetting, the same retirement reads as a deletion against an
+    /// untouched copy, and the kept version is lost from both sides.
+    #[test]
+    fn a_settlement_keeps_an_unchanged_winner_only_by_forgetting() {
+        use crate::endpoint::local::LocalEndpoint;
+
+        for forget in [true, false] {
+            let keep = tempfile::tempdir().unwrap();
+            let endpoint = |name: &str| -> Box<dyn crate::endpoint::Endpoint + Send> {
+                Box::new(
+                    LocalEndpoint::new(
+                        keep.path().join(name),
+                        keep.path().join(format!("staging-{name}")),
+                        crate::endpoint::local::EndpointOptions::default(),
+                    )
+                    .unwrap(),
+                )
+            };
+            for name in ["alpha", "beta"] {
+                fs::create_dir_all(keep.path().join(name)).unwrap();
+            }
+            fs::write(keep.path().join("alpha/keep.txt"), "original").unwrap();
+            fs::write(keep.path().join("alpha/other.txt"), "other").unwrap();
+            let mut session = Session::new(
+                endpoint("alpha"),
+                endpoint("beta"),
+                SyncMode::TwoWaySafe,
+                keep.path().join("state"),
+            )
+            .unwrap();
+            cycle_to_quiescence(&mut session);
+            fs::write(keep.path().join("beta/keep.txt"), "beta's edit").unwrap();
+            // Long enough for the session's watch to hear of it, as it has
+            // long since when someone resolves a conflict they can see.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            // Beta's copy as resolve would read it.
+            let mut reader = endpoint("beta");
+            let scanned = reader.scan().unwrap().root;
+            let expectation = crate::tree::node_at(scanned.as_ref(), "keep.txt")
+                .and_then(Node::synchronizable_subtree)
+                .unwrap();
+            let outcome = session
+                .apply_settlement(&Settlement {
+                    forget: match forget {
+                        true => vec!["keep.txt".into()],
+                        false => Vec::new(),
+                    },
+                    retire: vec![(
+                        Side::Beta,
+                        "keep.txt".into(),
+                        Retirement::Remove(expectation),
+                    )],
+                })
+                .unwrap();
+            assert_eq!(outcome.settled, vec!["keep.txt".to_string()], "{outcome:?}");
+            for _ in 0..3 {
+                session.run_cycle().unwrap();
+            }
+            let read = |side: &str| fs::read_to_string(keep.path().join(side).join("keep.txt"));
+            if forget {
+                assert_eq!(read("alpha").unwrap(), "original");
+                assert_eq!(read("beta").unwrap(), "original");
+            } else {
+                assert!(read("alpha").is_err() && read("beta").is_err());
+            }
+        }
+    }
+
+    /// A copy that changed after `resolve` read it is refused by path and
+    /// left alone; the ancestor has already forgotten the path, so the two
+    /// versions surface as a conflict rather than one silently winning.
+    #[test]
+    fn a_settlement_refuses_a_copy_changed_since_it_was_read() {
+        use crate::endpoint::local::LocalEndpoint;
+
+        let keep = tempfile::tempdir().unwrap();
+        let endpoint = |name: &str| -> Box<dyn crate::endpoint::Endpoint + Send> {
+            Box::new(
+                LocalEndpoint::new(
+                    keep.path().join(name),
+                    keep.path().join(format!("staging-{name}")),
+                    crate::endpoint::local::EndpointOptions::default(),
+                )
+                .unwrap(),
+            )
+        };
+        for name in ["alpha", "beta"] {
+            fs::create_dir_all(keep.path().join(name)).unwrap();
+        }
+        fs::write(keep.path().join("alpha/keep.txt"), "original").unwrap();
+        fs::write(keep.path().join("alpha/other.txt"), "other").unwrap();
+        let mut session = Session::new(
+            endpoint("alpha"),
+            endpoint("beta"),
+            SyncMode::TwoWaySafe,
+            keep.path().join("state"),
+        )
+        .unwrap();
+        cycle_to_quiescence(&mut session);
+        fs::write(keep.path().join("beta/keep.txt"), "beta's edit").unwrap();
+        let mut reader = endpoint("beta");
+        let scanned = reader.scan().unwrap().root;
+        let expectation = crate::tree::node_at(scanned.as_ref(), "keep.txt")
+            .and_then(Node::synchronizable_subtree)
+            .unwrap();
+        fs::write(keep.path().join("beta/keep.txt"), "beta's later edit!").unwrap();
+
+        let outcome = session
+            .apply_settlement(&Settlement {
+                forget: vec!["keep.txt".into()],
+                retire: vec![(
+                    Side::Beta,
+                    "keep.txt".into(),
+                    Retirement::Remove(expectation),
+                )],
+            })
+            .unwrap();
+        assert!(outcome.settled.is_empty(), "{outcome:?}");
+        assert_eq!(outcome.refused.len(), 1, "{outcome:?}");
+        let report = session.run_cycle().unwrap();
+        assert_eq!(report.conflicts.len(), 1, "{report:?}");
+        assert_eq!(
+            fs::read_to_string(keep.path().join("beta/keep.txt")).unwrap(),
+            "beta's later edit!"
+        );
     }
 
     #[test]

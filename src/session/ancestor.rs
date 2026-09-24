@@ -550,6 +550,59 @@ impl AncestorStore {
         Ok(())
     }
 
+    /// Forgets `paths`: the ancestor stops recording anything at or
+    /// beneath each of them, durably, and the hierarchy that leaves is
+    /// returned for the caller to install.
+    ///
+    /// This is how `resolve` states its outcome. A path the ancestor does
+    /// not know reads to the next cycle as a creation wherever it exists,
+    /// so the kept version propagates whether or not it changed since the
+    /// last sync — and a gap left by the retired loser can no longer read
+    /// as a deletion against an untouched copy. It is an ordinary achieved
+    /// record of drops, the same shape an unresolved intent is answered
+    /// with, so the journal's format is unchanged.
+    ///
+    /// The append is synced whatever the configured durability: the caller
+    /// is about to remove the losing copy, and a removal that survives a
+    /// power loss while this record does not is the very deletion this
+    /// exists to prevent. Paths the ancestor does not hold, and paths
+    /// inside another one given, write nothing. The root is refused.
+    pub(crate) fn forget(
+        &mut self,
+        ancestor: Option<&Node>,
+        paths: &[String],
+    ) -> Result<Option<Node>> {
+        if paths.iter().any(|path| path.is_empty()) {
+            bail!("the ancestor's root is never forgotten path by path");
+        }
+        let mut drops: Vec<Change> = Vec::new();
+        for path in paths {
+            let covered = paths
+                .iter()
+                .any(|outer| path.starts_with(&format!("{outer}/")));
+            if covered
+                || drops.iter().any(|drop| drop.path == *path)
+                || crate::tree::node_at(ancestor, path).is_none()
+            {
+                continue;
+            }
+            drops.push(Change {
+                path: path.clone(),
+                old: None,
+                new: None,
+            });
+        }
+        if drops.is_empty() {
+            return Ok(ancestor.cloned());
+        }
+        let forgotten = apply(ancestor, &drops)
+            .map_err(|message| anyhow::anyhow!("unable to forget in the ancestor: {message}"))?;
+        let record = self.encode(&JournalEntry::Achieved(drops))?;
+        self.append(&record, true)?;
+        self.generation += 1;
+        Ok(forgotten)
+    }
+
     /// Notes a failed compaction: logged on the first of a run of failures
     /// only, and the next attempt deferred by a number of records that
     /// doubles with each failure after the first, to a cap. The first
@@ -1871,6 +1924,48 @@ mod tests {
             unresolved.is_empty(),
             "a completed cycle consumes the intent"
         );
+    }
+
+    /// A forgotten path is gone from the ancestor for good — across a
+    /// reopen, and synced whatever the durability — while its siblings
+    /// stay; a path it never held writes nothing.
+    #[test]
+    fn a_forgotten_path_stays_forgotten_and_its_siblings_stay() {
+        let keep = tempdir().expect("temporary directory");
+        let path = keep.path().join("ancestor");
+        let (mut store, _, _) = AncestorStore::open(&path).expect("opens");
+        let inner = Node {
+            name: "d".into(),
+            content: directory(vec![file("x", 3)]).content.clone(),
+        };
+        let first = Some(directory(vec![file("a", 1), file("b", 2), inner]));
+        store
+            .record(&[change("", first.clone())], first.as_ref())
+            .expect("records");
+        let generation = store.generation();
+        let syncs = store.append_syncs;
+
+        let untouched = store
+            .forget(first.as_ref(), &["absent".into(), "d/absent".into()])
+            .expect("forgets nothing");
+        assert!(same(&untouched, &first));
+        assert_eq!(store.generation(), generation, "nothing was written");
+
+        let forgotten = store
+            .forget(first.as_ref(), &["a".into(), "d".into(), "d/x".into()])
+            .expect("forgets");
+        assert_eq!(store.generation(), generation + 1, "one record");
+        assert_eq!(store.append_syncs, syncs + 1, "the record is synced");
+        let expected = Some(directory(vec![file("b", 2)]));
+        assert!(same(&forgotten, &expected));
+        let (_, reloaded, unresolved) = AncestorStore::open(&path).expect("reopens");
+        assert!(
+            same(&reloaded, &expected),
+            "the forgetting survives a reopen"
+        );
+        assert!(unresolved.is_empty());
+
+        assert!(store.forget(forgotten.as_ref(), &[String::new()]).is_err());
     }
 
     /// An unresolved intent survives normalization: it is information the

@@ -1199,7 +1199,7 @@ fn agents_install_automatically_over_ssh() {
         &script,
         format!(
             "#!/bin/sh\n\
-             while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; --) shift; break;; *) break;; esac; done\n\
+             while [ $# -gt 0 ]; do case \"$1\" in -o) shift 2;; -T) shift;; --) shift; break;; *) break;; esac; done\n\
              shift\n\
              case \"$*\" in 'sh -c '*) ;; *) echo \"not wrapped in sh -c: $*\" >&2; exit 99;; esac\n\
              login=/bin/sh\n\

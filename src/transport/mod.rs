@@ -70,8 +70,28 @@ pub(crate) fn ssh_binary() -> String {
 /// the protocol stream is already LZ4-compressed, and recompressing it
 /// with zlib costs seconds of CPU on both ends of a large transfer for
 /// almost no wire savings.
+///
+/// The rest hold whatever the user's `ssh_config` says, since options on
+/// the command line win over it, and these connections stay open for days:
+/// no terminal on a binary protocol stream (`-T`), no agent or X11
+/// forwarded to the remote host for the supervisor's lifetime, no
+/// configured port forwards to break a reconnect when their port is taken,
+/// no local command, and a bound on connecting (the handshake and
+/// installation steps have their own). Host-key checking stays the user's:
+/// `BatchMode` already refuses an unknown host.
 pub(crate) fn ssh_options() -> Vec<&'static str> {
     vec![
+        "-T",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "ConnectTimeout=20",
         "-o",
         "BatchMode=yes",
         "-o",
@@ -2089,6 +2109,32 @@ pub(crate) mod tests {
         // The option terminator precedes the host, so a hostile host can't
         // read as an SSH option.
         assert_eq!(&argv[argv.len() - 3..], ["--", "host", "autobahn agent"]);
+        // The options that keep a long-lived connection safe and working,
+        // whatever ssh_config says, all ahead of the terminator.
+        let terminator = argv.iter().position(|word| word == "--").unwrap();
+        let options = &argv[..terminator];
+        assert!(options.contains(&"-T".to_owned()), "{argv:?}");
+        for option in [
+            "ForwardAgent=no",
+            "ForwardX11=no",
+            "ClearAllForwardings=yes",
+            "PermitLocalCommand=no",
+            "ConnectTimeout=20",
+        ] {
+            let at = options
+                .iter()
+                .position(|word| word == option)
+                .unwrap_or_else(|| panic!("{option} missing from {argv:?}"));
+            assert_eq!(options[at - 1], "-o", "{argv:?}");
+        }
+        // Host-key checking stays the user's: BatchMode already refuses an
+        // unknown host, and accept-new would trust one silently.
+        assert!(
+            !argv
+                .iter()
+                .any(|word| word.starts_with("StrictHostKeyChecking")),
+            "{argv:?}"
+        );
 
         let argv = Connection::ssh_argv("user@host", Some("/opt/bin/autobahn agent"));
         assert_eq!(

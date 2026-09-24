@@ -38,6 +38,8 @@ Remote endpoints use the scp-style `[user@]host:path` syntax, key-based SSH auth
 
 Sessions are independent: a host being down means its session retries with backoff and heals the moment the host answers — the others never notice. Sessions targeting the same host share one SSH connection.
 
+Your `ssh_config` applies to these connections, except for a few options autobahn always sets, which win over it: `-T` (no terminal on the protocol stream), `ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, `PermitLocalCommand=no`, `ConnectTimeout=20`, `BatchMode=yes`, `ServerAliveInterval=15`, `ServerAliveCountMax=4` and `Compression=no`. The connections stay open for days, so forwarding your agent or a port for their lifetime is not something to inherit by accident. Host-key checking is left to your configuration: with `BatchMode`, an unknown host is refused. `AUTOBAHN_SSH` replaces the `ssh` program itself.
+
 ## Top level
 
 Eight keys. Unknown keys are refused at startup, not ignored — here and in every section.

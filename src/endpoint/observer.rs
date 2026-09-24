@@ -292,11 +292,6 @@ impl RootObserver {
         }
     }
 
-    /// Establishes the watcher if it is absent and not in a backoff period.
-    ///
-    /// A failed attempt is not retried immediately: registering a recursive
-    /// watch walks the whole root, and the usual cause of failure is a host
-    /// already at its watch limit.
     /// Says that an endpoint over this root will wait for changes, so
     /// the root is to be watched from now on.
     pub fn want_watching(&self) {
@@ -304,6 +299,12 @@ impl RootObserver {
             .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
+    /// Establishes the watcher if one is wanted, and it is absent or has
+    /// stopped covering the tree, and no backoff period is running.
+    ///
+    /// A failed attempt is not retried immediately: registering a watch
+    /// walks every directory the scanner visits, and the usual cause of
+    /// failure is a host already at its watch limit.
     fn ensure_watching(&self) {
         if !self.watch_wanted.load(std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -573,6 +574,11 @@ impl RootObserver {
         Ok(())
     }
 
+    /// Whether the next scan must be a full walk regardless of the watch:
+    /// no full walk is on record (none has completed, or a new watch, a
+    /// failed or refused incremental walk, or a distrusted baseline has
+    /// cleared the record), or the last finished at least
+    /// [`FULL_SCAN_INTERVAL`] ago.
     fn full_scan_due(&self, state: &State) -> bool {
         match state.last_full_scan {
             Some(last) => last.elapsed() >= FULL_SCAN_INTERVAL,

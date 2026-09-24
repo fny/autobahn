@@ -51,8 +51,6 @@ pub enum SafetyHalt {
     /// from a stale copy. When they match it is rebuilt instead.
     #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and the two sides differ, so nothing was synchronized; without that record deletions would come back and edits could be overwritten. `autobahn doctor <group>` shows how they differ. Once they match it rebuilds on its own, or `autobahn reset <group>` merges them")]
     AncestorUnreadable(String),
-    /// The ancestor is damaged again after being rebuilt once. A disk that
-    /// damages one will damage another; it is not rebuilt twice.
     /// A directory that was a mount point, synchronized as part of the tree
     /// because mounts are not ignored, is now empty or gone where the
     /// ancestor says it held content: the signature of a filesystem that
@@ -60,6 +58,8 @@ pub enum SafetyHalt {
     /// that was on it.
     #[error("halted: {1} on {0} was a mount point and is now empty or gone, so its content was not deleted on the other side to match; remount it, or delete the content on the other side yourself if it really is gone")]
     MountVanished(&'static str, String),
+    /// The ancestor is damaged again after being rebuilt once. A disk that
+    /// damages one will damage another; it is not rebuilt twice.
     #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and it was rebuilt once already after the same kind of damage; a disk that damages one will damage another, so it is not rebuilt again. Check the disk, then `autobahn reset <group>`")]
     AncestorDamagedAgain(String),
 }
@@ -105,9 +105,10 @@ pub struct CycleReport {
     /// and digest, across both endpoints. A follow-up that reports the same
     /// pair again is not looking at a changing file.
     pub missing_staged: Vec<crate::endpoint::FileRequest>,
-    /// Whether a side's scan was skipped on the strength of a standing
+    /// Whether alpha's scan was skipped on the strength of a standing
     /// watch, its last snapshot standing in.
     pub alpha_scan_skipped: bool,
+    /// Whether beta's scan was skipped, in the same way.
     pub beta_scan_skipped: bool,
 }
 
@@ -132,7 +133,6 @@ impl CycleReport {
     }
 }
 
-/// A synchronization session between two endpoints.
 /// A point in a cycle at which a test may act. See
 /// [`Session::set_cycle_hook`].
 ///
@@ -158,6 +158,7 @@ pub enum CyclePoint {
 /// What [`Session::set_cycle_hook`] installs.
 pub type CycleHook = Box<dyn FnMut(CyclePoint) + Send>;
 
+/// A synchronization session between two endpoints.
 pub struct Session {
     /// The alpha endpoint.
     alpha: Box<dyn Endpoint + Send>,
@@ -289,8 +290,6 @@ impl Session {
         self.held.push(lock);
     }
 
-    /// Opts the ancestor store into power-loss durability: every journal
-    /// append syncs before the cycle is acknowledged.
     /// Whether mount points inside the roots are left alone (the default)
     /// or synchronized, as the configuration says. The endpoints scan
     /// accordingly; the session needs to know which to treat a vanished
@@ -299,6 +298,8 @@ impl Session {
         self.ignore_mounts = ignore;
     }
 
+    /// Opts the ancestor store into power-loss durability: every journal
+    /// append syncs before the cycle is acknowledged.
     pub fn set_power_durability(&mut self, enabled: bool) {
         self.power_durability = enabled;
         self.ancestor_store.set_power_durability(enabled);
@@ -890,8 +891,9 @@ impl Session {
 
         // Safety: if the ancestor root was a directory with non-trivial
         // content and exactly one side now presents an absent root, or one
-        // holding nothing synchronizable, then halt rather than propagate what is more likely an
-        // unmounted or wiped filesystem than an intentional mass deletion.
+        // holding nothing synchronizable, then halt rather than propagate
+        // what is more likely an unmounted or wiped filesystem than an
+        // intentional mass deletion.
         if one_side_emptied_root(
             self.ancestor.as_ref(),
             alpha_root.as_ref(),
@@ -921,15 +923,17 @@ impl Session {
         }
 
         // What this cycle is about to touch, announced in the journal
-        // *after* staging but before the first transition. If the process
-        // dies between the announcement and the achieved record, the next
-        // run finds the intent unresolved and drops these paths'
-        // provenance — a crash mid-cycle costs surfaced conflicts, never a
-        // silent overwrite of a revert made while the tool was down.
-        // Staging is deliberately outside the announced window: it mutates
-        // neither tree, it is the longest phase of a large cycle, and a
-        // crash there must recover as the clean propagation it still is
-        // rather than as conflict noise.
+        // *after* the first side's staging but before its transition. If
+        // the process dies between the announcement and the achieved
+        // record, the next run finds the intent unresolved and drops these
+        // paths' provenance — a crash mid-cycle costs surfaced conflicts,
+        // never a silent overwrite of a revert made while the tool was
+        // down. That first staging is deliberately outside the announced
+        // window: it mutates neither tree, it is the longest phase of a
+        // large cycle, and a crash there must recover as the clean
+        // propagation it still is rather than as conflict noise. When both
+        // sides have transitions, alpha's staging runs after beta's
+        // transition, and so inside the window.
         let intended: Vec<String> = reconciliation
             .alpha_transitions
             .iter()
@@ -1131,8 +1135,6 @@ pub fn transition_dependencies(transitions: &[Change]) -> Vec<FileRequest> {
     requests
 }
 
-/// Stages the content needed by `transitions` onto the destination endpoint,
-/// supplying it from the source endpoint in streamed batches.
 /// The total size of the content a transfer is about to move.
 ///
 /// A staging need names a path and a digest, not a length; the lengths are
@@ -1927,8 +1929,6 @@ mod tests {
         );
     }
 
-    /// Builds a snapshot around a root, sharing the root's storage across
-    /// clones — which is what an unchanged rescan produces.
     /// The intent record's whole purpose: a crash between the transitions
     /// and the achieved record must never let the stale ancestor authorize
     /// overwriting a revert made while the tool was down. The recovered
@@ -1985,6 +1985,8 @@ mod tests {
         );
     }
 
+    /// Builds a snapshot around a root, sharing the root's storage across
+    /// clones — which is what an unchanged rescan produces.
     fn scripted(root: Node) -> crate::tree::Snapshot {
         crate::tree::Snapshot {
             root: Some(root),

@@ -1,5 +1,8 @@
 //! The autobahn command line interface.
 
+#![warn(clippy::empty_line_after_doc_comments)]
+#![warn(clippy::doc_lazy_continuation)]
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -182,8 +185,8 @@ enum Command {
     /// Stop the login service. It stays registered and returns at the next
     /// login; `uninstall` makes it stay gone.
     Stop,
-    /// Stop and start the login service — after a configuration edit, or an
-    /// upgrade.
+    /// Stop and start the login service — after an upgrade, or after a
+    /// configuration edit when the configuration sets `reload = false`.
     Restart,
     /// Everything that needs you: conflicts, blocked paths, and halts,
     /// grouped by cause with the command that clears each one.
@@ -1031,7 +1034,8 @@ fn run_sync(
             eprintln!("warning: {warning}; pass --ignore for each to leave them out");
         }
     }
-    // The ancestor within says which paths exist and what they hold.
+    // The state directory holds the ancestor, which says which paths exist
+    // and what they hold. It is created private, its parent first.
     if let Some(parent) = state_directory.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
@@ -1449,10 +1453,10 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
     }
 }
 
-/// Loads the groups configuration from an explicit or default path.
-/// On a peer — a machine a leader pushed a name to, with no configuration
-/// of its own — the plans are the leader's star turned around, and a line
-/// says what the peer is doing about the lease. `None` anywhere else.
+/// The plans to show on a peer — a machine a leader pushed a name to,
+/// with no configuration of its own: the leader's star turned around, and
+/// a line that says what the peer is doing about the lease. `None`
+/// anywhere else.
 fn peer_plans(
     config: &Option<PathBuf>,
 ) -> Result<Option<(Vec<autobahn::config::SessionPlan>, String)>> {
@@ -1586,6 +1590,7 @@ fn check_startable(config: Option<PathBuf>) -> Result<()> {
         .context("the configuration would stop the supervisor at startup")
 }
 
+/// Loads the groups configuration from an explicit or default path.
 fn load_config(path: Option<PathBuf>) -> Result<Config> {
     let path = match path {
         Some(path) => path,
@@ -2134,9 +2139,8 @@ fn common_prefix(paths: &[&str]) -> String {
 
 /// A root-relative path as it goes into a command to paste: bare when
 /// the shell and the command line would read it as itself, quoted as one
-/// word otherwise, and
-/// shown escaped rather than quoted when it holds a control character,
-/// since no quoting makes a newline safe to paste.
+/// word otherwise, and shown escaped rather than quoted when it holds a
+/// control character, since no quoting makes a newline safe to paste.
 fn pasteable(path: &str) -> String {
     if path.chars().any(char::is_control) {
         return display_safe(path).into_owned();
@@ -2778,7 +2782,6 @@ fn run_diff(
     Ok(())
 }
 
-/// Resolves conflicts by putting the winner's version on every other side.
 #[allow(clippy::too_many_arguments)]
 /// The node a root-relative path names in a scanned tree, or `None` when
 /// nothing is there.
@@ -2848,6 +2851,7 @@ fn free_name(root: Option<&autobahn::tree::Node>, path: &str, side: &str) -> Str
     unreachable!("the counter is unbounded")
 }
 
+/// Resolves conflicts by putting the winner's version on every other side.
 #[allow(clippy::too_many_arguments)] // one parameter per command-line flag
 fn run_resolve(
     config: Option<PathBuf>,
@@ -3649,21 +3653,6 @@ fn run_resolve(
     Ok(())
 }
 
-/// Removes state belonging to sessions the configuration no longer
-/// describes.
-///
-/// "Stale" is decided against the configuration, never against age: a
-/// session that is configured but has not run in a year is not stale, and
-/// one removed from the configuration this morning is. Everything a session
-/// owns is keyed by its identifier — its directory under `sessions/`, its
-/// status record, and (on this machine as an agent) its staging — so the
-/// live set is the set of identifiers the configuration produces. Endpoint
-/// locks are keyed by the pair of endpoint identities instead, and the
-/// live set of those is computed the same way.
-///
-/// A session that is *running* holds its lock, and a lock that cannot be
-/// acquired means the state behind it is in use; such state is skipped and
-/// reported rather than removed from under a live process.
 /// Writes a starting configuration, and proves it loads before saying so.
 ///
 /// A template that did not load would be a poor introduction to a tool
@@ -3831,7 +3820,7 @@ fn run_availability(
             );
         }
     }
-    println!("  the supervisor reads the configuration at startup: `autobahn restart`");
+    println!("  a running supervisor applies it; with `reload = false`, `autobahn restart`");
     Ok(())
 }
 
@@ -3862,6 +3851,21 @@ fn write_example_script(
     Ok(Some(script))
 }
 
+/// Removes state belonging to sessions the configuration no longer
+/// describes.
+///
+/// "Stale" is decided against the configuration, never against age: a
+/// session that is configured but has not run in a year is not stale, and
+/// one removed from the configuration this morning is. Everything a session
+/// owns is keyed by its identifier — its directory under `sessions/`, its
+/// status record, and (on this machine as an agent) its staging — so the
+/// live set is the set of identifiers the configuration produces. Endpoint
+/// locks are keyed by the pair of endpoint identities instead, and the
+/// live set of those is computed the same way.
+///
+/// A session that is *running* holds its lock, and a lock that cannot be
+/// acquired means the state behind it is in use; such state is skipped and
+/// reported rather than removed from under a live process.
 #[allow(clippy::too_many_arguments)]
 fn run_clean(
     config: Option<PathBuf>,

@@ -21,7 +21,7 @@
 //!   Staging is therefore idempotent, resumable across interrupted cycles,
 //!   and deduplicated between paths that share content, all for free.
 //! - **Temporaries.** Every intermediate file this module creates is named
-//!   with the [`TEMPORARY_PREFIX`] that scans skip, so an in-flight (or
+//!   with the `TEMPORARY_PREFIX` that scans skip, so an in-flight (or
 //!   abandoned) transition is never mistaken for synchronizable content.
 
 use std::collections::{HashMap, HashSet};
@@ -190,9 +190,6 @@ pub struct LocalEndpoint {
 /// scan reads everything.
 const MAXIMUM_PENDING_PATHS: usize = 8192;
 
-/// The longest an endpoint will go on incremental scans alone. Watching is
-/// best-effort — events can be missed when a directory is created and
-/// populated faster than a recursive watch can follow it, and network
 /// The changed paths accumulated by a watcher since the last scan.
 #[derive(Default)]
 struct PendingChanges {
@@ -650,7 +647,6 @@ impl ChangeWatcher {
         )
     }
 
-    /// Indicates whether any change is currently recorded.
     /// The current size of the unconsumed change record.
     pub(crate) fn activity(&self) -> crate::endpoint::ChangeActivity {
         let pending = self
@@ -682,6 +678,7 @@ impl LocalEndpoint {
         // synchronization root into existence as an empty directory —
         // reading as an emptied root to safety checks, or as an authoritative
         // empty source to mirroring modes.
+
         // Ownership specifications resolve here, against this endpoint's
         // own user and group databases, so a bad name is a construction
         // error rather than a per-entry surprise at transition time.
@@ -906,14 +903,6 @@ impl LocalEndpoint {
         index
     }
 
-    /// Determines the changed paths for an incremental scan, or `None` when
-    /// this scan must read the whole hierarchy.
-    ///
-    /// A full scan is required when there is no baseline to adopt from, when
-    /// no watcher is established (or one was just established, whose record
-    /// begins after changes that may already have happened), when the
-    /// watcher's record is incomplete, and periodically regardless — see
-    /// [`FULL_SCAN_INTERVAL`].
     /// The digest and scan metadata the last scan recorded for a regular
     /// file at a root-relative path, or `None` when it recorded anything
     /// else, or nothing.
@@ -3404,9 +3393,6 @@ fn creation_mode(file_mode: u32, executable: bool) -> u32 {
     }
 }
 
-/// Returns the staging path for content with the specified digest.
-/// Accumulates, per digest, how many file publishes the given hierarchy
-/// could at most require.
 /// The fewest independent changes, or entries of one directory, worth
 /// spreading over threads: below this, the threads cost more than they
 /// return.
@@ -3430,6 +3416,8 @@ fn apply_helpers() -> usize {
         .saturating_sub(1)
 }
 
+/// Accumulates, per digest, how many file publishes the given hierarchy
+/// could at most require.
 fn count_staged_uses(node: &Node, uses: &mut HashMap<Digest, usize>) {
     match &node.content {
         Content::File { digest, .. } => *uses.entry(*digest).or_insert(0) += 1,
@@ -3443,7 +3431,7 @@ fn count_staged_uses(node: &Node, uses: &mut HashMap<Digest, usize>) {
 }
 
 /// Computes the staging root for a placement mode. `state_staging` is the
-/// state-area location used by [`StagingMode::State`]; the root-relative
+/// state-area location used by [`crate::endpoint::StagingMode::State`]; the root-relative
 /// placements build a hidden, scan-excluded directory name from the session
 /// identifier and side so that concurrent sessions (and the two sides of
 /// one session) never share staging space.
@@ -3529,6 +3517,7 @@ fn digest_hex(digest: &Digest) -> String {
     name
 }
 
+/// Returns the staging path for content with the specified digest.
 fn staged_path(staging_root: &Path, digest: &Digest) -> PathBuf {
     staging_root.join(digest_hex(digest))
 }
@@ -4001,10 +3990,10 @@ fn open_base(root: &Path, path: &str) -> Option<File> {
 
 /// Computes the rsync signature of an opened base (see [`open_base`]).
 ///
-/// No base, or an unreadable one, yields an empty signature, which is
-/// exactly right: with no usable base, delta generation degenerates to
-/// streaming the content, and correctness never depends on the base being
-/// what the destination expected.
+/// An unreadable base yields an empty signature, as does no base at all
+/// (the caller's default), which is exactly right: with no usable base,
+/// delta generation degenerates to streaming the content, and correctness
+/// never depends on the base being what the destination expected.
 fn base_signature(file: File, progress: Option<Arc<crate::progress::SideProgress>>) -> Signature {
     let Ok(metadata) = file.metadata() else {
         return Signature::default();

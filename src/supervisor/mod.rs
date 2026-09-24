@@ -1652,9 +1652,11 @@ impl<'a> Worker<'a> {
     /// recorded once, and the hold ends on resume (or any other control
     /// wake) or stop.
     fn hold_paused(&mut self, flags: &control::WorkerControl, stop: &AtomicBool) {
-        // Dropping the session releases its state lock and shuts down any
-        // agent — a paused session holds no resources and doesn't block
-        // other processes.
+        // Dropping the session releases its state lock and closes its
+        // channels, so a paused session doesn't block other processes. A
+        // pooled agent connection to the host is kept: the supervisor's
+        // pool holds it while any configured session, paused or not,
+        // reaches that host.
         self.session = None;
         self.progress.rest(crate::progress::Phase::Paused);
         self.record_state("paused");

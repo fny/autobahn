@@ -428,7 +428,7 @@ impl Node {
     /// that shares storage with `previous` — which must itself already have
     /// been validated under the same `synchronizable_only`.
     ///
-    /// A hierarchy built by [`apply`](crate::tree::apply) keeps the storage
+    /// A hierarchy built by [`apply`](fn@crate::tree::apply) keeps the storage
     /// of every subtree the change did not touch, so validating a new
     /// ancestor against the old one revisits only the root-to-leaf path that
     /// actually changed. On a large tree that is the difference between

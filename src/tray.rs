@@ -649,7 +649,8 @@ impl App {
     /// order they were made, so the menu answers at once however long the
     /// work takes.
     fn perform(&mut self, action: Action) {
-        // Nothing to run: the refresh that follows is the whole effect.
+        // Nothing to run: for a refresh, the refresh that follows is the
+        // whole effect, and a quit ends the loop before it gets here.
         if matches!(action, Action::Refresh | Action::Quit) {
             return;
         }
@@ -720,21 +721,20 @@ fn run_action(
     }
 }
 
-/// Raises a desktop notification, without ever blocking the event loop.
+/// Raises a desktop notification, carrying autobahn's own icon where the
+/// platform allows one, without ever blocking the event loop: the work
+/// runs on a thread of its own.
 ///
-/// On macOS the notification is posted by a spawned `osascript`: the
-/// native notification API needs a bundled application, and from a plain
-/// binary the notify-rust call never returns — it hung the loop for good
-/// when this was first tried. A separate process cannot do that. On Linux
-/// notify-rust speaks D-Bus and returns; it is still detached, since the
-/// bus can stall too.
-/// Raises a notification, carrying autobahn's own icon where the platform
-/// allows one.
-///
-/// On macOS `osascript` shows Script Editor's icon and offers no way to
-/// change it, so a notifier that does is preferred when one is installed
-/// and the plain script is the fallback. That is the whole reason the
-/// binary carries an image at all.
+/// On macOS the native notification API needs a bundled application, and
+/// from a plain binary the notify-rust call never returns — it hung the
+/// loop for good when this was first tried. So the native call is made
+/// only inside the app bundle; outside it the notification is posted by a
+/// spawned process, which cannot do that. `osascript` shows Script
+/// Editor's icon and offers no way to change it, so a notifier that does
+/// is preferred when one is installed and the plain script is the
+/// fallback. That is the whole reason the binary carries an image at all.
+/// On Linux notify-rust speaks D-Bus and returns; it is still detached,
+/// since the bus can stall too.
 fn notify_with(title: &str, body: &str, icon: Option<PathBuf>) {
     if std::env::var_os("AUTOBAHN_TRAY_DEBUG").is_some() {
         eprintln!("notify: {title} — {body}");
@@ -837,6 +837,8 @@ fn which_notifier() -> Result<PathBuf, ()> {
     Err(())
 }
 
+/// Runs an autobahn command to completion, and makes its standard error
+/// the error when it fails.
 fn run_quiet(mut command: std::process::Command) -> Result<()> {
     let output = command.output().context("unable to run autobahn")?;
     if output.status.success() {
@@ -1049,10 +1051,6 @@ fn troubled_groups(report: &StatusReport) -> Vec<String> {
     troubled.into_iter().map(|(_, name)| name).collect()
 }
 
-/// One group's state: its unhappiest session decides.
-///
-/// The same states `health_of` treats as trouble, so a group's dot and the
-/// icon's colour can never disagree.
 /// How a group is named in the menu: its root, its name, and — when it is
 /// peering — which side is doing the work. A group that is not peering
 /// says nothing about roles, which is every group until someone asks for
@@ -1066,6 +1064,10 @@ fn group_label(group: &crate::supervisor::GroupReport) -> String {
     format!("{}  ({}{role})", group.alpha, group.name)
 }
 
+/// One group's state: its unhappiest session decides.
+///
+/// The same states `health_of` treats as trouble, so a group's dot and the
+/// icon's colour can never disagree.
 fn group_health(group: &crate::supervisor::GroupReport, supervisor_running: bool) -> Health {
     if !supervisor_running {
         return Health::Idle;
@@ -1131,6 +1133,8 @@ fn status_dot(health: Health) -> muda::Icon {
     muda::Icon::from_rgba(rgba, SIZE, SIZE).expect("a valid dot")
 }
 
+/// The icon's overall colour: grey when no supervisor is running, else
+/// the worst state of any session.
 fn health_of(report: &StatusReport) -> Health {
     if !report.supervisor_running {
         return Health::Idle;

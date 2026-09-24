@@ -1,12 +1,15 @@
 //! Byte-stream transports and framing.
 //!
 //! Frames are the unit of exchange for the agent protocol: a 32-bit
-//! little-endian length prefix followed by that many bytes of bincode-encoded
-//! payload. The prefix is checked against [`protocol::MAXIMUM_FRAME_SIZE`] in
-//! both directions, so a corrupt or adversarial length can never induce a
-//! large allocation, and every frame is flushed as soon as it is written (the
-//! protocol is strictly request/response, so a buffered frame would deadlock
-//! both sides).
+//! little-endian length prefix followed by that many bytes of payload, a
+//! flag byte and a bincode-encoded body, LZ4-compressed when that helps. A
+//! message too large for one frame is split across several and reassembled
+//! on receipt, up to `MAXIMUM_MESSAGE_SIZE`. The receiver checks each
+//! prefix against [`protocol::MAXIMUM_FRAME_SIZE`] before allocating, so a
+//! corrupt or adversarial length can never induce a large allocation, and
+//! the sender's chunks stay under it by construction. Every frame is
+//! flushed as soon as it is written (the protocol is strictly
+//! request/response, so a buffered frame would deadlock both sides).
 //!
 //! A [`Connection`] carries those frames over a byte stream — normally the
 //! stdio of a child process (`ssh host autobahn agent`) — while
@@ -103,9 +106,6 @@ pub(crate) fn ssh_options() -> Vec<&'static str> {
     ]
 }
 
-/// A bidirectional byte-stream connection to an agent (typically a child
-/// process's stdio: `ssh host autobahn agent` for remote roots, or a direct
-/// `autobahn agent` child for testing — the identical code path minus SSH).
 /// A spawned agent's standard error, held until the connection proves
 /// itself and relayed line by line after that.
 ///
@@ -241,6 +241,9 @@ impl StderrRelay {
     }
 }
 
+/// A bidirectional byte-stream connection to an agent (typically a child
+/// process's stdio: `ssh host autobahn agent` for remote roots, or a direct
+/// `autobahn agent` child for testing — the identical code path minus SSH).
 pub struct Connection {
     /// The stream carrying frames from the agent.
     reader: Box<dyn Read + Send>,
@@ -345,12 +348,15 @@ impl Connection {
     /// Builds the argv for an SSH connection to `host` running the remote
     /// agent (`remote_command`, defaulting to `autobahn agent`).
     ///
-    /// The agent is the same binary as the CLI, and it must already be
-    /// installed on the remote host and resolvable on the login `PATH` —
-    /// autobahn never copies or bootstraps it. Its version must match the
-    /// local version exactly; the handshake performed by
-    /// [`RemoteEndpoint::connect`] enforces that and reports both versions on
-    /// mismatch.
+    /// The agent is the same binary as the CLI. This only builds the
+    /// command and installs nothing: with the default command the agent must
+    /// already be resolvable on the remote login `PATH`. The connections
+    /// autobahn makes for its sessions pass
+    /// [`install::versioned_remote_command`] instead, and when that agent is
+    /// missing they install it over SSH ([`install::ensure_agent`]) and
+    /// retry. Its version must match the local version exactly; the
+    /// handshake performed by [`RemoteEndpoint::connect`] enforces that and
+    /// reports both versions on mismatch.
     ///
     /// `BatchMode=yes` disables interactive prompting: password and
     /// passphrase prompts would otherwise compete with the protocol for the
@@ -687,9 +693,6 @@ fn moved_counters(
 pub(crate) static PANICKING_SESSIONS: std::sync::Mutex<Vec<String>> =
     std::sync::Mutex::new(Vec::new());
 
-/// Serves one channel: the endpoint is created here (answering the open),
-/// then requests are served in order, each answered on the shared writer.
-/// The thread ends when the dispatcher drops the channel's sender.
 /// How often a running scan reports its count, and how long it runs
 /// before the first report: a scan that finishes sooner — every routine
 /// cycle's — sends nothing extra.
@@ -726,6 +729,9 @@ fn reporting_scan<W: Write + Send, T>(
     })
 }
 
+/// Serves one channel: the endpoint is created here (answering the open),
+/// then requests are served in order, each answered on the shared writer.
+/// The thread ends when the dispatcher drops the channel's sender.
 fn serve_channel<W: Write + Send>(
     channel: u32,
     initialize: Initialize,
@@ -1128,15 +1134,14 @@ enum Anchor {
     To(Option<Snapshot>),
 }
 
-/// Creates the agent's local endpoint from the controller's initialization
-/// request. State-mode staging lives under the agent user's home directory,
-/// keyed by session identifier and side so that concurrent sessions (and
+/// Creates a channel's endpoint from the controller's initialization
+/// request. State-mode staging lives under the agent's state area —
+/// `crate::paths::default_state_root()` in production, so that
+/// `AUTOBAHN_HOME` moves it with everything else autobahn keeps — keyed by
+/// session identifier and side so that concurrent sessions (and
 /// interrupted cycles, and the two sides of one session) never share
 /// staging space; the root-relative placements follow the controller's
 /// staging mode.
-/// Creates a channel's endpoint, its staging kept under the agent's state
-/// area — `crate::paths::default_state_root()` in production, so that
-/// `AUTOBAHN_HOME` moves it with everything else autobahn keeps.
 fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Result<LocalEndpoint> {
     // The session and side come off the wire and name directories below;
     // nothing touches the filesystem until they are known to be genuine.
@@ -1248,8 +1253,6 @@ pub(crate) fn verify_handshake(handshake: &Handshake) -> Result<()> {
     Ok(())
 }
 
-/// Encodes a message and writes it as one length-prefixed frame, flushing so
-/// that the peer sees it immediately.
 /// The frame-payload flag marking an uncompressed body.
 ///
 /// The flag byte was introduced with compression; a build predating it
@@ -1315,6 +1318,9 @@ struct FrameScratch {
     compressed: Vec<u8>,
 }
 
+/// Encodes a message and writes it as length-prefixed frames (one, unless
+/// it is larger than [`FRAME_CHUNK_SIZE`]), flushing so that the peer sees
+/// it immediately.
 fn send_frame<W: Write, T: Serialize>(writer: &mut W, message: &T) -> Result<()> {
     // The buffers are moved out for the duration rather than borrowed
     // across the write, so a writer that re-entered this function on the

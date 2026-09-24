@@ -622,7 +622,7 @@ fn timed_out(error: &anyhow::Error) -> bool {
 /// path from the same state root, wherever it lives. The directory is
 /// `$XDG_RUNTIME_DIR/autobahn` on Linux when the system provides one (it
 /// is already the user's own, and `0700`), and `autobahn-<uid>` in the
-/// temporary directory otherwise, which [`bind`] makes private or refuses.
+/// temporary directory otherwise, which `bind` makes private or refuses.
 pub fn socket_path(state_root: &Path) -> PathBuf {
     socket_path_with(
         state_root,

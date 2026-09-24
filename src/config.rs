@@ -619,7 +619,7 @@ pub struct SessionPlan {
     pub peering: Option<PeeringPlan>,
     /// The stable identifier isolating this session's state, derived from
     /// the *resolved* endpoint identities (see
-    /// [`resolve_for_identity`](crate::paths::resolve_for_identity)) so that
+    /// [`resolve_for_identity`]) so that
     /// textual aliases of the same roots — across configurations, or between
     /// a supervisor and a manual `sync` — share one identity and therefore
     /// one state lock.

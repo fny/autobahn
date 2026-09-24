@@ -19,6 +19,9 @@
 //! - Remote endpoints run the same binary in agent mode over an SSH (or any
 //!   subprocess) byte stream, speaking a framed, version-checked protocol.
 
+#![warn(clippy::empty_line_after_doc_comments)]
+#![warn(clippy::doc_lazy_continuation)]
+
 pub mod alerts;
 pub mod config;
 pub mod endpoint;

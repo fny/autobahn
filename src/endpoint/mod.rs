@@ -25,7 +25,7 @@ use crate::tree::{Change, Digest, Node, Problem, Snapshot};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum StagingMode {
     /// In the endpoint's state area: the session state directory for local
-    /// endpoints, `~/.autobahn/staging/<session>` for agents.
+    /// endpoints, `~/.autobahn/staging/<session>-<side>` for agents.
     #[default]
     State,
     /// A sibling of the synchronization root — on the root's parent

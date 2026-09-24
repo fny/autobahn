@@ -529,8 +529,8 @@ pub fn stop() -> Result<()> {
     platform::stop()
 }
 
-/// Stops and starts the registered service — after a configuration edit,
-/// or an upgrade of the binary.
+/// Stops and starts the registered service — after an upgrade of the
+/// binary, or a configuration edit when `reload = false`.
 pub fn restart() -> Result<()> {
     if state()? == ServiceState::NotInstalled {
         bail!(

@@ -1028,10 +1028,6 @@ impl<'a> Scanner<'a> {
         Content::Directory(Arc::new(unique))
     }
 
-    /// Scans one directory entry, returning its node — or `None` when the
-    /// entry has vanished since it was listed (or was never there: an
-    /// incremental walk of baseline children can reach a removed entry
-    /// whose parent listing hasn't been repeated).
     /// Whether an entry is ignored, given where the walk is. Outside an
     /// ignored region the patterns decide as usual. Inside one, the
     /// question inverts: everything is ignored except what a negation
@@ -1041,6 +1037,10 @@ impl<'a> Scanner<'a> {
             .ignored_within(child_path, is_directory, self.within_ignored)
     }
 
+    /// Scans one directory entry, returning its node — or `None` when the
+    /// entry has vanished since it was listed (or was never there: an
+    /// incremental walk of baseline children can reach a removed entry
+    /// whose parent listing hasn't been repeated).
     fn scan_entry(
         &mut self,
         name: String,

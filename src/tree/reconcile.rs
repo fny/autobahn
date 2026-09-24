@@ -826,8 +826,9 @@ mod tests {
         );
     }
 
-    /// A large directory at `data/`, and the shapes the paranoid mode
-    /// cares about: emptied on one side, gone on one side.
+    /// A large directory at `data/` holding `n` files, from which the tests
+    /// below build the shapes the paranoid mode cares about: emptied on one
+    /// side, gone on one side.
     fn large(n: u8) -> Node {
         dir(
             "data",

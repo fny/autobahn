@@ -334,7 +334,8 @@ pub struct Progress {
     /// Files transferred, and the total this cycle will transfer.
     staged: AtomicU64,
     staged_total: AtomicU64,
-    /// Bytes transferred, and the total this cycle will transfer.
+    /// Bytes transferred; the total this cycle will transfer is
+    /// `staged_bytes_total`, below.
     staged_bytes: AtomicU64,
     /// Files and bytes moved over this session's whole life — every batch
     /// staged, never reset, seeded from the previous run's record. The
@@ -342,6 +343,7 @@ pub struct Progress {
     /// "how much, ever", which is what a shop's tally is.
     moved_files: AtomicU64,
     moved_bytes: AtomicU64,
+    /// The bytes this cycle will transfer, the total for `staged_bytes`.
     staged_bytes_total: AtomicU64,
     /// Changes applied, and the total this cycle will apply.
     applied: AtomicU64,
@@ -393,7 +395,6 @@ impl Progress {
         Phase::from_u8(self.phase.load(Ordering::Relaxed))
     }
 
-    /// Announces the size of the transfer a cycle is about to perform.
     /// Restores the lifetime tally recorded by a previous run.
     pub fn seed_moved(&self, files: u64, bytes: u64) {
         self.moved_files.store(files, Ordering::Relaxed);
@@ -408,6 +409,7 @@ impl Progress {
         )
     }
 
+    /// Announces the size of the transfer a cycle is about to perform.
     pub fn begin_staging(&self, files: u64, bytes: u64) {
         self.staged.store(0, Ordering::Relaxed);
         self.staged_bytes.store(0, Ordering::Relaxed);
@@ -454,7 +456,8 @@ impl Progress {
         counted.max(self.applied.load(Ordering::Relaxed))
     }
 
-    /// Clears the per-cycle counters and returns to waiting.
+    /// Ends the cycle's scans, clears its transfer and apply totals, and
+    /// enters `phase`, one of the resting ones: waiting, paused or retrying.
     pub fn rest(&self, phase: Phase) {
         self.alpha.end(None);
         self.beta.end(None);

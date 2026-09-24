@@ -959,24 +959,17 @@ impl LocalEndpoint {
             .open_scanned(source, digest)
             .map_err(|error| anyhow::anyhow!(error))?;
         let (temporary, output) = self.staging_temporary("copy")?;
-        let mut output = DigestingWriter::new(output);
-        let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
-        let copied = loop {
-            let count = match input.read(&mut buffer) {
-                Ok(0) => break output.flush().map(|()| output.digest() == *digest),
-                Ok(count) => count,
-                Err(error) => break Err(error),
-            };
-            if let Err(error) = output.write_all(&buffer[..count]) {
-                break Err(error);
-            }
-        };
-        drop(output);
-        let copied = match copied {
+        let copied = match copy_verifying(&mut input, output, digest) {
             Ok(copied) => copied,
-            Err(error) => {
+            Err(failure) => {
                 let _ = fs::remove_file(&temporary);
-                return Err(error).with_context(|| format!("unable to copy {source} into staging"));
+                return Err(match failure {
+                    CopyFailure::Read(error) => anyhow::Error::new(error)
+                        .context(format!("unable to read {source} into staging")),
+                    CopyFailure::Write(error) => {
+                        anyhow::Error::new(error).context("unable to write a staging file")
+                    }
+                });
             }
         };
         if !copied {
@@ -3901,24 +3894,46 @@ fn copy_into_private(
     temporary: &Path,
     digest: &Digest,
 ) -> Result<bool> {
-    let mut output = crate::fsutil::private_file(temporary)?;
+    let output = crate::fsutil::private_file(temporary)?;
+    copy_verifying(input, output, digest).map_err(|failure| match failure {
+        CopyFailure::Read(error) => {
+            anyhow::Error::new(error).context(format!("unable to read {}", source.display()))
+        }
+        CopyFailure::Write(error) => {
+            anyhow::Error::new(error).context(format!("unable to write {}", temporary.display()))
+        }
+    })
+}
+
+/// Which side of a [`copy_verifying`] failed, so each caller can say so
+/// in its own words: a copy into staging names no staging path, since its
+/// error can reach the peer.
+enum CopyFailure {
+    Read(io::Error),
+    Write(io::Error),
+}
+
+/// Streams `input` into `output`, a private temporary its caller created,
+/// while digesting it, and returns whether the content matched `digest`.
+/// The one copy both staging a local file and publishing by copy use.
+fn copy_verifying(
+    input: &mut impl Read,
+    mut output: File,
+    digest: &Digest,
+) -> Result<bool, CopyFailure> {
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0u8; COPY_BUFFER_SIZE];
     loop {
-        let count = input
-            .read(&mut buffer)
-            .with_context(|| format!("unable to read {}", source.display()))?;
+        let count = input.read(&mut buffer).map_err(CopyFailure::Read)?;
         if count == 0 {
             break;
         }
         hasher.update(&buffer[..count]);
         output
             .write_all(&buffer[..count])
-            .with_context(|| format!("unable to write {}", temporary.display()))?;
+            .map_err(CopyFailure::Write)?;
     }
-    output
-        .flush()
-        .with_context(|| format!("unable to flush {}", temporary.display()))?;
+    output.flush().map_err(CopyFailure::Write)?;
     Ok(hasher.finalize().as_bytes() == digest)
 }
 

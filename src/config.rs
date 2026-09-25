@@ -288,6 +288,11 @@ pub struct Config {
     /// How much the supervisor writes to its log: "quiet", "normal" (the
     /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
     pub log: Option<String>,
+    /// On battery, walk each root in full every ten minutes instead of two
+    /// (`crate::power`). Experimental: off unless set, and the name will
+    /// change when it settles.
+    #[serde(default)]
+    pub power_saver_experimental: bool,
     /// Settings inherited by every group.
     #[serde(default)]
     pub defaults: Defaults,
@@ -1780,6 +1785,14 @@ mod tests {
 
     fn parse(text: &str) -> Config {
         toml::from_str(text).expect("configuration should parse")
+    }
+
+    /// The power saver is off unless asked for, and is a top-level key.
+    #[test]
+    fn the_power_saver_is_off_unless_asked_for() {
+        assert!(!parse("").power_saver_experimental);
+        assert!(parse("power_saver_experimental = true").power_saver_experimental);
+        assert!(toml::from_str::<Config>("power_saver = true").is_err());
     }
 
     /// The whole point of the built-in table: a reader who writes only the

@@ -28,6 +28,7 @@ pub mod ownership;
 pub mod paths;
 pub mod peering;
 pub mod persist;
+pub mod power;
 pub mod progress;
 pub mod protocol;
 pub mod rsync;

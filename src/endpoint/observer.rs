@@ -54,8 +54,11 @@ use crate::tree::Snapshot;
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The longest a scan may be served without a full walk behind it, bounding
-/// how long a missed filesystem event can persist.
-const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(120);
+/// how long a missed filesystem event can persist: two minutes, or ten on
+/// battery with `power_saver_experimental` (`crate::power`).
+fn full_scan_interval() -> Duration {
+    crate::power::full_walk_interval()
+}
 
 /// What makes two endpoints able to share one observation.
 ///
@@ -446,7 +449,7 @@ impl RootObserver {
 
     fn full_scan_due(&self, state: &State) -> bool {
         match state.last_full_scan {
-            Some(last) => last.elapsed() >= FULL_SCAN_INTERVAL,
+            Some(last) => last.elapsed() >= full_scan_interval(),
             None => true,
         }
     }

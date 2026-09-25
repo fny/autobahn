@@ -1538,6 +1538,7 @@ fn run_watch(
         true => Some(autobahn::logging::Level::Debug),
         false => loaded.log_level,
     });
+    autobahn::power::set_enabled(loaded.power_saver);
     let state_root = resolve_state_root(state_root)?;
 
     // Said before the first cycle, while someone is still looking at the
@@ -1593,6 +1594,7 @@ fn run_watch(
                     true => Some(autobahn::logging::Level::Debug),
                     false => next.log_level,
                 });
+                autobahn::power::set_enabled(next.power_saver);
                 for (session, problem) in
                     autobahn::supervisor::unreadable_ancestors(&next.plans, &state_root)
                 {

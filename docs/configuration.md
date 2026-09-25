@@ -47,13 +47,14 @@ Eight keys. Unknown keys are refused at startup, not ignored — here and in eve
 | `on_alert` | string | — | Shell command run when a session needs a person. The only hook. `autobahn init` writes an experimental example at `~/.autobahn/on-alert.sh` to point it at. See [Alerts](./alerts.md). |
 | `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. `autobahn disable --host <host>` edits it for you. |
 | `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
+| `power_saver_experimental` | bool | `false` | On battery, walk each local root in full every 10 minutes instead of every 2. That walk is the backstop for changes the watcher never reported, and on a laptop it is almost all of autobahn's idle cost; the price is that such a change can take up to 10 minutes to be found. The power source is read at most once a minute, and the log says when it changes. A remote beta's agent is unaffected. Experimental: the name will change. |
 | `reload` | bool | `true` | Whether the running supervisor re-reads this file and applies an edit in place. See [Editing it while it runs](#editing-it-while-it-runs). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
 | `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
 | `[advanced.peering-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
 
-Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
+Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log`, `power_saver_experimental` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
 ## Session settings
 

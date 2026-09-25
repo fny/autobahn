@@ -33,6 +33,8 @@ pub struct Loaded {
     pub log_level: Option<crate::logging::Level>,
     /// Whether the configuration asks to be watched at all.
     pub reload: bool,
+    /// Whether to walk less often on battery (`crate::power`).
+    pub power_saver: bool,
 }
 
 /// Loads a configuration and derives everything the supervisor runs from,
@@ -50,6 +52,7 @@ pub fn load(path: &Path) -> Result<Loaded> {
         alerts,
         log_level,
         reload: configuration.reload,
+        power_saver: configuration.power_saver_experimental,
     })
 }
 

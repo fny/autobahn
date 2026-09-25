@@ -850,7 +850,7 @@ impl LocalEndpoint {
     /// no watcher is established (or one was just established, whose record
     /// begins after changes that may already have happened), when the
     /// watcher's record is incomplete, and periodically regardless — see
-    /// [`FULL_SCAN_INTERVAL`].
+    /// `full_scan_interval` in src/endpoint/observer.rs.
     /// Reports whether the last scan recorded a regular file at a
     /// root-relative path — the gate for base-signature computation, saving
     /// a filesystem probe for every path known to hold nothing usable.

@@ -497,14 +497,6 @@ LSMinimumSystemVersion     => 11.0
 
 Both match `Cargo.toml`'s `version = "0.4.0"`. `spctl -a -vv` says `rejected — source=Unnotarized Developer ID`, which is correct for a locally built app: `build.sh` signs with the Developer ID but does not notarise. Step 2 waits for CI-05.
 
-### 7l. The Intel build under Rosetta — optional, from the wishlist
-
-1. `rustup target add x86_64-apple-darwin && cargo test --release --target x86_64-apple-darwin`. It runs under Rosetta 2.
-2. `arch -x86_64 target/x86_64-apple-darwin/release/autobahn sync` on a small pair.
-
-**Record:** pass or fail, and the time against the native run. This is the cheapest evidence for or against keeping the Intel build published.
-
-
 ## Notes from the run of 2026-09-24
 
 **The login service could not be moved onto this build.** `autobahn restart` refused, correctly: *group 'shared': mode 'peering-alpha-experimental' was renamed to 'peering-alpha-dangerously-experimental'*. The live `~/.autobahn/config.toml` still uses the old spelling, and until it is changed the service keeps running its 2026-09-22 binary. That is why sections 1 and 5 were done in throwaway state roots under `watch`, and why the *another build* check and the app's own lines are still open.

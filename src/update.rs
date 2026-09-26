@@ -24,9 +24,11 @@
 //!   new build, because a rollback with nothing to roll back to is a
 //!   machine with no autobahn on it at all.
 //!
-//! Nothing here is a new dependency. Downloads shell out to curl or wget
-//! and checksums to sha256sum or shasum, exactly as the installer does,
-//! so both paths resolve the same assets and refuse on the same grounds.
+//! Downloads shell out to curl or wget and checksums to sha256sum or
+//! shasum, exactly as the installer does, so both paths resolve the same
+//! assets and refuse on the same grounds. The one library is
+//! `minisign-verify`, which checks the checksums' signature against the
+//! release key built into this binary.
 
 use std::fs::File;
 use std::io::{Seek, SeekFrom};
@@ -47,6 +49,15 @@ const AGENTS_ASSET: &str = "autobahn-agents.tar.gz";
 
 /// The asset carrying the checksums of every other asset.
 const CHECKSUMS_ASSET: &str = "SHA256SUMS";
+/// The minisign signature over [`CHECKSUMS_ASSET`], published beside it.
+const SIGNATURE_ASSET: &str = "SHA256SUMS.minisig";
+/// The public keys whose signatures on a release's checksums are trusted.
+/// Normally one; during a key rotation, a release carries the old and the
+/// new key, so it can install a release signed by either.
+const RELEASE_PUBLIC_KEYS: &[&str] = &[include_str!("../release.pub")];
+/// The last release published without a signature. Older ones install
+/// with a warning; anything newer must be signed.
+const LAST_UNSIGNED_RELEASE: (u64, u64, u64) = (0, 4, 0);
 
 /// The platforms a release publishes a build for. A machine outside this
 /// list has no asset to download, and saying so up front is better than a
@@ -95,7 +106,14 @@ pub fn run(options: Options) -> Result<()> {
         bin_dir,
         state_root,
     };
-    install(&options, resolved.as_deref(), &places, &source, &Installed)
+    install(
+        &options,
+        resolved.as_deref(),
+        &places,
+        &source,
+        &Installed,
+        &Trust::release()?,
+    )
 }
 
 /// Where a run puts things.
@@ -221,6 +239,7 @@ fn install(
     places: &Places,
     source: &dyn Fetch,
     service: &dyn Service,
+    trust: &Trust,
 ) -> Result<()> {
     let Places {
         platform,
@@ -306,6 +325,23 @@ fn install(
     //    name in the meantime.
     let sums = std::fs::read_to_string(&staged_sums)
         .with_context(|| format!("unable to read {}", staged_sums.display()))?;
+
+    // 2a. The checksums are only as good as whoever published them, and
+    //     they come from the same release as the files they check. The
+    //     signature is what ties them to autobahn's release key, which a
+    //     stolen token or a compromised build step does not hold.
+    let staged_signature = work.path().join(SIGNATURE_ASSET);
+    let signature = source
+        .fetch(SIGNATURE_ASSET, &staged_signature)
+        .ok()
+        .and_then(|()| std::fs::read_to_string(&staged_signature).ok());
+    match check_signature(sums.as_bytes(), signature.as_deref(), resolved, trust)? {
+        Signed::Verified => println!("  signature verified"),
+        Signed::OldUnsignedRelease => println!(
+            "  warning: {} predates signed releases, so its checksums carry no signature",
+            resolved.unwrap_or("this release")
+        ),
+    }
     let binary = Verified::open(&staged_binary, &format!("autobahn-{platform}"), &sums)?;
     let agents = match options.no_agents {
         true => None,
@@ -436,7 +472,9 @@ fn report_plan(
     // The resolved tag where it is known, so a dry run answers the
     // question it is asked most often: which release is "latest" today.
     let tag = resolved.unwrap_or("the latest release");
-    println!("  would download autobahn-{platform} and SHA256SUMS from {REPO} ({tag})");
+    println!(
+        "  would download autobahn-{platform}, SHA256SUMS and its signature from {REPO} ({tag})"
+    );
     if options.no_agents {
         println!("  would leave the agent bundle alone (--no-agents)");
     } else {
@@ -1104,6 +1142,107 @@ fn reported_version(output: &str) -> Option<&str> {
     })
 }
 
+/// The keys a release's checksums may be signed with, and the last release
+/// allowed to be unsigned.
+pub(crate) struct Trust {
+    keys: Vec<minisign_verify::PublicKey>,
+    last_unsigned: (u64, u64, u64),
+}
+
+impl Trust {
+    /// What `autobahn update` trusts: the release keys built into this
+    /// binary.
+    fn release() -> Result<Self> {
+        let keys = RELEASE_PUBLIC_KEYS
+            .iter()
+            .map(|key| minisign_verify::PublicKey::decode(key.trim()))
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(|error| anyhow!("the built-in release key does not decode: {error}"))?;
+        Ok(Self {
+            keys,
+            last_unsigned: LAST_UNSIGNED_RELEASE,
+        })
+    }
+}
+
+/// How a release's checksums were vouched for.
+#[derive(Debug, PartialEq, Eq)]
+enum Signed {
+    /// A trusted key signed them, for this release.
+    Verified,
+    /// A release from before signing, installed on its checksums alone.
+    OldUnsignedRelease,
+}
+
+/// Checks the checksums' signature: made by a trusted key, over exactly
+/// these bytes, and for the release being installed. A release with no
+/// signature is accepted only when it is known to predate signing; one
+/// whose identity cannot be told is refused, since "no signature" is also
+/// exactly what a forged release would look like.
+fn check_signature(
+    sums: &[u8],
+    signature: Option<&str>,
+    tag: Option<&str>,
+    trust: &Trust,
+) -> Result<Signed> {
+    let Some(text) = signature else {
+        return match tag.and_then(release_version) {
+            Some(version) if version <= trust.last_unsigned => Ok(Signed::OldUnsignedRelease),
+            Some(_) => bail!(
+                "{} publishes no signature for its checksums, and every release after \
+                 {}.{}.{} is signed. Nothing was installed: the release may have been \
+                 tampered with",
+                tag.unwrap_or_default(),
+                trust.last_unsigned.0,
+                trust.last_unsigned.1,
+                trust.last_unsigned.2
+            ),
+            None => bail!(
+                "unable to tell which release this is, and it publishes no signature for \
+                 its checksums, so nothing was installed. Retry, or name the release with \
+                 --version"
+            ),
+        };
+    };
+    let signature = minisign_verify::Signature::decode(text)
+        .map_err(|error| anyhow!("{SIGNATURE_ASSET} is not a minisign signature: {error}"))?;
+    if !trust
+        .keys
+        .iter()
+        .any(|key| key.verify(sums, &signature, false).is_ok())
+    {
+        bail!(
+            "{CHECKSUMS_ASSET} does not match its signature from autobahn's release key. \
+             Nothing was installed: the release may have been tampered with"
+        );
+    }
+    // The signature names the release it was made for. Checked, so a
+    // release cannot be passed off as another one that is also signed.
+    if let Some(tag) = tag {
+        let expected = format!("autobahn {tag}");
+        if signature.trusted_comment() != expected {
+            bail!(
+                "the signature on {CHECKSUMS_ASSET} is for \"{}\", not {tag}. Nothing was \
+                 installed",
+                signature.trusted_comment()
+            );
+        }
+    }
+    Ok(Signed::Verified)
+}
+
+/// The version in a release tag, `v1.2.3` or `v1.2.3-dev.1`.
+fn release_version(tag: &str) -> Option<(u64, u64, u64)> {
+    let core = tag.strip_prefix('v').unwrap_or(tag);
+    let core = core.split(['-', '+']).next()?;
+    let mut parts = core.split('.').map(|part| part.parse::<u64>().ok());
+    let version = (parts.next()??, parts.next()??, parts.next()??);
+    match parts.next() {
+        None => Some(version),
+        Some(_) => None,
+    }
+}
+
 /// Verifies one downloaded file against the release's checksums.
 fn verify(file: &Verified, name: &str, sums: &str) -> Result<()> {
     let expected = expected_checksum(sums, name)
@@ -1763,6 +1902,146 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
         assert_eq!(build_matches(&RunningBuild::Absent, "999.0.0"), None);
     }
 
+    /// Fixtures signed with two throwaway test keys, never release keys.
+    const TEST_KEY_A: &str = include_str!("../tests/fixtures/release-signing/a.pub");
+    const TEST_KEY_B: &str = include_str!("../tests/fixtures/release-signing/b.pub");
+    const SIGNED_SUMS: &str = include_str!("../tests/fixtures/release-signing/SHA256SUMS");
+    const SIGNED_BY_A: &str = include_str!("../tests/fixtures/release-signing/a.minisig");
+    const SIGNED_BY_B: &str = include_str!("../tests/fixtures/release-signing/b.minisig");
+    /// The release the fixtures' trusted comment names.
+    const SIGNED_TAG: &str = "v0.5.0";
+
+    impl Trust {
+        /// Trusts test key A, and treats every release as predating
+        /// signing: for the tests whose fake releases carry no signature.
+        fn lenient() -> Self {
+            Self {
+                keys: vec![minisign_verify::PublicKey::decode(TEST_KEY_A.trim()).unwrap()],
+                last_unsigned: (u64::MAX, u64::MAX, u64::MAX),
+            }
+        }
+
+        /// Trusts test key A, and releases after 0.4.0 must be signed.
+        fn strict() -> Self {
+            Self {
+                last_unsigned: LAST_UNSIGNED_RELEASE,
+                ..Self::lenient()
+            }
+        }
+    }
+
+    #[test]
+    fn the_built_in_release_key_decodes() {
+        let trust = Trust::release().expect("the release key decodes");
+        assert_eq!(trust.keys.len(), RELEASE_PUBLIC_KEYS.len());
+    }
+
+    #[test]
+    fn a_release_signed_by_a_trusted_key_is_verified() {
+        assert_eq!(
+            check_signature(
+                SIGNED_SUMS.as_bytes(),
+                Some(SIGNED_BY_A),
+                Some(SIGNED_TAG),
+                &Trust::strict()
+            )
+            .unwrap(),
+            Signed::Verified
+        );
+    }
+
+    #[test]
+    fn changed_checksums_fail_their_signature() {
+        let tampered = SIGNED_SUMS.replace('1', "3");
+        let error = check_signature(
+            tampered.as_bytes(),
+            Some(SIGNED_BY_A),
+            Some(SIGNED_TAG),
+            &Trust::strict(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+    }
+
+    #[test]
+    fn a_signature_from_another_key_is_refused() {
+        let error = check_signature(
+            SIGNED_SUMS.as_bytes(),
+            Some(SIGNED_BY_B),
+            Some(SIGNED_TAG),
+            &Trust::strict(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+    }
+
+    #[test]
+    fn a_rotation_trusts_either_key() {
+        let mut trust = Trust::strict();
+        trust
+            .keys
+            .push(minisign_verify::PublicKey::decode(TEST_KEY_B.trim()).unwrap());
+        for signature in [SIGNED_BY_A, SIGNED_BY_B] {
+            assert_eq!(
+                check_signature(
+                    SIGNED_SUMS.as_bytes(),
+                    Some(signature),
+                    Some(SIGNED_TAG),
+                    &trust
+                )
+                .unwrap(),
+                Signed::Verified
+            );
+        }
+    }
+
+    #[test]
+    fn a_signature_for_another_release_is_refused() {
+        let error = check_signature(
+            SIGNED_SUMS.as_bytes(),
+            Some(SIGNED_BY_A),
+            Some("v0.6.0"),
+            &Trust::strict(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("not v0.6.0"), "{error:#}");
+    }
+
+    #[test]
+    fn an_unsigned_release_installs_only_if_it_predates_signing() {
+        let trust = Trust::strict();
+        let sums = SIGNED_SUMS.as_bytes();
+        assert_eq!(
+            check_signature(sums, None, Some("v0.4.0"), &trust).unwrap(),
+            Signed::OldUnsignedRelease
+        );
+        assert_eq!(
+            check_signature(sums, None, Some("v0.1.0"), &trust).unwrap(),
+            Signed::OldUnsignedRelease
+        );
+        for newer in ["v0.4.1", "v0.5.0", "v0.5.0-dev.1", "v1.0.0"] {
+            let error = check_signature(sums, None, Some(newer), &trust).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("publishes no signature"),
+                "{newer}"
+            );
+        }
+        // Not knowing which release it is means not knowing it predates
+        // signing.
+        assert!(check_signature(sums, None, None, &trust).is_err());
+        assert!(check_signature(sums, None, Some("latest"), &trust).is_err());
+    }
+
+    #[test]
+    fn release_versions_parse() {
+        assert_eq!(release_version("v0.4.0"), Some((0, 4, 0)));
+        assert_eq!(release_version("0.5.1"), Some((0, 5, 1)));
+        assert_eq!(release_version("v0.5.0-dev.1"), Some((0, 5, 0)));
+        assert_eq!(release_version("v1.2"), None);
+        assert_eq!(release_version("v1.2.3.4"), None);
+        assert_eq!(release_version("latest"), None);
+    }
+
     /// A release served from a directory: the fake fetcher.
     struct Release(tempfile::TempDir);
 
@@ -1908,7 +2187,25 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
                 retarget,
                 ..Options::default()
             };
-            install(&options, Some("v999.0.0"), &self.places, release, service)
+            install(
+                &options,
+                Some("v999.0.0"),
+                &self.places,
+                release,
+                service,
+                &Trust::lenient(),
+            )
+        }
+
+        fn update_trusting(&self, release: &Release, service: &Stub, trust: &Trust) -> Result<()> {
+            install(
+                &Options::default(),
+                Some("v999.0.0"),
+                &self.places,
+                release,
+                service,
+                trust,
+            )
         }
 
         /// Whether the binary and bundle kept for a rollback are gone.
@@ -2205,5 +2502,39 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
             unsettled,
             vec!["work → boite: conflicts, 2 conflicts".to_owned()]
         );
+    }
+
+    /// A release newer than signing began, with no signature, installs
+    /// nothing: its checksums could have been published by anyone.
+    #[test]
+    fn an_unsigned_new_release_installs_nothing() {
+        let machine = Machine::new();
+        let release = Release::new();
+        let stub = Stub::new(&machine.target());
+        let error = machine
+            .update_trusting(&release, &stub, &Trust::strict())
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("publishes no signature"),
+            "{error:#}"
+        );
+        assert_eq!(machine.binary(), b"old binary");
+        assert_eq!(machine.agent(), b"old agent");
+    }
+
+    /// A signature that does not come from a trusted key over these
+    /// checksums installs nothing either.
+    #[test]
+    fn a_release_with_a_foreign_signature_installs_nothing() {
+        let machine = Machine::new();
+        let release = Release::new();
+        std::fs::write(release.0.path().join(SIGNATURE_ASSET), SIGNED_BY_B).unwrap();
+        let stub = Stub::new(&machine.target());
+        let error = machine
+            .update_trusting(&release, &stub, &Trust::strict())
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+        assert_eq!(machine.binary(), b"old binary");
+        assert_eq!(machine.agent(), b"old agent");
     }
 }

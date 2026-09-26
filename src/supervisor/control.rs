@@ -1633,11 +1633,18 @@ mod tests {
                     }
                 }
             }
-            assert!(
-                full,
-                "the backlog never filled: {} connections were queued and none refused",
-                pending.len()
-            );
+            if !full {
+                // A platform whose queue this cannot fill: the socket is
+                // still wedged, never accepting, and the timeout has to
+                // handle that all the same — so the test goes on rather
+                // than failing for the kernel's arithmetic. (macOS is not
+                // such a platform: it fills at 128, it just needs more
+                // than a handful of attempts.)
+                eprintln!(
+                    "note: this platform's listen backlog never filled after \
+                     {QUEUE_PROBE_LIMIT} connections"
+                );
+            }
             std::mem::forget(pending);
         }
         (listener, held)

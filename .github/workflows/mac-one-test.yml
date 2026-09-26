@@ -1,0 +1,52 @@
+# One test, on macOS, at any commit, by hand. For chasing a failure that
+# only macOS shows, without a Mac: run it at the failing commit with debug
+# logging, or at older commits to find where it started.
+#   gh workflow run mac-one-test.yml -f ref=<sha> -f test=<name> [-f suite=supervisor] [-f repeat=3]
+name: macOS, one test
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit to test
+        required: true
+      test:
+        description: Test name filter
+        required: true
+      suite:
+        description: Integration test file (tests/<suite>.rs), or "lib"
+        default: supervisor
+      repeat:
+        description: How many times to run it
+        default: "1"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - name: Run it
+        env:
+          SUITE: ${{ inputs.suite }}
+          TEST: ${{ inputs.test }}
+          REPEAT: ${{ inputs.repeat }}
+          AUTOBAHN_LOG: debug
+          RUST_BACKTRACE: "1"
+        run: |
+          if [ "$SUITE" = lib ]; then target=--lib; else target="--test $SUITE"; fi
+          cargo test --release $target --no-run
+          failed=0
+          for i in $(seq "$REPEAT"); do
+            echo "::group::run $i"
+            cargo test --release $target "$TEST" -- --nocapture --test-threads=1 || failed=$((failed+1))
+            echo "::endgroup::"
+          done
+          echo "failed $failed of $REPEAT"
+          [ "$failed" = 0 ]

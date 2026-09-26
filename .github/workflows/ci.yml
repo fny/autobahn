@@ -144,7 +144,7 @@ jobs:
           if [ -n "$XCODE" ]; then sudo xcode-select -s "$XCODE"; fi
           xcodebuild -version
       - name: Tests
-        run: cargo test --release --locked
+        run: cargo test --release --locked --no-fail-fast
       - name: The tray's lints and tests
         # The tray compiles only with --features tray, which neither the
         # suite above nor the Linux job's clippy turns on: without this its

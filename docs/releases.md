@@ -19,14 +19,16 @@ A tag that starts with `v` starts `.github/workflows/release.yml`.
 1. A guard job compares the tag with the `version` key in `Cargo.toml`, and asks the Actions API whether CI's `linux`, `linux-arm`, `mac` and `spec` jobs have all succeeded on the tagged commit, in some push or manually started run of `ci.yml`. If the versions disagree, or any of those jobs has not passed there, the run stops before any build starts.
 2. The Linux job builds static musl binaries for x86-64 and arm64.
 3. The macOS job builds both macOS binaries and the menu bar app, the app with `apps/macos/build.sh --unsigned`, and checks that the app reports the tag's version. Only then does it import the Developer ID certificate and sign them — the app with `apps/macos/release.sh --sign-only` — and Apple notarises them. This job waits for approval, because it holds the secrets.
-4. The release job collects every `autobahn-<os>-<arch>` binary into `autobahn-agents.tar.gz`. It writes `SHA256SUMS` over every asset.
-5. `gh release create` publishes the binaries, the bundle, the app archive, the checksums and `scripts/install.sh`.
+4. The release job collects every `autobahn-<os>-<arch>` binary into `autobahn-agents.tar.gz`. It writes `SHA256SUMS` over every asset. It signs `SHA256SUMS` with the release key into `SHA256SUMS.minisig`, and checks that signature against `release.pub` before publishing. This job runs in the `release` environment, which waits for approval, because it holds the signing key.
+5. `gh release create` publishes the binaries, the bundle, the app archive, the checksums, the signature and `scripts/install.sh`.
 
 The guard job exists because nothing checked the tag before, nor that the tagged commit was tested: CI skips commits that touch only docs and, on request, the macOS job, and a red run never stopped a tag. The package version names the agent on every remote host. If the tag and the package version disagree, the release publishes binaries whose agents carry a different version than the tag. No handshake catches this, because both ends of a session still agree with each other.
 
 `scripts/install.sh` installs from a published release, and the release publishes it too, so the one-liner runs the installer that matches the release it installs. It maps the platform the same way the controller does. It downloads the binary and the agent bundle, and verifies both against `SHA256SUMS` before it installs either. It refuses a bundle member that would land outside `agents/`. It writes to a temporary file and renames the file into place. It puts the command on your PATH and the agent bundle in `~/.autobahn/agents`.
 
 A `SHA256SUMS` that cannot be downloaded stops the install, with one message when the release has none (a `404`) and another when the download failed. `--insecure`, or `AUTOBAHN_INSECURE=1` in the piped form, installs an old release that publishes no checksums. It prints a warning, and nothing then checks that the files are the ones that were published. It never excuses a checksum that does not match.
+
+When `minisign` is installed, the installer also checks `SHA256SUMS` against the release key and refuses a signature that does not match. Without `minisign` it says so and goes on with the checksums alone.
 
 ## Prereleases
 
@@ -83,8 +85,8 @@ autobahn update --retarget                 # point a service run from elsewhere 
 The order of the steps is the point of the command:
 
 0. Check what the login service runs. If it is registered at another executable than the one being updated, restarting it would restart the old version, so stop and say so; `--retarget` points the service at the updated binary instead.
-1. Download the platform binary, the agent bundle and `SHA256SUMS` into a private temporary directory under `~/.autobahn/tmp/`.
-2. Verify every file against `SHA256SUMS`. Each file is opened once, and everything after this reads that open file, so what is installed is what was checked.
+1. Download the platform binary, the agent bundle, `SHA256SUMS` and `SHA256SUMS.minisig` into a private temporary directory under `~/.autobahn/tmp/`.
+2. Check that `SHA256SUMS` is signed by a release key and that the signature names this release, then verify every file against `SHA256SUMS`. Each file is opened once, and everything after this reads that open file, so what is installed is what was checked.
 3. Copy the verified binary beside the target, run that copy and read the version it reports. Ask it which baseline formats it reads: if some session's baseline is in another, the new build will rebuild it from the two sides, which is safe only where they match — so if any such session is not settled (synchronized, no conflicts, nothing blocked), stop here and name it.
 4. Replace the agent bundle. Write a temporary directory, then rename it into place. Keep the old one as `agents.previous`.
 5. Rename the new binary into place. Keep the old one as `autobahn.previous`.
@@ -100,6 +102,31 @@ Each step guards against one failure:
 - Step 7 is the only proof that the new version runs here. A restart command returns as soon as the service manager accepts it, and a service that is running may still be running the old file. It restores the bundle with the binary, because an old controller uploading the new bundle's agents fails every handshake on another platform just as the reverse does.
 
 If no login service is installed, the command says so and skips the restart. Start the supervisor yourself with `autobahn watch`, or register a service with `autobahn install`.
+
+## What an install trusts
+
+Checksums published beside the files they describe only prove that a download is intact. Whoever can replace the files can replace the checksums too. The signature is what ties a release to the project: `SHA256SUMS` is signed with [minisign](https://jedisct1.github.io/minisign/), by a key that is kept out of the build and used only by the approval-gated release job.
+
+- **A first install** trusts GitHub and TLS. The installer checks the signature too when `minisign` is installed, which is the only way a first install gets more than that.
+- **`autobahn update`** always checks the signature, against the key compiled into the running binary. It refuses a release whose signature does not verify. It refuses a signature whose trusted comment names another release, so an old signed release cannot be served in place of a new one. It refuses an unsigned release, unless the release is 0.4.0 or older, which were published before signing began.
+
+The release public key, also in `release.pub` at the top of the repository:
+
+```
+RWTTmFV9GHpLmH3sw8KlWiSqiqJK1AUrb9W3+UUi6/ja1uJ/MRGjGBUQ
+```
+
+To check a release by hand:
+
+```sh
+gh release download v0.5.0 --repo fny/autobahn --pattern 'SHA256SUMS*'
+minisign -V -p release.pub -m SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+```
+
+The first line minisign prints after a good signature is the trusted comment, `autobahn <tag>`. It should name the release you downloaded.
+
+**Rotating the key.** The binary trusts every key in its list, so a new key is added in one release and the old key removed in a later one. Every build between them accepts releases signed by either. A leaked key is removed at once, and builds that still carry it must be told to update by hand. The secret lives in the `MINISIGN_SECRET_KEY` secret of the repository's `release` environment.
 
 ## See also
 

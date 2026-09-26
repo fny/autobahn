@@ -151,10 +151,17 @@ fn supplying_a_file_streams_it_in_bounded_memory_and_time() {
     let keep = tempfile::tempdir().expect("temporary directory should be creatable");
     let root = keep.path().join("root");
     fs::create_dir_all(&root).expect("the root should be creatable");
+    // One-shot: every scan walks the disk. The files are made just before
+    // the scans that must see them, and a watcher's report of that can
+    // arrive later (macOS's FSEvents does), letting a scan serve a snapshot
+    // from before the file existed.
     let mut endpoint = LocalEndpoint::new(
         root.clone(),
         keep.path().join("staging"),
-        EndpointOptions::default(),
+        EndpointOptions {
+            one_shot: true,
+            ..EndpointOptions::default()
+        },
     )
     .expect("the endpoint should be creatable");
 

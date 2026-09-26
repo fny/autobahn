@@ -27,6 +27,7 @@ muda = { version = "0.19", optional = true }
 winit = { version = "0.30", optional = true }
 notify-rust = { version = "4", optional = true }
 toml_edit = "0.25.15"
+minisign-verify = "0.3"
 
 # The menu bar's ink, for the tray icon: the sign is drawn in the bar's
 # own black or white, which a template image cannot do once a coloured

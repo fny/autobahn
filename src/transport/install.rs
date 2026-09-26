@@ -40,8 +40,9 @@ use crate::protocol;
 /// does, and runs the agent this controller would have installed for that
 /// platform. A platform it holds no binary for falls back to the version's
 /// plain name, which is what every controller before this one installed.
-/// A missing agent exits 127, which is what a missing agent always looked
-/// like, and the caller installs it.
+/// A missing agent fails the way a missing agent always has (`sh` exits
+/// 127 on Linux, 126 on macOS), and the caller installs it: any failed
+/// first connection triggers an installation, whatever the exit status.
 pub fn versioned_remote_command() -> String {
     let version = protocol::version();
     let mut branches = String::new();
@@ -1126,6 +1127,11 @@ mod tests {
             .env("HOME", home.path())
             .output()
             .expect("sh runs");
+        // `sh` reports a missing program as 127 on Linux and 126 on macOS.
+        // Callers never read the code: any failed first connection installs
+        // the agent (see `endpoint::remote`), so only failure is asserted —
+        // and that nothing was picked, which is the claim the first half of
+        // this test makes and the part a third platform cannot change.
         assert!(
             !output.status.success(),
             "a missing agent must fail: {:?}",

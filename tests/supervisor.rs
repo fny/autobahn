@@ -2158,6 +2158,49 @@ fn clean_keeps_state_it_cannot_attribute_to_a_broken_disabled_group() {
 // ── conflicts, diff, resolve ─────────────────────────────────────────
 
 /// Runs the CLI against a world's configuration file and state root.
+/// Two `clean`s at once over the same stale endpoint locks both succeed.
+/// Each takes a lock before removing it, so the second can wait out the
+/// first and then find the directory gone; that is success, not an error.
+/// (Seen on CI, where parallel tests share a home directory.)
+#[test]
+fn concurrent_cleans_both_succeed_over_the_same_stale_locks() {
+    let world = World::new();
+    let (config, _, _) = two_groups(&world, "two-way-conflict");
+    let home = world.keep.path().join("home");
+    let locks = home.join(".autobahn").join("endpoint-locks");
+    for round in 0..5 {
+        for index in 0..40 {
+            let lock = locks.join(format!("{round:02x}{index:030x}"));
+            fs::create_dir_all(&lock).unwrap();
+            fs::write(lock.join("lock"), "").unwrap();
+        }
+        let spawn = || {
+            std::process::Command::new(agent_binary())
+                .args(["clean", "--config"])
+                .arg(&config)
+                .arg("--state-root")
+                .arg(world.state_root())
+                .env("HOME", &home)
+                .env_remove("AUTOBAHN_HOME")
+                .output()
+        };
+        let (first, second) = std::thread::scope(|scope| {
+            let first = scope.spawn(spawn);
+            let second = scope.spawn(spawn);
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        for output in [first.expect("clean runs"), second.expect("clean runs")] {
+            assert!(
+                output.status.success(),
+                "round {round}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(fs::read_dir(&locks).unwrap().count(), 0, "round {round}");
+    }
+}
+
 fn cli(world: &World, config: &Path, args: &[&str]) -> (bool, String) {
     let output = std::process::Command::new(agent_binary())
         .args(args)

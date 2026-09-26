@@ -1,0 +1,44 @@
+== E2 done file
+# Lane E2: done
+
+## Tickets
+- T2-1: **done**, 6de14b7. A scan delta's length is capped at 4 GiB and pre-allocation at 8 MiB, the block size is range-checked when there is a baseline, and every op is bounded before it is applied. `Signature::validate` range-checks the block size, and the new `Signature::validate_for_base` applies the hash-count bound, which needs the base length.
+- F-M-SUP M-12 part A: **done**, e663358. Deadlines on the handshake, channel open, probe and upload; the pool slot is marked connecting, and waiters wait on a condvar with a deadline instead of on a lock; control-socket clients connect without blocking and time out after 5 s (new `Probe::Unresponsive`); the tray is bounded through `status_report` → `probe`.
+- OPS-3: **done**, a80744c. Every `ssh_command` script is sent as `sh -c '<quoted>'`. The fake ssh in `tests/supervisor.rs` refuses an unwrapped command.
+- OPS-4: **done**, 2d219b1. `-T`, `ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, `PermitLocalCommand=no` and `ConnectTimeout=20` are on every ssh command, and `docs/configuration.md` lists them.
+- F-M-OUT (M-8 prune + relayed stderr): **done**, 67be704. Prune uses an allowlist and quoted exact paths. Relayed stderr is decoded lossily, escaped with `display_safe`, and relayed in pieces of at most 4 KiB.
+- F-L-MISC L-9 + L-22: **done**, f897956. `Response::Scan` is validated like a reassembled snapshot. A failed upload reports the last lines of the remote's stderr, not "Broken pipe".
+
+## Last full-suite run (`isolated lane-E2 cargo test --release --no-fail-fast`, on the final code)
+test result: ok. 439 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.19s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.16s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.82s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.58s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+`cargo fmt --check` and `cargo clippy --release --all-targets -- -D warnings` are clean.
+
+## For the integrator
+- **Edits outside the region**, each named in its commit:
+  - `tests/supervisor.rs`: the fake ssh's option parser skips `-T` and refuses a command not wrapped in `sh -c`.
+  - `docs/configuration.md`: one paragraph for OPS-4.
+  - `transport::MAXIMUM_MESSAGE_SIZE` is now `pub(crate)`; it is in my own file.
+- **Control client, which touches lane E1's file:** only the client functions changed (`send`, `probe`, `supervisor_is_running`), plus the new helpers `connect_client`, `timed_out`, `send_within`, `probe_within` and `CLIENT_TIMEOUT`, and a new `Probe::Unresponsive` variant. Expect textual merge overlap with E1 in `control.rs`, but no logical overlap.
+- **Follow-up for D1/E1:** `status` and the tray show nothing special for `Probe::Unresponsive` yet. Before this change, a timeout read as "a supervisor of another build". A "supervisor not responding" line belongs in their output code.
+- **Follow-up for A1 (optional):** `Signature::validate_for_base(len)` exists for any site that knows the base length. The received-signature site in `supply_*` does not know it, so the ticket's hash-count bound is not enforced there. The block-size range check does apply there, through `deltify`'s `validate()`.
+- **Lane B2:** I added two thread spawns, `autobahn-handshake` in `mux.rs` and the reader/writer threads in `install::run_within`. B2 may want to give them its stack-size treatment.
+- **Unexplained miss:** one full-suite run printed no `test result` line for the lib tests. My grep would not have shown a crash message. Four lib runs and one full run after that were all clean, so I could not reproduce it. Watch for it when integrating.
+- The known flake `a_standing_watch_lets_the_next_cycle_skip_the_beta_scan` failed once, during the M-12A run, and passed in the others.
+landed: 6 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 493 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.41s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.87s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.74s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.58s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

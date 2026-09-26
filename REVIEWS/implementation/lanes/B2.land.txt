@@ -1,0 +1,47 @@
+== B2 done file
+# Lane B2 — done
+
+- F-H4 — done — 830923a — A directory marked itself is now read whole: relisted and walked with no unread adoption. Relisting alone, as the ticket proposed, still missed same-name swaps, and both new tests showed it.
+- LOCAL-09 — done — 1e645fe — digest_file opens with O_NOFOLLOW|O_NONBLOCK, fstats and requires the lstat's regular file (same dev and inode), and caps the read at the lstat size + 1 MiB; any mismatch is recorded as Problematic "changed during scan".
+- F-L-STATE (L-26 only) — done — 5754760 — An incremental snapshot now carries min(its own start, the baseline's scanned_at), so adopted digests keep the recent-write rule of the scan that recorded them.
+- F-H25 (scanner backstop only) — done — 724c924 — The default state root, plus any root registered with scan::exclude_state_root (matched by dev and inode), scans as Untracked inside any root, and no negation re-includes it. main.rs resolve_state_root and the agent's serve_agent_with register their roots.
+- F-H5 — done — 84aea5f — New src/threads.rs (DEEP_STACK 64 MiB, spawn_deep, spawn_deep_scoped, run_deep), deep stacks at every listed spawn site plus the session's alpha-scan thread, a scanner depth cap of 4,096 (Problematic "too deep"), and an iterative Drop for Node.
+
+## Last full-suite run (`isolated lane-B2 cargo test --release --no-fail-fast`, on the final code)
+test result: ok. 434 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 75.19s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 26.11s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.01s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.38s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.79s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo fmt --check and clippy --release --all-targets -D warnings: clean.
+
+## For the integrator
+- Edits outside my region. Each is named in its commit message:
+  - src/main.rs: resolve_state_root now registers the state root; the one-shot `sync` arm wraps run_sync in run_deep (rustfmt reindented it).
+  - src/transport/mod.rs: serve_agent_with registers its state root (3 lines); its channel spawn call changed.
+  - src/transport/mux.rs: the router spawn call changed, and a new test `an_agent_never_scans_its_own_state_area` sits next to `spawned_agent`.
+  - src/supervisor/mod.rs: two spawn calls changed.
+  - src/session/mod.rs: the alpha scan spawn call changed.
+  - src/tree/mod.rs: `impl Drop for Node` added.
+  - src/lib.rs: `pub mod threads` added.
+  - tests: one new test each in tests/supervisor.rs and tests/e2e.rs.
+- Drop on Node: code can no longer destructure a Node by move (E0509). If another lane's merge adds `let Node { name, content } = node`, it will fail to compile and must use mem::take or a clone.
+- F-H4 cost: a marked directory costs a stat walk of its whole subtree. This includes directories that autobahn renames itself and a marked root. The observer's randomized sweep lives in observer.rs, lane B1's file, so I did not add a swap operation there; a scan-level swap test at several depths stands in for it.
+- F-H25: Supervisor::new does not register its state_root; that is lane E1's region, or lane D2's topology check could do it. The watcher (local.rs watch_tree) still watches a state root inside a root unless an ignore pattern covers it. If D2's refusal is bypassed, state writes wake the watcher for scans that find nothing new.
+- F-H5: the persist.rs writer thread (lane F2's file) still runs on 2 MiB. It passed the ~1,980-level test, but it may need spawn_deep near the 4,096 cap.
+- Details are in /home/ubuntu/lanes/B2.notes.md.
+landed: 5 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 452 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 65.92s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test a_standing_watch_lets_the_next_cycle_skip_the_beta_scan ... FAILED
+thread 'a_standing_watch_lets_the_next_cycle_skip_the_beta_scan' (1350244) panicked at tests/e2e.rs:1746:5:
+test result: FAILED. 34 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.06s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.91s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.81s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.59s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

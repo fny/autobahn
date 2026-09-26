@@ -1,0 +1,35 @@
+== C2 done file
+# Lane C2 — done
+
+- F-M-STATE M-32: done, 11332de. Journal records now carry a checksummed header (format 3, with a per-record marker). A header that fails its digest fails closed. Legacy records still read, and a legacy record running past the end counts as torn only when nothing well-formed follows it.
+- F-L-STATE L-16: done, d5b90a7. The journal's directory entry is synced once however this store creates it; a checkpoint creates the journal before its own directory sync.
+- F-L-STATE L-17: done, d5b90a7. The open-time format rewrite carries unresolved intents into the new journal atomically, and stored_generation reads without writing.
+- F-L-STATE L-18: done, d5b90a7. A failed compaction is logged once, retried with a back-off, and no longer fails the cycle; a failed checkpoint of an over-threshold record falls back to appending it.
+- F-L-STATE L-19: done, d5b90a7. achieved_changes refuses a results/transitions count mismatch, and the cycle fails with the ancestor unchanged.
+- (L-26 not attempted: it belongs to lane B2.)
+
+## Last full-suite run (`isolated lane-C2 cargo test --release --no-fail-fast`, at d5b90a7's tree)
+test result: ok. 434 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 55.68s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.55s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.16s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.02s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.64s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## For the integrator
+- CHECKPOINT_VERSION goes from 2 to 3 (`autobahn formats` now prints `ancestor 0 3`). An older build refuses a format-3 ancestor as UnknownFormat. Leaders push ancestor copies to peers, so an older peer refuses a newer leader's copy. Consider landing 11332de together with the wave-2a compatibility-epoch bump, or at least in the same release.
+- TODO.md (line 37) records a 2026-09-23 decision that "no reader is kept for an old layout". The ticket asks for old journals to stay readable, which this lane follows; TODO.md may want updating.
+- Edits outside the region (all small): src/session/mod.rs (the fold closure in run_cycle now propagates achieved_changes errors, plus one new test next to CountingEndpoint), tests/spec_replay.rs:358 and tests/spec_peering_replay.rs:387 (`.expect` on the new Result). Lane C1 also edits session/mod.rs, so expect a trivial merge there.
+- A pre-existing narrow hazard is noted in C2.notes.md: a failed large-record checkpoint whose rename landed, followed by a failed fallback append.
+landed: 2 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 440 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 50.54s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 34 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.76s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.96s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.59s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

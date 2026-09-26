@@ -1,0 +1,47 @@
+== E1 done file
+# Lane E1: done
+
+## Tickets
+- F-H13 + OPS-7 (with L-25 and L-23): **done**, eaded8e. An edit is diffed by session identifier and applied only to the sessions it changes, and pooled connections to hosts no session uses are closed. An empty configuration is applied live (every session stops) and refused only at startup, and the watch parses the bytes it compared. The shop and tray empty-state line landed in db55214.
+- F-M-SUP M-34: **done**, 083213f. Each worker's cycle loop runs under `catch_unwind`: a panic is recorded as `errored: internal error`, the session restarts with backoff, and 5 panics in 10 minutes give `halted`. Joins no longer use `expect`, and log macros cannot panic (`logging::failed()`).
+- F-M-SUP M-38: **done**, db55214. A new `Sessions` control request returns the running supervisor's sessions, its configuration text, the refusal notice and the logging-failed flag. `status`, the shop (every poll) and the tray plan from it. With no supervisor and a broken file, `status` shows the recorded statuses and the parse error.
+- F-M-OUT M-7 (log part only): **done**, a7ffd8c. Every log line's message goes through `text::display_safe`, so one event is one line.
+
+## Last full-suite run (`isolated lane-E1 cargo test --release --no-fail-fast`, at a7ffd8c's tree)
+- lib: test result: ok. 431 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 46.82s
+- main: test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+- e2e: test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.92s
+- spec_peering_replay: test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.46s
+- spec_replay: test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.99s
+- supervisor: test result: ok. 48 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.69s
+- doctests: test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+`cargo fmt --check` and `cargo clippy --release --all-targets -- -D warnings` are clean.
+
+## For the integrator
+- **B2 merge:** the session-worker spawn moved from `run_watch` into `Supervisor::start_session`. It is still a single `scope.spawn(move || { ... })`, and `catch_unwind` is inside the closure. Re-apply B2's stack-size builder to that call.
+- **The tray was not compiled:** the `tray` feature needs glib/gtk, which this machine lacks. Please run `cargo check --features tray` where they are installed. The edits are small: `App::build_report` uses `supervisor::shown_plans`, and `App::refresh` shows the empty-state message.
+- **Edits outside the lane's region:**
+  - `src/config.rs`: new `Config::parse(path, text)`, which `Config::load` now calls. This is D2's file; keep it if D2 reworks `load`.
+  - `src/transport/mux.rs`: new `AgentPool::retain`. This is E2's file.
+  - `src/shop.rs`: `Shop.plans` is now owned, the lifetime is dropped, `shop::run` takes `Vec<SessionPlan>`, `refresh_plans` is new, and `draw` has an empty-state line. D1 also edits this file.
+  - `src/main.rs`:
+    - `check_startable` and `run_watch` now call `load_for_startup`, and `run_watch` uses the new builders.
+    - `run_watch`'s startup line is written with `writeln!` instead of `println!`.
+    - `run_control` has one new match arm.
+    - `run_status` gets its data source from `shown_plans`, and gains `show_recorded`, the empty-state line and the logging-failed line.
+    - `run_shop` uses `shown_plans`.
+- **Wire format:** `ControlRequest::Sessions` is at index 8, and `ControlResponse::Sessions` at index 4. Both come after `Versioned` and `Mismatch`, and a test pins this. Any later control request goes after them.
+- **Behaviour changes to know about:**
+  - `Reloader::watch` no longer raises a halt flag or returns when an edit loads.
+  - `run_watch` returns for an edit only when the edit needs a full restart: `reload` turned off, peering on either side, a change to a configured alert plan, or a change to the log level. In that case the edit is put back in the reloader for the caller, as before.
+  - Peering supervisors therefore still restart on every edit.
+- **Not covered by a test:**
+  - An in-flight cycle in an untouched session surviving a reload. This needs a hook in the session loop. Kept workers are never signalled, and the add-a-group test shows the kept session's cycle count and connection carrying on.
+  - The shop's per-poll refresh is tested through `shown_plans`, which is what it calls, not through a TTY.
+  - The M-34 "fires one alert" check uses `alerts_for(status)`; no hook is run.
+- Details are in `/home/ubuntu/lanes/E1.notes.md`.
+CONFLICT at eaded8ecf1e21ff95f09053659fcc7fae37baf2e (supervisor: an edit is applied to the sessions it changes, and disabling the last one stops it)
+src/supervisor/control.rs
+src/supervisor/mod.rs
+RESULT conflict

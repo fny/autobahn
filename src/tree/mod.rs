@@ -19,7 +19,7 @@ mod reconcile;
 pub use apply::apply;
 pub use diff::{diff, diff_at};
 pub use executability::propagate_executability;
-pub use reconcile::{reconcile, Reconciliation};
+pub use reconcile::{reconcile, reconcile_since, ReconcileMemo, Reconciliation};
 
 use std::sync::Arc;
 
@@ -369,6 +369,83 @@ impl Node {
         problems
     }
 
+    /// The same as [`problems`](Node::problems), reusing a previous answer
+    /// for every subtree this hierarchy shares storage with `previous`.
+    ///
+    /// A scan adopts what it did not revisit, so from one cycle to the next
+    /// nearly every subtree is the very one it was: walking them all again
+    /// to find the problems in them was 9% of the controller's time per
+    /// changed cycle at 420k files. Problems are few; a shared subtree
+    /// takes those of `previous_problems` under its path. Past a few
+    /// hundred the lookup would cost more than the walk, so that falls back
+    /// to walking.
+    pub fn problems_since(&self, previous: Option<(&Node, &[Problem])>) -> Vec<Problem> {
+        const REUSE_LIMIT: usize = 256;
+        let Some((previous, previous_problems)) = previous else {
+            return self.problems();
+        };
+        if previous_problems.len() > REUSE_LIMIT {
+            return self.problems();
+        }
+        fn collect<'a>(
+            node: &'a Node,
+            before: Option<&'a Node>,
+            components: &mut Vec<&'a str>,
+            previous_problems: &[Problem],
+            problems: &mut Vec<Problem>,
+        ) {
+            if let Content::Problematic { message } = &node.content {
+                problems.push(Problem {
+                    path: components.join("/"),
+                    message: message.clone(),
+                    disagreement: false,
+                });
+                return;
+            }
+            if let (
+                Content::Directory(now),
+                Some(Node {
+                    content: Content::Directory(then),
+                    ..
+                }),
+            ) = (&node.content, before)
+            {
+                if Arc::ptr_eq(now, then) {
+                    let prefix = components.join("/");
+                    problems.extend(
+                        previous_problems
+                            .iter()
+                            .filter(|problem| {
+                                prefix.is_empty()
+                                    || problem.path == prefix
+                                    || problem
+                                        .path
+                                        .strip_prefix(prefix.as_str())
+                                        .is_some_and(|rest| rest.starts_with('/'))
+                            })
+                            .cloned(),
+                    );
+                    return;
+                }
+            }
+            for child in node.children() {
+                components.push(&child.name);
+                let then = before.and_then(|before| before.child(&child.name));
+                collect(child, then, components, previous_problems, problems);
+                components.pop();
+            }
+        }
+        let mut problems = Vec::new();
+        collect(
+            self,
+            Some(previous),
+            &mut Vec::new(),
+            previous_problems,
+            &mut problems,
+        );
+        problems
+    }
+
     /// Validates the hierarchy's structural invariants: sorted, unique,
     /// non-empty, separator-free child names; content-appropriate fields; and
     /// (when `synchronizable_only` is set) an absence of unsynchronizable
@@ -496,6 +573,132 @@ impl Node {
             child.validate_against(counterpart, synchronizable_only)?;
         }
         Ok(())
+    }
+}
+
+/// A digest of a whole snapshot, computed from its hierarchy the way a
+/// Merkle tree is: a directory's digest covers its children's, so what did
+/// not change since the last digest is not hashed again.
+///
+/// It stands in for hashing a snapshot's encoding where both sides of a
+/// session must prove they hold the same snapshot after applying changes:
+/// that meant encoding and hashing the whole thing — 45 MB at 420k files,
+/// on each side, for every edit. Any difference in any field of any node,
+/// or in the snapshot's other fields, changes it.
+///
+/// Directories' digests are kept per shared child list. An entry holds a
+/// weak reference to the list, which keeps the allocation — and so its
+/// address — reserved while the entry exists: an entry can never be taken
+/// for a different list that happens to reuse the memory. Entries whose
+/// list is gone are swept when the table has doubled since the last sweep.
+#[derive(Default)]
+pub struct TreeDigester {
+    directories: std::collections::HashMap<usize, (std::sync::Weak<Vec<Node>>, Digest)>,
+    swept_at: usize,
+}
+
+impl TreeDigester {
+    /// The digest of a snapshot: its hierarchy's, and every other field.
+    pub fn snapshot(&mut self, snapshot: &Snapshot) -> Digest {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"autobahn snapshot 1");
+        let head = Snapshot {
+            root: None,
+            ..snapshot.clone()
+        };
+        hasher.update(&bincode::serialize(&head).unwrap_or_default());
+        match &snapshot.root {
+            Some(root) => {
+                hasher.update(&[1]);
+                hasher.update(&self.node(root));
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        if self.directories.len() > 2 * self.swept_at.max(1024) {
+            self.directories
+                .retain(|_, (list, _)| list.strong_count() > 0);
+            self.swept_at = self.directories.len();
+        }
+        *hasher.finalize().as_bytes()
+    }
+
+    /// The digest of a snapshot's root node.
+    fn node(&mut self, node: &Node) -> Digest {
+        let mut bytes = Vec::new();
+        self.feed(&mut bytes, node);
+        *blake3::hash(&bytes).as_bytes()
+    }
+
+    /// Writes a node's bytes into its parent's. Every part is either of
+    /// fixed size or preceded by its length, so no two different nodes, or
+    /// lists of them, write the same bytes. Only directories are hashed on
+    /// their own — theirs is the digest that is kept — so a cold digest of a
+    /// tree hashes each byte once, in a call per directory.
+    fn feed(&mut self, bytes: &mut Vec<u8>, node: &Node) {
+        bytes.extend_from_slice(&(node.name.len() as u64).to_le_bytes());
+        bytes.extend_from_slice(node.name.as_bytes());
+        match &node.content {
+            Content::Directory(children) => {
+                bytes.push(0);
+                bytes.extend_from_slice(&self.children(children));
+            }
+            Content::File {
+                digest,
+                executable,
+                metadata,
+            } => {
+                // Named in full, so a field added later cannot be left out.
+                let FileMetadata {
+                    mtime_seconds,
+                    mtime_nanos,
+                    size,
+                    inode,
+                    mode,
+                } = metadata;
+                bytes.push(1);
+                bytes.extend_from_slice(digest);
+                bytes.push(u8::from(*executable));
+                bytes.extend_from_slice(&mtime_seconds.to_le_bytes());
+                bytes.extend_from_slice(&mtime_nanos.to_le_bytes());
+                bytes.extend_from_slice(&size.to_le_bytes());
+                bytes.extend_from_slice(&inode.to_le_bytes());
+                bytes.extend_from_slice(&mode.to_le_bytes());
+            }
+            Content::Symlink { target } => {
+                bytes.push(2);
+                bytes.extend_from_slice(&(target.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(target.as_bytes());
+            }
+            Content::Untracked => bytes.push(3),
+            Content::Problematic { message } => {
+                bytes.push(4);
+                bytes.extend_from_slice(&(message.len() as u64).to_le_bytes());
+                bytes.extend_from_slice(message.as_bytes());
+            }
+        }
+    }
+
+    fn children(&mut self, children: &Arc<Vec<Node>>) -> Digest {
+        let key = Arc::as_ptr(children) as usize;
+        if let Some((list, digest)) = self.directories.get(&key) {
+            if list
+                .upgrade()
+                .is_some_and(|list| Arc::ptr_eq(&list, children))
+            {
+                return *digest;
+            }
+        }
+        let mut bytes = Vec::with_capacity(children.len() * 96);
+        bytes.extend_from_slice(&(children.len() as u64).to_le_bytes());
+        for child in children.iter() {
+            self.feed(&mut bytes, child);
+        }
+        let digest = *blake3::hash(&bytes).as_bytes();
+        self.directories
+            .insert(key, (Arc::downgrade(children), digest));
+        digest
     }
 }
 
@@ -657,5 +860,191 @@ mod tests {
         assert!(dup.validate(false).is_err());
         let ok = Node::directory("", vec![file("a", 1, false), file("b", 2, false)]);
         assert!(ok.validate(true).is_ok());
+    }
+
+    #[test]
+    fn problems_since_matches_a_fresh_search() {
+        let problem = |name: &str, message: &str| Node {
+            name: name.into(),
+            content: Content::Problematic {
+                message: message.into(),
+            },
+        };
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut root = Node::directory(
+            "",
+            (0..12)
+                .map(|d| {
+                    Node::directory(
+                        format!("d{d:02}"),
+                        (0..8)
+                            .map(|e| {
+                                Node::directory(
+                                    format!("e{e}"),
+                                    (0..6)
+                                        .map(|f| match (d + e + f) % 17 {
+                                            0 => problem(&format!("f{f}"), "unreadable"),
+                                            _ => file(&format!("f{f}"), (f % 250) as u8, false),
+                                        })
+                                        .collect(),
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+        let mut problems = root.problems();
+        assert!(!problems.is_empty());
+        for round in 0..300 {
+            // One change copy-on-write: most subtrees stay shared.
+            let path = format!("d{:02}/e{}/f{}", next() % 12, next() % 8, next() % 7);
+            let new = match next() % 4 {
+                0 => None,
+                1 => Some(problem("x", &format!("round {round}"))),
+                _ => Some(file("x", (next() % 250) as u8, false)),
+            };
+            let changed = apply(
+                Some(&root),
+                &[Change {
+                    path,
+                    old: None,
+                    new,
+                }],
+            )
+            .unwrap()
+            .unwrap();
+            let fresh = changed.problems();
+            let reused = changed.problems_since(Some((&root, &problems)));
+            let paths = |problems: &[Problem]| -> Vec<(String, String)> {
+                problems
+                    .iter()
+                    .map(|p| (p.path.clone(), p.message.clone()))
+                    .collect()
+            };
+            assert_eq!(paths(&reused), paths(&fresh), "round {round}");
+            root = changed;
+            problems = reused;
+        }
+    }
+
+    #[test]
+    fn a_tree_digest_tells_every_difference_and_nothing_else() {
+        let snapshot = |root: Node| Snapshot {
+            root: Some(root),
+            files: 3,
+            ..Snapshot::default()
+        };
+        let tree = || {
+            Node::directory(
+                "",
+                vec![
+                    Node::directory("d", vec![file("a", 1, false), file("b", 2, false)]),
+                    file("c", 3, true),
+                ],
+            )
+        };
+        let mut digester = TreeDigester::default();
+        let first = digester.snapshot(&snapshot(tree()));
+        // The same content built separately — sharing nothing — agrees,
+        // and so does a fresh digester, which has cached nothing.
+        assert_eq!(digester.snapshot(&snapshot(tree())), first);
+        assert_eq!(TreeDigester::default().snapshot(&snapshot(tree())), first);
+        // Every kind of difference shows.
+        let changed = |change: Change| {
+            let root = apply(Some(&tree()), &[change]).unwrap().unwrap();
+            TreeDigester::default().snapshot(&snapshot(root))
+        };
+        let touched = {
+            let mut node = file("a", 1, false);
+            if let Content::File { metadata, .. } = &mut node.content {
+                metadata.mtime_nanos = 1;
+            }
+            node
+        };
+        for (what, change) in [
+            (
+                "metadata",
+                Change {
+                    path: "d/a".into(),
+                    old: None,
+                    new: Some(touched),
+                },
+            ),
+            (
+                "content",
+                Change {
+                    path: "d/a".into(),
+                    old: None,
+                    new: Some(file("a", 9, false)),
+                },
+            ),
+            (
+                "executability",
+                Change {
+                    path: "c".into(),
+                    old: None,
+                    new: Some(file("c", 3, false)),
+                },
+            ),
+            (
+                "removal",
+                Change {
+                    path: "d/b".into(),
+                    old: None,
+                    new: None,
+                },
+            ),
+            (
+                "addition",
+                Change {
+                    path: "d/z".into(),
+                    old: None,
+                    new: Some(file("z", 1, false)),
+                },
+            ),
+            (
+                "kind",
+                Change {
+                    path: "c".into(),
+                    old: None,
+                    new: Some(Node::directory("c", vec![])),
+                },
+            ),
+        ] {
+            assert_ne!(changed(change), first, "{what}");
+        }
+        let mut other_head = snapshot(tree());
+        other_head.files = 4;
+        assert_ne!(
+            TreeDigester::default().snapshot(&other_head),
+            first,
+            "the head"
+        );
+        // Incremental: a digester that saw the old tree, given one changed
+        // copy-on-write, agrees with one that saw nothing.
+        let old = tree();
+        let mut remembering = TreeDigester::default();
+        remembering.snapshot(&snapshot(old.clone()));
+        let new = apply(
+            Some(&old),
+            &[Change {
+                path: "d/b".into(),
+                old: None,
+                new: Some(file("b", 7, false)),
+            }],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            remembering.snapshot(&snapshot(new.clone())),
+            TreeDigester::default().snapshot(&snapshot(new))
+        );
     }
 }

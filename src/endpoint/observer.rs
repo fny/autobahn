@@ -60,8 +60,11 @@ use crate::tree::Snapshot;
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// The longest a scan may be served without a full walk behind it, bounding
-/// how long a missed filesystem event can persist.
-const FULL_SCAN_INTERVAL: Duration = Duration::from_secs(120);
+/// how long a missed filesystem event can persist: two minutes, or ten on
+/// battery with `power_saver_experimental` (`crate::power`).
+fn full_scan_interval() -> Duration {
+    crate::power::full_walk_interval()
+}
 
 /// What makes two endpoints able to share one observation.
 ///
@@ -435,7 +438,6 @@ impl RootObserver {
         // The walks already begun when this caller arrived. A walk begun
         // after it is as fresh as one of its own.
         let mut arrived = None;
-
         loop {
             let (baseline, behavior, want_full, walk, running) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
@@ -578,10 +580,10 @@ impl RootObserver {
     /// no full walk is on record (none has completed, or a new watch, a
     /// failed or refused incremental walk, or a distrusted baseline has
     /// cleared the record), or the last finished at least
-    /// [`FULL_SCAN_INTERVAL`] ago.
+    /// [`full_scan_interval`] ago.
     fn full_scan_due(&self, state: &State) -> bool {
         match state.last_full_scan {
-            Some(last) => last.elapsed() >= FULL_SCAN_INTERVAL,
+            Some(last) => last.elapsed() >= full_scan_interval(),
             None => true,
         }
     }
@@ -1365,8 +1367,6 @@ mod tests {
         assert!(fresh_generation > stale_generation);
     }
 
-    /// A stale fold offered as the baseline is a hint, never an oracle: a
-    /// change invalidated after the offer must still be seen.
     #[test]
     fn an_offered_baseline_cannot_hide_an_invalidated_change() {
         let keep = tempfile::tempdir().expect("tempdir");

@@ -35,6 +35,73 @@ Things we would like autobahn to do, thought through but not built or not suppor
 
 **Related, and separate: a sync that saturates the disk.** A large sync can keep a disk busy enough that the machine crawls. That calls for a limit, not a halt: a cap on transfer bandwidth, or on the scan and apply threads, set in the configuration. Also about a day.
 
+## A full walk that costs what the tree can afford
+
+**The problem.** Every session re-reads its whole tree every 120 seconds, whether or not anything changed (`FULL_SCAN_INTERVAL`, `src/endpoint/observer.rs`). Everyday syncing doesn't depend on it: an edit arrives because the watcher reports it. The walk is the backstop for changes the watcher never reports, and its interval is the longest such a change can go unnoticed. But its cost grows with the tree, and on a Mac it is not small.
+
+Measured on 2026-09-24: macOS 26.5.1, Apple M4, on battery, a 160,000-file corpus with both sides local, 30 one-minute `powermetrics` samples with nothing else running:
+
+| | CPU ms/s | Energy impact |
+|---|---|---|
+| mean | 55.2 | 76.5 |
+| median | 51.9 | 64.7 |
+| max | 123.5 | 163.0 |
+
+The samples alternate, as a 120-second walk lands in every other 60-second window. The 15 minutes with a walk averaged 152.9 energy and about 110 CPU ms/s. The 15 without one averaged 0.1 and about 1. For scale, in the same samples `sentineld` averaged 504 and WindowServer 116, so a walking minute sits between them. The walk is the whole of autobahn's idle cost, and it is enough to show among a laptop's noticeable consumers.
+
+A walk costs about 41 µs of CPU per file on that Mac, against about 7 µs on Linux (a 420k-file tree took about 3 CPU-seconds a walk on a c6i.8xlarge). Assuming the cost is linear in the tree's size, which matches the one measurement (it predicts 55 ms/s for 160k files), today's fixed interval costs:
+
+| Files | Every 2 minutes, Mac |
+|---|---|
+| 5k | 1.7 ms/s |
+| 50k | 17 ms/s |
+| 160k | 55 ms/s |
+| 500k | 171 ms/s |
+| 1M | 342 ms/s, a third of a core |
+
+So this is not only a battery problem: a very large tree is expensive on AC power too, all day.
+
+**What we hope to resolve.** The walk should cost what the machine can afford, not what the tree's size dictates, without giving up the promise that a silent miss is always found.
+
+- **The parameter is a CPU budget, and the interval follows from it.** Each walk is timed, and the next one waits long enough that walking uses at most, say, 1% of a core on battery and 5% on AC. The result is clamped between a floor and a ceiling.
+- **A floor of 2 minutes,** today's interval, so small trees lose nothing: a 5k-file tree walks in a fraction of a second and keeps walking every 2 minutes.
+- **A ceiling,** say 15 minutes, which is the promise about silent misses: no change the watcher missed goes unseen longer than that.
+- **A walk on wake from sleep,** the most common moment for a laptop to miss events, so the longer interval matters less.
+- **Settings for the whole machine, not per session,** since power belongs to the machine. Each process decides for its own host, so a remote agent on a plugged-in Linux box keeps its own pace while the laptop saves power. The power source is `IOPSCopyPowerSourcesInfo` on macOS and `/sys/class/power_supply` on Linux, cached for a minute.
+- **Visible in status,** for example "power saver: on (battery), walking every 11m", so a longer ceiling on missed changes is never hidden.
+
+At a 1% budget with those bounds, on the Mac:
+
+| Files | Interval | Cost |
+|---|---|---|
+| 5k | 2 min (floor) | 1.7 ms/s |
+| 50k | 3.4 min | 10 ms/s |
+| 160k | 11 min | 10 ms/s |
+| 220k | 15 min (ceiling) | 10 ms/s |
+| 500k | 15 min | 23 ms/s |
+| 1M | 15 min | 46 ms/s |
+
+From about 30k to 220k files the cost is held at 1% of a core. Above the ceiling it climbs again, and the choice there is between a longer ceiling and a costlier walk. The configuration might look like:
+
+```toml
+[power_saver]
+when = "battery"          # "battery" (default), "always", or "never"
+walk_budget = "1%"        # of one core, while saving
+walk_ceiling = "15m"
+```
+
+**What a longer interval risks.** A delay, not data. Every write is checked against the scan it was planned from, so a file that changed without an event cannot be overwritten blindly. The worst case is a stale copy on the other side for one interval, and perhaps a conflict to settle. Most misses aren't silent either: when FSEvents or inotify drops events it says so, and autobahn already walks at once. The periodic walk covers only what the operating system never reports.
+
+**What we don't know: how often silent misses happen.** It depends on the person and the workload: sleep and wake, external or network volumes, builds writing thousands of files. No fixed number is right for everyone, which is why the budget sets the interval rather than a guess at the miss rate. A cheap first step is to have each full walk log how many changes it found that no event reported. A few days of that on real machines would say whether 15 minutes is cautious or loose, and whether some watcher gap is worth fixing outright.
+
+**Cost.** About two days: the power-source check on each platform, timing the walk and choosing the next interval, the wake trigger, the configuration and its reload, the status line, and tests with the clock and power source behind seams. The miss-rate log is an hour on its own and could go first.
+
+**Where it falls short.**
+
+- **The per-file cost is one measurement,** on one Mac and one tree, and assumed linear. Trees with deep paths, many small directories, or a slow volume may cost more per file.
+- **The walk's CPU is not the whole of its energy.** Waking the disk and the memory traffic count too, and `powermetrics` attributes them only roughly, so the budget is a proxy for energy.
+- **A ceiling is still a ceiling.** On a million-file tree even 15 minutes costs 4.6% of a core. Only walking less, walking part of the tree at a time, or trusting the watcher more would go further, and each weakens the promise.
+
 ## FreeBSD as a supported platform
 
 **The problem.** FreeBSD was half-supported. CI ran the full suite in a FreeBSD VM on every push, and the docs listed it beside Linux and macOS. But no release published a FreeBSD build, `install.sh` refused it, and the agent bundle had no FreeBSD binary, so a FreeBSD remote host could not be set up without building one by hand. Two update tests that assume every tested platform has a published build kept CI red. FreeBSD was dropped for now: the CI job is removed, and the docs no longer mention it.

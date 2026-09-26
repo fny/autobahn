@@ -71,6 +71,14 @@ pub struct RemoteEndpoint {
     /// same fold the agent applies. Retaining it is what lets an unchanged
     /// rescan cost nothing on the wire.
     last_snapshot: Option<Snapshot>,
+    /// The encoding of `last_snapshot`, and its digest, when it came from
+    /// a verified reassembly — the next delta's baseline, kept rather than
+    /// re-encoded. Cleared whenever `last_snapshot` changes any other way,
+    /// so it only ever describes that snapshot exactly.
+    last_encoding: Option<(Vec<u8>, crate::tree::Digest)>,
+    /// Tree digests of `last_snapshot` and what changes build from it,
+    /// remembering what it hashed; see `TreeDigester`.
+    digester: crate::tree::TreeDigester,
     /// Where this endpoint's scans report that they are running.
     progress: Option<Arc<crate::progress::SideProgress>>,
 }
@@ -146,6 +154,10 @@ impl RemoteEndpoint {
                 self.seen = Some(header.generation);
                 self.receive_snapshot(header, what)
             }
+            Response::ScanChanges(changes) => {
+                self.seen = Some(changes.generation);
+                self.receive_changes(*changes, what)
+            }
             // The agent reports "unchanged" only against a snapshot it has
             // actually sent, so having nothing to reproduce means the two
             // sides disagree about what was transmitted. That is a protocol
@@ -164,8 +176,9 @@ impl RemoteEndpoint {
     /// baseline the agent named cannot be reproduced here.
     fn receive_snapshot(&mut self, header: ScanDelta, what: &str) -> Result<Snapshot> {
         match self.reassemble(&header) {
-            Ok(snapshot) => {
+            Ok((snapshot, encoding)) => {
                 self.last_snapshot = Some(snapshot.clone());
+                self.last_encoding = Some((encoding, header.digest));
                 Ok(snapshot)
             }
             Err(error) if header.baseline.is_some() => {
@@ -183,40 +196,119 @@ impl RemoteEndpoint {
                 if header.baseline.is_some() {
                     bail!("the agent answered a full-scan request with a delta");
                 }
-                let snapshot = self.reassemble(&header)?;
+                let (snapshot, encoding) = self.reassemble(&header)?;
                 self.last_snapshot = Some(snapshot.clone());
+                self.last_encoding = Some((encoding, header.digest));
                 Ok(snapshot)
             }
             Err(error) => Err(error),
         }
     }
 
+    /// Applies a changed scan's changes to the snapshot last received, and
+    /// holds the result to the agent's digest: the encoding of what was
+    /// built here must be the encoding the agent scanned. A baseline that
+    /// is not the one named, changes that do not apply, or a result that
+    /// does not verify is a performance event, as a byte delta's is — the
+    /// snapshot is asked for in full.
+    fn receive_changes(
+        &mut self,
+        scan: crate::protocol::ScanChanges,
+        what: &str,
+    ) -> Result<Snapshot> {
+        match self.apply_changes(&scan) {
+            Ok(snapshot) => {
+                self.last_snapshot = Some(snapshot.clone());
+                // Encoded only if a byte delta ever needs it as a base.
+                self.last_encoding = None;
+                Ok(snapshot)
+            }
+            Err(error) => {
+                eprintln!(
+                    "note: the agent's snapshot changes could not be reproduced \
+                     ({error:#}); requesting it in full"
+                );
+                let header = match self.exchange(Request::ScanFull)? {
+                    Response::ScanDelta(header) => header,
+                    response => return Err(unexpected_response(&response, what)),
+                };
+                if header.baseline.is_some() {
+                    bail!("the agent answered a full-scan request with a delta");
+                }
+                let (snapshot, encoding) = self.reassemble(&header)?;
+                self.last_snapshot = Some(snapshot.clone());
+                self.last_encoding = Some((encoding, header.digest));
+                Ok(snapshot)
+            }
+        }
+    }
+
+    /// Builds the snapshot a changed scan describes, verified; see
+    /// [`receive_changes`](RemoteEndpoint::receive_changes).
+    fn apply_changes(&mut self, scan: &crate::protocol::ScanChanges) -> Result<Snapshot> {
+        let last = self
+            .last_snapshot
+            .as_ref()
+            .ok_or_else(|| anyhow!("no previous snapshot to apply the changes to"))?;
+        if self.digester.snapshot(last) != scan.baseline {
+            bail!("the changes apply to a baseline this side does not hold");
+        }
+        for change in &scan.changes {
+            if let Some(node) = &change.new {
+                node.validate(false).map_err(|message| {
+                    anyhow!("a changed entry is not a valid hierarchy: {message}")
+                })?;
+            }
+        }
+        let root = crate::tree::apply(last.root.as_ref(), &scan.changes)
+            .map_err(|message| anyhow!("the changes do not apply: {message}"))?;
+        let snapshot = Snapshot {
+            root,
+            ..scan.head.clone()
+        };
+        if self.digester.snapshot(&snapshot) != scan.digest {
+            bail!("the snapshot built from the changes does not match the agent's digest");
+        }
+        Ok(snapshot)
+    }
+
     /// Pulls a delta's operations and applies them to the baseline this
     /// endpoint holds, verifying the result against the header's digest.
-    fn reassemble(&mut self, header: &ScanDelta) -> Result<Snapshot> {
+    fn reassemble(&mut self, header: &ScanDelta) -> Result<(Snapshot, Vec<u8>)> {
         use std::io::Cursor;
 
         check_delta_header(header)?;
 
         // The base is the encoding of the snapshot this endpoint last
-        // received — re-encoded now, so nothing is held between scans. Its
+        // received: the bytes its reassembly produced when it has them, and
+        // otherwise (after a fold, or a full scan) re-encoded now. Its
         // digest must be the one the agent computed the delta against.
+        //
+        // Applying a delta needs only the base's block layout, never its
+        // block hashes, so it is not signed. Re-encoding and signing a
+        // 45 MB snapshot per changed scan were a large part of the 273 ms
+        // the controller spent on each edit made remotely in a 420k tree.
         let (base, signature) = match header.baseline {
             Some(expected) => {
-                let last = self
-                    .last_snapshot
-                    .as_ref()
-                    .ok_or_else(|| anyhow!("no previous snapshot to serve as the baseline"))?;
-                let base = crate::transport::encode_snapshot(last)?;
-                let actual = *blake3::hash(&base).as_bytes();
+                let (base, actual) = match self.last_encoding.take() {
+                    Some(cached) => cached,
+                    None => {
+                        let last = self.last_snapshot.as_ref().ok_or_else(|| {
+                            anyhow!("no previous snapshot to serve as the baseline")
+                        })?;
+                        let base = crate::transport::encode_snapshot(last)?;
+                        let digest = *blake3::hash(&base).as_bytes();
+                        (base, digest)
+                    }
+                };
                 if actual != expected {
                     // The stream must still be drained, or the next request
                     // on this channel would be answered with its leftovers.
                     self.drain_delta()?;
                     bail!("the baseline encoding here differs from the agent's");
                 }
-                let signature = crate::rsync::signature(Cursor::new(&base), header.block_size)
-                    .context("unable to sign the baseline snapshot")?;
+                let signature =
+                    crate::rsync::Signature::layout(base.len() as u64, header.block_size);
                 (base, signature)
             }
             None => (Vec::new(), crate::rsync::Signature::default()),
@@ -240,7 +332,7 @@ impl RemoteEndpoint {
         let snapshot: Snapshot =
             bincode::deserialize(&output).context("unable to decode the reassembled snapshot")?;
         check_hierarchy(&snapshot)?;
-        Ok(snapshot)
+        Ok((snapshot, output))
     }
 
     /// Discards the rest of a delta stream.
@@ -276,6 +368,8 @@ impl RemoteEndpoint {
             stage_begin_answer: None,
             pending_pushes: 0,
             last_snapshot: None,
+            last_encoding: None,
+            digester: crate::tree::TreeDigester::default(),
             progress: None,
         }
     }
@@ -655,6 +749,7 @@ impl Endpoint for RemoteEndpoint {
                     .last_snapshot
                     .as_ref()
                     .and_then(|snapshot| super::fold_transition(snapshot, &transitions, &outcome));
+                self.last_encoding = None;
                 Ok(outcome)
             }
             response => Err(unexpected_response(&response, "transition")),
@@ -898,6 +993,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Recorded { .. } => "recorded",
         Response::PeeringState(_) => "peering state",
         Response::ScanProgress { .. } => "scan progress",
+        Response::ScanChanges(_) => "scan changes",
     }
 }
 

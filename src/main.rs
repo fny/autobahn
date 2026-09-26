@@ -3,6 +3,12 @@
 #![warn(clippy::empty_line_after_doc_comments)]
 #![warn(clippy::doc_lazy_continuation)]
 
+/// The static Linux builds link musl, whose allocator is slow and
+/// serializes on one lock; see the note in Cargo.toml.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1732,6 +1738,7 @@ fn run_watch(
         true => Some(autobahn::logging::Level::Debug),
         false => loaded.log_level,
     });
+    autobahn::power::set_enabled(loaded.power_saver);
     let state_root = locate_state_root(state_root)?;
     let own_state = autobahn::config::OwnState::new(&state_root, Some(&config_path));
     own_state.check_plans(&loaded.plans)?;
@@ -1806,6 +1813,7 @@ fn run_watch(
                     true => Some(autobahn::logging::Level::Debug),
                     false => next.log_level,
                 });
+                autobahn::power::set_enabled(next.power_saver);
                 for (session, problem) in
                     autobahn::supervisor::unreadable_ancestors(&next.plans, &state_root)
                 {
@@ -5288,15 +5296,20 @@ mod tests {
             .expect("the refusal is a string")
             .contains("mdoe"));
         assert!(
-            document["recorded"].as_array().expect("an array").is_empty(),
+            document["recorded"]
+                .as_array()
+                .expect("an array")
+                .is_empty(),
             "a state root with no status files records nothing"
         );
         // It has to survive a round trip: this is what a script reads.
         let text = serde_json::to_string(&document).expect("it serializes");
         let parsed: serde_json::Value = serde_json::from_str(&text).expect("it parses");
-        assert_eq!(parsed["configuration_error"], document["configuration_error"]);
+        assert_eq!(
+            parsed["configuration_error"],
+            document["configuration_error"]
+        );
     }
-
 
     /// A resolve flushes the sessions it touched, not the whole group: a
     /// destination that already agreed with the winner has nothing new to

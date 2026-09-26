@@ -52,6 +52,34 @@ pub struct Signature {
 }
 
 impl Signature {
+    /// The block layout `signature` would give a base of `length` bytes,
+    /// without reading it: the block size, the final block's size, and one
+    /// placeholder hash per block. Enough to *apply* a delta — `patch`
+    /// consults only the layout — and useless for computing one.
+    pub fn layout(length: u64, block_size: u32) -> Signature {
+        let block_size = if block_size == 0 {
+            DEFAULT_BLOCK_SIZE
+        } else {
+            block_size
+        };
+        if length == 0 {
+            return Signature::default();
+        }
+        let blocks = length.div_ceil(u64::from(block_size));
+        let last_block_size = (length - (blocks - 1) * u64::from(block_size)) as u32;
+        Signature {
+            block_size,
+            last_block_size,
+            hashes: vec![
+                BlockHash {
+                    weak: 0,
+                    strong: [0; 32],
+                };
+                blocks as usize
+            ],
+        }
+    }
+
     /// Indicates whether or not this signature describes an empty base.
     pub fn is_empty(&self) -> bool {
         self.block_size == 0
@@ -193,6 +221,106 @@ pub fn signature<R: Read>(base: R, block_size: u32) -> Result<Signature> {
     })
 }
 
+/// The base length from which [`file_signature`] hashes on several threads.
+const PARALLEL_SIGNATURE_MINIMUM: u64 = 64 << 20;
+/// The most threads [`file_signature`] uses.
+const SIGNATURE_THREADS_MAX: usize = 8;
+
+/// The signature of a whole file: what [`signature`] computes reading it
+/// from the start, with a large file's blocks read and hashed on several
+/// threads, each taking a contiguous range of whole blocks. Measured on a
+/// 4 GB base, one thread spent 2.7 s here while the rest of the machine
+/// waited on it.
+///
+/// A file whose length changes under the parallel reads is signed again in
+/// one pass, as `signature` would. Either way the result describes the file
+/// as it was read, and nothing depends on that matching what it is later:
+/// what a delta against it builds is checked against its digest.
+///
+/// `pulse` is called for every block read, from whichever thread read it,
+/// so a caller can show a long signature is moving.
+pub fn file_signature(
+    file: &std::fs::File,
+    block_size: u32,
+    pulse: &(dyn Fn() + Sync),
+) -> Result<Signature> {
+    use std::os::unix::fs::FileExt;
+
+    let block_size = if block_size == 0 {
+        DEFAULT_BLOCK_SIZE
+    } else {
+        block_size
+    };
+    let length = file
+        .metadata()
+        .context("unable to read base metadata")?
+        .len();
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(SIGNATURE_THREADS_MAX);
+    if length < PARALLEL_SIGNATURE_MINIMUM || threads < 2 {
+        return signature(Pulsed { inner: file, pulse }, block_size);
+    }
+    let block = u64::from(block_size);
+    let blocks = length.div_ceil(block);
+    let per_thread = blocks.div_ceil(threads as u64);
+    let parts: Vec<Option<Vec<BlockHash>>> = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..threads as u64)
+            .map(|thread| {
+                let first = (thread * per_thread).min(blocks);
+                let end = ((thread + 1) * per_thread).min(blocks);
+                scope.spawn(move || {
+                    let mut buffer = vec![0u8; block_size as usize];
+                    let mut hashes = Vec::with_capacity((end - first) as usize);
+                    for index in first..end {
+                        let offset = index * block;
+                        let size = block.min(length - offset) as usize;
+                        let bytes = &mut buffer[..size];
+                        file.read_exact_at(bytes, offset).ok()?;
+                        pulse();
+                        hashes.push(BlockHash {
+                            weak: weak_hash(bytes, block_size),
+                            strong: *blake3::hash(bytes).as_bytes(),
+                        });
+                    }
+                    Some(hashes)
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap_or(None))
+            .collect()
+    });
+    let unchanged = file
+        .metadata()
+        .is_ok_and(|metadata| metadata.len() == length);
+    if !unchanged || parts.iter().any(Option::is_none) {
+        return signature(Pulsed { inner: file, pulse }, block_size);
+    }
+    Ok(Signature {
+        block_size,
+        last_block_size: (length - (blocks - 1) * block) as u32,
+        hashes: parts.into_iter().flatten().flatten().collect(),
+    })
+}
+
+/// A reader that calls `pulse` for every read that returned bytes.
+struct Pulsed<'a, R> {
+    inner: R,
+    pulse: &'a (dyn Fn() + Sync),
+}
+
+impl<R: Read> Read for Pulsed<'_, R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        if read > 0 {
+            (self.pulse)();
+        }
+        Ok(read)
+    }
+}
+
 /// Computes delta operations that reconstruct the target stream from a base
 /// described by the provided signature, streaming operations to `emit`.
 /// Adjacent block matches are coalesced; data operations are bounded by
@@ -268,6 +396,10 @@ pub fn deltify<R: Read>(
     let mut r1 = 0u32;
     let mut r2 = 0u32;
     let mut rolling = false;
+    // The base block the next window is expected to be, if the target is
+    // the base unchanged there: the first, and then the one after each
+    // match. Checked once per match, so a changed stretch never pays it.
+    let mut expected: Option<usize> = Some(0);
 
     loop {
         // Ensure the buffer holds a full window plus, unless the target is
@@ -294,6 +426,25 @@ pub fn deltify<R: Read>(
         }
 
         let window = &buffer[position..position + block_size];
+        // Where the target is the base unchanged, the window just past a
+        // match is the next base block: its strong digest settles that
+        // without the weak checksum, whose byte-at-a-time sum would
+        // otherwise cost more than the hash. Any other outcome falls through
+        // to the search, so this changes nothing but the time taken.
+        if !rolling {
+            if let Some(index) = expected.take() {
+                if index < full_block_count
+                    && *blake3::hash(window).as_bytes() == signature.hashes[index].strong
+                {
+                    emitter.data(&buffer[start..position])?;
+                    emitter.block(index as u64)?;
+                    position += block_size;
+                    start = position;
+                    expected = Some(index + 1);
+                    continue;
+                }
+            }
+        }
         if !rolling {
             let (first, second) = weak_components(window, signature.block_size);
             r1 = first;
@@ -320,6 +471,7 @@ pub fn deltify<R: Read>(
             position += block_size;
             start = position;
             rolling = false;
+            expected = Some(index as usize + 1);
             continue;
         }
 
@@ -500,16 +652,18 @@ fn read_into<R: Read>(reader: &mut R, buffer: &mut [u8]) -> Result<usize> {
 /// a short final block, matching the classic rsync formulation (and thus the
 /// coefficients that the rolling update maintains).
 fn weak_components(block: &[u8], block_size: u32) -> (u32, u32) {
+    // Both components are sums modulo 2^16, and wrapping `u32` arithmetic
+    // is exact modulo 2^32 and so modulo 2^16: reducing once at the end
+    // gives the same values as reducing at every step, and leaves a loop
+    // without a carried mask, which the compiler vectorizes.
     let mut r1 = 0u32;
     let mut r2 = 0u32;
     for (index, &byte) in block.iter().enumerate() {
-        r1 = (r1 + byte as u32) & WEAK_HASH_MASK;
-        // Reducing the coefficient modulo 2^16 up front preserves the sum
-        // modulo 2^16 while keeping the product well inside `u32`.
-        let coefficient = block_size.wrapping_sub(index as u32) & WEAK_HASH_MASK;
-        r2 = (r2 + coefficient * byte as u32) & WEAK_HASH_MASK;
+        r1 = r1.wrapping_add(byte as u32);
+        let coefficient = block_size.wrapping_sub(index as u32);
+        r2 = r2.wrapping_add(coefficient.wrapping_mul(byte as u32));
     }
-    (r1, r2)
+    (r1 & WEAK_HASH_MASK, r2 & WEAK_HASH_MASK)
 }
 
 /// Computes the weak rolling checksum of a block: the low component in the
@@ -845,6 +999,85 @@ mod tests {
     }
 
     #[test]
+    fn a_file_signature_is_the_streamed_one() {
+        let directory = tempfile::tempdir().unwrap();
+        // Above the parallel threshold, ending in a short block, and a
+        // whole number of blocks; and one below it.
+        for (length, block_size) in [
+            ((PARALLEL_SIGNATURE_MINIMUM + 12_345) as usize, 1 << 16),
+            (
+                (PARALLEL_SIGNATURE_MINIMUM as usize).next_multiple_of(4096),
+                4096,
+            ),
+            (100_000, 1024),
+        ] {
+            let path = directory.path().join("base");
+            let content = pseudo_random(length, length as u64);
+            std::fs::write(&path, &content).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let parallel = file_signature(&file, block_size, &|| {}).unwrap();
+            let streamed = super::signature(Cursor::new(&content), block_size).unwrap();
+            assert_eq!(parallel.block_size, streamed.block_size);
+            assert_eq!(parallel.last_block_size, streamed.last_block_size);
+            assert_eq!(parallel.hashes.len(), streamed.hashes.len());
+            assert!(parallel
+                .hashes
+                .iter()
+                .zip(&streamed.hashes)
+                .all(|(a, b)| a.weak == b.weak && a.strong == b.strong));
+        }
+    }
+
+    #[test]
+    fn the_weak_checksum_is_the_one_reduced_at_every_step() {
+        // The definition, reduced modulo 2^16 at every step as it was first
+        // written; the shipped one reduces once, and must agree everywhere,
+        // including a block size of 2^16 itself.
+        fn reference(block: &[u8], block_size: u32) -> (u32, u32) {
+            let (mut r1, mut r2) = (0u32, 0u32);
+            for (index, &byte) in block.iter().enumerate() {
+                r1 = (r1 + byte as u32) & WEAK_HASH_MASK;
+                let coefficient = block_size.wrapping_sub(index as u32) & WEAK_HASH_MASK;
+                r2 = (r2 + coefficient * byte as u32) & WEAK_HASH_MASK;
+            }
+            (r1, r2)
+        }
+        for (length, block_size, seed) in [
+            (0, 1024, 1),
+            (1, 1024, 2),
+            (1024, 1024, 3),
+            (700, 1024, 4),
+            (1 << 16, 1 << 16, 5),
+            (40_000, 1 << 16, 6),
+        ] {
+            let block = pseudo_random(length, seed);
+            assert_eq!(
+                weak_components(&block, block_size),
+                reference(&block, block_size)
+            );
+        }
+        let saturated = vec![0xFFu8; 1 << 16];
+        assert_eq!(
+            weak_components(&saturated, 1 << 16),
+            reference(&saturated, 1 << 16)
+        );
+    }
+
+    #[test]
+    fn a_base_of_repeated_blocks_still_round_trips() {
+        // Every block of the base is the same, so the block expected after a
+        // match and the one the search would find are interchangeable.
+        let block = pseudo_random(1024, 21);
+        let base: Vec<u8> = block.iter().copied().cycle().take(64 * 1024).collect();
+        let ops = round_trip(&base, &base, 1024);
+        assert_eq!(block_total(&ops), 64);
+        let mut changed = base.clone();
+        changed[10_000] ^= 1;
+        changed.splice(30_000..30_000, pseudo_random(333, 22));
+        round_trip(&base, &changed, 1024);
+    }
+
+    #[test]
     fn large_pseudo_random_content_round_trips() {
         let base = pseudo_random(300_000, 15);
 
@@ -932,5 +1165,43 @@ mod tests {
         )
         .is_ok());
         assert_eq!(output, base);
+    }
+
+    #[test]
+    fn a_layout_matches_the_signature_it_stands_in_for() {
+        // Every block size a signature may carry (1 KiB to 64 KiB, and 0
+        // for the default), against lengths on and off block boundaries.
+        for length in [0usize, 1, 1000, 1024, 1025, 4096, 4097, 65_536, 100_000] {
+            for block_size in [0u32, 1024, 4096, 65_536] {
+                let base: Vec<u8> = (0..length).map(|i| (i * 31 % 251) as u8).collect();
+                let signed = signature(std::io::Cursor::new(&base), block_size).unwrap();
+                let laid = Signature::layout(length as u64, block_size);
+                assert_eq!(signed.block_size, laid.block_size, "{length} {block_size}");
+                assert_eq!(
+                    signed.last_block_size, laid.last_block_size,
+                    "{length} {block_size}"
+                );
+                assert_eq!(
+                    signed.hashes.len(),
+                    laid.hashes.len(),
+                    "{length} {block_size}"
+                );
+                // And a delta computed against the real signature applies
+                // against the layout alone.
+                let target: Vec<u8> = base.iter().rev().chain(base.iter()).copied().collect();
+                let mut ops = Vec::new();
+                deltify(std::io::Cursor::new(&target), &signed, &mut |op| {
+                    ops.push(op);
+                    Ok(())
+                })
+                .unwrap();
+                let mut output = Vec::new();
+                let mut cursor = std::io::Cursor::new(&base);
+                for op in &ops {
+                    patch(&mut cursor, &laid, op, &mut output).unwrap();
+                }
+                assert_eq!(output, target, "{length} {block_size}");
+            }
+        }
     }
 }

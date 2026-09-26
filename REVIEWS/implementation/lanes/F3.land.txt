@@ -1,0 +1,47 @@
+== F3 done file
+# F3 done
+
+## Tickets
+- CI-02 done f8b5462: check.sh keeps TLC's exit code and also fails on violated/Error:/Deadlock or a missing "Finished in"; --traces refuses a missing or empty dir; stub-java tests in the new spec/check-test.sh, which CI runs.
+- CI-03 done b871998: spec/tla2tools.version pins tla2tools v1.7.4 by URL and SHA-256; check.sh fetches it, verifies it, refuses a mismatch (TLA2TOOLS_TRUST=1 overrides for a TLA2TOOLS jar), and `check.sh --fetch` logs the version in CI.
+- CI-04 done 9740763: contents: read at the top of every workflow; only the release job gets contents: write.
+- CI-06 done 400ef2c: release.yml uses rustup directly, with no third-party actions; every `uses:` is SHA-pinned with its tag in a comment (current majors kept); release checkouts use persist-credentials: false.
+- CI-07 partial 7b98c2a: --locked on every cargo command in the workflows and in scripts/build-agents.sh; apps/macos/build.sh (F5) and the docs are not done.
+- CI-08 done e3b934c + 19bef61: the release's version job requires linux, linux-arm, mac and spec to have succeeded on the tagged commit, via the Actions API (actions: read, not checks: read, because release.yml's own jobs are also named linux/mac), counting push/dispatch runs only.
+- CI-09 done 0d0a7fb: the mac CI job runs clippy --features tray --all-targets and `cargo test --features tray --lib tray::`, both into target/tray.
+- CI-10 done 52a2a0c: dependabot.yml (cargo and actions, weekly, grouped), audit.yml (cargo-deny 0.20.2 binary pinned by SHA-256; weekly, on Cargo.lock/deny.toml changes, and by hand), and deny.toml with 3 accepted "unmaintained" advisories, each with a reason and a review date; the audit passes locally.
+- CI-05 (workflow half) done 05a0e31: the mac release job runs `build.sh --unsigned`, then imports the certificate, then runs `release.sh --sign-only apps/macos/Autobahn.app`.
+- HYG-1 (release check) done 95dcb31: the mac release job fails unless both plist version keys equal the tag, checked before signing (in the mac job, since the app only exists there).
+- REL-1 step 1 (workflow part) done 2497ede: install.sh is published as a release asset and listed in SHA256SUMS.
+- F-M-TEST (CI check) done b3cb9f5: the Linux job snapshots ~/.autobahn before and after cargo test and fails on any difference. Also 807f610: the spec job passes `-- --include-ignored`, ready for 2c marking the TLC tests #[ignore].
+- (extra) 0cc467e: actionlint 1.7.12 is clean on all workflows (it had 3 findings before this lane).
+
+## Last full-suite run (`isolated lane-F3 cargo test --release --no-fail-fast`)
+test result: ok. 422 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 78.46s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: FAILED. 32 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.62s   <- a_standing_watch_lets_the_next_cycle_skip_the_beta_scan, the known flake (passed 2 of 3 isolated reruns at load ~20; this lane changes no Rust)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.57s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.19s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.59s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+(The earlier full run, before the YAML-only commits, passed everything: 422/33/33/3/2/40/0.) fmt and clippy are clean; spec/check.sh quick passes against the real jar; the AUTOBAHN_TLC=1 replay passes.
+
+## For the integrator
+- **Land F5 with or before 05a0e31 and 95dcb31.** Without F5's build.sh --unsigned / release.sh --sign-only / plist-from-Cargo.toml, the release would rebuild after the certificate import and the version check would see 0.4.0.
+- CI-07 leftovers: add --locked to `apps/macos/build.sh`'s cargo build (F5's file; the review agent confirmed it's missing at F5 line 43), and to the build commands in docs/development.md and README.md (docs lane).
+- REL-1: point the README one-liner at releases/latest/download/install.sh (F1/docs).
+- Docs lane: spec/README.md:16 could mention the pin and TLA2TOOLS_TRUST; docs/releases.md could mention the CI gate.
+- Nothing on GitHub was run: the release gate, the permissions, the tray step and the audit workflow are verified only by actionlint, stub tests, and local runs of the scripts they call. The first real CI run and a tag dry run on a fork are the real checks.
+- F-M-TEST 2c: once the TLC tests are #[ignore], the spec job already runs them (`-- --include-ignored`).
+landed: 15 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 513 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 67.73s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.79s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.83s
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.88s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

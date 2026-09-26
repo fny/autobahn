@@ -39,6 +39,8 @@ pub struct Loaded {
     pub text: String,
     /// What to say about it without refusing it, once, as it loads.
     pub warnings: Vec<String>,
+    /// Whether to walk less often on battery (`crate::power`).
+    pub power_saver: bool,
 }
 
 /// Loads a configuration and derives everything the supervisor runs from,
@@ -69,6 +71,7 @@ pub fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Loaded> {
         reload: configuration.reload,
         text: text.to_owned(),
         warnings: configuration.warnings().to_vec(),
+        power_saver: configuration.power_saver_experimental,
     })
 }
 

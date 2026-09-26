@@ -89,7 +89,7 @@ The estimate is withheld unless the phase has been running long enough to have a
 
 A session between cycles is described by how its last cycle ended; so is a paused one, and one backing off from an error, both of which the recorded status names.
 
-Every command that talks to the running supervisor — `status`, `flush`, `pause`, `mi`, the menu bar app — sends its own build with the request, and a supervisor of another build refuses it rather than guess. After installing a new build by hand, before the service is restarted, `status` says so — *the running supervisor is 0.4.0+e15 and this is 0.4.1+e15; `autobahn restart` to run this build* — and shows what the supervisor last recorded. `autobahn update` restarts the service itself, so it never shows there.
+Every command that talks to the running supervisor — `status`, `flush`, `pause`, `mi`, the menu bar app — sends its own build with the request, and a supervisor of another build refuses it rather than guess. After installing a new build by hand, before the service is restarted, `status` says so — *the running supervisor is 0.4.0+e16 and this is 0.4.1+e16; `autobahn restart` to run this build* — and shows what the supervisor last recorded. `autobahn update` restarts the service itself, so it never shows there.
 
 A group with nothing to say is one line — every destination synchronized, nothing waiting on anyone, nothing going on long enough to earn a line:
 
@@ -126,7 +126,7 @@ Conflicts and blocked paths co-occur, so both counts are reported rather than on
 
 ## One-off syncs and scripting
 
-Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code. A one-off pass registers no filesystem watchers — it never waits for anything — so on a large tree it starts in a fraction of the time a `watch` does (a 160,000-file pair, already in sync: under a second):
+Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code. A one-off pass registers no filesystem watchers on either side, local or remote — it never waits for anything — so on a large tree it starts in a fraction of the time a `watch` does (a 160,000-file pair, already in sync: 0.7 s locally, 1.4 s over SSH):
 
 ```sh
 # One bidirectional pass, then exit:
@@ -134,6 +134,9 @@ autobahn sync ~/project /mnt/backup/project
 
 # Local ↔ remote over SSH:
 autobahn sync ~/project user@host:/srv/project
+
+# Every session in the configuration, once each:
+autobahn sync
 
 # Keep watching, like a one-group `watch`:
 autobahn sync ~/project user@host:/srv/project --watch

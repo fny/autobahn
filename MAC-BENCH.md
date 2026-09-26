@@ -499,7 +499,23 @@ Two files named `x\x1b]52;c;cHduZWQ=\x07` with different contents, one conflict.
 
 `^[` is ESC and `^G` is BEL, so the OSC 52 sequence reaches the terminal intact — and a second time inside a `resolve` command the reader is invited to copy. In a terminal that honours OSC 52 (iTerm2 with the setting enabled) that writes the clipboard.
 
-Not everything is raw: `sync`'s own conflict line printed the name escaped, as `"x\u{1b}]52;c;cHduZWQ=\u{7}"`. So the sanitising exists in one path and not the other, which is M-6's point exactly. Whether each terminal acts on it was not tested — that needs a person at Terminal.app and iTerm2.
+Not everything is raw: `sync`'s own conflict line printed the name escaped, as `"x\u{1b}]52;c;cHduZWQ=\u{7}"`. So the sanitising exists in one path and not the other, which is M-6's point exactly.
+
+**Re-run on the merged build (`162bfdf`), 2026-09-26: fixed in the code; the terminals could not be made to prove it.**
+
+`issues` now prints the name as visible text, `x\x1b]52;c;cHduZWQ=\x07` — no ESC, no BEL, nothing the terminal can act on. That is the whole of the fix, and it holds whatever a terminal is set to.
+
+The end-to-end half is inconclusive on this machine, and the control says why:
+
+| what was run | clipboard |
+|---|---|
+| `issues` with the hostile name, Terminal.app | unchanged |
+| `issues` with the hostile name, iTerm2 | unchanged |
+| **control:** a raw OSC 52 written straight to the tty, Terminal.app | unchanged |
+| **control:** the same, iTerm2, clipboard access off | unchanged |
+| **control:** the same, iTerm2, clipboard access **on**, after quitting and reopening it | **unchanged** |
+
+iTerm2 3.7.3 here does not honour an OSC 52 clipboard write even with `AllowClipboardAccess` set and the application restarted. So the attack cannot be demonstrated on this machine, and "the clipboard did not change" is not evidence about autobahn. The settings were put back exactly as they were, checked against a dump taken first.
 
 **Filed as** [`F-M6`](REVIEWS/fixes/F-M6-terminal-escapes-in-issues.md) (M-6).
 

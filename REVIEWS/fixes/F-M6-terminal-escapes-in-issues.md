@@ -18,7 +18,9 @@ A file named with an OSC 52 clipboard write reaches the terminal intact. Two fil
 
 The same name is *not* raw everywhere: `sync` printed it as `"x\u{1b}]52;c;cHduZWQ=\u{7}"`, escaped by Rust's `Debug`. So one path sanitises by accident and the other does not, which is M-6's point.
 
-Not tested, and still open: whether each terminal acts on the sequence. That needs a person at Terminal.app and iTerm2.
+**Re-run on the merged build (`162bfdf`), 2026-09-26: fixed.** `issues` prints the name as visible text — `x\x1b]52;c;cHduZWQ=\x07` — so nothing reaches the terminal that it could act on.
+
+Whether a terminal *would* have acted on it stays untested, and not for want of trying: a raw OSC 52 written straight to the tty changed nothing in Terminal.app, nor in iTerm2 3.7.3 with `AllowClipboardAccess` enabled and the application restarted. The control fails on this machine, so the end-to-end test cannot distinguish a fixed autobahn from a terminal that ignores the attack. The code-level evidence is what stands.
 
 ## Proposed resolution
 

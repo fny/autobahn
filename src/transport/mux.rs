@@ -670,9 +670,17 @@ impl Drop for AgentChannel {
 impl Shared {
     /// Sends one frame through the shared writer.
     fn send(&self, frame: &MuxRequest) -> Result<()> {
+        // Encoded and compressed before the lock is taken: see
+        // `encode_frame`. Only the write holds it, and only the write
+        // marks the wire busy.
+        let bytes = super::encode_frame(frame)?;
         let mut writer = self.writer.lock().unwrap_or_else(PoisonError::into_inner);
         self.wire.writing.store(true, Ordering::Relaxed);
-        let sent = super::send_frame(&mut *writer, frame);
+        use std::io::Write;
+        let sent = writer
+            .write_all(&bytes)
+            .and_then(|()| writer.flush())
+            .context("unable to write frame");
         self.wire.writing.store(false, Ordering::Relaxed);
         sent
     }

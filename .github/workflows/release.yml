@@ -96,10 +96,15 @@ jobs:
         include:
           - target: x86_64-unknown-linux-musl
             platform: linux-x86_64
+            # mimalloc's C, for the musl build (see Cargo.toml).
+            packages: musl-tools
           - target: aarch64-unknown-linux-musl
             platform: linux-aarch64
             linker: aarch64-linux-gnu-gcc
             packages: gcc-aarch64-linux-gnu
+            # mimalloc's C for aarch64 musl: zig, as no aarch64 musl
+            # compiler is packaged (see scripts/zig-cc).
+            zig: aarch64-linux-musl
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -123,10 +128,18 @@ jobs:
           [target.${{ matrix.target }}]
           linker = "${{ matrix.linker }}"
           EOF
+      - name: C compiler for the musl target
+        if: matrix.zig
+        run: |
+          python3 -m pip install --quiet ziglang
+          echo "CC_${TARGET//-/_}=$PWD/scripts/zig-cc ${{ matrix.zig }}" >> "$GITHUB_ENV"
+          echo "AR_${TARGET//-/_}=$PWD/scripts/zig-ar" >> "$GITHUB_ENV"
+        env:
+          TARGET: ${{ matrix.target }}
       - name: Build
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: cargo build --profile dist --locked --target ${{ matrix.target }}
       - name: Stage artifact
-        run: cp target/${{ matrix.target }}/release/autobahn autobahn-${{ matrix.platform }}
+        run: cp target/${{ matrix.target }}/dist/autobahn autobahn-${{ matrix.platform }}
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: autobahn-${{ matrix.platform }}
@@ -166,8 +179,8 @@ jobs:
         run: |
           for pair in aarch64-apple-darwin:darwin-aarch64 x86_64-apple-darwin:darwin-x86_64; do
             target=${pair%%:*}; platform=${pair##*:}
-            cargo build --release --locked --target "$target"
-            cp "target/$target/release/autobahn" "autobahn-$platform"
+            cargo build --profile dist --locked --target "$target"
+            cp "target/$target/dist/autobahn" "autobahn-$platform"
           done
       - name: Build the app, unsigned
         # Every build happens before the certificate exists: a dependency's

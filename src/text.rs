@@ -149,8 +149,14 @@ mod tests {
     fn display_block_keeps_newlines_and_escapes_the_rest() {
         let shown = display_block("unable to parse\n  |\n1 | mdoe = \"x\"\n  | ^^^^");
         assert!(shown.contains('\n'), "{shown:?}");
-        assert!(shown.contains("\n    |"), "continuation lines are indented: {shown:?}");
-        assert!(!shown.contains("\\n"), "a newline is not escaped away: {shown:?}");
+        assert!(
+            shown.contains("\n    |"),
+            "continuation lines are indented: {shown:?}"
+        );
+        assert!(
+            !shown.contains("\\n"),
+            "a newline is not escaped away: {shown:?}"
+        );
 
         let hostile = display_block("first\n\x1b]52;c;cHduZWQ=\x07second");
         assert!(!hostile.contains('\x1b'), "{hostile:?}");

@@ -50,8 +50,13 @@ const MAXIMUM_BACKOFF: Duration = Duration::from_secs(300);
 /// content settles immediately.
 pub const MAXIMUM_FOLLOW_UP_CYCLES: u32 = 5;
 
-/// The granularity at which sleeping workers check for a stop request.
-const STOP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+/// The granularity at which sleeping threads check for a stop request.
+///
+/// Control flags do not wait on it — they ring the worker's doorbell — so
+/// this bounds only how long a stop takes to be noticed. It was 25 ms, and
+/// every sleeping thread woke forty times a second to check: thirty
+/// sessions backing off from an unreachable host, 1,300 wake-ups a second.
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// The recorded state of one supervised session, as persisted to its status
 /// file after every attempt.
@@ -796,6 +801,7 @@ impl Supervisor {
             halt.store(true, Ordering::Relaxed);
             for session in &running {
                 session.stop.store(true, Ordering::Relaxed);
+                session.control.bell.ring();
             }
             for session in running {
                 if session.handle.join().is_err() {
@@ -860,6 +866,7 @@ impl Supervisor {
         for session in &stopping {
             session.stop.store(true, Ordering::Relaxed);
             session.control.wake.store(true, Ordering::Relaxed);
+            session.control.bell.ring();
         }
         for session in stopping {
             let display = session.plan.display();
@@ -1749,7 +1756,7 @@ impl<'a> Worker<'a> {
                     // surface (and heal) it.
                     Err(_) => return,
                 },
-                None => std::thread::sleep(slice.min(STOP_POLL_INTERVAL)),
+                None => flags.bell.wait(slice.min(STOP_POLL_INTERVAL)),
             }
         }
     }
@@ -1770,7 +1777,7 @@ impl<'a> Worker<'a> {
             crate::note!("[{}] paused", self.plan.display());
         }
         while !stop.load(Ordering::Relaxed) && flags.paused.load(Ordering::Relaxed) {
-            std::thread::sleep(STOP_POLL_INTERVAL);
+            flags.bell.wait(STOP_POLL_INTERVAL);
         }
     }
 
@@ -3030,7 +3037,7 @@ fn sleep_flagged(duration: Duration, stop: &AtomicBool, flags: &control::WorkerC
         if remaining.is_zero() {
             return;
         }
-        std::thread::sleep(remaining.min(STOP_POLL_INTERVAL));
+        flags.bell.wait(remaining.min(STOP_POLL_INTERVAL));
     }
 }
 

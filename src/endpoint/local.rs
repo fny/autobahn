@@ -193,8 +193,12 @@ const MAXIMUM_PENDING_PATHS: usize = 8192;
 /// The changed paths accumulated by a watcher since the last scan.
 #[derive(Default)]
 struct PendingChanges {
-    /// The absolute paths reported as changed.
+    /// The absolute paths reported as changed, each once.
     paths: Vec<PathBuf>,
+    /// The members of `paths`, so a path reported again — a file written
+    /// in many small appends — takes one place against the cap, not one
+    /// per event.
+    seen: std::collections::HashSet<PathBuf>,
     /// Whether the record is incomplete — too many paths, an event the
     /// backend flagged for rescan, or a watcher error. The next scan must
     /// then read everything.
@@ -208,7 +212,59 @@ impl PendingChanges {
         self.incomplete = true;
         self.paths.clear();
         self.paths.shrink_to_fit();
+        self.seen.clear();
+        self.seen.shrink_to_fit();
     }
+
+    /// Adds a path, once; gives up when the record outgrows its cap.
+    fn add(&mut self, path: PathBuf) {
+        if self.incomplete || self.seen.contains(&path) {
+            return;
+        }
+        if self.paths.len() >= MAXIMUM_PENDING_PATHS {
+            self.give_up();
+            return;
+        }
+        self.seen.insert(path.clone());
+        self.paths.push(path);
+    }
+}
+
+/// Whether a path lies strictly beneath a directory the scanner prunes, so
+/// that no scan could ever read it. The pruned directory itself is not
+/// beneath one: its appearing or going changes its parent's listing. A path
+/// that cannot be expressed is not beneath one — kept, the safe direction.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+fn beneath_a_pruned_directory(root: &Path, ignores: &crate::scan::IgnoreSet, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    let mut names = Vec::new();
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return false;
+        };
+        let Some(name) = name.to_str() else {
+            return false;
+        };
+        names.push(name.to_owned());
+    }
+    let pruned = |names: &[String]| {
+        let mut region = false;
+        for depth in 1..names.len() {
+            match ignores.traversal(&names[..depth].join("/"), true, region) {
+                Some(inner) => region = inner,
+                None => return true,
+            }
+        }
+        false
+    };
+    // The scanner matches names as reported, or composed (NFC) on a volume
+    // that decomposes them. Which one this volume does is not known here,
+    // so a path is left out only if it is pruned under both: whichever the
+    // scanner uses, it would never read it.
+    let composed: Vec<String> = names.iter().map(|name| scan::recompose(name)).collect();
+    pruned(&names) && (composed == names || pruned(&composed))
 }
 
 /// Watches `start` and every directory beneath it that the scanner would
@@ -381,18 +437,18 @@ pub(crate) struct ChangeWatcher {
 }
 
 impl PendingChanges {
-    /// Records one backend event: its paths, or the fact that the record
-    /// can no longer be trusted.
-    fn record(&mut self, event: notify::Result<notify::Event>) {
+    /// Records one backend event: its paths that `keep` accepts, or the
+    /// fact that the record can no longer be trusted.
+    fn record(&mut self, event: notify::Result<notify::Event>, keep: impl Fn(&Path) -> bool) {
         match event {
             // A backend that lost events (a kernel queue overflow) flags the
             // fact rather than reporting the paths.
             Ok(event) if event.need_rescan() => self.give_up(),
             Ok(event) => {
-                if self.paths.len() + event.paths.len() > MAXIMUM_PENDING_PATHS {
-                    self.give_up();
-                } else if !self.incomplete {
-                    self.paths.extend(event.paths);
+                for path in event.paths {
+                    if keep(&path) {
+                        self.add(path);
+                    }
                 }
             }
             Err(_) => self.give_up(),
@@ -412,7 +468,7 @@ impl ChangeWatcher {
     #[cfg(not(target_os = "linux"))]
     pub(crate) fn new(
         root: &Path,
-        _ignores: crate::scan::IgnoreSet,
+        ignores: crate::scan::IgnoreSet,
         _ignore_mounts: bool,
         notify: impl Fn() + Send + 'static,
     ) -> Result<ChangeWatcher> {
@@ -424,6 +480,12 @@ impl ChangeWatcher {
         let hold_events = Arc::new(Mutex::new(()));
         #[cfg(test)]
         let holding = Arc::clone(&hold_events);
+        let base = root.to_path_buf();
+        // FSEvents reports everything under the root, ignored or not, so a
+        // build writing into an ignored `target/` would fill the record and
+        // force a full walk each cycle. What lies beneath a directory the
+        // scanner prunes can never be read by a scan; it is left out here,
+        // as the Linux watch leaves it unwatched.
         let mut watcher =
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 #[cfg(test)]
@@ -431,7 +493,9 @@ impl ChangeWatcher {
                 recorder
                     .lock()
                     .expect("the pending lock is never poisoned")
-                    .record(event);
+                    .record(event, |path| {
+                        !beneath_a_pruned_directory(&base, &ignores, path)
+                    });
                 notify();
             })
             .context("unable to create a filesystem watcher")?;
@@ -550,10 +614,12 @@ impl ChangeWatcher {
                             }
                         }
                     }
+                    // Nothing beneath an ignored directory is watched here,
+                    // so there is nothing to filter.
                     recorder
                         .lock()
                         .expect("the pending lock is never poisoned")
-                        .record(event);
+                        .record(event, |_| true);
                     notify();
                 }
             })
@@ -607,13 +673,7 @@ impl ChangeWatcher {
             .lock()
             .expect("the pending lock is never poisoned");
         for path in paths {
-            if pending.paths.len() >= MAXIMUM_PENDING_PATHS {
-                pending.give_up();
-                return;
-            }
-            if !pending.incomplete {
-                pending.paths.push(path);
-            }
+            pending.add(path);
         }
     }
 
@@ -1020,7 +1080,10 @@ impl LocalEndpoint {
         let need = state.needs.get_mut(state.next)?;
         state.next += 1;
         let digest = need.request.digest;
-        state.current = Some(self.begin_supply(need).unwrap_or_else(SupplySource::Failed));
+        state.current = Some(
+            self.begin_supply(need, &mut state.alternatives)
+                .unwrap_or_else(SupplySource::Failed),
+        );
         Some(TransferFrame::Begin { digest })
     }
 
@@ -1036,12 +1099,16 @@ impl LocalEndpoint {
     /// merely fails staging as it would have anyway.)
     ///
     /// The need's signature moves into the source, which is its last user.
-    fn begin_supply(&self, need: &mut StagingNeed) -> Result<SupplySource, String> {
+    fn begin_supply(
+        &self,
+        need: &mut StagingNeed,
+        alternatives: &mut Option<std::collections::HashMap<Digest, Vec<String>>>,
+    ) -> Result<SupplySource, String> {
         let digest = need.request.digest;
         let (path, file) = match self.open_scanned(&need.request.path, &digest) {
             Ok(file) => (need.request.path.clone(), file),
             Err(primary_error) => self
-                .digest_paths(&digest, &need.request.path)
+                .digest_paths(alternatives, &digest, &need.request.path)
                 .into_iter()
                 .find_map(|candidate| {
                     let file = self.open_scanned(&candidate, &digest).ok()?;
@@ -1120,34 +1187,56 @@ impl LocalEndpoint {
         })
     }
 
-    /// Collects every root-relative path (other than the excluded one) whose
-    /// scanned content records the given digest. Only consulted when a
-    /// supply attempt fails, so the walk stays off the hot path.
-    fn digest_paths(&self, digest: &Digest, exclude: &str) -> Vec<String> {
+    /// Every root-relative path (other than the excluded one) whose scanned
+    /// content records the given digest. Only consulted when a supply
+    /// attempt fails.
+    ///
+    /// The paths are indexed by digest on the stream's first failure and
+    /// answered from the index after that. Walking the snapshot per failure
+    /// was 48 ms at 500k entries, so a burst of failures — a tree being
+    /// deleted while it is supplied — cost minutes: 10,000 of them, eight.
+    /// The index lives only as long as the stream, so an endpoint does not
+    /// hold every path twice while idle.
+    fn digest_paths(
+        &self,
+        alternatives: &mut Option<std::collections::HashMap<Digest, Vec<String>>>,
+        digest: &Digest,
+        exclude: &str,
+    ) -> Vec<String> {
         fn collect(
             node: &Node,
             path: &str,
-            digest: &Digest,
-            exclude: &str,
-            paths: &mut Vec<String>,
+            index: &mut std::collections::HashMap<Digest, Vec<String>>,
         ) {
             match &node.content {
-                Content::File {
-                    digest: recorded, ..
-                } if recorded == digest && path != exclude => paths.push(path.to_owned()),
+                Content::File { digest, .. } => {
+                    index.entry(*digest).or_default().push(path.to_owned())
+                }
                 Content::Directory(children) => {
                     for child in children.iter() {
-                        collect(child, &path_join(path, &child.name), digest, exclude, paths);
+                        collect(child, &path_join(path, &child.name), index);
                     }
                 }
                 _ => {}
             }
         }
-        let mut paths = Vec::new();
-        if let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
-            collect(root, "", digest, exclude, &mut paths);
-        }
-        paths
+        let index = alternatives.get_or_insert_with(|| {
+            let mut index = std::collections::HashMap::new();
+            if let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
+                collect(root, "", &mut index);
+            }
+            index
+        });
+        index
+            .get(digest)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter(|path| *path != exclude)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Applies a batch of transfer frames to the receive state.
@@ -1519,6 +1608,7 @@ impl Endpoint for LocalEndpoint {
             needs,
             next: 0,
             current: None,
+            alternatives: None,
         });
         Ok(())
     }
@@ -1740,6 +1830,9 @@ impl Endpoint for LocalEndpoint {
         let mut transitioner = Transitioner {
             root: &self.root,
             staging_root: &self.staging_root,
+            staging_device: fs::metadata(&self.staging_root)
+                .ok()
+                .map(|metadata| metadata.dev()),
             // Validation runs against this endpoint's own lease: the exact
             // scan these transitions were reconciled from, not whatever the
             // observer has published since. That is what keeps "matches the
@@ -1919,6 +2012,9 @@ struct SupplyState {
     /// Where the rest of the current need's content comes from, once it
     /// has begun.
     current: Option<SupplySource>,
+    /// Scanned paths by digest, for a need whose own path cannot supply:
+    /// built on the stream's first such failure (`digest_paths`).
+    alternatives: Option<std::collections::HashMap<Digest, Vec<String>>>,
 }
 
 /// How many operations a delta's helper thread may run ahead of the
@@ -2166,6 +2262,10 @@ struct Transitioner<'a> {
     root: &'a Path,
     /// The staging directory holding content to be applied.
     staging_root: &'a Path,
+    /// The device the staging directory is on, when it could be read: a
+    /// staged file on another device than its target cannot be renamed
+    /// into place, and trying costs a read and a hash of it first.
+    staging_device: Option<u64>,
     /// The last scan's hierarchy, which all validation is performed against.
     scanned: Option<&'a Node>,
     /// The behavior of the root's filesystem, governing how on-disk names
@@ -2220,6 +2320,7 @@ impl<'a> Transitioner<'a> {
         Transitioner {
             root: self.root,
             staging_root: self.staging_root,
+            staging_device: self.staging_device,
             scanned: self.scanned,
             behavior: self.behavior,
             symlink_mode: self.symlink_mode,
@@ -2744,7 +2845,16 @@ impl<'a> Transitioner<'a> {
         // Anything doubtful falls through to the copy path, which digests
         // what it moves and turns a mismatch into a retransfer.
         let mut published: Option<FileMetadata> = None;
+        // Across devices a rename cannot work, and the check before it
+        // reads and hashes the whole staged file: straight to the copy,
+        // which hashes it once as it moves it. A device that cannot be
+        // read is tried as before.
+        let same_device = match (self.staging_device, fs::metadata(parent)) {
+            (Some(staging), Ok(metadata)) => metadata.dev() == staging,
+            _ => true,
+        };
         let moved = last_use
+            && same_device
             && input.set_permissions(Permissions::from_mode(mode)).is_ok()
             && match input.metadata() {
                 Ok(opened) if opened.file_type().is_file() => {
@@ -4021,7 +4131,14 @@ fn base_signature(file: File, progress: Option<Arc<crate::progress::SideProgress
         return Signature::default();
     };
     let block_size = rsync::optimal_block_size(metadata.len());
-    rsync::signature(crate::progress::Pulsing::new(file, progress), block_size).unwrap_or_default()
+    // Signed on several threads when large (`rsync::file_signature`), each
+    // pulsing the side's progress as it reads.
+    let pulse = || {
+        if let Some(progress) = &progress {
+            progress.pulse();
+        }
+    };
+    rsync::file_signature(&file, block_size, &pulse).unwrap_or_default()
 }
 
 /// Verifies that a path is a real directory, without following symbolic
@@ -6335,16 +6452,16 @@ mod watch_tests {
             &root.path().join("vendor"),
             Duration::from_secs(3)
         ));
+        // The record holds each path once, so it is emptied first: the
+        // path appearing again is the second edit being seen.
+        drop(watcher.take());
         std::fs::write(root.path().join("vendor/keep.txt"), b"k2").unwrap();
-        let wanted = root.path().join("vendor/keep.txt");
-        let end = Instant::now() + Duration::from_secs(3);
-        let mut seen = 0;
-        while Instant::now() < end && seen < 2 {
-            seen = watcher.recorded().iter().filter(|p| **p == wanted).count();
-            std::thread::sleep(Duration::from_millis(50));
-        }
         assert!(
-            seen >= 2,
+            recorded_within(
+                &watcher,
+                &root.path().join("vendor/keep.txt"),
+                Duration::from_secs(3)
+            ),
             "an edit to a re-included file under a directory that arrived later was not seen"
         );
         std::thread::sleep(Duration::from_millis(300));
@@ -6895,6 +7012,7 @@ mod apply_path_tests {
         let mut transitioner = Transitioner {
             root: &root,
             staging_root: &staging,
+            staging_device: None,
             scanned: None,
             behavior: FilesystemBehavior::default(),
             symlink_mode: SymlinkMode::default(),

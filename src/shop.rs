@@ -817,12 +817,31 @@ fn held(side: &autobahn::supervisor::ConflictSide) -> String {
 }
 
 /// The last few lines the supervisor wrote, newest last.
+///
+/// Read from the end of the file: the shop refreshes this every 1.2 s, and
+/// the log is capped only in megabytes — reading all of it for three lines
+/// read the whole cap every refresh.
 fn recent_log(lines: usize) -> Vec<String> {
+    use std::io::{Read, Seek, SeekFrom};
+    /// Enough for the few lines shown, however long a line gets.
+    const TAIL_BYTES: u64 = 64 * 1024;
     let Ok(path) = autobahn::service::log_path() else {
         return Vec::new();
     };
-    let Ok(text) = std::fs::read_to_string(&path) else {
+    let Ok(mut file) = std::fs::File::open(&path) else {
         return Vec::new();
+    };
+    let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    let start = length.saturating_sub(TAIL_BYTES);
+    let mut bytes = Vec::new();
+    if file.seek(SeekFrom::Start(start)).is_err() || file.read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    let text = String::from_utf8_lossy(&bytes);
+    // Started mid-file, the first line is a fragment: dropped.
+    let text = match start {
+        0 => &text[..],
+        _ => text.split_once('\n').map(|(_, rest)| rest).unwrap_or(""),
     };
     text.lines()
         .rev()

@@ -291,6 +291,13 @@ pub struct Session {
     /// Whether mount points inside the roots are left alone (the default)
     /// or synchronized as part of the tree.
     ignore_mounts: bool,
+    /// Each side's last scanned root and the problems found in it, so the
+    /// next cycle's search can skip what did not change
+    /// ([`Node::problems_since`]).
+    scan_problems: [Option<(Node, Vec<Problem>)>; 2],
+    /// The last reconciliation's inputs and where it produced anything,
+    /// for the next to skip what did not change.
+    reconcile_memo: Option<crate::tree::ReconcileMemo>,
     /// The mount points each side reported, remembered across cycles (and
     /// runs, in the state directory) so a mount that goes away is known to
     /// have been one: see [`Session::account_for_mounts`].
@@ -573,6 +580,8 @@ impl Session {
             unreadable,
             power_durability: false,
             ignore_mounts: true,
+            scan_problems: [None, None],
+            reconcile_memo: None,
         })
     }
 
@@ -995,11 +1004,20 @@ impl Session {
 
         self.at(CyclePoint::AfterScans);
 
-        if let Some(root) = &alpha_snapshot.root {
-            report.alpha_scan_problems = root.problems();
-        }
-        if let Some(root) = &beta_snapshot.root {
-            report.beta_scan_problems = root.problems();
+        for (side, root, problems) in [
+            (0, &alpha_snapshot.root, &mut report.alpha_scan_problems),
+            (1, &beta_snapshot.root, &mut report.beta_scan_problems),
+        ] {
+            let Some(root) = root else {
+                self.scan_problems[side] = None;
+                continue;
+            };
+            *problems = root.problems_since(
+                self.scan_problems[side]
+                    .as_ref()
+                    .map(|(root, problems)| (root, problems.as_slice())),
+            );
+            self.scan_problems[side] = Some((root.clone(), problems.clone()));
         }
 
         // On a side whose filesystem can't preserve executability bits, the
@@ -1052,12 +1070,21 @@ impl Session {
 
         // Reconcile.
         self.progress.enter(crate::progress::Phase::Reconciling);
-        let reconciliation = reconcile(
+        // Against the last reconciliation's inputs, so only what changed
+        // since is walked: see `ReconcileMemo`.
+        let reconciliation = crate::tree::reconcile_since(
             self.ancestor.as_ref(),
             alpha_root.as_ref(),
             beta_root.as_ref(),
             self.mode,
+            self.reconcile_memo.as_ref(),
         );
+        self.reconcile_memo = Some(crate::tree::ReconcileMemo::of(
+            self.ancestor.as_ref(),
+            alpha_root.as_ref(),
+            beta_root.as_ref(),
+            &reconciliation,
+        ));
         report.conflicts = reconciliation.conflicts;
 
         // Safety: refuse to propagate a root deletion.

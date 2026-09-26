@@ -15,7 +15,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::endpoint::{FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
-use crate::tree::{Change, Digest};
+use crate::tree::{Change, Digest, Snapshot};
 
 /// The protocol magic, checked during the handshake.
 pub const MAGIC: u32 = 0x4142_4E31; // "ABN1"
@@ -271,6 +271,39 @@ pub enum Response {
     /// so, only once it has run that long, and always before the scan's
     /// own answer. The controller counts it and keeps reading.
     ScanProgress { entries: u64, bytes: u64 },
+    /// A changed scan as the tree changes that turn the snapshot last sent
+    /// into this one, rather than as a byte delta between their encodings.
+    ScanChanges(Box<ScanChanges>),
+}
+
+/// A changed scan, as the changes from the snapshot the channel last sent.
+///
+/// A byte delta ships and rebuilds the whole encoding: at 420k files the
+/// agent encoded, signed and diffed 45 MB, and the controller patched and
+/// decoded 45 MB into a tree sharing nothing with the one before, for an
+/// edit of one file. The changes are what the scan actually found, and
+/// the controller applies them copy-on-write, so what did not change is
+/// neither sent nor rebuilt.
+///
+/// It is held to the same standard as a byte delta: the changes apply to
+/// the snapshot whose digest is `baseline`, and must produce the one whose
+/// digest is `digest`, and anything that disagrees is asked for in full.
+/// These are tree digests (`TreeDigester`), which cover every field of
+/// every node as an encoding's hash does, and cost the size of the change
+/// rather than of the tree.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScanChanges {
+    /// The generation of the root's observer the snapshot was taken at.
+    pub generation: u64,
+    /// The tree digest of the snapshot the changes apply to.
+    pub baseline: Digest,
+    /// The tree digest of the snapshot they must produce.
+    pub digest: Digest,
+    /// Everything about the snapshot but its hierarchy.
+    pub head: Snapshot,
+    /// The changes, parents before children, each carrying only its new
+    /// content.
+    pub changes: Vec<Change>,
 }
 
 /// A controller-to-agent frame on a multiplexed connection.
@@ -338,7 +371,7 @@ pub enum MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 15;
+pub const COMPATIBILITY_EPOCH: u32 = 16;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

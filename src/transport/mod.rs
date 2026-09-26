@@ -52,7 +52,7 @@ use crate::endpoint::local::{EndpointOptions, LocalEndpoint};
 use crate::endpoint::Endpoint;
 use crate::protocol::{self, Handshake, Initialize, Request, Response};
 use crate::scan::IgnoreSet;
-use crate::tree::Snapshot;
+use crate::tree::{path_join, Change, Node, Snapshot};
 
 /// The remote command used by [`Connection::ssh_argv`] when no override is
 /// provided.
@@ -775,6 +775,14 @@ fn serve_channel<W: Write + Send>(
     // because transitions fold their achieved results into the latter —
     // leaving the endpoint holding a tree the controller has never seen.
     let mut last_sent: Option<Snapshot> = None;
+    // The encoding of `last_sent`, and its digest, when a scan produced it:
+    // the next delta's baseline, kept rather than re-encoded. It changes
+    // only with `last_sent` — a transition's fold or a failed send clears
+    // it — so it always describes exactly that snapshot.
+    let mut last_sent_encoding: Option<Encoding> = None;
+    // Tree digests for changed scans, remembering what it hashed so a scan
+    // costs the size of its change.
+    let mut digester = crate::tree::TreeDigester::default();
     // The operations of a snapshot delta in flight, drained by ScanPull.
     let mut pending: std::collections::VecDeque<crate::rsync::Op> = Default::default();
     // Peering. The fence is the lease this channel was refused against:
@@ -804,6 +812,9 @@ fn serve_channel<W: Write + Send>(
         // previous model, and recording the new one here would make the
         // next rescan report "unchanged" against a tree it never received.
         let mut anchor = Anchor::Keep;
+        // The encoding of the snapshot an `Anchor::To` names, when a scan
+        // just produced it.
+        let mut anchor_encoding: Option<Encoding> = None;
         // The fence refuses every write. Reads still answer, so a fenced
         // controller can see the tree it is no longer allowed to change,
         // and its scans keep the session's model honest for when it is
@@ -904,28 +915,34 @@ fn serve_channel<W: Write + Send>(
                             generation: endpoint.generation().unwrap_or(0),
                         });
                     }
-                    let header = snapshot_delta(
+                    let (answer, encoding) = changed_scan(
                         &snapshot,
                         last_sent.as_ref(),
+                        last_sent_encoding.as_ref(),
+                        &mut digester,
                         &mut pending,
                         endpoint.generation().unwrap_or(0),
                     )?;
                     anchor = Anchor::To(Some(snapshot));
-                    Ok(Response::ScanDelta(header))
+                    anchor_encoding = encoding;
+                    Ok(answer)
                 }),
             Request::ScanVerified => {
                 { reporting_scan(output, channel, &counted, || endpoint.scan_verified()) }.and_then(
                     |snapshot| {
                         // Never elided: the entire point is a full re-read whose
                         // result the controller sees in full.
-                        let header = snapshot_delta(
+                        let (answer, encoding) = changed_scan(
                             &snapshot,
                             last_sent.as_ref(),
+                            last_sent_encoding.as_ref(),
+                            &mut digester,
                             &mut pending,
                             endpoint.generation().unwrap_or(0),
                         )?;
                         anchor = Anchor::To(Some(snapshot));
-                        Ok(Response::ScanDelta(header))
+                        anchor_encoding = encoding;
+                        Ok(answer)
                     },
                 )
             }
@@ -936,10 +953,11 @@ fn serve_channel<W: Write + Send>(
                 Some(snapshot) => snapshot_delta(
                     snapshot,
                     None,
+                    None,
                     &mut pending,
                     endpoint.generation().unwrap_or(0),
                 )
-                .map(Response::ScanDelta),
+                .map(|(header, _)| Response::ScanDelta(header)),
                 None => Err(anyhow!("a full scan was requested before any scan")),
             },
             Request::ScanPull => Ok(Response::ScanOps(next_scan_batch(&mut pending))),
@@ -994,14 +1012,26 @@ fn serve_channel<W: Write + Send>(
         // dispatcher is failing with it.
         let delivered = serve_send(output, channel, response);
         match (&delivered, anchor) {
-            (Ok(()), Anchor::To(snapshot)) => last_sent = snapshot,
+            (Ok(()), Anchor::To(snapshot)) => {
+                last_sent = snapshot;
+                last_sent_encoding = anchor_encoding;
+                // Digested now, while the controller works on the answer,
+                // rather than when the next scan is waited on. After a
+                // changed scan this finds everything already digested.
+                if let Some(sent) = &last_sent {
+                    digester.snapshot(sent);
+                }
+            }
             (Ok(()), Anchor::Keep) => {}
             // Forgetting everything costs one full resend and avoids having
             // to reason about which send failures leave the controller's
             // model intact and which do not. Claiming otherwise is the
             // expensive mistake: it would let a later scan report
             // "unchanged" against a tree that never arrived.
-            (Err(_), _) => last_sent = None,
+            (Err(_), _) => {
+                last_sent = None;
+                last_sent_encoding = None;
+            }
         }
         if let Err(error) = delivered {
             let fallback = Response::Error(format!("unable to send the response: {error:#}"));
@@ -1043,28 +1073,183 @@ fn anchor_after_transition(sent: Option<&Snapshot>, folded: Option<&Snapshot>) -
 /// snapshot this channel last sent, or `None` for a full stream), leaving
 /// the operations queued for `ScanPull` and returning the header.
 ///
-/// The baseline is never held as bytes between scans: it is re-encoded
-/// here when needed, which costs one serialization on a changed scan and
-/// no memory in between. The header carries the digest of the *new*
-/// encoding, so if the controller's re-encoding of its copy of the
-/// baseline were ever to differ from this one, the reassembly would fail
-/// to verify and be redone in full — determinism of the encoding is a
+/// The largest change set sent as changes; a bigger one goes as a byte
+/// delta, which bounds what one answer can carry (a new subtree is sent
+/// whole) and suits a rewrite of much of the tree better anyway.
+const SCAN_CHANGES_MAX_BYTES: u64 = 4 * 1024 * 1024;
+
+/// A snapshot's encoding and the digest of it.
+pub(crate) type Encoding = (Vec<u8>, crate::tree::Digest);
+
+/// Answers a changed scan: as the changes from the snapshot last sent when
+/// there is one and the changes are small, and as a byte delta otherwise.
+/// Returns the answer and, for a byte delta, the new snapshot's encoding,
+/// which the next byte delta can use as its base; after changes it is made
+/// only if a byte delta ever needs it.
+fn changed_scan(
+    snapshot: &Snapshot,
+    last_sent: Option<&Snapshot>,
+    last_sent_encoding: Option<&Encoding>,
+    digester: &mut crate::tree::TreeDigester,
+    pending: &mut std::collections::VecDeque<crate::rsync::Op>,
+    generation: u64,
+) -> Result<(Response, Option<Encoding>)> {
+    if let Some(sent) = last_sent {
+        let changes = exact_changes(sent.root.as_ref(), snapshot.root.as_ref());
+        let small =
+            bincode::serialized_size(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
+        if small {
+            // Both digests are tree digests, which hash only what changed
+            // since the digester last saw these trees: no encoding at all
+            // on this path. One is made only if a later scan needs a byte
+            // delta against this snapshot.
+            let answer = Response::ScanChanges(Box::new(protocol::ScanChanges {
+                generation,
+                baseline: digester.snapshot(sent),
+                digest: digester.snapshot(snapshot),
+                head: Snapshot {
+                    root: None,
+                    ..snapshot.clone()
+                },
+                changes,
+            }));
+            return Ok((answer, None));
+        }
+    }
+    let (header, encoding) =
+        snapshot_delta(snapshot, last_sent, last_sent_encoding, pending, generation)?;
+    Ok((Response::ScanDelta(header), Some(encoding)))
+}
+
+/// The changes that turn `base` into `target` *exactly* — scan metadata
+/// included, which `tree::diff` rightly ignores — so that applying them
+/// reproduces `target`'s encoding byte for byte. Each carries only its new
+/// content. Subtrees sharing storage are skipped without a walk, which is
+/// what makes this cost the size of the change: a scan adopts what it did
+/// not revisit.
+pub(crate) fn exact_changes(base: Option<&Node>, target: Option<&Node>) -> Vec<Change> {
+    fn same_leaf(a: &Node, b: &Node) -> bool {
+        use crate::tree::Content;
+        match (&a.content, &b.content) {
+            (
+                Content::File {
+                    digest: d1,
+                    executable: e1,
+                    metadata: m1,
+                },
+                Content::File {
+                    digest: d2,
+                    executable: e2,
+                    metadata: m2,
+                },
+            ) => d1 == d2 && e1 == e2 && m1 == m2,
+            (Content::Symlink { target: t1 }, Content::Symlink { target: t2 }) => t1 == t2,
+            (Content::Untracked, Content::Untracked) => true,
+            (Content::Problematic { message: m1 }, Content::Problematic { message: m2 }) => {
+                m1 == m2
+            }
+            _ => false,
+        }
+    }
+    fn walk(path: &str, base: Option<&Node>, target: Option<&Node>, changes: &mut Vec<Change>) {
+        use crate::tree::Content;
+        let replace = |changes: &mut Vec<Change>| {
+            changes.push(Change {
+                path: path.to_owned(),
+                old: None,
+                new: target.cloned(),
+            })
+        };
+        match (base, target) {
+            (None, None) => {}
+            (Some(b), Some(t)) => match (&b.content, &t.content) {
+                (Content::Directory(left), Content::Directory(right)) => {
+                    if std::sync::Arc::ptr_eq(left, right) {
+                        return;
+                    }
+                    let (mut i, mut j) = (0, 0);
+                    while i < left.len() || j < right.len() {
+                        let order = match (left.get(i), right.get(j)) {
+                            (Some(l), Some(r)) => l.name.cmp(&r.name),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => unreachable!(),
+                        };
+                        match order {
+                            std::cmp::Ordering::Less => {
+                                let child = &left[i];
+                                walk(&path_join(path, &child.name), Some(child), None, changes);
+                                i += 1;
+                            }
+                            std::cmp::Ordering::Greater => {
+                                let child = &right[j];
+                                walk(&path_join(path, &child.name), None, Some(child), changes);
+                                j += 1;
+                            }
+                            std::cmp::Ordering::Equal => {
+                                let child = &left[i];
+                                walk(
+                                    &path_join(path, &child.name),
+                                    Some(child),
+                                    Some(&right[j]),
+                                    changes,
+                                );
+                                i += 1;
+                                j += 1;
+                            }
+                        }
+                    }
+                }
+                (Content::Directory(_), _) | (_, Content::Directory(_)) => replace(changes),
+                _ => {
+                    if !same_leaf(b, t) {
+                        replace(changes);
+                    }
+                }
+            },
+            _ => replace(changes),
+        }
+    }
+    let mut changes = Vec::new();
+    walk("", base, target, &mut changes);
+    changes
+}
+
+/// The baseline's encoding is the one the scan that produced it made, when
+/// the caller kept it (`baseline_encoding`), and is re-encoded otherwise —
+/// after a transition's fold. The new snapshot's encoding comes back for
+/// the caller to keep for the next delta. Keeping them holds one encoding
+/// per channel (45 MB at 420k files) in exchange for not encoding and
+/// hashing the baseline again on every changed scan, which was 65 ms of the
+/// 224 ms the agent spent per edit at that size. The header carries the
+/// digest of the *new* encoding, so if the controller's copy of the
+/// baseline were ever to differ from this one, the reassembly would fail to
+/// verify and be redone in full — determinism of the encoding is a
 /// performance assumption, not a correctness one.
 fn snapshot_delta(
     snapshot: &Snapshot,
     baseline: Option<&Snapshot>,
+    baseline_encoding: Option<&Encoding>,
     pending: &mut std::collections::VecDeque<crate::rsync::Op>,
     generation: u64,
-) -> Result<protocol::ScanDelta> {
+) -> Result<(protocol::ScanDelta, Encoding)> {
     let target = encode_snapshot(snapshot)?;
     let digest = *blake3::hash(&target).as_bytes();
     let (baseline_digest, signature) = match baseline {
         Some(baseline) => {
-            let base = encode_snapshot(baseline)?;
+            let encoded;
+            let (base, base_digest) = match baseline_encoding {
+                Some((bytes, digest)) => (bytes.as_slice(), *digest),
+                None => {
+                    encoded = encode_snapshot(baseline)?;
+                    let digest = *blake3::hash(&encoded).as_bytes();
+                    (encoded.as_slice(), digest)
+                }
+            };
             let block_size = crate::rsync::optimal_block_size(base.len() as u64);
-            let signature = crate::rsync::signature(std::io::Cursor::new(&base), block_size)
+            let signature = crate::rsync::signature(std::io::Cursor::new(base), block_size)
                 .context("unable to sign the baseline snapshot")?;
-            (Some(*blake3::hash(&base).as_bytes()), signature)
+            (Some(base_digest), signature)
         }
         None => (None, crate::rsync::Signature::default()),
     };
@@ -1074,13 +1259,14 @@ fn snapshot_delta(
         Ok(())
     })
     .context("unable to compute the snapshot delta")?;
-    Ok(protocol::ScanDelta {
+    let header = protocol::ScanDelta {
         generation,
         baseline: baseline_digest,
         digest,
         length: target.len() as u64,
         block_size: signature.block_size,
-    })
+    };
+    Ok((header, (target, digest)))
 }
 
 /// The content bound on one batch of snapshot delta operations. Batches
@@ -1115,14 +1301,16 @@ fn serve_send<W: Write>(
     channel: u32,
     response: Response,
 ) -> Result<()> {
+    // Encoded before the lock is taken: see `encode_frame`.
+    let bytes = encode_frame(&protocol::MuxResponse::Response { channel, response })
+        .context("unable to send response")?;
     let mut output = output
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    send_frame(
-        &mut *output,
-        &protocol::MuxResponse::Response { channel, response },
-    )
-    .context("unable to send response")
+    output
+        .write_all(&bytes)
+        .and_then(|()| output.flush())
+        .context("unable to send response")
 }
 
 /// What a delivered response implies about the snapshot a channel has
@@ -1171,7 +1359,8 @@ fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Res
         max_entry_count: initialize.max_entry_count,
         default_owner: initialize.default_owner.clone(),
         default_group: initialize.default_group.clone(),
-        // A session that waits has its root watched; a single pass does not.
+        // A session that will wait for changes has its root watched; a
+        // single pass says so, and is spared the registration walk.
         one_shot: initialize.one_shot,
         ignore_mounts: initialize.ignore_mounts,
     };
@@ -1316,6 +1505,17 @@ const SCRATCH_RETENTION_LIMIT: usize = 16 * 1024 * 1024;
 struct FrameScratch {
     encoded: Vec<u8>,
     compressed: Vec<u8>,
+}
+
+/// Encodes a message into the exact bytes `send_frame` would write, so a
+/// caller sharing its writer can encode and compress *before* taking the
+/// writer's lock and hold it only to write. Held across the encoding, the
+/// lock made every small request to a host wait out the compression of
+/// whatever 8 MiB transfer batch was ahead of it.
+pub(crate) fn encode_frame<T: Serialize>(message: &T) -> Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    send_frame(&mut bytes, message)?;
+    Ok(bytes)
 }
 
 /// Encodes a message and writes it as length-prefixed frames (one, unless
@@ -2410,7 +2610,8 @@ pub(crate) mod tests {
 
         // Full stream: against nothing.
         let mut pending = std::collections::VecDeque::new();
-        let header = snapshot_delta(&first, None, &mut pending, 0).expect("delta");
+        let (header, first_encoding) =
+            snapshot_delta(&first, None, None, &mut pending, 0).expect("delta");
         assert!(header.baseline.is_none());
         let mut output = Vec::new();
         let mut base = std::io::Cursor::new(Vec::new());
@@ -2439,7 +2640,22 @@ pub(crate) mod tests {
         // stream must reproduce the second snapshot, and carry far less
         // data than the encoding — that is the point of the delta.
         let second = snapshot_with(2);
-        let header = snapshot_delta(&second, Some(&first), &mut pending, 0).expect("delta");
+        // Against the first's encoding as kept from its own delta, and as
+        // re-encoded: the same delta either way, which is what lets the
+        // agent keep it.
+        let (header, _) =
+            snapshot_delta(&second, Some(&first), None, &mut pending, 0).expect("delta");
+        let reencoded: Vec<crate::rsync::Op> = pending.iter().cloned().collect();
+        let (kept, _) = snapshot_delta(
+            &second,
+            Some(&first),
+            Some(&first_encoding),
+            &mut pending,
+            0,
+        )
+        .expect("delta");
+        assert_eq!(format!("{kept:?}"), format!("{header:?}"));
+        assert_eq!(format!("{reencoded:?}"), format!("{:?}", pending));
         assert_eq!(header.baseline, Some(*blake3::hash(&encoded).as_bytes()));
         let signature =
             crate::rsync::signature(std::io::Cursor::new(&encoded), header.block_size).unwrap();
@@ -2611,5 +2827,108 @@ pub(crate) mod tests {
             assert!(entries >= last && entries > 0 && bytes == entries * 10);
             last = entries;
         }
+    }
+
+    #[test]
+    fn exact_changes_reproduce_the_target_encoding() {
+        use crate::tree::{apply, Content, FileMetadata, Node};
+        use std::sync::Arc;
+        let file = |name: &str, byte: u8, mtime: i64| Node {
+            name: name.into(),
+            content: Content::File {
+                digest: [byte; 32],
+                executable: false,
+                metadata: FileMetadata {
+                    mtime_seconds: mtime,
+                    size: u64::from(byte),
+                    ..FileMetadata::default()
+                },
+            },
+        };
+        let shared = Node::directory(
+            "shared",
+            (0..50).map(|i| file(&format!("s{i:02}"), 1, 5)).collect(),
+        );
+        let base = Node::directory(
+            "",
+            vec![
+                Node::directory(
+                    "d",
+                    vec![file("a", 1, 10), file("b", 2, 10), file("c", 3, 10)],
+                ),
+                file("becomes-dir", 4, 10),
+                Node::directory("becomes-file", vec![file("x", 5, 10)]),
+                shared.clone(),
+                Node {
+                    name: "link".into(),
+                    content: Content::Symlink {
+                        target: "d/a".into(),
+                    },
+                },
+            ],
+        );
+        let target = Node::directory(
+            "",
+            vec![
+                // a: metadata only (a touch); b: content; c: removed; e: added.
+                Node::directory(
+                    "d",
+                    vec![file("a", 1, 11), file("b", 9, 10), file("e", 6, 10)],
+                ),
+                Node::directory("becomes-dir", vec![file("y", 7, 10)]),
+                file("becomes-file", 8, 10),
+                shared,
+                Node {
+                    name: "link".into(),
+                    content: Content::Symlink {
+                        target: "d/e".into(),
+                    },
+                },
+                Node {
+                    name: "skipped".into(),
+                    content: Content::Untracked,
+                },
+            ],
+        );
+        let changes = exact_changes(Some(&base), Some(&target));
+        // The shared subtree is not walked, and nothing unchanged is sent.
+        assert!(
+            changes
+                .iter()
+                .all(|change| !change.path.starts_with("shared")),
+            "{changes:?}"
+        );
+        assert!(changes.iter().all(|change| change.old.is_none()));
+        let paths: Vec<&str> = changes.iter().map(|change| change.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "becomes-dir",
+                "becomes-file",
+                "d/a",
+                "d/b",
+                "d/c",
+                "d/e",
+                "link",
+                "skipped"
+            ]
+        );
+        let built = apply(Some(&base), &changes).unwrap();
+        let snapshot = |root: Option<Node>| Snapshot {
+            root,
+            files: 9,
+            ..Snapshot::default()
+        };
+        assert_eq!(
+            encode_snapshot(&snapshot(built)).unwrap(),
+            encode_snapshot(&snapshot(Some(target.clone()))).unwrap(),
+            "applying the changes must reproduce the encoding exactly"
+        );
+        // Identical storage: no changes at all.
+        assert!(exact_changes(Some(&target), Some(&target)).is_empty());
+        // From nothing, and to nothing: the root itself.
+        assert_eq!(exact_changes(None, Some(&target)).len(), 1);
+        assert_eq!(exact_changes(Some(&target), None).len(), 1);
+        let _ = Arc::<()>::default();
     }
 }

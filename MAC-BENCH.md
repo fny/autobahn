@@ -46,6 +46,8 @@ Write results under each section's **Record** as you go, with the commit you tes
 
 A running session walks both trees in full every 120 seconds (`FULL_SCAN_INTERVAL`, `src/endpoint/observer.rs`), because events can be lost. Since the walk went parallel, each one is a short burst on up to eight threads. On a build box nobody cares; on a laptop on battery it may matter. It isn't configurable, so this compares two builds.
 
+For scale, measured on Linux (c6i.8xlarge, 2026-09-24): a 420,000-file session with both sides on one machine used 12 CPU-seconds in 240 idle seconds, four full walks, so about 3 CPU-seconds per walk of 420k files, or 2.5% of one core on average. A 160,000-file tree should cost roughly 1.2 CPU-seconds a walk, 1% of a core per side.
+
 1. A tree the size of a real one: `python3 bench/corpus.py code ~/bench-160k/a --scale 4` (160,000 files), then `cp -R ~/bench-160k/a ~/bench-160k/b`.
 2. A config with just that group, `two-way-conflict`, both sides local.
 3. Unplug the charger. Leave the machine idle: no edits, lid open, display may sleep.
@@ -519,6 +521,16 @@ LSMinimumSystemVersion     => 11.0
 ```
 
 Both match `Cargo.toml`'s `version = "0.4.0"`. `spctl -a -vv` says `rejected — source=Unnotarized Developer ID`, which is correct for a locally built app: `build.sh` signs with the Developer ID but does not notarise. Step 2 waits for CI-05.
+
+## 8. Does a build in an ignored directory force full walks?
+
+On Linux the watcher never watches an ignored directory, and the kernel merges repeated events for one file, so neither a build in an ignored `target/` nor a file written thousands of times fills the change record (measured: no full walk). FSEvents watches the whole tree and reports what the ignore set would have kept out, so on macOS a `cargo build` inside an ignored `target/` of a synced tree may fill the 8,192-path record and make the next cycle walk everything (TODO-SPEED, "The change record fills with noise").
+
+1. A synced Rust project with `target` in its ignores, and `autobahn watch --debug`.
+2. `cargo build` (a clean one, so it writes thousands of files), and count cycles in the log whose `cycle finished in` is as long as a full walk of the tree.
+3. The fix is built (`290ad1e`, branch `speed-review`): each FSEvents path strictly beneath a directory the scanner prunes is left out, and a path is recorded once however often it is reported. Run the build with and without it (the commit before it is the baseline) to confirm the full walks go. It compiles for macOS and its logic is tested on Linux, but it has never run against real FSEvents.
+
+**Record:** full walks during the build, with and without the fix, and the tree's size.
 
 ## Notes from the run of 2026-09-24
 

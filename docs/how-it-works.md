@@ -34,8 +34,12 @@ The payoff is not one optimization. It is the same optimization appearing at fou
 | Which subtrees differ? | Skip any that share storage | `src/tree/diff.rs` |
 | Must the scan cache be rewritten? | Not if it already describes this tree | `src/endpoint/local.rs` |
 | Must the agent send a tree over the wire? | No — send one byte | `src/transport/mod.rs` |
+| Must a changed tree cross whole? | No — only its changes, checked by a digest that rehashes only unshared subtrees | `src/transport/mod.rs`, `TreeDigester` in `src/tree/mod.rs` |
+| Must reconcile revisit a subtree? | Not if all three sides share it with the last cycle and nothing came of it | `reconcile_since` in `src/tree/reconcile.rs` |
 
 The last row matters most in practice. An idle remote endpoint answers a scan request with a single enum tag. No serialization, no transfer, no decode. A heartbeat over a half-million-file tree costs one round trip — and while the agent's watcher stands, not even that. Every answer from the agent carries its change generation, a wait for changes counts from the generation the controller last saw, and a cycle that follows a quiet wait reuses the last snapshot rather than asking again (`src/endpoint/remote.rs`). A watcher in backoff says so and is never skipped, and a snapshot older than a minute is not reused, so the periodic full walk still runs.
+
+A tree that did change crosses as its exact changes against the last one sent. The controller applies them to its copy, sharing everything they do not touch. Both sides then compare a Merkle-style digest of the whole snapshot, which covers every field of every node. It is cached per shared subtree, so an edit rehashes only the directories above it. Anything that disagrees is asked for in full. At 420,000 files over SSH, an edit made on the remote side went from 633 ms to 19 ms this way.
 
 This idea has a sharp edge, and the code states it as a contract (`src/tree/mod.rs`). Shared storage tells you how a tree was *built*, not what it *holds*. A tree read from disk shares nothing with an identical tree in memory. So two equal trees can answer `false`. **Callers can use the answer to prove agreement. They must never use it to prove difference.** Every use above is safe in that direction only.
 
@@ -48,7 +52,7 @@ That makes a scan cost the size of the change instead of the size of the tree. I
 So the design bounds the damage rather than assuming the events are complete:
 
 - If the kernel queue overflows, or the record grows past 8192 paths, the watcher discards its paths and demands a full scan (`src/endpoint/local.rs`).
-- A full scan runs at least every 120 seconds regardless (`FULL_SCAN_INTERVAL`, `src/endpoint/observer.rs`). This is the ceiling on how long a missed event can persist.
+- A full scan runs at least every 120 seconds regardless (`FULL_WALK_INTERVAL`, `src/power.rs`). This is the ceiling on how long a missed event can persist. With `power_saver_experimental`, it is 10 minutes while the machine is on battery.
 - A transition problem clears the record (`src/endpoint/local.rs`). The filesystem disagreed with the tree, so the tree is proven stale.
 - A root that cannot be watched at all still works. It falls back to the interval.
 

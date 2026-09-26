@@ -1025,6 +1025,12 @@ fn send_within(
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => {
             return Err(anyhow::Error::new(error).context(unresponsive()));
         }
+        // Refused, which on some kernels is what a full accept queue does
+        // rather than making the client wait. The supervisor's lock says
+        // which it was: still held means it is there and wedged.
+        Err(error) if supervisor_lock_held(state_root) => {
+            return Err(anyhow::Error::new(error).context(unresponsive()));
+        }
         Err(error) => {
             return Err(anyhow::Error::new(error).context(format!(
                 "unable to reach a running supervisor at {} (is `autobahn watch` running?)",
@@ -1065,12 +1071,37 @@ pub fn probe(state_root: &Path) -> Probe {
     probe_within(state_root, CLIENT_TIMEOUT)
 }
 
+/// Whether a supervisor holds this state root's lock — the one it takes
+/// for as long as it runs. Asked only when a connection was refused, to
+/// tell a wedged supervisor from an absent one. Acquiring it here would
+/// prove it free, so the lock taken for the test is released immediately.
+fn supervisor_lock_held(state_root: &Path) -> bool {
+    let directory = state_root.join("supervisor");
+    if !directory.join("lock").exists() {
+        return false;
+    }
+    match crate::session::SessionLock::acquire(directory) {
+        // Free: nothing is running here. (Dropped at once, which releases.)
+        Ok(_lock) => false,
+        Err(error) => error.downcast_ref::<crate::session::SessionLockHeld>().is_some(),
+    }
+}
+
 /// [`probe`], with the client timeout given.
 fn probe_within(state_root: &Path, timeout: Duration) -> Probe {
     let stream = match connect_client(&socket_path(state_root), timeout) {
         Ok(stream) => stream,
         Err(error) if error.kind() == std::io::ErrorKind::TimedOut => return Probe::Unresponsive,
-        Err(_) => return Probe::Absent,
+        // A refusal is not proof of absence. Kernels differ on what a full
+        // accept queue does to a connecting client: Linux makes it wait,
+        // which times out above, while macOS refuses it at once — so a
+        // wedged supervisor would read as no supervisor at all. The
+        // supervisor's own lock settles it: still held means it is there
+        // and not answering.
+        Err(_) => match supervisor_lock_held(state_root) {
+            true => return Probe::Unresponsive,
+            false => return Probe::Absent,
+        },
     };
     // One served by another user is not this user's supervisor.
     if !matches!(peer_is_same_user(&stream), Ok(true)) {
@@ -1563,37 +1594,60 @@ mod tests {
         assert_eq!(inventory.notice, None);
     }
 
+    /// How many connections the fixture will queue before it decides the
+    /// platform will not refuse one. Above every backlog seen so far
+    /// (Linux 1, macOS 128) and far below the open-file limit on both, so
+    /// a refusal here is the queue filling and not descriptors running
+    /// out.
+    const QUEUE_PROBE_LIMIT: usize = 200;
+
     /// A control socket whose supervisor is wedged: bound and listening,
     /// never accepting. With `backlog_full`, its queue of pending
     /// connections is full too, so a blocking connect would never return.
-    fn wedged_socket(state_root: &Path, backlog_full: bool) -> UnixListener {
+    fn wedged_socket(
+        state_root: &Path,
+        backlog_full: bool,
+    ) -> (UnixListener, crate::session::SessionLock) {
+        // A real supervisor holds this for as long as it runs, and the
+        // probe reads it to tell "wedged" from "gone".
+        let held = crate::session::SessionLock::acquire(state_root.join("supervisor"))
+            .expect("the supervisor lock is free in a fresh state root");
         let listener = UnixListener::bind(socket_path(state_root)).expect("binds");
         if backlog_full {
             use std::os::unix::io::AsRawFd;
-            // Listening again sets the backlog; the smallest fills fast.
+            // Listening again sets the backlog. A kernel reads the number
+            // as a hint, not an instruction: Linux queues one connection
+            // for `0` and refuses the second, while macOS keeps its own
+            // minimum and queues 128 (measured). So the fixture fills the
+            // queue by connecting until one is refused, rather than
+            // assuming how deep it is.
             assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 0) }, 0);
             let mut pending = Vec::new();
-            let full =
-                (0..64).any(
-                    |_| match connect_client(&socket_path(state_root), Duration::ZERO) {
-                        Ok(stream) => {
-                            pending.push(stream);
-                            false
-                        }
-                        Err(_) => true,
-                    },
-                );
-            assert!(full, "the backlog never filled");
+            let mut full = false;
+            for _ in 0..QUEUE_PROBE_LIMIT {
+                match connect_client(&socket_path(state_root), Duration::ZERO) {
+                    Ok(stream) => pending.push(stream),
+                    Err(_) => {
+                        full = true;
+                        break;
+                    }
+                }
+            }
+            assert!(
+                full,
+                "the backlog never filled: {} connections were queued and none refused",
+                pending.len()
+            );
             std::mem::forget(pending);
         }
-        listener
+        (listener, held)
     }
 
     #[test]
     fn a_wedged_supervisor_is_unresponsive_within_the_client_timeout() {
         for backlog_full in [false, true] {
             let root = tempfile::tempdir().expect("a temporary directory");
-            let _listener = wedged_socket(root.path(), backlog_full);
+            let _wedged = wedged_socket(root.path(), backlog_full);
             let started = std::time::Instant::now();
             let probe = probe_within(root.path(), Duration::from_millis(300));
             assert!(
@@ -1625,7 +1679,7 @@ mod tests {
     #[test]
     fn a_status_report_against_a_wedged_supervisor_returns() {
         let root = tempfile::tempdir().expect("a temporary directory");
-        let _listener = wedged_socket(root.path(), true);
+        let _wedged = wedged_socket(root.path(), true);
         let started = std::time::Instant::now();
         let report = crate::supervisor::status_report(&[], root.path());
         assert!(started.elapsed() < CLIENT_TIMEOUT + Duration::from_secs(5));

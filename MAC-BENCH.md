@@ -57,7 +57,30 @@ A running session walks both trees in full every 120 seconds (`FULL_SCAN_INTERVA
 
 **Record:** both averages, the macOS version, and the machine.
 
-**Not run.** It needs the charger out for two 30-minute idle windows and `sudo powermetrics`; the machine was on AC at 25%. Left for a person.
+**Result — `d7c2e21`, macOS 26.5.1, Apple M4, on battery, 2026-09-24.** The 120-second window ran; the 600-second one was skipped by decision.
+
+30 one-minute samples, `01:26:45` onward, 160,000-file corpus, both roots local, nothing else of ours on the machine.
+
+| | CPU ms/s | Energy impact |
+|---|---|---|
+| mean | 55.16 | 76.51 |
+| median | 51.93 | 64.72 |
+| max | 123.53 | 163.00 |
+
+The mean hides the shape, and the shape is the finding. The samples alternate, because a 120-second walk lands in every other 60-second window:
+
+- **15 walking samples:** mean energy **152.9**, about 110 CPU ms/s held for the whole minute — roughly 11% of one core.
+- **15 idle samples:** mean energy **0.10**, about 1 CPU ms/s.
+
+So a walk costs about 6.6 seconds of CPU, and there is one every two minutes: **about 3.3 minutes of CPU per hour** on a machine where nothing is changing. For scale, in the same samples `sentineld` averaged 504 and `WindowServer` 116 — while it walks, autobahn out-consumes the window server.
+
+**The decision this section asked for:** the walk *is* the idle cost, and it is large enough to see. Everything else autobahn does on battery is free.
+
+**The 600-second window was not run**, by decision rather than obstacle. The cost of one walk does not change, only how often it happens, so five times fewer walks is about five times less: roughly 15 energy and 11 CPU ms/s on average, or 40 seconds of CPU per hour. Running it would only confirm that a colder page cache does not make each walk dearer.
+
+**Two limits on the number.** Both roots were on this Mac, so it did both sides' scanning; a laptop syncing to a remote host walks one tree, not two. And the walk is now parallel, so it is a short loud burst rather than a long quiet one — better for latency, worse for a battery that would rather nothing happened.
+
+**Filed as** [`MAC-7`](REVIEWS/fixes/MAC-7-battery-walk-interval.md).
 
 
 ## 3. The Linux wins, measured on macOS

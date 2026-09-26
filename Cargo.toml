@@ -23,7 +23,7 @@ unicode-normalization = "0.1"
 
 # The menu bar app, behind a feature so the agent build stays lean.
 tray-icon = { version = "0.24", optional = true }
-muda = { version = "0.19", optional = true }
+muda = { version = "0.20", optional = true }
 winit = { version = "0.30", optional = true }
 notify-rust = { version = "4", optional = true }
 toml_edit = "0.25.15"

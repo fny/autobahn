@@ -1,0 +1,6 @@
+# Lane 2br notes
+- 78f2dc9 (HYG-3) -> conflicts in transport/mod.rs and endpoint/local.rs. transport: kept integration's ChannelCounters/PROGRESS_INTERVAL/report_progress/moved_counters/PANICKING_SESSIONS, dropped only the stray serve_channel doc above SCAN_REPORT_INTERVAL (2b's move puts it on serve_channel); serve_channel now takes `counted` as a parameter, so 2b's reordered `let counted` was dropped and integration's comment about the parameter kept. local.rs: 2b's reworded base_signature doc on integration's new signature (with `progress`).
+- 147d37a, c52c0bc, 469bebd: applied cleanly.
+- f049953: conflict in docs/development.md spec paragraph: combined 2b's tla2tools pin + `--locked` with integration's (1ff692a) `-- --include-ignored` and its parenthetical; matches .github/workflows/ci.yml.
+- Follow-up ea6d8d1: I9 cited `a_scan_answered_whole_with_an_invalid_hierarchy_is_refused`, renamed by 2a (1ac12a3) to `a_scan_with_an_invalid_hierarchy_is_refused`. Separate commit (can't amend a non-tip commit without rebasing).
+- Checked every backticked identifier the 5 docs commits add: all exist in the current tree. apps/macos/build.sh now has --locked (fb43787), so 2b's "still open" note on it is resolved.

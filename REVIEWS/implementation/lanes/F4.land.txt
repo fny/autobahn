@@ -1,0 +1,49 @@
+== F4 done file
+# F4 done
+
+| Ticket | Status | Commit | Summary |
+|---|---|---|---|
+| BENCH-1 | done | 3ff653a | The observer listens on 127.0.0.1 unless given `--listen`, needs `--root`, writes floor probes only beneath it (plain relative paths, no symlinked directories, fresh temporaries), and caps request size, staged probes and connections; `floor` drops `--dest-root`. |
+| BENCH-2 | done | 560d7ca | `ab.sh --corpus DIR` only reads DIR (each leg copies it under `$WORK`); every recursive delete goes through a `scrub` guard confined to `$WORK`; documented in `--help` and README. |
+| BENCH-3 | done | 2e1c0b3 | orchestrate.py and verify/launch.py run commands as argv lists only (`run()` refuses strings); remote shell strings shlex-quote every value; public keys, IPs and the commit id read back from instances are checked against their shape; test in `bench/test_orchestrate.py`. |
+| BENCH-4 | done | bae6eab | Took the ticket's "limit the flag" option: `--remote` must see this machine's filesystem (random-token read-back over ssh) or is refused; a leg fails at once, exit nonzero, if the subject or observer exits, the agents fail, or the cold sync misses 600s. |
+| BENCH-5 | done | 4103d29 | One `excluded()` rule for latency, cold sync, resources and bursts, with excluded runs listed by reason; the six contaminated bench-1789947877 jobs are found via plan.json group widths; remote CPU is summed per host (`remote_by_host`) with carry-forward merging; cycle_cost labels its TOTAL and adds a `no anc` column. Tests in `bench/test_aggregate.py`. |
+| BENCH-6 | done | 69c1f9d | The eleven scripts use `sync --config --state-root` / `watch`, run under `set -euo pipefail`, check that the binary runs and that background subjects started, and fail fast; scripts/mi runs under a scratch HOME and uses `issues` / `resolve --yes`. |
+| LOCAL-07 | done | de2d34f | ab.sh and git-sync.sh work in `mktemp -d` directories removed on exit, under `set -euo pipefail`; ab.sh's corpus moved to an owner-checked private cache (`$AB_CACHE`), and its reports to a kept private directory. |
+
+## Last full-suite run (`isolated lane-F4 cargo test --release --no-fail-fast`)
+
+    test result: ok. 422 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 60.42s
+    test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+    test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.86s
+    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.86s
+    test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.98s
+    test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.59s
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+Root `cargo fmt --check` and `cargo clippy --release --all-targets -- -D warnings` are clean.
+Bench harness (`bench/harness`): clippy clean, 7/7 tests pass. `bench/smoke.sh` passes (run with `env -u CARGO_TARGET_DIR`, since it looks for `harness/target/release/benchmark`).
+`python3 bench/test_orchestrate.py` and `python3 bench/test_aggregate.py` pass.
+
+## For the integrator
+
+- **Outside `bench/` and `scripts/mi`:** commit 4103d29 edits `examples/cycle_cost.rs` (a doc comment, output lines and an extra column; no lane owns the file).
+- **Interface changes inside bench:** `benchmark observer <port> --root <dir> [--listen <addr>]` (root is required); `benchmark floor` no longer accepts `--dest-root`. Every caller in the repository is updated. Rebuild the harness binary before any fleet run.
+- **Not run against AWS** (no credentials): the orchestrate.py and launch.py rewrite (BENCH-3), plus the EC2-only verify scripts (bottleneck, coldfan, gates, latency, soak). differential.sh (needs mutagen) was checked statically only: shellcheck, `bash -n`, the broken-binary preflight. Do one bake/run smoke before trusting a fleet run.
+- **Headline numbers shift for bench-1789947877:** its six width-contaminated jobs now leave the latency and resource tables too, not just cold sync, because they are flagged for the first time.
+- **Harness formatting:** the harness was not rustfmt-clean at wave-0 (agents.rs, partitions.rs, sampler.rs, walk.rs). I formatted only code I wrote, so `cargo fmt --check` inside `bench/harness` still reports those pre-existing diffs.
+- **Pre-existing, not investigated:** `examples/cycle_cost` panics intermittently on small trees ("one edit should yield one transition"), with or without my change.
+- **Still failing shellcheck:** `bench/verify/fanout.sh` and `bench/alpha-bench.sh`; neither is in my tickets.
+- **Local verify scripts** (crash, exhaustion, fanout-correctness) no longer `pkill -x autobahn`, which on this shared machine would kill other lanes' processes. They signal their own setsid process group instead.
+landed: 7 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 513 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 61.00s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.85s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.95s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.84s
+test result: ok. 63 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.86s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

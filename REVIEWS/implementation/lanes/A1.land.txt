@@ -1,0 +1,35 @@
+== A1 done file
+# Lane A1: done
+
+## Tickets
+- T1-1 done c5fc052: every supply goes through `open_scanned`, which checks validate_path, snapshot membership (new `snapshot_file`), digest equality, O_NOFOLLOW|O_NONBLOCK, and inode/size, and reads no further than the scanned size; there are 8 tests, one of them through a real agent.
+- T1-5 done f6e2302: stage_begin refuses the whole batch for an invalid, empty or reserved-prefix path before touching anything, and bases for both signing and patching open through a new `open_base`, which lstat's each parent and opens with O_NOFOLLOW|O_NONBLOCK plus an fstat.
+- LOCAL-03 partial (my part is done) 85b7ee5: the `open_receive_file` and `stage_locally` temporaries are created through `fsutil::private_file` by a new `staging_temporary`, which is 0600, uses O_EXCL|O_NOFOLLOW and retries on a taken name, and their errors that reach the peer name no staging path. `temporary_name`'s random component and the publish-path temporary are lane A2's.
+- F-H7 done 1150671: supply now streams from a `SupplySource`: whole-file chunks read as they are pulled, or deltify on a helper thread over a bounded sync_channel. Alternates are tried only before Begin. A truncation mid-stream ends the file with an error. A 256 MiB file now peaks at about 8 MB of heap, down from 268 MB.
+- F-M-STAGE partial (only M-31, as assigned) 7b7005d: a patch failure discards and sinks that one file, and the stream goes on.
+
+## Last full-suite run (`isolated lane-A1 cargo test --release --no-fail-fast`, at 7b7005d's tree)
+test result: ok. 438 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.95s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 23.96s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.67s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.07s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.58s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.62s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo fmt --check and clippy -D warnings: clean.
+
+## For the integrator
+- Merging with A2:
+  - Both lanes add a test module at the end of local.rs: mine is `mod supply_receive_tests`, A2's is `apply_path_tests`. Keep both.
+  - `open_base` duplicates the parent check in A2's `resolve_confined`. It can be swapped for `resolve_confined` plus the O_NOFOLLOW open.
+  - stage_begin's reserved-prefix check duplicates T1-4's `validate_name` change. It is harmless and can be dropped once T1-4 lands.
+  - `copy_verifying` is no longer called by `stage_locally`. Only A2's publish path uses it now.
+- `a_planted_symlink_at_a_temporary_name_is_not_followed` predicts temporary names from pid and `TEMPORARY_COUNTER`. Once A2 randomizes `temporary_name`, it still passes, but only vacuously. Rework it or drop the plant half.
+- New test binary `tests/supply_memory.rs` installs a counting `#[global_allocator]` and must stay single-test. It uses sparse files, so it costs no disk.
+- `base_signature` now takes an opened `File`, not a path.
+- T1-1's INVARIANTS wording is left to the wave-2 docs lane (2b).
+- No edits were made outside local.rs, except the new tests/supply_memory.rs.
+CONFLICT at c5fc05292cfd5bae73521f4e753189e3c3d4d13d (supply: a peer can name only content this side's own scan recorded inside its root)
+src/endpoint/local.rs
+RESULT conflict

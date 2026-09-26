@@ -1,0 +1,29 @@
+# Lane 2br — done (replay of lane-2b onto integration)
+
+- HYG-3 — done — 64e5c0b (from 78f2dc9) + ea6d8d1 — conflicts in src/transport/mod.rs and src/endpoint/local.rs resolved: kept integration's ChannelCounters/PROGRESS_INTERVAL/report_progress/moved_counters/PANICKING_SESSIONS and serve_channel's new `counted` parameter (so 2b's reordered `let counted` was dropped), moved only the stray serve_channel doc onto serve_channel; 2b's base_signature doc wording applied to integration's new `progress` signature. ea6d8d1 fixes I9's citation of a test lane 2a renamed (a_scan_with_an_invalid_hierarchy_is_refused).
+- OPS-5 — done — 189fadb (from 147d37a) — clean.
+- T1 docs — done — 16d208c (from c52c0bc) — clean.
+- Wave-1 docs follow-ups — done — 35100d7 (from f049953) — conflict in docs/development.md's spec paragraph: combined 2b's tla2tools pin and `--locked` with integration's `-- --include-ignored` and its "listed as ignored" parenthetical (matches ci.yml).
+- Review follow-up — done — b206c67 (from 469bebd) — clean.
+
+## Last full suite (`isolated lane-2br cargo test --release --no-fail-fast`, at ea6d8d1)
+test result: ok. 607 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 81.14s
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.50s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.93s
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.98s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.87s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.37s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+cargo fmt --check, clippy --release --all-targets -D warnings: clean. cargo doc --no-deps --document-private-items: no warnings.
+(The two ignored tests are the TLC spec replays, ignored without TLC per 1ff692a.)
+
+## For the integrator
+- Every backticked identifier the replayed docs add was checked against the current tree; all exist.
+- 2b's open item "apps/macos/build.sh lacks --locked" is resolved on integration (fb43787). Still open from 2b: stray `#[allow(clippy::too_many_arguments)]` on `node_at` in main.rs; `Signature::validate_for_base` has no production caller (documented in I9).
+- One user-visible string changed (from 2b): enable/disable's closing line and `restart`'s help.

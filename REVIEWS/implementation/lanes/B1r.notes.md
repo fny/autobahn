@@ -1,0 +1,2 @@
+- a100592 -> 7ea1b12: one conflict in LocalEndpoint::transition (integration's `swept` line vs B1's `lease_generation`); kept both. endpoint:: tests 110 ok.
+- 3125675 -> b84f154: one conflict in Scanner::probe_entry (integration's F-H25 state-root check vs B1's IgnoreSet::traversal). Kept the state-root check first, then B1's traversal call. Note: the watcher (observer.rs) does not skip state roots; that was true before too, it only costs spurious events.

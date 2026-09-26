@@ -1,0 +1,37 @@
+== D2 done file
+# Lane D2 — done
+
+- F-H2 — done — 5753818 — `config::check_session_topology` (component-aware containment, M-39) is called by `plans()` and by manual `run_sync` before any endpoint opens; the cross-session check uses the same comparison.
+- F-H25 — partial (planning refusal only, as assigned) — 9507e69 — `config::OwnState` refuses a local root that is or holds the state root, the default state root, or the config file's real directory, unless ignored; called in run_sync, run_sync_config, check_startable, run_watch (startup + each applied edit). Scanner/agent backstop is lane B2's.
+- F-H12 — partial (as scoped) — af902be — the cross-session overlap check compares plan indices; `alpha_is_written` is an exhaustive match; `display()` shows `group@host:path` when betas of one group share a host. SessionKey threading and progress key (D3) left as follow-up.
+- OPS-6 — done — e0b97a6 — credential-directory warning once per local root at the start of `sync` (both forms) and `watch`; new group key `acknowledge_secrets`.
+
+## Last full-suite run (`isolated lane-D2 cargo test --release --no-fail-fast`)
+- lib: test result: ok. 430 passed; 0 failed
+- main: test result: ok. 33 passed; 0 failed
+- e2e: test result: FAILED. 32 passed; 1 failed — the failure is the known flake `a_standing_watch_lets_the_next_cycle_skip_the_beta_scan`; it passed when rerun alone.
+- spec_peering_replay: test result: ok. 3 passed; 0 failed
+- spec_replay: test result: ok. 2 passed; 0 failed
+- supervisor: test result: ok. 40 passed; 0 failed
+- topology (new): test result: ok. 5 passed; 0 failed
+- doctests: test result: ok. 0 passed; 0 failed
+`cargo fmt --check` and `cargo clippy --release --all-targets -- -D warnings` are clean.
+
+## For the integrator
+- main.rs call sites touched: `run_sync` (a block after `identifier`, and one after `state_directory`), `run_sync_config` (now resolves the config path up front), `check_startable` (now returns the own-state check result), `run_watch` (a check + warnings after `state_root`, and a check on each reloaded `next` that `continue`s with the old config). These may conflict with D3 (run_sync) and E1/F2 small calls. They are all small.
+- New test file `tests/topology.rs` (CLI tests with their own HOME per child).
+- Behaviour change: remote endpoints are compared across sessions only within the same (destination, agent_command) scope. Before, they were compared textually whatever the agent_command.
+- Not covered: the peering `Supervisor::new` callers in supervisor/peer.rs (they run pushed configs), and `reload::load` itself. The watch loop checks each edit before applying it.
+- Follow-ups: a typed SessionKey (the identifier) through the control Selector, progress (D3/L-30), alert state (`SessionAlerts::key()` in alerts.rs collides the same way), status, shop and tray; the F-H12 status/progress separation tests; the OPS-6 warning shown in `status`; docs for `acknowledge_secrets` and the new refusals (lane 2b).
+landed: 4 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 510 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 59.54s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.04s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.41s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.80s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.60s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

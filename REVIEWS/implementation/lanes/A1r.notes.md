@@ -1,0 +1,6 @@
+- c5fc052 (T1-1): conflicts only in the unix::fs import line (kept A2's DirBuilderExt + OpenOptions) and end-of-file test modules (kept apply_path_tests and confinement_tests). endpoint::local 79 pass.
+- f6e2302 (T1-5): stage_begin keeps A1's discard-first + request validation, then A2's prepare_staging_root (instead of A1's create_dir_all). Kept A2's copy_into_private alongside A1's open_base. 81 pass.
+- 85b7ee5 (LOCAL-03): test-module doc conflict (took A1's rename to supply_receive_tests). Removed dead copy_verifying. Split temporary_name → temporary_name_at(purpose,count) so the planted-symlink test is no longer vacuous; mutation (File::create in staging_temporary) makes it fail. Plants 4 (<8 ATTEMPTS). 84 pass.
+- 1150671 (F-H7): applied cleanly; clippy clean; endpoint::local 86 + supply_memory 1 pass.
+- 7b7005d (F-M-STAGE M-31): applied cleanly; 87 pass.
+- Finished; see A1r.done.md.

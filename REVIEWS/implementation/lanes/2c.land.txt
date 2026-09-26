@@ -1,0 +1,37 @@
+== 2c done file
+# Lane 2c — done
+
+- M-46 done d0cabaf — standing-watch test waits (≤4 cycles / 20 s) for beta's edit to reach alpha, asserts a beta scan separately, and writes alpha's edit inside a wait to avoid a second watch-expiry race; 200/200 consecutive runs pass (was 6 failures in 41).
+- M-47 done 22bff62 — cut oracle requires the latest versions (both sides without conflict, one side with), scenario adds a deletion and a file→directory change, new restart test (BeforeBetaTransition/AfterBetaTransition/BeforeRecord, both transports), and a mutation test proving a rollback of modify.txt fails the oracle.
+- M-54 done e09a02e — TLC replay tests are #[ignore]d (and fail if forced without AUTOBAHN_TLC); the non-UTF-8 name test is ignored on macOS and fails elsewhere instead of returning early.
+- arm64 fan-out rerun: skipped per brief (integrator runs it).
+
+## Last full-suite run (`isolated lane-2c cargo test --release --no-fail-fast`, exit 0)
+test result: ok. 588 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.65s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.73s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 9.51s
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.98s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.62s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.43s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## For the integrator
+- Edits outside region (named in e09a02e): test attribute + skip branch of `non_utf8_names_are_marked_and_deduplicated` in src/scan/mod.rs (lane B2's file — expect a trivial merge at most); TLC commands in spec/README.md and docs/development.md.
+- FINDING (M-47): after a cut or crash inside the intent window, a deletion is silently undone (the file returns to alpha, no conflict) because the intent drops provenance. No data lost; the oracle tolerates it for the deletion only. Consider a ticket if deletions should surface as conflicts instead.
+- Product note (M-46): after any idle `await_change` times out, beta's remote watch answer lands just after, so the next cycle rescans beta instead of reusing the snapshot (src/endpoint/remote.rs). Efficiency only.
+- Not done: M-46's deterministic hook tests for late events/polling fallback (observer tests, outside this lane).
+- The standing-watch flake the brief mentions should now be gone.
+landed: 3 commits
+FMT_OK
+CLIPPY_FAIL
+      1 error: could not compile `autobahn` (lib test) due to 2 previous errors
+      1 error: could not compile `autobahn` (lib) due to 2 previous errors
+      1 error: unused variable: `progress`
+      1 error[E0425]: cannot find value `progress` in this scope
+      1 warning: build failed, waiting for other jobs to finish...
+RESULT landed

@@ -1,0 +1,32 @@
+== E3 done file
+# E3 done
+
+- F-H27 — done — 355c5bf — The example hook passes the summary to osascript as `item 1 of argv`; summary/detail are sanitized (display_safe + 400-byte cap, ≤50 detail lines) at composition and again in Dispatcher::dispatch; an unedited shipped example hook is rewritten at supervisor startup, an edited one with the unsafe line gets a warning.
+- F-M-SUP (M-35 only) — done — 23b86de — Hook stdin is written and stderr drained on their own threads within the deadline; stderr lines are logged (sanitized, capped at 4 KB/run with "… truncated"); timeout kills the hook's process group.
+
+Last full suite (`isolated lane-E3 cargo test --release --no-fail-fast`):
+test result: ok. 431 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.41s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.24s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7.96s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.26s
+test result: ok. 40 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.78s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+For the integrator:
+- Edits outside src/alerts.rs: the ON_ALERT_EXAMPLE string in src/config.rs (D2's file), and one line at the top of `watch_alerts` in src/supervisor/mod.rs calling `crate::alerts::refresh_configured_example_hook(&plan)`. Expect trivial conflicts only if another lane edits those same lines.
+- `SHIPPED_ON_ALERT_EXAMPLES` in alerts.rs holds the one example ever shipped (b2d9a6d = v0.4/wave-0), verbatim. If a future release ships a changed ON_ALERT_EXAMPLE, append that release's version there.
+- `alerts::run` gained a `log: &dyn Fn(&str)` parameter (private fn; only the Dispatcher calls it).
+- supervisor/reload.rs's refused-config alert is sanitized through Dispatcher::dispatch without edits to that file.
+- Notes: /home/ubuntu/lanes/E3.notes.md.
+landed: 2 commits
+FMT_OK
+CLIPPY_OK
+test result: ok. 502 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.42s
+test result: ok. 33 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 25.01s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.92s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.77s
+test result: ok. 41 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.62s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+RESULT landed

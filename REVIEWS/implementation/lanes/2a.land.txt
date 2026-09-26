@@ -1,0 +1,50 @@
+== 2a done file
+# Lane 2a: done
+
+## Tickets
+- F-M-SUP M-12 part B: **done**, ee537cd. Each agent channel's `SideProgress` counts its work: entries, bytes, applied changes, and new `pulse()`s for hashed, signed, delta-encoded and patched blocks. A per-connection reporter sends `MuxResponse::Progress { channel, counter }` every 5 s, only when the counter moved. A controller watchdog fails the connection after 60 s with no answer and no movement, and the reason names the channel, the request and the silence. A change wait gets its own length as grace, and a frame still crossing a slow link resets the clock. Peering attach mode is covered by the same code.
+- P-13 remote half: **done**, 084cd1b. `Initialize.one_shot`, which the agent honors. The supervisor's single pass opens both sides one-shot. Measured on 160k files: configured sync to a local beta 0.52 → 0.20 s, through an agent 0.66 → 0.33 s.
+- Remove `Response::Scan` (L-9, HYG-4): **done**, 95c1b69. The variant and its arm are gone. The transport parts of HYG-4 are in the same commit: poison-tolerant mux and agent-output locks, and a test on the version's charset.
+- Stack size for E2's threads: **skipped**. None of them handle tree data: the handshake thread decodes only a `Handshake`, and `run_within` moves raw bytes. The router that decodes snapshots already uses `spawn_deep`.
+- Epoch bump: **done**, 5965bf3. `COMPATIBILITY_EPOCH` 14 → 15. `docs/releases.md` and `docs/commands.md` now say e15. The commit body also records `CHECKPOINT_VERSION` 3 from C2.
+
+## Last full-suite run (`isolated lane-2a cargo test --release --no-fail-fast`, on the final code)
+test result: ok. 599 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 64.57s
+test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+test result: ok. 35 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.57s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.93s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.97s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.09s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.42s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+`cargo fmt --check` and `cargo clippy --release --all-targets -- -D warnings` are clean. The known flake `a_standing_watch_lets_the_next_cycle_skip_the_beta_scan` failed once in 7 targeted runs during P-13, and passed in every full run.
+
+## For the integrator
+- **Edits outside the region**, each named in its commit:
+  - `src/progress.rs`: `SideProgress::pulse`, `activity`, a `work` field, and the `Pulsing` Read/Write/Seek adapter.
+  - `src/endpoint/local.rs`: beyond bare increments, `Transitioner` gained a `progress` field. `content_matches`, `staged_content_matches` and `copy_into_private` gained an `Option<&SideProgress>` parameter, and readers are wrapped in `Pulsing` at the deltify, patch and signature call sites. `src/rsync/mod.rs` itself is unchanged.
+  - `src/main.rs`: one line, `one_shot: !watch` in the direct `sync`'s `Initialize`.
+  - `src/supervisor/mod.rs`: a `Worker.one_shot` field, set in `run_once` and threaded through `connect`.
+  - `TODO-SPEED.md`: the P-13 item is checked off with the numbers. `docs/configuration.md`: one paragraph on silence detection.
+- **Wire changes need all four commits together.** The first three change the wire format, and only the last bumps the epoch. Land them as a set.
+- **Every `Initialize {..}` literal needs `one_shot`.** Another lane's merge that adds one will fail to compile until it does. Likewise, `MuxResponse` is now an enum: use `MuxResponse::Response { channel, response }`.
+- Behaviour to know: a transfer on a link slower than about 1 Mbit/s is protected by the "frame crossing" excuse, which covers frames in either direction. `SILENCE_LIMIT` is 60 s, and the agent's `PROGRESS_INTERVAL` is 5 s (100 ms under `cfg(test)`).
+- Optional follow-ups:
+  - `open_endpoints` (used by doctor, diff and resolve) still opens endpoints watching. Those commands never wait, and could pass `one_shot = true`.
+  - HYG-4 items outside my files: `let _ = shown/inner/root/intent_recorded`, the closure in `attempt_once`, and `isatty` → `IsTerminal`.
+  - The test hook `transport::PANICKING_SESSIONS` exists (cfg(test) only) for any later panic-containment work.
+- Details are in /home/ubuntu/lanes/2a.notes.md.
+landed: 4 commits
+FMT_OK
+CLIPPY_FAIL
+      1 error: could not compile `autobahn` (lib test) due to 2 previous errors
+      1 error: could not compile `autobahn` (lib) due to 2 previous errors
+      1 error: unused variable: `progress`
+      1 error[E0425]: cannot find value `progress` in this scope
+      1 warning: build failed, waiting for other jobs to finish...
+RESULT landed

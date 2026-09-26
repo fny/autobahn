@@ -1,0 +1,32 @@
+== 3a done file
+# Lane 3a: done
+
+- HYG-4 leftovers: **done**, 54271d3. Removed the dead `let _ =` bindings (shown, inner, intent_recorded, session's root) and the values they discarded, removed attempt_once's immediately-invoked closure, replaced the last `libc::isatty` with IsTerminal, and added a version-charset test (mutation-checked). The mux locks were already poison-tolerant. Kept `let _ = root;` in endpoint/local.rs, which silences an unused parameter on targets other than Linux and macOS.
+- One-shot endpoints: **done**, 46b7d12. `open_endpoints` (used by doctor, diff and resolve) now opens one-shot. On 202k entries, doctor went from 2.0–2.4 s to 0.70 s (4,002 inotify watches down to 0). diff was 0.00–0.01 s both before and after, because it never scans and the watch only starts on the first scan.
+- M-46 deterministic observer tests: **done**, 6fe5757. A late-event test and a polling-fallback test, driven by a new cfg(test) `ChangeWatcher::hold_events` seam in local.rs. Both are mutation-checked.
+- fanout.sh hard-coded path: **done**, cb45ef3. The repo root now comes from the script's location, `BM` can override it, and a missing harness gets a clear message. Passes shellcheck.
+- resolve's flush: **done**, b1b056e. Resolve sends one Flush per touched session through the existing `Selector::session`, so no protocol change was needed. A unit test drives a real resolve.
+
+## Last full suite (`isolated lane-3a cargo test --release --no-fail-fast`, exit 0)
+test result: ok. 610 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 58.60s
+test result: ok. 50 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.07s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.88s
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.97s
+test result: ok. 72 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.87s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.38s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## For the integrator
+- The non-Linux `ChangeWatcher::new` gained the cfg(test) `hold_events` seam, which was not compiled here. Check it on macOS CI. The two new observer tests are not Linux-only.
+- Edits outside this lane's own files: src/shop.rs (`help_page` lost its unused `width` parameter, and its call site changed), src/main.rs (run_diff, run_clean, run_resolve's flush block and retire loop, plus a cfg(test) `RESOLVE_FLUSHES` thread_local above `run_resolve`), and src/endpoint/local.rs (ChangeWatcher test seam only). These may conflict textually with the D1 or D3 regions of main.rs.
+- `a_single_pass_asks_its_agents_not_to_watch` asserted that open_endpoints is *not* one-shot. It now asserts that it is.
+- Other bench/verify scripts still default to /home/ubuntu/Workspace/autobahn, though they accept BM/AB overrides. See the notes.
+CONFLICT at b1b056e4fdbd6886066a0858de94fb9aca8f5048 (resolve: only the sessions it touched are flushed)
+src/main.rs
+RESULT conflict

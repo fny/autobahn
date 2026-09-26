@@ -1,0 +1,31 @@
+== 3b done file
+# Lane 3b: done
+
+- F-H1 stage 2: **done**, 2688d08. Resolution now makes the ancestor forget the path, so the kept version is a creation. A running supervisor's workers apply it between cycles (new `Resolve`/`Resolved` control requests). Without a supervisor, `resolve` takes the session locks itself. With fan-out, every beta ends with the winner's version. The winner-unchanged and strict refusals are gone; the root and one-way refusals stay.
+
+## Last full-suite run (`isolated lane-3b cargo test --release --no-fail-fast`)
+    test result: ok. 612 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 57.01s
+    test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+    test result: ok. 37 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 27.61s
+    test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+    test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+    test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.26s
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+    test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 2.48s
+    test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.96s
+    test result: ok. 78 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 19.47s
+    test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.37s
+    test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.76s
+    test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+## For the integrator
+- Lane 3a's item 5 (resolve flushes only touched sessions) edits the same tail of `run_resolve` (the flush block), so expect a conflict. The group flush is still there after a supervised resolve.
+- Lane 3a's one-shot change to `open_endpoints` should compose: `resolve` builds `Session::with_lock` from those endpoints when no supervisor runs.
+- Edits outside the region, named in the commit: a `ControlResponse::Resolution` arm in `run_control` (main.rs), the `resolutions` field in the `Registry` literal in `run_watch`, and a test-only `cycle_hooks` field on `Supervisor`.
+- Control wire: the new request variants come after `Sessions`, and the new response variant goes at the end. Requests are version-enveloped, so there is no cross-build issue.
+- Known limitations (details in 3b.notes.md): a paused session holds its part until it is resumed, and `resolve` waits up to 120 s for it. A loser edited milliseconds before the settlement can be refused if the watcher has not reported the edit yet (the safe direction).
+- Docs that describe `resolve` may want a line about forgetting (lane 2b's area).
+CONFLICT at 2688d08a04ca7d0ec023230feb519c6e78d0c1e6 (resolve: the kept version is a creation, and the ancestor's owner makes it so)
+src/main.rs
+src/session/mod.rs
+RESULT conflict

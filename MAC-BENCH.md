@@ -475,7 +475,14 @@ So the launcher behaves correctly on both; only the test's expectation is Linux-
 
 Two more tests fail on macOS for the same kind of reason, found while running the suite in full: `a_wedged_supervisor_is_unresponsive_within_the_client_timeout` and `a_status_report_against_a_wedged_supervisor_returns` both panic with *the backlog never filled* (`src/supervisor/control.rs:1586`). The fixture wedges a supervisor with `listen(fd, 0)`; macOS keeps its own minimum backlog, so the queue never fills. Both reproduce on untouched `main`. Filed as [`MAC-6`](REVIEWS/fixes/MAC-6-control-socket-backlog-test.md) (L-44). With MAC-5 fixed, the suite on macOS is **604 passed, 2 failed**, and those two are MAC-6.
 
-Steps 2 and 3 (the diff scratch path, and `--all` as a filename) still need the menu, and a person to click it.
+**Steps 2 and 3, re-run on the merged build (`4aeeec4`), 2026-09-26: both pass.**
+
+Two conflicts in a throwaway fleet, one file named `--all` and one `ordinary.txt`, with the app run against that state root (`tray --config … --state-root …`) so nothing real was at risk.
+
+- **Step 2, the diff's scratch file.** *Show diff* on `--all` left `~/mb9/home/tmp/diff-8381f83c6a6ff5f2c58d82e29890d4f4.diff`, mode `0600`, inside a `tmp/` of mode `0700` — under the **state root**, not the shared `/tmp`, which is what LOCAL-04 asks for. The name is a blake3 digest of group, host and path, so the filename does not leak either. The CLI's own `diff` takes the same route: `private_tempdir_in(&state_root)` (`src/main.rs:2755`), with the reason written beside it.
+- **Step 3, `--all` as a filename.** Settling it from the menu settled **only** it: `issues` then showed one conflict, `ordinary.txt`, and `~/mb9/b/--all` held `alpha version`, so *keep alpha* really applied. Before the fix both would have gone, because `--all` reached `resolve` as a flag.
+
+So F-H30 and LOCAL-04 are verified on a Mac, and with step 1 passing since the exit-code fix, 7i is complete.
 
 ### 7j. Escape sequences in file names — F-M-OUT
 

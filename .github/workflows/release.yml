@@ -246,6 +246,10 @@ jobs:
   release:
     needs: [linux, mac]
     runs-on: ubuntu-latest
+    # For MINISIGN_SECRET_KEY, which signs the checksums. The environment
+    # asks for approval, so nothing is signed that a person did not let
+    # through.
+    environment: release
     permissions:
       contents: write
     steps:
@@ -258,6 +262,7 @@ jobs:
           sparse-checkout: |
             src/protocol.rs
             scripts/install.sh
+            release.pub
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           merge-multiple: true
@@ -293,6 +298,28 @@ jobs:
           # installs the release it came with, not whatever main holds.
           cp source/scripts/install.sh install.sh
           sha256sum autobahn-* Autobahn-macos-aarch64.zip install.sh > SHA256SUMS
+      - name: Sign the checksums
+        # The checksums come from this same release, so on their own they
+        # prove only that a download is intact. The signature, by a key
+        # that lives in the approval-gated environment and nowhere in the
+        # build, is what `autobahn update` and the installer check. The
+        # trusted comment names the tag, and the updater requires it, so a
+        # signed release cannot be served in place of another.
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+        run: |
+          test -n "$MINISIGN_SECRET_KEY" || { echo "MINISIGN_SECRET_KEY is not set" >&2; exit 1; }
+          sudo apt-get install -y -qq minisign >/dev/null
+          umask 077
+          key="$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$key"
+          minisign -S -s "$key" -m SHA256SUMS -x SHA256SUMS.minisig -t "autobahn $GITHUB_REF_NAME"
+          # Checked against the public key the binaries carry, so a wrong
+          # secret fails here rather than on every user's update.
+          minisign -V -p source/release.pub -m SHA256SUMS -x SHA256SUMS.minisig
+      - name: Remove the signing key
+        if: always()
+        run: rm -f "$RUNNER_TEMP/minisign.key"
       - name: Publish release
         # A tag with a hyphen in it is a prerelease, which is what
         # semantic versioning means by v0.5.0-dev.1. Marking it as one
@@ -319,4 +346,5 @@ jobs:
             autobahn-agents.tar.gz \
             Autobahn-macos-aarch64.zip \
             install.sh \
-            SHA256SUMS
+            SHA256SUMS \
+            SHA256SUMS.minisig

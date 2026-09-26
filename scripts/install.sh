@@ -22,9 +22,17 @@
 # old release that publishes no checksums through, and it never excuses a
 # checksum that does not match.
 #
+# When minisign is installed, SHA256SUMS is also checked against the
+# release signing key below, and a bad signature stops the install.
+# Without minisign the checksums still catch a damaged download, but not
+# a replaced release: `autobahn update` checks the signature itself.
+#
 set -eu
 
 REPO="fny/autobahn"
+# The public half of the release signing key, the same one the binary
+# carries (release.pub). docs/releases.md says how it is rotated.
+RELEASE_PUBLIC_KEY="RWTTmFV9GHpLmH3sw8KlWiSqiqJK1AUrb9W3+UUi6/ja1uJ/MRGjGBUQ"
 # The earlier name, AUTOBAHN_PREFIX, is still honoured: it was never a
 # prefix in the GNU sense (the binary went straight into it, not into
 # its bin/), which is why it was renamed.
@@ -201,6 +209,23 @@ fi
 status=0
 fetch "SHA256SUMS" "$WORK/SHA256SUMS" || status=$?
 if [ "$status" -eq 0 ]; then
+    if have minisign; then
+        sigstatus=0
+        fetch "SHA256SUMS.minisig" "$WORK/SHA256SUMS.minisig" || sigstatus=$?
+        if [ "$sigstatus" -eq 0 ]; then
+            minisign -V -q -P "$RELEASE_PUBLIC_KEY" -m "$WORK/SHA256SUMS" \
+                -x "$WORK/SHA256SUMS.minisig" >/dev/null 2>&1 \
+                || die "the release's SHA256SUMS does not match its signature. Refusing to install.
+Report this: the files are not the ones that were published."
+            say "  signature verified"
+        elif [ "$sigstatus" -eq 4 ]; then
+            warn "note: this release publishes no signature (releases before signing do not)."
+        else
+            die "unable to download SHA256SUMS.minisig from $BASE. Refusing to install: retry."
+        fi
+    else
+        say "  note: minisign is not installed, so the release signature is not checked"
+    fi
     # Prints the entry for exactly this asset name. `sha256sum -b` writes
     # the name as `*name`, and that is the same entry.
     expected_for() {

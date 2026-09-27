@@ -266,6 +266,7 @@ const DEFAULT_SETTLE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// The parsed configuration file.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Whether the running supervisor re-reads this file and applies an
@@ -290,6 +291,7 @@ pub struct Config {
     pub disabled_hosts: Vec<String>,
     /// Retired. Kept only so that a configuration written against the old
     /// spelling is told what to write instead of "unknown field".
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub disabled: Option<toml::Value>,
     /// How much the supervisor writes to its log: "quiet", "normal" (the
     /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
@@ -321,6 +323,7 @@ pub struct Config {
     pub ignore_directory: Option<PathBuf>,
     /// Retired. Kept only so that a configuration written against the old
     /// shape gets an answer rather than "unknown field `alerts`".
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub alerts: Option<toml::Value>,
 }
 
@@ -329,6 +332,7 @@ pub struct Config {
 /// message — the subsystem comes second because the warning should land
 /// first.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Advanced {
     /// Alerter timing.
@@ -341,6 +345,7 @@ pub struct Advanced {
     /// Renamed. Kept only so that a configuration written against the old
     /// name gets an answer rather than "unknown field".
     #[serde(default, rename = "peering-experimental")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub retired_peering: Option<toml::Value>,
     /// Let the controller run as root (see `autobahn::root`). Read by
     /// `root::config_allows_root`; here so that the key is known.
@@ -356,6 +361,7 @@ pub struct Advanced {
 /// gone costs the wait once. Both are here for the fleet that needs them
 /// moved, not for tuning.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PeeringAdvanced {
     /// How long a lease stays valid after the leader last renewed it. The
@@ -404,6 +410,7 @@ impl Config {
 /// reader would discover by trying. They are configurable because a fleet
 /// somewhere will need one of them moved, not because anyone should.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AlertsAdvanced {
     /// How long a condition must hold before it counts, for states with no
@@ -432,6 +439,7 @@ pub struct AlertsAdvanced {
 /// A duration as written in the configuration: a plain number of seconds,
 /// or a suffixed string.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum DurationSpec {
     /// A plain number of seconds, matching how `interval` is written.
@@ -442,6 +450,7 @@ pub enum DurationSpec {
 
 /// Settings inherited by every group (each overridable per group).
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// The default synchronization mode.
@@ -486,6 +495,7 @@ pub struct Defaults {
 /// A size limit as written in the configuration: a raw byte count or a
 /// suffixed string.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum SizeSpec {
     /// A raw byte count.
@@ -497,6 +507,7 @@ pub enum SizeSpec {
 /// One synchronization group: a local alpha directory fanned out to one or
 /// more beta destinations.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     /// The alpha synchronization root: a local path (`~` is expanded) or a
@@ -1345,19 +1356,18 @@ impl Config {
                 (true, Some(plan)) => Some(plan),
                 _ => None,
             };
-            let power_durability = match group
-                .durability
-                .as_deref()
-                .or(self.defaults.durability.as_deref())
-                .unwrap_or("process")
-            {
-                "process" => false,
-                "power" => true,
-                other => {
-                    errors.push(format!(
-                        "group '{name}': unknown durability '{other}' \
-                         (expected 'process' or 'power')"
-                    ));
+            let power_durability = match parse_word(
+                DURABILITY,
+                "durability",
+                group
+                    .durability
+                    .as_deref()
+                    .or(self.defaults.durability.as_deref())
+                    .unwrap_or("process"),
+            ) {
+                Ok(word) => word.word == "power",
+                Err(complaint) => {
+                    errors.push(format!("group '{name}': {complaint}"));
                     false
                 }
             };
@@ -1817,13 +1827,10 @@ impl Config {
 
 /// Parses a symbolic link mode name.
 pub fn parse_symlink_mode(mode: &str) -> Result<SymlinkMode, String> {
-    match mode {
+    match parse_word(SYMLINK_MODES, "symlink mode", mode)?.word {
         "ignore" => Ok(SymlinkMode::Ignore),
         "portable" => Ok(SymlinkMode::Portable),
-        "raw" | "posix-raw" => Ok(SymlinkMode::Raw),
-        other => Err(format!(
-            "unknown symlink mode '{other}' (expected one of: ignore, portable, raw)"
-        )),
+        _ => Ok(SymlinkMode::Raw),
     }
 }
 
@@ -1851,14 +1858,10 @@ pub fn parse_permission_mode(mode: &str, directory: bool) -> Result<u32, String>
 
 /// Parses a staging placement name.
 pub fn parse_staging_mode(mode: &str) -> Result<StagingMode, String> {
-    match mode {
+    match parse_word(STAGING_MODES, "staging placement", mode)?.word {
         "state" => Ok(StagingMode::State),
         "beside-root" => Ok(StagingMode::BesideRoot),
-        "inside-root" => Ok(StagingMode::InsideRoot),
-        other => Err(format!(
-            "unknown staging placement '{other}' (expected one of: state, beside-root, \
-             inside-root)"
-        )),
+        _ => Ok(StagingMode::InsideRoot),
     }
 }
 
@@ -1921,6 +1924,306 @@ pub fn parse_duration(spec: &DurationSpec) -> Result<Duration, String> {
         .ok_or_else(|| format!("duration '{text}' overflows"))
 }
 
+/// Every synchronization mode this build reads: its canonical name, the
+/// older spellings still accepted for it, the reconciliation it runs and
+/// whether the name asks for peering.
+///
+/// One table, read by the parser, by the error a bad name gets, by
+/// [`mode_name`] and by the schema the editor builds its form from. A
+/// mode is added by adding a row, so none of those four can fall behind
+/// the others.
+pub const MODES: &[ModeName] = &[
+    ModeName {
+        name: "two-way-conflict",
+        also: &["two-way-safe"],
+        mode: SyncMode::TwoWaySafe,
+        peering: false,
+        about: "Both ways. A file both sides changed is reported, never chosen between.",
+    },
+    ModeName {
+        name: "two-way-paranoid",
+        also: &[],
+        mode: SyncMode::TwoWayParanoid,
+        peering: false,
+        about: "As two-way-conflict, and a large directory that goes empty or missing on                 one side is disbelieved rather than propagated.",
+    },
+    ModeName {
+        name: "two-way-alpha",
+        also: &["two-way-resolved"],
+        mode: SyncMode::TwoWayResolved,
+        peering: false,
+        about: "Both ways, and alpha wins a collision — except that a deletion never beats                 an edit.",
+    },
+    ModeName {
+        name: "two-way-alpha-strict",
+        also: &[],
+        mode: SyncMode::TwoWayStrict,
+        peering: false,
+        about: "As two-way-alpha with that exception removed: alpha's deletion beats beta's                 edit.",
+    },
+    ModeName {
+        name: "one-way-conflict",
+        also: &["one-way-safe"],
+        mode: SyncMode::OneWaySafe,
+        peering: false,
+        about: "Alpha to beta only. A file changed on beta is reported rather than                 overwritten.",
+    },
+    ModeName {
+        name: "one-way-alpha",
+        also: &["one-way-replica", "mirror"],
+        mode: SyncMode::OneWayReplica,
+        peering: false,
+        about: "Alpha to beta only, and beta is made to match — what rsync --delete does.",
+    },
+    ModeName {
+        name: "peering-conflict-dangerously-experimental",
+        also: &[],
+        mode: SyncMode::TwoWaySafe,
+        peering: true,
+        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known                 security and collision issues: read docs/peering.md first.",
+    },
+    ModeName {
+        name: "peering-alpha-dangerously-experimental",
+        also: &[],
+        mode: SyncMode::TwoWayResolved,
+        peering: true,
+        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known                 security and collision issues: read docs/peering.md first.",
+    },
+];
+
+/// Names that were renamed, and what they were renamed to. A
+/// configuration that uses one is told why rather than merely told the
+/// name is unknown.
+pub const RENAMED_MODES: &[(&str, &str, &str)] = &[
+    (
+        "peering-conflict-experimental",
+        "peering-conflict-dangerously-experimental",
+        "peering has known security and collision issues. Read docs/peering.md before          enabling it",
+    ),
+    (
+        "peering-alpha-experimental",
+        "peering-alpha-dangerously-experimental",
+        "peering has known security and collision issues. Read docs/peering.md before          enabling it",
+    ),
+];
+
+/// One row of [`MODES`].
+#[derive(Debug)]
+pub struct ModeName {
+    /// What this mode is called now, and what `status` prints.
+    pub name: &'static str,
+    /// Older spellings of the same mode, still read.
+    pub also: &'static [&'static str],
+    /// The reconciliation it runs.
+    pub mode: SyncMode,
+    /// Whether the name asks for peering.
+    pub peering: bool,
+    /// One sentence, for a reader choosing between them.
+    pub about: &'static str,
+}
+
+/// One word a configuration key accepts, and what it means.
+///
+/// The same shape as a row of [`MODES`] without the reconciliation: the
+/// parser reads it, the error a wrong word gets is written from it, and
+/// the editor's form offers exactly these.
+#[derive(Debug)]
+pub struct Word {
+    /// The canonical spelling.
+    pub word: &'static str,
+    /// Older or looser spellings that mean the same thing.
+    pub also: &'static [&'static str],
+    /// One line, for a person choosing between them.
+    pub about: &'static str,
+}
+
+/// What `symlink_mode` accepts.
+pub const SYMLINK_MODES: &[Word] = &[
+    Word {
+        word: "ignore",
+        also: &[],
+        about: "Symbolic links are left where they are and never carried.",
+    },
+    Word {
+        word: "portable",
+        also: &[],
+        about: "Links that stay inside the root are carried as links; anything else is                 refused rather than followed.",
+    },
+    Word {
+        word: "raw",
+        also: &["posix-raw"],
+        about: "Every link is carried exactly as written, including one that points                 outside the root.",
+    },
+];
+
+/// What `staging` accepts.
+pub const STAGING_MODES: &[Word] = &[
+    Word {
+        word: "state",
+        also: &[],
+        about: "Staged content lives under the state root, off the synchronized tree.",
+    },
+    Word {
+        word: "beside-root",
+        also: &[],
+        about: "Staged content lives next to the root, for a root on a different                 filesystem from the state.",
+    },
+    Word {
+        word: "inside-root",
+        also: &[],
+        about: "Staged content lives inside the root itself: the last resort, and it                 shows up in the tree while it is there.",
+    },
+];
+
+/// What `durability` accepts.
+pub const DURABILITY: &[Word] = &[
+    Word {
+        word: "process",
+        also: &[],
+        about: "The journal survives this process dying. The default.",
+    },
+    Word {
+        word: "power",
+        also: &[],
+        about: "Every record is flushed to the disk, so the journal survives the power                 going out. Slower.",
+    },
+];
+
+/// What `log` accepts.
+pub const LOG_LEVELS: &[Word] = &[
+    Word {
+        word: "quiet",
+        also: &["error", "errors"],
+        about: "Only what went wrong.",
+    },
+    Word {
+        word: "normal",
+        also: &["info"],
+        about: "What went wrong, and what changed. The default.",
+    },
+    Word {
+        word: "debug",
+        also: &["verbose", "trace"],
+        about: "Every decision, named file by file. Megabytes a day.",
+    },
+];
+
+/// The words a configuration key accepts, or `None` where the value is
+/// free text. Keyed by the key as it is written in the file, so the
+/// editor can ask about a field it only knows the name of.
+pub fn vocabulary(key: &str) -> Option<&'static [Word]> {
+    match key {
+        "symlink_mode" => Some(SYMLINK_MODES),
+        "staging" => Some(STAGING_MODES),
+        "durability" => Some(DURABILITY),
+        "log" => Some(LOG_LEVELS),
+        _ => None,
+    }
+}
+
+/// Reads one word from a table, or says what was expected. The canonical
+/// spellings are listed; the older ones are accepted without being
+/// advertised.
+pub fn parse_word<'a>(words: &'a [Word], what: &str, given: &str) -> Result<&'a Word, String> {
+    if let Some(word) = words
+        .iter()
+        .find(|word| word.word == given || word.also.contains(&given))
+    {
+        return Ok(word);
+    }
+    let expected: Vec<&str> = words.iter().map(|word| word.word).collect();
+    Err(format!(
+        "unknown {what} '{given}' (expected one of: {})",
+        expected.join(", ")
+    ))
+}
+
+/// What a value is for, where the type alone does not say: a widget hint
+/// for a form, keyed by the key as it is written.
+pub fn widget(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "alpha" => "endpoint",
+        "betas" => "endpoints",
+        "ignores" | "ignore_files" => "patterns",
+        "disabled_hosts" => "hosts",
+        "on_alert" => "command",
+        "agent_command" => "command",
+        "file_mode" | "directory_mode" => "octal",
+        "max_file_size" => "size",
+        "interval" => "seconds",
+        "ttl" | "timeout" => "duration",
+        key if key.ends_with("_after") => "duration",
+        _ => return None,
+    })
+}
+
+/// The configuration's own shape, for anything that builds a form from
+/// it.
+///
+/// The fields and their types come from the very structs the parser
+/// deserializes into, so a field cannot be in one and not the other. The
+/// words a field accepts come from the tables above, which the parsers
+/// also read. The widget hints say what a value is for. Nothing here is
+/// a second list of anything, which is the whole point.
+#[cfg(feature = "schema")]
+pub fn schema() -> serde_json::Value {
+    let mut document =
+        serde_json::to_value(schemars::schema_for!(Config)).expect("a schema is JSON");
+    annotate(&mut document);
+    document
+}
+
+/// Walks the derived schema and writes what the tables know onto it:
+/// `enum` for a validator, `x-words` for a form that wants to say what
+/// each word means, and `x-widget` for one that wants the right control.
+#[cfg(feature = "schema")]
+fn annotate(node: &mut serde_json::Value) {
+    use serde_json::{json, Value};
+
+    if let Value::Object(map) = node {
+        if let Some(Value::Object(properties)) = map.get_mut("properties") {
+            for (key, property) in properties.iter_mut() {
+                let words: Option<Vec<(&str, &str)>> = match key.as_str() {
+                    "mode" => Some(
+                        MODES
+                            .iter()
+                            .map(|row| (row.name, row.about))
+                            .collect(),
+                    ),
+                    key => vocabulary(key)
+                        .map(|words| words.iter().map(|word| (word.word, word.about)).collect()),
+                };
+                let Value::Object(property) = property else {
+                    continue;
+                };
+                if let Some(words) = words {
+                    property.insert(
+                        "enum".to_owned(),
+                        Value::Array(words.iter().map(|(word, _)| json!(word)).collect()),
+                    );
+                    property.insert(
+                        "x-words".to_owned(),
+                        Value::Array(
+                            words
+                                .iter()
+                                .map(|(word, about)| json!({"word": word, "about": about}))
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(widget) = widget(key) {
+                    property.insert("x-widget".to_owned(), json!(widget));
+                }
+            }
+        }
+        for (_, value) in map.iter_mut() {
+            annotate(value);
+        }
+    } else if let Value::Array(items) = node {
+        items.iter_mut().for_each(annotate);
+    }
+}
+
 /// Parses a synchronization mode name to what reconciliation runs.
 ///
 /// A peering spelling parses to the reconciliation mode it wraps; the
@@ -1937,48 +2240,35 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
     // wins. The older names (safe, resolved, replica) described the same
     // four modes without exposing that structure; they stay accepted so
     // existing configurations keep working.
-    match mode {
-        "two-way-conflict" | "two-way-safe" => Ok((SyncMode::TwoWaySafe, false)),
-        // Off the grid: two-way-conflict that also refuses to trust a
-        // large directory going empty or missing on one side.
-        "two-way-paranoid" => Ok((SyncMode::TwoWayParanoid, false)),
-        "two-way-alpha" | "two-way-resolved" => Ok((SyncMode::TwoWayResolved, false)),
-        // Off the grid: two-way-alpha with its one exception removed —
-        // alpha's deletion beats beta's edit, instead of yielding to it.
-        "two-way-alpha-strict" => Ok((SyncMode::TwoWayStrict, false)),
-        "one-way-conflict" | "one-way-safe" => Ok((SyncMode::OneWaySafe, false)),
-        // "mirror" is what everyone calls this shape (rsync --delete), so
-        // it is accepted too.
-        "one-way-alpha" | "one-way-replica" | "mirror" => Ok((SyncMode::OneWayReplica, false)),
-        // A third direction: two-way, and the betas can take the lead
-        // while the alpha is away. Experimental, and spelled so.
-        "peering-conflict-dangerously-experimental" => Ok((SyncMode::TwoWaySafe, true)),
-        "peering-alpha-dangerously-experimental" => Ok((SyncMode::TwoWayResolved, true)),
-        // The old spellings are answered, not merely unknown: the rename is
-        // the point, and a configuration that used them should be told why
-        // rather than quietly carried across.
-        "peering-conflict-experimental" | "peering-alpha-experimental" => Err(format!(
-            "mode '{mode}' was renamed to '{}': peering has known security and \
-             collision issues. Read docs/peering.md before enabling it",
-            mode.replace("-experimental", "-dangerously-experimental")
-        )),
-        other => Err(format!(
-            "unknown mode '{other}' (expected one of: two-way-conflict, two-way-paranoid, \
-             two-way-alpha, two-way-alpha-strict, one-way-conflict, one-way-alpha, \
-             peering-conflict-dangerously-experimental, peering-alpha-dangerously-experimental)"
-        )),
+    if let Some(row) = MODES
+        .iter()
+        .find(|row| row.name == mode || row.also.contains(&mode))
+    {
+        return Ok((row.mode, row.peering));
     }
+    // The old spellings are answered, not merely unknown: the rename is
+    // the point, and a configuration that used them should be told why
+    // rather than quietly carried across.
+    if let Some((_, now, why)) = RENAMED_MODES.iter().find(|(was, ..)| *was == mode) {
+        return Err(format!("mode '{mode}' was renamed to '{now}': {why}"));
+    }
+    let expected: Vec<&str> = MODES.iter().map(|row| row.name).collect();
+    Err(format!(
+        "unknown mode '{mode}' (expected one of: {})",
+        expected.join(", ")
+    ))
 }
 
 /// Returns the canonical name of a synchronization mode.
 pub fn mode_name(mode: SyncMode) -> &'static str {
-    match mode {
-        SyncMode::TwoWaySafe => "two-way-conflict",
-        SyncMode::TwoWayParanoid => "two-way-paranoid",
-        SyncMode::TwoWayResolved => "two-way-alpha",
-        SyncMode::TwoWayStrict => "two-way-alpha-strict",
-        SyncMode::OneWaySafe => "one-way-conflict",
-        SyncMode::OneWayReplica => "one-way-alpha",
+    match MODES
+        .iter()
+        .find(|row| row.mode == mode && !row.peering)
+    {
+        Some(row) => row.name,
+        // Unreachable while every mode has a row of its own: the table
+        // is the list of modes, not a view of it.
+        None => "unknown",
     }
 }
 
@@ -2114,6 +2404,124 @@ fn host_of(destination: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every word in every table is a word its parser takes, and every
+    /// alias means what the row it sits on means. The tables are what
+    /// the error messages and the schema are written from, so a row
+    /// nobody can parse would be an offer the file cannot accept.
+    #[test]
+    fn every_word_the_tables_offer_is_a_word_a_parser_takes() {
+        for row in MODES {
+            assert_eq!(
+                parse_mode_spec(row.name).unwrap(),
+                (row.mode, row.peering),
+                "{}",
+                row.name
+            );
+            for also in row.also {
+                assert_eq!(
+                    parse_mode_spec(also).unwrap(),
+                    (row.mode, row.peering),
+                    "{also}"
+                );
+            }
+            assert!(!row.about.is_empty(), "{} says nothing", row.name);
+        }
+        for (was, now, _) in RENAMED_MODES {
+            let complaint = parse_mode_spec(was).unwrap_err();
+            assert!(complaint.contains(now), "{complaint}");
+            assert!(parse_mode_spec(now).is_ok(), "{now}");
+        }
+        for word in SYMLINK_MODES {
+            assert!(parse_symlink_mode(word.word).is_ok(), "{}", word.word);
+            for also in word.also {
+                assert_eq!(
+                    parse_symlink_mode(also).unwrap(),
+                    parse_symlink_mode(word.word).unwrap()
+                );
+            }
+        }
+        for word in STAGING_MODES {
+            assert!(parse_staging_mode(word.word).is_ok(), "{}", word.word);
+        }
+        for word in LOG_LEVELS {
+            assert_eq!(
+                crate::logging::Level::parse(word.word).map(|level| level.name()),
+                Some(word.word),
+                "{}",
+                word.word
+            );
+            for also in word.also {
+                assert_eq!(
+                    crate::logging::Level::parse(also).map(|level| level.name()),
+                    Some(word.word),
+                    "{also}"
+                );
+            }
+        }
+        // Durability is read where the plans are built, through the same
+        // table reader, so the table is checked against that reader.
+        for word in DURABILITY {
+            assert_eq!(
+                parse_word(DURABILITY, "durability", word.word).unwrap().word,
+                word.word
+            );
+        }
+        let complaint = parse_word(DURABILITY, "durability", "sometimes").unwrap_err();
+        assert!(complaint.contains("process, power"), "{complaint}");
+    }
+
+    /// The schema is the structs the parser uses, with the tables
+    /// written onto it — not a second description that can fall behind.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn the_schema_describes_the_same_file_the_parser_reads() {
+        let document = schema();
+        let groups = &document["properties"]["groups"];
+        assert!(groups.is_object(), "the schema names the groups map");
+        let defaults = &document["$defs"]["Defaults"]["properties"];
+        assert!(
+            defaults.get("interval").is_some(),
+            "a field of the struct is a field of the schema"
+        );
+        assert_eq!(defaults["interval"]["x-widget"], "seconds");
+
+        // Every word the schema offers anywhere is a word the file takes.
+        fn walk(node: &serde_json::Value, found: &mut usize) {
+            if let Some(map) = node.as_object() {
+                if let Some(words) = map.get("x-words").and_then(|words| words.as_array()) {
+                    *found += 1;
+                    for word in words {
+                        let word = word["word"].as_str().expect("a word is text");
+                        assert!(!word.is_empty());
+                    }
+                }
+                for value in map.values() {
+                    walk(value, found);
+                }
+            } else if let Some(items) = node.as_array() {
+                items.iter().for_each(|item| walk(item, found));
+            }
+        }
+        let mut found = 0;
+        walk(&document, &mut found);
+        assert!(found >= 4, "the tables reached the schema: {found}");
+
+        let mode = &document["$defs"]["Group"]["properties"]["mode"];
+        let offered: Vec<&str> = mode["enum"]
+            .as_array()
+            .expect("mode offers words")
+            .iter()
+            .map(|word| word.as_str().expect("a word is text"))
+            .collect();
+        assert_eq!(
+            offered,
+            MODES.iter().map(|row| row.name).collect::<Vec<_>>()
+        );
+        for word in offered {
+            assert!(parse_mode(word).is_ok(), "{word}");
+        }
+    }
     use super::*;
 
     /// A group name that starts with `-` reads as an option to every

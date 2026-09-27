@@ -31,6 +31,10 @@ minisign-verify = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
 gpui = { version = "0.2", optional = true }
 schemars = { version = "1", optional = true }
+# The other window: the same fleet drawn with GPUI Kit, which brings
+# its own GPUI. Kept behind its own feature and its own binary, so the
+# two never meet in one process.
+gpui-kit = { version = "0.6", optional = true }
 
 # The menu bar's ink, for the tray icon: the sign is drawn in the bar's
 # own black or white, which a template image cannot do once a coloured
@@ -55,6 +59,8 @@ tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2"
 desk = ["dep:gpui", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
+# The window again, on GPUI Kit. Its own binary: autobahn-desk-kit.
+desk-kit = ["dep:gpui-kit", "dep:image", "schema"]
 
 [dev-dependencies]
 proptest = "1"
@@ -78,3 +84,8 @@ codegen-units = 1
 # musl-tools on x86_64, zig (scripts/zig-cc) on aarch64.
 [target.'cfg(target_env = "musl")'.dependencies]
 mimalloc = { version = "0.1", default-features = false }
+
+[[bin]]
+name = "autobahn-desk-kit"
+path = "src/kit/main.rs"
+required-features = ["desk-kit"]

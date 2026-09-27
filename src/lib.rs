@@ -48,8 +48,14 @@ pub mod supervisor;
 pub mod text;
 pub mod threads;
 pub mod transport;
+/// Photographing a window, for whichever one is asked to.
+#[cfg(any(feature = "desk", feature = "desk-kit"))]
+pub(crate) mod camera;
+/// The same window, drawn with GPUI Kit.
+#[cfg(feature = "desk-kit")]
+pub mod kit;
 /// What the surfaces say, in one place.
-#[cfg(any(feature = "tray", feature = "desk"))]
+#[cfg(any(feature = "tray", feature = "desk", feature = "desk-kit"))]
 pub(crate) mod words;
 /// Notifications the system posts, for whoever can post them.
 #[cfg(any(feature = "tray", feature = "desk"))]

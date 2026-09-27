@@ -28,8 +28,8 @@ winit = { version = "0.30", optional = true }
 notify-rust = { version = "4", optional = true }
 toml_edit = "0.25.15"
 minisign-verify = "0.3"
-eframe = { version = "0.33.3", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"], optional = true }
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
+gpui = { version = "0.2", optional = true }
 
 # The menu bar's ink, for the tray icon: the sign is drawn in the bar's
 # own black or white, which a template image cannot do once a coloured
@@ -44,7 +44,7 @@ objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication",
 [features]
 tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit"]
 # A window over the fleet, personal and unshipped: apps/personal.
-desk = ["dep:eframe", "dep:image"]
+desk = ["dep:gpui", "dep:image"]
 
 [dev-dependencies]
 proptest = "1"

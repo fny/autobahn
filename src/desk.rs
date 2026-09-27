@@ -96,6 +96,7 @@ fn tint(colour: u32, alpha: u32) -> Rgba {
 enum Pane {
     Groups,
     Conflicts,
+    Config,
     Log,
     Hosts,
 }
@@ -105,6 +106,7 @@ impl Pane {
         match self {
             Pane::Groups => "Groups",
             Pane::Conflicts => "Conflicts",
+            Pane::Config => "Config",
             Pane::Log => "Log",
             Pane::Hosts => "Hosts",
         }
@@ -115,6 +117,7 @@ impl Pane {
         match self {
             Pane::Groups => "every group, every session, and what each one last did",
             Pane::Conflicts => "the paths waiting on a person",
+            Pane::Config => "the file, as the parser reads it",
             Pane::Log => "the supervisor's own account of itself",
             Pane::Hosts => "the machines the fleet talks to, and the bundle they run",
         }
@@ -135,6 +138,16 @@ pub struct Desk {
     /// Both sides of the open conflict, read when it was opened.
     sides: Option<(Side, Side)>,
     diff: Option<String>,
+    /// The configuration file as the editor holds it, and which part of
+    /// it the form is showing.
+    sheet: Option<Sheet>,
+    section: Section,
+    /// The field being typed into, if any.
+    typing: Option<Typing>,
+    /// The shape of the file, from the structs the parser reads it into.
+    shape: serde_json::Value,
+    /// Where keys go, so a window that is being typed into hears them.
+    focus: gpui::FocusHandle,
     log: Vec<String>,
     /// Which of the supervisor's two log files the lines came from.
     log_path: Option<PathBuf>,
@@ -157,6 +170,60 @@ struct Conflict {
     /// what the window has to show — and it needs to know where they are.
     alpha_root: String,
     beta_root: String,
+}
+
+/// Which part of the file the form is showing.
+#[derive(Clone, PartialEq, Eq)]
+enum Section {
+    /// The keys at the top of the file.
+    Settings,
+    /// `[defaults]`, inherited by every group.
+    Defaults,
+    /// One `[groups.x]`.
+    Group(String),
+}
+
+impl Section {
+    fn title(&self) -> String {
+        match self {
+            Section::Settings => "settings".to_owned(),
+            Section::Defaults => "defaults".to_owned(),
+            Section::Group(name) => name.clone(),
+        }
+    }
+}
+
+/// The configuration file, as the editor holds it between saves.
+struct Sheet {
+    path: PathBuf,
+    /// The file exactly as it was read, so an edit made elsewhere since
+    /// then is noticed rather than overwritten.
+    text: String,
+    /// The file itself, comments and order kept: every edit goes through
+    /// `toml_edit`, so saving a form does not rewrite a hand-written
+    /// file into something its author would not recognise.
+    document: toml_edit::DocumentMut,
+    /// What the parser said when the last save was refused. Nothing is
+    /// written while this is set — the parser is the referee, not the
+    /// form.
+    refused: Option<String>,
+}
+
+/// A field being typed into.
+struct Typing {
+    at: Spot,
+    text: String,
+    /// Where the next character goes, as a byte index into `text`.
+    cursor: usize,
+}
+
+/// Where one value lives in the file.
+#[derive(Clone, PartialEq, Eq)]
+struct Spot {
+    section: Section,
+    key: String,
+    /// Which entry, when the value is a list.
+    item: Option<usize>,
 }
 
 /// One side of a conflict, as the filesystem has it. Read once, when the
@@ -364,6 +431,7 @@ fn run_with(config: Option<PathBuf>, state_root: PathBuf, shots: Option<PathBuf>
             for (pane, name) in [
                 (Pane::Groups, "groups"),
                 (Pane::Conflicts, "conflicts"),
+                (Pane::Config, "config"),
                 (Pane::Log, "log"),
                 (Pane::Hosts, "hosts"),
             ] {
@@ -445,6 +513,11 @@ impl Desk {
             conflict: None,
             sides: None,
             diff: None,
+            sheet: None,
+            section: Section::Settings,
+            typing: None,
+            shape: crate::config::schema(),
+            focus: cx.focus_handle(),
             log: Vec::new(),
             log_path: None,
             errors_only: false,
@@ -480,6 +553,9 @@ impl Render for Desk {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.pane;
         div()
+            .id("desk")
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::typed))
             .size_full()
             .flex()
             .font_family(self.sans.clone())
@@ -497,6 +573,7 @@ impl Render for Desk {
                     .child(match pane {
                         Pane::Groups => self.groups(cx),
                         Pane::Conflicts => self.conflicts(cx),
+                        Pane::Config => self.config_pane(cx),
                         Pane::Log => self.log_pane(cx),
                         Pane::Hosts => self.hosts(),
                     })
@@ -571,6 +648,7 @@ impl Desk {
                     .gap(step(0.5))
                     .child(self.nav(Pane::Groups, None, cx))
                     .child(self.nav(Pane::Conflicts, Some(waiting), cx))
+                    .child(self.nav(Pane::Config, None, cx))
                     .child(self.nav(Pane::Log, None, cx))
                     .child(self.nav(Pane::Hosts, None, cx)),
             )
@@ -629,9 +707,7 @@ impl Desk {
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.pane = pane;
-                if pane == Pane::Log && this.log.is_empty() {
-                    this.read_log();
-                }
+                this.settle(pane);
                 cx.notify();
             }))
             .into_any_element()
@@ -1457,6 +1533,733 @@ impl Desk {
             })
     }
 
+    // ── the configuration ────────────────────────────────────────────
+
+    /// The file: its sections down the left, the fields of the open one
+    /// on the right. Every field is drawn from the schema the parser's
+    /// own structs generate, so a key the file may hold is a key this
+    /// form shows, and the words a key accepts are the words it offers.
+    fn config_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(sheet) = &self.sheet else {
+            return empty("no configuration file to read");
+        };
+        let path = sheet.path.clone();
+        let refused = sheet.refused.clone();
+        let sections = self.sections();
+        let open = self.section.clone();
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .child(
+                div()
+                    .id("sections")
+                    .w(px(260.))
+                    .flex_shrink_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p(step(3.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(0.5))
+                    .border_r_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SUNK))
+                    .child(
+                        div()
+                            .px(step(2.5))
+                            .pb(step(1.))
+                            .font_family(self.mono.clone())
+                            .text_size(px(T_PILL))
+                            .text_color(rgb(FAINT))
+                            .truncate()
+                            .child(tail(&tilde(&path.display().to_string()), 3)),
+                    )
+                    .child(
+                        div()
+                            .px(step(2.5))
+                            .pb(step(2.))
+                            .text_size(px(T_PILL))
+                            .text_color(rgb(FAINT))
+                            .child(
+                                "Every change is written at once. Nothing is written that the \
+                                 parser would not load.",
+                            ),
+                    )
+                    .child(
+                        div().px(step(2.)).pb(step(2.5)).flex().child(
+                            button("re-read-config", "Re-read the file").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.typing = None;
+                                    this.read_sheet();
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                    )
+                    .children(sections.into_iter().map(|section| {
+                        let chosen = section == open;
+                        let label = section.title();
+                        let group = matches!(section, Section::Group(_));
+                        div()
+                            .id(SharedString::from(format!("section-{label}")))
+                            .px(step(2.5))
+                            .py(step(1.5))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(step(1.5))
+                            .text_size(px(T_ROW))
+                            .when(chosen, |row| row.bg(rgb(RAISED)).text_color(rgb(INK)))
+                            .when(!chosen, |row| {
+                                row.text_color(rgb(DIM)).hover(|row| row.bg(rgb(PANEL)))
+                            })
+                            .when(group, |row| row.child(dot(BLUE)))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.section = section.clone();
+                                this.typing = None;
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .child(
+                div()
+                    .id("fields")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .overflow_y_scroll()
+                    .px(step(6.))
+                    .py(step(5.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(4.))
+                    .when_some(refused, |column, refused| {
+                        column.child(
+                            div()
+                                .rounded(px(8.))
+                                .bg(tint(AMBER, 0x14))
+                                .border_1()
+                                .border_color(tint(AMBER, 0x50))
+                                .p(step(3.5))
+                                .flex()
+                                .flex_col()
+                                .gap(step(1.5))
+                                .child(
+                                    div()
+                                        .text_size(px(T_META))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(AMBER))
+                                        .child("not saved — the file would not load"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(T_META))
+                                        .text_color(rgb(DIM))
+                                        .child(crate::text::display_block(&refused)),
+                                ),
+                        )
+                    })
+                    .children(self.form(cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The sections of the open file, in the order they are written.
+    fn sections(&self) -> Vec<Section> {
+        let mut sections = vec![Section::Settings, Section::Defaults];
+        if let Some(sheet) = &self.sheet {
+            if let Some(groups) = sheet.document.get("groups").and_then(|item| item.as_table()) {
+                for (name, _) in groups.iter() {
+                    sections.push(Section::Group(name.to_owned()));
+                }
+            }
+        }
+        sections
+    }
+
+    /// The fields of the open section, from the schema.
+    fn form(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let properties = match &self.section {
+            Section::Settings => self.shape.get("properties").cloned(),
+            Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
+            Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),
+        };
+        let Some(serde_json::Value::Object(properties)) = properties else {
+            return vec![empty("the schema says nothing about this section")];
+        };
+        properties
+            .iter()
+            .filter(|(key, _)| !SILENT.contains(&key.as_str()))
+            .map(|(key, field)| self.field(key, field, cx))
+            .collect()
+    }
+
+    /// One field: its name, what it holds now, and the control for it.
+    fn field(&self, key: &str, field: &serde_json::Value, cx: &mut Context<Self>) -> AnyElement {
+        let about = field["description"].as_str().unwrap_or_default().to_owned();
+        let words: Vec<(String, String)> = field["x-words"]
+            .as_array()
+            .map(|words| {
+                words
+                    .iter()
+                    .map(|word| {
+                        (
+                            word["word"].as_str().unwrap_or_default().to_owned(),
+                            word["about"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
+        let held = self.held(key);
+        div()
+            .flex()
+            .gap(step(4.))
+            .child(
+                div()
+                    .w(px(210.))
+                    .flex_shrink_0()
+                    .pt(step(1.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(T_ROW))
+                            .text_color(rgb(INK))
+                            .child(key.to_owned()),
+                    )
+                    .when(!widget.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .text_size(px(T_PILL))
+                                .text_color(rgb(FAINT))
+                                .child(widget.clone()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(1.5))
+                    .child(self.widget(key, field, &words, held, cx))
+                    .when(!about.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .max_w(px(620.))
+                                .text_size(px(T_META))
+                                .text_color(rgb(FAINT))
+                                .child(first_sentence(&about)),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    /// The control a field gets: words to choose from, a switch, a list,
+    /// or a line of text.
+    fn widget(
+        &self,
+        key: &str,
+        field: &serde_json::Value,
+        words: &[(String, String)],
+        held: Option<toml_edit::Item>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let section = self.section.clone();
+        if !words.is_empty() {
+            let now = held
+                .as_ref()
+                .and_then(|item| item.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let set = held.is_some();
+            return div()
+                .flex()
+                .flex_col()
+                .gap(step(1.5))
+                .child(div()
+                .flex()
+                .flex_wrap()
+                .gap(step(1.5))
+                .children(words.iter().map(|(word, _)| {
+                    let chosen = *word == now;
+                    let word = word.clone();
+                    let writing = word.clone();
+                    let key = key.to_owned();
+                    let section = section.clone();
+                    div()
+                        .id(SharedString::from(format!("word-{key}-{word}")))
+                        .px(step(2.))
+                        .py(step(1.))
+                        .rounded(px(6.))
+                        .cursor_pointer()
+                        .border_1()
+                        .text_size(px(T_META))
+                        .when(chosen, |chip| {
+                            chip.bg(tint(BLUE, 0x22))
+                                .border_color(tint(BLUE, 0x60))
+                                .text_color(rgb(BLUE))
+                        })
+                        .when(!chosen, |chip| {
+                            chip.bg(rgb(RAISED))
+                                .border_color(rgb(LINE))
+                                .text_color(rgb(DIM))
+                                .hover(|chip| chip.bg(rgb(0x252c36)))
+                        })
+                        .child(word.clone())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            // Clicking the chosen word again takes the key
+                            // out of the file, which is how a group goes
+                            // back to inheriting one.
+                            this.put(
+                                &Spot {
+                                    section: section.clone(),
+                                    key: key.clone(),
+                                    item: None,
+                                },
+                                (!chosen).then(|| toml_edit::value(writing.clone())),
+                            );
+                            cx.notify();
+                        }))
+                }))
+                )
+                .when(!set, |column| {
+                    column.child(
+                        div()
+                            .text_size(px(T_META))
+                            .text_color(rgb(FAINT))
+                            .child("not in the file · inherited"),
+                    )
+                })
+                .into_any_element();
+        }
+        let default = &field["default"];
+        match holds(field) {
+            Holds::Switch => {
+                let now = held
+                    .as_ref()
+                    .and_then(|item| item.as_bool())
+                    .or_else(|| default.as_bool())
+                    .unwrap_or(false);
+                let set = held.is_some();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(2.5))
+                    .child(self.switch(key, now, cx))
+                    .when(!set, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(T_META))
+                                .text_color(rgb(FAINT))
+                                .child(match default.as_bool() {
+                                    Some(true) => "not in the file · on unless said otherwise",
+                                    Some(false) => "not in the file · off unless said otherwise",
+                                    None => "not in the file",
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Holds::List => {
+                let entries: Vec<String> = held
+                    .as_ref()
+                    .and_then(|item| item.as_array())
+                    .map(|array| {
+                        array
+                            .iter()
+                            .map(|value| value.as_str().unwrap_or_default().to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.list(key, entries, cx)
+            }
+            Holds::Line => {
+                let text = held.as_ref().map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| item.to_string().trim().to_owned())
+                });
+                self.line(key, None, text, cx)
+            }
+        }
+    }
+
+    fn switch(&self, key: &str, on: bool, cx: &mut Context<Self>) -> AnyElement {
+        let section = self.section.clone();
+        let key = key.to_owned();
+        toggle_switch(SharedString::from(format!("switch-{key}")), on)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.put(
+                    &Spot {
+                        section: section.clone(),
+                        key: key.clone(),
+                        item: None,
+                    },
+                    Some(toml_edit::value(!on)),
+                );
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// A list of strings: each entry editable, removable, and one more
+    /// can be started.
+    fn list(&self, key: &str, entries: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
+        let section = self.section.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap(step(1.))
+            .children(entries.iter().enumerate().map(|(index, entry)| {
+                let key = key.to_owned();
+                let section = section.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(1.5))
+                    .child(self.line(&key, Some(index), Some(entry.clone()), cx))
+                    .child(
+                        button(format!("drop-{key}-{index}"), "×").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.drop_item(
+                                    &Spot {
+                                        section: section.clone(),
+                                        key: key.clone(),
+                                        item: Some(index),
+                                    },
+                                );
+                                cx.notify();
+                            },
+                        )),
+                    )
+            }))
+            .child({
+                let key = key.to_owned();
+                let section = section.clone();
+                let next = entries.len();
+                div().flex().child(
+                    button(format!("add-{key}"), "Add").on_click(cx.listener(
+                        move |this, _, window, cx| {
+                            this.start_typing(
+                                Spot {
+                                    section: section.clone(),
+                                    key: key.clone(),
+                                    item: Some(next),
+                                },
+                                String::new(),
+                                window,
+                            );
+                            cx.notify();
+                        },
+                    )),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One line of text: what it holds, or a caret where it is being
+    /// typed into.
+    fn line(
+        &self,
+        key: &str,
+        item: Option<usize>,
+        held: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let spot = Spot {
+            section: self.section.clone(),
+            key: key.to_owned(),
+            item,
+        };
+        let typing = self
+            .typing
+            .as_ref()
+            .filter(|typing| typing.at == spot);
+        let id = SharedString::from(format!(
+            "line-{}-{key}-{}",
+            self.section.title(),
+            item.map(|index| index.to_string()).unwrap_or_default()
+        ));
+        let frame = div()
+            .id(id)
+            .h(step(7.))
+            .px(step(2.))
+            .min_w(px(220.))
+            .max_w(px(620.))
+            .rounded(px(6.))
+            .border_1()
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .font_family(self.mono.clone())
+            .text_size(px(T_META));
+        match typing {
+            Some(typing) => {
+                let (before, after) = typing.text.split_at(typing.cursor);
+                frame
+                    .bg(rgb(SUNK))
+                    .border_color(tint(BLUE, 0x80))
+                    .text_color(rgb(INK))
+                    .child(before.to_owned())
+                    .child(div().w(px(1.5)).h(px(15.)).bg(rgb(BLUE)))
+                    .child(after.to_owned())
+                    .into_any_element()
+            }
+            None => {
+                let start = held.clone().unwrap_or_default();
+                frame
+                    .bg(rgb(RAISED))
+                    .border_color(rgb(LINE))
+                    .hover(|line| line.border_color(rgb(0x39424e)))
+                    .text_color(match held.is_some() {
+                        true => rgb(INK),
+                        false => rgb(FAINT),
+                    })
+                    .child(match &held {
+                        Some(text) if text.is_empty() => "(empty)".to_owned(),
+                        Some(text) => text.clone(),
+                        None => "not set".to_owned(),
+                    })
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_typing(spot.clone(), start.clone(), window);
+                        cx.notify();
+                    }))
+                    .into_any_element()
+            }
+        }
+    }
+
+    // ── what the editor does to the file ─────────────────────────────
+
+    fn config_path(&self) -> Option<PathBuf> {
+        match &self.config {
+            Some(path) => Some(path.clone()),
+            None => crate::paths::default_config_path().ok(),
+        }
+    }
+
+    fn read_sheet(&mut self) {
+        let Some(path) = self.config_path() else {
+            return;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match text.parse::<toml_edit::DocumentMut>() {
+                Ok(document) => {
+                    self.sheet = Some(Sheet {
+                        path,
+                        text,
+                        document,
+                        refused: None,
+                    })
+                }
+                Err(error) => {
+                    self.said = Some(format!("{} does not parse: {error}", path.display()))
+                }
+            },
+            Err(error) => {
+                self.said = Some(format!("unable to read {}: {error}", path.display()))
+            }
+        }
+    }
+
+    /// What the file holds for a key of the open section.
+    fn held(&self, key: &str) -> Option<toml_edit::Item> {
+        let sheet = self.sheet.as_ref()?;
+        let table: &toml_edit::Item = match &self.section {
+            Section::Settings => sheet.document.as_item(),
+            Section::Defaults => sheet.document.get("defaults")?,
+            Section::Group(name) => sheet.document.get("groups")?.get(name)?,
+        };
+        table.get(key).cloned()
+    }
+
+    fn start_typing(&mut self, at: Spot, text: String, window: &mut Window) {
+        let cursor = text.len();
+        self.typing = Some(Typing { at, text, cursor });
+        window.focus(&self.focus);
+    }
+
+    /// Keys, while a field is being typed into. Nothing else in the
+    /// window reads them.
+    fn typed(&mut self, event: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(typing) = &mut self.typing else {
+            return;
+        };
+        let key = event.keystroke.key.as_str();
+        let command = event.keystroke.modifiers.platform;
+        match key {
+            "escape" => self.typing = None,
+            "enter" => {
+                let typing = self.typing.take().expect("a field is being typed into");
+                let text = typing.text.clone();
+                self.put(&typing.at, Some(toml_edit::value(text)));
+            }
+            "backspace" => {
+                if typing.cursor > 0 {
+                    let mut at = typing.cursor - 1;
+                    while !typing.text.is_char_boundary(at) {
+                        at -= 1;
+                    }
+                    typing.text.replace_range(at..typing.cursor, "");
+                    typing.cursor = at;
+                }
+            }
+            "left" => {
+                let mut at = typing.cursor;
+                while at > 0 {
+                    at -= 1;
+                    if typing.text.is_char_boundary(at) {
+                        break;
+                    }
+                }
+                typing.cursor = at;
+            }
+            "right" => {
+                let mut at = typing.cursor;
+                while at < typing.text.len() {
+                    at += 1;
+                    if typing.text.is_char_boundary(at) {
+                        break;
+                    }
+                }
+                typing.cursor = at;
+            }
+            "v" if command => {
+                if let Some(pasted) = cx
+                    .read_from_clipboard()
+                    .and_then(|item| item.text())
+                    .filter(|text| !text.is_empty())
+                {
+                    let pasted: String = pasted.lines().next().unwrap_or_default().to_owned();
+                    let at = typing.cursor;
+                    typing.text.insert_str(at, &pasted);
+                    typing.cursor = at + pasted.len();
+                }
+            }
+            _ => {
+                if command {
+                    return;
+                }
+                if let Some(typed) = event.keystroke.key_char.as_ref() {
+                    let at = typing.cursor;
+                    typing.text.insert_str(at, typed);
+                    typing.cursor = at + typed.len();
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Writes one value into the file — or does not, and says why.
+    ///
+    /// The form never decides whether an edit is allowed: the candidate
+    /// document goes through `Config::parse`, the very function the
+    /// supervisor loads the file with, and only a document that parses
+    /// is written to disk.
+    fn put(&mut self, at: &Spot, value: Option<toml_edit::Item>) {
+        let Some(sheet) = &self.sheet else { return };
+        let mut document = sheet.document.clone();
+        {
+            let table = match table_for(&mut document, &at.section) {
+                Some(table) => table,
+                None => {
+                    self.said = Some(format!("{} is not in the file", at.section.title()));
+                    return;
+                }
+            };
+            match (at.item, value) {
+                (None, Some(value)) => {
+                    table.insert(&at.key, value);
+                }
+                (None, None) => {
+                    table.remove(&at.key);
+                }
+                (Some(index), value) => {
+                    let mut array = table
+                        .get(&at.key)
+                        .and_then(|item| item.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    match value {
+                        Some(value) => {
+                            let text = value
+                                .as_str()
+                                .map(str::to_owned)
+                                .unwrap_or_else(|| value.to_string());
+                            match index < array.len() {
+                                true => {
+                                    array.replace(index, text);
+                                }
+                                false => array.push(text),
+                            }
+                        }
+                        None => {
+                            if index < array.len() {
+                                array.remove(index);
+                            }
+                        }
+                    }
+                    table.insert(&at.key, toml_edit::value(array));
+                }
+            }
+        }
+        self.commit(document);
+    }
+
+    fn drop_item(&mut self, at: &Spot) {
+        self.put(at, None);
+    }
+
+    /// Checks a candidate document with the parser, and writes it only
+    /// if the parser takes it.
+    fn commit(&mut self, document: toml_edit::DocumentMut) {
+        let Some(sheet) = &mut self.sheet else { return };
+        // Somebody may have been editing the same file in an editor
+        // since it was read. Their work is not this window's to
+        // overwrite.
+        if let Ok(now) = std::fs::read_to_string(&sheet.path) {
+            if now != sheet.text {
+                sheet.refused = Some(
+                    "the file changed on disk since this form read it. Re-read it, then make \
+                     the change again."
+                        .to_owned(),
+                );
+                self.said = Some("not saved: the file changed on disk".to_owned());
+                return;
+            }
+        }
+        let text = document.to_string();
+        match crate::config::Config::parse(&sheet.path, &text) {
+            Ok(_) => match std::fs::write(&sheet.path, &text) {
+                Ok(()) => {
+                    sheet.document = document;
+                    sheet.text = text;
+                    sheet.refused = None;
+                    let path = sheet.path.clone();
+                    self.said = Some(format!("saved {}", tilde(&path.display().to_string())));
+                }
+                Err(error) => {
+                    self.said = Some(format!("unable to write: {error}"));
+                }
+            },
+            Err(error) => {
+                sheet.refused = Some(format!("{error:#}"));
+                self.said = Some("not saved: the file would not load".to_owned());
+            }
+        }
+    }
+
     // ── the log ──────────────────────────────────────────────────────
 
     /// The supervisor's own account, filtered — the file is megabytes and
@@ -2004,7 +2807,16 @@ impl Desk {
                     }
                 }
             }
-            Pane::Log => self.read_log(),
+            Pane::Config => {
+                if self.sheet.is_none() {
+                    self.read_sheet();
+                }
+            }
+            Pane::Log => {
+                if self.log.is_empty() {
+                    self.read_log();
+                }
+            }
             Pane::Hosts => {}
         }
     }
@@ -2261,6 +3073,102 @@ fn toggle(id: &'static str, text: &'static str, on: bool) -> gpui::Stateful<Div>
         .child(text)
 }
 
+/// What a field holds, as the schema says.
+enum Holds {
+    Switch,
+    List,
+    Line,
+}
+
+/// Reads the type out of a schema field, through the `["string","null"]`
+/// spelling an optional field gets.
+fn holds(field: &serde_json::Value) -> Holds {
+    let named = |name: &str| match &field["type"] {
+        serde_json::Value::String(only) => only == name,
+        serde_json::Value::Array(any) => any.iter().any(|kind| kind == name),
+        _ => false,
+    };
+    if named("boolean") {
+        return Holds::Switch;
+    }
+    if named("array") {
+        return Holds::List;
+    }
+    Holds::Line
+}
+
+/// Keys the form does not show: the retired spellings kept only so a
+/// file that uses them gets an answer, and the sections that have a
+/// place of their own in the sidebar.
+const SILENT: &[&str] = &[
+    "groups",
+    "defaults",
+    "advanced",
+    "disabled",
+    "alerts",
+    "peering-experimental",
+];
+
+/// The table one section lives in, made if the file has not got it yet.
+fn table_for<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    section: &Section,
+) -> Option<&'a mut toml_edit::Table> {
+    match section {
+        Section::Settings => Some(document.as_table_mut()),
+        Section::Defaults => document
+            .entry("defaults")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut(),
+        Section::Group(name) => document
+            .entry("groups")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()?
+            .entry(name)
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut(),
+    }
+}
+
+/// The first sentence of a doc comment: enough to say what a field is
+/// for, without turning a form into a manual.
+fn first_sentence(about: &str) -> String {
+    let about = about.replace('\n', " ");
+    match about.split_once(". ") {
+        Some((first, _)) => format!("{first}."),
+        None => about,
+    }
+}
+
+/// A switch, for a key that is either on or off.
+fn toggle_switch(id: SharedString, on: bool) -> gpui::Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(44.))
+        .h(step(6.))
+        .rounded(px(12.))
+        .p(px(3.))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .when(on, |track| track.bg(tint(GREEN, 0x60)).justify_end())
+        .when(!on, |track| track.bg(rgb(RAISED)).justify_start())
+        .border_1()
+        .border_color(match on {
+            true => tint(GREEN, 0x80),
+            false => rgb(LINE),
+        })
+        .child(
+            div()
+                .size(px(16.))
+                .rounded_full()
+                .bg(rgb(match on {
+                    true => GREEN,
+                    false => FAINT,
+                })),
+        )
+}
+
 /// A pane with nothing in it yet says so in the middle, once.
 fn empty(text: &'static str) -> AnyElement {
     div()
@@ -2503,6 +3411,53 @@ mod tests {
         assert_eq!(on_this_machine("/tmp/a:b"), Some(PathBuf::from("/tmp/a:b")));
         let home = std::env::var("HOME").expect("a home directory");
         assert_eq!(on_this_machine("~/x"), Some(PathBuf::from(home).join("x")));
+    }
+
+    /// An edit through the form is an edit to the file the person wrote:
+    /// their comments and their order survive it, and the parser — the
+    /// same function the supervisor loads the file with — is what says
+    /// whether it may be written at all.
+    #[test]
+    fn an_edit_keeps_the_file_a_person_wrote_and_the_parser_has_the_last_word() {
+        let path = std::path::Path::new("config.toml");
+        let text = "# the fleet\n\
+                    [defaults]\n\
+                    mode = \"two-way-conflict\"  # both ways\n\
+                    \n\
+                    [groups.notes]\n\
+                    alpha = \"/tmp/a\"\n\
+                    betas = [\"/tmp/b\"]\n";
+        let mut document: toml_edit::DocumentMut = text.parse().expect("the file parses");
+
+        let table = table_for(&mut document, &Section::Group("notes".to_owned()))
+            .expect("the group is in the file");
+        table.insert("mode", toml_edit::value("one-way-alpha"));
+        let written = document.to_string();
+        assert!(written.contains("# the fleet"), "{written}");
+        assert!(written.contains("# both ways"), "{written}");
+        assert!(written.contains("mode = \"one-way-alpha\""), "{written}");
+        crate::config::Config::parse(path, &written).expect("the parser takes it");
+
+        // A key the parser does not know is refused, and the form is not
+        // the thing that decided so.
+        let table = table_for(&mut document, &Section::Group("notes".to_owned())).unwrap();
+        table.insert("mdoe", toml_edit::value("two-way-conflict"));
+        let complaint = crate::config::Config::parse(path, &document.to_string())
+            .expect_err("the parser refuses it");
+        assert!(format!("{complaint:#}").contains("mdoe"), "{complaint:#}");
+    }
+
+    /// A section the file has not got yet is made when something is
+    /// written into it, and not before.
+    #[test]
+    fn a_missing_section_is_made_only_when_it_is_written_to() {
+        let mut document: toml_edit::DocumentMut =
+            "[groups.a]\nalpha = \"/tmp/a\"\n".parse().unwrap();
+        assert!(!document.to_string().contains("[defaults]"));
+        let table = table_for(&mut document, &Section::Defaults).expect("a table is made");
+        table.insert("interval", toml_edit::value(30));
+        assert!(document.to_string().contains("[defaults]"));
+        assert!(document.to_string().contains("interval = 30"));
     }
 
     /// A path that will not fit keeps its end, which is the part that

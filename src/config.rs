@@ -2471,6 +2471,20 @@ mod tests {
         assert!(complaint.contains("process, power"), "{complaint}");
     }
 
+    /// Prints what the schema says about a few keys, for a person
+    /// building a form against it.
+    #[cfg(feature = "schema")]
+    #[test]
+    #[ignore = "a look at the schema, not a check"]
+    fn show_the_schema() {
+        let document = schema();
+        for key in ["reload", "disabled_hosts", "log", "on_alert"] {
+            println!("{key}: {}", document["properties"][key]);
+        }
+        println!("betas: {}", document["$defs"]["Group"]["properties"]["betas"]);
+        println!("ignores: {}", document["$defs"]["Group"]["properties"]["ignores"]);
+    }
+
     /// The schema is the structs the parser uses, with the tables
     /// written onto it — not a second description that can fall behind.
     #[cfg(feature = "schema")]

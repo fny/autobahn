@@ -21,6 +21,7 @@
 //! under ages however long the host name beside them runs.
 
 mod area;
+mod buffer;
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -2233,7 +2234,13 @@ impl Desk {
             selection: BLUE,
         };
         let font = self.mono.clone();
-        let area = cx.new(|cx| area::Area::new(text, list, font, px(T_META), ink, cx));
+        // A list shows ten lines and scrolls; a single value is one
+        // line and always was.
+        let rows = match list {
+            true => 10,
+            false => 1,
+        };
+        let area = cx.new(|cx| area::Area::new(text, list, rows, font, px(T_META), ink, cx));
         area.read(cx).focus(window);
         cx.subscribe(&area, |this, _, said, cx| {
             this.finish_edit(*said == area::Said::Keep, cx);

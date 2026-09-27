@@ -9,3 +9,7 @@ spec/states/
 
 # A/B, burst and matrix runs made here; the published ones are committed deliberately
 bench/results-bench-*/
+
+# The personal window's bundle and its build directory: the script makes
+# both, and neither belongs in the repository.
+apps/personal/Autobahn Desk.app/

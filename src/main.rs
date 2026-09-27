@@ -238,6 +238,22 @@ enum Command {
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
+    /// Personal: a window over the fleet — every group, the conflicts
+    /// with their differences, the log and the hosts. Unshipped, and
+    /// built by `apps/personal/build.sh` with the `desk` feature.
+    #[command(hide = true)]
+    Desk {
+        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        #[arg(long)]
+        config: Option<PathBuf>,
+        /// Override the state root (defaults to ~/.autobahn).
+        #[arg(long)]
+        state_root: Option<PathBuf>,
+        /// Photograph each pane into this directory and quit. How the
+        /// design document's screenshots are made.
+        #[arg(long, value_name = "DIR")]
+        shoot: Option<PathBuf>,
+    },
     /// Run the menu bar app: an icon whose colour is the state of every
     /// session, a menu with the detail, and the ways to settle each
     /// conflict. Experimental. Built with the `tray` feature.
@@ -766,6 +782,19 @@ fn main() {
             config,
             state_root,
         } => run_resolve(config, state_root, selector, paths, keep, all, yes, host),
+        #[cfg(feature = "desk")]
+        Command::Desk {
+            config,
+            state_root,
+            shoot,
+        } => resolve_state_root(state_root).and_then(|root| match shoot {
+            Some(directory) => autobahn::desk::shoot(config, root, directory),
+            None => autobahn::desk::run(config, root),
+        }),
+        #[cfg(not(feature = "desk"))]
+        Command::Desk { .. } => Err(anyhow::anyhow!(
+            "this build has no window; build one with `apps/personal/build.sh`"
+        )),
         #[cfg(feature = "tray")]
         Command::Tray { config, state_root } => {
             resolve_state_root(state_root).and_then(|root| autobahn::tray::run(config, root))

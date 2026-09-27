@@ -24,6 +24,8 @@
 
 pub mod alerts;
 pub mod config;
+#[cfg(feature = "desk")]
+pub mod desk;
 pub mod endpoint;
 pub mod fsutil;
 pub mod icon;

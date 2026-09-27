@@ -581,7 +581,7 @@ impl Render for Desk {
                         Pane::Conflicts => self.conflicts(cx),
                         Pane::Config => self.config_pane(cx),
                         Pane::Log => self.log_pane(cx),
-                        Pane::Hosts => self.hosts(),
+                        Pane::Hosts => self.hosts(cx),
                     })
                     .child(self.footer()),
             )
@@ -987,121 +987,136 @@ impl Desk {
             .when_some(
                 session.progress.as_ref().filter(|_| working),
                 |band, progress| {
-                    band.child(self.aside(describe(progress), BLUE))
+                    band.child(self.aside(
+                        format!("doing-{}-{}", group.name, session.beta),
+                        describe(progress),
+                        BLUE,
+                        cx,
+                    ))
                 },
             )
             .when_some(session.error.as_ref(), |band, error| {
-                band.child(self.aside(crate::text::display_safe(error).to_string(), RED))
+                band.child(self.aside(
+                    format!("error-{}-{}", group.name, session.beta),
+                    crate::text::display_safe(error).to_string(),
+                    RED,
+                    cx,
+                ))
+            })
+            // What is waiting reads across the card, like the error
+            // above it, rather than into a column half its width.
+            .when(open, |band| {
+                let mut band = band;
+                for (index, (heading, paths)) in
+                    waiting_groups(session).into_iter().enumerate()
+                {
+                    band = band.child(
+                        div()
+                            .pl(step(8.))
+                            .pr(step(4.))
+                            .pb(step(0.5))
+                            .text_size(px(T_META))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(AMBER))
+                            .child(heading),
+                    );
+                    for (at, path) in paths.into_iter().enumerate() {
+                        band = band.child(
+                            div().pl(step(10.)).pr(step(4.)).pb(step(0.5)).child(
+                                self.copyable(
+                                    format!(
+                                        "waiting-{}-{}-{index}-{at}",
+                                        group.name, session.beta
+                                    ),
+                                    path,
+                                    DIM,
+                                    cx,
+                                ),
+                            ),
+                        );
+                    }
+                    band = band.child(div().h(step(1.5)));
+                }
+                band
             })
             .when(open, |band| band.child(self.detail(group, session, cx)))
             .into_any_element()
     }
 
-    /// A line hanging under a session row, indented past its dot.
-    fn aside(&self, text: String, colour: u32) -> Div {
+    /// A line hanging under a session row, indented past its dot. It
+    /// runs the whole width of the card and scrolls sideways rather
+    /// than losing its end, because the end of one of these lines is
+    /// the reason — "refusing to remove unsynchronizable content" — and
+    /// the beginning is only a path.
+    fn aside(&self, id: String, text: String, colour: u32, cx: &mut Context<Self>) -> Div {
         div()
             .pl(step(8.))
             .pr(step(4.))
             .pb(step(2.))
+            .child(self.copyable(id, text, colour, cx))
+    }
+
+    /// Text a person can take away: gpui draws no selection, so a click
+    /// puts the whole line on the clipboard instead.
+    fn copyable(
+        &self,
+        id: String,
+        text: String,
+        colour: u32,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<Div> {
+        let taken = text.clone();
+        div()
+            .id(SharedString::from(id))
+            .overflow_x_scroll()
+            .whitespace_nowrap()
+            .cursor_pointer()
             .font_family(self.mono.clone())
             .text_size(px(T_META))
             .text_color(rgb(colour))
+            .hover(|line| line.bg(rgb(RAISED)))
+            .tooltip(tip("Click to copy this line"))
             .child(text)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(taken.clone()));
+                this.said = Some(format!("copied: {}", cap(&taken, 90)));
+                cx.notify();
+            }))
     }
 
-    /// The open session: both roots, what it last did, what is stuck, and
-    /// the four things that can be asked of it.
+    /// The open session: the two roots, and the four things that can be
+    /// asked of it. Everything the row above already says — the mode,
+    /// the cycles, the state — is not said again here.
     fn detail(
         &mut self,
         group: &GroupReport,
         session: &SessionReport,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let waiting: Vec<String> = session
-            .blocked
-            .iter()
-            .map(|blocked| crate::text::display_safe(blocked).to_string())
-            .chain(
-                session
-                    .conflicts
-                    .iter()
-                    .map(|conflict| crate::text::display_safe(&conflict.path).to_string()),
-            )
-            .collect();
         div()
             .bg(rgb(SUNK))
             .border_t_1()
             .border_color(rgb(HAIR))
             .p(step(4.))
             .flex()
-            .gap(step(6.))
+            .flex_col()
+            .gap(step(1.5))
+            .child(self.pair("alpha", tilde(&group.alpha), cx))
+            .child(self.pair("beta", tilde(&session.beta), cx))
             .child(
-                // Wide enough for a path: the two roots are the point of
-                // this panel, and a clipped root names nothing.
                 div()
-                    .w(px(560.))
-                    .flex_shrink_0()
+                    .pt(step(2.))
                     .flex()
-                    .flex_col()
                     .gap(step(1.5))
-                    .child(self.pair("alpha", tilde(&group.alpha)))
-                    .child(self.pair("beta", tilde(&session.beta)))
-                    .child(self.pair("mode", session.mode.clone()))
-                    .child(self.pair("cycles", thousands(session.cycles)))
-                    .child(self.pair("state", session.state.clone()))
-                    .child(
-                        div()
-                            .pt(step(2.))
-                            .flex()
-                            .gap(step(1.5))
-                            .child(self.verb(group, session, Verb::Flush, cx))
-                            .child(self.verb(group, session, Verb::Verify, cx))
-                            .child(self.verb(group, session, Verb::Pause, cx))
-                            .child(self.verb(group, session, Verb::Resume, cx)),
-                    )
-                    .child(
-                        div()
-                            .pt(step(1.))
-                            .text_size(px(T_META))
-                            .text_color(rgb(FAINT))
-                            .child(
-                                "Reset is not here on purpose: it resurrects deletions, and \
-                                 wants a sentence of its own before it is offered.",
-                            ),
-                    ),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w(px(0.))
-                    .pl(step(6.))
-                    .border_l_1()
-                    .border_color(rgb(HAIR))
-                    .flex()
-                    .flex_col()
-                    .gap(step(1.))
-                    .child(label("waiting on a person"))
-                    .when(waiting.is_empty(), |column| {
-                        column.child(
-                            div()
-                                .text_size(px(T_META))
-                                .text_color(rgb(FAINT))
-                                .child("nothing is waiting"),
-                        )
-                    })
-                    .children(waiting.into_iter().map(|path| {
-                        div()
-                            .font_family(self.mono.clone())
-                            .text_size(px(T_META))
-                            .text_color(rgb(AMBER))
-                            .truncate()
-                            .child(path)
-                    })),
+                    .child(self.verb(group, session, Verb::Flush, cx))
+                    .child(self.verb(group, session, Verb::Verify, cx))
+                    .child(self.verb(group, session, Verb::Pause, cx))
+                    .child(self.verb(group, session, Verb::Resume, cx)),
             )
             .into_any_element()
     }
 
-    fn pair(&self, name: &'static str, value: String) -> Div {
+    fn pair(&self, name: &'static str, value: String, cx: &mut Context<Self>) -> Div {
         div()
             .flex()
             .items_baseline()
@@ -1118,10 +1133,7 @@ impl Desk {
                 div()
                     .flex_1()
                     .min_w(px(0.))
-                    .font_family(self.mono.clone())
-                    .text_size(px(T_DATA))
-                    .truncate()
-                    .child(value),
+                    .child(self.copyable(format!("pair-{name}-{value}"), value, INK, cx)),
             )
     }
 
@@ -1139,6 +1151,7 @@ impl Desk {
             format!("verb-{}-{}-{}", name, beta, verb.word()),
             verb.word(),
         )
+        .tooltip(tip(verb.about()))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.control(&name, &beta, &key, verb);
             cx.notify();
@@ -1288,12 +1301,12 @@ impl Desk {
                         true => "blocked path",
                         false => "conflict",
                     }))
-                    .child(
-                        div()
-                            .font_family(self.mono.clone())
-                            .text_size(px(T_BODY))
-                            .child(crate::text::display_safe(&item.path).to_string()),
-                    )
+                    .child(self.copyable(
+                        format!("conflict-path-{}", item.path),
+                        crate::text::display_safe(&item.path).to_string(),
+                        INK,
+                        cx,
+                    ))
                     .child(
                         div()
                             .text_size(px(T_META))
@@ -1324,7 +1337,9 @@ impl Desk {
                                 .flex()
                                 .gap(step(1.5))
                                 .child(
-                                    button("keep-alpha", "Keep alpha").on_click(cx.listener(
+                                    button("keep-alpha", "Keep alpha")
+                                        .tooltip(tip("Keep this machine's version and copy it over the other side."))
+                                        .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             this.resolve(&alpha, "alpha");
                                             cx.notify();
@@ -1332,7 +1347,11 @@ impl Desk {
                                     )),
                                 )
                                 .child(
-                                    button("keep-beta", format!("Keep {keep_host}")).on_click(
+                                    button("keep-beta", format!("Keep {keep_host}"))
+                                        .tooltip(tip(
+                                            "Keep the other side's version and copy it here.",
+                                        ))
+                                        .on_click(
                                         cx.listener(move |this, _, _, cx| {
                                             let keep = host.host.clone();
                                             this.resolve(&host, &keep);
@@ -1340,7 +1359,9 @@ impl Desk {
                                         }),
                                     ),
                                 )
-                                .child(button("keep-both", "Keep both").on_click(cx.listener(
+                                .child(button("keep-both", "Keep both")
+                                    .tooltip(tip("Keep both versions: the other side's is kept beside this one under a suffixed name."))
+                                    .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.resolve(&both, "both");
                                         cx.notify();
@@ -1348,7 +1369,9 @@ impl Desk {
                                 )))
                                 .when(!binary, |row| {
                                     row.child(
-                                        button("show-diff", "Show the difference").on_click(
+                                        button("show-diff", "Show the difference")
+                                            .tooltip(tip("Run autobahn diff and show what it prints."))
+                                            .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 this.read_diff(&shown);
                                                 cx.notify();
@@ -1508,12 +1531,14 @@ impl Desk {
             .child(self.pair(
                 "size",
                 side.size.map(human_size).unwrap_or_else(|| "—".to_owned()),
+                cx,
             ))
             .child(self.pair(
                 "written",
                 side.modified
                     .map(|at| crate::logging::stamp(at as libc::time_t))
                     .unwrap_or_else(|| "—".to_owned()),
+                cx,
             ))
             .child(self.pair(
                 "blake3",
@@ -1522,14 +1547,13 @@ impl Desk {
                     (None, Some(size)) if size > HASH_LIMIT => "too large to hash here".to_owned(),
                     _ => "—".to_owned(),
                 },
+                cx,
             ))
             .when_some(file, |card, file| {
                 card.child(
                     div().pt(step(1.5)).flex().child(
-                        button(
-                            format!("reveal-{}", side.name),
-                            "Reveal in Finder",
-                        )
+                        button(format!("reveal-{}", side.name), "Reveal in Finder")
+                            .tooltip(tip("Show this file in the Finder."))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.reveal(&file);
                             cx.notify();
@@ -1603,6 +1627,7 @@ impl Desk {
                             .gap(step(1.5))
                             .child(
                                 button("save-config", "Save")
+                                    .tooltip(tip("Write the held changes. The supervisor re-reads the file within a few seconds and restarts only the sessions whose plan changed."))
                                     .when(pending == 0 || refused.is_some(), |save| {
                                         save.opacity(0.45)
                                     })
@@ -1617,7 +1642,9 @@ impl Desk {
                                     })),
                             )
                             .when(pending > 0, |row| {
-                                row.child(button("revert-config", "Revert").on_click(
+                                row.child(button("revert-config", "Revert")
+                                    .tooltip(tip("Throw the held changes away and go back to the file on disk."))
+                                    .on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.revert();
                                         cx.notify();
@@ -1625,7 +1652,9 @@ impl Desk {
                                 ))
                             })
                             .when(pending == 0, |row| {
-                                row.child(button("re-read-config", "Re-read").on_click(
+                                row.child(button("re-read-config", "Re-read")
+                                    .tooltip(tip("Read the file again, in case it was edited elsewhere."))
+                                    .on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.typing = None;
                                         this.read_sheet();
@@ -2386,7 +2415,9 @@ impl Desk {
                             },
                         )),
                     )
-                    .child(button("re-read", "Re-read").on_click(cx.listener(
+                    .child(button("re-read", "Re-read")
+                        .tooltip(tip("Read the last 400 lines of the log again."))
+                        .on_click(cx.listener(
                         |this, _, _, cx| {
                             this.read_log();
                             cx.notify();
@@ -2419,10 +2450,21 @@ impl Desk {
                     .text_size(px(T_META))
                     .flex()
                     .flex_col()
-                    .children(lines.into_iter().map(|line| {
+                    .children(lines.into_iter().enumerate().map(|(index, line)| {
                         let complaint = is_complaint(&line);
                         let chatter = line.contains("debug:");
+                        let taken = line.clone();
                         div()
+                            .id(SharedString::from(format!("log-{index}")))
+                            .cursor_pointer()
+                            .tooltip(tip("Click to copy this line"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    taken.clone(),
+                                ));
+                                this.said = Some(format!("copied: {}", cap(&taken, 90)));
+                                cx.notify();
+                            }))
                             .pl(step(1.5))
                             .pr(step(1.5))
                             .py(px(1.))
@@ -2448,7 +2490,7 @@ impl Desk {
 
     /// Every host the fleet talks to, what it is carrying, and whether
     /// this build can talk to it.
-    fn hosts(&mut self) -> AnyElement {
+    fn hosts(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(report) = &self.report else {
             return empty("reading the fleet…");
         };
@@ -2513,11 +2555,12 @@ impl Desk {
                         div()
                             .w(px(320.))
                             .flex_shrink_0()
-                            .font_family(self.mono.clone())
-                            .text_size(px(T_META))
-                            .text_color(rgb(colour_of(worst)))
-                            .truncate()
-                            .child(complaint),
+                            .child(self.copyable(
+                                format!("host-{index}"),
+                                complaint,
+                                colour_of(worst),
+                                cx,
+                            )),
                     )
                     .child(
                         div()
@@ -2869,12 +2912,31 @@ impl Desk {
         match pane {
             Pane::Groups => {
                 if self.selected.is_none() {
+                    // The one that needs a person, if any: a window
+                    // that opens on a session with nothing to say has
+                    // wasted the only choice it gets to make.
                     self.selected = self.report.as_ref().and_then(|report| {
-                        report.groups.iter().find_map(|group| {
-                            group
-                                .sessions
-                                .first()
-                                .map(|session| (group.name.clone(), session.session.clone()))
+                        let sessions = || {
+                            report.groups.iter().flat_map(|group| {
+                                group.sessions.iter().map(move |session| (group, session))
+                            })
+                        };
+                        // What needs a person first, then what is away,
+                        // then whatever is first: a window that opens
+                        // on a session with nothing to say has wasted
+                        // the only choice it gets to make.
+                        let wanted = sessions()
+                            .find(|(_, session)| {
+                                severity(&session.state) == Severity::Attention
+                            })
+                            .or_else(|| {
+                                sessions().find(|(_, session)| {
+                                    severity(&session.state) == Severity::Bad
+                                })
+                            })
+                            .or_else(|| sessions().next());
+                        wanted.map(|(group, session)| {
+                            (group.name.clone(), session.session.clone())
                         })
                     });
                 }
@@ -3275,6 +3337,33 @@ fn toggle_switch(id: SharedString, on: bool) -> gpui::Stateful<Div> {
         )
 }
 
+/// What a button does, shown while the pointer rests on it.
+struct Tip {
+    text: SharedString,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px(step(2.))
+            .py(step(1.))
+            .rounded(px(6.))
+            .bg(rgb(RAISED))
+            .border_1()
+            .border_color(rgb(LINE))
+            .shadow_md()
+            .text_size(px(T_META))
+            .text_color(rgb(INK))
+            .max_w(px(320.))
+            .child(self.text.clone())
+    }
+}
+
+/// Hangs a sentence on a control.
+fn tip(text: &'static str) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView {
+    move |_, cx| cx.new(|_| Tip { text: text.into() }).into()
+}
+
 /// A pane with nothing in it yet says so in the middle, once.
 fn empty(text: &'static str) -> AnyElement {
     div()
@@ -3307,6 +3396,19 @@ impl Verb {
         }
     }
 
+    /// What pressing it does, for the tooltip.
+    fn about(self) -> &'static str {
+        match self {
+            Verb::Flush => "Wake this session for a cycle now, rather than waiting for its \
+                            interval.",
+            Verb::Verify => "Re-read every file's content on the next cycle, so a change made \
+                             without the metadata moving is seen.",
+            Verb::Pause => "Suspend cycling for this session. Nothing is forgotten; it picks \
+                            up where it left off.",
+            Verb::Resume => "Start cycling again after a pause.",
+        }
+    }
+
     fn done(self) -> &'static str {
         match self {
             Verb::Flush => "flushed",
@@ -3315,6 +3417,54 @@ impl Verb {
             Verb::Resume => "resumed",
         }
     }
+}
+
+/// What one session is waiting on, grouped the way `issues` groups it:
+/// the reason first, the paths under it.
+///
+/// A cause is the innermost message, and twenty files stopped by one
+/// thing are one heading with twenty paths, not twenty reasons.
+fn waiting_groups(session: &SessionReport) -> Vec<(String, Vec<String>)> {
+    const MOST: usize = 20;
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    for entry in &session.blocked {
+        let (side, path, cause) = crate::blocked::parts(entry);
+        let heading = format!("blocked on {side} · {cause}");
+        let path = crate::text::display_safe(path).to_string();
+        match groups.iter_mut().find(|(other, _)| *other == heading) {
+            Some((_, paths)) => paths.push(path),
+            None => groups.push((heading, vec![path])),
+        }
+    }
+    if !session.conflicts.is_empty() {
+        groups.push((
+            match session.conflicts.len() {
+                1 => "1 conflict · both sides changed it".to_owned(),
+                many => format!("{many} conflicts · both sides changed them"),
+            },
+            session
+                .conflicts
+                .iter()
+                .map(|conflict| crate::text::display_safe(&conflict.path).to_string())
+                .collect(),
+        ));
+    }
+    for (heading, paths) in &mut groups {
+        if heading.starts_with("blocked") && paths.len() > 1 {
+            *heading = format!("{} blocked · {}", paths.len(), heading.replacen("blocked on ", "on ", 1));
+        }
+        if paths.len() > MOST {
+            let rest = paths.len() - MOST;
+            paths.truncate(MOST);
+            paths.push(format!("… and {rest} more"));
+        }
+    }
+    groups
+}
+
+/// A line cut to fit a status bar.
+fn cap(text: &str, most: usize) -> String {
+    crate::text::cap_line(text, most).into_owned()
 }
 
 /// Whether a log line is the supervisor complaining.

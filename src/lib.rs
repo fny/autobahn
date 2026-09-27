@@ -23,6 +23,7 @@
 #![warn(clippy::doc_lazy_continuation)]
 
 pub mod alerts;
+pub mod blocked;
 pub mod config;
 #[cfg(feature = "desk")]
 pub mod desk;

@@ -20,6 +20,8 @@
 //! and is right-aligned in it, so cycles line up under cycles and ages
 //! under ages however long the host name beside them runs.
 
+mod area;
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -70,7 +72,6 @@ const BLUE: u32 = 0x6ea8f0;
 /// The type scale, in points.
 const T_PILL: f32 = 10.5;
 const T_META: f32 = 11.0;
-const T_DATA: f32 = 12.0;
 const T_ROW: f32 = 12.5;
 const T_BODY: f32 = 13.0;
 const T_GROUP: f32 = 14.5;
@@ -142,8 +143,8 @@ pub struct Desk {
     /// it the form is showing.
     sheet: Option<Sheet>,
     section: Section,
-    /// The field being typed into, if any.
-    typing: Option<Typing>,
+    /// The field being edited, if any.
+    editing: Option<Edit>,
     /// The shape of the file, from the structs the parser reads it into.
     shape: serde_json::Value,
     /// Where keys go, so a window that is being typed into hears them.
@@ -215,12 +216,12 @@ struct Sheet {
     edits: usize,
 }
 
-/// A field being typed into.
-struct Typing {
+/// A field being edited, and the block of text doing the editing.
+struct Edit {
     at: Spot,
-    text: String,
-    /// Where the next character goes, as a byte index into `text`.
-    cursor: usize,
+    area: gpui::Entity<area::Area>,
+    /// Whether the value is a list, one entry to a line.
+    list: bool,
 }
 
 /// Where one value lives in the file.
@@ -521,7 +522,7 @@ impl Desk {
             diff: None,
             sheet: None,
             section: Section::Settings,
-            typing: None,
+            editing: None,
             shape: crate::config::schema(),
             focus: cx.focus_handle(),
             log: Vec::new(),
@@ -1656,7 +1657,7 @@ impl Desk {
                                     .tooltip(tip("Read the file again, in case it was edited elsewhere."))
                                     .on_click(
                                     cx.listener(|this, _, _, cx| {
-                                        this.typing = None;
+                                        this.editing = None;
                                         this.read_sheet();
                                         cx.notify();
                                     }),
@@ -1698,7 +1699,7 @@ impl Desk {
                             .child(label)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.section = section.clone();
-                                this.typing = None;
+                                this.editing = None;
                                 cx.notify();
                             }))
                     })),
@@ -1873,12 +1874,17 @@ impl Desk {
                 .flex()
                 .flex_wrap()
                 .gap(step(1.5))
-                .children(words.iter().map(|(word, _)| {
+                .children(words.iter().map(|(word, about)| {
                     let chosen = *word == now;
                     let word = word.clone();
                     let writing = word.clone();
                     let key = key.to_owned();
                     let section = section.clone();
+                    let about = SharedString::from(match chosen {
+                        true => format!("{about}\n\nClick again to take the key out of the \
+                                         file, so it is inherited."),
+                        false => about.clone(),
+                    });
                     div()
                         .id(SharedString::from(format!("word-{key}-{word}")))
                         .px(step(2.))
@@ -1899,6 +1905,10 @@ impl Desk {
                                 .hover(|chip| chip.bg(rgb(0x252c36)))
                         })
                         .child(word.clone())
+                        .tooltip(move |_, cx| {
+                            let about = about.clone();
+                            cx.new(|_| Tip { text: about }).into()
+                        })
                         .on_click(cx.listener(move |this, _, _, cx| {
                             // Clicking the chosen word again takes the key
                             // out of the file, which is how a group goes
@@ -1981,6 +1991,10 @@ impl Desk {
         let section = self.section.clone();
         let key = key.to_owned();
         toggle_switch(SharedString::from(format!("switch-{key}")), on)
+            .tooltip(match on {
+                true => tip("Write false into the file"),
+                false => tip("Write true into the file"),
+            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.put(
                     &Spot {
@@ -1995,63 +2009,118 @@ impl Desk {
             .into_any_element()
     }
 
-    /// A list of strings: each entry editable, removable, and one more
-    /// can be started.
+    /// A list of strings, edited as what it is: lines.
+    ///
+    /// Twenty ignore patterns are twenty lines, not twenty little boxes
+    /// with a cross beside each. Reading them, pasting a few in, taking
+    /// one out — all of that is what a block of text is for.
     fn list(&self, key: &str, entries: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
-        let section = self.section.clone();
+        let spot = Spot {
+            section: self.section.clone(),
+            key: key.to_owned(),
+            item: None,
+        };
+        if let Some(edit) = self.editing.as_ref().filter(|edit| edit.at == spot) {
+            return self.editor(edit, "one to a line", cx);
+        }
+        let start = entries.join("\n");
+        let count = entries.len();
         div()
             .flex()
             .flex_col()
-            .gap(step(1.))
-            .children(entries.iter().enumerate().map(|(index, entry)| {
-                let key = key.to_owned();
-                let section = section.clone();
+            .gap(step(1.5))
+            .child(
                 div()
+                    .id(SharedString::from(format!("list-{key}")))
+                    .min_w(px(280.))
+                    .max_w(px(620.))
+                    .px(step(2.))
+                    .py(step(1.5))
+                    .rounded(px(6.))
+                    .bg(rgb(RAISED))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .cursor_pointer()
+                    .hover(|list| list.border_color(rgb(0x39424e)))
+                    .tooltip(tip("Click to edit these as text, one to a line"))
+                    .font_family(self.mono.clone())
+                    .text_size(px(T_META))
                     .flex()
-                    .items_center()
-                    .gap(step(1.5))
-                    .child(self.line(&key, Some(index), Some(entry.clone()), cx))
-                    .child(
-                        button(format!("drop-{key}-{index}"), "×").on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.drop_item(
-                                    &Spot {
-                                        section: section.clone(),
-                                        key: key.clone(),
-                                        item: Some(index),
-                                    },
-                                );
-                                cx.notify();
-                            },
-                        )),
+                    .flex_col()
+                    .when(count == 0, |list| {
+                        list.child(div().text_color(rgb(FAINT)).child("nothing"))
+                    })
+                    .children(
+                        entries
+                            .into_iter()
+                            .map(|entry| div().whitespace_nowrap().child(entry)),
                     )
-            }))
-            .child({
-                let key = key.to_owned();
-                let section = section.clone();
-                let next = entries.len();
-                div().flex().child(
-                    button(format!("add-{key}"), "Add").on_click(cx.listener(
-                        move |this, _, window, cx| {
-                            this.start_typing(
-                                Spot {
-                                    section: section.clone(),
-                                    key: key.clone(),
-                                    item: Some(next),
-                                },
-                                String::new(),
-                                window,
-                            );
-                            cx.notify();
-                        },
-                    )),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.start_edit(spot.clone(), start.clone(), true, window, cx);
+                        cx.notify();
+                    })),
+            )
+            .when(count > 1, |column| {
+                column.child(
+                    div()
+                        .text_size(px(T_PILL))
+                        .text_color(rgb(FAINT))
+                        .child(format!("{count} entries")),
                 )
             })
             .into_any_element()
     }
 
-    /// One line of text: what it holds, or a caret where it is being
-    /// typed into.
+    /// The block of text itself, with the two things that end it.
+    fn editor(&self, edit: &Edit, about: &'static str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(step(1.5))
+            .child(
+                div()
+                    .min_w(px(280.))
+                    .max_w(px(620.))
+                    .px(step(2.))
+                    .py(step(1.5))
+                    .rounded(px(6.))
+                    .bg(rgb(SUNK))
+                    .border_1()
+                    .border_color(tint(BLUE, 0x80))
+                    .child(edit.area.clone()),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(1.5))
+                    .child(
+                        button("edit-keep", "Done")
+                            .tooltip(tip("Keep this value. Command-Enter does the same."))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.finish_edit(true, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        button("edit-leave", "Cancel")
+                            .tooltip(tip("Leave the value as it was. Escape does the same."))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.finish_edit(false, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(T_PILL))
+                            .text_color(rgb(FAINT))
+                            .child(about),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One value of text: what it holds, or the block editing it.
     fn line(
         &self,
         key: &str,
@@ -2064,20 +2133,18 @@ impl Desk {
             key: key.to_owned(),
             item,
         };
-        let typing = self
-            .typing
-            .as_ref()
-            .filter(|typing| typing.at == spot);
-        let id = SharedString::from(format!(
-            "line-{}-{key}-{}",
-            self.section.title(),
-            item.map(|index| index.to_string()).unwrap_or_default()
-        ));
-        let frame = div()
-            .id(id)
+        if let Some(edit) = self.editing.as_ref().filter(|edit| edit.at == spot) {
+            return self.editor(edit, "Enter keeps it", cx);
+        }
+        let start = held.clone().unwrap_or_default();
+        div()
+            .id(SharedString::from(format!(
+                "line-{}-{key}",
+                self.section.title()
+            )))
             .h(step(7.))
             .px(step(2.))
-            .min_w(px(220.))
+            .min_w(px(280.))
             .max_w(px(620.))
             .rounded(px(6.))
             .border_1()
@@ -2085,41 +2152,25 @@ impl Desk {
             .items_center()
             .cursor_pointer()
             .font_family(self.mono.clone())
-            .text_size(px(T_META));
-        match typing {
-            Some(typing) => {
-                let (before, after) = typing.text.split_at(typing.cursor);
-                frame
-                    .bg(rgb(SUNK))
-                    .border_color(tint(BLUE, 0x80))
-                    .text_color(rgb(INK))
-                    .child(before.to_owned())
-                    .child(div().w(px(1.5)).h(px(15.)).bg(rgb(BLUE)))
-                    .child(after.to_owned())
-                    .into_any_element()
-            }
-            None => {
-                let start = held.clone().unwrap_or_default();
-                frame
-                    .bg(rgb(RAISED))
-                    .border_color(rgb(LINE))
-                    .hover(|line| line.border_color(rgb(0x39424e)))
-                    .text_color(match held.is_some() {
-                        true => rgb(INK),
-                        false => rgb(FAINT),
-                    })
-                    .child(match &held {
-                        Some(text) if text.is_empty() => "(empty)".to_owned(),
-                        Some(text) => text.clone(),
-                        None => "not set".to_owned(),
-                    })
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.start_typing(spot.clone(), start.clone(), window);
-                        cx.notify();
-                    }))
-                    .into_any_element()
-            }
-        }
+            .text_size(px(T_META))
+            .bg(rgb(RAISED))
+            .border_color(rgb(LINE))
+            .hover(|line| line.border_color(rgb(0x39424e)))
+            .tooltip(tip("Click to type a value. Enter keeps it, Escape leaves it."))
+            .text_color(match held.is_some() {
+                true => rgb(INK),
+                false => rgb(FAINT),
+            })
+            .child(match &held {
+                Some(text) if text.is_empty() => "(empty)".to_owned(),
+                Some(text) => text.clone(),
+                None => "not set".to_owned(),
+            })
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.start_edit(spot.clone(), start.clone(), false, window, cx);
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     // ── what the editor does to the file ─────────────────────────────
@@ -2167,86 +2218,65 @@ impl Desk {
         table.get(key).cloned()
     }
 
-    fn start_typing(&mut self, at: Spot, text: String, window: &mut Window) {
-        let cursor = text.len();
-        self.typing = Some(Typing { at, text, cursor });
-        window.focus(&self.focus);
+    /// Opens a block of text over a value.
+    fn start_edit(
+        &mut self,
+        at: Spot,
+        text: String,
+        list: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ink = area::Ink {
+            text: INK,
+            caret: BLUE,
+            selection: BLUE,
+        };
+        let font = self.mono.clone();
+        let area = cx.new(|cx| area::Area::new(text, list, font, px(T_META), ink, cx));
+        area.read(cx).focus(window);
+        cx.subscribe(&area, |this, _, said, cx| {
+            this.finish_edit(*said == area::Said::Keep, cx);
+            cx.notify();
+        })
+        .detach();
+        self.editing = Some(Edit { at, area, list });
     }
 
-    /// Keys, while a field is being typed into. Nothing else in the
-    /// window reads them.
-    fn typed(&mut self, event: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        let key = event.keystroke.key.as_str();
-        let command = event.keystroke.modifiers.platform;
-        if command && key == "s" {
-            self.save();
-            cx.notify();
-            return;
-        }
-        let Some(typing) = &mut self.typing else {
+    /// Closes it, keeping what was typed or leaving the value alone.
+    fn finish_edit(&mut self, keep: bool, cx: &mut Context<Self>) {
+        let Some(edit) = self.editing.take() else {
             return;
         };
-        match key {
-            "escape" => self.typing = None,
-            "enter" => {
-                let typing = self.typing.take().expect("a field is being typed into");
-                let text = typing.text.clone();
-                self.put(&typing.at, Some(toml_edit::value(text)));
-            }
-            "backspace" => {
-                if typing.cursor > 0 {
-                    let mut at = typing.cursor - 1;
-                    while !typing.text.is_char_boundary(at) {
-                        at -= 1;
-                    }
-                    typing.text.replace_range(at..typing.cursor, "");
-                    typing.cursor = at;
-                }
-            }
-            "left" => {
-                let mut at = typing.cursor;
-                while at > 0 {
-                    at -= 1;
-                    if typing.text.is_char_boundary(at) {
-                        break;
-                    }
-                }
-                typing.cursor = at;
-            }
-            "right" => {
-                let mut at = typing.cursor;
-                while at < typing.text.len() {
-                    at += 1;
-                    if typing.text.is_char_boundary(at) {
-                        break;
-                    }
-                }
-                typing.cursor = at;
-            }
-            "v" if command => {
-                if let Some(pasted) = cx
-                    .read_from_clipboard()
-                    .and_then(|item| item.text())
-                    .filter(|text| !text.is_empty())
-                {
-                    let pasted: String = pasted.lines().next().unwrap_or_default().to_owned();
-                    let at = typing.cursor;
-                    typing.text.insert_str(at, &pasted);
-                    typing.cursor = at + pasted.len();
-                }
-            }
-            _ => {
-                if command {
-                    return;
-                }
-                if let Some(typed) = event.keystroke.key_char.as_ref() {
-                    let at = typing.cursor;
-                    typing.text.insert_str(at, typed);
-                    typing.cursor = at + typed.len();
-                }
-            }
+        if !keep {
+            return;
         }
-        cx.notify();
+        let text = edit.area.read(cx).text().to_owned();
+        let value = match edit.list {
+            true => {
+                let mut list = toml_edit::Array::new();
+                for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    list.push(line);
+                }
+                Some(toml_edit::value(list))
+            }
+            false => match text.trim() {
+                // An emptied value is not an empty value: the key comes
+                // out of the file and whatever it inherits applies.
+                "" => None,
+                text => Some(number_or_text(text)),
+            },
+        };
+        self.put(&edit.at, value);
+    }
+
+    /// The one key the window itself reads: everything else belongs to
+    /// the block being typed into, which has the focus while it is open.
+    fn typed(&mut self, event: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.keystroke.modifiers.platform && event.keystroke.key == "s" {
+            self.save();
+            cx.notify();
+        }
     }
 
     /// Writes one value into the file — or does not, and says why.
@@ -2303,10 +2333,6 @@ impl Desk {
             }
         }
         self.hold(document);
-    }
-
-    fn drop_item(&mut self, at: &Spot) {
-        self.put(at, None);
     }
 
     /// Takes a changed document as the one being edited, and asks the
@@ -2372,7 +2398,7 @@ impl Desk {
 
     /// Throws the held edits away and goes back to the file on disk.
     fn revert(&mut self) {
-        self.typing = None;
+        self.editing = None;
         self.read_sheet();
         self.said = Some("went back to the file on disk".to_owned());
     }
@@ -3277,6 +3303,16 @@ fn table_for<'a>(
             .entry(name)
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
+    }
+}
+
+/// A value written back into the file: a number where the text is one,
+/// so `interval = 30` does not become `interval = "30"` and then fail
+/// to load.
+fn number_or_text(text: &str) -> toml_edit::Item {
+    match text.parse::<i64>() {
+        Ok(number) => toml_edit::value(number),
+        Err(_) => toml_edit::value(text.to_owned()),
     }
 }
 

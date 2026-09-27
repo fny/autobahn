@@ -94,7 +94,7 @@ fn tint(colour: u32, alpha: u32) -> Rgba {
 /// The panes, in the order the rail lists them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
-    Fleet,
+    Groups,
     Conflicts,
     Log,
     Hosts,
@@ -103,7 +103,7 @@ enum Pane {
 impl Pane {
     fn title(self) -> &'static str {
         match self {
-            Pane::Fleet => "Fleet",
+            Pane::Groups => "Groups",
             Pane::Conflicts => "Conflicts",
             Pane::Log => "Log",
             Pane::Hosts => "Hosts",
@@ -113,7 +113,7 @@ impl Pane {
     /// The line under the title: what this pane is for.
     fn about(self) -> &'static str {
         match self {
-            Pane::Fleet => "every group, every session, and what each one last did",
+            Pane::Groups => "every group, every session, and what each one last did",
             Pane::Conflicts => "the paths waiting on a person",
             Pane::Log => "the supervisor's own account of itself",
             Pane::Hosts => "the machines the fleet talks to, and the bundle they run",
@@ -362,7 +362,7 @@ fn run_with(config: Option<PathBuf>, state_root: PathBuf, shots: Option<PathBuf>
         let state_root = state_root.clone();
         cx.spawn(async move |cx: &mut gpui::AsyncApp| {
             for (pane, name) in [
-                (Pane::Fleet, "fleet"),
+                (Pane::Groups, "groups"),
                 (Pane::Conflicts, "conflicts"),
                 (Pane::Log, "log"),
                 (Pane::Hosts, "hosts"),
@@ -438,7 +438,7 @@ impl Desk {
         let mut desk = Desk {
             config,
             state_root,
-            pane: pane.unwrap_or(Pane::Fleet),
+            pane: pane.unwrap_or(Pane::Groups),
             report: None,
             read_at: None,
             selected: None,
@@ -495,7 +495,7 @@ impl Render for Desk {
                     .flex_col()
                     .child(self.header())
                     .child(match pane {
-                        Pane::Fleet => self.fleet(cx),
+                        Pane::Groups => self.groups(cx),
                         Pane::Conflicts => self.conflicts(cx),
                         Pane::Log => self.log_pane(cx),
                         Pane::Hosts => self.hosts(),
@@ -569,7 +569,7 @@ impl Desk {
                     .flex()
                     .flex_col()
                     .gap(step(0.5))
-                    .child(self.nav(Pane::Fleet, None, cx))
+                    .child(self.nav(Pane::Groups, None, cx))
                     .child(self.nav(Pane::Conflicts, Some(waiting), cx))
                     .child(self.nav(Pane::Log, None, cx))
                     .child(self.nav(Pane::Hosts, None, cx)),
@@ -729,12 +729,12 @@ impl Desk {
 
     // ── the fleet ────────────────────────────────────────────────────
 
-    fn fleet(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn groups(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(report) = self.report.clone() else {
             return empty("reading the fleet…");
         };
         div()
-            .id("fleet")
+            .id("groups")
             .flex_1()
             .min_h(px(0.))
             .overflow_y_scroll()
@@ -954,8 +954,10 @@ impl Desk {
             .flex()
             .gap(step(6.))
             .child(
+                // Wide enough for a path: the two roots are the point of
+                // this panel, and a clipped root names nothing.
                 div()
-                    .w(px(380.))
+                    .w(px(560.))
                     .flex_shrink_0()
                     .flex()
                     .flex_col()
@@ -1974,7 +1976,7 @@ impl Desk {
     /// it. Used when a window opens straight onto one pane.
     fn settle(&mut self, pane: Pane) {
         match pane {
-            Pane::Fleet => {
+            Pane::Groups => {
                 if self.selected.is_none() {
                     self.selected = self.report.as_ref().and_then(|report| {
                         report.groups.iter().find_map(|group| {

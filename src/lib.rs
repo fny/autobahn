@@ -48,6 +48,12 @@ pub mod supervisor;
 pub mod text;
 pub mod threads;
 pub mod transport;
+/// Notifications the system posts, for whoever can post them.
+#[cfg(any(feature = "tray", feature = "desk"))]
+pub(crate) mod native_alert;
+/// What the menu bar shows, for the tray and for the window.
+#[cfg(any(feature = "tray", feature = "desk"))]
+pub(crate) mod menubar;
 #[cfg(feature = "tray")]
 pub mod tray;
 pub mod tree;

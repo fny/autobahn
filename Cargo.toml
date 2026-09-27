@@ -41,11 +41,18 @@ schemars = { version = "1", optional = true }
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
 objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSAppearance", "NSResponder", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView"] }
+# Notifications the system itself posts, rather than the deprecated path
+# notify-rust reaches for: grouped under the app, replaced by identifier
+# rather than stacked, and drawn the way every other notification is.
+# Only a bundled app may use it, which is checked before it is asked.
+objc2-user-notifications = { version = "0.3", optional = true, default-features = false, features = ["std", "UNUserNotificationCenter", "UNNotificationRequest", "UNNotificationContent", "UNNotificationTrigger", "UNNotificationSound", "block2"] }
+block2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSBundle", "NSString", "NSError", "NSDictionary"] }
 
 [features]
-tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit"]
+tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 # A window over the fleet, personal and unshipped: apps/personal.
-desk = ["dep:gpui", "dep:image", "schema"]
+desk = ["dep:gpui", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
 

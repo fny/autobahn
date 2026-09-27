@@ -416,15 +416,31 @@ fn run_with(config: Option<PathBuf>, state_root: PathBuf, shots: Option<PathBuf>
         }]);
 
         let Some(directory) = shots.clone() else {
-            // A window over the fleet is the whole app: when it closes,
-            // the app has nothing left to be.
-            cx.on_window_closed(|cx| {
-                if cx.windows().is_empty() {
-                    cx.quit();
-                }
-            })
-            .detach();
             open_window(config.clone(), state_root.clone(), None, cx).ok();
+            // The item in the menu bar belongs to the process, not to
+            // the window: closing the window leaves it there, the way
+            // the tray was always there, and "Open the window" brings
+            // the window back. The tray and the window were two
+            // processes polling the same files and saying the same
+            // things; now they are one.
+            match crate::menubar::Bar::start(config.clone(), state_root.clone(), || {}) {
+                Ok(mut bar) => {
+                    bar.window = true;
+                    bar.appear();
+                    cx.set_global(Menubar(bar));
+                    watch_the_bar(config.clone(), state_root.clone(), cx);
+                }
+                Err(error) => {
+                    eprintln!("no item in the menu bar: {error:#}");
+                    // Without one, the window is the whole app again.
+                    cx.on_window_closed(|cx| {
+                        if cx.windows().is_empty() {
+                            cx.quit();
+                        }
+                    })
+                    .detach();
+                }
+            }
             return;
         };
 
@@ -470,6 +486,57 @@ fn run_with(config: Option<PathBuf>, state_root: PathBuf, shots: Option<PathBuf>
         .detach();
     });
     Ok(())
+}
+
+/// The menu bar item, kept by the process rather than by a window.
+struct Menubar(crate::menubar::Bar);
+
+impl gpui::Global for Menubar {}
+
+/// Keeps the item up to date and answers what is chosen in it.
+///
+/// The same few seconds the tray used, on the application's own timer:
+/// the window has one of its own for the fleet, and this outlives any
+/// window.
+fn watch_the_bar(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
+    cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+        loop {
+            gpui::Timer::after(crate::menubar::POLL).await;
+            let carried = cx.update(|cx| {
+                let mut show = false;
+                let mut quit = false;
+                cx.update_global::<Menubar, ()>(|menubar, _| {
+                    while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+                        match menubar.0.chose(&event.id) {
+                            Some(crate::menubar::Action::Quit) => quit = true,
+                            Some(crate::menubar::Action::Show) => show = true,
+                            _ => {}
+                        }
+                    }
+                    menubar.0.finished();
+                });
+                if quit {
+                    cx.quit();
+                }
+                if show {
+                    cx.activate(true);
+                    if cx.windows().is_empty() {
+                        open_window(config.clone(), state_root.clone(), None, cx).ok();
+                    } else {
+                        for window in cx.windows() {
+                            window
+                                .update(cx, |_, window, _| window.activate_window())
+                                .ok();
+                        }
+                    }
+                }
+            });
+            if carried.is_err() {
+                break;
+            }
+        }
+    })
+    .detach();
 }
 
 /// Opens the window, on `pane` when one is asked for.

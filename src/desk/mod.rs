@@ -23,7 +23,7 @@
 mod area;
 mod buffer;
 
-use crate::words::{fill, t};
+use crate::words::{count as counted, fill, t};
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -841,8 +841,8 @@ impl Desk {
                                 Some(_) => fill(
                                     "pane.counted",
                                     &[
-                                        ("groups", &groups.to_string()),
-                                        ("sessions", &sessions.to_string()),
+                                        ("groups", &counted("pane.group", groups, &[])),
+                                        ("sessions", &counted("pane.session", sessions, &[])),
                                         ("about", self.pane.about()),
                                     ],
                                 ),
@@ -854,9 +854,9 @@ impl Desk {
                     .flex()
                     .items_center()
                     .gap(step(2.))
-                    .child(count(needs, t("fleet.needs_you"), AMBER))
-                    .child(count(away, t("fleet.away"), RED))
-                    .child(count(fine, t("fleet.synchronized"), GREEN)),
+                    .child(count(needs, counted("fleet.needs_you", needs, &[]), AMBER))
+                    .child(count(away, counted("fleet.away", away, &[]), RED))
+                    .child(count(fine, counted("fleet.synchronized", fine, &[]), GREEN)),
             )
             .into_any_element()
     }
@@ -1041,7 +1041,11 @@ impl Desk {
                             .font_family(self.mono.clone())
                             .text_size(px(T_META))
                             .text_color(rgb(DIM))
-                            .child(fill("fleet.cycles", &[("count", &thousands(session.cycles))])),
+                            .child(counted(
+                                "fleet.cycles",
+                                session.cycles as usize,
+                                &[("count", &thousands(session.cycles))],
+                            )),
                     )
                     .child(
                         div()
@@ -1747,13 +1751,7 @@ impl Desk {
                                 .pb(step(2.5))
                                 .text_size(px(T_PILL))
                                 .text_color(rgb(AMBER))
-                                .child(match pending {
-                                    1 => t("config.pending_one").to_owned(),
-                                    count => fill(
-                                        "config.pending_many",
-                                        &[("count", &count.to_string())],
-                                    ),
-                                }),
+                                .child(counted("config.pending", pending, &[])),
                         )
                     })
                     .children(sections.into_iter().map(|section| {
@@ -2158,7 +2156,7 @@ impl Desk {
                     div()
                         .text_size(px(T_PILL))
                         .text_color(rgb(FAINT))
-                        .child(fill("config.entries", &[("count", &count.to_string())])),
+                        .child(counted("config.entries", count, &[])),
                 )
             })
             .into_any_element()
@@ -2491,13 +2489,7 @@ impl Desk {
                 sheet.refused = None;
                 let path = sheet.path.clone();
                 let path = tilde(&path.display().to_string());
-                self.said = Some(match edits {
-                    1 => fill("config.saved_one", &[("path", &path)]),
-                    count => fill(
-                        "config.saved_many",
-                        &[("count", &count.to_string()), ("path", &path)],
-                    ),
-                });
+                self.said = Some(counted("config.saved", edits, &[("path", &path)]));
             }
             Err(error) => {
                 self.said = Some(fill("config.unwritable", &[("error", &error.to_string())]))
@@ -2570,12 +2562,10 @@ impl Desk {
                             .when_some(self.log_path.clone(), |line, path| {
                                 line.child(tilde(&path.display().to_string()))
                             })
-                            .child(fill(
+                            .child(counted(
                                 "log.counted",
-                                &[
-                                    ("shown", &shown.to_string()),
-                                    ("held", &held.to_string()),
-                                ],
+                                held,
+                                &[("shown", &shown.to_string()), ("held", &held.to_string())],
                             )),
                     ),
             )
@@ -2711,12 +2701,7 @@ impl Desk {
                             .text_right()
                             .text_size(px(T_META))
                             .text_color(rgb(FAINT))
-                            .child(match count {
-                                1 => t("hosts.sessions_one").to_owned(),
-                                count => {
-                                    fill("hosts.sessions_many", &[("count", &count.to_string())])
-                                }
-                            }),
+                            .child(counted("hosts.session", count, &[])),
                     )
             })
             .collect();
@@ -3285,7 +3270,7 @@ fn pill(text: impl Into<SharedString>, colour: u32) -> Div {
 /// One of the three numbers in the header: the figure, then the word.
 /// A zero keeps its place and loses its colour, so the row does not
 /// move about as the fleet changes.
-fn count(n: usize, word: &'static str, colour: u32) -> Div {
+fn count(n: usize, word: String, colour: u32) -> Div {
     let lit = n > 0;
     div()
         .flex()
@@ -3640,26 +3625,17 @@ fn waiting_groups(session: &SessionReport) -> Vec<(String, Vec<String>)> {
     let mut groups: Vec<(String, Vec<String>)> = causes
         .into_iter()
         .map(|(side, cause, paths)| {
-            let heading = match paths.len() {
-                1 => fill("waiting.blocked", &[("side", side), ("cause", cause)]),
-                count => fill(
-                    "waiting.blocked_many",
-                    &[
-                        ("count", &count.to_string()),
-                        ("side", side),
-                        ("cause", cause),
-                    ],
-                ),
-            };
+            let heading = counted(
+                "waiting.blocked",
+                paths.len(),
+                &[("side", side), ("cause", cause)],
+            );
             (heading, paths)
         })
         .collect();
     if !session.conflicts.is_empty() {
         groups.push((
-            match session.conflicts.len() {
-                1 => t("waiting.conflict_one").to_owned(),
-                many => fill("waiting.conflict_many", &[("count", &many.to_string())]),
-            },
+            counted("waiting.conflict", session.conflicts.len(), &[]),
             session
                 .conflicts
                 .iter()
@@ -3671,7 +3647,7 @@ fn waiting_groups(session: &SessionReport) -> Vec<(String, Vec<String>)> {
         if paths.len() > MOST {
             let rest = paths.len() - MOST;
             paths.truncate(MOST);
-            paths.push(fill("waiting.and_more", &[("count", &rest.to_string())]));
+            paths.push(counted("waiting.and_more", rest, &[]));
         }
     }
     groups

@@ -25,7 +25,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::config::SessionPlan;
 use crate::supervisor::{status_report, StatusReport};
-use crate::words::{fill, t};
+use crate::words::{count as counted, fill, t};
 use crate::text::display_safe;
 
 /// How often the report is refreshed.
@@ -988,12 +988,10 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
         .iter()
         .flat_map(|group| group.sessions.iter())
         .collect();
-    let count = |state: &str| sessions.iter().filter(|s| s.state == state).count();
+    let how_many = |state: &str| sessions.iter().filter(|s| s.state == state).count();
     let mut parts = Vec::new();
-    match queued {
-        0 => {}
-        1 => parts.push(t("menu.queued_one").to_owned()),
-        one => parts.push(fill("menu.queued_many", &[("count", &one.to_string())])),
+    if queued > 0 {
+        parts.push(counted("menu.queued", queued, &[]));
     }
     if !report.supervisor_running {
         parts.push(
@@ -1009,14 +1007,14 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
         parts.push(crate::supervisor::control::UNRESPONSIVE.to_owned());
     }
     if report.config_notice.is_some() {
-        parts.push("configuration refused".to_owned());
+        parts.push(t("menu.refused_short").to_owned());
     }
     if report.supervisor_mismatch.is_some() {
-        parts.push("restart needed".to_owned());
+        parts.push(t("menu.restart_needed").to_owned());
     }
     parts.push(fill(
         "menu.synchronized",
-        &[("count", &count("synchronized").to_string())],
+        &[("count", &how_many("synchronized").to_string())],
     ));
     for (state, word) in [
         ("conflicts", "in conflict"),
@@ -1025,7 +1023,7 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
         ("errored", "failing"),
         ("blocked", "blocked"),
     ] {
-        let n = count(state);
+        let n = how_many(state);
         if n > 0 {
             parts.push(fill("menu.counted", &[("count", &n.to_string()), ("word", word)]));
         }

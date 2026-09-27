@@ -25,6 +25,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::config::SessionPlan;
 use crate::supervisor::{status_report, StatusReport};
+use crate::words::{fill, t};
 use crate::text::display_safe;
 
 /// How often the report is refreshed.
@@ -345,7 +346,11 @@ impl Bar {
         // message and a way out.
         self.model = None;
         let menu = Menu::new();
-        let _ = menu.append(&MenuItem::new(format!("autobahn: {message}"), false, None));
+        let _ = menu.append(&MenuItem::new(
+            fill("menu.trouble", &[("message", message)]),
+            false,
+            None,
+        ));
         let _ = menu.append(&PredefinedMenuItem::separator());
         self.actions.clear();
         let quit = MenuItem::new("Quit", true, None);
@@ -394,16 +399,16 @@ impl Bar {
             item
         };
         if self.window {
-            fixed("Open the window", Action::Show);
+            fixed(t("menu.open_window"), Action::Show);
             let _ = menu.append(&PredefinedMenuItem::separator());
         }
-        let service_start = fixed("Start service", Action::ServiceStart);
-        let service_stop = fixed("Stop service", Action::ServiceStop);
-        let service_restart = fixed("Restart service", Action::ServiceRestart);
-        fixed("Open log", Action::OpenLog);
-        fixed("Refresh", Action::Refresh);
+        let service_start = fixed(t("menu.service_start"), Action::ServiceStart);
+        let service_stop = fixed(t("menu.service_stop"), Action::ServiceStop);
+        let service_restart = fixed(t("menu.service_restart"), Action::ServiceRestart);
+        fixed(t("menu.open_log"), Action::OpenLog);
+        fixed(t("menu.refresh"), Action::Refresh);
         let _ = menu.append(&PredefinedMenuItem::separator());
-        fixed("Quit", Action::Quit);
+        fixed(t("menu.quit"), Action::Quit);
 
         if let Some(tray) = &self.tray {
             tray.set_menu(Some(Box::new(menu.clone())));
@@ -467,7 +472,7 @@ impl Bar {
             (None, None) => {}
         }
         if let Some(tray) = &self.tray {
-            let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
+            let _ = tray.set_tooltip(Some(fill("menu.tooltip", &[("summary", &summary)])));
             // The menu bar carries the name of whatever needs attention.
             // One group is named outright; several are the worst one and
             // a count, because the menu bar is not a place for a list.
@@ -475,7 +480,10 @@ impl Bar {
             let title = match troubled.split_first() {
                 None => None,
                 Some((first, [])) => Some(first.clone()),
-                Some((first, rest)) => Some(format!("{first} +{}", rest.len())),
+                Some((first, rest)) => Some(fill(
+                    "menu.and_more",
+                    &[("first", first), ("count", &rest.len().to_string())],
+                )),
             };
             tray.set_title(title.as_deref());
         }
@@ -516,7 +524,14 @@ impl Bar {
                             .age_seconds
                             .map(format_age)
                             .unwrap_or_else(|| "never run".to_owned());
-                        format!("{}  —  {}, {}", session.label(), session.state, age)
+                        fill(
+                            "menu.session",
+                            &[
+                                ("label", session.label()),
+                                ("state", &session.state),
+                                ("age", &age),
+                            ],
+                        )
                     }
                 };
                 entry.line.set_text(line);
@@ -556,7 +571,7 @@ impl Bar {
                         let _ = item.append(&choice);
                     };
                     add(
-                        "Show diff".into(),
+                        t("menu.show_diff").into(),
                         Action::Diff {
                             group: group.name.clone(),
                             path: conflict.path.clone(),
@@ -565,12 +580,12 @@ impl Bar {
                     );
                     let _ = item.append(&PredefinedMenuItem::separator());
                     for (label, keep) in [
-                        ("Keep alpha's version".to_owned(), "alpha".to_owned()),
+                        (t("menu.keep_alpha").to_owned(), "alpha".to_owned()),
                         (
-                            format!("Keep {}'s version", session.label()),
+                            fill("menu.keep_host", &[("name", session.label())]),
                             session.selector().to_owned(),
                         ),
-                        ("Keep both".to_owned(), "both".to_owned()),
+                        (t("menu.keep_both").to_owned(), "both".to_owned()),
                     ] {
                         add(
                             label,
@@ -628,7 +643,7 @@ impl Bar {
                 notify_with(
                     "configuration",
                     "autobahn",
-                    &format!("configuration refused: {}", display_safe(first)),
+                    &fill("menu.config_refused", &[("message", &display_safe(first))]),
                     crate::icon::ensure(&self.state_root),
                 );
             }
@@ -977,14 +992,15 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
     let mut parts = Vec::new();
     match queued {
         0 => {}
-        one => parts.push(format!("{one} queued")),
+        1 => parts.push(t("menu.queued_one").to_owned()),
+        one => parts.push(fill("menu.queued_many", &[("count", &one.to_string())])),
     }
     if !report.supervisor_running {
         parts.push(
             match report.service.as_str() {
-                "stopped" => "Not running (service stopped)",
-                "not-installed" => "Not running (no service installed)",
-                _ => "Not running",
+                "stopped" => t("menu.stopped"),
+                "not-installed" => t("menu.not_installed"),
+                _ => t("menu.not_running"),
             }
             .to_owned(),
         );
@@ -998,7 +1014,10 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
     if report.supervisor_mismatch.is_some() {
         parts.push("restart needed".to_owned());
     }
-    parts.push(format!("{} synchronized", count("synchronized")));
+    parts.push(fill(
+        "menu.synchronized",
+        &[("count", &count("synchronized").to_string())],
+    ));
     for (state, word) in [
         ("conflicts", "in conflict"),
         ("halted", "halted"),
@@ -1008,7 +1027,7 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
     ] {
         let n = count(state);
         if n > 0 {
-            parts.push(format!("{n} {word}"));
+            parts.push(fill("menu.counted", &[("count", &n.to_string()), ("word", word)]));
         }
     }
     parts.join(", ")
@@ -1031,7 +1050,7 @@ pub(crate) fn warning_of(report: &StatusReport, last_error: Option<&str>) -> Opt
             report
                 .config_notice
                 .as_ref()
-                .map(|notice| format!("configuration refused: {}", notice.message))
+                .map(|notice| fill("menu.config_refused", &[("message", &notice.message)]))
         })
         .or_else(|| {
             report
@@ -1058,8 +1077,8 @@ pub(crate) fn warning_line(whole: &str) -> String {
     let mut lines = whole.split('\n');
     let first = lines.next().unwrap_or("").trim_end();
     match lines.any(|rest| !rest.trim().is_empty()) {
-        true => format!("⚠ {} — click for details", display_safe(first)),
-        false => format!("⚠ {}", display_safe(first)),
+        true => fill("menu.warning_click", &[("text", &display_safe(first))]),
+        false => fill("menu.warning", &[("text", &display_safe(first))]),
     }
 }
 
@@ -1126,7 +1145,10 @@ pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {
         "follower" => ", following",
         _ => "",
     };
-    format!("{}  ({}{role})", group.alpha, group.name)
+    fill(
+        "menu.group",
+        &[("alpha", &group.alpha), ("name", &group.name), ("role", &role)],
+    )
 }
 
 /// One group's state: its unhappiest session decides.

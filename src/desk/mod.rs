@@ -23,6 +23,8 @@
 mod area;
 mod buffer;
 
+use crate::words::{fill, t};
+
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -106,22 +108,22 @@ enum Pane {
 impl Pane {
     fn title(self) -> &'static str {
         match self {
-            Pane::Groups => "Groups",
-            Pane::Conflicts => "Conflicts",
-            Pane::Config => "Config",
-            Pane::Log => "Log",
-            Pane::Hosts => "Hosts",
+            Pane::Groups => t("pane.groups"),
+            Pane::Conflicts => t("pane.conflicts"),
+            Pane::Config => t("pane.config"),
+            Pane::Log => t("pane.log"),
+            Pane::Hosts => t("pane.hosts"),
         }
     }
 
     /// The line under the title: what this pane is for.
     fn about(self) -> &'static str {
         match self {
-            Pane::Groups => "every group, every session, and what each one last did",
-            Pane::Conflicts => "the paths waiting on a person",
-            Pane::Config => "the file, as the parser reads it",
-            Pane::Log => "the supervisor's own account of itself",
-            Pane::Hosts => "the machines the fleet talks to, and the bundle they run",
+            Pane::Groups => t("pane.groups_about"),
+            Pane::Conflicts => t("pane.conflicts_about"),
+            Pane::Config => t("pane.config_about"),
+            Pane::Log => t("pane.log_about"),
+            Pane::Hosts => t("pane.hosts_about"),
         }
     }
 }
@@ -194,11 +196,11 @@ enum Section {
 impl Section {
     fn title(&self) -> String {
         match self {
-            Section::Settings => "settings".to_owned(),
-            Section::Defaults => "defaults".to_owned(),
-            Section::Advanced => "advanced".to_owned(),
-            Section::Alerts => "advanced · alerts".to_owned(),
-            Section::Peering => "advanced · peering".to_owned(),
+            Section::Settings => t("config.settings").to_owned(),
+            Section::Defaults => t("config.defaults").to_owned(),
+            Section::Advanced => t("config.advanced").to_owned(),
+            Section::Alerts => t("config.advanced_alerts").to_owned(),
+            Section::Peering => t("config.advanced_peering").to_owned(),
             Section::Group(name) => name.clone(),
         }
     }
@@ -287,7 +289,7 @@ fn inspect(name: &'static str, root: &str, path: &str) -> Side {
             modified: None,
             digest: None,
             binary: false,
-            trouble: Some("on another machine".to_owned()),
+            trouble: Some(t("conflicts.elsewhere").to_owned()),
         };
     };
     let file = directory.join(path);
@@ -311,12 +313,15 @@ fn inspect(name: &'static str, root: &str, path: &str) -> Side {
                 .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
                 .map(|since| since.as_secs() as i64);
             if !metadata.is_file() {
-                side.trouble = Some("not a plain file".to_owned());
+                side.trouble = Some(t("conflicts.not_a_file").to_owned());
                 return side;
             }
         }
         Err(error) => {
-            side.trouble = Some(format!("cannot be read: {}", error.kind()));
+            side.trouble = Some(fill(
+                "conflicts.unreadable",
+                &[("reason", &error.kind().to_string())],
+            ));
             return side;
         }
     }
@@ -325,7 +330,10 @@ fn inspect(name: &'static str, root: &str, path: &str) -> Side {
             side.binary = binary;
             side.digest = digest;
         }
-        Err(error) => side.trouble = Some(format!("cannot be read: {error}")),
+        Err(error) => {
+            side.trouble =
+                Some(fill("conflicts.unreadable", &[("reason", &error.to_string())]))
+        }
     }
     side
 }
@@ -440,7 +448,7 @@ fn run_with(config: Option<PathBuf>, state_root: PathBuf, shots: Option<PathBuf>
                     watch_the_bar(config.clone(), state_root.clone(), cx);
                 }
                 Err(error) => {
-                    eprintln!("no item in the menu bar: {error:#}");
+                    eprintln!("{}", fill("status.no_menu_bar", &[("error", &format!("{error:#}"))]));
                     // Without one, the window is the whole app again.
                     cx.on_window_closed(|cx| {
                         if cx.windows().is_empty() {
@@ -559,7 +567,7 @@ fn open_window(
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
-            title: Some("Autobahn Desk".into()),
+            title: Some(t("app.window").into()),
             appears_transparent: true,
             ..Default::default()
         }),
@@ -675,9 +683,9 @@ impl Desk {
         let waiting = self.waiting();
         let running = self.report.as_ref().map(|report| report.supervisor_running);
         let (service, colour) = match running {
-            Some(true) => ("supervisor running", GREEN),
-            Some(false) => ("no supervisor", RED),
-            None => ("reading…", FAINT),
+            Some(true) => (t("fleet.supervisor_running"), GREEN),
+            Some(false) => (t("fleet.supervisor_missing"), RED),
+            None => (t("fleet.reading"), FAINT),
         };
         div()
             .w(px(212.))
@@ -707,13 +715,13 @@ impl Desk {
                                 div()
                                     .text_size(px(15.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .child("autobahn"),
+                                    .child(t("app.name")),
                             )
                             .child(
                                 div()
                                     .text_size(px(T_ROW))
                                     .text_color(rgb(FAINT))
-                                    .child("desk"),
+                                    .child(t("app.surface")),
                             ),
                     )
                     .child(
@@ -830,9 +838,13 @@ impl Desk {
                             .text_color(rgb(FAINT))
                             .child(match self.report {
                                 None => self.pane.about().to_owned(),
-                                Some(_) => format!(
-                                    "{groups} groups · {sessions} sessions · {}",
-                                    self.pane.about()
+                                Some(_) => fill(
+                                    "pane.counted",
+                                    &[
+                                        ("groups", &groups.to_string()),
+                                        ("sessions", &sessions.to_string()),
+                                        ("about", self.pane.about()),
+                                    ],
                                 ),
                             }),
                     ),
@@ -842,9 +854,9 @@ impl Desk {
                     .flex()
                     .items_center()
                     .gap(step(2.))
-                    .child(count(needs, "need you", AMBER))
-                    .child(count(away, "away", RED))
-                    .child(count(fine, "synchronized", GREEN)),
+                    .child(count(needs, t("fleet.needs_you"), AMBER))
+                    .child(count(away, t("fleet.away"), RED))
+                    .child(count(fine, t("fleet.synchronized"), GREEN)),
             )
             .into_any_element()
     }
@@ -855,7 +867,7 @@ impl Desk {
         let age = self
             .read_at
             .map(|at| format_age(at.elapsed().as_secs()))
-            .unwrap_or_else(|| "never".to_owned());
+            .unwrap_or_else(|| t("fleet.never").to_owned());
         div()
             .h(step(7.5))
             .flex_shrink_0()
@@ -875,14 +887,14 @@ impl Desk {
                     .child(crate::text::display_safe(said).to_string()),
                 None => div()
                     .text_color(rgb(FAINT))
-                    .child("every number here came from status --json"),
+                    .child(t("fleet.provenance")),
             })
             .child(
                 div()
                     .flex_shrink_0()
                     .pl(step(4.))
                     .text_color(rgb(FAINT))
-                    .child(format!("read {age} ago")),
+                    .child(fill("fleet.read_ago", &[("age", &age)])),
             )
             .into_any_element()
     }
@@ -891,7 +903,7 @@ impl Desk {
 
     fn groups(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(report) = self.report.clone() else {
-            return empty("reading the fleet…");
+            return empty(t("fleet.reading_fleet"));
         };
         div()
             .id("groups")
@@ -1029,7 +1041,7 @@ impl Desk {
                             .font_family(self.mono.clone())
                             .text_size(px(T_META))
                             .text_color(rgb(DIM))
-                            .child(format!("{} cycles", thousands(session.cycles))),
+                            .child(fill("fleet.cycles", &[("count", &thousands(session.cycles))])),
                     )
                     .child(
                         div()
@@ -1040,8 +1052,8 @@ impl Desk {
                             .text_size(px(T_META))
                             .text_color(rgb(FAINT))
                             .child(match session.age_seconds {
-                                Some(age) => format!("{} ago", format_age(age)),
-                                None => "never".to_owned(),
+                                Some(age) => fill("fleet.ago", &[("age", &format_age(age))]),
+                                None => t("fleet.never").to_owned(),
                             }),
                     )
                     .child(
@@ -1153,11 +1165,11 @@ impl Desk {
             .text_size(px(T_META))
             .text_color(rgb(colour))
             .hover(|line| line.bg(rgb(RAISED)))
-            .tooltip(tip("Click to copy this line"))
+            .tooltip(tip(t("tip.copy")))
             .child(text)
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(taken.clone()));
-                this.said = Some(format!("copied: {}", cap(&taken, 90)));
+                this.said = Some(fill("status.copied", &[("text", &cap(&taken, 90))]));
                 cx.notify();
             }))
     }
@@ -1179,8 +1191,8 @@ impl Desk {
             .flex()
             .flex_col()
             .gap(step(1.5))
-            .child(self.pair("alpha", tilde(&group.alpha), cx))
-            .child(self.pair("beta", tilde(&session.beta), cx))
+            .child(self.pair(t("fleet.alpha"), tilde(&group.alpha), cx))
+            .child(self.pair(t("fleet.beta"), tilde(&session.beta), cx))
             .child(
                 div()
                     .pt(step(2.))
@@ -1244,7 +1256,7 @@ impl Desk {
     fn conflicts(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let waiting = self.waiting_list();
         if waiting.is_empty() {
-            return empty("nothing needs you");
+            return empty(t("conflicts.none"));
         }
         let open = self.conflict.clone();
         div()
@@ -1342,7 +1354,7 @@ impl Desk {
                     ),
             )
             .child(match self.conflict.clone() {
-                None => empty("pick one from the left"),
+                None => empty(t("conflicts.pick")),
                 Some(item) => self.conflict_detail(item, cx),
             })
             .into_any_element()
@@ -1376,8 +1388,8 @@ impl Desk {
                     .border_b_1()
                     .border_color(rgb(LINE))
                     .child(label(match item.blocked {
-                        true => "blocked path",
-                        false => "conflict",
+                        true => t("conflicts.blocked"),
+                        false => t("conflicts.conflict"),
                     }))
                     .child(self.copyable(
                         format!("conflict-path-{}", item.path),
@@ -1397,11 +1409,7 @@ impl Desk {
                                 .pt(step(1.))
                                 .text_size(px(T_META))
                                 .text_color(rgb(DIM))
-                                .child(
-                                    "A blocked path is a filesystem to fix, not a version to \
-                                     choose: something on one side cannot be written where the \
-                                     other side wants it.",
-                                ),
+                                .child(t("conflicts.blocked_about")),
                         )
                     })
                     .when(!item.blocked, |head| {
@@ -1415,8 +1423,8 @@ impl Desk {
                                 .flex()
                                 .gap(step(1.5))
                                 .child(
-                                    button("keep-alpha", "Keep alpha")
-                                        .tooltip(tip("Keep this machine's version and copy it over the other side."))
+                                    button("keep-alpha", t("conflicts.keep_alpha"))
+                                        .tooltip(tip(t("tip.keep_alpha")))
                                         .on_click(cx.listener(
                                         move |this, _, _, cx| {
                                             this.resolve(&alpha, "alpha");
@@ -1425,10 +1433,8 @@ impl Desk {
                                     )),
                                 )
                                 .child(
-                                    button("keep-beta", format!("Keep {keep_host}"))
-                                        .tooltip(tip(
-                                            "Keep the other side's version and copy it here.",
-                                        ))
+                                    button("keep-beta", fill("conflicts.keep_beta", &[("name", &keep_host)]))
+                                        .tooltip(tip(t("tip.keep_beta")))
                                         .on_click(
                                         cx.listener(move |this, _, _, cx| {
                                             let keep = host.host.clone();
@@ -1437,8 +1443,8 @@ impl Desk {
                                         }),
                                     ),
                                 )
-                                .child(button("keep-both", "Keep both")
-                                    .tooltip(tip("Keep both versions: the other side's is kept beside this one under a suffixed name."))
+                                .child(button("keep-both", t("conflicts.keep_both"))
+                                    .tooltip(tip(t("tip.keep_both")))
                                     .on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.resolve(&both, "both");
@@ -1447,8 +1453,8 @@ impl Desk {
                                 )))
                                 .when(!binary, |row| {
                                     row.child(
-                                        button("show-diff", "Show the difference")
-                                            .tooltip(tip("Run autobahn diff and show what it prints."))
+                                        button("show-diff", t("conflicts.show_difference"))
+                                            .tooltip(tip(t("tip.show_difference")))
                                             .on_click(
                                             cx.listener(move |this, _, _, cx| {
                                                 this.read_diff(&shown);
@@ -1527,17 +1533,13 @@ impl Desk {
             .flex()
             .flex_col()
             .gap(step(3.))
-            .child(label("neither side is text"))
+            .child(label(t("conflicts.binary")))
             .child(
                 div()
                     .max_w(px(680.))
                     .text_size(px(T_META))
                     .text_color(rgb(DIM))
-                    .child(
-                        "There is nothing to merge, so the only question is which file \
-                         survives. Keep both settles it by keeping the other one beside \
-                         it under a suffixed name.",
-                    ),
+                    .child(t("conflicts.binary_about")),
             )
             .child(
                 div()
@@ -1557,10 +1559,7 @@ impl Desk {
                             div()
                                 .text_size(px(T_META))
                                 .text_color(rgb(GREEN))
-                                .child(format!(
-                                    "Both sides hash the same: {suffix} is one file in \
-                                     two places, and either choice keeps it."
-                                )),
+                                .child(fill("conflicts.same", &[("name", &suffix)])),
                         ),
                 )
             })
@@ -1592,7 +1591,7 @@ impl Desk {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(side.name),
                     )
-                    .when(newer, |head| head.child(pill("written last", BLUE)))
+                    .when(newer, |head| head.child(pill(t("conflicts.written_last"), BLUE)))
                     .when_some(side.trouble.clone(), |head, trouble| {
                         head.child(pill(trouble, AMBER))
                     }),
@@ -1607,31 +1606,35 @@ impl Desk {
             )
             .child(div().h(step(0.5)))
             .child(self.pair(
-                "size",
-                side.size.map(human_size).unwrap_or_else(|| "—".to_owned()),
+                t("conflicts.size"),
+                side.size
+                    .map(human_size)
+                    .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
                 cx,
             ))
             .child(self.pair(
-                "written",
+                t("conflicts.written"),
                 side.modified
                     .map(|at| crate::logging::stamp(at as libc::time_t))
-                    .unwrap_or_else(|| "—".to_owned()),
+                    .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
                 cx,
             ))
             .child(self.pair(
-                "blake3",
+                t("conflicts.digest"),
                 match (&side.digest, side.size) {
                     (Some(digest), _) => digest.chars().take(16).collect::<String>(),
-                    (None, Some(size)) if size > HASH_LIMIT => "too large to hash here".to_owned(),
-                    _ => "—".to_owned(),
+                    (None, Some(size)) if size > HASH_LIMIT => {
+                        t("conflicts.too_large").to_owned()
+                    }
+                    _ => t("conflicts.unknown").to_owned(),
                 },
                 cx,
             ))
             .when_some(file, |card, file| {
                 card.child(
                     div().pt(step(1.5)).flex().child(
-                        button(format!("reveal-{}", side.name), "Reveal in Finder")
-                            .tooltip(tip("Show this file in the Finder."))
+                        button(format!("reveal-{}", side.name), t("conflicts.reveal"))
+                            .tooltip(tip(t("tip.reveal")))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.reveal(&file);
                             cx.notify();
@@ -1649,7 +1652,7 @@ impl Desk {
     /// form shows, and the words a key accepts are the words it offers.
     fn config_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(sheet) = &self.sheet else {
-            return empty("no configuration file to read");
+            return empty(t("config.none"));
         };
         let path = sheet.path.clone();
         let refused = sheet.refused.clone();
@@ -1690,11 +1693,7 @@ impl Desk {
                             .pb(step(2.))
                             .text_size(px(T_PILL))
                             .text_color(rgb(FAINT))
-                            .child(
-                                "Changes are held until you save, because the supervisor \
-                                 re-reads the file as soon as it changes. Nothing is written \
-                                 that would not load.",
-                            ),
+                            .child(t("config.held")),
                     )
                     .child(
                         div()
@@ -1704,8 +1703,8 @@ impl Desk {
                             .flex_wrap()
                             .gap(step(1.5))
                             .child(
-                                button("save-config", "Save")
-                                    .tooltip(tip("Write the held changes. The supervisor re-reads the file within a few seconds and restarts only the sessions whose plan changed."))
+                                button("save-config", t("config.save"))
+                                    .tooltip(tip(t("tip.save")))
                                     .when(pending == 0 || refused.is_some(), |save| {
                                         save.opacity(0.45)
                                     })
@@ -1720,8 +1719,8 @@ impl Desk {
                                     })),
                             )
                             .when(pending > 0, |row| {
-                                row.child(button("revert-config", "Revert")
-                                    .tooltip(tip("Throw the held changes away and go back to the file on disk."))
+                                row.child(button("revert-config", t("config.revert"))
+                                    .tooltip(tip(t("tip.revert")))
                                     .on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.revert();
@@ -1730,8 +1729,8 @@ impl Desk {
                                 ))
                             })
                             .when(pending == 0, |row| {
-                                row.child(button("re-read-config", "Re-read")
-                                    .tooltip(tip("Read the file again, in case it was edited elsewhere."))
+                                row.child(button("re-read-config", t("config.re_read"))
+                                    .tooltip(tip(t("tip.config_re_read")))
                                     .on_click(
                                     cx.listener(|this, _, _, cx| {
                                         this.editing = None;
@@ -1749,8 +1748,11 @@ impl Desk {
                                 .text_size(px(T_PILL))
                                 .text_color(rgb(AMBER))
                                 .child(match pending {
-                                    1 => "1 change not written".to_owned(),
-                                    count => format!("{count} changes not written"),
+                                    1 => t("config.pending_one").to_owned(),
+                                    count => fill(
+                                        "config.pending_many",
+                                        &[("count", &count.to_string())],
+                                    ),
                                 }),
                         )
                     })
@@ -1809,10 +1811,7 @@ impl Desk {
                                         .text_size(px(T_META))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(AMBER))
-                                        .child(
-                                            "held, not written — the supervisor would refuse \
-                                             this",
-                                        ),
+                                        .child(t("config.refused")),
                                 )
                                 .child(
                                     div()
@@ -1862,7 +1861,7 @@ impl Desk {
             Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),
         };
         let Some(serde_json::Value::Object(properties)) = properties else {
-            return vec![empty("the schema says nothing about this section")];
+            return vec![empty(t("config.no_shape"))];
         };
         let silent: &[&str] = match self.section {
             Section::Settings => SILENT_AT_THE_TOP,
@@ -1976,8 +1975,7 @@ impl Desk {
                     let key = key.to_owned();
                     let section = section.clone();
                     let about = SharedString::from(match chosen {
-                        true => format!("{about}\n\nClick again to take the key out of the \
-                                         file, so it is inherited."),
+                        true => fill("tip.word_chosen", &[("about", about)]),
                         false => about.clone(),
                     });
                     div()
@@ -2025,7 +2023,7 @@ impl Desk {
                         div()
                             .text_size(px(T_META))
                             .text_color(rgb(FAINT))
-                            .child("not in the file · inherited"),
+                            .child(t("config.inherited")),
                     )
                 })
                 .into_any_element();
@@ -2050,9 +2048,9 @@ impl Desk {
                                 .text_size(px(T_META))
                                 .text_color(rgb(FAINT))
                                 .child(match default.as_bool() {
-                                    Some(true) => "not in the file · on unless said otherwise",
-                                    Some(false) => "not in the file · off unless said otherwise",
-                                    None => "not in the file",
+                                    Some(true) => t("config.absent_on"),
+                                    Some(false) => t("config.absent_off"),
+                                    None => t("config.absent"),
                                 }),
                         )
                     })
@@ -2087,8 +2085,8 @@ impl Desk {
         let key = key.to_owned();
         toggle_switch(SharedString::from(format!("switch-{key}")), on)
             .tooltip(match on {
-                true => tip("Write false into the file"),
-                false => tip("Write true into the file"),
+                true => tip(t("tip.switch_on")),
+                false => tip(t("tip.switch_off")),
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.put(
@@ -2116,7 +2114,7 @@ impl Desk {
             item: None,
         };
         if let Some(edit) = self.editing.as_ref().filter(|edit| edit.at == spot) {
-            return self.editor(edit, "one to a line", cx);
+            return self.editor(edit, t("config.one_to_a_line"), cx);
         }
         let start = entries.join("\n");
         let count = entries.len();
@@ -2137,13 +2135,13 @@ impl Desk {
                     .border_color(rgb(LINE))
                     .cursor_pointer()
                     .hover(|list| list.border_color(rgb(0x39424e)))
-                    .tooltip(tip("Click to edit these as text, one to a line"))
+                    .tooltip(tip(t("tip.list")))
                     .font_family(self.mono.clone())
                     .text_size(px(T_META))
                     .flex()
                     .flex_col()
                     .when(count == 0, |list| {
-                        list.child(div().text_color(rgb(FAINT)).child("nothing"))
+                        list.child(div().text_color(rgb(FAINT)).child(t("config.nothing")))
                     })
                     .children(
                         entries
@@ -2160,7 +2158,7 @@ impl Desk {
                     div()
                         .text_size(px(T_PILL))
                         .text_color(rgb(FAINT))
-                        .child(format!("{count} entries")),
+                        .child(fill("config.entries", &[("count", &count.to_string())])),
                 )
             })
             .into_any_element()
@@ -2190,16 +2188,16 @@ impl Desk {
                     .items_center()
                     .gap(step(1.5))
                     .child(
-                        button("edit-keep", "Done")
-                            .tooltip(tip("Keep this value. Command-Enter does the same."))
+                        button("edit-keep", t("config.done"))
+                            .tooltip(tip(t("tip.keep_value")))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.finish_edit(true, cx);
                                 cx.notify();
                             })),
                     )
                     .child(
-                        button("edit-leave", "Cancel")
-                            .tooltip(tip("Leave the value as it was. Escape does the same."))
+                        button("edit-leave", t("config.cancel"))
+                            .tooltip(tip(t("tip.leave_value")))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.finish_edit(false, cx);
                                 cx.notify();
@@ -2229,7 +2227,7 @@ impl Desk {
             item,
         };
         if let Some(edit) = self.editing.as_ref().filter(|edit| edit.at == spot) {
-            return self.editor(edit, "Enter keeps it", cx);
+            return self.editor(edit, t("config.enter_keeps"), cx);
         }
         let start = held.clone().unwrap_or_default();
         div()
@@ -2251,15 +2249,15 @@ impl Desk {
             .bg(rgb(RAISED))
             .border_color(rgb(LINE))
             .hover(|line| line.border_color(rgb(0x39424e)))
-            .tooltip(tip("Click to type a value. Enter keeps it, Escape leaves it."))
+            .tooltip(tip(t("tip.line")))
             .text_color(match held.is_some() {
                 true => rgb(INK),
                 false => rgb(FAINT),
             })
             .child(match &held {
-                Some(text) if text.is_empty() => "(empty)".to_owned(),
+                Some(text) if text.is_empty() => t("config.empty").to_owned(),
                 Some(text) => text.clone(),
-                None => "not set".to_owned(),
+                None => t("config.not_set").to_owned(),
             })
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.start_edit(spot.clone(), start.clone(), false, window, cx);
@@ -2293,11 +2291,17 @@ impl Desk {
                     })
                 }
                 Err(error) => {
-                    self.said = Some(format!("{} does not parse: {error}", path.display()))
+                    self.said = Some(fill(
+                        "config.unreadable",
+                        &[("path", &path.display().to_string()), ("error", &error.to_string())],
+                    ))
                 }
             },
             Err(error) => {
-                self.said = Some(format!("unable to read {}: {error}", path.display()))
+                self.said = Some(fill(
+                    "status.unreadable",
+                    &[("path", &path.display().to_string()), ("error", &error.to_string())],
+                ))
             }
         }
     }
@@ -2399,7 +2403,8 @@ impl Desk {
             let table = match table_for(&mut document, &at.section) {
                 Some(table) => table,
                 None => {
-                    self.said = Some(format!("{} is not in the file", at.section.title()));
+                    self.said =
+                        Some(fill("config.missing_section", &[("section", &at.section.title())]));
                     return;
                 }
             };
@@ -2464,7 +2469,7 @@ impl Desk {
             return;
         }
         if let Some(refused) = &sheet.refused {
-            self.said = Some(format!("not saved: {}", first_line(refused)));
+            self.said = Some(fill("config.not_saved", &[("reason", &first_line(refused))]));
             return;
         }
         // Somebody may have been editing the same file in an editor
@@ -2472,12 +2477,8 @@ impl Desk {
         // overwrite.
         if let Ok(now) = std::fs::read_to_string(&sheet.path) {
             if now != sheet.text {
-                sheet.refused = Some(
-                    "the file changed on disk since this form read it. Re-read it, then make \
-                     the change again."
-                        .to_owned(),
-                );
-                self.said = Some("not saved: the file changed on disk".to_owned());
+                sheet.refused = Some(t("config.changed").to_owned());
+                self.said = Some(t("config.changed_short").to_owned());
                 return;
             }
         }
@@ -2489,17 +2490,18 @@ impl Desk {
                 sheet.edits = 0;
                 sheet.refused = None;
                 let path = sheet.path.clone();
-                self.said = Some(format!(
-                    "wrote {} change{} to {}; the supervisor re-reads it within a few seconds",
-                    edits,
-                    match edits {
-                        1 => "",
-                        _ => "s",
-                    },
-                    tilde(&path.display().to_string())
-                ));
+                let path = tilde(&path.display().to_string());
+                self.said = Some(match edits {
+                    1 => fill("config.saved_one", &[("path", &path)]),
+                    count => fill(
+                        "config.saved_many",
+                        &[("count", &count.to_string()), ("path", &path)],
+                    ),
+                });
             }
-            Err(error) => self.said = Some(format!("unable to write: {error}")),
+            Err(error) => {
+                self.said = Some(fill("config.unwritable", &[("error", &error.to_string())]))
+            }
         }
     }
 
@@ -2507,7 +2509,7 @@ impl Desk {
     fn revert(&mut self) {
         self.editing = None;
         self.read_sheet();
-        self.said = Some("went back to the file on disk".to_owned());
+        self.said = Some(t("config.reverted").to_owned());
     }
 
     // ── the log ──────────────────────────────────────────────────────
@@ -2541,15 +2543,15 @@ impl Desk {
                     .border_color(rgb(LINE))
                     .bg(rgb(SUNK))
                     .child(
-                        toggle("errors-only", "errors only", errors_only).on_click(cx.listener(
+                        toggle("errors-only", t("log.errors_only"), errors_only).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.errors_only = !this.errors_only;
                                 cx.notify();
                             },
                         )),
                     )
-                    .child(button("re-read", "Re-read")
-                        .tooltip(tip("Read the last 400 lines of the log again."))
+                    .child(button("re-read", t("log.re_read"))
+                        .tooltip(tip(t("tip.log_re_read")))
                         .on_click(cx.listener(
                         |this, _, _, cx| {
                             this.read_log();
@@ -2568,7 +2570,13 @@ impl Desk {
                             .when_some(self.log_path.clone(), |line, path| {
                                 line.child(tilde(&path.display().to_string()))
                             })
-                            .child(format!("{shown} of the last {held} lines")),
+                            .child(fill(
+                                "log.counted",
+                                &[
+                                    ("shown", &shown.to_string()),
+                                    ("held", &held.to_string()),
+                                ],
+                            )),
                     ),
             )
             .child(
@@ -2590,12 +2598,13 @@ impl Desk {
                         div()
                             .id(SharedString::from(format!("log-{index}")))
                             .cursor_pointer()
-                            .tooltip(tip("Click to copy this line"))
+                            .tooltip(tip(t("tip.copy")))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.write_to_clipboard(gpui::ClipboardItem::new_string(
                                     taken.clone(),
                                 ));
-                                this.said = Some(format!("copied: {}", cap(&taken, 90)));
+                                this.said =
+                                    Some(fill("status.copied", &[("text", &cap(&taken, 90))]));
                                 cx.notify();
                             }))
                             .pl(step(1.5))
@@ -2625,7 +2634,7 @@ impl Desk {
     /// this build can talk to it.
     fn hosts(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let Some(report) = &self.report else {
-            return empty("reading the fleet…");
+            return empty(t("fleet.reading_fleet"));
         };
         let mut hosts: Vec<(String, usize, Severity, String, Option<String>)> = Vec::new();
         for group in &report.groups {
@@ -2703,8 +2712,10 @@ impl Desk {
                             .text_size(px(T_META))
                             .text_color(rgb(FAINT))
                             .child(match count {
-                                1 => "1 session".to_owned(),
-                                count => format!("{count} sessions"),
+                                1 => t("hosts.sessions_one").to_owned(),
+                                count => {
+                                    fill("hosts.sessions_many", &[("count", &count.to_string())])
+                                }
                             }),
                     )
             })
@@ -2736,17 +2747,20 @@ impl Desk {
                             .border_b_1()
                             .border_color(rgb(HAIR))
                             .child(div().size(px(7.)).flex_shrink_0())
-                            .child(div().flex_1().min_w(px(0.)).child(label("host")))
-                            .child(div().w(px(320.)).flex_shrink_0().child(label(
-                                "what it last said",
-                            )))
+                            .child(div().flex_1().min_w(px(0.)).child(label(t("hosts.host"))))
+                            .child(
+                                div()
+                                    .w(px(320.))
+                                    .flex_shrink_0()
+                                    .child(label(t("hosts.said"))),
+                            )
                             .child(
                                 div()
                                     .w(px(88.))
                                     .flex_shrink_0()
                                     .flex()
                                     .justify_end()
-                                    .child(label("carrying")),
+                                    .child(label(t("hosts.carrying"))),
                             ),
                     )
                     .children(rows),
@@ -2761,7 +2775,7 @@ impl Desk {
                     .flex()
                     .flex_col()
                     .gap(step(2.))
-                    .child(label("the agent bundle"))
+                    .child(label(t("hosts.bundle")))
                     .child(match manifest {
                         Ok(manifest) => div()
                             .font_family(self.mono.clone())
@@ -2777,10 +2791,14 @@ impl Desk {
                                     .collect::<Vec<_>>(),
                             ),
                         Err(_) => div().text_size(px(T_META)).text_color(rgb(FAINT)).child(
-                            format!(
-                                "{} carries no manifest, so a stale bundle is caught by the \
-                                 handshake rather than before it is sent",
-                                tilde(&self.state_root.join("agents").display().to_string())
+                            fill(
+                                "hosts.no_manifest",
+                                &[(
+                                    "path",
+                                    &tilde(
+                                        &self.state_root.join("agents").display().to_string(),
+                                    ),
+                                )],
                             ),
                         ),
                     })
@@ -2790,7 +2808,10 @@ impl Desk {
                             .font_family(self.mono.clone())
                             .text_size(px(T_META))
                             .text_color(rgb(FAINT))
-                            .child(format!("this build is {}", crate::protocol::version())),
+                            .child(fill(
+                                "hosts.build",
+                                &[("version", &crate::protocol::version())],
+                            )),
                     ),
             )
             .into_any_element()
@@ -2833,7 +2854,10 @@ impl Desk {
                 self.report = Some(status_report(&selected, &self.state_root));
             }
             Err(error) => {
-                self.said = Some(format!("the configuration does not load: {error:#}"));
+                self.said = Some(fill(
+                    "status.config_refused",
+                    &[("error", &format!("{error:#}"))],
+                ));
             }
         }
     }
@@ -2920,10 +2944,10 @@ impl Desk {
         let shown = std::process::Command::new("open").arg("-R").arg(file).status();
         self.said = Some(match shown {
             Ok(status) if status.success() => {
-                format!("revealed {}", tilde(&file.display().to_string()))
+                fill("status.revealed", &[("path", &tilde(&file.display().to_string()))])
             }
-            Ok(status) => format!("the Finder refused: {status}"),
-            Err(error) => format!("unable to ask the Finder: {error}"),
+            Ok(status) => fill("status.finder_refused", &[("status", &status.to_string())]),
+            Err(error) => fill("status.finder_unreachable", &[("error", &error.to_string())]),
         });
     }
 
@@ -2948,7 +2972,7 @@ impl Desk {
         };
         self.said = Some(
             match crate::supervisor::control::send(&self.state_root, &request) {
-                Ok(_) => format!("{} {beta}", verb.done()),
+                Ok(_) => fill("status.control_done", &[("done", verb.done()), ("beta", beta)]),
                 Err(error) => format!("{error:#}"),
             },
         );
@@ -2977,10 +3001,13 @@ impl Desk {
                 self.conflict = None;
                 self.sides = None;
                 self.diff = None;
-                format!("kept {keep}: {}", crate::text::display_safe(&item.path))
+                fill(
+                    "status.kept",
+                    &[("keep", keep), ("path", &crate::text::display_safe(&item.path))],
+                )
             }
             Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            Err(error) => format!("unable to run resolve: {error}"),
+            Err(error) => fill("status.resolve_failed", &[("error", &error.to_string())]),
         });
         self.read_at = None;
     }
@@ -3004,10 +3031,10 @@ impl Desk {
                 String::from_utf8_lossy(&output.stdout).into_owned()
             }
             Ok(output) => match String::from_utf8_lossy(&output.stderr).trim() {
-                "" => "the two sides read the same".to_owned(),
+                "" => t("status.diff_same").to_owned(),
                 complaint => complaint.to_owned(),
             },
-            Err(error) => format!("unable to run diff: {error}"),
+            Err(error) => fill("status.diff_failed", &[("error", &error.to_string())]),
         });
     }
 
@@ -3022,10 +3049,12 @@ impl Desk {
             Err(_) => match std::fs::read_to_string(&watch) {
                 Ok(text) => (watch, text),
                 Err(_) => {
-                    self.log = vec![format!(
-                        "neither {} nor {} can be read",
-                        service.display(),
-                        watch.display()
+                    self.log = vec![fill(
+                        "log.unreadable",
+                        &[
+                            ("service", &service.display().to_string()),
+                            ("watch", &watch.display().to_string()),
+                        ],
                     )];
                     self.log_path = None;
                     return;
@@ -3560,32 +3589,29 @@ enum Verb {
 impl Verb {
     fn word(self) -> &'static str {
         match self {
-            Verb::Flush => "Flush",
-            Verb::Verify => "Verify",
-            Verb::Pause => "Pause",
-            Verb::Resume => "Resume",
+            Verb::Flush => t("verb.flush"),
+            Verb::Verify => t("verb.verify"),
+            Verb::Pause => t("verb.pause"),
+            Verb::Resume => t("verb.resume"),
         }
     }
 
     /// What pressing it does, for the tooltip.
     fn about(self) -> &'static str {
         match self {
-            Verb::Flush => "Wake this session for a cycle now, rather than waiting for its \
-                            interval.",
-            Verb::Verify => "Re-read every file's content on the next cycle, so a change made \
-                             without the metadata moving is seen.",
-            Verb::Pause => "Suspend cycling for this session. Nothing is forgotten; it picks \
-                            up where it left off.",
-            Verb::Resume => "Start cycling again after a pause.",
+            Verb::Flush => t("tip.flush"),
+            Verb::Verify => t("tip.verify"),
+            Verb::Pause => t("tip.pause"),
+            Verb::Resume => t("tip.resume"),
         }
     }
 
     fn done(self) -> &'static str {
         match self {
-            Verb::Flush => "flushed",
-            Verb::Verify => "will verify",
-            Verb::Pause => "paused",
-            Verb::Resume => "resumed",
+            Verb::Flush => t("verb.flushed"),
+            Verb::Verify => t("verb.will_verify"),
+            Verb::Pause => t("verb.paused"),
+            Verb::Resume => t("verb.resumed"),
         }
     }
 }
@@ -3597,21 +3623,42 @@ impl Verb {
 /// thing are one heading with twenty paths, not twenty reasons.
 fn waiting_groups(session: &SessionReport) -> Vec<(String, Vec<String>)> {
     const MOST: usize = 20;
-    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    // Grouped by what stopped them: twenty files held up by one thing
+    // are one heading with twenty paths, not twenty reasons.
+    let mut causes: Vec<(&str, &str, Vec<String>)> = Vec::new();
     for entry in &session.blocked {
         let (side, path, cause) = crate::blocked::parts(entry);
-        let heading = format!("blocked on {side} · {cause}");
         let path = crate::text::display_safe(path).to_string();
-        match groups.iter_mut().find(|(other, _)| *other == heading) {
-            Some((_, paths)) => paths.push(path),
-            None => groups.push((heading, vec![path])),
+        match causes
+            .iter_mut()
+            .find(|(other_side, other, _)| *other_side == side && *other == cause)
+        {
+            Some((_, _, paths)) => paths.push(path),
+            None => causes.push((side, cause, vec![path])),
         }
     }
+    let mut groups: Vec<(String, Vec<String>)> = causes
+        .into_iter()
+        .map(|(side, cause, paths)| {
+            let heading = match paths.len() {
+                1 => fill("waiting.blocked", &[("side", side), ("cause", cause)]),
+                count => fill(
+                    "waiting.blocked_many",
+                    &[
+                        ("count", &count.to_string()),
+                        ("side", side),
+                        ("cause", cause),
+                    ],
+                ),
+            };
+            (heading, paths)
+        })
+        .collect();
     if !session.conflicts.is_empty() {
         groups.push((
             match session.conflicts.len() {
-                1 => "1 conflict · both sides changed it".to_owned(),
-                many => format!("{many} conflicts · both sides changed them"),
+                1 => t("waiting.conflict_one").to_owned(),
+                many => fill("waiting.conflict_many", &[("count", &many.to_string())]),
             },
             session
                 .conflicts
@@ -3620,14 +3667,11 @@ fn waiting_groups(session: &SessionReport) -> Vec<(String, Vec<String>)> {
                 .collect(),
         ));
     }
-    for (heading, paths) in &mut groups {
-        if heading.starts_with("blocked") && paths.len() > 1 {
-            *heading = format!("{} blocked · {}", paths.len(), heading.replacen("blocked on ", "on ", 1));
-        }
+    for (_, paths) in &mut groups {
         if paths.len() > MOST {
             let rest = paths.len() - MOST;
             paths.truncate(MOST);
-            paths.push(format!("… and {rest} more"));
+            paths.push(fill("waiting.and_more", &[("count", &rest.to_string())]));
         }
     }
     groups

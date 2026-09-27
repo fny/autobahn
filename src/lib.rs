@@ -48,6 +48,9 @@ pub mod supervisor;
 pub mod text;
 pub mod threads;
 pub mod transport;
+/// What the surfaces say, in one place.
+#[cfg(any(feature = "tray", feature = "desk"))]
+pub(crate) mod words;
 /// Notifications the system posts, for whoever can post them.
 #[cfg(any(feature = "tray", feature = "desk"))]
 pub(crate) mod native_alert;

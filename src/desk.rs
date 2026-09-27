@@ -203,10 +203,16 @@ struct Sheet {
     /// `toml_edit`, so saving a form does not rewrite a hand-written
     /// file into something its author would not recognise.
     document: toml_edit::DocumentMut,
-    /// What the parser said when the last save was refused. Nothing is
-    /// written while this is set — the parser is the referee, not the
-    /// form.
+    /// What the loader said about the document as it now stands.
+    /// Nothing is written while this is set — the loader is the referee,
+    /// not the form.
     refused: Option<String>,
+    /// How many changes have been made since the file was last read or
+    /// written. An edit is held here, not written as it is made: the
+    /// supervisor re-reads the file two seconds after it changes, and a
+    /// form that wrote every click would hand it half-finished
+    /// configurations to start sessions from.
+    edits: usize,
 }
 
 /// A field being typed into.
@@ -648,7 +654,7 @@ impl Desk {
                     .gap(step(0.5))
                     .child(self.nav(Pane::Groups, None, cx))
                     .child(self.nav(Pane::Conflicts, Some(waiting), cx))
-                    .child(self.nav(Pane::Config, None, cx))
+                    .child(self.nav(Pane::Config, Some(self.pending()), cx))
                     .child(self.nav(Pane::Log, None, cx))
                     .child(self.nav(Pane::Hosts, None, cx)),
             )
@@ -1545,6 +1551,7 @@ impl Desk {
         };
         let path = sheet.path.clone();
         let refused = sheet.refused.clone();
+        let pending = sheet.edits;
         let sections = self.sections();
         let open = self.section.clone();
         div()
@@ -1582,21 +1589,64 @@ impl Desk {
                             .text_size(px(T_PILL))
                             .text_color(rgb(FAINT))
                             .child(
-                                "Every change is written at once. Nothing is written that the \
-                                 parser would not load.",
+                                "Changes are held until you save, because the supervisor \
+                                 re-reads the file as soon as it changes. Nothing is written \
+                                 that would not load.",
                             ),
                     )
                     .child(
-                        div().px(step(2.)).pb(step(2.5)).flex().child(
-                            button("re-read-config", "Re-read the file").on_click(cx.listener(
-                                |this, _, _, cx| {
-                                    this.typing = None;
-                                    this.read_sheet();
-                                    cx.notify();
-                                },
-                            )),
-                        ),
+                        div()
+                            .px(step(2.))
+                            .pb(step(2.5))
+                            .flex()
+                            .flex_wrap()
+                            .gap(step(1.5))
+                            .child(
+                                button("save-config", "Save")
+                                    .when(pending == 0 || refused.is_some(), |save| {
+                                        save.opacity(0.45)
+                                    })
+                                    .when(pending > 0 && refused.is_none(), |save| {
+                                        save.bg(tint(GREEN, 0x30))
+                                            .border_color(tint(GREEN, 0x70))
+                                            .text_color(rgb(GREEN))
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.save();
+                                        cx.notify();
+                                    })),
+                            )
+                            .when(pending > 0, |row| {
+                                row.child(button("revert-config", "Revert").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.revert();
+                                        cx.notify();
+                                    }),
+                                ))
+                            })
+                            .when(pending == 0, |row| {
+                                row.child(button("re-read-config", "Re-read").on_click(
+                                    cx.listener(|this, _, _, cx| {
+                                        this.typing = None;
+                                        this.read_sheet();
+                                        cx.notify();
+                                    }),
+                                ))
+                            }),
                     )
+                    .when(pending > 0, |column| {
+                        column.child(
+                            div()
+                                .px(step(2.5))
+                                .pb(step(2.5))
+                                .text_size(px(T_PILL))
+                                .text_color(rgb(AMBER))
+                                .child(match pending {
+                                    1 => "1 change not written".to_owned(),
+                                    count => format!("{count} changes not written"),
+                                }),
+                        )
+                    })
                     .children(sections.into_iter().map(|section| {
                         let chosen = section == open;
                         let label = section.title();
@@ -1652,7 +1702,10 @@ impl Desk {
                                         .text_size(px(T_META))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(AMBER))
-                                        .child("not saved — the file would not load"),
+                                        .child(
+                                            "held, not written — the supervisor would refuse \
+                                             this",
+                                        ),
                                 )
                                 .child(
                                     div()
@@ -2061,6 +2114,7 @@ impl Desk {
                         text,
                         document,
                         refused: None,
+                        edits: 0,
                     })
                 }
                 Err(error) => {
@@ -2093,11 +2147,16 @@ impl Desk {
     /// Keys, while a field is being typed into. Nothing else in the
     /// window reads them.
     fn typed(&mut self, event: &gpui::KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let command = event.keystroke.modifiers.platform;
+        if command && key == "s" {
+            self.save();
+            cx.notify();
+            return;
+        }
         let Some(typing) = &mut self.typing else {
             return;
         };
-        let key = event.keystroke.key.as_str();
-        let command = event.keystroke.modifiers.platform;
         match key {
             "escape" => self.typing = None,
             "enter" => {
@@ -2214,17 +2273,38 @@ impl Desk {
                 }
             }
         }
-        self.commit(document);
+        self.hold(document);
     }
 
     fn drop_item(&mut self, at: &Spot) {
         self.put(at, None);
     }
 
-    /// Checks a candidate document with the parser, and writes it only
-    /// if the parser takes it.
-    fn commit(&mut self, document: toml_edit::DocumentMut) {
+    /// Takes a changed document as the one being edited, and asks the
+    /// loader what it thinks of it. Nothing is written here.
+    fn hold(&mut self, document: toml_edit::DocumentMut) {
         let Some(sheet) = &mut self.sheet else { return };
+        sheet.refused = refusal(&sheet.path, &document.to_string());
+        sheet.document = document;
+        sheet.edits += 1;
+    }
+
+    /// How many changes are waiting to be written.
+    fn pending(&self) -> usize {
+        self.sheet.as_ref().map_or(0, |sheet| sheet.edits)
+    }
+
+    /// Writes the edited document, if the loader takes it and nobody
+    /// else has touched the file since it was read.
+    fn save(&mut self) {
+        let Some(sheet) = &mut self.sheet else { return };
+        if sheet.edits == 0 {
+            return;
+        }
+        if let Some(refused) = &sheet.refused {
+            self.said = Some(format!("not saved: {}", first_line(refused)));
+            return;
+        }
         // Somebody may have been editing the same file in an editor
         // since it was read. Their work is not this window's to
         // overwrite.
@@ -2239,25 +2319,33 @@ impl Desk {
                 return;
             }
         }
-        let text = document.to_string();
-        match crate::config::Config::parse(&sheet.path, &text) {
-            Ok(_) => match std::fs::write(&sheet.path, &text) {
-                Ok(()) => {
-                    sheet.document = document;
-                    sheet.text = text;
-                    sheet.refused = None;
-                    let path = sheet.path.clone();
-                    self.said = Some(format!("saved {}", tilde(&path.display().to_string())));
-                }
-                Err(error) => {
-                    self.said = Some(format!("unable to write: {error}"));
-                }
-            },
-            Err(error) => {
-                sheet.refused = Some(format!("{error:#}"));
-                self.said = Some("not saved: the file would not load".to_owned());
+        let text = sheet.document.to_string();
+        match std::fs::write(&sheet.path, &text) {
+            Ok(()) => {
+                let edits = sheet.edits;
+                sheet.text = text;
+                sheet.edits = 0;
+                sheet.refused = None;
+                let path = sheet.path.clone();
+                self.said = Some(format!(
+                    "wrote {} change{} to {}; the supervisor re-reads it within a few seconds",
+                    edits,
+                    match edits {
+                        1 => "",
+                        _ => "s",
+                    },
+                    tilde(&path.display().to_string())
+                ));
             }
+            Err(error) => self.said = Some(format!("unable to write: {error}")),
         }
+    }
+
+    /// Throws the held edits away and goes back to the file on disk.
+    fn revert(&mut self) {
+        self.typing = None;
+        self.read_sheet();
+        self.said = Some("went back to the file on disk".to_owned());
     }
 
     // ── the log ──────────────────────────────────────────────────────
@@ -3130,6 +3218,24 @@ fn table_for<'a>(
     }
 }
 
+/// What the supervisor would say about this document, or nothing if it
+/// would take it.
+///
+/// Not `Config::parse`, which is types and unknown keys: this is
+/// `reload::load_bytes`, the very function a running supervisor reloads
+/// with, so the form cannot write a file that parses and is then
+/// refused by the daemon two seconds later.
+fn refusal(path: &std::path::Path, text: &str) -> Option<String> {
+    crate::supervisor::reload::load_bytes(path, text.as_bytes())
+        .err()
+        .map(|error| format!("{error:#}"))
+}
+
+/// The first line of a message, for a status bar that has one line.
+fn first_line(message: &str) -> String {
+    message.lines().next().unwrap_or_default().to_owned()
+}
+
 /// The first sentence of a doc comment: enough to say what a field is
 /// for, without turning a form into a manual.
 fn first_sentence(about: &str) -> String {
@@ -3445,6 +3551,30 @@ mod tests {
         let complaint = crate::config::Config::parse(path, &document.to_string())
             .expect_err("the parser refuses it");
         assert!(format!("{complaint:#}").contains("mdoe"), "{complaint:#}");
+    }
+
+    /// The form asks the loader, not the parser: a document that serde
+    /// takes but the supervisor would refuse must not reach the disk,
+    /// because the supervisor re-reads the file within seconds of it
+    /// changing and would refuse it there instead.
+    #[test]
+    fn the_gate_is_what_the_supervisor_would_load() {
+        let path = std::path::Path::new("config.toml");
+        let text = "[defaults]\nmode = \"two-way-conflict\"\n\n\
+                    [groups.a]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
+        assert_eq!(refusal(path, text), None);
+
+        let mut document: toml_edit::DocumentMut = text.parse().unwrap();
+        let table = table_for(&mut document, &Section::Group("a".to_owned())).unwrap();
+        table.insert(
+            "ignores",
+            toml_edit::value(toml_edit::Array::from_iter(["["])),
+        );
+        let broken = document.to_string();
+        crate::config::Config::parse(path, &broken)
+            .expect("serde takes it: a list of strings is a list of strings");
+        let complaint = refusal(path, &broken).expect("the loader does not");
+        assert!(complaint.contains("ignore"), "{complaint}");
     }
 
     /// A section the file has not got yet is made when something is

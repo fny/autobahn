@@ -2485,6 +2485,7 @@ mod tests {
         println!("ignores: {}", document["$defs"]["Group"]["properties"]["ignores"]);
     }
 
+
     /// The schema is the structs the parser uses, with the tables
     /// written onto it — not a second description that can fall behind.
     #[cfg(feature = "schema")]

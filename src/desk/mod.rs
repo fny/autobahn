@@ -181,6 +181,12 @@ enum Section {
     Settings,
     /// `[defaults]`, inherited by every group.
     Defaults,
+    /// `[advanced]`, whose defaults are the right answer.
+    Advanced,
+    /// `[advanced.alerts]`: how long a condition must hold.
+    Alerts,
+    /// `[advanced.peering-dangerously-experimental]`: the lease timing.
+    Peering,
     /// One `[groups.x]`.
     Group(String),
 }
@@ -190,6 +196,9 @@ impl Section {
         match self {
             Section::Settings => "settings".to_owned(),
             Section::Defaults => "defaults".to_owned(),
+            Section::Advanced => "advanced".to_owned(),
+            Section::Alerts => "advanced · alerts".to_owned(),
+            Section::Peering => "advanced · peering".to_owned(),
             Section::Group(name) => name.clone(),
         }
     }
@@ -1821,7 +1830,13 @@ impl Desk {
 
     /// The sections of the open file, in the order they are written.
     fn sections(&self) -> Vec<Section> {
-        let mut sections = vec![Section::Settings, Section::Defaults];
+        let mut sections = vec![
+            Section::Settings,
+            Section::Defaults,
+            Section::Advanced,
+            Section::Alerts,
+            Section::Peering,
+        ];
         if let Some(sheet) = &self.sheet {
             if let Some(groups) = sheet.document.get("groups").and_then(|item| item.as_table()) {
                 for (name, _) in groups.iter() {
@@ -1837,14 +1852,26 @@ impl Desk {
         let properties = match &self.section {
             Section::Settings => self.shape.get("properties").cloned(),
             Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
+            Section::Advanced => self.shape["$defs"]["Advanced"].get("properties").cloned(),
+            Section::Alerts => self.shape["$defs"]["AlertsAdvanced"]
+                .get("properties")
+                .cloned(),
+            Section::Peering => self.shape["$defs"]["PeeringAdvanced"]
+                .get("properties")
+                .cloned(),
             Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),
         };
         let Some(serde_json::Value::Object(properties)) = properties else {
             return vec![empty("the schema says nothing about this section")];
         };
+        let silent: &[&str] = match self.section {
+            Section::Settings => SILENT_AT_THE_TOP,
+            Section::Advanced => SILENT_IN_ADVANCED,
+            _ => &[],
+        };
         properties
             .iter()
-            .filter(|(key, _)| !SILENT.contains(&key.as_str()))
+            .filter(|(key, _)| !silent.contains(&key.as_str()))
             .map(|(key, field)| self.field(key, field, cx))
             .collect()
     }
@@ -2281,6 +2308,12 @@ impl Desk {
         let table: &toml_edit::Item = match &self.section {
             Section::Settings => sheet.document.as_item(),
             Section::Defaults => sheet.document.get("defaults")?,
+            Section::Advanced => sheet.document.get("advanced")?,
+            Section::Alerts => sheet.document.get("advanced")?.get("alerts")?,
+            Section::Peering => sheet
+                .document
+                .get("advanced")?
+                .get("peering-dangerously-experimental")?,
             Section::Group(name) => sheet.document.get("groups")?.get(name)?,
         };
         table.get(key).cloned()
@@ -3347,10 +3380,15 @@ fn holds(field: &serde_json::Value) -> Holds {
     Holds::Line
 }
 
-/// Keys the form does not show: the retired spellings kept only so a
-/// file that uses them gets an answer, and the sections that have a
-/// place of their own in the sidebar.
-const SILENT: &[&str] = &[
+/// Keys the form does not show at the top of the file: the sections
+/// that have a place of their own in the sidebar, and the retired
+/// spellings kept only so that a file still using one gets an answer
+/// rather than "unknown field".
+///
+/// Only at the top of the file. A group has a `disabled` of its own
+/// that is a flag and not a retired anything, and hiding it everywhere
+/// because the name is spoken for at the top is how it went missing.
+const SILENT_AT_THE_TOP: &[&str] = &[
     "groups",
     "defaults",
     "advanced",
@@ -3358,6 +3396,11 @@ const SILENT: &[&str] = &[
     "alerts",
     "peering-experimental",
 ];
+
+/// The same, for `[advanced]`: its two timing tables are sections of
+/// their own, and `peering-experimental` is the spelling that was
+/// renamed.
+const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-experimental", "peering-experimental"];
 
 /// The table one section lives in, made if the file has not got it yet.
 fn table_for<'a>(
@@ -3368,6 +3411,24 @@ fn table_for<'a>(
         Section::Settings => Some(document.as_table_mut()),
         Section::Defaults => document
             .entry("defaults")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut(),
+        Section::Advanced => document
+            .entry("advanced")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut(),
+        Section::Alerts => document
+            .entry("advanced")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()?
+            .entry("alerts")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut(),
+        Section::Peering => document
+            .entry("advanced")
+            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+            .as_table_mut()?
+            .entry("peering-dangerously-experimental")
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
         Section::Group(name) => document

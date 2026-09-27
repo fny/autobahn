@@ -55,6 +55,10 @@ enum Action {
         host: String,
     },
     OpenLog,
+    /// Opens the whole of the warning the menu could only summarize.
+    ShowWarning {
+        text: String,
+    },
     ServiceStart,
     ServiceStop,
     ServiceRestart,
@@ -454,8 +458,43 @@ impl App {
         let queued = self.queued.load(std::sync::atomic::Ordering::SeqCst);
         let summary = summary_of(report, queued);
         model.summary.set_text(&summary);
-        let error_text = warning_of(report, self.last_error.as_deref());
-        set_optional(&model.menu, &model.summary, &mut model.error, error_text);
+        let warning = warning_of(report, self.last_error.as_deref());
+        // Unlike every other optional line, this one can be clicked: the
+        // menu holds one line and the message is often several.
+        match (&warning, model.error.as_ref()) {
+            (Some(warning), Some(item)) => {
+                item.set_text(&warning.line);
+                self.actions.insert(
+                    item.id().clone(),
+                    Action::ShowWarning {
+                        text: warning.whole.clone(),
+                    },
+                );
+            }
+            (Some(warning), None) => {
+                let item = MenuItem::new(&warning.line, true, None);
+                let position = model
+                    .menu
+                    .items()
+                    .iter()
+                    .position(|other| other.id() == model.summary.id())
+                    .map(|at| at + 1);
+                let _ = model.menu.insert(&item, position.unwrap_or(0));
+                self.actions.insert(
+                    item.id().clone(),
+                    Action::ShowWarning {
+                        text: warning.whole.clone(),
+                    },
+                );
+                model.error = Some(item);
+            }
+            (None, Some(item)) => {
+                self.actions.remove(item.id());
+                let _ = model.menu.remove(item);
+                model.error = None;
+            }
+            (None, None) => {}
+        }
         if let Some(tray) = &self.tray {
             let _ = tray.set_tooltip(Some(format!("autobahn — {summary}")));
             // The menu bar carries the name of whatever needs attention.
@@ -611,9 +650,13 @@ impl App {
         // menu stays until the file loads again.
         if report.config_notice != self.last_notice {
             if let Some(notice) = &report.config_notice {
+                // The first line only: a notification is narrower than a
+                // menu, and the caret diagram under a parse error reads as
+                // rubble once its newlines are escaped away.
+                let first = notice.message.split('\n').next().unwrap_or("").trim_end();
                 notify_with(
                     "autobahn",
-                    &format!("configuration refused: {}", display_safe(&notice.message)),
+                    &format!("configuration refused: {}", display_safe(first)),
                     crate::icon::ensure(&self.state_root),
                 );
             }
@@ -714,6 +757,15 @@ fn run_action(
             }
         }
         Action::OpenLog => crate::service::log_path().and_then(|log| open_path(&log)),
+        // Written where `Show diff` writes, which is private to this user
+        // and inside the state root, and with its newlines intact: the
+        // caret diagram is the readable part of a parse error.
+        Action::ShowWarning { text } => {
+            let file = crate::paths::tray_warning_file(state_root)?;
+            crate::persist::write_atomically(&file, text.as_bytes())
+                .with_context(|| format!("unable to write {}", file.display()))?;
+            open_path(&file)
+        }
         Action::ServiceStart => crate::service::start(),
         Action::ServiceStop => crate::service::stop(),
         Action::ServiceRestart => crate::service::restart(),
@@ -972,30 +1024,53 @@ fn summary_of(report: &StatusReport, queued: usize) -> String {
     parts.join(", ")
 }
 
-/// The menu's warning line, if any. The refused edit takes the same line,
-/// under an action's failure when there is one: both are things the
-/// person did. A supervisor that does not answer, or is another build,
-/// comes after.
-fn warning_of(report: &StatusReport, last_error: Option<&str>) -> Option<String> {
-    last_error
-        .map(|e| format!("⚠ {}", display_safe(e)))
+/// The menu's warning line, if any, and the whole message behind it. The
+/// refused edit takes the same line, under an action's failure when there
+/// is one: both are things the person did. A supervisor that does not
+/// answer, or is another build, comes after.
+///
+/// A menu item is one line, and a parse error is not: it carries a caret
+/// under the offending key, and the key is the first thing a reader wants.
+/// So the line is the message's *first* line, and the rest is a click
+/// away — rather than the whole thing escaped onto one line and then cut
+/// in the middle, which loses the key and keeps the list of valid ones.
+fn warning_of(report: &StatusReport, last_error: Option<&str>) -> Option<Warning> {
+    let whole = last_error
+        .map(str::to_owned)
         .or_else(|| {
             report
                 .config_notice
                 .as_ref()
-                .map(|notice| format!("⚠ configuration refused: {}", display_safe(&notice.message)))
+                .map(|notice| format!("configuration refused: {}", notice.message))
         })
         .or_else(|| {
             report
                 .supervisor_unresponsive
-                .then(|| format!("⚠ {}", crate::supervisor::control::unresponsive_message()))
+                .then(crate::supervisor::control::unresponsive_message)
         })
-        .or_else(|| {
-            report
-                .supervisor_mismatch
-                .as_ref()
-                .map(|mismatch| format!("⚠ {}", display_safe(mismatch)))
-        })
+        .or_else(|| report.supervisor_mismatch.clone())?;
+    Some(Warning {
+        line: warning_line(&whole),
+        whole,
+    })
+}
+
+/// A warning as the menu shows it: one line, and everything behind it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Warning {
+    line: String,
+    whole: String,
+}
+
+/// The single line a menu item can hold: the message's first line,
+/// escaped, and an invitation when there is more underneath.
+fn warning_line(whole: &str) -> String {
+    let mut lines = whole.split('\n');
+    let first = lines.next().unwrap_or("").trim_end();
+    match lines.any(|rest| !rest.trim().is_empty()) {
+        true => format!("⚠ {} — click for details", display_safe(first)),
+        false => format!("⚠ {}", display_safe(first)),
+    }
 }
 
 /// The configuration's shape: group names and their sessions, by key —
@@ -1368,11 +1443,59 @@ mod menu_tests {
         assert!(summary.contains("supervisor not responding"), "{summary}");
         assert!(!summary.contains("restart needed"), "{summary}");
         let warning = warning_of(&report(true), None).expect("a warning");
-        assert!(warning.contains("answered nothing"), "{warning}");
-        assert!(!warning.contains("another build"), "{warning}");
+        assert!(warning.line.contains("answered nothing"), "{}", warning.line);
+        assert!(!warning.line.contains("another build"), "{}", warning.line);
 
         assert!(!summary_of(&report(false), 0).contains("not responding"));
         assert_eq!(warning_of(&report(false), None), None);
+    }
+
+    /// A menu item is one line and a parse error is several. The line has
+    /// to carry the part that names what is wrong — the first line — and
+    /// say that there is more, rather than escaping the whole thing onto
+    /// one line where the truncation eats the answer.
+    #[test]
+    fn a_multi_line_warning_is_summarized_and_kept_whole() {
+        let message = "unable to parse configuration /x/config.toml: TOML parse error at line 1\n  |\n1 | mdoe = \"two-way\"\n  | ^^^^\nunknown field `mdoe`";
+        let report = StatusReport {
+            version: 4,
+            supervisor_running: true,
+            service: "running".into(),
+            groups: Vec::new(),
+            config_notice: Some(crate::supervisor::reload::Notice {
+                at: 0,
+                message: message.to_owned(),
+            }),
+            supervisor_mismatch: None,
+            supervisor_unresponsive: false,
+        };
+        let warning = warning_of(&report, None).expect("a warning");
+        assert!(warning.line.starts_with("⚠ configuration refused:"), "{}", warning.line);
+        assert!(warning.line.contains("line 1"), "{}", warning.line);
+        assert!(warning.line.ends_with("click for details"), "{}", warning.line);
+        assert!(!warning.line.contains('\n') && !warning.line.contains("\\n"), "{}", warning.line);
+        // The whole message keeps its shape, for the file a click opens.
+        assert!(warning.whole.contains("mdoe"), "{}", warning.whole);
+        assert!(warning.whole.contains('\n'), "{}", warning.whole);
+
+        // A one-line warning says nothing about details that do not exist.
+        let short = warning_of(&report_with_notice("no such group"), None).expect("a warning");
+        assert!(!short.line.contains("click for details"), "{}", short.line);
+    }
+
+    fn report_with_notice(message: &str) -> StatusReport {
+        StatusReport {
+            version: 4,
+            supervisor_running: true,
+            service: "running".into(),
+            groups: Vec::new(),
+            config_notice: Some(crate::supervisor::reload::Notice {
+                at: 0,
+                message: message.to_owned(),
+            }),
+            supervisor_mismatch: None,
+            supervisor_unresponsive: false,
+        }
     }
 }
 

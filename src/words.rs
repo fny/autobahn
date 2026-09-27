@@ -91,9 +91,13 @@ mod tests {
     /// see is the key itself, in the middle of the window.
     #[test]
     fn every_key_the_window_asks_for_is_in_the_catalogue() {
+        // Every surface that speaks: the two windows, what they share,
+        // and the menu bar.
         let sources = [
             include_str!("desk/mod.rs"),
             include_str!("desk/area.rs"),
+            include_str!("kit/mod.rs"),
+            include_str!("surface.rs"),
             include_str!("menubar.rs"),
         ];
         let mut asked = Vec::new();
@@ -136,6 +140,8 @@ mod tests {
         let sources = concat!(
             include_str!("desk/mod.rs"),
             include_str!("desk/area.rs"),
+            include_str!("kit/mod.rs"),
+            include_str!("surface.rs"),
             include_str!("menubar.rs"),
         );
         let unused: Vec<&String> = catalogue()

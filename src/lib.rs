@@ -48,6 +48,9 @@ pub mod supervisor;
 pub mod text;
 pub mod threads;
 pub mod transport;
+/// What a window over the fleet is, apart from its drawing.
+#[cfg(any(feature = "desk", feature = "desk-kit"))]
+pub(crate) mod surface;
 /// Photographing a window, for whichever one is asked to.
 #[cfg(any(feature = "desk", feature = "desk-kit"))]
 pub(crate) mod camera;

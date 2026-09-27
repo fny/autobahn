@@ -15,11 +15,18 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use gpui_kit::component::Root;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::input::{Editor, EditorState, Textarea, TextareaState};
+use gpui_kit::component::switch::Switch;
+use gpui_kit::component::{Root, Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 use crate::supervisor::{status_report, GroupReport, SessionReport, StatusReport};
+use crate::surface::{
+    self, first_sentence, holds, tilde, Conflict, Holds, Section, Sheet, Side, Spot,
+    SILENT_AT_THE_TOP, SILENT_IN_ADVANCED,
+};
 use crate::words::{count as counted, fill, t};
 
 /// How often the fleet is re-read when nothing is working, and when
@@ -59,6 +66,7 @@ fn tint(colour: u32, alpha: u32) -> Rgba {
 enum Pane {
     Groups,
     Conflicts,
+    Config,
     Log,
     Hosts,
 }
@@ -68,6 +76,7 @@ impl Pane {
         match self {
             Pane::Groups => t("pane.groups"),
             Pane::Conflicts => t("pane.conflicts"),
+            Pane::Config => t("pane.config"),
             Pane::Log => t("pane.log"),
             Pane::Hosts => t("pane.hosts"),
         }
@@ -77,6 +86,7 @@ impl Pane {
         match self {
             Pane::Groups => t("pane.groups_about"),
             Pane::Conflicts => t("pane.conflicts_about"),
+            Pane::Config => t("pane.config_about"),
             Pane::Log => t("pane.log_about"),
             Pane::Hosts => t("pane.hosts_about"),
         }
@@ -93,6 +103,23 @@ pub struct Desk {
     report: Option<StatusReport>,
     read_at: Option<Instant>,
     selected: Option<(String, crate::supervisor::control::SessionKey)>,
+    /// The conflict the conflicts pane has open, its two sides, and the
+    /// difference when it has been asked for.
+    conflict: Option<Conflict>,
+    sides: Option<(Side, Side)>,
+    diff: Option<String>,
+    /// The log, in the kit's own code editor: selectable, searchable
+    /// with control-F, and set in the monospace the theme names.
+    log: Option<Entity<EditorState>>,
+    log_path: Option<PathBuf>,
+    log_lines: usize,
+    /// The configuration file, which section is open, and the block
+    /// editing one of its values.
+    sheet: Option<Sheet>,
+    section: Section,
+    /// One live block per value of the file, made as it is first drawn.
+    fields: std::collections::HashMap<(Section, String), Entity<TextareaState>>,
+    shape: serde_json::Value,
     said: Option<String>,
 }
 
@@ -102,14 +129,19 @@ pub fn run(config: Option<PathBuf>, state_root: PathBuf) -> Result<()> {
 }
 
 /// The same window, photographed into `directory` and closed again.
-pub fn shoot(config: Option<PathBuf>, state_root: PathBuf, directory: PathBuf) -> Result<()> {
-    run_with(config, state_root, Some(directory))
+pub fn shoot(
+    config: Option<PathBuf>,
+    state_root: PathBuf,
+    directory: PathBuf,
+    pane: Option<String>,
+) -> Result<()> {
+    run_with(config, state_root, Some((directory, pane)))
 }
 
 fn run_with(
     config: Option<PathBuf>,
     state_root: PathBuf,
-    shots: Option<PathBuf>,
+    shots: Option<(PathBuf, Option<String>)>,
 ) -> Result<()> {
     gpui_kit::application().run(move |cx: &mut App| {
         gpui_kit::init(cx);
@@ -126,17 +158,39 @@ fn run_with(
             }),
             ..Default::default()
         };
+        let wanted = shots.as_ref().and_then(|(_, pane)| pane.clone());
         let window = cx
             .open_window(options, |window, cx| {
-                let desk = cx.new(|cx| Desk::new(config, state_root, cx));
+                let desk = cx.new(|cx| {
+                    let mut desk = Desk::new(config, state_root, cx);
+                    if let Some(pane) = wanted.as_deref() {
+                        desk.pane = match pane {
+                            "conflicts" => Pane::Conflicts,
+                            "config" => Pane::Config,
+                            "log" => Pane::Log,
+                            "hosts" => Pane::Hosts,
+                            _ => Pane::Groups,
+                        };
+                        desk.settle(desk.pane, window, cx);
+                    }
+                    desk
+                });
                 cx.new(|cx| Root::new(desk, window, cx))
             })
             .expect("unable to open the window");
-        let Some(directory) = shots.clone() else { return };
+        // The theme is the window's, not only the application's: told
+        // once here, every component in it is drawn in the dark.
+        window
+            .update(cx, |_, window, cx| {
+                Theme::change(ThemeMode::Dark, Some(window), cx);
+            })
+            .ok();
+        let Some((directory, pane)) = shots.clone() else { return };
         cx.spawn(async move |cx| {
             let sleep = cx.background_executor().timer(Duration::from_millis(900));
             sleep.await;
-            let path = directory.join("desk-kit.png");
+            let name = pane.clone().unwrap_or_else(|| "groups".to_owned());
+            let path = directory.join(format!("kit-{name}.png"));
             let taken = window.update(cx, |_, window, _| {
                 let bounds = window.bounds();
                 crate::camera::grab(
@@ -174,6 +228,16 @@ impl Desk {
             report: None,
             read_at: None,
             selected: None,
+            conflict: None,
+            sides: None,
+            diff: None,
+            log: None,
+            log_path: None,
+            log_lines: 0,
+            sheet: None,
+            section: Section::Settings,
+            fields: std::collections::HashMap::new(),
+            shape: crate::config::schema(),
             said: None,
         };
         desk.refresh();
@@ -282,7 +346,7 @@ impl Desk {
 }
 
 impl Render for Desk {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.pane;
         div()
             .size_full()
@@ -300,7 +364,10 @@ impl Render for Desk {
                     .child(self.header())
                     .child(match pane {
                         Pane::Groups => self.groups(cx),
-                        _ => empty(pane.about()),
+                        Pane::Conflicts => self.conflicts(cx),
+                        Pane::Config => self.config_pane(window, cx),
+                        Pane::Log => self.log_pane(window, cx),
+                        Pane::Hosts => self.hosts(cx),
                     })
                     .child(self.footer()),
             )
@@ -366,6 +433,7 @@ impl Desk {
                     .gap(step(0.5))
                     .child(self.nav(Pane::Groups, None, cx))
                     .child(self.nav(Pane::Conflicts, Some(waiting), cx))
+                    .child(self.nav(Pane::Config, Some(self.pending()), cx))
                     .child(self.nav(Pane::Log, None, cx))
                     .child(self.nav(Pane::Hosts, None, cx)),
             )
@@ -416,8 +484,9 @@ impl Desk {
             .when_some(badge.filter(|count| *count > 0), |row, count| {
                 row.child(pill(count.to_string(), AMBER))
             })
-            .on_click(cx.listener(move |this, _, _, cx| {
+            .on_click(cx.listener(move |this, _, window, cx| {
                 this.pane = pane;
+                this.settle(pane, window, cx);
                 cx.notify();
             }))
             .into_any_element()
@@ -698,6 +767,1349 @@ impl Desk {
     }
 }
 
+
+impl Desk {
+    /// What a pane needs read before it is looked at.
+    fn settle(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        match pane {
+            Pane::Conflicts => {
+                if self.conflict.is_none() {
+                    if let Some(first) = self.waiting_list().into_iter().find(|it| !it.blocked) {
+                        self.open_conflict(first);
+                    }
+                }
+            }
+            Pane::Log => {
+                if self.log.is_none() {
+                    self.read_log(window, cx);
+                }
+            }
+            Pane::Config => {
+                if self.sheet.is_none() {
+                    self.read_sheet();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn waiting_list(&self) -> Vec<Conflict> {
+        let mut waiting = Vec::new();
+        for group in self.report.iter().flat_map(|report| report.groups.iter()) {
+            for session in &group.sessions {
+                for conflict in &session.conflicts {
+                    waiting.push(Conflict {
+                        group: group.name.clone(),
+                        host: session.host.clone(),
+                        path: conflict.path.clone(),
+                        blocked: false,
+                        alpha_root: group.alpha.clone(),
+                        beta_root: session.beta.clone(),
+                    });
+                }
+                for blocked in &session.blocked {
+                    waiting.push(Conflict {
+                        group: group.name.clone(),
+                        host: session.host.clone(),
+                        path: blocked.clone(),
+                        blocked: true,
+                        alpha_root: group.alpha.clone(),
+                        beta_root: session.beta.clone(),
+                    });
+                }
+            }
+        }
+        waiting
+    }
+
+    fn open_conflict(&mut self, item: Conflict) {
+        self.sides = Some((
+            surface::inspect("alpha", &item.alpha_root, &item.path),
+            surface::inspect("beta", &item.beta_root, &item.path),
+        ));
+        self.conflict = Some(item);
+        self.diff = None;
+    }
+
+    // ── the conflicts ────────────────────────────────────────────────
+
+    fn conflicts(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let waiting = self.waiting_list();
+        if waiting.is_empty() {
+            return empty(t("conflicts.none"));
+        }
+        let open = self.conflict.clone();
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .child(
+                div()
+                    .id("queue")
+                    .w(px(352.))
+                    .flex_shrink_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p(step(3.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(0.5))
+                    .border_r_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SUNK))
+                    .children(waiting.into_iter().enumerate().map(|(index, item)| {
+                        let chosen = open.as_ref() == Some(&item);
+                        let name = item
+                            .path
+                            .rsplit('/')
+                            .next()
+                            .unwrap_or(&item.path)
+                            .to_owned();
+                        let where_ = match item.path.rsplit_once('/') {
+                            Some((directory, _)) => format!("{} · {directory}/", item.group),
+                            None => item.group.clone(),
+                        };
+                        let colour = match item.blocked {
+                            true => RED,
+                            false => AMBER,
+                        };
+                        let word = match item.blocked {
+                            true => t("conflicts.blocked"),
+                            false => t("conflicts.conflict"),
+                        };
+                        let taken = item.clone();
+                        div()
+                            .id(SharedString::from(format!("waiting-{index}")))
+                            .px(step(2.5))
+                            .py(step(1.5))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .when(chosen, |row| row.bg(rgb(RAISED)))
+                            .hover(|row| row.bg(rgb(PANEL)))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(step(1.5))
+                                    .child(dot(colour))
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w(px(0.))
+                                            .font_family(self.mono.clone())
+                                            .text_size(px(12.5))
+                                            .truncate()
+                                            .child(crate::text::display_safe(&name).to_string()),
+                                    )
+                                    .child(pill(word, colour)),
+                            )
+                            .child(
+                                div()
+                                    .pl(step(3.5))
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(10.5))
+                                    .text_color(rgb(FAINT))
+                                    .truncate()
+                                    .child(where_),
+                            )
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.open_conflict(taken.clone());
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .child(match self.conflict.clone() {
+                None => empty(t("conflicts.pick")),
+                Some(item) => self.conflict_detail(item, cx),
+            })
+            .into_any_element()
+    }
+
+    fn conflict_detail(&mut self, item: Conflict, cx: &mut Context<Self>) -> AnyElement {
+        let sides = self.sides.clone();
+        let binary = sides
+            .as_ref()
+            .is_some_and(|(alpha, beta)| alpha.binary || beta.binary);
+        let keep_host = match item.host.contains(':') {
+            true => surface::short_name(&item.host),
+            false => "beta".to_owned(),
+        };
+        let diff = self.diff.clone();
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(step(6.))
+                    .pt(step(5.))
+                    .pb(step(4.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(2.))
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .child(label(match item.blocked {
+                        true => t("conflicts.blocked"),
+                        false => t("conflicts.conflict"),
+                    }))
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(13.))
+                            .child(crate::text::display_safe(&item.path).to_string()),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(format!("{} · {}", item.group, tilde(&item.host))),
+                    )
+                    .when(item.blocked, |head| {
+                        head.child(
+                            div()
+                                .pt(step(1.))
+                                .text_size(px(11.))
+                                .text_color(rgb(DIM))
+                                .child(t("conflicts.blocked_about")),
+                        )
+                    })
+                    .when(!item.blocked, |head| {
+                        let alpha = item.clone();
+                        let host = item.clone();
+                        let both = item.clone();
+                        let shown = item.clone();
+                        head.child(
+                            div()
+                                .pt(step(1.))
+                                .flex()
+                                .gap(step(1.5))
+                                .child(
+                                    Button::new("keep-alpha")
+                                        .small()
+                                        .outline()
+                                        .label(t("conflicts.keep_alpha"))
+                                        .tooltip(t("tip.keep_alpha"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.resolve(&alpha, "alpha");
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("keep-beta")
+                                        .small()
+                                        .outline()
+                                        .label(fill(
+                                            "conflicts.keep_beta",
+                                            &[("name", &keep_host)],
+                                        ))
+                                        .tooltip(t("tip.keep_beta"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            let keep = host.host.clone();
+                                            this.resolve(&host, &keep);
+                                            cx.notify();
+                                        })),
+                                )
+                                .child(
+                                    Button::new("keep-both")
+                                        .small()
+                                        .outline()
+                                        .label(t("conflicts.keep_both"))
+                                        .tooltip(t("tip.keep_both"))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.resolve(&both, "both");
+                                            cx.notify();
+                                        })),
+                                )
+                                .when(!binary, |row| {
+                                    row.child(
+                                        Button::new("show-diff")
+                                            .small()
+                                            .label(t("conflicts.show_difference"))
+                                            .tooltip(t("tip.show_difference"))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.read_diff(&shown);
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                    }),
+            )
+            .when_some(sides.filter(|_| binary), |column, (alpha, beta)| {
+                column.child(self.binary_card(&item, &alpha, &beta, cx))
+            })
+            .when_some(diff.filter(|_| !binary), |column, diff| {
+                column.child(
+                    div()
+                        .id("diff")
+                        .flex_1()
+                        .min_h(px(0.))
+                        .overflow_scroll()
+                        .px(step(4.5))
+                        .py(step(4.))
+                        .font_family(self.mono.clone())
+                        .text_size(px(11.))
+                        .flex()
+                        .flex_col()
+                        .children(diff.lines().map(|line| {
+                            let (colour, ground) = match line.chars().next() {
+                                Some('+') => (GREEN, tint(GREEN, 0x14)),
+                                Some('-') => (RED, tint(RED, 0x14)),
+                                Some('@') => (BLUE, tint(BLUE, 0x10)),
+                                _ => (DIM, rgba(0x00000000)),
+                            };
+                            div()
+                                .px(step(1.5))
+                                .bg(ground)
+                                .text_color(rgb(colour))
+                                .whitespace_nowrap()
+                                .child(crate::text::display_safe(line).to_string())
+                        })),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn binary_card(
+        &self,
+        item: &Conflict,
+        alpha: &Side,
+        beta: &Side,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let newer = match (alpha.modified, beta.modified) {
+            (Some(a), Some(b)) if a > b => Some("alpha"),
+            (Some(a), Some(b)) if b > a => Some("beta"),
+            _ => None,
+        };
+        let same = alpha.digest.is_some() && alpha.digest == beta.digest;
+        let name = item.path.rsplit('/').next().unwrap_or(&item.path).to_owned();
+        div()
+            .id("binary")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(step(6.))
+            .py(step(5.))
+            .flex()
+            .flex_col()
+            .gap(step(3.))
+            .child(label(t("conflicts.binary")))
+            .child(
+                div()
+                    .max_w(px(680.))
+                    .text_size(px(11.))
+                    .text_color(rgb(DIM))
+                    .child(t("conflicts.binary_about")),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(step(4.))
+                    .child(self.side_card(alpha, newer == Some("alpha"), cx))
+                    .child(self.side_card(beta, newer == Some("beta"), cx)),
+            )
+            .when(same, |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(step(2.))
+                        .child(dot(GREEN))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(GREEN))
+                                .child(fill("conflicts.same", &[("name", &name)])),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn side_card(&self, side: &Side, newer: bool, cx: &mut Context<Self>) -> Div {
+        let file = side.file.clone();
+        let name = side.name;
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .rounded(px(8.))
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(LINE))
+            .p(step(3.5))
+            .flex()
+            .flex_col()
+            .gap(step(1.5))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(2.))
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(side.name),
+                    )
+                    .when(newer, |head| head.child(pill(t("conflicts.written_last"), BLUE)))
+                    .when_some(side.trouble.clone(), |head, trouble| {
+                        head.child(pill(trouble, AMBER))
+                    }),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(11.))
+                    .text_color(rgb(FAINT))
+                    .truncate()
+                    .child(surface::tail(&side.root, 3)),
+            )
+            .child(div().h(step(0.5)))
+            .child(self.pair(
+                t("conflicts.size"),
+                side.size
+                    .map(surface::human_size)
+                    .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
+            ))
+            .child(self.pair(
+                t("conflicts.written"),
+                side.modified
+                    .map(|at| crate::logging::stamp(at as libc::time_t))
+                    .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
+            ))
+            .child(self.pair(
+                t("conflicts.digest"),
+                match (&side.digest, side.size) {
+                    (Some(digest), _) => digest.chars().take(16).collect::<String>(),
+                    (None, Some(size)) if size > surface::HASH_LIMIT => {
+                        t("conflicts.too_large").to_owned()
+                    }
+                    _ => t("conflicts.unknown").to_owned(),
+                },
+            ))
+            .when_some(file, |card, file| {
+                card.child(
+                    div().pt(step(1.5)).flex().child(
+                        Button::new(SharedString::from(format!("reveal-{name}")))
+                            .small()
+                            .outline()
+                            .label(t("conflicts.reveal"))
+                            .tooltip(t("tip.reveal"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.reveal(&file);
+                                cx.notify();
+                            })),
+                    ),
+                )
+            })
+    }
+
+    fn pair(&self, name: &'static str, value: String) -> Div {
+        div()
+            .flex()
+            .items_baseline()
+            .gap(step(2.5))
+            .child(
+                div()
+                    .w(px(52.))
+                    .flex_shrink_0()
+                    .text_size(px(10.5))
+                    .text_color(rgb(FAINT))
+                    .child(name),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .font_family(self.mono.clone())
+                    .text_size(px(12.))
+                    .truncate()
+                    .child(value),
+            )
+    }
+
+    // ── the hosts ────────────────────────────────────────────────────
+
+    fn hosts(&mut self, _cx: &mut Context<Self>) -> AnyElement {
+        let Some(report) = &self.report else {
+            return empty(t("fleet.reading_fleet"));
+        };
+        let mut hosts: Vec<(String, usize, Severity, String, Option<String>)> = Vec::new();
+        for group in &report.groups {
+            for session in &group.sessions {
+                let severity = severity(&session.state);
+                match hosts.iter_mut().find(|(host, ..)| host == &session.host) {
+                    Some((_, count, worst, state, error)) => {
+                        *count += 1;
+                        if severity > *worst {
+                            *worst = severity;
+                            *state = session.state.clone();
+                            *error = session.error.clone();
+                        }
+                    }
+                    None => hosts.push((
+                        session.host.clone(),
+                        1,
+                        severity,
+                        session.state.clone(),
+                        session.error.clone(),
+                    )),
+                }
+            }
+        }
+        hosts.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        let manifest = std::fs::read_to_string(self.state_root.join("agents").join("MANIFEST"));
+        let rows: Vec<Div> = hosts
+            .into_iter()
+            .enumerate()
+            .map(|(index, (host, count, worst, state, error))| {
+                let said = error
+                    .filter(|_| worst != Severity::Fine)
+                    .map(|error| {
+                        crate::text::display_safe(
+                            error.rsplit(": ").next().unwrap_or(error.as_str()),
+                        )
+                        .to_string()
+                    })
+                    .unwrap_or(state);
+                div()
+                    .h(step(9.))
+                    .px(step(4.))
+                    .flex()
+                    .items_center()
+                    .gap(step(3.))
+                    .when(index > 0, |row| row.border_t_1().border_color(rgb(HAIR)))
+                    .child(dot(colour_of(worst)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_family(self.mono.clone())
+                            .text_size(px(12.5))
+                            .truncate()
+                            .child(tilde(&host)),
+                    )
+                    .child(
+                        div()
+                            .w(px(320.))
+                            .flex_shrink_0()
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.))
+                            .text_color(rgb(colour_of(worst)))
+                            .truncate()
+                            .child(said),
+                    )
+                    .child(
+                        div()
+                            .w(px(88.))
+                            .flex_shrink_0()
+                            .text_right()
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(counted("hosts.session", count, &[])),
+                    )
+            })
+            .collect();
+        div()
+            .id("hosts")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .p(step(6.))
+            .flex()
+            .flex_col()
+            .gap(step(4.))
+            .child(
+                div()
+                    .rounded(px(8.))
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(step(7.))
+                            .px(step(4.))
+                            .flex()
+                            .items_center()
+                            .gap(step(3.))
+                            .border_b_1()
+                            .border_color(rgb(HAIR))
+                            .child(div().size(px(7.)).flex_shrink_0())
+                            .child(div().flex_1().min_w(px(0.)).child(label(t("hosts.host"))))
+                            .child(
+                                div()
+                                    .w(px(320.))
+                                    .flex_shrink_0()
+                                    .child(label(t("hosts.said"))),
+                            )
+                            .child(
+                                div()
+                                    .w(px(88.))
+                                    .flex_shrink_0()
+                                    .flex()
+                                    .justify_end()
+                                    .child(label(t("hosts.carrying"))),
+                            ),
+                    )
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .rounded(px(8.))
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(LINE))
+                    .p(step(4.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(2.))
+                    .child(label(t("hosts.bundle")))
+                    .child(match manifest {
+                        Ok(manifest) => div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.))
+                            .text_color(rgb(DIM))
+                            .flex()
+                            .flex_col()
+                            .gap(px(1.))
+                            .children(
+                                manifest
+                                    .lines()
+                                    .map(|line| div().child(line.to_owned()))
+                                    .collect::<Vec<_>>(),
+                            ),
+                        Err(_) => div().text_size(px(11.)).text_color(rgb(FAINT)).child(fill(
+                            "hosts.no_manifest",
+                            &[(
+                                "path",
+                                &tilde(&self.state_root.join("agents").display().to_string()),
+                            )],
+                        )),
+                    })
+                    .child(
+                        div()
+                            .pt(step(1.))
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(fill("hosts.build", &[("version", &crate::protocol::version())])),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    // ── the log ──────────────────────────────────────────────────────
+
+    /// The supervisor's account, in a block that selects and searches:
+    /// the kit's own text area, read-only.
+    fn log_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.log.is_none() {
+            self.read_log(window, cx);
+        }
+        let Some(text) = self.log.clone() else {
+            return empty(t("fleet.reading_fleet"));
+        };
+        let path = self
+            .log_path
+            .as_ref()
+            .map(|path| tilde(&path.display().to_string()))
+            .unwrap_or_default();
+        let lines = self.log_lines;
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .h(step(11.))
+                    .flex_shrink_0()
+                    .px(step(6.))
+                    .flex()
+                    .items_center()
+                    .gap(step(2.))
+                    .border_b_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SUNK))
+                    .child(
+                        Button::new("re-read")
+                            .small()
+                            .outline()
+                            .label(t("log.re_read"))
+                            .tooltip(t("tip.log_re_read"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.log = None;
+                                this.read_log(window, cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(step(2.5))
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(path)
+                            .child(counted(
+                                "log.counted",
+                                lines,
+                                &[("shown", &lines.to_string()), ("held", &lines.to_string())],
+                            )),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .p(step(3.))
+                    .child(Editor::new(&text).readonly(true).h_full()),
+            )
+            .into_any_element()
+    }
+
+    fn read_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let service = self.state_root.join("service.log");
+        let watch = self.state_root.join("watch.log");
+        let (path, text) = match std::fs::read_to_string(&service) {
+            Ok(text) => (Some(service), text),
+            Err(_) => match std::fs::read_to_string(&watch) {
+                Ok(text) => (Some(watch), text),
+                Err(_) => (
+                    None,
+                    fill(
+                        "log.unreadable",
+                        &[
+                            ("service", &service.display().to_string()),
+                            ("watch", &watch.display().to_string()),
+                        ],
+                    ),
+                ),
+            },
+        };
+        let tail: Vec<&str> = text.lines().rev().take(400).collect();
+        let shown: String = tail
+            .into_iter()
+            .rev()
+            .collect::<Vec<&str>>()
+            .join("\n");
+        self.log_lines = shown.lines().count();
+        self.log_path = path;
+        let block = cx.new(|cx| EditorState::new(window, cx).default_value(shown));
+        self.log = Some(block);
+    }
+
+    // ── the configuration ────────────────────────────────────────────
+
+    fn read_sheet(&mut self) {
+        match Sheet::read(self.config.as_deref()) {
+            Ok(sheet) => self.sheet = Some(sheet),
+            Err(complaint) => self.said = Some(complaint),
+        }
+    }
+
+    fn held(&self, key: &str) -> Option<toml_edit::Item> {
+        self.sheet.as_ref()?.held(&self.section, key)
+    }
+
+    fn pending(&self) -> usize {
+        self.sheet.as_ref().map_or(0, |sheet| sheet.pending())
+    }
+
+    fn put(&mut self, at: &Spot, value: Option<toml_edit::Item>) {
+        let Some(sheet) = &mut self.sheet else { return };
+        if let Some(said) = sheet.put(at, value) {
+            self.said = Some(said);
+        }
+    }
+
+    fn save(&mut self) {
+        let Some(sheet) = &mut self.sheet else { return };
+        if let Some(said) = sheet.save() {
+            self.said = Some(said);
+        }
+    }
+
+    fn config_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.sheet.is_none() {
+            self.read_sheet();
+        }
+        let Some(sheet) = &self.sheet else {
+            return empty(t("config.none"));
+        };
+        let path = sheet.path.clone();
+        let refused = sheet.refused().map(str::to_owned);
+        let pending = sheet.pending();
+        let sections = sheet.sections();
+        let open = self.section.clone();
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .flex()
+            .child(
+                div()
+                    .id("sections")
+                    .w(px(260.))
+                    .flex_shrink_0()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p(step(3.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(0.5))
+                    .border_r_1()
+                    .border_color(rgb(LINE))
+                    .bg(rgb(SUNK))
+                    .child(
+                        div()
+                            .px(step(2.5))
+                            .pb(step(1.))
+                            .font_family(self.mono.clone())
+                            .text_size(px(10.5))
+                            .text_color(rgb(FAINT))
+                            .truncate()
+                            .child(surface::tail(&tilde(&path.display().to_string()), 3)),
+                    )
+                    .child(
+                        div()
+                            .px(step(2.5))
+                            .pb(step(2.))
+                            .text_size(px(10.5))
+                            .text_color(rgb(FAINT))
+                            .child(t("config.held")),
+                    )
+                    .child(
+                        div()
+                            .px(step(2.))
+                            .pb(step(2.5))
+                            .flex()
+                            .flex_wrap()
+                            .gap(step(1.5))
+                            .child(
+                                Button::new("save-config")
+                                    .small()
+                                    .outline()
+                                    .when(pending > 0 && refused.is_none(), |save| save.primary())
+                                    .label(t("config.save"))
+                                    .tooltip(t("tip.save"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.take_the_fields(cx);
+                                        this.save();
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("revert-config")
+                                    .small()
+                                    .outline()
+                                    .label(match pending {
+                                        0 => t("config.re_read"),
+                                        _ => t("config.revert"),
+                                    })
+                                    .tooltip(match pending {
+                                        0 => t("tip.config_re_read"),
+                                        _ => t("tip.revert"),
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.fields.clear();
+                                        this.sheet = None;
+                                        this.read_sheet();
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .when(pending > 0, |column| {
+                        column.child(
+                            div()
+                                .px(step(2.5))
+                                .pb(step(2.5))
+                                .text_size(px(10.5))
+                                .text_color(rgb(AMBER))
+                                .child(counted("config.pending", pending, &[])),
+                        )
+                    })
+                    .children(sections.into_iter().map(|section| {
+                        let chosen = section == open;
+                        let label = section.title();
+                        let group = matches!(section, Section::Group(_));
+                        div()
+                            .id(SharedString::from(format!("section-{label}")))
+                            .px(step(2.5))
+                            .py(step(1.5))
+                            .rounded(px(6.))
+                            .cursor_pointer()
+                            .flex()
+                            .items_center()
+                            .gap(step(1.5))
+                            .text_size(px(12.5))
+                            .when(chosen, |row| row.bg(rgb(RAISED)).text_color(rgb(INK)))
+                            .when(!chosen, |row| {
+                                row.text_color(rgb(DIM)).hover(|row| row.bg(rgb(PANEL)))
+                            })
+                            .when(group, |row| row.child(dot(BLUE)))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.section = section.clone();
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .child(
+                div()
+                    .id("fields")
+                    .flex_1()
+                    .min_w(px(0.))
+                    .h_full()
+                    .overflow_y_scroll()
+                    .px(step(6.))
+                    .py(step(5.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(4.))
+                    .when_some(refused, |column, refused| {
+                        column.child(
+                            div()
+                                .rounded(px(8.))
+                                .bg(tint(AMBER, 0x14))
+                                .border_1()
+                                .border_color(tint(AMBER, 0x50))
+                                .p(step(3.5))
+                                .flex()
+                                .flex_col()
+                                .gap(step(1.5))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(AMBER))
+                                        .child(t("config.refused")),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(11.))
+                                        .text_color(rgb(DIM))
+                                        .child(crate::text::display_block(&refused)),
+                                ),
+                        )
+                    })
+                    .children(self.form(window, cx)),
+            )
+            .into_any_element()
+    }
+
+    /// The fields of the open section, from the schema.
+    fn form(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let properties = match &self.section {
+            Section::Settings => self.shape.get("properties").cloned(),
+            Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
+            Section::Advanced => self.shape["$defs"]["Advanced"].get("properties").cloned(),
+            Section::Alerts => self.shape["$defs"]["AlertsAdvanced"]
+                .get("properties")
+                .cloned(),
+            Section::Peering => self.shape["$defs"]["PeeringAdvanced"]
+                .get("properties")
+                .cloned(),
+            Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),
+        };
+        let Some(serde_json::Value::Object(properties)) = properties else {
+            return vec![empty(t("config.no_shape"))];
+        };
+        let silent: &[&str] = match self.section {
+            Section::Settings => SILENT_AT_THE_TOP,
+            Section::Advanced => SILENT_IN_ADVANCED,
+            _ => &[],
+        };
+        properties
+            .iter()
+            .filter(|(key, _)| !silent.contains(&key.as_str()))
+            .map(|(key, field)| self.field(key, field, window, cx))
+            .collect::<Vec<_>>()
+    }
+
+    fn field(
+        &mut self,
+        key: &str,
+        field: &serde_json::Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let about = field["description"].as_str().unwrap_or_default().to_owned();
+        let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
+        let words: Vec<(String, String)> = field["x-words"]
+            .as_array()
+            .map(|words| {
+                words
+                    .iter()
+                    .map(|word| {
+                        (
+                            word["word"].as_str().unwrap_or_default().to_owned(),
+                            word["about"].as_str().unwrap_or_default().to_owned(),
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let held = self.held(key);
+        div()
+            .flex()
+            .gap(step(4.))
+            .child(
+                div()
+                    .w(px(210.))
+                    .flex_shrink_0()
+                    .pt(step(1.))
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.))
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            .text_size(px(12.5))
+                            .child(key.to_owned()),
+                    )
+                    .when(!widget.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(FAINT))
+                                .child(widget.clone()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(0.))
+                    .flex()
+                    .flex_col()
+                    .gap(step(1.5))
+                    .child(self.widget(key, field, &words, held, window, cx))
+                    .when(!about.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .max_w(px(620.))
+                                .text_size(px(11.))
+                                .text_color(rgb(FAINT))
+                                .child(first_sentence(&about)),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn widget(
+        &mut self,
+        key: &str,
+        field: &serde_json::Value,
+        words: &[(String, String)],
+        held: Option<toml_edit::Item>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let section = self.section.clone();
+        if !words.is_empty() {
+            let now = held
+                .as_ref()
+                .and_then(|item| item.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let set = held.is_some();
+            return div()
+                .flex()
+                .flex_col()
+                .gap(step(1.5))
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(step(1.5))
+                        .children(words.iter().map(|(word, about)| {
+                            let chosen = *word == now;
+                            let writing = word.clone();
+                            let key = key.to_owned();
+                            let section = section.clone();
+                            Button::new(SharedString::from(format!("word-{key}-{word}")))
+                                .small()
+                                .label(word.clone())
+                                .tooltip(about.clone())
+                                .when(chosen, |chip| chip.primary())
+                                .when(!chosen, |chip| chip.ghost())
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.put(
+                                        &Spot {
+                                            section: section.clone(),
+                                            key: key.clone(),
+                                            item: None,
+                                        },
+                                        (!chosen).then(|| toml_edit::value(writing.clone())),
+                                    );
+                                    cx.notify();
+                                }))
+                        })),
+                )
+                .when(!set, |column| {
+                    column.child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(t("config.inherited")),
+                    )
+                })
+                .into_any_element();
+        }
+        let default = &field["default"];
+        match holds(field) {
+            Holds::Switch => {
+                let now = held
+                    .as_ref()
+                    .and_then(|item| item.as_bool())
+                    .or_else(|| default.as_bool())
+                    .unwrap_or(false);
+                let set = held.is_some();
+                let key = key.to_owned();
+                let section = section.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(2.5))
+                    .child(
+                        Switch::new(SharedString::from(format!("switch-{key}")))
+                            .checked(now)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.put(
+                                    &Spot {
+                                        section: section.clone(),
+                                        key: key.clone(),
+                                        item: None,
+                                    },
+                                    Some(toml_edit::value(!now)),
+                                );
+                                cx.notify();
+                            })),
+                    )
+                    .when(!set, |row| {
+                        row.child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(FAINT))
+                                .child(match default.as_bool() {
+                                    Some(true) => t("config.absent_on"),
+                                    Some(false) => t("config.absent_off"),
+                                    None => t("config.absent"),
+                                }),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Holds::List => {
+                let entries: Vec<String> = held
+                    .as_ref()
+                    .and_then(|item| item.as_array())
+                    .map(|array| {
+                        array
+                            .iter()
+                            .map(|value| value.as_str().unwrap_or_default().to_owned())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.value(key, entries.join("\n"), true, window, cx)
+            }
+            Holds::Line => {
+                let text = held
+                    .as_ref()
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| item.to_string().trim().to_owned())
+                    })
+                    .unwrap_or_default();
+                self.value(key, text, false, window, cx)
+            }
+        }
+    }
+
+    /// A value, in the kit's own text block: it selects, it takes every
+    /// key this machine has taught you, and it undoes. One per field,
+    /// live — there is nothing to open or close, and Save takes what
+    /// they hold.
+    fn value(
+        &mut self,
+        key: &str,
+        text: String,
+        list: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let at = (self.section.clone(), key.to_owned());
+        let block = match self.fields.get(&at) {
+            Some(block) => block.clone(),
+            None => {
+                let rows = match list {
+                    true => 10,
+                    false => 1,
+                };
+                let shown = text.clone();
+                let block = cx.new(|cx| {
+                    TextareaState::new(window, cx)
+                        .rows(rows)
+                        .default_value(shown)
+                        .placeholder(t("config.not_set"))
+                });
+                self.fields.insert(at, block.clone());
+                block
+            }
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap(step(1.))
+            .child(
+                div()
+                    .max_w(px(620.))
+                    .child(Textarea::new(&block).bordered(true)),
+            )
+            .when(list, |column| {
+                column.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(FAINT))
+                        .child(t("config.one_to_a_line")),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// What the fields hold that the file does not, written in one go.
+    ///
+    /// A word or a switch is written as it is chosen, because there is
+    /// nothing to finish typing; text is taken here, when a person says
+    /// so, which is also what keeps the supervisor from being handed a
+    /// path half-typed.
+    fn take_the_fields(&mut self, cx: &mut Context<Self>) {
+        let Some(sheet) = &self.sheet else { return };
+        let mut changes: Vec<(Spot, Option<toml_edit::Item>)> = Vec::new();
+        for ((section, key), block) in &self.fields {
+            let typed = block.read(cx).value().to_string();
+            let held = sheet.held(section, key);
+            let list = held
+                .as_ref()
+                .map(|item| item.as_array().is_some())
+                .unwrap_or_else(|| typed.contains('\n'));
+            let value = match list {
+                true => {
+                    let mut array = toml_edit::Array::new();
+                    for line in typed.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                        array.push(line);
+                    }
+                    match array.is_empty() {
+                        true => None,
+                        false => Some(toml_edit::value(array)),
+                    }
+                }
+                false => match typed.trim() {
+                    "" => None,
+                    text => Some(surface::number_or_text(text)),
+                },
+            };
+            let same = match (&value, &held) {
+                (Some(value), Some(held)) => value.to_string() == held.to_string(),
+                (None, None) => true,
+                _ => false,
+            };
+            if !same {
+                changes.push((
+                    Spot {
+                        section: section.clone(),
+                        key: key.to_string(),
+                        item: None,
+                    },
+                    value,
+                ));
+            }
+        }
+        for (at, value) in changes {
+            self.put(&at, value);
+        }
+    }
+
+    // ── what the window does to the fleet ────────────────────────────
+
+    fn resolve(&mut self, item: &Conflict, keep: &str) {
+        let mut command = std::process::Command::new(surface::exe());
+        command
+            .arg("resolve")
+            .arg(&item.group)
+            .arg(&item.path)
+            .arg("--keep")
+            .arg(keep)
+            .arg("--yes")
+            .arg("--state-root")
+            .arg(&self.state_root);
+        if let Some(config) = &self.config {
+            command.arg("--config").arg(config);
+        }
+        self.said = Some(match command.output() {
+            Ok(output) if output.status.success() => {
+                self.conflict = None;
+                self.sides = None;
+                self.diff = None;
+                fill(
+                    "status.kept",
+                    &[("keep", keep), ("path", &crate::text::display_safe(&item.path))],
+                )
+            }
+            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            Err(error) => fill("status.resolve_failed", &[("error", &error.to_string())]),
+        });
+        self.read_at = None;
+    }
+
+    fn read_diff(&mut self, item: &Conflict) {
+        let mut command = std::process::Command::new(surface::exe());
+        command
+            .arg("diff")
+            .arg(&item.group)
+            .arg(&item.path)
+            .arg("--state-root")
+            .arg(&self.state_root);
+        if let Some(config) = &self.config {
+            command.arg("--config").arg(config);
+        }
+        self.diff = Some(match command.output() {
+            Ok(output) if !output.stdout.is_empty() => {
+                String::from_utf8_lossy(&output.stdout).into_owned()
+            }
+            Ok(output) => match String::from_utf8_lossy(&output.stderr).trim() {
+                "" => t("status.diff_same").to_owned(),
+                complaint => complaint.to_owned(),
+            },
+            Err(error) => fill("status.diff_failed", &[("error", &error.to_string())]),
+        });
+    }
+
+    fn reveal(&mut self, file: &std::path::Path) {
+        let shown = std::process::Command::new("open").arg("-R").arg(file).status();
+        self.said = Some(match shown {
+            Ok(status) if status.success() => {
+                fill("status.revealed", &[("path", &tilde(&file.display().to_string()))])
+            }
+            Ok(status) => fill("status.finder_refused", &[("status", &status.to_string())]),
+            Err(error) => fill("status.finder_unreachable", &[("error", &error.to_string())]),
+        });
+    }
+}
+
 // ── the small pieces ─────────────────────────────────────────────────
 
 fn dot(colour: u32) -> Div {
@@ -759,6 +2171,14 @@ fn count(n: usize, word: String, colour: u32) -> Div {
         )
 }
 
+fn label(text: &'static str) -> Div {
+    div()
+        .text_size(px(10.5))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(FAINT))
+        .child(text)
+}
+
 fn empty(text: &'static str) -> AnyElement {
     div()
         .flex_1()
@@ -770,17 +2190,6 @@ fn empty(text: &'static str) -> AnyElement {
         .text_color(rgb(FAINT))
         .child(text)
         .into_any_element()
-}
-
-fn tilde(path: &str) -> String {
-    let Some(home) = std::env::var_os("HOME") else {
-        return path.to_owned();
-    };
-    let home = home.to_string_lossy().into_owned();
-    match path.strip_prefix(&home) {
-        Some(rest) => format!("~{rest}"),
-        None => path.to_owned(),
-    }
 }
 
 fn thousands(n: u64) -> String {

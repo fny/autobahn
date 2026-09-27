@@ -88,6 +88,13 @@ pub fn timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.as_secs() as libc::time_t)
         .unwrap_or(0);
+    stamp(seconds)
+}
+
+/// The same stamp, for a moment that is not now: the time a file was
+/// last written, say. One formatter, so every time this program prints
+/// reads the same way.
+pub fn stamp(seconds: libc::time_t) -> String {
     // SAFETY: `localtime_r` writes into a `tm` this call owns, and
     // `strftime` writes at most `buffer.len()` bytes including the
     // terminator. Neither keeps a reference past the call.

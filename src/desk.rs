@@ -132,6 +132,8 @@ pub struct Desk {
     selected: Option<(String, crate::supervisor::control::SessionKey)>,
     /// The conflict the conflicts pane has open, and its diff once read.
     conflict: Option<Conflict>,
+    /// Both sides of the open conflict, read when it was opened.
+    sides: Option<(Side, Side)>,
     diff: Option<String>,
     log: Vec<String>,
     /// Which of the supervisor's two log files the lines came from.
@@ -150,6 +152,165 @@ struct Conflict {
     host: String,
     path: String,
     blocked: bool,
+    /// Where each side of this path lives. A conflict over a file that
+    /// is not text has no diff to read, so the two files themselves are
+    /// what the window has to show — and it needs to know where they are.
+    alpha_root: String,
+    beta_root: String,
+}
+
+/// One side of a conflict, as the filesystem has it. Read once, when the
+/// path is opened, and never again on the way to a frame: a window that
+/// hashes a file every sixtieth of a second is a window that stops.
+#[derive(Clone, PartialEq, Eq)]
+struct Side {
+    /// `alpha` or `beta`, the words every other surface uses.
+    name: &'static str,
+    /// The directory this side of the pair lives in.
+    root: String,
+    /// The whole path, as a person would type it.
+    place: String,
+    /// The file itself, when it is on this machine.
+    file: Option<PathBuf>,
+    size: Option<u64>,
+    /// Seconds since the epoch, for the same stamp the log uses.
+    modified: Option<i64>,
+    /// The blake3 of the contents — the digest the scanner records, so
+    /// two sides that agree here are the same file to the engine too.
+    digest: Option<String>,
+    /// Whether the first few kilobytes hold a NUL, which is how `diff`
+    /// decides it will not print the file either.
+    binary: bool,
+    /// Why there is nothing else to say: another machine, or gone.
+    trouble: Option<String>,
+}
+
+/// Files larger than this are measured and dated but not hashed. Reading
+/// a gigabyte to fill in one line is not worth freezing the window for,
+/// and the size and the time already answer "which one is mine".
+const HASH_LIMIT: u64 = 512 * 1024 * 1024;
+
+/// Everything about one side, in one pass over the file.
+fn inspect(name: &'static str, root: &str, path: &str) -> Side {
+    let place = format!("{}/{path}", root.trim_end_matches('/'));
+    let Some(directory) = on_this_machine(root) else {
+        return Side {
+            name,
+            root: root.to_owned(),
+            place,
+            file: None,
+            size: None,
+            modified: None,
+            digest: None,
+            binary: false,
+            trouble: Some("on another machine".to_owned()),
+        };
+    };
+    let file = directory.join(path);
+    let mut side = Side {
+        name,
+        root: root.to_owned(),
+        place,
+        file: Some(file.clone()),
+        size: None,
+        modified: None,
+        digest: None,
+        binary: false,
+        trouble: None,
+    };
+    match std::fs::symlink_metadata(&file) {
+        Ok(metadata) => {
+            side.size = Some(metadata.len());
+            side.modified = metadata
+                .modified()
+                .ok()
+                .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|since| since.as_secs() as i64);
+            if !metadata.is_file() {
+                side.trouble = Some("not a plain file".to_owned());
+                return side;
+            }
+        }
+        Err(error) => {
+            side.trouble = Some(format!("cannot be read: {}", error.kind()));
+            return side;
+        }
+    }
+    match read_through(&file, side.size.unwrap_or(0)) {
+        Ok((binary, digest)) => {
+            side.binary = binary;
+            side.digest = digest;
+        }
+        Err(error) => side.trouble = Some(format!("cannot be read: {error}")),
+    }
+    side
+}
+
+/// Reads the file once: says whether it looks binary, and hashes it when
+/// it is small enough to be worth hashing.
+fn read_through(file: &std::path::Path, size: u64) -> std::io::Result<(bool, Option<String>)> {
+    use std::io::Read;
+
+    let mut handle = std::fs::File::open(file)?;
+    let mut buffer = vec![0u8; 64 * 1024];
+    let mut hasher = blake3::Hasher::new();
+    let hash = size <= HASH_LIMIT;
+    let mut read = 0u64;
+    let mut binary = false;
+    loop {
+        let count = handle.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        // `diff` calls a file binary on a NUL near its start, and so
+        // does this, so the two never disagree about what can be shown.
+        if read < 8192 && buffer[..count].contains(&0) {
+            binary = true;
+        }
+        if hash {
+            hasher.update(&buffer[..count]);
+        } else if binary {
+            break;
+        }
+        read += count as u64;
+    }
+    Ok((
+        binary,
+        hash.then(|| hasher.finalize().to_hex().to_string()),
+    ))
+}
+
+/// The directory a root names on this machine, or `None` when the root
+/// is `host:path` and belongs to another one.
+fn on_this_machine(root: &str) -> Option<PathBuf> {
+    if let Some((before, _)) = root.split_once(':') {
+        if !before.starts_with('/') && !before.starts_with('~') && !before.contains('/') {
+            return None;
+        }
+    }
+    let Some(rest) = root.strip_prefix('~') else {
+        return Some(PathBuf::from(root));
+    };
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(rest.trim_start_matches('/')))
+}
+
+/// A size a person can hold in their head, and the exact one beside it.
+fn human_size(size: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if size < 1024 {
+        return format!("{size} bytes");
+    }
+    let mut value = size as f64 / 1024.0;
+    let mut unit = UNITS[0];
+    for next in &UNITS[1..] {
+        if value < 1024.0 {
+            break;
+        }
+        value /= 1024.0;
+        unit = next;
+    }
+    format!("{value:.1} {unit} · {} bytes", thousands(size))
 }
 
 /// Runs the window until it is closed.
@@ -178,43 +339,93 @@ fn run_with(config: Option<PathBuf>, state_root: PathBuf, shots: Option<PathBuf>
             name: "Autobahn Desk".into(),
             items: vec![MenuItem::action("Quit", Quit)],
         }]);
-        // A window over the fleet is the whole app: when it closes, the
-        // app has nothing left to be.
-        cx.on_window_closed(|cx| {
-            if cx.windows().is_empty() {
-                cx.quit();
-            }
-        })
-        .detach();
 
-        let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Autobahn Desk".into()),
-                appears_transparent: true,
-                ..Default::default()
-            }),
-            ..Default::default()
+        let Some(directory) = shots.clone() else {
+            // A window over the fleet is the whole app: when it closes,
+            // the app has nothing left to be.
+            cx.on_window_closed(|cx| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
+            open_window(config.clone(), state_root.clone(), None, cx).ok();
+            return;
         };
+
+        // Photographing: a pane at a time, each in a window of its own.
+        // A window that has just opened has certainly drawn its first
+        // frame; a window that has been told to show a different pane
+        // has only certainly been told, and macOS may not have drawn it
+        // again — which is how three identical photographs happen.
         let config = config.clone();
         let state_root = state_root.clone();
-        let shots = shots.clone();
-        let window = cx.open_window(options, |_, cx| {
-            cx.new(|cx| Desk::new(config, state_root, cx))
-        });
-        let Ok(window) = window else { return };
-        if let Some(directory) = shots {
-            window
-                .update(cx, |desk, window, cx| desk.photograph(directory, window, cx))
-                .ok();
-        }
+        cx.spawn(async move |cx: &mut gpui::AsyncApp| {
+            for (pane, name) in [
+                (Pane::Fleet, "fleet"),
+                (Pane::Conflicts, "conflicts"),
+                (Pane::Log, "log"),
+                (Pane::Hosts, "hosts"),
+            ] {
+                let window = cx.update(|cx| {
+                    open_window(config.clone(), state_root.clone(), Some(pane), cx)
+                })??;
+                gpui::Timer::after(Duration::from_millis(900)).await;
+                let path = directory.join(format!("desk-{name}.png"));
+                window.update(cx, |_, window, _| {
+                    let bounds = window.bounds();
+                    let frame = camera::grab(
+                        bounds.origin.x.to_f64(),
+                        bounds.origin.y.to_f64(),
+                        bounds.size.width.to_f64(),
+                        bounds.size.height.to_f64(),
+                    );
+                    match frame.and_then(|frame| Ok(frame.save(&path)?)) {
+                        Ok(()) => println!("{}", path.display()),
+                        Err(error) => eprintln!("unable to photograph {name}: {error:#}"),
+                    }
+                    window.remove_window();
+                })?;
+                gpui::Timer::after(Duration::from_millis(200)).await;
+            }
+            cx.update(|cx| cx.quit())?;
+            anyhow::Ok(())
+        })
+        .detach();
     });
     Ok(())
 }
 
+/// Opens the window, on `pane` when one is asked for.
+fn open_window(
+    config: Option<PathBuf>,
+    state_root: PathBuf,
+    pane: Option<Pane>,
+    cx: &mut App,
+) -> Result<gpui::WindowHandle<Desk>> {
+    let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some("Autobahn Desk".into()),
+            appears_transparent: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    cx.open_window(options, |_, cx| {
+        cx.new(|cx| Desk::new(config, state_root, pane, cx))
+    })
+    .map_err(|error| anyhow::anyhow!("unable to open the window: {error}"))
+}
+
 impl Desk {
-    fn new(config: Option<PathBuf>, state_root: PathBuf, cx: &mut Context<Self>) -> Self {
+    fn new(
+        config: Option<PathBuf>,
+        state_root: PathBuf,
+        pane: Option<Pane>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let names = cx.text_system().all_font_names();
         let pick = |candidates: &[&str], fallback: &str| -> SharedString {
             for candidate in candidates {
@@ -227,11 +438,12 @@ impl Desk {
         let mut desk = Desk {
             config,
             state_root,
-            pane: Pane::Fleet,
+            pane: pane.unwrap_or(Pane::Fleet),
             report: None,
             read_at: None,
             selected: None,
             conflict: None,
+            sides: None,
             diff: None,
             log: Vec::new(),
             log_path: None,
@@ -241,6 +453,9 @@ impl Desk {
             mono: pick(&["SF Mono", "Menlo", "Monaco"], "Menlo"),
         };
         desk.refresh();
+        if let Some(pane) = pane {
+            desk.settle(pane);
+        }
         // The fleet is re-read on a timer rather than per frame, so a
         // window that nobody is looking at costs nothing but the read.
         cx.spawn(async move |this, cx| {
@@ -584,7 +799,7 @@ impl Desk {
                             .text_size(px(T_META))
                             .text_color(rgb(FAINT))
                             .truncate()
-                            .child(group.alpha.clone()),
+                            .child(tilde(&group.alpha)),
                     )
                     .child(
                         div()
@@ -944,8 +1159,7 @@ impl Desk {
                                             }),
                                     )
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.conflict = Some(item.clone());
-                                        this.diff = None;
+                                        this.open_conflict(item.clone());
                                         cx.notify();
                                     }))
                             })
@@ -965,6 +1179,12 @@ impl Desk {
             false => "beta".to_owned(),
         };
         let diff = self.diff.clone();
+        let sides = self.sides.clone();
+        // A file with a NUL in it has no difference anyone can read, so
+        // the window compares the two files instead of their text.
+        let binary = sides
+            .as_ref()
+            .is_some_and(|(alpha, beta)| alpha.binary || beta.binary);
         div()
             .flex_1()
             .min_w(px(0.))
@@ -1042,18 +1262,23 @@ impl Desk {
                                         cx.notify();
                                     },
                                 )))
-                                .child(
-                                    button("show-diff", "Show the difference").on_click(
-                                        cx.listener(move |this, _, _, cx| {
-                                            this.read_diff(&shown);
-                                            cx.notify();
-                                        }),
-                                    ),
-                                ),
+                                .when(!binary, |row| {
+                                    row.child(
+                                        button("show-diff", "Show the difference").on_click(
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.read_diff(&shown);
+                                                cx.notify();
+                                            }),
+                                        ),
+                                    )
+                                }),
                         )
                     }),
             )
-            .when_some(diff, |column, diff| {
+            .when_some(sides.filter(|_| binary), |column, (alpha, beta)| {
+                column.child(self.binary_card(&item, &alpha, &beta, cx))
+            })
+            .when_some(diff.filter(|_| !binary), |column, diff| {
                 column.child(
                     div()
                         .id("diff")
@@ -1083,6 +1308,151 @@ impl Desk {
                 )
             })
             .into_any_element()
+    }
+
+    /// Two files that cannot be diffed, side by side: how big each one
+    /// is, when it was last written, what it hashes to, and a way to go
+    /// and look at it.
+    fn binary_card(
+        &self,
+        item: &Conflict,
+        alpha: &Side,
+        beta: &Side,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let newer = match (alpha.modified, beta.modified) {
+            (Some(a), Some(b)) if a > b => Some("alpha"),
+            (Some(a), Some(b)) if b > a => Some("beta"),
+            _ => None,
+        };
+        let same = alpha.digest.is_some() && alpha.digest == beta.digest;
+        let suffix = item
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&item.path)
+            .to_owned();
+        div()
+            .id("binary")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(step(6.))
+            .py(step(5.))
+            .flex()
+            .flex_col()
+            .gap(step(3.))
+            .child(label("neither side is text"))
+            .child(
+                div()
+                    .max_w(px(680.))
+                    .text_size(px(T_META))
+                    .text_color(rgb(DIM))
+                    .child(
+                        "There is nothing to merge, so the only question is which file \
+                         survives. Keep both settles it by keeping the other one beside \
+                         it under a suffixed name.",
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap(step(4.))
+                    .child(self.side_card(alpha, newer == Some("alpha"), cx))
+                    .child(self.side_card(beta, newer == Some("beta"), cx)),
+            )
+            .when(same, |card| {
+                card.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(step(2.))
+                        .child(dot(GREEN))
+                        .child(
+                            div()
+                                .text_size(px(T_META))
+                                .text_color(rgb(GREEN))
+                                .child(format!(
+                                    "Both sides hash the same: {suffix} is one file in \
+                                     two places, and either choice keeps it."
+                                )),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One side of that comparison.
+    fn side_card(&self, side: &Side, newer: bool, cx: &mut Context<Self>) -> Div {
+        let file = side.file.clone();
+        div()
+            .flex_1()
+            .min_w(px(0.))
+            .rounded(px(8.))
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(LINE))
+            .p(step(3.5))
+            .flex()
+            .flex_col()
+            .gap(step(1.5))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(2.))
+                    .child(
+                        div()
+                            .text_size(px(T_ROW))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(side.name),
+                    )
+                    .when(newer, |head| head.child(pill("written last", BLUE)))
+                    .when_some(side.trouble.clone(), |head, trouble| {
+                        head.child(pill(trouble, AMBER))
+                    }),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(T_META))
+                    .text_color(rgb(FAINT))
+                    .truncate()
+                    .child(tail(&side.root, 3)),
+            )
+            .child(div().h(step(0.5)))
+            .child(self.pair(
+                "size",
+                side.size.map(human_size).unwrap_or_else(|| "—".to_owned()),
+            ))
+            .child(self.pair(
+                "written",
+                side.modified
+                    .map(|at| crate::logging::stamp(at as libc::time_t))
+                    .unwrap_or_else(|| "—".to_owned()),
+            ))
+            .child(self.pair(
+                "blake3",
+                match (&side.digest, side.size) {
+                    (Some(digest), _) => digest.chars().take(16).collect::<String>(),
+                    (None, Some(size)) if size > HASH_LIMIT => "too large to hash here".to_owned(),
+                    _ => "—".to_owned(),
+                },
+            ))
+            .when_some(file, |card, file| {
+                card.child(
+                    div().pt(step(1.5)).flex().child(
+                        button(
+                            format!("reveal-{}", side.name),
+                            "Reveal in Finder",
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.reveal(&file);
+                            cx.notify();
+                        })),
+                    ),
+                )
+            })
     }
 
     // ── the log ──────────────────────────────────────────────────────
@@ -1445,6 +1815,8 @@ impl Desk {
                         host: session.host.clone(),
                         path: conflict.path.clone(),
                         blocked: false,
+                        alpha_root: group.alpha.clone(),
+                        beta_root: session.beta.clone(),
                     });
                 }
                 for blocked in &session.blocked {
@@ -1453,11 +1825,37 @@ impl Desk {
                         host: session.host.clone(),
                         path: blocked.clone(),
                         blocked: true,
+                        alpha_root: group.alpha.clone(),
+                        beta_root: session.beta.clone(),
                     });
                 }
             }
         }
         waiting
+    }
+
+    /// Opens a conflict: both sides are read once, here, so the window
+    /// never touches a file on its way to a frame.
+    fn open_conflict(&mut self, item: Conflict) {
+        self.sides = Some((
+            inspect("alpha", &item.alpha_root, &item.path),
+            inspect("beta", &item.beta_root, &item.path),
+        ));
+        self.conflict = Some(item);
+        self.diff = None;
+    }
+
+    /// Shows a file to the Finder, which is the one thing a window can
+    /// do that a terminal cannot do better.
+    fn reveal(&mut self, file: &std::path::Path) {
+        let shown = std::process::Command::new("open").arg("-R").arg(file).status();
+        self.said = Some(match shown {
+            Ok(status) if status.success() => {
+                format!("revealed {}", tilde(&file.display().to_string()))
+            }
+            Ok(status) => format!("the Finder refused: {status}"),
+            Err(error) => format!("unable to ask the Finder: {error}"),
+        });
     }
 
     /// A control request, for the one session the row belongs to.
@@ -1508,6 +1906,7 @@ impl Desk {
         self.said = Some(match output {
             Ok(output) if output.status.success() => {
                 self.conflict = None;
+                self.sides = None;
                 self.diff = None;
                 format!("kept {keep}: {}", crate::text::display_safe(&item.path))
             }
@@ -1571,87 +1970,41 @@ impl Desk {
         self.log.reverse();
     }
 
-    /// Walks the panes, photographs each, and quits. Nothing here runs
-    /// unless `shoot` asked for it.
-    fn photograph(&mut self, directory: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
-        cx.spawn_in(window, async move |this, cx| {
-            for (pane, name) in [
-                (Pane::Fleet, "fleet"),
-                (Pane::Conflicts, "conflicts"),
-                (Pane::Log, "log"),
-                (Pane::Hosts, "hosts"),
-            ] {
-                this.update(cx, |this, cx| {
-                    this.pane = pane;
-                    match pane {
-                        // Each pane is photographed as a reader would
-                        // find it: with something open in it.
-                        Pane::Conflicts => {
-                            if this.conflict.is_none() {
-                                if let Some(first) =
-                                    this.waiting_list().into_iter().find(|item| !item.blocked)
-                                {
-                                    this.conflict = Some(first.clone());
-                                    this.read_diff(&first);
-                                }
-                            }
-                        }
-                        Pane::Log => this.read_log(),
-                        Pane::Fleet => {
-                            if this.selected.is_none() {
-                                if let Some(report) = &this.report {
-                                    if let Some((group, session)) = report
-                                        .groups
-                                        .iter()
-                                        .flat_map(|group| {
-                                            group
-                                                .sessions
-                                                .iter()
-                                                .map(move |session| (group, session))
-                                        })
-                                        .next()
-                                    {
-                                        this.selected = Some((
-                                            group.name.clone(),
-                                            session.session.clone(),
-                                        ));
-                                    }
-                                }
-                            }
-                        }
-                        Pane::Hosts => {}
-                    }
-                    cx.notify();
-                })?;
-                // The window server hands back the last frame it was
-                // given, and macOS stops redrawing a window it thinks
-                // nobody can see — so the window is asked to the front
-                // and redrawn before the shutter, not after.
-                cx.update(|window, cx| {
-                    cx.activate(true);
-                    window.activate_window();
-                    window.refresh();
-                })?;
-                gpui::Timer::after(Duration::from_millis(900)).await;
-                let path = directory.join(format!("desk-{name}.png"));
-                cx.update(|window, _| {
-                    let bounds = window.bounds();
-                    match camera::photograph(
-                        bounds.origin.x.to_f64(),
-                        bounds.origin.y.to_f64(),
-                        bounds.size.width.to_f64(),
-                        bounds.size.height.to_f64(),
-                        &path,
-                    ) {
-                        Ok(()) => println!("{}", path.display()),
-                        Err(error) => eprintln!("unable to photograph {name}: {error:#}"),
-                    }
-                })?;
+    /// Opens a pane the way a reader would find it: with something in
+    /// it. Used when a window opens straight onto one pane.
+    fn settle(&mut self, pane: Pane) {
+        match pane {
+            Pane::Fleet => {
+                if self.selected.is_none() {
+                    self.selected = self.report.as_ref().and_then(|report| {
+                        report.groups.iter().find_map(|group| {
+                            group
+                                .sessions
+                                .first()
+                                .map(|session| (group.name.clone(), session.session.clone()))
+                        })
+                    });
+                }
             }
-            cx.update(|_, cx| cx.quit())?;
-            anyhow::Ok(())
-        })
-        .detach();
+            Pane::Conflicts => {
+                if self.conflict.is_none() {
+                    if let Some(first) =
+                        self.waiting_list().into_iter().find(|item| !item.blocked)
+                    {
+                        self.open_conflict(first.clone());
+                        let binary = self
+                            .sides
+                            .as_ref()
+                            .is_some_and(|(alpha, beta)| alpha.binary || beta.binary);
+                        if !binary {
+                            self.read_diff(&first);
+                        }
+                    }
+                }
+            }
+            Pane::Log => self.read_log(),
+            Pane::Hosts => {}
+        }
     }
 }
 
@@ -1662,7 +2015,6 @@ impl Desk {
 #[cfg(target_os = "macos")]
 mod camera {
     use std::ffi::c_void;
-    use std::path::Path;
 
     use anyhow::{anyhow, Result};
 
@@ -1720,7 +2072,7 @@ mod camera {
         fn CGContextRelease(context: *mut c_void);
     }
 
-    pub fn photograph(x: f64, y: f64, width: f64, height: f64, path: &Path) -> Result<()> {
+    pub fn grab(x: f64, y: f64, width: f64, height: f64) -> Result<image::RgbaImage> {
         let rect = CGRect {
             origin: CGPoint { x, y },
             size: CGSize { width, height },
@@ -1763,21 +2115,17 @@ mod camera {
             CGContextRelease(context);
             CGColorSpaceRelease(space);
             CGImageRelease(image);
-            let buffer = image::RgbaImage::from_raw(width as u32, height as u32, pixels)
-                .ok_or_else(|| anyhow!("the frame did not fit its own dimensions"))?;
-            buffer.save(path)?;
+            image::RgbaImage::from_raw(width as u32, height as u32, pixels)
+                .ok_or_else(|| anyhow!("the frame did not fit its own dimensions"))
         }
-        Ok(())
     }
 }
 
 #[cfg(not(target_os = "macos"))]
 mod camera {
-    use std::path::Path;
-
     use anyhow::{anyhow, Result};
 
-    pub fn photograph(_x: f64, _y: f64, _w: f64, _h: f64, _path: &Path) -> Result<()> {
+    pub fn grab(_x: f64, _y: f64, _w: f64, _h: f64) -> Result<image::RgbaImage> {
         Err(anyhow!("photographing the window is macOS only"))
     }
 }
@@ -2014,6 +2362,17 @@ fn tilde(path: &str) -> String {
     }
 }
 
+/// The end of a path: the last `keep` parts, with a mark where the rest
+/// was dropped. A window cannot show a long path and a person does not
+/// need the whole of one twice on the same screen.
+fn tail(path: &str, keep: usize) -> String {
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.len() <= keep {
+        return path.to_owned();
+    }
+    format!("…/{}", parts[parts.len() - keep..].join("/"))
+}
+
 /// The short name of a beta: the host it is on, or the last part of the
 /// path when it is a directory on this machine. Long enough to tell two
 /// apart, short enough to sit on a button.
@@ -2129,6 +2488,60 @@ mod tests {
         assert_eq!(format_age(3_599), "59m");
         assert_eq!(format_age(3_600), "1h");
         assert_eq!(format_age(90_000), "1d");
+    }
+
+    /// A root either names a directory this process can open or a
+    /// machine it can only talk to, and the window says different things
+    /// about the two.
+    #[test]
+    fn a_root_is_read_as_a_path_or_as_a_machine() {
+        assert_eq!(on_this_machine("fny:~/code"), None);
+        assert_eq!(on_this_machine("/tmp/a"), Some(PathBuf::from("/tmp/a")));
+        // A colon inside a local path is a character, not a host.
+        assert_eq!(on_this_machine("/tmp/a:b"), Some(PathBuf::from("/tmp/a:b")));
+        let home = std::env::var("HOME").expect("a home directory");
+        assert_eq!(on_this_machine("~/x"), Some(PathBuf::from(home).join("x")));
+    }
+
+    /// A path that will not fit keeps its end, which is the part that
+    /// tells two sides of a conflict apart.
+    #[test]
+    fn a_long_path_keeps_the_end_that_matters() {
+        assert_eq!(tail("/a/b/c/d/e", 3), "…/c/d/e");
+        assert_eq!(tail("/a/b", 3), "/a/b");
+        assert_eq!(tail("fny:~/code/src", 3), "fny:~/code/src");
+    }
+
+    /// Both answers to "how big": the one a person compares at a glance
+    /// and the one they would see in a terminal.
+    #[test]
+    fn a_size_is_readable_and_exact() {
+        assert_eq!(human_size(0), "0 bytes");
+        assert_eq!(human_size(512), "512 bytes");
+        assert_eq!(human_size(2_048), "2.0 KiB · 2,048 bytes");
+        assert_eq!(human_size(5_242_880), "5.0 MiB · 5,242,880 bytes");
+    }
+
+    /// One pass over a file answers both questions, and the digest is
+    /// the one the scanner records — so a side that matches here matches
+    /// for the engine too.
+    #[test]
+    fn one_read_says_whether_it_is_text_and_what_it_hashes_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = dir.path().join("a.txt");
+        std::fs::write(&text, b"hello\n").unwrap();
+        let (binary, digest) = read_through(&text, 6).unwrap();
+        assert!(!binary);
+        assert_eq!(
+            digest.unwrap(),
+            blake3::hash(b"hello\n").to_hex().to_string()
+        );
+
+        let blob = dir.path().join("a.bin");
+        std::fs::write(&blob, b"\x7fELF\0\0\0").unwrap();
+        let (binary, digest) = read_through(&blob, 7).unwrap();
+        assert!(binary);
+        assert!(digest.is_some(), "a small binary is still hashed");
     }
 
     /// Every measurement in the window is a whole number of steps, and a

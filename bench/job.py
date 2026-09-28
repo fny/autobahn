@@ -183,13 +183,28 @@ def peer_ip():
 
 
 def peer_ips():
-    """Every destination's private address, in destination order. The
-    orchestrator writes one per line."""
+    """This job's destinations' private addresses, in destination order.
+    The orchestrator writes one per line for every machine in the group.
+
+    Trimmed to the cell's width, as `destinations` is: a group is sized
+    for its widest cell, and a 1-beta cell on a fan-out group that
+    watched every address waited for each edit to land on ten machines
+    while one was synchronized. None ever did, so every attempt of the
+    window was censored, for both tools alike — seven jobs of
+    bench-1790564569 measured nothing a-to-b that way."""
     if LOCAL:
         return ["127.0.0.1"]
     with open(f"{BENCH}/peer-ip") as handle:
         listed = [line.strip() for line in handle if line.strip()]
-    return listed or ["127.0.0.1"]
+    if not listed:
+        return ["127.0.0.1"]
+    if WIDTH is None:
+        return listed
+    if len(listed) < WIDTH:
+        raise RuntimeError(
+            f"cell wants {WIDTH} destination(s), the group lists "
+            f"{len(listed)} address(es)")
+    return listed[:WIDTH]
 
 
 def self_ip():

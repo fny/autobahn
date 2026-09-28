@@ -60,7 +60,7 @@ desk = ["dep:gpui", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:not
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
 # The window again, on GPUI Kit. Its own binary: autobahn-desk-kit.
-desk-kit = ["dep:gpui-kit", "dep:image", "schema"]
+desk-kit = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 
 [dev-dependencies]
 proptest = "1"

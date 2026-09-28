@@ -61,6 +61,36 @@ fn tint(colour: u32, alpha: u32) -> Rgba {
     rgba((colour << 8) | alpha)
 }
 
+/// How much room the window has, which is the only thing the layout
+/// below asks about.
+///
+/// Three answers rather than a number: a pane that asks "how wide am
+/// I" in pixels ends up with a different threshold in every corner of
+/// the file, and they drift. The measurements are where a column stops
+/// fitting, not where a device is.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Room {
+    /// Under 720 points: one column, and the rail becomes a row.
+    Tight,
+    /// Under 1080: the rail stays, the least useful columns go.
+    Snug,
+    /// Everything fits.
+    Wide,
+}
+
+impl Room {
+    fn of(window: &Window) -> Room {
+        let width = window.viewport_size().width;
+        if width < px(720.) {
+            Room::Tight
+        } else if width < px(1080.) {
+            Room::Snug
+        } else {
+            Room::Wide
+        }
+    }
+}
+
 /// The panes, in the order the rail lists them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
@@ -93,6 +123,102 @@ impl Pane {
     }
 }
 
+/// Opens a window, on the pane it is asked for.
+fn open_window(
+    config: Option<PathBuf>,
+    state_root: PathBuf,
+    pane: Option<String>,
+    cx: &mut App,
+) -> gpui_kit::WindowHandle<Root> {
+    // A width can be asked for, which is how the narrow layouts are
+    // looked at without a hand on the window's edge.
+    let wide = std::env::var("AUTOBAHN_DESK_WIDTH")
+        .ok()
+        .and_then(|width| width.parse::<f32>().ok())
+        .unwrap_or(1240.);
+    let bounds = Bounds::centered(None, size(px(wide), px(820.)), cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        titlebar: Some(TitlebarOptions {
+            title: Some(t("app.window").into()),
+            appears_transparent: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let window = cx
+        .open_window(options, |window, cx| {
+            let desk = cx.new(|cx| {
+                let mut desk = Desk::new(config, state_root, cx);
+                if let Some(pane) = pane.as_deref() {
+                    desk.pane = match pane {
+                        "conflicts" => Pane::Conflicts,
+                        "config" => Pane::Config,
+                        "log" => Pane::Log,
+                        "hosts" => Pane::Hosts,
+                        _ => Pane::Groups,
+                    };
+                    desk.settle(desk.pane, window, cx);
+                }
+                desk
+            });
+            cx.new(|cx| Root::new(desk, window, cx))
+        })
+        .expect("unable to open the window");
+    // The theme is the window's, not only the application's.
+    window
+        .update(cx, |_, window, cx| {
+            Theme::change(ThemeMode::Dark, Some(window), cx);
+        })
+        .ok();
+    window
+}
+
+/// The menu bar item, kept by the process rather than by a window.
+struct Menubar(crate::menubar::Bar);
+
+impl Global for Menubar {}
+
+/// Keeps the item up to date and answers what is chosen in it.
+fn watch_the_bar(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        loop {
+            let sleep = cx.background_executor().timer(crate::menubar::POLL);
+            sleep.await;
+            cx.update(|cx| {
+                let mut show = false;
+                let mut quit = false;
+                cx.update_global::<Menubar, ()>(|menubar, _| {
+                    while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+                        match menubar.0.chose(&event.id) {
+                            Some(crate::menubar::Action::Quit) => quit = true,
+                            Some(crate::menubar::Action::Show) => show = true,
+                            _ => {}
+                        }
+                    }
+                    menubar.0.finished();
+                });
+                if quit {
+                    cx.quit();
+                }
+                if show {
+                    cx.activate(true);
+                    if cx.windows().is_empty() {
+                        open_window(config.clone(), state_root.clone(), None, cx);
+                    } else {
+                        for window in cx.windows() {
+                            window
+                                .update(cx, |_, window, _| window.activate_window())
+                                .ok();
+                        }
+                    }
+                }
+            });
+        }
+    })
+    .detach();
+}
+
 /// What the window is showing.
 pub struct Desk {
     config: Option<PathBuf>,
@@ -100,6 +226,9 @@ pub struct Desk {
     mono: SharedString,
     state_root: PathBuf,
     pane: Pane,
+    /// How much room the last frame had, for the parts that are built
+    /// before the frame knows.
+    room: Room,
     report: Option<StatusReport>,
     read_at: Option<Instant>,
     selected: Option<(String, crate::supervisor::control::SessionKey)>,
@@ -113,6 +242,10 @@ pub struct Desk {
     log: Option<Entity<EditorState>>,
     log_path: Option<PathBuf>,
     log_lines: usize,
+    /// How many lines the tail holds, before the filter.
+    log_held: usize,
+    /// Whether the log shows only what the supervisor complained about.
+    errors_only: bool,
     /// The configuration file, which section is open, and the block
     /// editing one of its values.
     sheet: Option<Sheet>,
@@ -148,43 +281,25 @@ fn run_with(
         cx.activate(true);
         let config = config.clone();
         let state_root = state_root.clone();
-        let bounds = Bounds::centered(None, size(px(1240.), px(820.)), cx);
-        let options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
-            titlebar: Some(TitlebarOptions {
-                title: Some(t("app.window").into()),
-                appears_transparent: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
         let wanted = shots.as_ref().and_then(|(_, pane)| pane.clone());
-        let window = cx
-            .open_window(options, |window, cx| {
-                let desk = cx.new(|cx| {
-                    let mut desk = Desk::new(config, state_root, cx);
-                    if let Some(pane) = wanted.as_deref() {
-                        desk.pane = match pane {
-                            "conflicts" => Pane::Conflicts,
-                            "config" => Pane::Config,
-                            "log" => Pane::Log,
-                            "hosts" => Pane::Hosts,
-                            _ => Pane::Groups,
-                        };
-                        desk.settle(desk.pane, window, cx);
-                    }
-                    desk
-                });
-                cx.new(|cx| Root::new(desk, window, cx))
-            })
-            .expect("unable to open the window");
-        // The theme is the window's, not only the application's: told
-        // once here, every component in it is drawn in the dark.
-        window
-            .update(cx, |_, window, cx| {
-                Theme::change(ThemeMode::Dark, Some(window), cx);
-            })
-            .ok();
+        let window = open_window(config.clone(), state_root.clone(), wanted, cx);
+        if shots.is_none() {
+            // The same item in the menu bar the other window puts
+            // there, from the same code: one poll, one notifier, and
+            // "Open the window" when this one has been closed.
+            match crate::menubar::Bar::start(config.clone(), state_root.clone(), || {}) {
+                Ok(mut bar) => {
+                    bar.window = true;
+                    bar.appear();
+                    cx.set_global(Menubar(bar));
+                    watch_the_bar(config.clone(), state_root.clone(), cx);
+                }
+                Err(error) => eprintln!(
+                    "{}",
+                    fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
+                ),
+            }
+        }
         let Some((directory, pane)) = shots.clone() else { return };
         cx.spawn(async move |cx| {
             let sleep = cx.background_executor().timer(Duration::from_millis(900));
@@ -225,6 +340,7 @@ impl Desk {
             mono: SharedString::from(mono.to_owned()),
             state_root,
             pane: Pane::Groups,
+            room: Room::Wide,
             report: None,
             read_at: None,
             selected: None,
@@ -234,6 +350,8 @@ impl Desk {
             log: None,
             log_path: None,
             log_lines: 0,
+            log_held: 0,
+            errors_only: false,
             sheet: None,
             section: Section::Settings,
             fields: std::collections::HashMap::new(),
@@ -348,13 +466,15 @@ impl Desk {
 impl Render for Desk {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.pane;
+        let room = Room::of(window);
+        self.room = room;
         div()
             .size_full()
             .flex()
             .text_size(px(13.))
             .text_color(rgb(INK))
             .bg(rgb(GROUND))
-            .child(self.rail(cx))
+            .when(room > Room::Tight, |shell| shell.child(self.rail(cx)))
             .child(
                 div()
                     .flex_1()
@@ -362,6 +482,7 @@ impl Render for Desk {
                     .flex()
                     .flex_col()
                     .child(self.header())
+                    .when(room == Room::Tight, |column| column.child(self.tabs(cx)))
                     .child(match pane {
                         Pane::Groups => self.groups(cx),
                         Pane::Conflicts => self.conflicts(cx),
@@ -464,8 +585,35 @@ impl Desk {
             .into_any_element()
     }
 
+    /// The panes as a row, when the window is too narrow for a rail.
+    /// The rail's two facts — whether a supervisor is running, and
+    /// which state root this is — move to the footer, which is the
+    /// other place a person looks for them.
+    fn tabs(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let waiting = self.waiting();
+        let pending = self.pending();
+        div()
+            .id("tabs")
+            .flex_shrink_0()
+            .overflow_x_scroll()
+            .px(step(3.))
+            .py(step(1.5))
+            .flex()
+            .gap(step(1.))
+            .border_b_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(RAIL))
+            .child(self.nav(Pane::Groups, None, cx))
+            .child(self.nav(Pane::Conflicts, Some(waiting), cx))
+            .child(self.nav(Pane::Config, Some(pending), cx))
+            .child(self.nav(Pane::Log, None, cx))
+            .child(self.nav(Pane::Hosts, None, cx))
+            .into_any_element()
+    }
+
     fn nav(&self, pane: Pane, badge: Option<usize>, cx: &mut Context<Self>) -> AnyElement {
         let chosen = self.pane == pane;
+        let row = self.room == Room::Tight;
         div()
             .id(SharedString::from(format!("nav-{}", pane.title())))
             .h(step(7.5))
@@ -473,7 +621,9 @@ impl Desk {
             .rounded(px(6.))
             .flex()
             .items_center()
-            .justify_between()
+            .gap(step(1.5))
+            .when(!row, |item| item.justify_between())
+            .when(row, |item| item.flex_shrink_0())
             .cursor_pointer()
             .text_size(px(12.5))
             .when(chosen, |row| row.bg(rgb(RAISED)).text_color(rgb(INK)))
@@ -500,6 +650,9 @@ impl Desk {
             .h(step(14.))
             .flex_shrink_0()
             .px(step(6.))
+            // With no rail, the traffic lights sit over this header, and
+            // the title has to start after them.
+            .when(self.room == Room::Tight, |header| header.pl(px(84.)))
             .flex()
             .items_center()
             .justify_between()
@@ -538,11 +691,20 @@ impl Desk {
                     .flex()
                     .items_center()
                     .gap(step(2.))
-                    .child(count(needs, counted("fleet.needs_you", needs, &[]), AMBER))
-                    .child(count(away, counted("fleet.away", away, &[]), RED))
-                    .child(count(fine, counted("fleet.synchronized", fine, &[]), GREEN)),
+                    // The words go before the numbers do.
+                    .child(count(needs, self.word("fleet.needs_you", needs), AMBER))
+                    .child(count(away, self.word("fleet.away", away), RED))
+                    .child(count(fine, self.word("fleet.synchronized", fine), GREEN)),
             )
             .into_any_element()
+    }
+
+    /// The word beside a count, where there is room for one.
+    fn word(&self, key: &str, n: usize) -> String {
+        match self.room {
+            Room::Tight => String::new(),
+            _ => counted(key, n, &[]),
+        }
     }
 
     fn footer(&self) -> AnyElement {
@@ -561,13 +723,33 @@ impl Desk {
             .border_color(rgb(LINE))
             .bg(rgb(RAIL))
             .text_size(px(11.))
-            .child(match &self.said {
-                Some(said) => div()
-                    .text_color(rgb(DIM))
-                    .truncate()
-                    .child(crate::text::display_safe(said).to_string()),
-                None => div().text_color(rgb(FAINT)).child(t("fleet.provenance")),
-            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(2.))
+                    .min_w(px(0.))
+                    .when(self.room == Room::Tight, |line| {
+                        let running = self.report.as_ref().map(|r| r.supervisor_running);
+                        line.child(dot(match running {
+                            Some(true) => GREEN,
+                            Some(false) => RED,
+                            None => FAINT,
+                        }))
+                    })
+                    .child(match &self.said {
+                        Some(said) => div()
+                            .text_color(rgb(DIM))
+                            .truncate()
+                            .child(crate::text::display_safe(said).to_string()),
+                        None => div().text_color(rgb(FAINT)).truncate().child(
+                            match self.room {
+                                Room::Tight => tilde(&self.state_root.display().to_string()),
+                                _ => t("fleet.provenance").to_owned(),
+                            },
+                        ),
+                    }),
+            )
             .child(
                 div()
                     .flex_shrink_0()
@@ -670,6 +852,7 @@ impl Desk {
         let key = (group.name.clone(), session.session.clone());
         let open = self.selected.as_ref() == Some(&key);
         let severity = severity(&session.state);
+        let room = self.room;
         div()
             .flex()
             .flex_col()
@@ -698,17 +881,22 @@ impl Desk {
                             .truncate()
                             .child(tilde(&crate::text::display_safe(&session.beta))),
                     )
-                    .child(
-                        div()
-                            .w(px(100.))
-                            .flex_shrink_0()
-                            .font_family(self.mono.clone())
-                            .text_size(px(11.))
-                            .text_color(rgb(FAINT))
-                            .truncate()
-                            .child(session.mode.clone()),
-                    )
-                    .child(
+                    // The mode is the first thing to go: it is the same
+                    // for every session of a group nine times in ten.
+                    .when(room == Room::Wide, |row| {
+                        row.child(
+                            div()
+                                .w(px(100.))
+                                .flex_shrink_0()
+                                .font_family(self.mono.clone())
+                                .text_size(px(11.))
+                                .text_color(rgb(FAINT))
+                                .truncate()
+                                .child(session.mode.clone()),
+                        )
+                    })
+                    .when(room > Room::Tight, |row| {
+                        row.child(
                         div()
                             .w(px(100.))
                             .flex_shrink_0()
@@ -721,7 +909,8 @@ impl Desk {
                                 session.cycles as usize,
                                 &[("count", &thousands(session.cycles))],
                             )),
-                    )
+                        )
+                    })
                     .child(
                         div()
                             .w(px(64.))
@@ -737,7 +926,7 @@ impl Desk {
                     )
                     .child(
                         div()
-                            .w(px(148.))
+                            .when(room > Room::Tight, |cell| cell.w(px(148.)))
                             .flex_shrink_0()
                             .flex()
                             .justify_end()
@@ -752,17 +941,40 @@ impl Desk {
                     })),
             )
             .when_some(session.error.as_ref(), |band, error| {
-                band.child(
-                    div()
-                        .pl(step(8.))
-                        .pr(step(4.))
-                        .pb(step(2.))
-                        .font_family(self.mono.clone())
-                        .text_size(px(11.))
-                        .text_color(rgb(RED))
-                        .child(crate::text::display_safe(error).to_string()),
-                )
+                band.child(self.aside(crate::text::display_safe(error).to_string(), RED))
             })
+            // What is waiting reads across the card, the reason first.
+            .when(open, |band| {
+                let mut band = band;
+                for (heading, paths) in surface::waiting_groups(session) {
+                    band = band.child(
+                        div()
+                            .pl(step(8.))
+                            .pr(step(4.))
+                            .pb(step(0.5))
+                            .text_size(px(11.))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(AMBER))
+                            .child(heading),
+                    );
+                    for path in paths {
+                        band = band.child(
+                            div()
+                                .pl(step(10.))
+                                .pr(step(4.))
+                                .pb(step(0.5))
+                                .font_family(self.mono.clone())
+                                .text_size(px(11.))
+                                .text_color(rgb(DIM))
+                                .truncate()
+                                .child(path),
+                        );
+                    }
+                    band = band.child(div().h(step(1.5)));
+                }
+                band
+            })
+            .when(open, |band| band.child(self.detail(group, session, cx)))
             .into_any_element()
     }
 }
@@ -831,6 +1043,106 @@ impl Desk {
         self.diff = None;
     }
 
+    /// A line hanging under a session row, indented past its dot.
+    fn aside(&self, text: String, colour: u32) -> Div {
+        div()
+            .pl(step(8.))
+            .pr(step(4.))
+            .pb(step(2.))
+            .font_family(self.mono.clone())
+            .text_size(px(11.))
+            .text_color(rgb(colour))
+            .child(text)
+    }
+
+    /// The open session: the two roots, and the four things that can be
+    /// asked of it. What the row above says is not said again.
+    fn detail(
+        &mut self,
+        group: &GroupReport,
+        session: &SessionReport,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .bg(rgb(SUNK))
+            .border_t_1()
+            .border_color(rgb(HAIR))
+            .p(step(4.))
+            .flex()
+            .flex_col()
+            .gap(step(1.5))
+            .child(self.pair(t("fleet.alpha"), tilde(&group.alpha)))
+            .child(self.pair(t("fleet.beta"), tilde(&session.beta)))
+            .child(
+                div()
+                    .pt(step(2.))
+                    .flex()
+                    .flex_wrap()
+                    .gap(step(1.5))
+                    .child(self.verb(group, session, Verb::Flush, cx))
+                    .child(self.verb(group, session, Verb::Verify, cx))
+                    .child(self.verb(group, session, Verb::Pause, cx))
+                    .child(self.verb(group, session, Verb::Resume, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn verb(
+        &self,
+        group: &GroupReport,
+        session: &SessionReport,
+        verb: Verb,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = group.name.clone();
+        let beta = session.beta.clone();
+        let key = session.session.clone();
+        Button::new(SharedString::from(format!(
+            "verb-{name}-{beta}-{}",
+            verb.word()
+        )))
+        .small()
+        .outline()
+        .label(verb.word())
+        .tooltip(verb.about())
+        .on_click(cx.listener(move |this, _, _, cx| {
+            this.control(&name, &beta, &key, verb);
+            cx.notify();
+        }))
+        .into_any_element()
+    }
+
+    /// A control request, for the one session the row belongs to.
+    fn control(
+        &mut self,
+        group: &str,
+        beta: &str,
+        session: &crate::supervisor::control::SessionKey,
+        verb: Verb,
+    ) {
+        let selector = crate::supervisor::control::Selector {
+            group: Some(group.to_owned()),
+            host: Some(beta.to_owned()),
+            session: Some(session.clone()),
+        };
+        let request = match verb {
+            Verb::Flush => crate::supervisor::control::ControlRequest::Flush(selector),
+            Verb::Verify => crate::supervisor::control::ControlRequest::Verify(selector),
+            Verb::Pause => crate::supervisor::control::ControlRequest::Pause(selector),
+            Verb::Resume => crate::supervisor::control::ControlRequest::Resume(selector),
+        };
+        self.said = Some(
+            match crate::supervisor::control::send(&self.state_root, &request) {
+                Ok(_) => fill(
+                    "status.control_done",
+                    &[("done", verb.done()), ("beta", beta)],
+                ),
+                Err(error) => format!("{error:#}"),
+            },
+        );
+        self.read_at = None;
+    }
+
     // ── the conflicts ────────────────────────────────────────────────
 
     fn conflicts(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -839,15 +1151,20 @@ impl Desk {
             return empty(t("conflicts.none"));
         }
         let open = self.conflict.clone();
+        let room = self.room;
+        // Narrow, the queue and what it opens take turns: a list that is
+        // half a window wide beside a detail that is the other half is
+        // two things neither of which can be read.
+        let showing_detail = room == Room::Tight && open.is_some();
         div()
             .flex_1()
             .min_h(px(0.))
             .flex()
-            .child(
+            .when(!showing_detail, |pane| pane.child(
                 div()
                     .id("queue")
-                    .w(px(352.))
-                    .flex_shrink_0()
+                    .when(room > Room::Tight, |queue| queue.w(px(352.)).flex_shrink_0())
+                    .when(room == Room::Tight, |queue| queue.flex_1().min_w(px(0.)))
                     .h_full()
                     .overflow_y_scroll()
                     .p(step(3.))
@@ -920,10 +1237,12 @@ impl Desk {
                                 cx.notify();
                             }))
                     })),
-            )
-            .child(match self.conflict.clone() {
-                None => empty(t("conflicts.pick")),
-                Some(item) => self.conflict_detail(item, cx),
+            ))
+            .when(room > Room::Tight || showing_detail, |pane| {
+                pane.child(match self.conflict.clone() {
+                    None => empty(t("conflicts.pick")),
+                    Some(item) => self.conflict_detail(item, cx),
+                })
             })
             .into_any_element()
     }
@@ -953,10 +1272,30 @@ impl Desk {
                     .gap(step(2.))
                     .border_b_1()
                     .border_color(rgb(LINE))
-                    .child(label(match item.blocked {
-                        true => t("conflicts.blocked"),
-                        false => t("conflicts.conflict"),
-                    }))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(step(2.))
+                            .when(self.room == Room::Tight, |head| {
+                                head.child(
+                                    Button::new("back-to-queue")
+                                        .small()
+                                        .ghost()
+                                        .label(t("conflicts.back"))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.conflict = None;
+                                            this.sides = None;
+                                            this.diff = None;
+                                            cx.notify();
+                                        })),
+                                )
+                            })
+                            .child(label(match item.blocked {
+                                true => t("conflicts.blocked"),
+                                false => t("conflicts.conflict"),
+                            })),
+                    )
                     .child(
                         div()
                             .font_family(self.mono.clone())
@@ -1111,6 +1450,7 @@ impl Desk {
                 div()
                     .flex()
                     .gap(step(4.))
+                    .when(self.room == Room::Tight, |sides| sides.flex_col())
                     .child(self.side_card(alpha, newer == Some("alpha"), cx))
                     .child(self.side_card(beta, newer == Some("beta"), cx)),
             )
@@ -1264,6 +1604,7 @@ impl Desk {
             }
         }
         hosts.sort_by(|a, b| b.2.cmp(&a.2).then(a.0.cmp(&b.0)));
+        let room = self.room;
         let manifest = std::fs::read_to_string(self.state_root.join("agents").join("MANIFEST"));
         let rows: Vec<Div> = hosts
             .into_iter()
@@ -1295,16 +1636,21 @@ impl Desk {
                             .truncate()
                             .child(tilde(&host)),
                     )
-                    .child(
-                        div()
-                            .w(px(320.))
-                            .flex_shrink_0()
-                            .font_family(self.mono.clone())
-                            .text_size(px(11.))
-                            .text_color(rgb(colour_of(worst)))
-                            .truncate()
-                            .child(said),
-                    )
+                    .when(room > Room::Tight, |row| {
+                        row.child(
+                            div()
+                                .w(match room {
+                                    Room::Wide => px(320.),
+                                    _ => px(200.),
+                                })
+                                .flex_shrink_0()
+                                .font_family(self.mono.clone())
+                                .text_size(px(11.))
+                                .text_color(rgb(colour_of(worst)))
+                                .truncate()
+                                .child(said),
+                        )
+                    })
                     .child(
                         div()
                             .w(px(88.))
@@ -1344,12 +1690,17 @@ impl Desk {
                             .border_color(rgb(HAIR))
                             .child(div().size(px(7.)).flex_shrink_0())
                             .child(div().flex_1().min_w(px(0.)).child(label(t("hosts.host"))))
-                            .child(
-                                div()
-                                    .w(px(320.))
-                                    .flex_shrink_0()
-                                    .child(label(t("hosts.said"))),
-                            )
+                            .when(room > Room::Tight, |head| {
+                                head.child(
+                                    div()
+                                        .w(match room {
+                                            Room::Wide => px(320.),
+                                            _ => px(200.),
+                                        })
+                                        .flex_shrink_0()
+                                        .child(label(t("hosts.said"))),
+                                )
+                            })
                             .child(
                                 div()
                                     .w(px(88.))
@@ -1423,6 +1774,7 @@ impl Desk {
             .map(|path| tilde(&path.display().to_string()))
             .unwrap_or_default();
         let lines = self.log_lines;
+        let held = self.log_held;
         div()
             .flex_1()
             .min_h(px(0.))
@@ -1439,6 +1791,19 @@ impl Desk {
                     .border_b_1()
                     .border_color(rgb(LINE))
                     .bg(rgb(SUNK))
+                    .child(
+                        Button::new("errors-only")
+                            .small()
+                            .when(self.errors_only, |button| button.primary())
+                            .when(!self.errors_only, |button| button.outline())
+                            .label(t("log.errors_only"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.errors_only = !this.errors_only;
+                                this.log = None;
+                                this.read_log(window, cx);
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new("re-read")
                             .small()
@@ -1463,8 +1828,8 @@ impl Desk {
                             .child(path)
                             .child(counted(
                                 "log.counted",
-                                lines,
-                                &[("shown", &lines.to_string()), ("held", &lines.to_string())],
+                                held,
+                                &[("shown", &lines.to_string()), ("held", &held.to_string())],
                             )),
                     ),
             )
@@ -1497,13 +1862,16 @@ impl Desk {
                 ),
             },
         };
-        let tail: Vec<&str> = text.lines().rev().take(400).collect();
-        let shown: String = tail
-            .into_iter()
+        let held = text.lines().rev().take(400).count();
+        let tail: Vec<&str> = text
+            .lines()
             .rev()
-            .collect::<Vec<&str>>()
-            .join("\n");
+            .take(400)
+            .filter(|line| !self.errors_only || surface::is_complaint(line))
+            .collect();
+        let shown: String = tail.into_iter().rev().collect::<Vec<&str>>().join("\n");
         self.log_lines = shown.lines().count();
+        self.log_held = held;
         self.log_path = path;
         let block = cx.new(|cx| EditorState::new(window, cx).default_value(shown));
         self.log = Some(block);
@@ -1552,48 +1920,67 @@ impl Desk {
         let pending = sheet.pending();
         let sections = sheet.sections();
         let open = self.section.clone();
+        let room = self.room;
         div()
             .flex_1()
             .min_h(px(0.))
             .flex()
+            .when(room == Room::Tight, |pane| pane.flex_col())
             .child(
                 div()
                     .id("sections")
-                    .w(px(260.))
                     .flex_shrink_0()
-                    .h_full()
-                    .overflow_y_scroll()
                     .p(step(3.))
                     .flex()
-                    .flex_col()
                     .gap(step(0.5))
-                    .border_r_1()
-                    .border_color(rgb(LINE))
                     .bg(rgb(SUNK))
+                    // Beside the form when there is room for a column,
+                    // and a row of them above it when there is not.
+                    .when(room > Room::Tight, |column| {
+                        column
+                            .w(px(260.))
+                            .h_full()
+                            .overflow_y_scroll()
+                            .flex_col()
+                            .border_r_1()
+                            .border_color(rgb(LINE))
+                    })
+                    .when(room == Room::Tight, |row| {
+                        row.w_full()
+                            .overflow_x_scroll()
+                            .items_center()
+                            .border_b_1()
+                            .border_color(rgb(LINE))
+                    })
                     .child(
                         div()
                             .px(step(2.5))
-                            .pb(step(1.))
+                            .flex_shrink_0()
+                            .when(room > Room::Tight, |line| line.pb(step(1.)))
                             .font_family(self.mono.clone())
                             .text_size(px(10.5))
                             .text_color(rgb(FAINT))
                             .truncate()
                             .child(surface::tail(&tilde(&path.display().to_string()), 3)),
                     )
-                    .child(
-                        div()
-                            .px(step(2.5))
-                            .pb(step(2.))
-                            .text_size(px(10.5))
-                            .text_color(rgb(FAINT))
-                            .child(t("config.held")),
-                    )
+                    // The sentence about saving is worth its room only
+                    // when there is room.
+                    .when(room > Room::Tight, |column| {
+                        column.child(
+                            div()
+                                .px(step(2.5))
+                                .pb(step(2.))
+                                .text_size(px(10.5))
+                                .text_color(rgb(FAINT))
+                                .child(t("config.held")),
+                        )
+                    })
                     .child(
                         div()
                             .px(step(2.))
-                            .pb(step(2.5))
+                            .flex_shrink_0()
+                            .when(room > Room::Tight, |row| row.pb(step(2.5)).flex_wrap())
                             .flex()
-                            .flex_wrap()
                             .gap(step(1.5))
                             .child(
                                 Button::new("save-config")
@@ -1632,7 +2019,8 @@ impl Desk {
                         column.child(
                             div()
                                 .px(step(2.5))
-                                .pb(step(2.5))
+                                .flex_shrink_0()
+                                .when(room > Room::Tight, |line| line.pb(step(2.5)))
                                 .text_size(px(10.5))
                                 .text_color(rgb(AMBER))
                                 .child(counted("config.pending", pending, &[])),
@@ -1649,6 +2037,7 @@ impl Desk {
                             .rounded(px(6.))
                             .cursor_pointer()
                             .flex()
+                            .flex_shrink_0()
                             .items_center()
                             .gap(step(1.5))
                             .text_size(px(12.5))
@@ -1764,11 +2153,12 @@ impl Desk {
         div()
             .flex()
             .gap(step(4.))
+            .when(self.room == Room::Tight, |field| field.flex_col().gap(step(1.5)))
             .child(
                 div()
-                    .w(px(210.))
-                    .flex_shrink_0()
-                    .pt(step(1.))
+                    .when(self.room > Room::Tight, |name| {
+                        name.w(px(210.)).flex_shrink_0().pt(step(1.))
+                    })
                     .flex()
                     .flex_col()
                     .gap(px(2.))
@@ -2110,6 +2500,44 @@ impl Desk {
     }
 }
 
+/// What can be asked of a running session.
+#[derive(Clone, Copy)]
+enum Verb {
+    Flush,
+    Verify,
+    Pause,
+    Resume,
+}
+
+impl Verb {
+    fn word(self) -> &'static str {
+        match self {
+            Verb::Flush => t("verb.flush"),
+            Verb::Verify => t("verb.verify"),
+            Verb::Pause => t("verb.pause"),
+            Verb::Resume => t("verb.resume"),
+        }
+    }
+
+    fn done(self) -> &'static str {
+        match self {
+            Verb::Flush => t("verb.flushed"),
+            Verb::Verify => t("verb.will_verify"),
+            Verb::Pause => t("verb.paused"),
+            Verb::Resume => t("verb.resumed"),
+        }
+    }
+
+    fn about(self) -> &'static str {
+        match self {
+            Verb::Flush => t("tip.flush"),
+            Verb::Verify => t("tip.verify"),
+            Verb::Pause => t("tip.pause"),
+            Verb::Resume => t("tip.resume"),
+        }
+    }
+}
+
 // ── the small pieces ─────────────────────────────────────────────────
 
 fn dot(colour: u32) -> Div {
@@ -2160,15 +2588,17 @@ fn count(n: usize, word: String, colour: u32) -> Div {
                 }))
                 .child(n.to_string()),
         )
-        .child(
-            div()
-                .text_size(px(11.))
-                .text_color(rgb(match lit {
-                    true => DIM,
-                    false => FAINT,
-                }))
-                .child(word),
-        )
+        .when(!word.is_empty(), |chip| {
+            chip.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(match lit {
+                        true => DIM,
+                        false => FAINT,
+                    }))
+                    .child(word),
+            )
+        })
 }
 
 fn label(text: &'static str) -> Div {

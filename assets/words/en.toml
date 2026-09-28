@@ -58,6 +58,7 @@ and_more_many = "… and {count} more"
 [conflicts]
 none = "nothing needs you"
 pick = "pick one from the left"
+back = "← Back"
 conflict = "conflict"
 blocked = "blocked path"
 blocked_about = "A blocked path is a filesystem to fix, not a version to choose: something on one side cannot be written where the other side wants it."

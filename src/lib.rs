@@ -61,10 +61,10 @@ pub mod kit;
 #[cfg(any(feature = "tray", feature = "desk", feature = "desk-kit"))]
 pub(crate) mod words;
 /// Notifications the system posts, for whoever can post them.
-#[cfg(any(feature = "tray", feature = "desk"))]
+#[cfg(any(feature = "tray", feature = "desk", feature = "desk-kit"))]
 pub(crate) mod native_alert;
 /// What the menu bar shows, for the tray and for the window.
-#[cfg(any(feature = "tray", feature = "desk"))]
+#[cfg(any(feature = "tray", feature = "desk", feature = "desk-kit"))]
 pub(crate) mod menubar;
 #[cfg(feature = "tray")]
 pub mod tray;

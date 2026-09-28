@@ -9,6 +9,53 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+/// mimalloc's options, by their place in its `mi_option_e` (v3, the
+/// version libmimalloc-sys builds by default; the crate names only a few).
+/// `the_allocator_options_are_the_ones_meant` checks each against its
+/// default in mimalloc's options.c, so a renumbering fails the tests.
+#[cfg(target_env = "musl")]
+mod allocator_option {
+    pub const ARENA_EAGER_COMMIT: libmimalloc_sys::mi_option_t = 4;
+    pub const PURGE_DELAY: libmimalloc_sys::mi_option_t = 15;
+}
+
+/// Has mimalloc commit its arenas on demand and give freed memory back
+/// after 50 ms. By default it commits arenas whole and purges freed memory
+/// only when the thread that freed it next allocates, which a sync's idle
+/// threads never do, so memory from a busy moment stays resident.
+///
+/// Measured 2026-09-24 and 28, one run of each, synthetic corpora synced
+/// over SSH to the same machine. Idle memory after the cold sync,
+/// controller plus agent: 5k files 68 → 35 MB, 50k 119 → 87, 200k no
+/// change. After ten 200 MB cold syncs to one host: ~85 + ~130 MB → 23 +
+/// 44, with those cold syncs ~5% slower. Remote-side edits: no measurable
+/// cost up to 200k files (p50 within 1 ms), about 2 ms of 19 at 420k,
+/// where an edit touches tens of megabytes the allocator has handed back.
+/// Purging at once went lower still (14 + 15 MB after the cold syncs) but
+/// slowed them 25%.
+///
+/// Options set here override mimalloc's environment variables, which it
+/// reads before `main`; a `MIMALLOC_*` setting still wins where one is
+/// given, for experiments.
+#[cfg(target_env = "musl")]
+fn tune_allocator() {
+    use allocator_option::*;
+    let options = [
+        (PURGE_DELAY, "MIMALLOC_PURGE_DELAY", 50),
+        (ARENA_EAGER_COMMIT, "MIMALLOC_ARENA_EAGER_COMMIT", 0),
+    ];
+    for (option, variable, value) in options {
+        if std::env::var_os(variable).is_none() {
+            // Safety: setting an option is thread-safe and takes effect for
+            // later allocations; no pointer is involved.
+            unsafe { libmimalloc_sys::mi_option_set(option, value) };
+        }
+    }
+}
+
+#[cfg(not(target_env = "musl"))]
+fn tune_allocator() {}
+
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -615,6 +662,7 @@ fn bundled_launch() -> bool {
 }
 
 fn main() {
+    tune_allocator();
     // Double-clicked inside the app bundle, macOS runs the executable with
     // no arguments. There is no other way for a bundle to say what its
     // binary should do, and the binary is the same one the terminal runs.
@@ -5278,6 +5326,22 @@ fn problem_line(side: &str, problem: &autobahn::tree::Problem) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Each option number names the option meant: read before anything
+    /// sets them, each holds its default in mimalloc's options.c, and
+    /// the options beside them hold different ones.
+    #[cfg(target_env = "musl")]
+    #[test]
+    fn the_allocator_options_are_the_ones_meant() {
+        use super::allocator_option::*;
+        let get = |option| unsafe { libmimalloc_sys::mi_option_get(option) };
+        assert_eq!(get(ARENA_EAGER_COMMIT), 2, "arena_eager_commit (=2)");
+        assert_eq!(get(PURGE_DELAY), 1000, "purge_delay (=1000)");
+        // purge_decommits (=1) follows arena_eager_commit, and
+        // use_numa_nodes (=0) follows purge_delay.
+        assert_eq!(get(ARENA_EAGER_COMMIT + 1), 1);
+        assert_eq!(get(PURGE_DELAY + 1), 0);
+    }
+
     /// A reader parsing `--json` is the one least able to cope with a
     /// message on standard error, so a refused configuration has to reach
     /// it inside the document: the refusal itself, and whatever the

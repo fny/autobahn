@@ -11,14 +11,21 @@
 //! `config::schema`, and every line of English still comes from
 //! `assets/words/en.toml`.
 
+mod ink;
+
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{Editor, EditorState, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    Editor, EditorState, InputHighlighter, Textarea, TextareaState,
+};
+use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Root, Sizable as _, Theme, ThemeMode};
+use gpui_kit::component::{Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -95,20 +102,32 @@ impl Room {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Groups,
-    Conflicts,
-    Config,
-    Log,
     Hosts,
+    Conflicts,
+    Log,
+    Config,
 }
 
 impl Pane {
     fn title(self) -> &'static str {
         match self {
             Pane::Groups => t("pane.groups"),
-            Pane::Conflicts => t("pane.conflicts"),
-            Pane::Config => t("pane.config"),
-            Pane::Log => t("pane.log"),
             Pane::Hosts => t("pane.hosts"),
+            Pane::Conflicts => t("pane.conflicts"),
+            Pane::Log => t("pane.log"),
+            Pane::Config => t("pane.config"),
+        }
+    }
+
+    /// The mark beside its name. From the kit's bundled Lucide set, so
+    /// there is nothing to draw and nothing to ship.
+    fn icon(self) -> IconName {
+        match self {
+            Pane::Groups => IconName::Folder,
+            Pane::Hosts => IconName::Network,
+            Pane::Conflicts => IconName::TriangleAlert,
+            Pane::Log => IconName::FileText,
+            Pane::Config => IconName::Settings,
         }
     }
 
@@ -151,6 +170,13 @@ fn open_window(
             let desk = cx.new(|cx| {
                 let mut desk = Desk::new(config, state_root, cx);
                 if let Some(pane) = pane.as_deref() {
+                    // `config:defaults` opens the configuration on one of
+                    // its sections, which is the only way a picture of a
+                    // section can be taken without a hand on the mouse.
+                    let (pane, section) = match pane.split_once(':') {
+                        Some((pane, section)) => (pane, Some(section)),
+                        None => (pane, None),
+                    };
                     desk.pane = match pane {
                         "conflicts" => Pane::Conflicts,
                         "config" => Pane::Config,
@@ -158,6 +184,16 @@ fn open_window(
                         "hosts" => Pane::Hosts,
                         _ => Pane::Groups,
                     };
+                    if let Some(section) = section {
+                        desk.section = match section {
+                            "defaults" => Section::Defaults,
+                            "advanced" => Section::Advanced,
+                            "alerts" => Section::Alerts,
+                            "peering" => Section::Peering,
+                            "settings" => Section::Settings,
+                            name => Section::Group(name.to_owned()),
+                        };
+                    }
                     desk.settle(desk.pane, window, cx);
                 }
                 desk
@@ -219,6 +255,55 @@ fn watch_the_bar(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
     .detach();
 }
 
+/// One of the words a setting will take, and what choosing it means.
+///
+/// A row of chips said what the choices were but not what they did: the
+/// reason each one exists only fitted in a tooltip, which is a place a
+/// person finds by accident. In a list there is room for the sentence
+/// beside the word.
+#[derive(Clone)]
+struct Choice {
+    word: String,
+    about: String,
+    mono: SharedString,
+}
+
+impl SearchableListItem for Choice {
+    type Value = String;
+
+    fn title(&self) -> SharedString {
+        self.word.clone().into()
+    }
+
+    fn value(&self) -> &String {
+        &self.word
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .text_size(px(12.5))
+                    .child(self.word.clone()),
+            )
+            .when(!self.about.is_empty(), |row| {
+                row.child(
+                    div()
+                        .text_size(px(10.5))
+                        .text_color(rgb(FAINT))
+                        .child(self.about.clone()),
+                )
+            })
+    }
+}
+
+/// The list behind one of those fields.
+type Choices = SelectState<SearchableVec<Choice>>;
+
 /// What the window is showing.
 pub struct Desk {
     config: Option<PathBuf>,
@@ -244,6 +329,12 @@ pub struct Desk {
     log_lines: usize,
     /// How many lines the tail holds, before the filter.
     log_held: usize,
+    /// The text last shown, so a tail that has nothing new leaves the
+    /// block — and its selection, and its search — alone.
+    log_text: String,
+    /// Whether the log follows the file, re-reading and staying at the end.
+    log_tail: bool,
+    log_read_at: Option<Instant>,
     /// Whether the log shows only what the supervisor complained about.
     errors_only: bool,
     /// The configuration file, which section is open, and the block
@@ -252,6 +343,8 @@ pub struct Desk {
     section: Section,
     /// One live block per value of the file, made as it is first drawn.
     fields: std::collections::HashMap<(Section, String), Entity<TextareaState>>,
+    /// The same, for the fields that take one of a fixed set of words.
+    choices: std::collections::HashMap<(Section, String), Entity<Choices>>,
     shape: serde_json::Value,
     said: Option<String>,
 }
@@ -276,7 +369,12 @@ fn run_with(
     state_root: PathBuf,
     shots: Option<(PathBuf, Option<String>)>,
 ) -> Result<()> {
-    gpui_kit::application().run(move |cx: &mut App| {
+    // The icons are files the kit embeds, so the application has to be
+    // told where its assets come from or every one of them draws as
+    // nothing.
+    gpui_kit::application()
+        .with_assets(gpui_kit::assets::Assets)
+        .run(move |cx: &mut App| {
         gpui_kit::init(cx);
         cx.activate(true);
         let config = config.clone();
@@ -351,10 +449,14 @@ impl Desk {
             log_path: None,
             log_lines: 0,
             log_held: 0,
+            log_text: String::new(),
+            log_tail: false,
+            log_read_at: None,
             errors_only: false,
             sheet: None,
             section: Section::Settings,
             fields: std::collections::HashMap::new(),
+            choices: std::collections::HashMap::new(),
             shape: crate::config::schema(),
             said: None,
         };
@@ -366,7 +468,9 @@ impl Desk {
                 let sleep = cx.background_executor().timer(POLL_WHILE_WORKING);
                 sleep.await;
                 let carried = this.update(cx, |this, cx| {
-                    if this.refresh_if_due() {
+                    // A tailing log asks for a frame of its own: the reading
+                    // itself needs a window, and only `render` has one.
+                    if this.refresh_if_due() || (this.log_tail && this.pane == Pane::Log) {
                         cx.notify();
                     }
                 });
@@ -553,10 +657,10 @@ impl Desk {
                     .flex_col()
                     .gap(step(0.5))
                     .child(self.nav(Pane::Groups, None, cx))
+                    .child(self.nav(Pane::Hosts, None, cx))
                     .child(self.nav(Pane::Conflicts, Some(waiting), cx))
-                    .child(self.nav(Pane::Config, Some(self.pending()), cx))
                     .child(self.nav(Pane::Log, None, cx))
-                    .child(self.nav(Pane::Hosts, None, cx)),
+                    .child(self.nav(Pane::Config, Some(self.pending()), cx)),
             )
             .child(div().flex_1())
             .child(
@@ -604,10 +708,10 @@ impl Desk {
             .border_color(rgb(LINE))
             .bg(rgb(RAIL))
             .child(self.nav(Pane::Groups, None, cx))
-            .child(self.nav(Pane::Conflicts, Some(waiting), cx))
-            .child(self.nav(Pane::Config, Some(pending), cx))
-            .child(self.nav(Pane::Log, None, cx))
             .child(self.nav(Pane::Hosts, None, cx))
+            .child(self.nav(Pane::Conflicts, Some(waiting), cx))
+            .child(self.nav(Pane::Log, None, cx))
+            .child(self.nav(Pane::Config, Some(pending), cx))
             .into_any_element()
     }
 
@@ -630,7 +734,21 @@ impl Desk {
             .when(!chosen, |row| {
                 row.text_color(rgb(DIM)).hover(|row| row.bg(rgb(SUNK)))
             })
-            .child(pane.title())
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(2.))
+                    .child(
+                        Icon::new(pane.icon())
+                            .size_4()
+                            .text_color(rgb(match chosen {
+                                true => INK,
+                                false => FAINT,
+                            })),
+                    )
+                    .child(pane.title()),
+            )
             .when_some(badge.filter(|count| *count > 0), |row, count| {
                 row.child(pill(count.to_string(), AMBER))
             })
@@ -1762,7 +1880,13 @@ impl Desk {
     /// The supervisor's account, in a block that selects and searches:
     /// the kit's own text area, read-only.
     fn log_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        if self.log.is_none() {
+        // Tailing happens here rather than in the poll loop: building a
+        // block needs a window, and this is where one is in hand. The
+        // loop only says the clock has moved, by asking for a frame.
+        let due = self
+            .log_read_at
+            .is_none_or(|at| at.elapsed() >= POLL_AT_REST);
+        if self.log.is_none() || (self.log_tail && due) {
             self.read_log(window, cx);
         }
         let Some(text) = self.log.clone() else {
@@ -1805,6 +1929,22 @@ impl Desk {
                             })),
                     )
                     .child(
+                        Button::new("tail")
+                            .small()
+                            .when(self.log_tail, |button| button.primary())
+                            .when(!self.log_tail, |button| button.outline())
+                            .label(t("log.tail"))
+                            .tooltip(t("tip.log_tail"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.log_tail = !this.log_tail;
+                                if this.log_tail {
+                                    this.log = None;
+                                    this.read_log(window, cx);
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         Button::new("re-read")
                             .small()
                             .outline()
@@ -1843,7 +1983,13 @@ impl Desk {
             .into_any_element()
     }
 
+    /// Read the tail of the log into the block, and leave it at the end.
+    ///
+    /// The whole file is never shown: four hundred lines is what a person
+    /// reads after something went wrong, and the count in the header says
+    /// how many were held back.
     fn read_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.log_read_at = Some(Instant::now());
         let service = self.state_root.join("service.log");
         let watch = self.state_root.join("watch.log");
         let (path, text) = match std::fs::read_to_string(&service) {
@@ -1870,10 +2016,39 @@ impl Desk {
             .filter(|line| !self.errors_only || surface::is_complaint(line))
             .collect();
         let shown: String = tail.into_iter().rev().collect::<Vec<&str>>().join("\n");
+        // A tail that found nothing new keeps the block it has, and with
+        // it the selection, the search and wherever the reader had got to.
+        if self.log.is_some() && shown == self.log_text {
+            return;
+        }
         self.log_lines = shown.lines().count();
         self.log_held = held;
         self.log_path = path;
-        let block = cx.new(|cx| EditorState::new(window, cx).default_value(shown));
+        self.log_text = shown.clone();
+        let block = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language("log")
+                // A log is read at its end, so the end is where it stops:
+                // half a screen of nothing under the last line is room to
+                // type into, which nobody does here.
+                .scroll_beyond_last_line(Some(0))
+                .default_value(shown);
+            // The kit ships a highlighter per bundled language and none of
+            // them is a log; ours is small enough to hand over directly.
+            state.set_highlighter_factory(
+                Rc::new(|language| match language {
+                    "log" => Some(Box::new(ink::LogInk::new()) as Box<dyn InputHighlighter>),
+                    _ => None,
+                }),
+                cx,
+            );
+            state
+        });
+        // The end of a log is the part worth reading, so that is where it
+        // opens. Anything past the last line clamps to the last line.
+        block.update(cx, |state, cx| {
+            state.set_scroll_offset(point(px(0.), px(-1.0e9)), cx);
+        });
         self.log = Some(block);
     }
 
@@ -2009,6 +2184,7 @@ impl Desk {
                                     })
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.fields.clear();
+                                        this.choices.clear();
                                         this.sheet = None;
                                         this.read_sheet();
                                         cx.notify();
@@ -2119,9 +2295,20 @@ impl Desk {
             Section::Advanced => SILENT_IN_ADVANCED,
             _ => &[],
         };
-        properties
+        let mut fields: Vec<(&String, &serde_json::Value)> = properties
             .iter()
             .filter(|(key, _)| !silent.contains(&key.as_str()))
+            .collect();
+        // The schema is a map, so its own order is alphabetical; the
+        // reading order is in the file beside the parser.
+        fields.sort_by_key(|(key, field)| {
+            (
+                field["x-order"].as_u64().unwrap_or(u64::MAX),
+                (*key).clone(),
+            )
+        });
+        fields
+            .into_iter()
             .map(|(key, field)| self.field(key, field, window, cx))
             .collect::<Vec<_>>()
     }
@@ -2135,6 +2322,7 @@ impl Desk {
     ) -> AnyElement {
         let about = field["description"].as_str().unwrap_or_default().to_owned();
         let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
+        let unit = field["x-unit"].as_str().unwrap_or_default().to_owned();
         let words: Vec<(String, String)> = field["x-words"]
             .as_array()
             .map(|words| {
@@ -2168,12 +2356,24 @@ impl Desk {
                             .text_size(px(12.5))
                             .child(key.to_owned()),
                     )
-                    .when(!widget.is_empty(), |column| {
+                    // "seconds" under "seconds" is one word too many: the
+                    // unit is the longer answer, so it is the one kept.
+                    .when(!widget.is_empty() && !unit.starts_with(&widget), |column| {
                         column.child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(rgb(FAINT))
                                 .child(widget.clone()),
+                        )
+                    })
+                    // The unit belongs where the value is typed, not in
+                    // a sentence under it that nobody reads twice.
+                    .when(!unit.is_empty(), |column| {
+                        column.child(
+                            div()
+                                .text_size(px(10.5))
+                                .text_color(rgb(BLUE))
+                                .child(unit.clone()),
                         )
                     }),
             )
@@ -2215,6 +2415,8 @@ impl Desk {
                 .unwrap_or_default()
                 .to_owned();
             let set = held.is_some();
+            let default = field["default"].as_str().unwrap_or_default().to_owned();
+            let list = self.choose(key, words, &now, window, cx);
             return div()
                 .flex()
                 .flex_col()
@@ -2222,31 +2424,35 @@ impl Desk {
                 .child(
                     div()
                         .flex()
-                        .flex_wrap()
+                        .items_center()
                         .gap(step(1.5))
-                        .children(words.iter().map(|(word, about)| {
-                            let chosen = *word == now;
-                            let writing = word.clone();
-                            let key = key.to_owned();
-                            let section = section.clone();
-                            Button::new(SharedString::from(format!("word-{key}-{word}")))
-                                .small()
-                                .label(word.clone())
-                                .tooltip(about.clone())
-                                .when(chosen, |chip| chip.primary())
-                                .when(!chosen, |chip| chip.ghost())
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.put(
-                                        &Spot {
-                                            section: section.clone(),
-                                            key: key.clone(),
-                                            item: None,
-                                        },
-                                        (!chosen).then(|| toml_edit::value(writing.clone())),
-                                    );
-                                    cx.notify();
-                                }))
-                        })),
+                        .child(
+                            // Wide enough for the longest word any of
+                            // these take, and no wider: a control the
+                            // width of the pane reads as a text field.
+                            div().w(px(260.)).flex_shrink_0().child(
+                                Select::new(&list)
+                                    .menu_width(px(460.))
+                                    .placeholder(match default.is_empty() {
+                                        true => t("config.absent").to_owned(),
+                                        false => default.clone(),
+                                    }),
+                            ),
+                        )
+                        .when(set, |row| {
+                            let at = (self.section.clone(), key.to_owned());
+                            row.child(
+                                Button::new(SharedString::from(format!("unset-{key}")))
+                                    .small()
+                                    .ghost()
+                                    .label(t("config.unset"))
+                                    .tooltip(t("tip.unset"))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.unset(&at);
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
                 )
                 .when(!set, |column| {
                     column.child(
@@ -2329,6 +2535,66 @@ impl Desk {
         }
     }
 
+    /// The list for a field that takes one of a fixed set of words.
+    ///
+    /// Built once and kept: the list owns which row is chosen, and what
+    /// it hears from the person is written the moment they choose it —
+    /// a word is never half-typed, so there is nothing for Save to take.
+    fn choose(
+        &mut self,
+        key: &str,
+        words: &[(String, String)],
+        now: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Choices> {
+        let at = (self.section.clone(), key.to_owned());
+        if let Some(list) = self.choices.get(&at) {
+            return list.clone();
+        }
+        let items: Vec<Choice> = words
+            .iter()
+            .map(|(word, about)| Choice {
+                word: word.clone(),
+                about: first_sentence(about),
+                mono: self.mono.clone(),
+            })
+            .collect();
+        let chosen = items
+            .iter()
+            .position(|choice| choice.word == now)
+            .map(IndexPath::new);
+        let list = cx.new(|cx| SelectState::new(SearchableVec::new(items), chosen, window, cx));
+        let spot = Spot {
+            section: at.0.clone(),
+            key: at.1.clone(),
+            item: None,
+        };
+        cx.subscribe(&list, move |this, _, event: &SelectEvent<_>, cx| {
+            let SelectEvent::Confirm(word) = event;
+            this.put(&spot, word.clone().map(toml_edit::value));
+            cx.notify();
+        })
+        .detach();
+        self.choices.insert(at, list.clone());
+        list
+    }
+
+    /// Take a word back out of the file, and out of the list with it.
+    fn unset(&mut self, at: &(Section, String)) {
+        self.put(
+            &Spot {
+                section: at.0.clone(),
+                key: at.1.clone(),
+                item: None,
+            },
+            None,
+        );
+        // The list holds which row is chosen, so it is rebuilt rather
+        // than argued with: the next frame reads the file again.
+        self.choices.remove(at);
+    }
+
     /// A value, in the kit's own text block: it selects, it takes every
     /// key this machine has taught you, and it undoes. One per field,
     /// live — there is nothing to open or close, and Save takes what
@@ -2345,16 +2611,21 @@ impl Desk {
         let block = match self.fields.get(&at) {
             Some(block) => block.clone(),
             None => {
-                let rows = match list {
-                    true => 10,
-                    false => 1,
-                };
+                // A single value is a line. A list is five lines and
+                // scrolls: ten was half the pane for two patterns.
+                //
+                // Rows only size a block that grows, which is why this
+                // asks for five of them either way rather than setting
+                // `rows`: a plain block takes whatever height the row it
+                // sits in happens to have, which is one line.
                 let shown = text.clone();
                 let block = cx.new(|cx| {
-                    TextareaState::new(window, cx)
-                        .rows(rows)
-                        .default_value(shown)
-                        .placeholder(t("config.not_set"))
+                    let block = TextareaState::new(window, cx);
+                    let block = match list {
+                        true => block.auto_grow(5, 5),
+                        false => block,
+                    };
+                    block.default_value(shown).placeholder(t("config.not_set"))
                 });
                 self.fields.insert(at, block.clone());
                 block

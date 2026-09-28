@@ -1945,28 +1945,28 @@ pub const MODES: &[ModeName] = &[
         also: &[],
         mode: SyncMode::TwoWayParanoid,
         peering: false,
-        about: "As two-way-conflict, and a large directory that goes empty or missing on                 one side is disbelieved rather than propagated.",
+        about: "As two-way-conflict, and a large directory that goes empty or missing on one side is disbelieved rather than propagated.",
     },
     ModeName {
         name: "two-way-alpha",
         also: &["two-way-resolved"],
         mode: SyncMode::TwoWayResolved,
         peering: false,
-        about: "Both ways, and alpha wins a collision — except that a deletion never beats                 an edit.",
+        about: "Both ways, and alpha wins a collision — except that a deletion never beats an edit.",
     },
     ModeName {
         name: "two-way-alpha-strict",
         also: &[],
         mode: SyncMode::TwoWayStrict,
         peering: false,
-        about: "As two-way-alpha with that exception removed: alpha's deletion beats beta's                 edit.",
+        about: "As two-way-alpha with that exception removed: alpha's deletion beats beta's edit.",
     },
     ModeName {
         name: "one-way-conflict",
         also: &["one-way-safe"],
         mode: SyncMode::OneWaySafe,
         peering: false,
-        about: "Alpha to beta only. A file changed on beta is reported rather than                 overwritten.",
+        about: "Alpha to beta only. A file changed on beta is reported rather than overwritten.",
     },
     ModeName {
         name: "one-way-alpha",
@@ -1980,14 +1980,14 @@ pub const MODES: &[ModeName] = &[
         also: &[],
         mode: SyncMode::TwoWaySafe,
         peering: true,
-        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known                 security and collision issues: read docs/peering.md first.",
+        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/peering.md first.",
     },
     ModeName {
         name: "peering-alpha-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWayResolved,
         peering: true,
-        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known                 security and collision issues: read docs/peering.md first.",
+        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/peering.md first.",
     },
 ];
 
@@ -1998,12 +1998,12 @@ pub const RENAMED_MODES: &[(&str, &str, &str)] = &[
     (
         "peering-conflict-experimental",
         "peering-conflict-dangerously-experimental",
-        "peering has known security and collision issues. Read docs/peering.md before          enabling it",
+        "peering has known security and collision issues. Read docs/peering.md before enabling it",
     ),
     (
         "peering-alpha-experimental",
         "peering-alpha-dangerously-experimental",
-        "peering has known security and collision issues. Read docs/peering.md before          enabling it",
+        "peering has known security and collision issues. Read docs/peering.md before enabling it",
     ),
 ];
 
@@ -2047,12 +2047,12 @@ pub const SYMLINK_MODES: &[Word] = &[
     Word {
         word: "portable",
         also: &[],
-        about: "Links that stay inside the root are carried as links; anything else is                 refused rather than followed.",
+        about: "Links that stay inside the root are carried as links; anything else is refused rather than followed.",
     },
     Word {
         word: "raw",
         also: &["posix-raw"],
-        about: "Every link is carried exactly as written, including one that points                 outside the root.",
+        about: "Every link is carried exactly as written, including one that points outside the root.",
     },
 ];
 
@@ -2066,12 +2066,12 @@ pub const STAGING_MODES: &[Word] = &[
     Word {
         word: "beside-root",
         also: &[],
-        about: "Staged content lives next to the root, for a root on a different                 filesystem from the state.",
+        about: "Staged content lives next to the root, for a root on a different filesystem from the state.",
     },
     Word {
         word: "inside-root",
         also: &[],
-        about: "Staged content lives inside the root itself: the last resort, and it                 shows up in the tree while it is there.",
+        about: "Staged content lives inside the root itself: the last resort, and it shows up in the tree while it is there.",
     },
 ];
 
@@ -2085,7 +2085,7 @@ pub const DURABILITY: &[Word] = &[
     Word {
         word: "power",
         also: &[],
-        about: "Every record is flushed to the disk, so the journal survives the power                 going out. Slower.",
+        about: "Every record is flushed to the disk, so the journal survives the power going out. Slower.",
     },
 ];
 
@@ -2136,6 +2136,73 @@ pub fn parse_word<'a>(words: &'a [Word], what: &str, given: &str) -> Result<&'a 
         "unknown {what} '{given}' (expected one of: {})",
         expected.join(", ")
     ))
+}
+
+/// The order the keys of a section are worth reading in.
+///
+/// A schema is a map, so a form built straight from one is alphabetical,
+/// which puts `acknowledge_secrets` above `alpha` and `disabled` nowhere
+/// near the mode it qualifies. This is the reading order; anything not
+/// named here follows, alphabetically.
+pub const ORDER: &[&str] = &[
+    // The top of the file.
+    "reload",
+    "log",
+    "on_alert",
+    "disabled_hosts",
+    "power_saver_experimental",
+    // A group, and the defaults that stand behind one.
+    "alpha",
+    "betas",
+    "mode",
+    "disabled",
+    "interval",
+    "ignores",
+    "ignore_files",
+    "ignore_mounts",
+    "max_file_size",
+    "max_entry_count",
+    "symlink_mode",
+    "file_mode",
+    "directory_mode",
+    "default_owner",
+    "default_group",
+    "durability",
+    "staging",
+    "agent_command",
+    "acknowledge_secrets",
+    // The timings.
+    "alert_after",
+    "after",
+    "coalesce_after",
+    "settle_after",
+    "repeat_after",
+    "timeout",
+    "ttl",
+    "failover_after",
+    "allow_root",
+];
+
+/// Where a key sits in [`ORDER`], for a form to sort by.
+pub fn order_of(key: &str) -> usize {
+    ORDER
+        .iter()
+        .position(|known| *known == key)
+        .unwrap_or(ORDER.len())
+}
+
+/// The unit a number or a duration is written in, for a form to put
+/// beside the box rather than leave a person guessing.
+pub fn unit(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "interval" => "seconds",
+        "max_entry_count" => "entries",
+        "max_file_size" => "bytes, or 100MB · 2GiB",
+        "file_mode" | "directory_mode" => "octal, as 0644",
+        "ttl" | "timeout" => "30s · 5m · 2h",
+        key if key.ends_with("_after") => "30s · 5m · 2h",
+        _ => return None,
+    })
 }
 
 /// What a value is for, where the type alone does not say: a widget hint
@@ -2214,6 +2281,10 @@ fn annotate(node: &mut serde_json::Value) {
                 if let Some(widget) = widget(key) {
                     property.insert("x-widget".to_owned(), json!(widget));
                 }
+                if let Some(unit) = unit(key) {
+                    property.insert("x-unit".to_owned(), json!(unit));
+                }
+                property.insert("x-order".to_owned(), json!(order_of(key)));
             }
         }
         for (_, value) in map.iter_mut() {
@@ -2591,7 +2662,7 @@ mod tests {
         let is_mode = |word: &&str| word.contains("-way-") || word.starts_with("peering-");
         let named: Vec<&str> = TEMPLATE
             .lines()
-            .filter_map(|line| line.strip_prefix("#   "))
+            .filter_map(|line| line.strip_prefix("# "))
             .filter_map(|line| line.split_whitespace().next())
             .filter(is_mode)
             .collect();

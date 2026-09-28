@@ -567,9 +567,21 @@ def await_reconvergence(corpora, timeout_seconds=600):
 # ── samplers ─────────────────────────────────────────────────────────
 
 def stop_samplers():
+    """Stops every sampler, here and on every destination — the same set
+    `start_samplers` starts them on.
+
+    Stopping them on the first destination only, as this did from when
+    fan-out cells began starting them everywhere (d38f8fc), left every
+    earlier sampler running on the other nine: each kept writing into
+    the log the next one had just truncated, so a destination's series
+    became several samplers' rows interleaved, of other tool-runs and
+    other process patterns. Every fan-out cell's remote CPU and peak RSS
+    was meaningless (bench-1790564569: 10,337% of a core for an idle
+    autobahn), while pairwise cells, whose one destination is the first,
+    were unaffected."""
     # The bracket keeps the pattern from matching its own shell wrapper.
     run(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
-    peer(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
+    on_every_destination(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
 
 
 def start_samplers(tool):

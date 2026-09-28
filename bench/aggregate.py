@@ -95,6 +95,15 @@ def find_tainted(records, plan=None):
             # The offered load was not what the report claims; every
             # latency sample this tool-run produced is suspect.
             tainted.setdefault(key, "background_load_failure")
+        elif kind == "workload" and record.get("attempts") and not record.get("samples"):
+            # A whole window in which not one edit landed measured the
+            # harness, or a tool that had stopped, not latency. Counted as
+            # censored it became a p99 "over two minutes" in the headline:
+            # bench-1790564569 had seven such windows, all a harness fault
+            # (a narrow cell watching every destination of a fan-out
+            # group), and both tools alike. Left out here and listed with
+            # its reason, so a real stall is still in plain view.
+            tainted.setdefault(key, "nothing_landed")
         elif kind == "job_start":
             # A job that ran with more destinations than its cell asked
             # for was a different cell — a fan-out under a pairwise name.

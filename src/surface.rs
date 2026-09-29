@@ -299,14 +299,26 @@ pub(crate) const SILENT_AT_THE_TOP: &[&str] = &[
 /// renamed.
 pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-experimental", "peering-experimental"];
 
-/// Keys that belong to their section but almost nobody needs.
+/// Session keys nobody should meet before they have gone looking.
 ///
-/// `default_owner` and `default_group` matter in one case: an agent
-/// running as root, which refuses to start unless one of them is set
-/// (`root::check_agent`). Every other fleet — your files, your user —
-/// leaves them empty, so the form keeps them folded away rather than
-/// asking a question about ownership between `mode` and `interval`.
-pub(crate) const RARE: &[&str] = &["default_owner", "default_group"];
+/// They are not dangerous, they are a different kind of question. Two
+/// are about ownership and only mean anything to an agent running as
+/// root (`root::check_agent`). The rest are about how the machinery
+/// works rather than what it should do — where the journal is flushed,
+/// where staging lives, which binary the other end runs, and a promise
+/// that the credentials under a root were meant.
+///
+/// They are drawn at the foot of the section they belong to, under the
+/// same heading as `[experimental]`, and only for a window that has
+/// been let in. See `Desk::unlocked` in either window.
+pub(crate) const EXPERIMENTAL: &[&str] = &[
+    "durability",
+    "staging",
+    "agent_command",
+    "acknowledge_secrets",
+    "default_owner",
+    "default_group",
+];
 
 /// The tables one listed section draws, in the order it draws them.
 ///
@@ -814,21 +826,21 @@ mod tests {
         assert!(fresh.to_string().contains("[experimental]"), "{fresh}");
     }
 
-    /// A folded key is still a key: if one is renamed in the structs the
-    /// parser reads, the fold must not go on hiding a name nothing has.
+    /// A hidden key is still a key: if one is renamed in the structs the
+    /// parser reads, the list must not go on hiding a name nothing has —
+    /// the field would come back to the top of the form, in the middle
+    /// of the ordinary settings, and nobody would be told.
     #[test]
-    fn every_folded_key_is_a_key_the_file_really_has() {
+    fn every_hidden_key_is_a_key_the_file_really_has() {
         let shape = crate::config::schema();
-        for section in ["Defaults", "Group"] {
-            let properties = shape["$defs"][section]["properties"]
-                .as_object()
-                .unwrap_or_else(|| panic!("{section} has properties"));
-            for key in RARE {
-                assert!(
-                    properties.contains_key(*key),
-                    "{section} has no '{key}' to fold away"
-                );
-            }
+        // Every session key is a group key. Only some are also
+        // inheritable, which is why the group is the one that must
+        // have them all.
+        let group = shape["$defs"]["Group"]["properties"]
+            .as_object()
+            .expect("a group has properties");
+        for key in EXPERIMENTAL {
+            assert!(group.contains_key(*key), "a group has no '{key}' to hide");
         }
     }
 

@@ -150,8 +150,16 @@ pub struct Desk {
     section: Section,
     /// The field being edited, if any.
     editing: Option<Edit>,
-    /// The folds a person has opened, by name.
-    folds: std::collections::HashSet<&'static str>,
+    /// Whether this window is showing what it keeps back.
+    ///
+    /// Five clicks on the wordmark. Not a secret and not a password —
+    /// a door that does not open by leaning on it, for settings that
+    /// are a different kind of question rather than a dangerous one.
+    unlocked: bool,
+    /// Clicks so far, and when the last one landed: a run that stops
+    /// for a moment is somebody clicking about, not asking for this.
+    knocks: u8,
+    knocked_at: Option<Instant>,
     /// The shape of the file, from the structs the parser reads it into.
     shape: serde_json::Value,
     /// Where keys go, so a window that is being typed into hears them.
@@ -389,7 +397,9 @@ impl Desk {
             sheet: None,
             section: Section::Settings,
             editing: None,
-            folds: std::collections::HashSet::new(),
+            unlocked: false,
+            knocks: 0,
+            knocked_at: None,
             shape: crate::config::schema(),
             focus: cx.focus_handle(),
             log: Vec::new(),
@@ -490,6 +500,7 @@ impl Desk {
                     .gap(step(0.5))
                     .child(
                         div()
+                            .id("wordmark")
                             .flex()
                             .items_baseline()
                             .gap(step(1.5))
@@ -502,9 +513,16 @@ impl Desk {
                             .child(
                                 div()
                                     .text_size(px(T_ROW))
-                                    .text_color(rgb(FAINT))
+                                    .text_color(match self.unlocked {
+                                        true => rgb(BLUE),
+                                        false => rgb(FAINT),
+                                    })
                                     .child(t("app.surface")),
-                            ),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.knock();
+                                cx.notify();
+                            })),
                     )
                     .child(
                         div()
@@ -1611,29 +1629,53 @@ impl Desk {
     /// The fields of the open section, from the schema.
     ///
     /// A section is usually one table, and then this draws one run of
-    /// fields. `[advanced]` is three, so it draws three — the second
-    /// under a heading, the third behind a fold, and every field
-    /// carrying the table it belongs to rather than taking the pane's.
+    /// fields. `[experimental]` is three, so it draws three, each under
+    /// its own heading, and every field carries the table it belongs to
+    /// rather than taking the pane's.
+    ///
+    /// The experimental keys of an ordinary section come last, under a
+    /// heading of their own, and only once the window has been let in.
     fn form(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let parts = drawn_with(&self.section);
         let mut drawn = Vec::new();
         for (index, part) in parts.iter().enumerate() {
             if index > 0 {
-                match part {
-                    // Peering is spelled dangerously-experimental in the
-                    // file for a reason; it stays shut until asked for.
-                    Section::Peering => {
-                        drawn.push(self.fold("peering", t("config.peering_fold").to_owned(), cx));
-                        if !self.open("peering") {
-                            continue;
-                        }
-                    }
-                    other => drawn.push(self.heading(other.title())),
-                }
+                drawn.push(self.heading(part.title()));
             }
             drawn.extend(self.run(part, cx));
         }
+        if self.unlocked {
+            let kept = self.kept_back(cx);
+            if !kept.is_empty() {
+                drawn.push(self.heading(t("config.experimental").to_owned()));
+                drawn.extend(kept);
+            }
+        }
         drawn
+    }
+
+    /// The experimental keys of the open section, in the file's order.
+    ///
+    /// Drawn apart from the rest rather than filtered back in, so that
+    /// turning the key on does not shuffle the settings somebody was
+    /// already reading.
+    fn kept_back(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        // Only the two sections that hold session settings have any:
+        // the top of the file has no session keys, and reaching the
+        // experimental tables at all is already the door.
+        let shape = match &self.section {
+            Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
+            Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),
+            _ => None,
+        };
+        let Some(serde_json::Value::Object(properties)) = shape else {
+            return Vec::new();
+        };
+        properties
+            .iter()
+            .filter(|(key, _)| EXPERIMENTAL.contains(&key.as_str()))
+            .map(|(key, field)| self.field(&self.section, key, field, cx))
+            .collect()
     }
 
     /// A line naming the table the fields under it are written to.
@@ -1645,10 +1687,6 @@ impl Desk {
             .text_color(rgb(DIM))
             .child(title)
             .into_any_element()
-    }
-
-    fn open(&self, name: &str) -> bool {
-        self.folds.contains(name)
     }
 
     /// The fields of one table, in the order the file writes them.
@@ -1673,54 +1711,15 @@ impl Desk {
             Section::Advanced => SILENT_IN_ADVANCED,
             _ => &[],
         };
-        // The rare ones stay in the section they are written to — that
-        // is where the file wants them — but they go under a fold at the
-        // foot of it rather than in the middle of the ordinary keys.
-        let (plain, rare): (Vec<_>, Vec<_>) = properties
+        // The kept-back keys are written to this same table — that is
+        // where the file wants them — but the form draws them at the
+        // foot of the section, together, and only when it is let in.
+        properties
             .iter()
             .filter(|(key, _)| !silent.contains(&key.as_str()))
-            .partition(|(key, _)| !RARE.contains(&key.as_str()));
-        let mut drawn: Vec<AnyElement> = plain
-            .into_iter()
+            .filter(|(key, _)| !EXPERIMENTAL.contains(&key.as_str()))
             .map(|(key, field)| self.field(part, key, field, cx))
-            .collect();
-        if !rare.is_empty() {
-            drawn.push(self.fold("rare", counted("config.rare", rare.len(), &[]), cx));
-            if self.open("rare") {
-                drawn.extend(
-                    rare.into_iter()
-                        .map(|(key, field)| self.field(part, key, field, cx)),
-                );
-            }
-        }
-        drawn
-    }
-
-    /// The line that opens a fold, and says what is behind it.
-    fn fold(&self, name: &'static str, label: String, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.open(name);
-        div()
-            .id(SharedString::from(format!("fold-{name}")))
-            .pt(step(1.))
-            .flex()
-            .items_center()
-            .gap(step(1.5))
-            .cursor_pointer()
-            .text_size(px(T_META))
-            .text_color(rgb(DIM))
-            .hover(|row| row.text_color(rgb(INK)))
-            .child(match open {
-                true => "\u{25be}",
-                false => "\u{25b8}",
-            })
-            .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if !this.folds.remove(name) {
-                    this.folds.insert(name);
-                }
-                cx.notify();
-            }))
-            .into_any_element()
+            .collect()
     }
 
     /// One field: its name, what it holds now, and the control for it.
@@ -1732,11 +1731,27 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let about = field["description"].as_str().unwrap_or_default().to_owned();
+        let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
+        let held = self.held(part, key);
+        // A window that has not been let in is not offered the
+        // experimental words — unless the file already holds one, in
+        // which case hiding it would offer to change the setting to
+        // something else and call that the only choice.
+        let now = held
+            .as_ref()
+            .and_then(|item| item.as_str())
+            .unwrap_or_default()
+            .to_owned();
+        let unlocked = self.unlocked;
         let words: Vec<(String, String)> = field["x-words"]
             .as_array()
             .map(|words| {
                 words
                     .iter()
+                    .filter(|word| {
+                        let kept = word["experimental"].as_bool().unwrap_or(false);
+                        !kept || unlocked || word["word"].as_str() == Some(now.as_str())
+                    })
                     .map(|word| {
                         (
                             word["word"].as_str().unwrap_or_default().to_owned(),
@@ -1746,8 +1761,6 @@ impl Desk {
                     .collect()
             })
             .unwrap_or_default();
-        let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
-        let held = self.held(part, key);
         div()
             .flex()
             .gap(step(4.))
@@ -2516,10 +2529,51 @@ impl Desk {
     }
 
     fn sections(&self) -> Vec<Section> {
+        // The experimental tables are not listed at all until the
+        // window has been let in; nothing points at a door either.
+        let unlocked = self.unlocked;
         self.sheet
             .as_ref()
             .map(|sheet| sheet.sections())
             .unwrap_or_default()
+            .into_iter()
+            .filter(|section| unlocked || *section != Section::Advanced)
+            .collect()
+    }
+
+    /// One click on the wordmark. Five in a row open the door.
+    ///
+    /// In a row, and within a few seconds of each other: a person who
+    /// clicks the title twice today and three times tomorrow has not
+    /// asked for anything. Five more shut it again, so a window that
+    /// was opened to read one setting can be put back.
+    fn knock(&mut self) {
+        const RUN: Duration = Duration::from_secs(2);
+        const ENOUGH: u8 = 5;
+        let carried = self.knocked_at.is_some_and(|at| at.elapsed() < RUN);
+        self.knocks = match carried {
+            true => self.knocks + 1,
+            false => 1,
+        };
+        self.knocked_at = Some(Instant::now());
+        if self.knocks < ENOUGH {
+            return;
+        }
+        self.knocks = 0;
+        self.knocked_at = None;
+        self.unlocked = !self.unlocked;
+        // A section that is about to stop being listed must not stay
+        // open underneath the list.
+        if !self.unlocked && matches!(self.section, Section::Advanced) {
+            self.section = Section::Settings;
+        }
+        self.said = Some(
+            match self.unlocked {
+                true => t("status.unlocked"),
+                false => t("status.locked"),
+            }
+            .to_owned(),
+        );
     }
 
     fn pending(&self) -> usize {

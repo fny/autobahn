@@ -2171,12 +2171,15 @@ pub const ORDER: &[&str] = &[
     "symlink_mode",
     "file_mode",
     "directory_mode",
-    "default_owner",
-    "default_group",
+    // The experimental tail of a section, in the order a window that
+    // has been let in draws it: how the machinery works first, then
+    // the two that only mean anything to an agent running as root.
     "durability",
     "staging",
     "agent_command",
     "acknowledge_secrets",
+    "default_owner",
+    "default_group",
     // The timings.
     "alert_after",
     "after",
@@ -2256,15 +2259,23 @@ fn annotate(node: &mut serde_json::Value) {
     if let Value::Object(map) = node {
         if let Some(Value::Object(properties)) = map.get_mut("properties") {
             for (key, property) in properties.iter_mut() {
-                let words: Option<Vec<(&str, &str)>> = match key.as_str() {
+                // The third of each triple says the word is experimental:
+                // a peering mode is one, and a form that has not been
+                // let in does not offer it. The list is here rather than
+                // in the form because this is where the words are.
+                let words: Option<Vec<(&str, &str, bool)>> = match key.as_str() {
                     "mode" => Some(
                         MODES
                             .iter()
-                            .map(|row| (row.name, row.about))
+                            .map(|row| (row.name, row.about, row.peering))
                             .collect(),
                     ),
-                    key => vocabulary(key)
-                        .map(|words| words.iter().map(|word| (word.word, word.about)).collect()),
+                    key => vocabulary(key).map(|words| {
+                        words
+                            .iter()
+                            .map(|word| (word.word, word.about, false))
+                            .collect()
+                    }),
                 };
                 let Value::Object(property) = property else {
                     continue;
@@ -2272,14 +2283,16 @@ fn annotate(node: &mut serde_json::Value) {
                 if let Some(words) = words {
                     property.insert(
                         "enum".to_owned(),
-                        Value::Array(words.iter().map(|(word, _)| json!(word)).collect()),
+                        Value::Array(words.iter().map(|(word, _, _)| json!(word)).collect()),
                     );
                     property.insert(
                         "x-words".to_owned(),
                         Value::Array(
                             words
                                 .iter()
-                                .map(|(word, about)| json!({"word": word, "about": about}))
+                                .map(|(word, about, kept)| {
+                                    json!({"word": word, "about": about, "experimental": kept})
+                                })
                                 .collect(),
                         ),
                     );

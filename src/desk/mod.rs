@@ -150,6 +150,8 @@ pub struct Desk {
     section: Section,
     /// The field being edited, if any.
     editing: Option<Edit>,
+    /// Whether the rarely-needed keys at the foot of a section are open.
+    rare_open: bool,
     /// The shape of the file, from the structs the parser reads it into.
     shape: serde_json::Value,
     /// Where keys go, so a window that is being typed into hears them.
@@ -387,6 +389,7 @@ impl Desk {
             sheet: None,
             section: Section::Settings,
             editing: None,
+            rare_open: false,
             shape: crate::config::schema(),
             focus: cx.focus_handle(),
             log: Vec::new(),
@@ -1627,11 +1630,49 @@ impl Desk {
             Section::Advanced => SILENT_IN_ADVANCED,
             _ => &[],
         };
-        properties
+        // The rare ones stay in the section they are written to — that
+        // is where the file wants them — but they go under a fold at the
+        // foot of it rather than in the middle of the ordinary keys.
+        let (plain, rare): (Vec<_>, Vec<_>) = properties
             .iter()
             .filter(|(key, _)| !silent.contains(&key.as_str()))
+            .partition(|(key, _)| !RARE.contains(&key.as_str()));
+        let mut drawn: Vec<AnyElement> = plain
+            .into_iter()
             .map(|(key, field)| self.field(key, field, cx))
-            .collect()
+            .collect();
+        if !rare.is_empty() {
+            drawn.push(self.fold(rare.len(), cx));
+            if self.rare_open {
+                drawn.extend(rare.into_iter().map(|(key, field)| self.field(key, field, cx)));
+            }
+        }
+        drawn
+    }
+
+    /// The line that opens the rarely-needed keys, and says how many.
+    fn fold(&self, held: usize, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.rare_open;
+        div()
+            .id("rare")
+            .pt(step(1.))
+            .flex()
+            .items_center()
+            .gap(step(1.5))
+            .cursor_pointer()
+            .text_size(px(T_META))
+            .text_color(rgb(DIM))
+            .hover(|row| row.text_color(rgb(INK)))
+            .child(match open {
+                true => "\u{25be}",
+                false => "\u{25b8}",
+            })
+            .child(counted("config.rare", held, &[]))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.rare_open = !this.rare_open;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     /// One field: its name, what it holds now, and the control for it.

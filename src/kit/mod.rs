@@ -32,7 +32,7 @@ use gpui_kit::*;
 use crate::supervisor::{status_report, GroupReport, SessionReport, StatusReport};
 use crate::surface::{
     self, first_sentence, holds, tilde, Conflict, Holds, Section, Sheet, Side, Spot,
-    SILENT_AT_THE_TOP, SILENT_IN_ADVANCED,
+    RARE, SILENT_AT_THE_TOP, SILENT_IN_ADVANCED,
 };
 use crate::words::{count as counted, fill, t};
 
@@ -151,11 +151,20 @@ fn open_window(
 ) -> gpui_kit::WindowHandle<Root> {
     // A width can be asked for, which is how the narrow layouts are
     // looked at without a hand on the window's edge.
-    let wide = std::env::var("AUTOBAHN_DESK_WIDTH")
-        .ok()
-        .and_then(|width| width.parse::<f32>().ok())
-        .unwrap_or(1240.);
-    let bounds = Bounds::centered(None, size(px(wide), px(820.)), cx);
+    let asked = |name: &str, fallback: f32| {
+        std::env::var(name)
+            .ok()
+            .and_then(|size| size.parse::<f32>().ok())
+            .unwrap_or(fallback)
+    };
+    let bounds = Bounds::centered(
+        None,
+        size(
+            px(asked("AUTOBAHN_DESK_WIDTH", 1240.)),
+            px(asked("AUTOBAHN_DESK_HEIGHT", 820.)),
+        ),
+        cx,
+    );
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
@@ -345,6 +354,8 @@ pub struct Desk {
     fields: std::collections::HashMap<(Section, String), Entity<TextareaState>>,
     /// The same, for the fields that take one of a fixed set of words.
     choices: std::collections::HashMap<(Section, String), Entity<Choices>>,
+    /// Whether the rarely-needed keys at the foot of a section are open.
+    rare_open: bool,
     shape: serde_json::Value,
     said: Option<String>,
 }
@@ -457,6 +468,7 @@ impl Desk {
             section: Section::Settings,
             fields: std::collections::HashMap::new(),
             choices: std::collections::HashMap::new(),
+            rare_open: false,
             shape: crate::config::schema(),
             said: None,
         };
@@ -2307,10 +2319,57 @@ impl Desk {
                 (*key).clone(),
             )
         });
-        fields
+        // The rare ones stay in the section they are written to — that
+        // is where the file wants them — but they go under a fold at the
+        // foot of it rather than in the middle of the ordinary keys.
+        let (plain, rare): (Vec<_>, Vec<_>) = fields
+            .into_iter()
+            .partition(|(key, _)| !RARE.contains(&key.as_str()));
+        let mut drawn: Vec<AnyElement> = plain
             .into_iter()
             .map(|(key, field)| self.field(key, field, window, cx))
-            .collect::<Vec<_>>()
+            .collect();
+        if !rare.is_empty() {
+            drawn.push(self.fold(rare.len(), cx));
+            if self.rare_open {
+                drawn.extend(
+                    rare.into_iter()
+                        .map(|(key, field)| self.field(key, field, window, cx)),
+                );
+            }
+        }
+        drawn
+    }
+
+    /// The line that opens the rarely-needed keys, and says how many.
+    fn fold(&self, held: usize, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.rare_open;
+        div()
+            .id("rare")
+            .pt(step(1.))
+            .flex()
+            .items_center()
+            .gap(step(1.5))
+            .cursor_pointer()
+            .text_color(rgb(DIM))
+            .hover(|row| row.text_color(rgb(INK)))
+            .child(
+                Icon::new(match open {
+                    true => IconName::ChevronDown,
+                    false => IconName::ChevronRight,
+                })
+                .size_4(),
+            )
+            .child(
+                div()
+                    .text_size(px(11.5))
+                    .child(counted("config.rare", held, &[])),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.rare_open = !this.rare_open;
+                cx.notify();
+            }))
+            .into_any_element()
     }
 
     fn field(

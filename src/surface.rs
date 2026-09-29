@@ -298,6 +298,15 @@ pub(crate) const SILENT_AT_THE_TOP: &[&str] = &[
 /// renamed.
 pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-experimental", "peering-experimental"];
 
+/// Keys that belong to their section but almost nobody needs.
+///
+/// `default_owner` and `default_group` matter in one case: an agent
+/// running as root, which refuses to start unless one of them is set
+/// (`root::check_agent`). Every other fleet — your files, your user —
+/// leaves them empty, so the form keeps them folded away rather than
+/// asking a question about ownership between `mode` and `interval`.
+pub(crate) const RARE: &[&str] = &["default_owner", "default_group"];
+
 /// The table one section lives in, made if the file has not got it yet.
 pub(crate) fn table_for<'a>(
     document: &'a mut toml_edit::DocumentMut,
@@ -747,6 +756,24 @@ impl Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folded key is still a key: if one is renamed in the structs the
+    /// parser reads, the fold must not go on hiding a name nothing has.
+    #[test]
+    fn every_folded_key_is_a_key_the_file_really_has() {
+        let shape = crate::config::schema();
+        for section in ["Defaults", "Group"] {
+            let properties = shape["$defs"][section]["properties"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{section} has properties"));
+            for key in RARE {
+                assert!(
+                    properties.contains_key(*key),
+                    "{section} has no '{key}' to fold away"
+                );
+            }
+        }
+    }
 
     /// about the two.
     #[test]

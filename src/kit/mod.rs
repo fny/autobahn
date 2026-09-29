@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Editor, EditorState, InputHighlighter, Textarea, TextareaState,
+    Editor, EditorState, InputEvent, InputHighlighter, Textarea, TextareaState,
 };
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
@@ -40,6 +40,11 @@ use crate::words::{count as counted, fill, t};
 /// something is.
 const POLL_AT_REST: Duration = Duration::from_secs(2);
 const POLL_WHILE_WORKING: Duration = Duration::from_millis(500);
+
+/// How long after the last keystroke the loader is asked what it makes
+/// of the document. Long enough not to run mid-word, short enough that
+/// a mistake is pointed at while you are still looking at it.
+const SETTLE_AFTER: Duration = Duration::from_millis(400);
 
 /// The palette, as the other window has it.
 const GROUND: u32 = 0x10141a;
@@ -363,6 +368,13 @@ pub struct Desk {
     fields: std::collections::HashMap<(Section, String), Entity<TextareaState>>,
     /// The same, for the fields that take one of a fixed set of words.
     choices: std::collections::HashMap<(Section, String), Entity<Choices>>,
+    /// Which of those blocks hold a list rather than one value.
+    lists: std::collections::HashSet<(Section, String)>,
+    /// When the last keystroke landed, so the loader is asked once the
+    /// typing stops rather than on every letter.
+    typed_at: Option<Instant>,
+    /// The form's own scroll, so Save can put the refusal in view.
+    form: ScrollHandle,
     /// Whether this window is showing what it keeps back.
     ///
     /// Five clicks on the wordmark. Not a secret and not a password —
@@ -485,6 +497,9 @@ impl Desk {
             section: Section::Settings,
             fields: std::collections::HashMap::new(),
             choices: std::collections::HashMap::new(),
+            lists: std::collections::HashSet::new(),
+            typed_at: None,
+            form: ScrollHandle::new(),
             unlocked: false,
             knocks: 0,
             knocked_at: None,
@@ -504,6 +519,12 @@ impl Desk {
                     if this.refresh_if_due() || (this.log_tail && this.pane == Pane::Log) {
                         cx.notify();
                     }
+                    if this.quiet_for(SETTLE_AFTER) {
+                        this.typed_at = None;
+                        if this.sheet.as_mut().is_some_and(Sheet::settle) {
+                            cx.notify();
+                        }
+                    }
                 });
                 if carried.is_err() {
                     break;
@@ -515,6 +536,12 @@ impl Desk {
     }
 
     // ── the seam, which is the other window's ────────────────────────
+
+    /// Whether typing has stopped for this long. False when nothing has
+    /// been typed since the last time the loader caught up.
+    fn quiet_for(&self, pause: Duration) -> bool {
+        self.typed_at.is_some_and(|at| at.elapsed() >= pause)
+    }
 
     fn refresh_if_due(&mut self) -> bool {
         let due = match self.read_at {
@@ -2248,6 +2275,11 @@ impl Desk {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.take_the_fields(cx);
                                         this.save();
+                                        // Whatever the loader said is at
+                                        // the top of the form, which is
+                                        // not where a long section leaves
+                                        // you when you press Save.
+                                        this.form.set_offset(point(px(0.), px(0.)));
                                         cx.notify();
                                     })),
                             )
@@ -2266,6 +2298,7 @@ impl Desk {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.fields.clear();
                                         this.choices.clear();
+                                        this.lists.clear();
                                         this.sheet = None;
                                         this.read_sheet();
                                         cx.notify();
@@ -2313,6 +2346,7 @@ impl Desk {
             .child(
                 div()
                     .id("fields")
+                    .track_scroll(&self.form)
                     .flex_1()
                     .min_w(px(0.))
                     .h_full()
@@ -2443,10 +2477,10 @@ impl Desk {
     /// turning the key on does not shuffle the settings somebody was
     /// already reading.
     fn kept_back(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        // Only the two sections that hold session settings have any:
-        // the top of the file has no session keys, and reaching the
-        // experimental tables at all is already the door.
+        // The experimental tables themselves have none: reaching them
+        // at all is already the door.
         let shape = match &self.section {
+            Section::Settings => self.shape.get("properties").cloned(),
             Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
             Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),
             _ => None,
@@ -2480,9 +2514,19 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let about = field["description"].as_str().unwrap_or_default().to_owned();
-        let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
-        let unit = field["x-unit"].as_str().unwrap_or_default().to_owned();
+        // One line of subtext, not two. The unit says what a valid
+        // value looks like and the widget word says what kind of thing
+        // it is; where there is a unit it has already said both.
+        let hint = match field["x-unit"].as_str() {
+            Some(unit) => unit.to_owned(),
+            None => field["x-widget"].as_str().unwrap_or_default().to_owned(),
+        };
+        let fallback = field["x-default"].as_str().unwrap_or_default().to_owned();
         let held = self.held(part, key);
+        let touched = self
+            .sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.changed(part, key));
         // A window that has not been let in is not offered the
         // experimental words — unless the file already holds one, in
         // which case hiding it would offer to change the setting to
@@ -2525,28 +2569,27 @@ impl Desk {
                     .gap(px(2.))
                     .child(
                         div()
-                            .font_family(self.mono.clone())
-                            .text_size(px(12.5))
-                            .child(key.to_owned()),
+                            .flex()
+                            .items_center()
+                            .gap(step(1.5))
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(12.5))
+                                    // A key that differs from the file
+                                    // says so where the key is read,
+                                    // not only in a count at the top.
+                                    .when(touched, |name| name.text_color(rgb(AMBER)))
+                                    .child(key.to_owned()),
+                            )
+                            .when(touched, |row| row.child(dot(AMBER))),
                     )
-                    // "seconds" under "seconds" is one word too many: the
-                    // unit is the longer answer, so it is the one kept.
-                    .when(!widget.is_empty() && !unit.starts_with(&widget), |column| {
+                    .when(!hint.is_empty(), |column| {
                         column.child(
                             div()
                                 .text_size(px(10.5))
                                 .text_color(rgb(FAINT))
-                                .child(widget.clone()),
-                        )
-                    })
-                    // The unit belongs where the value is typed, not in
-                    // a sentence under it that nobody reads twice.
-                    .when(!unit.is_empty(), |column| {
-                        column.child(
-                            div()
-                                .text_size(px(10.5))
-                                .text_color(rgb(BLUE))
-                                .child(unit.clone()),
+                                .child(hint.clone()),
                         )
                     }),
             )
@@ -2557,7 +2600,7 @@ impl Desk {
                     .flex()
                     .flex_col()
                     .gap(step(1.5))
-                    .child(self.widget(part, key, field, &words, held, window, cx))
+                    .child(self.widget(part, key, field, &words, held, &fallback, window, cx))
                     .when(!about.is_empty(), |column| {
                         column.child(
                             div()
@@ -2578,6 +2621,7 @@ impl Desk {
         field: &serde_json::Value,
         words: &[(String, String)],
         held: Option<toml_edit::Item>,
+        fallback: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -2589,7 +2633,10 @@ impl Desk {
                 .unwrap_or_default()
                 .to_owned();
             let set = held.is_some();
-            let default = field["default"].as_str().unwrap_or_default().to_owned();
+            let default = match field["default"].as_str() {
+                Some(default) => default.to_owned(),
+                None => fallback.to_owned(),
+            };
             let list = self.choose(part, key, words, &now, window, cx);
             return div()
                 .flex()
@@ -2606,10 +2653,13 @@ impl Desk {
                             // width of the pane reads as a text field.
                             div().w(px(260.)).flex_shrink_0().child(
                                 Select::new(&list)
-                                    .menu_width(px(460.))
+                                    .menu_width(px(580.))
                                     .placeholder(match default.is_empty() {
                                         true => t("config.absent").to_owned(),
-                                        false => default.clone(),
+                                        false => fill(
+                                            "config.default_is",
+                                            &[("default", &default)],
+                                        ),
                                     }),
                             ),
                         )
@@ -2674,9 +2724,9 @@ impl Desk {
                                 .text_size(px(11.))
                                 .text_color(rgb(FAINT))
                                 .child(match default.as_bool() {
-                                    Some(true) => t("config.absent_on"),
-                                    Some(false) => t("config.absent_off"),
-                                    None => t("config.absent"),
+                                    Some(true) => t("config.absent_on").to_owned(),
+                                    Some(false) => t("config.absent_off").to_owned(),
+                                    None => t("config.absent").to_owned(),
                                 }),
                         )
                     })
@@ -2693,7 +2743,7 @@ impl Desk {
                             .collect()
                     })
                     .unwrap_or_default();
-                self.value(part, key, entries.join("\n"), true, window, cx)
+                self.value(part, key, entries.join("\n"), true, fallback, window, cx)
             }
             Holds::Line => {
                 let text = held
@@ -2704,7 +2754,7 @@ impl Desk {
                             .unwrap_or_else(|| item.to_string().trim().to_owned())
                     })
                     .unwrap_or_default();
-                self.value(part, key, text, false, window, cx)
+                self.value(part, key, text, false, fallback, window, cx)
             }
         }
     }
@@ -2780,9 +2830,12 @@ impl Desk {
         key: &str,
         text: String,
         list: bool,
+        fallback: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // "one to a line" is said once, under the key, by the hint the
+        // schema carries — not again under the box.
         let at = (part.clone(), key.to_owned());
         let block = match self.fields.get(&at) {
             Some(block) => block.clone(),
@@ -2795,14 +2848,35 @@ impl Desk {
                 // `rows`: a plain block takes whatever height the row it
                 // sits in happens to have, which is one line.
                 let shown = text.clone();
+                // An empty field that says only "not set" has not
+                // answered the question a person actually has, which is
+                // what happens if they leave it alone.
+                let empty = match fallback.is_empty() {
+                    true => t("config.not_set").to_owned(),
+                    false => fill("config.default_is", &[("default", fallback)]),
+                };
                 let block = cx.new(|cx| {
                     let block = TextareaState::new(window, cx);
                     let block = match list {
                         true => block.auto_grow(5, 5),
                         false => block,
                     };
-                    block.default_value(shown).placeholder(t("config.not_set"))
+                    block.default_value(shown).placeholder(empty)
                 });
+                if list {
+                    self.lists.insert(at.clone());
+                }
+                // Typing is a change like any other: the count at the
+                // top and the mark beside the key both follow it, and
+                // the loader catches up once the typing stops.
+                let typed = at.clone();
+                cx.subscribe(&block, move |this, _, event: &InputEvent, cx| {
+                    if matches!(event, InputEvent::Change) {
+                        this.take_one(&typed, cx);
+                        cx.notify();
+                    }
+                })
+                .detach();
                 self.fields.insert(at, block.clone());
                 block
             }
@@ -2816,14 +2890,6 @@ impl Desk {
                     .max_w(px(620.))
                     .child(Textarea::new(&block).bordered(true)),
             )
-            .when(list, |column| {
-                column.child(
-                    div()
-                        .text_size(px(10.5))
-                        .text_color(rgb(FAINT))
-                        .child(t("config.one_to_a_line")),
-                )
-            })
             .into_any_element()
     }
 
@@ -2834,50 +2900,65 @@ impl Desk {
     /// so, which is also what keeps the supervisor from being handed a
     /// path half-typed.
     fn take_the_fields(&mut self, cx: &mut Context<Self>) {
+        let every: Vec<(Section, String)> = self.fields.keys().cloned().collect();
+        for at in every {
+            self.take_one(&at, cx);
+        }
+    }
+
+    /// What one block holds, into the document — if it says something
+    /// the file does not already say.
+    fn take_one(&mut self, at: &(Section, String), cx: &mut Context<Self>) {
+        let Some(block) = self.fields.get(at).cloned() else {
+            return;
+        };
         let Some(sheet) = &self.sheet else { return };
-        let mut changes: Vec<(Spot, Option<toml_edit::Item>)> = Vec::new();
-        for ((section, key), block) in &self.fields {
-            let typed = block.read(cx).value().to_string();
-            let held = sheet.held(section, key);
-            let list = held
+        let (section, key) = at;
+        let typed = block.read(cx).value().to_string();
+        let held = sheet.held(section, key);
+        // Whether this is a list is the schema's answer, kept from when
+        // the block was built: a one-line list is still a list, and
+        // guessing from the text turns it into a string.
+        let list = self.lists.contains(at)
+            || held
                 .as_ref()
-                .map(|item| item.as_array().is_some())
-                .unwrap_or_else(|| typed.contains('\n'));
-            let value = match list {
-                true => {
-                    let mut array = toml_edit::Array::new();
-                    for line in typed.lines().map(str::trim).filter(|line| !line.is_empty()) {
-                        array.push(line);
-                    }
-                    match array.is_empty() {
-                        true => None,
-                        false => Some(toml_edit::value(array)),
-                    }
+                .is_some_and(|item| item.as_array().is_some());
+        let value = match list {
+            true => {
+                let mut array = toml_edit::Array::new();
+                for line in typed.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                    array.push(line);
                 }
-                false => match typed.trim() {
-                    "" => None,
-                    text => Some(surface::number_or_text(text)),
-                },
-            };
-            let same = match (&value, &held) {
-                (Some(value), Some(held)) => value.to_string() == held.to_string(),
-                (None, None) => true,
-                _ => false,
-            };
-            if !same {
-                changes.push((
-                    Spot {
-                        section: section.clone(),
-                        key: key.to_string(),
-                        item: None,
-                    },
-                    value,
-                ));
+                match array.is_empty() {
+                    true => None,
+                    false => Some(toml_edit::value(array)),
+                }
+            }
+            false => match typed.trim() {
+                "" => None,
+                text => Some(surface::number_or_text(text)),
+            },
+        };
+        let same = match (&value, &held) {
+            (Some(value), Some(held)) => value.to_string() == held.to_string(),
+            (None, None) => true,
+            _ => false,
+        };
+        if same {
+            return;
+        }
+        let at = Spot {
+            section: section.clone(),
+            key: key.to_string(),
+            item: None,
+        };
+        // Quietly: the loader is too slow to run on every keystroke.
+        if let Some(sheet) = &mut self.sheet {
+            if let Some(said) = sheet.later(&at, value) {
+                self.said = Some(said);
             }
         }
-        for (at, value) in changes {
-            self.put(&at, value);
-        }
+        self.typed_at = Some(Instant::now());
     }
 
     // ── what the window does to the fleet ────────────────────────────

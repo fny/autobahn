@@ -2162,22 +2162,22 @@ pub const ORDER: &[&str] = &[
     "betas",
     "mode",
     "disabled",
-    "interval",
     "ignores",
     "ignore_files",
     "ignore_mounts",
     "max_file_size",
     "max_entry_count",
     "symlink_mode",
-    "file_mode",
-    "directory_mode",
     // The experimental tail of a section, in the order a window that
-    // has been let in draws it: how the machinery works first, then
-    // the two that only mean anything to an agent running as root.
+    // has been let in draws it: the cycle, then how the machinery
+    // works, then how created entries land and who owns them.
+    "interval",
     "durability",
     "staging",
     "agent_command",
     "acknowledge_secrets",
+    "file_mode",
+    "directory_mode",
     "default_owner",
     "default_group",
     // The timings.
@@ -2204,12 +2204,45 @@ pub fn order_of(key: &str) -> usize {
 /// beside the box rather than leave a person guessing.
 pub fn unit(key: &str) -> Option<&'static str> {
     Some(match key {
-        "interval" => "seconds",
-        "max_entry_count" => "entries",
-        "max_file_size" => "bytes, or 100MB · 2GiB",
-        "file_mode" | "directory_mode" => "octal, as 0644",
-        "ttl" | "timeout" => "30s · 5m · 2h",
-        key if key.ends_with("_after") => "30s · 5m · 2h",
+        "interval" => "whole seconds",
+        "max_entry_count" => "a whole number of entries",
+        "max_file_size" => "bytes, or a size: 100MB · 2GiB · 500K",
+        "file_mode" | "directory_mode" => "octal permissions: 0600 · 0644 · 0755",
+        "ttl" | "timeout" => "a length of time: 30s · 5m · 2h",
+        key if key.ends_with("_after") => "a length of time: 30s · 5m · 2h",
+        "alpha" => "a path, or user@host:path",
+        "betas" | "disabled_hosts" | "ignores" | "ignore_files" => "one to a line",
+        "on_alert" | "agent_command" => "a shell command",
+        _ => return None,
+    })
+}
+
+/// What a key means when the file does not say, where that answer is a
+/// constant in this program rather than something the schema carries.
+///
+/// A form that says "not set" and stops has told a person nothing: the
+/// question they have is what happens then. Everything here is the very
+/// constant the code falls back to, named beside it so the two cannot
+/// drift without this table looking wrong.
+pub fn fallback(key: &str) -> Option<String> {
+    Some(match key {
+        "interval" => DEFAULT_INTERVAL_SECONDS.to_string(),
+        // `endpoint::local`, which is where created entries get their bits.
+        "file_mode" => "0600".to_owned(),
+        "directory_mode" => "0700".to_owned(),
+        "symlink_mode" => "raw".to_owned(),
+        "durability" => "process".to_owned(),
+        "staging" => "state".to_owned(),
+        // `mode` has no fallback on purpose: a group without one, and
+        // with no default behind it, is refused rather than guessed at.
+        "max_file_size" | "max_entry_count" => "no limit".to_owned(),
+        "alert_after" => format!("{}s", DEFAULT_ALERT_AFTER.as_secs()),
+        "coalesce_after" => format!("{}s", DEFAULT_COALESCE_AFTER.as_secs()),
+        "settle_after" => format!("{}m", DEFAULT_SETTLE_AFTER.as_secs() / 60),
+        "timeout" => format!("{}s", DEFAULT_ALERT_TIMEOUT.as_secs()),
+        "repeat_after" => "never".to_owned(),
+        "ttl" => format!("{}s", DEFAULT_PEERING_TTL.as_secs()),
+        "failover_after" => format!("{}s", DEFAULT_PEERING_FAILOVER_AFTER.as_secs()),
         _ => return None,
     })
 }
@@ -2302,6 +2335,9 @@ fn annotate(node: &mut serde_json::Value) {
                 }
                 if let Some(unit) = unit(key) {
                     property.insert("x-unit".to_owned(), json!(unit));
+                }
+                if let Some(fallback) = fallback(key) {
+                    property.insert("x-default".to_owned(), json!(fallback));
                 }
                 property.insert("x-order".to_owned(), json!(order_of(key)));
             }

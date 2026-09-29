@@ -1460,7 +1460,7 @@ impl Desk {
         };
         let path = sheet.path.clone();
         let refused = sheet.refused.clone();
-        let pending = sheet.edits;
+        let pending = sheet.pending();
         let sections = self.sections();
         let open = self.section.clone();
         div()
@@ -1731,8 +1731,18 @@ impl Desk {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let about = field["description"].as_str().unwrap_or_default().to_owned();
-        let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
+        // One line of subtext, not two. The unit says what a valid
+        // value looks like and the widget word says what kind of thing
+        // it is; where there is a unit it has already said both.
+        let hint = match field["x-unit"].as_str() {
+            Some(unit) => unit.to_owned(),
+            None => field["x-widget"].as_str().unwrap_or_default().to_owned(),
+        };
         let held = self.held(part, key);
+        let touched = self
+            .sheet
+            .as_ref()
+            .is_some_and(|sheet| sheet.changed(part, key));
         // A window that has not been let in is not offered the
         // experimental words — unless the file already holds one, in
         // which case hiding it would offer to change the setting to
@@ -1774,17 +1784,30 @@ impl Desk {
                     .gap(px(2.))
                     .child(
                         div()
-                            .font_family(self.mono.clone())
-                            .text_size(px(T_ROW))
-                            .text_color(rgb(INK))
-                            .child(key.to_owned()),
+                            .flex()
+                            .items_center()
+                            .gap(step(1.5))
+                            .child(
+                                div()
+                                    .font_family(self.mono.clone())
+                                    .text_size(px(T_ROW))
+                                    // A key that differs from the file
+                                    // says so where the key is read,
+                                    // not only in a count at the top.
+                                    .text_color(match touched {
+                                        true => rgb(AMBER),
+                                        false => rgb(INK),
+                                    })
+                                    .child(key.to_owned()),
+                            )
+                            .when(touched, |row| row.child(dot(AMBER))),
                     )
-                    .when(!widget.is_empty(), |column| {
+                    .when(!hint.is_empty(), |column| {
                         column.child(
                             div()
                                 .text_size(px(T_PILL))
                                 .text_color(rgb(FAINT))
-                                .child(widget.clone()),
+                                .child(hint.clone()),
                         )
                     }),
             )

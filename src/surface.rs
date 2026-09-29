@@ -75,12 +75,20 @@ pub(crate) struct Sheet {
     /// Nothing is written while this is set — the loader is the referee,
     /// not the form.
     pub(crate) refused: Option<String>,
-    /// How many changes have been made since the file was last read or
-    /// written. An edit is held here, not written as it is made: the
-    /// supervisor re-reads the file two seconds after it changes, and a
-    /// form that wrote every click would hand it half-finished
-    /// configurations to start sessions from.
-    pub(crate) edits: usize,
+    /// The file as it was read, parsed. Every "has this changed" question
+    /// is answered against this, never against a count of how many times
+    /// somebody touched a control: setting a value back to what it was is
+    /// not a change, and a form that says it is asks to be ignored.
+    ///
+    /// An edit is held here, not written as it is made: the supervisor
+    /// re-reads the file two seconds after it changes, and a form that
+    /// wrote every keystroke would hand it half-finished configurations
+    /// to start sessions from.
+    pub(crate) was: toml_edit::DocumentMut,
+    /// Whether the loader has been asked about the document as it now
+    /// stands, and whether the next edit should skip asking.
+    stale: bool,
+    quiet: bool,
 }
 
 /// Where one value lives in the file.
@@ -312,10 +320,14 @@ pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-
 /// same heading as `[experimental]`, and only for a window that has
 /// been let in. See `Desk::unlocked` in either window.
 pub(crate) const EXPERIMENTAL: &[&str] = &[
+    "power_saver_experimental",
+    "interval",
     "durability",
     "staging",
     "agent_command",
     "acknowledge_secrets",
+    "file_mode",
+    "directory_mode",
     "default_owner",
     "default_group",
 ];
@@ -385,6 +397,82 @@ fn experimental<'a>(
         .entry(name)
         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
+}
+
+/// What one document holds for a key of a section.
+fn in_document(
+    document: &toml_edit::DocumentMut,
+    section: &Section,
+    key: &str,
+) -> Option<toml_edit::Item> {
+    // Read from whichever spelling the file has, as the parser does.
+    let tuning = || {
+        document
+            .get("experimental")
+            .or_else(|| document.get("advanced"))
+    };
+    let table: &toml_edit::Item = match section {
+        Section::Settings => document.as_item(),
+        Section::Defaults => document.get("defaults")?,
+        Section::Advanced => tuning()?,
+        Section::Alerts => tuning()?.get("alerts")?,
+        Section::Peering => tuning()?.get("peering-dangerously-experimental")?,
+        Section::Group(name) => document.get("groups")?.get(name)?,
+    };
+    table.get(key).cloned()
+}
+
+/// One value, written the same way however it was spaced in the file.
+///
+/// Comparing two values by their text compares their whitespace with
+/// them: `["a", "b"]` and `["a","b"]` say the same thing, and a form
+/// that rebuilt a list from a text block would otherwise report every
+/// list it touched as changed.
+fn plain(item: &toml_edit::Item) -> String {
+    fn written(held: &toml_edit::Value) -> String {
+        match held {
+            toml_edit::Value::Array(array) => {
+                let inside: Vec<String> = array.iter().map(written).collect();
+                format!("[{}]", inside.join(", "))
+            }
+            toml_edit::Value::InlineTable(table) => {
+                let mut inside: Vec<String> = table
+                    .iter()
+                    .map(|(key, held)| format!("{key} = {}", written(held)))
+                    .collect();
+                inside.sort();
+                format!("{{{}}}", inside.join(", "))
+            }
+            leaf => leaf.to_string().trim().to_owned(),
+        }
+    }
+    match item {
+        toml_edit::Item::Value(held) => written(held),
+        // A table is never compared as a leaf: `differ` walks into it.
+        other => other.to_string(),
+    }
+}
+
+/// Counts the leaf values that differ between two documents.
+fn differ(was: &toml_edit::Table, now: &toml_edit::Table, changes: &mut usize) {
+    for (key, held) in was.iter() {
+        match now.get(key) {
+            None => *changes += 1,
+            Some(mine) => match (held.as_table(), mine.as_table()) {
+                (Some(was), Some(now)) => differ(was, now, changes),
+                _ => {
+                    if plain(held) != plain(mine) {
+                        *changes += 1;
+                    }
+                }
+            },
+        }
+    }
+    for (key, _) in now.iter() {
+        if was.get(key).is_none() {
+            *changes += 1;
+        }
+    }
 }
 
 /// A value written back into the file: a number where the text is one,
@@ -638,31 +726,17 @@ impl Sheet {
         Ok(Sheet {
             path,
             text,
+            was: document.clone(),
             document,
             refused: None,
-            edits: 0,
+            stale: false,
+            quiet: false,
         })
     }
 
     /// What the file holds for a key of a section.
     pub(crate) fn held(&self, section: &Section, key: &str) -> Option<toml_edit::Item> {
-        let sheet = self;
-        // Read from whichever spelling the file has, as the parser does.
-        let tuning = || {
-            sheet
-                .document
-                .get("experimental")
-                .or_else(|| sheet.document.get("advanced"))
-        };
-        let table: &toml_edit::Item = match section {
-            Section::Settings => sheet.document.as_item(),
-            Section::Defaults => sheet.document.get("defaults")?,
-            Section::Advanced => tuning()?,
-            Section::Alerts => tuning()?.get("alerts")?,
-            Section::Peering => tuning()?.get("peering-dangerously-experimental")?,
-            Section::Group(name) => sheet.document.get("groups")?.get(name)?,
-        };
-        table.get(key).cloned()
+        in_document(&self.document, section, key)
     }
 
     /// The sections of the file, in the order they are written.
@@ -739,14 +813,66 @@ impl Sheet {
     /// Takes a changed document as the one being edited, and asks the
     /// loader what it thinks of it. Nothing is written here.
     fn hold(&mut self, document: toml_edit::DocumentMut) {
-        self.refused = refusal(&self.path, &document.to_string());
         self.document = document;
-        self.edits += 1;
+        match self.quiet {
+            true => self.stale = true,
+            false => self.ask(),
+        }
     }
 
-    /// How many changes are waiting to be written.
+    /// Ask the loader what it makes of the document as it stands.
+    ///
+    /// This is the real thing — `reload::load_bytes`, the very call the
+    /// supervisor makes — and it plans every session in the file, which
+    /// on a fleet this size is tens of milliseconds. Fine for a click.
+    /// Not fine for a keystroke, which is what [`Sheet::later`] is for.
+    fn ask(&mut self) {
+        self.refused = refusal(&self.path, &self.document.to_string());
+        self.stale = false;
+    }
+
+    /// Take a changed document without asking the loader yet.
+    ///
+    /// Typing is a stream of changes and the loader is too slow to run
+    /// on each one. The document is updated — so the count of what is
+    /// pending stays honest as you type — and the verdict is marked
+    /// stale for [`Sheet::settle`] to catch up on once the typing stops.
+    pub(crate) fn later(&mut self, at: &Spot, value: Option<toml_edit::Item>) -> Option<String> {
+        let quietly = std::mem::replace(&mut self.quiet, true);
+        let said = self.put(at, value);
+        self.quiet = quietly;
+        said
+    }
+
+    /// Catch up on a verdict that typing left behind. True if it moved.
+    pub(crate) fn settle(&mut self) -> bool {
+        if !self.stale {
+            return false;
+        }
+        self.ask();
+        true
+    }
+
+    /// How many values differ from the file on disk.
+    ///
+    /// Counted, not tallied: a value put back to what it was stops
+    /// counting, which is the whole reason this walks two documents
+    /// rather than adding one per edit.
     pub(crate) fn pending(&self) -> usize {
-        self.edits
+        let mut changes = 0;
+        differ(self.was.as_table(), self.document.as_table(), &mut changes);
+        changes
+    }
+
+    /// Whether one value differs from the file on disk.
+    pub(crate) fn changed(&self, section: &Section, key: &str) -> bool {
+        let was = in_document(&self.was, section, key);
+        let now = in_document(&self.document, section, key);
+        match (was, now) {
+            (None, None) => false,
+            (Some(was), Some(now)) => plain(&was) != plain(&now),
+            _ => true,
+        }
     }
 
     /// What the loader says about the document as it stands.
@@ -758,9 +884,12 @@ impl Sheet {
     /// else has touched the file since it was read.
     pub(crate) fn save(&mut self) -> Option<String> {
         let sheet = self;
-        if sheet.edits == 0 {
+        if sheet.pending() == 0 {
             return None;
         }
+        // Typing may have outrun the loader. Ask before writing: the
+        // gate is the whole point, and a stale yes is not one.
+        sheet.settle();
         if let Some(refused) = &sheet.refused {
             return Some(fill(
                 "config.not_saved",
@@ -779,9 +908,9 @@ impl Sheet {
         let text = sheet.document.to_string();
         match std::fs::write(&sheet.path, &text) {
             Ok(()) => {
-                let edits = sheet.edits;
+                let edits = sheet.pending();
                 sheet.text = text;
-                sheet.edits = 0;
+                sheet.was = sheet.document.clone();
                 sheet.refused = None;
                 let path = sheet.path.clone();
                 let path = tilde(&path.display().to_string());
@@ -833,14 +962,21 @@ mod tests {
     #[test]
     fn every_hidden_key_is_a_key_the_file_really_has() {
         let shape = crate::config::schema();
-        // Every session key is a group key. Only some are also
-        // inheritable, which is why the group is the one that must
-        // have them all.
-        let group = shape["$defs"]["Group"]["properties"]
-            .as_object()
-            .expect("a group has properties");
+        // A key belongs to the top of the file, to a group, or to both
+        // — but it must belong somewhere, or the list is hiding a name
+        // nothing has and the field would quietly come back.
+        let places = [
+            shape["properties"].as_object(),
+            shape["$defs"]["Group"]["properties"].as_object(),
+        ];
         for key in EXPERIMENTAL {
-            assert!(group.contains_key(*key), "a group has no '{key}' to hide");
+            assert!(
+                places
+                    .iter()
+                    .flatten()
+                    .any(|properties| properties.contains_key(*key)),
+                "nothing in the file has a '{key}' to hide"
+            );
         }
     }
 
@@ -980,3 +1116,4 @@ mod tests {
         assert!(Severity::Bad > Severity::Attention && Severity::Attention > Severity::Fine);
     }
 }
+

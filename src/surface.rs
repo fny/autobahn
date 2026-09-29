@@ -307,6 +307,20 @@ pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-
 /// asking a question about ownership between `mode` and `interval`.
 pub(crate) const RARE: &[&str] = &["default_owner", "default_group"];
 
+/// The tables one listed section draws, in the order it draws them.
+///
+/// Every section but `[advanced]` draws itself alone. Advanced held a
+/// single key, and its two timing tables were listed beside it as
+/// sections of their own — three places to look for one idea. They are
+/// drawn together now; each field is still written to its own table,
+/// which is what the `Section` beside it is for.
+pub(crate) fn drawn_with(section: &Section) -> Vec<Section> {
+    match section {
+        Section::Advanced => vec![Section::Advanced, Section::Alerts, Section::Peering],
+        alone => vec![alone.clone()],
+    }
+}
+
 /// The table one section lives in, made if the file has not got it yet.
 pub(crate) fn table_for<'a>(
     document: &'a mut toml_edit::DocumentMut,
@@ -622,13 +636,9 @@ impl Sheet {
 
     /// The sections of the file, in the order they are written.
     pub(crate) fn sections(&self) -> Vec<Section> {
-        let mut sections = vec![
-            Section::Settings,
-            Section::Defaults,
-            Section::Advanced,
-            Section::Alerts,
-            Section::Peering,
-        ];
+        // Alerts and peering are not listed: they are drawn inside
+        // `[advanced]`, which is the only place anyone looks for them.
+        let mut sections = vec![Section::Settings, Section::Defaults, Section::Advanced];
         if let Some(groups) = self.document.get("groups").and_then(|item| item.as_table()) {
             for (name, _) in groups.iter() {
                 sections.push(Section::Group(name.to_owned()));

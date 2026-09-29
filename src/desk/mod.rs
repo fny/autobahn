@@ -150,8 +150,8 @@ pub struct Desk {
     section: Section,
     /// The field being edited, if any.
     editing: Option<Edit>,
-    /// Whether the rarely-needed keys at the foot of a section are open.
-    rare_open: bool,
+    /// The folds a person has opened, by name.
+    folds: std::collections::HashSet<&'static str>,
     /// The shape of the file, from the structs the parser reads it into.
     shape: serde_json::Value,
     /// Where keys go, so a window that is being typed into hears them.
@@ -389,7 +389,7 @@ impl Desk {
             sheet: None,
             section: Section::Settings,
             editing: None,
-            rare_open: false,
+            folds: std::collections::HashSet::new(),
             shape: crate::config::schema(),
             focus: cx.focus_handle(),
             log: Vec::new(),
@@ -1609,8 +1609,51 @@ impl Desk {
 
 
     /// The fields of the open section, from the schema.
+    ///
+    /// A section is usually one table, and then this draws one run of
+    /// fields. `[advanced]` is three, so it draws three — the second
+    /// under a heading, the third behind a fold, and every field
+    /// carrying the table it belongs to rather than taking the pane's.
     fn form(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let properties = match &self.section {
+        let parts = drawn_with(&self.section);
+        let mut drawn = Vec::new();
+        for (index, part) in parts.iter().enumerate() {
+            if index > 0 {
+                match part {
+                    // Peering is spelled dangerously-experimental in the
+                    // file for a reason; it stays shut until asked for.
+                    Section::Peering => {
+                        drawn.push(self.fold("peering", t("config.peering_fold").to_owned(), cx));
+                        if !self.open("peering") {
+                            continue;
+                        }
+                    }
+                    other => drawn.push(self.heading(other.title())),
+                }
+            }
+            drawn.extend(self.run(part, cx));
+        }
+        drawn
+    }
+
+    /// A line naming the table the fields under it are written to.
+    fn heading(&self, title: String) -> AnyElement {
+        div()
+            .pt(step(3.))
+            .font_family(self.mono.clone())
+            .text_size(px(T_META))
+            .text_color(rgb(DIM))
+            .child(title)
+            .into_any_element()
+    }
+
+    fn open(&self, name: &str) -> bool {
+        self.folds.contains(name)
+    }
+
+    /// The fields of one table, in the order the file writes them.
+    fn run(&self, part: &Section, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let properties = match part {
             Section::Settings => self.shape.get("properties").cloned(),
             Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
             Section::Advanced => self.shape["$defs"]["Advanced"].get("properties").cloned(),
@@ -1625,7 +1668,7 @@ impl Desk {
         let Some(serde_json::Value::Object(properties)) = properties else {
             return vec![empty(t("config.no_shape"))];
         };
-        let silent: &[&str] = match self.section {
+        let silent: &[&str] = match part {
             Section::Settings => SILENT_AT_THE_TOP,
             Section::Advanced => SILENT_IN_ADVANCED,
             _ => &[],
@@ -1639,22 +1682,25 @@ impl Desk {
             .partition(|(key, _)| !RARE.contains(&key.as_str()));
         let mut drawn: Vec<AnyElement> = plain
             .into_iter()
-            .map(|(key, field)| self.field(key, field, cx))
+            .map(|(key, field)| self.field(part, key, field, cx))
             .collect();
         if !rare.is_empty() {
-            drawn.push(self.fold(rare.len(), cx));
-            if self.rare_open {
-                drawn.extend(rare.into_iter().map(|(key, field)| self.field(key, field, cx)));
+            drawn.push(self.fold("rare", counted("config.rare", rare.len(), &[]), cx));
+            if self.open("rare") {
+                drawn.extend(
+                    rare.into_iter()
+                        .map(|(key, field)| self.field(part, key, field, cx)),
+                );
             }
         }
         drawn
     }
 
-    /// The line that opens the rarely-needed keys, and says how many.
-    fn fold(&self, held: usize, cx: &mut Context<Self>) -> AnyElement {
-        let open = self.rare_open;
+    /// The line that opens a fold, and says what is behind it.
+    fn fold(&self, name: &'static str, label: String, cx: &mut Context<Self>) -> AnyElement {
+        let open = self.open(name);
         div()
-            .id("rare")
+            .id(SharedString::from(format!("fold-{name}")))
             .pt(step(1.))
             .flex()
             .items_center()
@@ -1667,16 +1713,24 @@ impl Desk {
                 true => "\u{25be}",
                 false => "\u{25b8}",
             })
-            .child(counted("config.rare", held, &[]))
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.rare_open = !this.rare_open;
+            .child(label)
+            .on_click(cx.listener(move |this, _, _, cx| {
+                if !this.folds.remove(name) {
+                    this.folds.insert(name);
+                }
                 cx.notify();
             }))
             .into_any_element()
     }
 
     /// One field: its name, what it holds now, and the control for it.
-    fn field(&self, key: &str, field: &serde_json::Value, cx: &mut Context<Self>) -> AnyElement {
+    fn field(
+        &self,
+        part: &Section,
+        key: &str,
+        field: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let about = field["description"].as_str().unwrap_or_default().to_owned();
         let words: Vec<(String, String)> = field["x-words"]
             .as_array()
@@ -1693,7 +1747,7 @@ impl Desk {
             })
             .unwrap_or_default();
         let widget = field["x-widget"].as_str().unwrap_or_default().to_owned();
-        let held = self.held(key);
+        let held = self.held(part, key);
         div()
             .flex()
             .gap(step(4.))
@@ -1728,7 +1782,7 @@ impl Desk {
                     .flex()
                     .flex_col()
                     .gap(step(1.5))
-                    .child(self.widget(key, field, &words, held, cx))
+                    .child(self.widget(part, key, field, &words, held, cx))
                     .when(!about.is_empty(), |column| {
                         column.child(
                             div()
@@ -1746,13 +1800,14 @@ impl Desk {
     /// or a line of text.
     fn widget(
         &self,
+        part: &Section,
         key: &str,
         field: &serde_json::Value,
         words: &[(String, String)],
         held: Option<toml_edit::Item>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let section = self.section.clone();
+        let section = part.clone();
         if !words.is_empty() {
             let now = held
                 .as_ref()
@@ -1841,7 +1896,7 @@ impl Desk {
                     .flex()
                     .items_center()
                     .gap(step(2.5))
-                    .child(self.switch(key, now, cx))
+                    .child(self.switch(part, key, now, cx))
                     .when(!set, |row| {
                         row.child(
                             div()
@@ -1867,7 +1922,7 @@ impl Desk {
                             .collect()
                     })
                     .unwrap_or_default();
-                self.list(key, entries, cx)
+                self.list(part, key, entries, cx)
             }
             Holds::Line => {
                 let text = held.as_ref().map(|item| {
@@ -1875,13 +1930,13 @@ impl Desk {
                         .map(str::to_owned)
                         .unwrap_or_else(|| item.to_string().trim().to_owned())
                 });
-                self.line(key, None, text, cx)
+                self.line(part, key, None, text, cx)
             }
         }
     }
 
-    fn switch(&self, key: &str, on: bool, cx: &mut Context<Self>) -> AnyElement {
-        let section = self.section.clone();
+    fn switch(&self, part: &Section, key: &str, on: bool, cx: &mut Context<Self>) -> AnyElement {
+        let section = part.clone();
         let key = key.to_owned();
         toggle_switch(SharedString::from(format!("switch-{key}")), on)
             .tooltip(match on {
@@ -1907,9 +1962,15 @@ impl Desk {
     /// Twenty ignore patterns are twenty lines, not twenty little boxes
     /// with a cross beside each. Reading them, pasting a few in, taking
     /// one out — all of that is what a block of text is for.
-    fn list(&self, key: &str, entries: Vec<String>, cx: &mut Context<Self>) -> AnyElement {
+    fn list(
+        &self,
+        part: &Section,
+        key: &str,
+        entries: Vec<String>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let spot = Spot {
-            section: self.section.clone(),
+            section: part.clone(),
             key: key.to_owned(),
             item: None,
         };
@@ -2016,13 +2077,14 @@ impl Desk {
     /// One value of text: what it holds, or the block editing it.
     fn line(
         &self,
+        part: &Section,
         key: &str,
         item: Option<usize>,
         held: Option<String>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let spot = Spot {
-            section: self.section.clone(),
+            section: part.clone(),
             key: key.to_owned(),
             item,
         };
@@ -2031,10 +2093,7 @@ impl Desk {
         }
         let start = held.clone().unwrap_or_default();
         div()
-            .id(SharedString::from(format!(
-                "line-{}-{key}",
-                self.section.title()
-            )))
+            .id(SharedString::from(format!("line-{}-{key}", part.title())))
             .h(step(7.))
             .px(step(2.))
             .min_w(px(280.))
@@ -2452,8 +2511,8 @@ impl Desk {
         }
     }
 
-    fn held(&self, key: &str) -> Option<toml_edit::Item> {
-        self.sheet.as_ref()?.held(&self.section, key)
+    fn held(&self, part: &Section, key: &str) -> Option<toml_edit::Item> {
+        self.sheet.as_ref()?.held(part, key)
     }
 
     fn sections(&self) -> Vec<Section> {

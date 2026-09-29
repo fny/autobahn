@@ -135,9 +135,10 @@ reverted = "went back to the file on disk"
 missing_section = "{section} is not in the file"
 settings = "settings"
 defaults = "defaults"
-advanced = "advanced"
-advanced_alerts = "advanced · alerts"
-advanced_peering = "advanced · peering"
+advanced = "experimental"
+advanced_alerts = "alerts"
+advanced_peering = "peering"
+peering_fold = "peering · dangerously experimental"
 
 [status]
 copied = "copied: {text}"

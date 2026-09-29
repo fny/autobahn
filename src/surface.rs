@@ -38,11 +38,11 @@ pub(crate) enum Section {
     Settings,
     /// `[defaults]`, inherited by every group.
     Defaults,
-    /// `[advanced]`, whose defaults are the right answer.
+    /// `[experimental]`, whose defaults are the right answer.
     Advanced,
-    /// `[advanced.alerts]`: how long a condition must hold.
+    /// `[experimental.alerts]`: how long a condition must hold.
     Alerts,
-    /// `[advanced.peering-dangerously-experimental]`: the lease timing.
+    /// `[experimental.peering-dangerously-experimental]`: the lease timing.
     Peering,
     /// One `[groups.x]`.
     Group(String),
@@ -288,12 +288,13 @@ pub(crate) const SILENT_AT_THE_TOP: &[&str] = &[
     "groups",
     "defaults",
     "advanced",
+    "experimental",
     "disabled",
     "alerts",
     "peering-experimental",
 ];
 
-/// The same, for `[advanced]`: its two timing tables are sections of
+/// The same, for `[experimental]`: its two timing tables are sections of
 /// their own, and `peering-experimental` is the spelling that was
 /// renamed.
 pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-experimental", "peering-experimental"];
@@ -309,7 +310,7 @@ pub(crate) const RARE: &[&str] = &["default_owner", "default_group"];
 
 /// The tables one listed section draws, in the order it draws them.
 ///
-/// Every section but `[advanced]` draws itself alone. Advanced held a
+/// Every section but `[experimental]` draws itself alone. It held a
 /// single key, and its two timing tables were listed beside it as
 /// sections of their own — three places to look for one idea. They are
 /// drawn together now; each field is still written to its own table,
@@ -332,21 +333,12 @@ pub(crate) fn table_for<'a>(
             .entry("defaults")
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
-        Section::Advanced => document
-            .entry("advanced")
-            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut(),
-        Section::Alerts => document
-            .entry("advanced")
-            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut()?
+        Section::Advanced => experimental(document),
+        Section::Alerts => experimental(document)?
             .entry("alerts")
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
-        Section::Peering => document
-            .entry("advanced")
-            .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
-            .as_table_mut()?
+        Section::Peering => experimental(document)?
             .entry("peering-dangerously-experimental")
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
@@ -358,6 +350,29 @@ pub(crate) fn table_for<'a>(
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
     }
+}
+
+/// The `[experimental]` table, or the `[advanced]` one a file written
+/// before the rename already has.
+///
+/// Whichever is there is the one written to. Making the new one beside
+/// the old would leave a file saying the same thing twice, which the
+/// parser refuses as a duplicate — so an old file stays an old file
+/// until somebody renames the header themselves.
+fn experimental<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+) -> Option<&'a mut toml_edit::Table> {
+    let name = match document.contains_key("experimental") {
+        true => "experimental",
+        false => match document.contains_key("advanced") {
+            true => "advanced",
+            false => "experimental",
+        },
+    };
+    document
+        .entry(name)
+        .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
+        .as_table_mut()
 }
 
 /// A value written back into the file: a number where the text is one,
@@ -620,15 +635,19 @@ impl Sheet {
     /// What the file holds for a key of a section.
     pub(crate) fn held(&self, section: &Section, key: &str) -> Option<toml_edit::Item> {
         let sheet = self;
+        // Read from whichever spelling the file has, as the parser does.
+        let tuning = || {
+            sheet
+                .document
+                .get("experimental")
+                .or_else(|| sheet.document.get("advanced"))
+        };
         let table: &toml_edit::Item = match section {
             Section::Settings => sheet.document.as_item(),
             Section::Defaults => sheet.document.get("defaults")?,
-            Section::Advanced => sheet.document.get("advanced")?,
-            Section::Alerts => sheet.document.get("advanced")?.get("alerts")?,
-            Section::Peering => sheet
-                .document
-                .get("advanced")?
-                .get("peering-dangerously-experimental")?,
+            Section::Advanced => tuning()?,
+            Section::Alerts => tuning()?.get("alerts")?,
+            Section::Peering => tuning()?.get("peering-dangerously-experimental")?,
             Section::Group(name) => sheet.document.get("groups")?.get(name)?,
         };
         table.get(key).cloned()
@@ -637,7 +656,7 @@ impl Sheet {
     /// The sections of the file, in the order they are written.
     pub(crate) fn sections(&self) -> Vec<Section> {
         // Alerts and peering are not listed: they are drawn inside
-        // `[advanced]`, which is the only place anyone looks for them.
+        // `[experimental]`, the only place anyone looks for them.
         let mut sections = vec![Section::Settings, Section::Defaults, Section::Advanced];
         if let Some(groups) = self.document.get("groups").and_then(|item| item.as_table()) {
             for (name, _) in groups.iter() {
@@ -766,6 +785,34 @@ impl Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An edit must not turn one section into two. A file written before
+    /// the rename says `[advanced]`, the parser still reads it, and a
+    /// window that wrote `[experimental]` beside it would leave a file
+    /// that names the same table twice — which the parser refuses, on
+    /// the next save, for a change the person did not make.
+    #[test]
+    fn a_file_that_says_advanced_goes_on_saying_advanced() {
+        let path = std::path::Path::new("config.toml");
+        let text = "[advanced]\nallow_root = false\n\n\
+                    [groups.notes]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
+        let mut document: toml_edit::DocumentMut = text.parse().expect("the file parses");
+
+        table_for(&mut document, &Section::Alerts)
+            .expect("the table is there")
+            .insert("coalesce_after", toml_edit::value("5s"));
+        let written = document.to_string();
+        assert!(written.contains("[advanced.alerts]"), "{written}");
+        assert!(!written.contains("[experimental"), "{written}");
+        crate::config::Config::parse(path, &written).expect("the parser takes it");
+
+        // A file with neither gets the name the section has now.
+        let mut fresh: toml_edit::DocumentMut = "".parse().expect("an empty file parses");
+        table_for(&mut fresh, &Section::Advanced)
+            .expect("the table is made")
+            .insert("allow_root", toml_edit::value(true));
+        assert!(fresh.to_string().contains("[experimental]"), "{fresh}");
+    }
 
     /// A folded key is still a key: if one is renamed in the structs the
     /// parser reads, the fold must not go on hiding a name nothing has.

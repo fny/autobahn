@@ -72,14 +72,14 @@ Six rules make it usable rather than maddening:
 - **A cascade is held and reported once.** A closing laptop does not take its sessions together: each goes when its own connection times out, seconds apart, so every arrival changed the set and every change was news. The window (60 seconds) runs from the first arrival nobody has been told about, not from the latest, so a steady trickle cannot hold the notification back indefinitely.
 - **Trouble that comes and goes is reported once.** A conflict on a file two machines are both editing appears, clears, and returns all day. Everything must stay clear for 15 minutes before a return counts as news rather than as the same trouble continuing — otherwise one flapping session is a notification a minute.
 
-## `[advanced.alerts]`
+## `[experimental.alerts]`
 
 The alerter's timing. These are not preferences — they are the values that make it correct, and there is no second right answer a reader would discover by trying. The section exists so that finding yourself in it is itself the message.
 
 | Key | Default | What it governs |
 |---|---|---|
 | `alert_after` | 30s | How long a condition must hold before it counts. Written here, it replaces the whole per-state table rather than sitting behind it. |
-| `[advanced.alerts.after]` | see above | Per-state hold times, keyed by state name. Overrides the built-in table one state at a time. |
+| `[experimental.alerts.after]` | see above | Per-state hold times, keyed by state name. Overrides the built-in table one state at a time. |
 | `coalesce_after` | 60s | How long a grown set is held so a cascade arrives as one notification. |
 | `settle_after` | 15m | How long everything must stay clear before trouble returning counts as news. |
 | `repeat_after` | never | Re-fire an unchanged set. Off, and usually should be: a notification that returns while you are already working on it teaches you to ignore it. |

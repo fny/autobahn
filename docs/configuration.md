@@ -53,9 +53,11 @@ Eight keys. Unknown keys are refused at startup, not ignored — here and in eve
 | `reload` | bool | `true` | Whether the running supervisor re-reads this file and applies an edit in place. See [Editing it while it runs](#editing-it-while-it-runs). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
-| `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
-| `[advanced.peering-dangerously-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
-| `advanced.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
+| `[experimental.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
+| `[experimental.peering-dangerously-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
+| `experimental.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
+
+`[experimental]` was called `[advanced]`. The old name is still read and still means the same table, so nothing has to be edited; write only one of the two, because a file that names both is refused as the duplicate it is.
 
 Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log`, `power_saver_experimental` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
@@ -92,7 +94,7 @@ Beyond keys and values it does not know, a configuration is refused at startup, 
 
 A root that holds credentials is warned about, not refused: see `acknowledge_secrets` above.
 
-Separately, `watch`, `sync`, `resolve`, `install` and `start` refuse to run as root, before any session is planned, unless `--allow-root` or `advanced.allow_root` says root is meant; root under someone else's home (`sudo`) is refused regardless.
+Separately, `watch`, `sync`, `resolve`, `install` and `start` refuse to run as root, before any session is planned, unless `--allow-root` or `experimental.allow_root` says root is meant; root under someone else's home (`sudo`) is refused regardless.
 
 ### Symbolic links
 

@@ -61,7 +61,7 @@ impl Identity {
 }
 
 /// The controller's check, for `watch`, `sync`, `resolve`, `install` and
-/// `start`. `allowed` is `--allow-root` or `advanced.allow_root`.
+/// `start`. `allowed` is `--allow-root` or `experimental.allow_root`.
 pub fn check_controller(identity: Identity, allowed: bool) -> Result<()> {
     identity.refuse_borrowed_home()?;
     if identity.euid == 0 && !allowed {
@@ -70,7 +70,7 @@ pub fn check_controller(identity: Identity, allowed: bool) -> Result<()> {
              commands in that user's configuration; as root, a configuration anyone else can \
              edit runs as root, and a scanner race becomes a way to write anywhere. Run it as \
              the user whose files these are, or pass --allow-root (or set \
-             `advanced.allow_root = true`) if root is really meant"
+             `experimental.allow_root = true`) if root is really meant"
         );
     }
     Ok(())
@@ -95,14 +95,24 @@ pub fn check_agent(identity: Identity, initialize: &Initialize) -> Result<()> {
     Ok(())
 }
 
-/// Whether a configuration file sets `advanced.allow_root = true`, read
-/// on its own so that the check does not depend on the rest of the file
-/// being valid. A file that cannot be read or parsed does not allow it.
+/// Whether a configuration file sets `experimental.allow_root = true`,
+/// read on its own so that the check does not depend on the rest of the
+/// file being valid. A file that cannot be read or parsed does not allow
+/// it.
+///
+/// Both spellings of the section are read, as the parser reads both. A
+/// file that says root is meant must go on saying it after a rename;
+/// this is the one place where not hearing it is the safe failure and
+/// the wrong answer at the same time — the command refuses, and the
+/// person who wrote the key is told nothing.
 pub fn config_allows_root(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
-        .and_then(|table| table.get("advanced")?.get("allow_root")?.as_bool())
+        .and_then(|table| {
+            let section = table.get("experimental").or_else(|| table.get("advanced"))?;
+            section.get("allow_root")?.as_bool()
+        })
         .unwrap_or(false)
 }
 
@@ -177,10 +187,13 @@ mod tests {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let path = directory.path().join("config.toml");
         assert!(!config_allows_root(&path), "no file");
+        std::fs::write(&path, "[experimental]\nallow_root = true\n").unwrap();
+        assert!(config_allows_root(&path));
+        std::fs::write(&path, "[experimental]\nallow_root = false\n").unwrap();
+        assert!(!config_allows_root(&path));
+        // The name this section had before still says it.
         std::fs::write(&path, "[advanced]\nallow_root = true\n").unwrap();
         assert!(config_allows_root(&path));
-        std::fs::write(&path, "[advanced]\nallow_root = false\n").unwrap();
-        assert!(!config_allows_root(&path));
         std::fs::write(&path, "not toml [").unwrap();
         assert!(!config_allows_root(&path));
     }

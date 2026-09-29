@@ -58,7 +58,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Run `watch`, `sync`, `resolve`, `install` or `start` as root, which
-    /// is refused otherwise (as is `advanced.allow_root = true`).
+    /// is refused otherwise (as is `experimental.allow_root = true`).
     #[arg(long, global = true)]
     allow_root: bool,
 }
@@ -916,7 +916,7 @@ impl std::error::Error for Unsettled {}
 
 /// Refuses the commands that write state or run a configuration's
 /// commands when this is root and nobody said root was meant: by
-/// `--allow-root`, or `advanced.allow_root` in the configuration the
+/// `--allow-root`, or `experimental.allow_root` in the configuration the
 /// command would read. See `autobahn::root`.
 fn refuse_root(command: &Command, allow_root: bool) -> Result<()> {
     let identity = autobahn::root::Identity::current();
@@ -5458,8 +5458,8 @@ mod tests {
         assert!(format!("{error:#}").contains("no sessions"));
     }
     use super::{
-        blocked_fix, blocked_parts, blocked_path, clusters, common_prefix, conflict_filter,
-        format_estimate, parse_remote, render_status_entry, roll_up,
+        blocked_fix, clusters, common_prefix, conflict_filter, format_estimate, parse_remote,
+        render_status_entry, roll_up,
     };
 
     #[test]

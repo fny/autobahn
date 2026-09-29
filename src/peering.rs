@@ -631,7 +631,7 @@ mod star_tests {
     use super::*;
 
     const PUSHED: &str = r#"
-        [advanced.peering-dangerously-experimental]
+        [experimental.peering-dangerously-experimental]
         ttl = "10s"
         failover_after = "20s"
 

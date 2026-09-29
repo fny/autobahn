@@ -89,7 +89,7 @@ A configuration mistake is refused at startup with the problem named, not half-a
 
 A root that holds credentials — `.ssh`, `.aws` and the like — is not refused, since someone may mean to synchronize them, but `sync` and `watch` warn about it when they start, until the group sets `acknowledge_secrets` or ignores them. See [What is refused](./configuration.md#what-is-refused).
 
-And the commands that act refuse to run as root, unless `--allow-root` or `advanced.allow_root` says root is meant — and never as root under another user's home.
+And the commands that act refuse to run as root, unless `--allow-root` or `experimental.allow_root` says root is meant — and never as root under another user's home.
 
 ## When you act
 

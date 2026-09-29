@@ -308,8 +308,12 @@ pub struct Config {
     #[serde(default)]
     pub groups: BTreeMap<String, Group>,
     /// Tuning that has a correct value already.
-    #[serde(default)]
-    pub advanced: Advanced,
+    ///
+    /// Spelled `[advanced]` until it was not. The old name is still
+    /// read, so no file on any machine had to be edited for this; a
+    /// file carrying both is refused as the duplicate it is.
+    #[serde(default, alias = "advanced")]
+    pub experimental: Advanced,
     /// What is worth saying about this configuration without refusing
     /// it, gathered once per load by [`warnings`](Self::warnings) however
     /// many times its sessions are planned.
@@ -327,7 +331,8 @@ pub struct Config {
     pub alerts: Option<toml::Value>,
 }
 
-/// The `[advanced]` section: settings whose defaults are the right answer.
+/// The `[experimental]` section: settings whose defaults are the right
+/// answer.
 /// Grouped under one heading so that finding yourself here is itself the
 /// message — the subsystem comes second because the warning should land
 /// first.
@@ -353,8 +358,9 @@ pub struct Advanced {
     pub allow_root: bool,
 }
 
-/// The `[advanced.peering-dangerously-experimental]` section: how long a lease lives,
-/// and how long a peer waits past a dead lease before it takes the lead.
+/// The `[experimental.peering-dangerously-experimental]` section: how long
+/// a lease lives, and how long a peer waits past a dead lease before it
+/// takes the lead.
 ///
 /// As with the alerter's timing, the defaults are the answer. A blip must
 /// never cause a failover, so the wait is long; a leader that is really
@@ -1157,11 +1163,11 @@ impl Config {
             );
         }
 
-        let advanced = &self.advanced.alerts;
+        let advanced = &self.experimental.alerts;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
             None => Ok(fallback),
             Some(spec) => parse_duration(spec).map_err(|message| {
-                anyhow!("invalid configuration:\n  advanced.alerts.{what}: {message}")
+                anyhow!("invalid configuration:\n  experimental.alerts.{what}: {message}")
             }),
         };
 
@@ -1186,7 +1192,7 @@ impl Config {
             let Some(alert) = Alert::parse(name) else {
                 let known: Vec<&str> = Alert::all().iter().map(|alert| alert.name()).collect();
                 bail!(
-                    "invalid configuration:\n  advanced.alerts.after.{name}: unknown state \
+                    "invalid configuration:\n  experimental.alerts.after.{name}: unknown state \
                      (expected one of: {})",
                     known.join(", ")
                 );
@@ -1194,7 +1200,7 @@ impl Config {
             after.insert(
                 alert,
                 parse_duration(spec).map_err(|message| {
-                    anyhow!("invalid configuration:\n  advanced.alerts.after.{name}: {message}")
+                    anyhow!("invalid configuration:\n  experimental.alerts.after.{name}: {message}")
                 })?,
             );
         }
@@ -1218,19 +1224,19 @@ impl Config {
     /// built-in defaults. Resolved whether or not any group is in a
     /// peering mode: a bad value is a configuration error either way.
     pub fn peering_plan(&self) -> Result<PeeringPlan> {
-        if self.advanced.retired_peering.is_some() {
+        if self.experimental.retired_peering.is_some() {
             bail!(
                 "invalid configuration:\n  [advanced.peering-experimental] was renamed to \
-                 [advanced.peering-dangerously-experimental]: peering has known security \
+                 [experimental.peering-dangerously-experimental]: peering has known security \
                  and collision issues. Read docs/peering.md before enabling it."
             );
         }
-        let advanced = &self.advanced.peering;
+        let advanced = &self.experimental.peering;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| {
             match spec {
             None => Ok(fallback),
             Some(spec) => parse_duration(spec).map_err(|message| {
-                anyhow!("invalid configuration:\n  advanced.peering-dangerously-experimental.{what}: {message}")
+                anyhow!("invalid configuration:\n  experimental.peering-dangerously-experimental.{what}: {message}")
             }),
         }
         };
@@ -1245,7 +1251,7 @@ impl Config {
         // still good.
         if failover_after < ttl {
             bail!(
-                "invalid configuration:\n  advanced.peering-dangerously-experimental.failover_after \
+                "invalid configuration:\n  experimental.peering-dangerously-experimental.failover_after \
                  ({}s) is shorter than ttl ({}s); a peer must not take the lead while the \
                  lease is still valid",
                 failover_after.as_secs(),
@@ -1253,7 +1259,7 @@ impl Config {
             );
         }
         if ttl.is_zero() {
-            bail!("invalid configuration:\n  advanced.peering-dangerously-experimental.ttl must not be zero");
+            bail!("invalid configuration:\n  experimental.peering-dangerously-experimental.ttl must not be zero");
         }
         Ok(PeeringPlan {
             ttl,
@@ -1514,7 +1520,7 @@ impl Config {
             if let Some(plan) = peering {
                 if plan.ttl < interval.saturating_mul(2) {
                     errors.push(format!(
-                        "group '{name}': advanced.peering-dangerously-experimental.ttl ({}s) must be at \
+                        "group '{name}': experimental.peering-dangerously-experimental.ttl ({}s) must be at \
                          least twice the interval ({}s); the lease is renewed once per cycle",
                         plan.ttl.as_secs(),
                         interval.as_secs()
@@ -2771,17 +2777,50 @@ mod tests {
         }
     }
 
+    /// The section was called `[advanced]` first. Every configuration on
+    /// every machine says that, and none of them was going to be edited
+    /// for a word, so the old spelling still loads and still means the
+    /// same table. A file that writes both is a file that says one thing
+    /// twice, and is refused.
     #[test]
-    fn the_advanced_section_overrides_the_built_in_table() {
+    fn the_name_that_section_had_before_still_reads() {
         use crate::alerts::Alert;
         let config = parse(
             r#"
             on_alert = "notify me"
 
+            [advanced]
+            allow_root = true
+
             [advanced.alerts]
             coalesce_after = "5s"
+            "#,
+        );
+        assert!(config.experimental.allow_root);
+        let plan = config.alert_plan().expect("a plan");
+        assert_eq!(plan.coalesce_after, Duration::from_secs(5));
+        // And the built-in table is still underneath it.
+        assert_eq!(plan.after(Alert::Errored), Duration::from_secs(120));
 
-            [advanced.alerts.after]
+        let both = Config::parse(
+            std::path::Path::new("config.toml"),
+            "[experimental]\nallow_root = true\n\n[advanced]\nallow_root = false\n",
+        )
+        .expect_err("a file that writes the section twice is refused");
+        assert!(format!("{both:#}").contains("duplicate field"), "{both:#}");
+    }
+
+    #[test]
+    fn the_experimental_section_overrides_the_built_in_table() {
+        use crate::alerts::Alert;
+        let config = parse(
+            r#"
+            on_alert = "notify me"
+
+            [experimental.alerts]
+            coalesce_after = "5s"
+
+            [experimental.alerts.after]
             unreachable = "1m"
             "#,
         );

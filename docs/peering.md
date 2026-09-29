@@ -33,7 +33,7 @@ The alpha must be the machine the configuration runs on, and every beta must be 
 Timing lives where the alerter's does, correct as shipped:
 
 ```toml
-[advanced.peering-dangerously-experimental]
+[experimental.peering-dangerously-experimental]
 ttl            = "30s"     # a lease is stale this long after its last renewal
 failover_after = "120s"    # a candidate waits this long past stale before it leads
 ```

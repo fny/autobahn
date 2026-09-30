@@ -135,8 +135,6 @@ A laptop that attaches to a leading beta therefore trusts that beta with the lap
 
 **A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
 
-**The attach socket does not check who connects.** On the leading beta, `~/.autobahn/peering/attach.sock` has no peer-credential check, no explicit permissions and no timeout. Unlike the control socket, it accepts any local process that can connect and send the alpha's greeting. On a multi-user host, another local user could pose as the alpha. Do not run a peering beta on a machine shared with users you do not trust.
-
 ## What is not covered
 
 - **A one-off `sync` or `resolve` is not fenced.** A channel that never presents a lease is never refused, so a command run by hand from any machine can still write a peer. Peering trusts the operator here.

@@ -1,7 +1,7 @@
 # PEER-5: Harden the attach socket like the control socket
 
 **Findings:** M-1 (DEEPSEEK F5, GLM M1, KIMI ABN-M1, OPUS S4).
-**Status:** deferred, not in v1. Documented in `docs/peering.md`. This belongs to question 3, local users on a shared host, but it is filed here because it exists only when peering is enabled.
+**Status:** fixed, 2026-09-30. The socket is `0600` in a private `peering/`, a connection from another user is refused before anything is read, the greeting has a 10 s deadline and a 64-byte cap, and each connection is greeted on its own thread. The deadline is cleared once the alpha has greeted: the connection idles between cycles. Other local users could not reach the socket before either, since the state root and `peering/` are made `0700` at every start; what this adds is the control socket's checks, and a silent client no longer holds up the alpha. The other-user test runs only as root, and passes under `sudo`.
 
 ## Problem
 

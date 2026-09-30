@@ -205,33 +205,16 @@ fn lead(
     // The attach socket: the alpha dials in here, and its connection
     // becomes the endpoint of the session that has the alpha's side.
     let socket = directory.join(peering::ATTACH_SOCKET);
-    let _ = std::fs::remove_file(&socket);
-    let listener = std::os::unix::net::UnixListener::bind(&socket)
-        .with_context(|| format!("unable to listen at {}", socket.display()))?;
-    listener
-        .set_nonblocking(true)
-        .context("unable to configure the attach socket")?;
+    let listener = bind_attach_socket(directory, &socket)?;
     std::thread::scope(|scope| -> Result<()> {
         let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
         let acceptor = &inner_stop;
         let supervisor_ref = &supervisor;
         scope.spawn(move || {
-            while !acceptor.load(Ordering::Relaxed) {
-                match listener.accept() {
-                    Ok((stream, _)) => {
-                        if let Err(error) = accept_attachment(stream, supervisor_ref) {
-                            crate::complain!("peering: an attachment was refused: {error:#}");
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(ROLE_POLL);
-                    }
-                    Err(error) => {
-                        crate::complain!("peering: the attach socket failed: {error:#}");
-                        return;
-                    }
-                }
-            }
+            serve_attachments(&listener, acceptor, GREETING_TIMEOUT, |name, connection| {
+                crate::note!("peering: {name} attached");
+                supervisor_ref.offer_attachment(&name, connection);
+            })
         });
         // The supervisor runs until it is told to stop; this thread tells
         // it to, when it has stepped down or the process is stopping.
@@ -276,30 +259,111 @@ fn lead(
     })
 }
 
+/// How long a connection to the attach socket has to say who it is.
+const GREETING_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The longest greeting read: a name, which is `alpha`.
+const MAXIMUM_GREETING: u64 = 64;
+
+/// Binds the attach socket as the control socket is bound: in a private
+/// directory, the socket itself only the owner's, whatever the umask.
+fn bind_attach_socket(directory: &Path, socket: &Path) -> Result<std::os::unix::net::UnixListener> {
+    use std::os::unix::fs::PermissionsExt;
+    crate::fsutil::private_dir(directory)
+        .with_context(|| format!("unable to prepare {}", directory.display()))?;
+    let _ = std::fs::remove_file(socket);
+    let listener = std::os::unix::net::UnixListener::bind(socket)
+        .with_context(|| format!("unable to listen at {}", socket.display()))?;
+    std::fs::set_permissions(socket, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("unable to restrict {}", socket.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("unable to configure the attach socket")?;
+    Ok(listener)
+}
+
+/// Accepts attachments until `stop`, each on a thread of its own: a
+/// connection that says nothing holds up only itself, until its greeting
+/// times out, and never the alpha dialing in behind it. What greets
+/// properly is handed to `attached` with its name.
+fn serve_attachments(
+    listener: &std::os::unix::net::UnixListener,
+    stop: &AtomicBool,
+    timeout: Duration,
+    attached: impl Fn(String, crate::transport::Connection) + Sync,
+) {
+    std::thread::scope(|scope| {
+        while !stop.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    let attached = &attached;
+                    scope.spawn(move || match greet(stream, timeout) {
+                        Ok((name, connection)) => attached(name, connection),
+                        Err(error) => {
+                            crate::complain!("peering: an attachment was refused: {error:#}")
+                        }
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(ROLE_POLL);
+                }
+                Err(error) => {
+                    crate::complain!("peering: the attach socket failed: {error:#}");
+                    return;
+                }
+            }
+        }
+    });
+}
+
 /// Reads an attachment's greeting — the peer's name on a line — and
-/// offers the connection to the supervisor under that name.
-fn accept_attachment(
+/// returns the connection behind it. Held to what the control socket
+/// holds its clients to: the same user as this process, a greeting within
+/// `timeout` and [`MAXIMUM_GREETING`] bytes, and the only name that
+/// attaches.
+fn greet(
     stream: std::os::unix::net::UnixStream,
-    supervisor: &super::Supervisor,
-) -> Result<()> {
+    timeout: Duration,
+) -> Result<(String, crate::transport::Connection)> {
+    use std::io::{BufRead, Read};
     stream
         .set_nonblocking(false)
         .context("unable to configure the attachment")?;
-    let mut reader = std::io::BufReader::new(
+    if !super::control::peer_is_same_user(&stream)? {
+        anyhow::bail!("the connection is from another user");
+    }
+    stream
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| stream.set_write_timeout(Some(timeout)))
+        .context("unable to configure the attachment")?;
+    let mut limited = std::io::BufReader::new(
         stream
             .try_clone()
             .context("unable to clone the attachment")?,
-    );
+    )
+    .take(MAXIMUM_GREETING);
     let mut name = String::new();
-    std::io::BufRead::read_line(&mut reader, &mut name).context("unable to read the greeting")?;
+    limited
+        .read_line(&mut name)
+        .context("unable to read the greeting")?;
+    if !name.ends_with('\n') {
+        anyhow::bail!("no greeting within {MAXIMUM_GREETING} bytes");
+    }
     let name = name.trim().to_owned();
     if name != peering::ALPHA {
         anyhow::bail!("{name:?} is not a peer that attaches");
     }
-    crate::note!("peering: {name} attached");
-    let connection = crate::transport::Connection::from_streams(Box::new(reader), Box::new(stream));
-    supervisor.offer_attachment(&name, connection);
-    Ok(())
+    // The connection is long-lived and idles between cycles: the greeting's
+    // deadline is not the session's.
+    stream
+        .set_read_timeout(None)
+        .and_then(|()| stream.set_write_timeout(None))
+        .context("unable to configure the attachment")?;
+    let reader = limited.into_inner();
+    Ok((
+        name,
+        crate::transport::Connection::from_streams(Box::new(reader), Box::new(stream)),
+    ))
 }
 
 /// The alpha's `watch` when its groups peer: lead until fenced, then
@@ -555,6 +619,114 @@ mod tests {
         assert!(matches!(followed, Followed::TakeOver { term: 4 }));
         let betas: Vec<String> = star.plans.iter().map(|plan| plan.beta_spec()).collect();
         assert_eq!(betas, ["other:/srv/g"]);
+    }
+
+    /// A connection that says nothing holds up only itself: the alpha
+    /// dialing in behind it attaches at once, and the silent one is closed
+    /// when its greeting times out. The socket and its directory are the
+    /// owner's alone.
+    #[test]
+    fn a_silent_connection_does_not_hold_up_the_alpha() {
+        use std::io::{Read, Write};
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixStream;
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join("peering");
+        let socket = directory.join(peering::ATTACH_SOCKET);
+        let listener = bind_attach_socket(&directory, &socket).expect("bound");
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&directory), mode(&socket)), (0o700, 0o600));
+
+        let stop = AtomicBool::new(false);
+        let attached = std::sync::Mutex::new(Vec::new());
+        let timeout = Duration::from_secs(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                serve_attachments(&listener, &stop, timeout, |name, _| {
+                    attached.lock().unwrap().push(name)
+                })
+            });
+            let mut silent = UnixStream::connect(&socket).expect("connects");
+            std::thread::sleep(Duration::from_millis(100));
+            let started = std::time::Instant::now();
+            let mut alpha = UnixStream::connect(&socket).expect("connects");
+            alpha.write_all(b"alpha\n").unwrap();
+            while attached.lock().unwrap().is_empty() {
+                assert!(
+                    started.elapsed() < Duration::from_secs(1),
+                    "the alpha was held up behind a silent connection"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(*attached.lock().unwrap(), ["alpha"]);
+            silent
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            assert_eq!(silent.read(&mut [0u8; 1]).expect("closed, not failed"), 0);
+            assert!(started.elapsed() >= timeout - Duration::from_millis(200));
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+
+    /// A greeting is a short line naming the alpha: an endless one and a
+    /// name that does not attach are refused.
+    #[test]
+    fn a_greeting_is_short_and_names_the_alpha() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        let greeting = |sent: &[u8]| {
+            let (server, mut client) = UnixStream::pair().unwrap();
+            client.write_all(sent).unwrap();
+            greet(server, Duration::from_secs(2)).map(|(name, _)| name)
+        };
+        let error = greeting(&[b'a'; 200]).expect_err("endless");
+        assert!(
+            format!("{error:#}").contains("no greeting within"),
+            "{error:#}"
+        );
+        let error = greeting(b"box2\n").expect_err("not the alpha");
+        assert!(
+            format!("{error:#}").contains("not a peer that attaches"),
+            "{error:#}"
+        );
+        assert_eq!(
+            greeting(b"alpha\nand the handshake").expect("the alpha"),
+            "alpha"
+        );
+    }
+
+    /// A connection from another user is refused before anything it sends
+    /// is read, whatever the socket's permissions let through. Runs only as
+    /// root, which can connect as another user.
+    #[test]
+    fn another_user_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::process::CommandExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        std::fs::set_permissions(keep.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        let socket = keep.path().join("attach.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
+        let mut client = std::process::Command::new("python3")
+            .args([
+                "-c",
+                "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); \
+                 s.sendall(b'alpha\\n'); s.recv(1)",
+            ])
+            .arg(&socket)
+            .uid(65534)
+            .gid(65534)
+            .spawn()
+            .expect("a client as nobody");
+        let (stream, _) = listener.accept().expect("accepted");
+        let error = greet(stream, Duration::from_secs(5))
+            .map(|(name, _)| name)
+            .expect_err("another user");
+        assert!(format!("{error:#}").contains("another user"), "{error:#}");
+        let _ = client.wait();
     }
 
     /// A lease on this host that names this peer brings it back leading at

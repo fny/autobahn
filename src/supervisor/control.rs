@@ -983,7 +983,7 @@ pub(crate) fn serve(listener: UnixListener, registry: &Registry, stop: &AtomicBo
 /// Verifies that the connecting peer is the same user as this process:
 /// control requests are state-destructive (`reset` in particular), so
 /// authorization must not rest on directory permissions alone.
-fn peer_is_same_user(stream: &UnixStream) -> Result<bool> {
+pub(crate) fn peer_is_same_user(stream: &UnixStream) -> Result<bool> {
     use std::os::unix::io::AsRawFd;
     let fd = stream.as_raw_fd();
     #[cfg(target_os = "linux")]

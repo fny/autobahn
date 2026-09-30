@@ -707,7 +707,19 @@ impl SessionPlan {
     /// still the alpha of the pair, this host's own root (the alpha of
     /// `self`) as the beta, under the identifier the leader pushed so it
     /// is the same session the leader ran.
-    pub(crate) fn attached_alpha(&self, alpha_path: &str, identifier: String) -> SessionPlan {
+    pub(crate) fn attached_alpha(
+        &self,
+        alpha_path: &str,
+        identifier: String,
+    ) -> anyhow::Result<SessionPlan> {
+        // The identifier names the session's directory under the state
+        // root, its lock and its ancestor: one pushed by a leader is held to
+        // the shape a genuine one has, or it could name a place anywhere.
+        anyhow::ensure!(
+            crate::protocol::is_session_identifier(&identifier),
+            "the session identifier {identifier:?} for group {} is not one a leader makes",
+            self.group
+        );
         let own = match &self.alpha {
             EndpointTarget::Local(path) => path.clone(),
             EndpointTarget::Remote { path, .. } => PathBuf::from(path),
@@ -718,7 +730,7 @@ impl SessionPlan {
             agent_command: None,
         };
         let beta = EndpointTarget::Local(own);
-        SessionPlan {
+        Ok(SessionPlan {
             host: crate::peering::ALPHA.to_owned(),
             alpha_identity: target_identity(&alpha),
             beta_identity: target_identity(&beta),
@@ -728,7 +740,7 @@ impl SessionPlan {
             identifier,
             shown_path: None,
             ..self.clone()
-        }
+        })
     }
 
     /// The mode as the configuration spells it: the peering spelling for

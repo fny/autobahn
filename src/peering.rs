@@ -1062,7 +1062,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
                     continue;
                 };
                 let identifier = String::from_utf8(identifier).context("the pushed session id")?;
-                plans.push(plan.attached_alpha(&alpha_path, identifier.trim().to_owned()));
+                plans.push(plan.attached_alpha(&alpha_path, identifier.trim().to_owned())?);
             }
         }
     }
@@ -1154,6 +1154,33 @@ mod star_tests {
         );
 
         assert!(derive_star(PUSHED, "nobody:/x", keep.path()).is_err());
+    }
+
+    /// A pushed session identifier names the session's directory, lock and
+    /// ancestor on the follower, so it is held to the shape a leader makes:
+    /// one that could name a path elsewhere refuses the whole star, naming
+    /// the group, and nothing is derived from it.
+    #[test]
+    fn a_pushed_session_identifier_must_be_genuine() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let name = "ubuntu@vm:/home/faraz/Workspace/Voltai";
+        for hostile in ["../../x", "/tmp/elsewhere", "a/b", "", "ABCDEF"] {
+            write_pushed_file(keep.path(), "sessions/g", hostile.as_bytes()).unwrap();
+            let error = derive_star(PUSHED, name, keep.path()).expect_err(hostile);
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("group g") && message.contains("not one a leader makes"),
+                "{hostile:?}: {message}"
+            );
+        }
+        let genuine = crate::session::session_identifier("a", "b");
+        write_pushed_file(keep.path(), "sessions/g", format!("{genuine}\n").as_bytes()).unwrap();
+        let star = derive_star(PUSHED, name, keep.path()).expect("a genuine identifier");
+        assert!(
+            star.plans.iter().any(|plan| plan.identifier() == genuine),
+            "{:?}",
+            star.plans
+        );
     }
 
     /// Two groups reach one host at two roots. Each pushes its own name

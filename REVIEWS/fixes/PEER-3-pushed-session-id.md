@@ -1,7 +1,7 @@
 # PEER-3: Validate pushed session identifiers
 
 **Findings:** H-22 (KIMI ABN-H5).
-**Status:** deferred, not in v1. This is a tier 1 confinement break, but it is reachable only with peering enabled. Documented in `docs/peering.md`.
+**Status:** fixed, 2026-09-30. `derive_star` and `SessionPlan::attached_alpha` refuse an identifier `is_session_identifier` does not accept, naming the group; `ancestor_copy_path` already did. A follower that re-reads a bad push keeps the last star that derived (PEER-8).
 
 ## Problem
 

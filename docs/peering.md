@@ -133,8 +133,6 @@ In the usual setup this grants nothing new, because a leader already holds an SS
 
 A laptop that attaches to a leading beta therefore trusts that beta with the laptop user's files.
 
-**A pushed session identifier can escape `~/.autobahn`.** A follower uses the pushed `sessions/<group>` content as a directory name after trimming whitespace, without other checks. A malicious leader can place session state, locks and status files elsewhere in the follower's home directory.
-
 **A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
 
 **The attach socket does not check who connects.** On the leading beta, `~/.autobahn/peering/attach.sock` has no peer-credential check, no explicit permissions and no timeout. Unlike the control socket, it accepts any local process that can connect and send the alpha's greeting. On a multi-user host, another local user could pose as the alpha. Do not run a peering beta on a machine shared with users you do not trust.

@@ -47,6 +47,41 @@ pub(crate) fn t(key: &str) -> &'static str {
     }
 }
 
+/// One of the hints, chosen at random.
+///
+/// The bottom of the window is a line that is empty most of the time,
+/// and a line that is empty most of the time is a place to teach
+/// somebody something they would not otherwise find — the TUI, the
+/// JSON, the door on the wordmark. Every hint is in the catalogue
+/// under `[hints]`, so adding one is adding a line to a file.
+///
+/// Random rather than in order: a person who opens this window twice
+/// a day should not read the same sentence every time.
+pub(crate) fn hint() -> &'static str {
+    static EVERY: OnceLock<Vec<&'static str>> = OnceLock::new();
+    let every = EVERY.get_or_init(|| {
+        let mut said: Vec<&'static str> = catalogue()
+            .iter()
+            .filter(|(key, text)| key.starts_with("hints.") && !text.trim().is_empty())
+            .map(|(_, text)| text.as_str())
+            .collect();
+        // The map's order is the hash's; sorted, the choice below is the
+        // only thing deciding which one anybody sees.
+        said.sort();
+        said
+    });
+    if every.is_empty() {
+        return "";
+    }
+    // No dependency for this: the clock is random enough to pick one of
+    // half a dozen sentences, and nothing here needs to be unguessable.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.subsec_nanos() as usize)
+        .unwrap_or(0);
+    every[now % every.len()]
+}
+
 /// The line for a key, with `{name}` replaced by what is given.
 pub(crate) fn fill(key: &str, values: &[(&str, &str)]) -> String {
     let mut text = t(key).to_owned();
@@ -146,6 +181,9 @@ mod tests {
         );
         let unused: Vec<&String> = catalogue()
             .keys()
+            // `hint()` reads every key under `[hints]` at once, so no
+            // source names one of them and none of them is unused.
+            .filter(|key| !key.starts_with("hints."))
             .filter(|key| {
                 let counted = key
                     .strip_suffix("_one")
@@ -155,6 +193,21 @@ mod tests {
             })
             .collect();
         assert!(unused.is_empty(), "nothing asks for: {unused:?}");
+    }
+
+    /// Every hint is offered, and an empty one is not a hint.
+    #[test]
+    fn a_hint_is_one_of_the_ones_written_down() {
+        let every: Vec<&str> = catalogue()
+            .iter()
+            .filter(|(key, text)| key.starts_with("hints.") && !text.trim().is_empty())
+            .map(|(_, text)| text.as_str())
+            .collect();
+        assert!(!every.is_empty(), "there are no hints to show");
+        for _ in 0..50 {
+            let said = hint();
+            assert!(every.contains(&said), "{said:?} is not one of the hints");
+        }
     }
 
     /// What is put into a line lands where the line says it should.

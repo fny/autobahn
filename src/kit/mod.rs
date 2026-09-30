@@ -137,9 +137,12 @@ impl Pane {
         }
     }
 
+    /// What a pane is for, under its name. Groups has none: a list of
+    /// every group with what each one last did explains itself, and a
+    /// sentence saying so is a sentence in the way.
     fn about(self) -> &'static str {
         match self {
-            Pane::Groups => t("pane.groups_about"),
+            Pane::Groups => "",
             Pane::Conflicts => t("pane.conflicts_about"),
             Pane::Config => t("pane.config_about"),
             Pane::Log => t("pane.log_about"),
@@ -374,6 +377,9 @@ pub struct Desk {
     /// When the last keystroke landed, so the loader is asked once the
     /// typing stops rather than on every letter.
     typed_at: Option<Instant>,
+    /// The hint this window opened with. Picked once: a line that
+    /// changed under the eye would be read as something happening.
+    hint: SharedString,
     /// The form's own scroll, so Save can put the refusal in view.
     form: ScrollHandle,
     /// Whether the loader's complaints are unfolded. Shut by default:
@@ -509,6 +515,7 @@ impl Desk {
             choices: std::collections::HashMap::new(),
             lists: std::collections::HashSet::new(),
             typed_at: None,
+            hint: SharedString::from(crate::words::hint()),
             form: ScrollHandle::new(),
             showing_faults: false,
             at_fields: std::collections::HashMap::new(),
@@ -911,8 +918,15 @@ impl Desk {
                             .text_color(rgb(FAINT))
                             .child(match self.report {
                                 None => self.pane.about().to_owned(),
+                                // A pane with nothing to say about itself
+                                // takes the shorter line, rather than the
+                                // longer one with a separator hanging off
+                                // the end of it.
                                 Some(_) => fill(
-                                    "pane.counted",
+                                    match self.pane.about().is_empty() {
+                                        true => "pane.counted_bare",
+                                        false => "pane.counted",
+                                    },
                                     &[
                                         ("groups", &counted("pane.group", groups, &[])),
                                         ("sessions", &counted("pane.session", sessions, &[])),
@@ -978,10 +992,13 @@ impl Desk {
                             .text_color(rgb(DIM))
                             .truncate()
                             .child(crate::text::display_safe(said).to_string()),
+                        // Nothing to say is a place to teach something:
+                        // one of the hints, chosen when the window
+                        // opened, rather than the same sentence for ever.
                         None => div().text_color(rgb(FAINT)).truncate().child(
                             match self.room {
                                 Room::Tight => tilde(&self.state_root.display().to_string()),
-                                _ => t("fleet.provenance").to_owned(),
+                                _ => self.hint.to_string(),
                             },
                         ),
                     }),

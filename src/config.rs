@@ -1317,11 +1317,7 @@ impl Config {
             if looks_like_a_path {
                 let path = crate::paths::expand_tilde(named).unwrap_or_else(|_| named.into());
                 if !path.exists() {
-                    warnings.push(format!(
-                        "on_alert: there is no {} to run; a session that needs a person \
-                         will say so in the log and nowhere else",
-                        path.display()
-                    ));
+                    warnings.push(format!("on_alert: there is no {} to run", path.display()));
                 }
             }
         }

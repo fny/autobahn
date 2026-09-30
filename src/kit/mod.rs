@@ -382,6 +382,14 @@ pub struct Desk {
     hint: SharedString,
     /// The form's own scroll, so Save can put the refusal in view.
     form: ScrollHandle,
+    /// The name being typed for a new group, while one is being made.
+    naming: Option<Entity<TextareaState>>,
+    /// The group the name in that field would rename, when it is a
+    /// rename rather than a new one.
+    renaming: Option<String>,
+    /// The group a Remove is waiting on a second click for. Nothing
+    /// that takes settings out of a file happens on one click.
+    removing: Option<String>,
     /// Whether the loader's complaints are unfolded. Shut by default:
     /// the line beside Save says there is one, which is all most of
     /// them need to say.
@@ -517,6 +525,9 @@ impl Desk {
             typed_at: None,
             hint: SharedString::from(crate::words::hint()),
             form: ScrollHandle::new(),
+            naming: None,
+            renaming: None,
+            removing: None,
             showing_faults: false,
             at_fields: std::collections::HashMap::new(),
             at_warned: std::collections::HashMap::new(),
@@ -2555,7 +2566,7 @@ impl Desk {
                                 })),
                         )
                     })
-                    .children(sections.into_iter().map(|section| {
+                    .children(sections.clone().into_iter().map(|section| {
                         let chosen = section == open;
                         let label = section.title();
                         let group = matches!(section, Section::Group(_));
@@ -2581,9 +2592,19 @@ impl Desk {
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.section = section.clone();
+                                this.removing = None;
                                 cx.notify();
                             }))
-                    })),
+                    }))
+                    // Making a group: a name, and the two keys it cannot
+                    // load without, left empty for the form to ask for.
+                    .child(self.naming(window, cx))
+                    // Renaming and removing the open one. Under the list
+                    // rather than beside each row: these are rare, and a
+                    // Remove on every line is a Remove under every mouse.
+                    .when(matches!(open, Section::Group(_)), |column| {
+                        column.child(self.group_tools(&open, cx))
+                    }),
             )
             .child(
                 div()
@@ -2642,6 +2663,185 @@ impl Desk {
                     .children(self.form(window, cx)),
             )
             .into_any_element()
+    }
+
+    /// The line that makes a group: a button, or a field and two more.
+    fn naming(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(field) = self.naming.clone() else {
+            return div()
+                .pt(step(2.))
+                .px(step(1.5))
+                // A flex row, so the button is the width of its label
+                // rather than the width of the column it sits in.
+                .flex()
+                .child(
+                    Button::new("new-group")
+                        .small()
+                        .ghost()
+                        .label(t("group.add"))
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let field = cx.new(|cx| {
+                                TextareaState::new(window, cx).placeholder(t("group.name_it"))
+                            });
+                            field.update(cx, |field, cx| field.focus(window, cx));
+                            this.naming = Some(field);
+                            this.renaming = None;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element();
+        };
+        div()
+            .pt(step(2.))
+            .px(step(1.5))
+            .flex()
+            .flex_col()
+            .gap(step(1.5))
+            .child(Textarea::new(&field).bordered(true))
+            .child(
+                div()
+                    .flex()
+                    .gap(step(1.5))
+                    .child(
+                        Button::new("make-group")
+                            .xsmall()
+                            .primary()
+                            .label(t("group.make"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.make(cx);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("cancel-group")
+                            .xsmall()
+                            .ghost()
+                            .label(t("group.cancel"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.naming = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// Rename and Remove, for the group the form is showing.
+    fn group_tools(&mut self, open: &Section, cx: &mut Context<Self>) -> AnyElement {
+        let Section::Group(name) = open else {
+            return div().into_any_element();
+        };
+        let name = name.clone();
+        let asking = self.removing.as_deref() == Some(name.as_str());
+        let renaming = name.clone();
+        let removing = name.clone();
+        div()
+            .pt(step(2.))
+            .px(step(1.5))
+            .flex()
+            .flex_col()
+            .gap(step(1.5))
+            .child(
+                div()
+                    .flex()
+                    .gap(step(1.5))
+                    .child(
+                        Button::new("rename-group")
+                            .xsmall()
+                            .outline()
+                            .label(t("group.rename"))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                // Renaming is naming, with the old name
+                                // already in the field.
+                                let held = renaming.clone();
+                                let field = cx.new(|cx| {
+                                    TextareaState::new(window, cx).default_value(held.clone())
+                                });
+                                field.update(cx, |field, cx| field.focus(window, cx));
+                                this.naming = Some(field);
+                                this.renaming = Some(held);
+                                this.removing = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("remove-group")
+                            .xsmall()
+                            .when(asking, |button| button.danger())
+                            .when(!asking, |button| button.outline())
+                            .label(t("group.remove"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                match this.removing.as_deref() == Some(removing.as_str()) {
+                                    true => this.drop(&removing),
+                                    // The first click asks; the second
+                                    // does it. Nothing that takes
+                                    // settings out of a file happens on
+                                    // one click.
+                                    false => this.removing = Some(removing.clone()),
+                                }
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .when(asking, |column| {
+                column.child(
+                    div()
+                        .max_w(px(220.))
+                        .text_size(px(10.5))
+                        .text_color(rgb(AMBER))
+                        .child(fill("group.removing", &[("name", &name)])),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// Makes the group the field names, or renames the open one to it.
+    fn make(&mut self, cx: &mut Context<Self>) {
+        let Some(field) = self.naming.clone() else { return };
+        let name = field.read(cx).value().to_string();
+        let name = name.trim().to_owned();
+        let from = self.renaming.clone();
+        let Some(sheet) = &mut self.sheet else { return };
+        let complaint = match &from {
+            Some(from) => sheet.rename_group(from, &name),
+            None => sheet.make_group(&name),
+        };
+        match complaint {
+            Some(said) => self.said = Some(said),
+            None => {
+                self.said = Some(fill(
+                    match from.is_some() {
+                        true => "group.renamed",
+                        false => "group.made",
+                    },
+                    &[("name", &name)],
+                ));
+                // The form follows the group it just made or renamed,
+                // and every cached field belongs to the old name.
+                self.section = Section::Group(name);
+                self.fields.clear();
+                self.choices.clear();
+                self.lists.clear();
+                self.naming = None;
+                self.renaming = None;
+            }
+        }
+    }
+
+    /// Takes the group out, and says what is left to do about its state.
+    fn drop(&mut self, name: &str) {
+        let Some(sheet) = &mut self.sheet else { return };
+        match sheet.drop_group(name) {
+            Some(said) => self.said = Some(said),
+            None => {
+                self.said = Some(fill("group.removed", &[("name", name)]));
+                self.section = Section::Settings;
+                self.removing = None;
+                self.fields.clear();
+                self.choices.clear();
+                self.lists.clear();
+            }
+        }
     }
 
     /// The fields of the open section, from the schema.

@@ -1175,6 +1175,87 @@ impl Sheet {
         None
     }
 
+    /// Makes a group, with the two keys without which it cannot load.
+    ///
+    /// A group needs an alpha and at least one beta, so it is written
+    /// with both, empty. That is refused by the loader — which is the
+    /// point: the form opens on a section whose two required fields are
+    /// red and say what they want, rather than on a table that quietly
+    /// does nothing.
+    pub(crate) fn make_group(&mut self, name: &str) -> Option<String> {
+        if name.trim().is_empty() {
+            return Some(t("config.group_needs_a_name").to_owned());
+        }
+        let name = name.trim();
+        // A name a command could not pass, and one already taken.
+        if name.starts_with('-') {
+            return Some(t("config.group_leading_dash").to_owned());
+        }
+        if self.groups().iter().any(|held| held == name) {
+            return Some(fill("config.group_exists", &[("name", name)]));
+        }
+        let mut document = self.document.clone();
+        let Some(table) = table_for(&mut document, &Section::Group(name.to_owned())) else {
+            return Some(fill("config.missing_section", &[("section", name)]));
+        };
+        table.insert("alpha", toml_edit::value(""));
+        table.insert("betas", toml_edit::value(toml_edit::Array::new()));
+        self.hold(document);
+        None
+    }
+
+    /// Takes a group out of the file. Its state is not this window's to
+    /// remove — `autobahn clean` is what does that — so the caller says
+    /// so rather than leaving ancestors and staged content behind in
+    /// silence.
+    pub(crate) fn drop_group(&mut self, name: &str) -> Option<String> {
+        let mut document = self.document.clone();
+        let Some(groups) = document.get_mut("groups").and_then(|item| item.as_table_mut()) else {
+            return Some(fill("config.no_such_group", &[("name", name)]));
+        };
+        if groups.remove(name).is_none() {
+            return Some(fill("config.no_such_group", &[("name", name)]));
+        }
+        self.hold(document);
+        None
+    }
+
+    /// Renames a group, keeping everything in it and where it sits.
+    pub(crate) fn rename_group(&mut self, from: &str, to: &str) -> Option<String> {
+        let to = to.trim();
+        if to.is_empty() {
+            return Some(t("config.group_needs_a_name").to_owned());
+        }
+        if to == from {
+            return None;
+        }
+        if to.starts_with('-') {
+            return Some(t("config.group_leading_dash").to_owned());
+        }
+        if self.groups().iter().any(|held| held == to) {
+            return Some(fill("config.group_exists", &[("name", to)]));
+        }
+        let mut document = self.document.clone();
+        let Some(groups) = document.get_mut("groups").and_then(|item| item.as_table_mut()) else {
+            return Some(fill("config.no_such_group", &[("name", from)]));
+        };
+        let Some(held) = groups.remove(from) else {
+            return Some(fill("config.no_such_group", &[("name", from)]));
+        };
+        groups.insert(to, held);
+        self.hold(document);
+        None
+    }
+
+    /// Every group the file names, in the order it names them.
+    pub(crate) fn groups(&self) -> Vec<String> {
+        self.document
+            .get("groups")
+            .and_then(|item| item.as_table())
+            .map(|groups| groups.iter().map(|(name, _)| name.to_owned()).collect())
+            .unwrap_or_default()
+    }
+
     /// Takes a changed document as the one being edited, and asks the
     /// loader what it thinks of it. Nothing is written here.
     fn hold(&mut self, document: toml_edit::DocumentMut) {
@@ -1485,6 +1566,55 @@ mod tests {
 
         // And a sentence with a colon in it is still not a key.
         assert!(fault_at("unable to read configuration /x: no such file").is_none());
+    }
+
+    /// A group can be made, renamed and taken out, and a name that
+    /// would not work is refused before the file is touched.
+    #[test]
+    fn a_group_can_be_made_renamed_and_taken_out() {
+        let text = "[defaults]\nmode = \"two-way-conflict\"\n\n\
+                    [groups.notes]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
+        let mut sheet = Sheet {
+            path: std::path::PathBuf::from("config.toml"),
+            text: text.to_owned(),
+            was: text.parse().unwrap(),
+            document: text.parse().unwrap(),
+            refused: None,
+            warned: Vec::new(),
+            stale: false,
+            quiet: false,
+        };
+
+        // Made with the two keys it cannot load without, both empty —
+        // so the loader refuses it and the form says which fields want
+        // filling, rather than a table that quietly does nothing.
+        assert_eq!(sheet.make_group("work"), None);
+        assert!(sheet.groups().contains(&"work".to_owned()));
+        assert!(sheet.held(&Section::Group("work".to_owned()), "alpha").is_some());
+        assert!(sheet.refused().is_some(), "an empty alpha is refused");
+
+        // A name that is taken, or that a command would read as an
+        // option, is refused before anything is written.
+        assert!(sheet.make_group("work").is_some());
+        assert!(sheet.make_group("-x").is_some());
+        assert!(sheet.make_group("  ").is_some());
+        assert_eq!(sheet.groups().len(), 2);
+
+        // Renaming keeps what is in it.
+        assert_eq!(sheet.rename_group("notes", "reading"), None);
+        assert_eq!(
+            sheet
+                .held(&Section::Group("reading".to_owned()), "alpha")
+                .map(|held| held.to_string().trim().to_owned()),
+            Some("\"/tmp/a\"".to_owned())
+        );
+        assert!(sheet.rename_group("reading", "work").is_some(), "taken");
+        assert!(sheet.rename_group("nothing", "x").is_some(), "no such group");
+
+        // And taking one out leaves the rest alone.
+        assert_eq!(sheet.drop_group("work"), None);
+        assert_eq!(sheet.groups(), vec!["reading".to_owned()]);
+        assert!(sheet.drop_group("work").is_some(), "already gone");
     }
 
     /// A hidden key is still a key: if one is renamed in the structs the

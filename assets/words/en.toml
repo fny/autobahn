@@ -81,6 +81,14 @@ unknown = "—"
 reveal_finder = "Reveal in Finder"
 reveal_folder = "Show the folder"
 
+# How much of itself the app shows.
+[presence]
+both = "Both"
+window = "Window"
+menubar = "Menu bar"
+at_next_launch = "kept; the menu bar item follows at the next launch"
+unwritable = "could not write the preference: {error}"
+
 [service]
 start = "Start"
 stop = "Stop"
@@ -212,6 +220,9 @@ keep_beta = "Keep the other side's version and copy it here."
 keep_both = "Keep both versions: the other side's is kept beside this one under a suffixed name."
 show_difference = "Show diff between the dipatcher and a peer."
 reveal = "Open the folder this file is in."
+presence_both = "A window and an item in the menu bar."
+presence_window = "A window, and nothing in the menu bar."
+presence_menubar = "An item in the menu bar, no window until it is asked for, and no icon in the dock."
 service_start = "Start the installed login service."
 service_stop = "Stop it. It stays registered and comes back at the next login."
 service_restart = "Stop and start it — after an upgrade, or an edit with reload off."

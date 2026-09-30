@@ -156,6 +156,7 @@ fn open_window(
     config: Option<PathBuf>,
     state_root: PathBuf,
     pane: Option<String>,
+    shown: bool,
     cx: &mut App,
 ) -> gpui_kit::WindowHandle<Root> {
     // A width can be asked for, which is how the narrow layouts are
@@ -175,6 +176,10 @@ fn open_window(
         cx,
     );
     let options = WindowOptions {
+        // A menu bar application still builds its window; it just does
+        // not put it on the screen until the menu asks for it, which
+        // is what "Open the window" in that menu is for.
+        show: shown,
         window_bounds: Some(WindowBounds::Windowed(bounds)),
         titlebar: Some(TitlebarOptions {
             title: Some(t("app.window").into()),
@@ -265,9 +270,12 @@ fn watch_the_bar(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
                     cx.quit();
                 }
                 if show {
+                    // Asking for the window is asking to be an
+                    // application with one, dock icon and all.
+                    crate::dock::in_the_dock(true);
                     cx.activate(true);
                     if cx.windows().is_empty() {
-                        open_window(config.clone(), state_root.clone(), None, cx);
+                        open_window(config.clone(), state_root.clone(), None, true, cx);
                     } else {
                         for window in cx.windows() {
                             window
@@ -382,6 +390,9 @@ pub struct Desk {
     hint: SharedString,
     /// The form's own scroll, so Save can put the refusal in view.
     form: ScrollHandle,
+    /// How much of itself this app shows: a window, a menu bar item,
+    /// or both.
+    presence: crate::dock::Presence,
     /// The name being typed for a new group, while one is being made.
     naming: Option<Entity<TextareaState>>,
     /// The group the name in that field would rename, when it is a
@@ -444,8 +455,22 @@ fn run_with(
         let config = config.clone();
         let state_root = state_root.clone();
         let wanted = shots.as_ref().and_then(|(_, pane)| pane.clone());
-        let window = open_window(config.clone(), state_root.clone(), wanted, cx);
-        if shots.is_none() {
+        // What this machine asked for: a window, a menu bar item, or
+        // both. A screenshot always wants the window, whatever the
+        // file says.
+        let presence = match shots.is_some() {
+            true => crate::dock::Presence::Both,
+            false => crate::dock::read(&state_root),
+        };
+        crate::dock::in_the_dock(presence.opens_a_window());
+        let window = open_window(
+            config.clone(),
+            state_root.clone(),
+            wanted,
+            presence.opens_a_window(),
+            cx,
+        );
+        if shots.is_none() && presence.takes_the_menu_bar() {
             // The same item in the menu bar the other window puts
             // there, from the same code: one poll, one notifier, and
             // "Open the window" when this one has been closed.
@@ -497,6 +522,7 @@ impl Desk {
             .into_iter()
             .find(|name| names.iter().any(|known| known == name))
             .unwrap_or("Menlo");
+        let presence = crate::dock::read(&state_root);
         let mut desk = Desk {
             config,
             mono: SharedString::from(mono.to_owned()),
@@ -525,6 +551,7 @@ impl Desk {
             typed_at: None,
             hint: SharedString::from(crate::words::hint()),
             form: ScrollHandle::new(),
+            presence,
             naming: None,
             renaming: None,
             removing: None,
@@ -652,6 +679,9 @@ impl Desk {
                 self.said = Some(fill("status.config_refused", &[("error", &first)]));
             }
         }
+        // The dock icon carries what needs a person, so a glance at it
+        // answers the question the window was opened to answer.
+        crate::dock::badge(self.waiting());
     }
 
     fn working(&self) -> bool {
@@ -848,6 +878,47 @@ impl Desk {
                                 })),
                         )
                     })
+                    // How much of itself this app shows. Kept in the
+                    // state root rather than the fleet's configuration:
+                    // whether this machine draws an icon is nobody
+                    // else's business.
+                    .child(
+                        div()
+                            .flex()
+                            .gap(step(1.))
+                            .children(
+                                [
+                                    crate::dock::Presence::Both,
+                                    crate::dock::Presence::Window,
+                                    crate::dock::Presence::Menubar,
+                                ]
+                                .into_iter()
+                                .map(|presence| {
+                                    let chosen = presence == self.presence;
+                                    Button::new(SharedString::from(format!(
+                                        "presence-{}",
+                                        presence.word()
+                                    )))
+                                    .xsmall()
+                                    .when(chosen, |button| button.primary())
+                                    .when(!chosen, |button| button.ghost())
+                                    .label(t(match presence {
+                                        crate::dock::Presence::Both => "presence.both",
+                                        crate::dock::Presence::Window => "presence.window",
+                                        crate::dock::Presence::Menubar => "presence.menubar",
+                                    }))
+                                    .tooltip(t(match presence {
+                                        crate::dock::Presence::Both => "tip.presence_both",
+                                        crate::dock::Presence::Window => "tip.presence_window",
+                                        crate::dock::Presence::Menubar => "tip.presence_menubar",
+                                    }))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.show_as(presence);
+                                        cx.notify();
+                                    }))
+                                }),
+                            ),
+                    )
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -857,6 +928,22 @@ impl Desk {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Chooses how much of itself the app shows, now and at next launch.
+    ///
+    /// The dock follows at once, because that is the half a person can
+    /// see happen. The menu bar item does not: taking one away and
+    /// putting it back mid-session is more moving parts than the
+    /// setting is worth, so it settles at the next launch and the
+    /// status line says so.
+    fn show_as(&mut self, presence: crate::dock::Presence) {
+        self.presence = presence;
+        crate::dock::in_the_dock(presence.opens_a_window());
+        self.said = Some(match crate::dock::write(&self.state_root, presence) {
+            Some(error) => fill("presence.unwritable", &[("error", &error)]),
+            None => t("presence.at_next_launch").to_owned(),
+        });
     }
 
     /// Asks the service manager for something, and says what came back.

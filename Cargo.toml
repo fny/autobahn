@@ -44,7 +44,7 @@ gpui-kit = { version = "0.6", optional = true }
 # objc2 refuses to compile anywhere else, and the tray builds on Linux.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = { version = "0.6", optional = true }
-objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSAppearance", "NSResponder", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView"] }
+objc2-app-kit = { version = "0.3", optional = true, features = ["NSApplication", "NSAppearance", "NSResponder", "NSStatusItem", "NSStatusBarButton", "NSButton", "NSControl", "NSView", "NSDockTile"] }
 # Notifications the system itself posts, rather than the deprecated path
 # notify-rust reaches for: grouped under the app, replaced by identifier
 # rather than stacked, and drawn the way every other notification is.

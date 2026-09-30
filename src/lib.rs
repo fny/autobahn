@@ -48,6 +48,10 @@ pub mod supervisor;
 pub mod text;
 pub mod threads;
 pub mod transport;
+/// The application's own presence: the dock icon, and whether there is
+/// a window, a menu bar item, or both.
+#[cfg(any(feature = "desk", feature = "desk-kit"))]
+pub mod dock;
 /// What a window over the fleet is, apart from its drawing.
 #[cfg(any(feature = "desk", feature = "desk-kit"))]
 pub(crate) mod surface;

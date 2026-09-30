@@ -656,6 +656,29 @@ pub(crate) fn refusal(path: &std::path::Path, text: &str) -> Result<Vec<String>,
     }
 }
 
+/// A plain sentence, written so a Markdown reader leaves it alone.
+///
+/// The kit draws selectable text through a Markdown view, and our
+/// messages are full of characters Markdown means something by: the
+/// asterisk in `*.safetensors`, the underscores in `max_file_size`,
+/// the backticks in a field's description. Escaped, they read as
+/// themselves — and a selection copied out of the view carries the
+/// rendered text, not this.
+pub(crate) fn as_written(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 8);
+    for letter in text.chars() {
+        if matches!(
+            letter,
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')'
+                | '#' | '+' | '-' | '.' | '!' | '|' | '<' | '>' | '~'
+        ) {
+            out.push('\\');
+        }
+        out.push(letter);
+    }
+    out
+}
+
 /// The first line of a message, for a status bar that has one line.
 pub(crate) fn first_line(message: &str) -> String {
     message.lines().next().unwrap_or_default().to_owned()
@@ -1181,6 +1204,19 @@ mod tests {
         let its_own = "invalid configuration:\n  group 'aws': invalid size 'asdf'\n                         group 'fny': no mode and the defaults specify none";
         assert_eq!(faults(its_own).len(), 2);
         assert_eq!(blamed(its_own), Some(Section::Group("aws".to_owned())));
+    }
+
+    /// Every character Markdown reads as punctuation comes back as
+    /// itself, and nothing else is touched.
+    #[test]
+    fn a_sentence_survives_being_drawn_as_markdown() {
+        let said = "no ignore file named \"a_b*c\" in ~/.autobahn/ignores (available: x.y)";
+        let written = as_written(said);
+        assert!(written.contains("a\\_b\\*c"), "{written}");
+        assert!(written.contains("\\(available"), "{written}");
+        // And unescaping it gives back exactly what went in, so nothing
+        // was dropped or doubled on the way.
+        assert_eq!(written.replace('\\', ""), said.replace('\\', ""));
     }
 
     /// A complaint that names its key belongs under that key, and the

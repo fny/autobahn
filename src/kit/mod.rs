@@ -23,6 +23,7 @@ use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, InputHighlighter, Textarea, TextareaState,
 };
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
+use gpui_kit::component::text::{SelectionFormat, TextView};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode};
@@ -2500,12 +2501,14 @@ impl Desk {
                                     faults
                                         .iter()
                                         .filter(|fault| surface::fault_at(fault).is_none())
-                                        .map(|fault| {
-                                            div()
-                                                .font_family(self.mono.clone())
-                                                .text_size(px(11.))
-                                                .text_color(rgb(DIM))
-                                                .child(crate::text::display_block(fault))
+                                        .enumerate()
+                                        .map(|(index, fault)| {
+                                            div().min_w(px(0.)).child(said(
+                                                format!("homeless-{index}"),
+                                                &crate::text::display_block(fault),
+                                                DIM,
+                                                11.,
+                                            ))
                                         }),
                                 ),
                         )
@@ -2772,7 +2775,12 @@ impl Desk {
                                     // A flex child will not wrap until it
                                     // is allowed to be narrower than its
                                     // text, which is what this says.
-                                    .child(div().min_w(px(0.)).child(fault.said.clone())),
+                                    .child(div().min_w(px(0.)).child(said(
+                                        format!("said-{key}"),
+                                        &fault.said,
+                                        ink,
+                                        11.,
+                                    ))),
                             )
                             .when(!fault.instead.is_empty(), |column| {
                                 column.child(
@@ -3334,6 +3342,24 @@ impl Verb {
 }
 
 // ── the small pieces ─────────────────────────────────────────────────
+
+/// A line of the loader's own words, which a person can select and copy.
+///
+/// Every other label in this window is text the window wrote and a
+/// reader can retype. A complaint is not: it names a path, a value,
+/// a filename, and the thing anybody wants to do with it is paste it
+/// somewhere. So complaints alone are drawn through the kit's text
+/// view, which selects, rather than a plain label, which cannot.
+fn said(id: impl Into<SharedString>, words: &str, colour: u32, size: f32) -> impl IntoElement {
+    let id: SharedString = id.into();
+    TextView::markdown(id, surface::as_written(words))
+        .selectable(true)
+        // A selection carries what was read, not the escaping that got
+        // it there.
+        .selection_format(SelectionFormat::Plain)
+        .text_size(px(size))
+        .text_color(rgb(colour))
+}
 
 fn dot(colour: u32) -> Div {
     div()

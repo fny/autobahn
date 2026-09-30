@@ -1720,12 +1720,14 @@ impl Desk {
                                     faults
                                         .iter()
                                         .filter(|fault| fault_at(fault).is_none())
-                                        .map(|fault| {
-                                            div()
-                                                .font_family(self.mono.clone())
-                                                .text_size(px(T_META))
-                                                .text_color(rgb(DIM))
-                                                .child(crate::text::display_block(fault))
+                                        .enumerate()
+                                        .map(|(index, fault)| {
+                                            self.copyable(
+                                                format!("homeless-{index}"),
+                                                crate::text::display_block(fault),
+                                                DIM,
+                                                cx,
+                                            )
                                         }),
                                 ),
                         )
@@ -1970,10 +1972,16 @@ impl Desk {
                                     .text_size(px(T_META))
                                     .text_color(rgb(ink))
                                     .child(div().flex_shrink_0().child("\u{26a0}"))
-                                    // A flex child will not wrap until it
-                                    // is allowed to be narrower than its
-                                    // text, which is what this says.
-                                    .child(div().min_w(px(0.)).child(fault.said.clone())),
+                                    // Nothing in this window selects — it
+                                    // draws its own text — so a complaint
+                                    // offers the other way to take it
+                                    // away: one click copies it.
+                                    .child(div().min_w(px(0.)).child(self.copyable(
+                                        format!("said-{key}"),
+                                        fault.said.clone(),
+                                        ink,
+                                        cx,
+                                    ))),
                             )
                             .when(!fault.instead.is_empty(), |column| {
                                 column.child(

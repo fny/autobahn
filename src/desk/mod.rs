@@ -154,6 +154,9 @@ pub struct Desk {
     /// the line beside Save says there is one, which is all most of
     /// them need to say.
     showing_faults: bool,
+    /// The complaints that belong to a field, by the field they belong
+    /// to. Worked out once a frame, where the loader's verdict is read.
+    at_fields: std::collections::HashMap<(Section, String), At>,
     /// Whether this window is showing what it keeps back.
     ///
     /// Five clicks on the wordmark. Not a secret and not a password —
@@ -402,6 +405,7 @@ impl Desk {
             section: Section::Settings,
             editing: None,
             showing_faults: false,
+            at_fields: std::collections::HashMap::new(),
             unlocked: false,
             knocks: 0,
             knocked_at: None,
@@ -1474,6 +1478,15 @@ impl Desk {
         };
         let faults = refused.as_deref().map(faults).unwrap_or_default();
         let blamed = refused.as_deref().and_then(blamed);
+        // Every fault that names a key goes under that key. What is
+        // left belongs to the file rather than to a field, and that is
+        // what the line beside Save is for.
+        self.at_fields = faults
+            .iter()
+            .filter_map(|fault| fault_at(fault))
+            .map(|at| ((at.section.clone(), at.key.clone()), at))
+            .collect();
+        let homeless = faults.len() - self.at_fields.len();
         let showing = self.showing_faults && refused.is_some();
         let pending = sheet.pending();
         let sections = self.sections();
@@ -1581,7 +1594,7 @@ impl Desk {
                                 .child(t("config.checking")),
                         )
                     })
-                    .when(!faults.is_empty(), |column| {
+                    .when(homeless > 0, |column| {
                         let where_ = blamed
                             .as_ref()
                             .map(Section::title)
@@ -1608,7 +1621,7 @@ impl Desk {
                                     div()
                                         .text_size(px(T_PILL))
                                         .text_color(rgb(RED))
-                                        .child(counted("config.faults", faults.len(), &[])),
+                                        .child(counted("config.faults", homeless, &[])),
                                 )
                                 .child(
                                     div()
@@ -1666,7 +1679,7 @@ impl Desk {
                     // Only when it was asked for, and never taller than
                     // a third of the pane: the form is what this column
                     // is for.
-                    .when(showing, |column| {
+                    .when(showing && homeless > 0, |column| {
                         column.child(
                             div()
                                 .id("faults-detail")
@@ -1688,13 +1701,18 @@ impl Desk {
                                         .text_color(rgb(RED))
                                         .child(t("config.refused")),
                                 )
-                                .children(faults.iter().map(|fault| {
-                                    div()
-                                        .font_family(self.mono.clone())
-                                        .text_size(px(T_META))
-                                        .text_color(rgb(DIM))
-                                        .child(crate::text::display_block(fault))
-                                })),
+                                .children(
+                                    faults
+                                        .iter()
+                                        .filter(|fault| fault_at(fault).is_none())
+                                        .map(|fault| {
+                                            div()
+                                                .font_family(self.mono.clone())
+                                                .text_size(px(T_META))
+                                                .text_color(rgb(DIM))
+                                                .child(crate::text::display_block(fault))
+                                        }),
+                                ),
                         )
                     })
                     .children(self.form(cx)),
@@ -1820,6 +1838,12 @@ impl Desk {
             .sheet
             .as_ref()
             .is_some_and(|sheet| sheet.changed(part, key));
+        let fault = self.at_fields.get(&(part.clone(), key.to_owned())).map(|at| At {
+            section: at.section.clone(),
+            key: at.key.clone(),
+            said: at.said.clone(),
+            instead: at.instead.clone(),
+        });
         // A window that has not been let in is not offered the
         // experimental words — unless the file already holds one, in
         // which case hiding it would offer to change the setting to
@@ -1869,15 +1893,23 @@ impl Desk {
                                     .font_family(self.mono.clone())
                                     .text_size(px(T_ROW))
                                     // A key that differs from the file
-                                    // says so where the key is read,
-                                    // not only in a count at the top.
-                                    .text_color(match touched {
-                                        true => rgb(AMBER),
-                                        false => rgb(INK),
+                                    // says so where the key is read, not
+                                    // only in a count at the top — and a
+                                    // key the loader is refusing says so
+                                    // louder than one merely edited.
+                                    .text_color(match (fault.is_some(), touched) {
+                                        (true, _) => rgb(RED),
+                                        (false, true) => rgb(AMBER),
+                                        (false, false) => rgb(INK),
                                     })
                                     .child(key.to_owned()),
                             )
-                            .when(touched, |row| row.child(dot(AMBER))),
+                            .when(touched || fault.is_some(), |row| {
+                                row.child(dot(match fault.is_some() {
+                                    true => RED,
+                                    false => AMBER,
+                                }))
+                            }),
                     )
                     .when(!hint.is_empty(), |column| {
                         column.child(
@@ -1896,6 +1928,69 @@ impl Desk {
                     .flex_col()
                     .gap(step(1.5))
                     .child(self.widget(part, key, field, &words, held, cx))
+                    // The loader's complaint about this value, under the
+                    // value: the mistake and the fix in one place.
+                    .when_some(fault, |column, fault: At| {
+                        let spot = Spot {
+                            section: part.clone(),
+                            key: key.to_owned(),
+                            item: None,
+                        };
+                        column
+                            .child(
+                                div()
+                                    .max_w(px(620.))
+                                    .flex()
+                                    .gap(step(1.5))
+                                    .text_size(px(T_META))
+                                    .text_color(rgb(RED))
+                                    .child(div().flex_shrink_0().child("\u{26a0}"))
+                                    .child(div().child(fault.said.clone())),
+                            )
+                            .when(!fault.instead.is_empty(), |column| {
+                                column.child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .items_center()
+                                        .gap(step(1.5))
+                                        .child(
+                                            div()
+                                                .text_size(px(T_PILL))
+                                                .text_color(rgb(FAINT))
+                                                .child(t("config.there_is")),
+                                        )
+                                        .children(fault.instead.iter().map(|word| {
+                                            let taken = word.clone();
+                                            let spot = spot.clone();
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "instead-{key}-{word}"
+                                                )))
+                                                .px(step(2.))
+                                                .py(px(2.))
+                                                .rounded(px(999.))
+                                                .border_1()
+                                                .border_color(rgb(LINE))
+                                                .bg(rgb(SUNK))
+                                                .cursor_pointer()
+                                                .font_family(self.mono.clone())
+                                                .text_size(px(T_PILL))
+                                                .text_color(rgb(DIM))
+                                                .hover(|chip| {
+                                                    chip.bg(rgb(RAISED)).text_color(rgb(INK))
+                                                })
+                                                .child(word.clone())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let mut array = toml_edit::Array::new();
+                                                    array.push(taken.clone());
+                                                    this.put(&spot, Some(toml_edit::value(array)));
+                                                    cx.notify();
+                                                }))
+                                        })),
+                                )
+                            })
+                    })
                     .when(!about.is_empty(), |column| {
                         column.child(
                             div()

@@ -1345,7 +1345,7 @@ impl Config {
                 Some(mode) => match parse_mode_spec(mode) {
                     Ok((mode, peers)) => (Some(mode), peers),
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(format!("group '{name}': mode: {message}"));
                         (None, false)
                     }
                 },
@@ -1373,7 +1373,7 @@ impl Config {
             ) {
                 Ok(word) => word.word == "power",
                 Err(complaint) => {
-                    errors.push(format!("group '{name}': {complaint}"));
+                    errors.push(format!("group '{name}': durability: {complaint}"));
                     false
                 }
             };
@@ -1485,7 +1485,7 @@ impl Config {
             // failure discovered only by the affected session's worker.
             match IgnoreSet::new(&ignores) {
                 Err(error) => {
-                    errors.push(format!("group '{name}': invalid ignore pattern: {error:#}"))
+                    errors.push(format!("group '{name}': ignores: invalid pattern: {error:#}"))
                 }
                 // A line that cannot ever do anything is a mistake worth
                 // refusing, not a preference: combining ignore files
@@ -1537,20 +1537,26 @@ impl Config {
                 Some(mode) => match parse_symlink_mode(mode) {
                     Ok(mode) => mode,
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(format!("group '{name}': symlink_mode: {message}"));
                         SymlinkMode::default()
                     }
                 },
             };
-            let mut permission = |value: Option<&str>, directory: bool| match value {
-                None => None,
-                Some(mode) => match parse_permission_mode(mode, directory) {
-                    Ok(bits) => Some(bits),
-                    Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
-                        None
-                    }
-                },
+            let mut permission = |value: Option<&str>, directory: bool| {
+                let key = match directory {
+                    true => "directory_mode",
+                    false => "file_mode",
+                };
+                match value {
+                    None => None,
+                    Some(mode) => match parse_permission_mode(mode, directory) {
+                        Ok(bits) => Some(bits),
+                        Err(message) => {
+                            errors.push(format!("group '{name}': {key}: {message}"));
+                            None
+                        }
+                    },
+                }
             };
             let file_mode = permission(
                 group
@@ -1575,7 +1581,7 @@ impl Config {
                 Some(spec) => match parse_size(spec) {
                     Ok(bytes) => Some(bytes),
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(format!("group '{name}': max_file_size: {message}"));
                         None
                     }
                 },
@@ -1594,7 +1600,7 @@ impl Config {
                 Some(mode) => match parse_staging_mode(mode) {
                     Ok(mode) => mode,
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(format!("group '{name}': staging: {message}"));
                         StagingMode::default()
                     }
                 },
@@ -1825,10 +1831,62 @@ impl Config {
         }
 
         if !errors.is_empty() {
+            let errors = fold(errors);
             bail!("invalid configuration:\n  {}", errors.join("\n  "));
         }
         Ok((plans, warnings))
     }
+}
+
+/// Says each fault once, however many groups ran into it.
+///
+/// Every group is planned in turn, so a bad value in `[defaults]` is
+/// found once per group that inherits it, and the file came back
+/// saying the same sentence eight times with a different name in
+/// front. That is one fault. It was never eight, and a person reading
+/// eight of them has to work out that it was one.
+///
+/// A fault the defaults caused is reported alone: the groups it
+/// reaches are every group, and naming them adds nothing. A fault two
+/// groups happen to share is reported once and names them, because
+/// there the group is where somebody would go to fix it.
+fn fold(errors: Vec<String>) -> Vec<String> {
+    let mut order: Vec<String> = Vec::new();
+    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in errors {
+        let (group, fault) = match line.strip_prefix("group '") {
+            Some(rest) => match rest.split_once("': ") {
+                Some((group, fault)) => (Some(group.to_owned()), fault.to_owned()),
+                None => (None, line.clone()),
+            },
+            None => (None, line.clone()),
+        };
+        if !order.contains(&fault) {
+            order.push(fault.clone());
+        }
+        let seen = groups.entry(fault).or_default();
+        if let Some(group) = group {
+            if !seen.contains(&group) {
+                seen.push(group);
+            }
+        }
+    }
+    order
+        .into_iter()
+        .map(|fault| {
+            let named = groups.get(&fault).cloned().unwrap_or_default();
+            // Inherited: the defaults are where it is written and where
+            // it would be fixed, so the groups are not worth naming.
+            if fault.starts_with("the defaults' ") {
+                return fault;
+            }
+            match named.len() {
+                0 => fault,
+                1 => format!("group '{}': {fault}", named[0]),
+                _ => format!("groups {}: {fault}", named.join(", ")),
+            }
+        })
+        .collect()
 }
 
 /// Parses a symbolic link mode name.
@@ -2857,6 +2915,61 @@ mod tests {
         )
         .expect_err("a file that writes the section twice is refused");
         assert!(format!("{both:#}").contains("duplicate field"), "{both:#}");
+    }
+
+    /// One bad value in `[defaults]` is one fault, however many groups
+    /// inherit it — the file used to come back saying the same sentence
+    /// once per group with a different name in front.
+    #[test]
+    fn a_fault_the_defaults_cause_is_reported_once() {
+        let error = format!(
+            "{:#}",
+            parse(
+                r#"
+                [defaults]
+                mode = "two-way-conflict"
+                max_file_size = "asdf"
+
+                [groups.a]
+                alpha = "/tmp/a"
+                betas = ["/tmp/b"]
+
+                [groups.b]
+                alpha = "/tmp/c"
+                betas = ["/tmp/d"]
+
+                [groups.c]
+                alpha = "/tmp/e"
+                betas = ["/tmp/f"]
+                "#,
+            )
+            .plans()
+            .expect_err("a bad size is refused")
+        );
+        let said = error.matches("invalid size").count();
+        assert_eq!(said, 1, "{error}");
+        // And the key it is about is named, so a form can put it where
+        // the value was typed.
+        assert!(error.contains("max_file_size: invalid size"), "{error}");
+    }
+
+    /// A fault two groups happen to share is still about those groups,
+    /// so it names them rather than pretending it came from above.
+    #[test]
+    fn a_fault_two_groups_share_names_them_once() {
+        let folded = fold(vec![
+            "group 'a': mode: unknown mode 'sideways'".to_owned(),
+            "group 'b': mode: unknown mode 'sideways'".to_owned(),
+            "group 'c': has an empty alpha".to_owned(),
+            "the defaults' ignore_files: no ignore file named \"x\"".to_owned(),
+        ]);
+        assert_eq!(folded.len(), 3, "{folded:?}");
+        assert_eq!(folded[0], "groups a, b: mode: unknown mode 'sideways'");
+        assert_eq!(folded[1], "group 'c': has an empty alpha");
+        assert_eq!(
+            folded[2],
+            "the defaults' ignore_files: no ignore file named \"x\""
+        );
     }
 
     #[test]

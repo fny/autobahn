@@ -505,6 +505,60 @@ pub(crate) fn faults(refusal: &str) -> Vec<String> {
     seen
 }
 
+/// One fault, matched to the field it is about.
+///
+/// The loader names the key it was reading — "the defaults'
+/// ignore_files: …", "group 'aws': max_file_size: …" — which is what
+/// lets a form put the complaint under the control that caused it
+/// rather than in a paragraph at the top of the pane.
+///
+/// Returns where it belongs, what to say there, and the words it
+/// offered instead, when it offered any.
+pub(crate) struct At {
+    pub(crate) section: Section,
+    pub(crate) key: String,
+    pub(crate) said: String,
+    pub(crate) instead: Vec<String>,
+}
+
+pub(crate) fn fault_at(fault: &str) -> Option<At> {
+    let (section, rest) = match fault.strip_prefix("the defaults' ") {
+        Some(rest) => (Section::Defaults, rest),
+        None => {
+            let rest = fault.strip_prefix("group '")?;
+            let (name, rest) = rest.split_once("': ")?;
+            (Section::Group(name.to_owned()), rest)
+        }
+    };
+    // "key: what went wrong". A colon inside the complaint itself is
+    // common, so only the first one counts, and only when what is in
+    // front of it looks like a key rather than a sentence.
+    let (key, said) = rest.split_once(": ")?;
+    if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+        return None;
+    }
+    // "(available: a, b, c)" is a list of choices wearing a sentence.
+    let mut said = said.to_owned();
+    let mut instead = Vec::new();
+    if let Some(open) = said.find("(available: ") {
+        if let Some(close) = said[open..].find(')') {
+            instead = said[open + 12..open + close]
+                .split(", ")
+                .map(str::trim)
+                .filter(|word| !word.is_empty())
+                .map(str::to_owned)
+                .collect();
+            said.replace_range(open..open + close + 1, "");
+        }
+    }
+    Some(At {
+        section,
+        key: key.to_owned(),
+        said: said.trim().trim_end_matches(&[' ', ','][..]).to_owned(),
+        instead,
+    })
+}
+
 /// The section a refusal is about, when it names one.
 ///
 /// A fault inherited from `[defaults]` is reported against every group
@@ -1047,6 +1101,33 @@ mod tests {
         let its_own = "invalid configuration:\n  group 'aws': invalid size 'asdf'\n                         group 'fny': no mode and the defaults specify none";
         assert_eq!(faults(its_own).len(), 2);
         assert_eq!(blamed(its_own), Some(Section::Group("aws".to_owned())));
+    }
+
+    /// A complaint that names its key belongs under that key, and the
+    /// filenames it offered are a choice rather than a sentence.
+    #[test]
+    fn a_fault_that_names_its_key_lands_on_that_field() {
+        let at = fault_at(
+            "the defaults' ignore_files: no ignore file named \"asdfasdf\" in \
+             /Users/x/.autobahn/ignores (available: Node.gitignore, Rust.gitignore)",
+        )
+        .expect("it names a key");
+        assert_eq!(at.section, Section::Defaults);
+        assert_eq!(at.key, "ignore_files");
+        assert_eq!(at.instead, vec!["Node.gitignore", "Rust.gitignore"]);
+        assert!(!at.said.contains("available"), "{}", at.said);
+        assert!(at.said.starts_with("no ignore file named"), "{}", at.said);
+
+        let mine = fault_at("group 'aws': max_file_size: invalid size 'asdf'")
+            .expect("a group's own key");
+        assert_eq!(mine.section, Section::Group("aws".to_owned()));
+        assert_eq!(mine.key, "max_file_size");
+        assert!(mine.instead.is_empty());
+
+        // A complaint that is a sentence, not a key, belongs nowhere in
+        // particular and must not be forced under a field.
+        assert!(fault_at("group 'aws': a peering mode needs a local alpha").is_none());
+        assert!(fault_at("sessions 'a' and 'b': endpoint nested").is_none());
     }
 
     /// A hidden key is still a key: if one is renamed in the structs the

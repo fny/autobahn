@@ -2695,7 +2695,7 @@ impl Desk {
             .as_ref()
             .is_some_and(|sheet| sheet.changed(part, key));
         let at = (part.clone(), key.to_owned());
-        let refused = self.at_fields.contains_key(&at);
+
         let said_here: Vec<(String, Vec<String>)> = self
             .at_fields
             .get(&at)
@@ -2707,10 +2707,12 @@ impl Desk {
                     .collect()
             })
             .unwrap_or_default();
-        let ink = match refused {
-            true => RED,
-            false => AMBER,
-        };
+        // Red is "something here is wrong", whether the loader refuses
+        // the file over it or merely remarks on it — a hook that is not
+        // there is a broken alerter either way. Amber is kept for the
+        // one thing it can mean on its own: edited, not written yet.
+        // The two used to share it, and a dot could not be read.
+        let ink = RED;
         // A window that has not been let in is not offered the
         // experimental words — unless the file already holds one, in
         // which case hiding it would offer to change the setting to

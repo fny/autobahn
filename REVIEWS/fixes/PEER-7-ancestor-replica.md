@@ -1,7 +1,9 @@
 # PEER-7: Ancestor replica adoption and trust
 
 **Findings:** H-11 (ASTRA F06), L-10 (KIMI ABN-L7), and fabricated history, issue 6 of the peering trust discussion.
-**Status:** deferred, not in v1. Documented in `docs/peering.md`.
+**Status:** H-11 and L-10 fixed, 2026-09-30. The false-history mitigation is not done, on purpose: see below. False history stays documented in `docs/peering.md` as a known security issue.
+
+**Why the mitigation was left out.** An alpha that keeps its own ancestor after a handback reconciles the attached session against history from before the failover. When the handback happens, the two trees are level, so most differences read as the same change on both sides. The window after the handback is the problem. A file created during the failover and deleted on the alpha before the alpha's first cycle reads as a creation on the beta against the old ancestor, and comes back. That undoes a user's deletion in the honest case to guard against a dishonest leader, and by the ticket's own account it does not stop careful fabrication.
 
 ## Problem
 

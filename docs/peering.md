@@ -142,7 +142,6 @@ A laptop that attaches to a leading beta therefore trusts that beta with the lap
 
 These can let two controllers write one root, or leave a peer stuck, in some timings.
 
-- **A newer ancestor can be replaced by an older replica.** If a peer's ancestor still lives only in its journal, adoption treats it as generation zero. An older replica then overwrites it, losing the history that tells a deliberate edit from an unchanged file.
 - **Several peering groups share one identity.** Groups aimed at different roots on one host push different `name` files to the same place. The last push wins, so failover covers only part of the groups.
 - **A follower takes over with an old configuration.** A follower reads the pushed configuration once, before it starts following. Changes pushed while it follows are ignored at takeover.
 - **Handoff can stall or go to the wrong peer.**
@@ -150,7 +149,6 @@ These can let two controllers write one root, or leave a peer stuck, in some tim
   - Plain groups stop while the alpha follows.
   - `peering yield --to <beta>` does not check its target, so a typo leaves nobody leading until the timeout.
   - Some leases ignore the configured `ttl`.
-- **An oversized ancestor record can wedge a follower.** A record over the 1 GiB read limit is still written, and every later open of that ancestor then fails until `reset`.
 
 ## What is not covered
 

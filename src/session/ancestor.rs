@@ -158,6 +158,15 @@ pub(crate) struct AncestorStore {
     /// before the next attempt: the back-off after repeated failures.
     compaction_failures: u32,
     compaction_deferred: u32,
+    /// Whether the next record must be a checkpoint: one for a record too
+    /// large to journal failed, and may or may not have landed, so no
+    /// record can be journalled against either generation until a
+    /// checkpoint settles which one the store stands at.
+    checkpoint_owed: bool,
+    /// A lower limit on a record's payload than the loader's, so a test
+    /// can hold the limit without writing a gigabyte.
+    #[cfg(test)]
+    pub(crate) record_limit: Option<u64>,
     /// The journal, held open across appends. An intent and an achieved
     /// record per cycle would otherwise cost two opens per cycle, which
     /// measured as two to four milliseconds of p50 on the edit path. The
@@ -286,6 +295,9 @@ impl AncestorStore {
             compaction_warnings: 0,
             compaction_failures: 0,
             compaction_deferred: 0,
+            checkpoint_owed: false,
+            #[cfg(test)]
+            record_limit: None,
             journal: None,
         };
 
@@ -355,6 +367,9 @@ impl AncestorStore {
             compaction_warnings: 0,
             compaction_failures: 0,
             compaction_deferred: 0,
+            checkpoint_owed: false,
+            #[cfg(test)]
+            record_limit: None,
             journal: None,
         }
     }
@@ -515,12 +530,25 @@ impl AncestorStore {
         // the record applies to the checkpoint before. Failing the cycle
         // instead would fail every first cycle on a filesystem whose
         // directories cannot be synced.
-        if record.len() as u64 > self.compaction_threshold() {
+        //
+        // Not a record over the limit the loader reads, though: journalled,
+        // every later open of the store would refuse it. Its checkpoint
+        // failing fails the cycle, and since that checkpoint may have
+        // landed, the next record is a checkpoint as well.
+        let oversized = self.oversized(&record);
+        if oversized || self.checkpoint_owed || record.len() as u64 > self.compaction_threshold() {
             match self.checkpoint(self.generation + 1, ancestor) {
                 Ok(()) => {
                     self.generation += 1;
                     self.compaction_failures = 0;
+                    self.checkpoint_owed = false;
                     return Ok(());
+                }
+                Err(error) if oversized || self.checkpoint_owed => {
+                    self.checkpoint_owed = true;
+                    return Err(error.context(
+                        "unable to checkpoint a change set too large for the ancestor journal",
+                    ));
                 }
                 Err(error) => self.compaction_failed(&error),
             }
@@ -627,8 +655,26 @@ impl AncestorStore {
         encode_record(self.generation, entry)
     }
 
-    /// Appends one encoded record, rolling back a partial write.
+    /// Whether an encoded record's payload is over the limit the loader
+    /// reads a record to.
+    fn oversized(&self, record: &[u8]) -> bool {
+        #[cfg(test)]
+        let limit = self.record_limit.unwrap_or(MAXIMUM_RECORD_SIZE);
+        #[cfg(not(test))]
+        let limit = MAXIMUM_RECORD_SIZE;
+        record.len().saturating_sub(RECORD_HEADER_SIZE) as u64 > limit
+    }
+
+    /// Appends one encoded record, rolling back a partial write. A record
+    /// the loader would refuse is never written: every later open of the
+    /// store would fail on it.
     fn append(&mut self, record: &[u8], sync: bool) -> Result<()> {
+        if self.oversized(record) {
+            bail!(
+                "an ancestor journal record of {} bytes is over the {MAXIMUM_RECORD_SIZE}-byte limit",
+                record.len()
+            );
+        }
         if self.journal.is_none() {
             self.journal = Some(
                 OpenOptions::new()
@@ -2337,6 +2383,78 @@ mod tests {
         // holds the record and the journal's copy is spent.
         let (_, loaded, _) = AncestorStore::open(&path).expect("reopens");
         assert!(same(&loaded, &large));
+    }
+
+    /// A change set too large for a journal record is checkpointed and
+    /// never journalled: written, the loader would refuse it and every
+    /// later open of the store would fail. Appended directly, it is
+    /// refused and the journal is untouched.
+    #[test]
+    fn an_oversized_record_is_checkpointed_and_never_journalled() {
+        let keep = tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+        store.record_limit = Some(4 * 1024);
+        let seed = Some(directory(vec![file("seed", 0)]));
+        store
+            .record(&[change("", seed.clone())], seed.as_ref())
+            .expect("records");
+        let journal = fs::read(journal_path(&path)).unwrap();
+
+        let record = encode_record(store.generation, &JournalEntry::Intent(vec!["x".repeat(8192)]))
+            .unwrap();
+        let error = store.append(&record, false).expect_err("over the limit");
+        assert!(format!("{error:#}").contains("limit"), "{error:#}");
+        assert_eq!(fs::read(journal_path(&path)).unwrap(), journal);
+
+        let children: Vec<Node> = (0..500).map(|i| file(&format!("f{i:04}"), 1)).collect();
+        let large = Some(directory(children));
+        store
+            .record(&[change("", large.clone())], large.as_ref())
+            .expect("checkpointed instead");
+        assert_eq!(store.generation, 2);
+        assert!(fs::read(journal_path(&path)).unwrap().is_empty());
+        drop(store);
+        let (store, loaded, _) = AncestorStore::open(&path).expect("reopens");
+        assert_eq!(store.generation, 2);
+        assert!(same(&loaded, &large));
+    }
+
+    /// When the checkpoint that stands in for an oversized record fails,
+    /// the cycle fails — the record cannot be journalled instead — and the
+    /// next record is a checkpoint too, since the failed one may have
+    /// landed: what reopens is always the ancestor last recorded.
+    #[test]
+    fn a_failed_checkpoint_of_an_oversized_record_fails_and_is_owed() {
+        let keep = tempdir().unwrap();
+        let path = keep.path().join("ancestor");
+        let mut store = AncestorStore::open(&path).expect("the store opens").0;
+        store.record_limit = Some(4 * 1024);
+        let seed = Some(directory(vec![file("seed", 0)]));
+        store
+            .record(&[change("", seed.clone())], seed.as_ref())
+            .expect("records");
+
+        let children: Vec<Node> = (0..500).map(|i| file(&format!("f{i:04}"), 1)).collect();
+        let large = Some(directory(children));
+        store.fail_directory_sync = true;
+        store
+            .record(&[change("", large.clone())], large.as_ref())
+            .expect_err("an oversized record whose checkpoint failed fails the cycle");
+        assert_eq!(store.generation, 1);
+
+        // The next cycle — the ancestor still as it was, since the failed
+        // one was never installed — records a small change: checkpointed.
+        store.fail_directory_sync = false;
+        let next = Some(directory(vec![file("seed", 0), file("small", 2)]));
+        store
+            .record(&[change("small", Some(file("small", 2)))], next.as_ref())
+            .expect("records");
+        assert_eq!(store.generation, 2);
+        drop(store);
+        let (store, loaded, _) = AncestorStore::open(&path).expect("reopens");
+        assert_eq!(store.generation, 2);
+        assert!(same(&loaded, &next));
     }
 
     /// Records five cycles and returns the journal's bytes with the offset

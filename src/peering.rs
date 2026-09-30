@@ -836,6 +836,64 @@ mod tests {
         assert_eq!(copy.ancestor.as_ref().map(|n| n.children().len()), Some(2));
     }
 
+    /// Records `generations` small cycles into a fresh store at `path`,
+    /// every one journalled: the store is a journal and no checkpoint.
+    fn journal_only(path: &Path, generations: u64) {
+        let (mut store, _, _) = AncestorStore::open(path).unwrap();
+        let mut names = Vec::new();
+        for generation in 1..=generations {
+            names.push(format!("f{generation:03}"));
+            let tree = Node::directory(
+                "",
+                names.iter().map(|name| Node::directory(name, Vec::new())).collect(),
+            );
+            store
+                .record(
+                    &[Change {
+                        path: String::new(),
+                        old: None,
+                        new: Some(tree.clone()),
+                    }],
+                    Some(&tree),
+                )
+                .unwrap();
+        }
+        assert!(!path.exists(), "the store should hold no checkpoint");
+        assert_eq!(AncestorStore::stored_generation(path).unwrap(), generations);
+    }
+
+    /// Adoption compares the two stores' generations journal and all: a
+    /// newer local history that is only in its journal is kept over an
+    /// older copy, and a copy that is only a journal is still a copy.
+    #[test]
+    fn adoption_reads_generations_from_the_journal_too() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let state_root = keep.path();
+        let directory = state_root.join(DIRECTORY);
+        let session = crate::session::session_identifier("a", "b");
+        let own = state_root.join("sessions").join(&session).join("ancestor");
+        let copy = ancestor_copy_path(&directory, &session).unwrap();
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+
+        // A journal-only local ancestor at 10 is kept over a copy at 9.
+        journal_only(&own, 10);
+        journal_only(&copy, 9);
+        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(AncestorStore::stored_generation(&own).unwrap(), 10);
+
+        // A journal-only copy at 9 is adopted over a local ancestor at 5.
+        AncestorStore::reset(&own).unwrap();
+        journal_only(&own, 5);
+        assert!(adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(AncestorStore::stored_generation(&own).unwrap(), 9);
+        let (_, adopted, _) = AncestorStore::open(&own).unwrap();
+        assert_eq!(adopted.map(|tree| tree.children().len()), Some(9));
+
+        // No copy at all adopts nothing.
+        AncestorStore::reset(&copy).unwrap();
+        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
+    }
 }
 
 /// The star as a follower sees it: the plans it would run as leader, and
@@ -1135,17 +1193,19 @@ pub fn destination_of(leader: &str) -> &str {
 /// the copy's files. A beta that starts to lead seeds its sessions this
 /// way; an alpha that gets the lead back adopts what the beta recorded
 /// meanwhile. Returns whether anything was adopted.
+///
+/// Both generations are the store's own, journal and all: a store may be
+/// a checkpoint, a journal, or both, and one whose history is still only
+/// in its journal holds every generation it recorded. Read from the
+/// checkpoint alone, it stood at zero, and any older copy replaced it.
 pub fn adopt_newer_copy(state_root: &Path, directory: &Path, session: &str) -> Result<bool> {
     let copy = ancestor_copy_path(directory, session)?;
-    if !copy.exists() {
+    let copied = AncestorStore::stored_generation(&copy)?;
+    if copied == 0 {
         return Ok(false);
     }
     let own = state_root.join("sessions").join(session).join("ancestor");
-    let copied = AncestorStore::stored_generation(&copy)?;
-    let held = match own.exists() {
-        true => AncestorStore::stored_generation(&own)?,
-        false => 0,
-    };
+    let held = AncestorStore::stored_generation(&own)?;
     if copied <= held {
         return Ok(false);
     }

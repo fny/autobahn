@@ -127,9 +127,7 @@ These are open and will not be fixed before peering leaves this status.
 
 In the usual setup this grants nothing new, because a leader already holds an SSH login to every peer. It does mean you should peer only machines that would each trust the others with a shell. SSH keys locked to `command="autobahn agent"` do not contain a peering leader, and are not supported with peering.
 
-**While a beta leads, it can push files into the alpha's machine.** A genuine leader never does this, but the alpha still accepts files into its `~/.autobahn/peering/`. A pushed `name` file makes the alpha refuse to start alongside its own configuration. If you then move your configuration aside as the error suggests, the alpha runs the pushed configuration instead, including its commands. If this happens, delete `~/.autobahn/peering/name` and keep your own configuration.
-
-When the alpha attaches, it serves the leader only its own peering sessions, as its own configuration has them: the root, ignores, modes, owners and staging are the alpha's, whatever the leader asks for. A leader can change files inside those roots, as any beta can in a two-way mode, and nothing outside them.
+**While a beta leads, it can change what the alpha syncs with it, and nothing else there.** When the alpha attaches, it serves the leader only its own peering sessions, as its own configuration has them: the root, ignores, modes, owners and staging are the alpha's, whatever the leader asks for, and the alpha takes no pushed files. A leader can change files inside those roots, as any beta can in a two-way mode, and nothing outside them.
 
 **A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
 
@@ -138,7 +136,7 @@ When the alpha attaches, it serves the leader only its own peering sessions, as 
 - **A one-off `sync` or `resolve` is not fenced.** A channel that never presents a lease is never refused, so a command run by hand from any machine can still write a peer. Peering trusts the operator here.
 - **A beta that cannot reach another beta.** Every peer must be able to reach every other with the specs in the configuration. Two servers that need a tunnel between them are a follow-up (`peer_ssh_config`).
 - **A beta's sessions with the other betas start without an ancestor.** The alpha's session with each beta is replicated; a session between two betas exists only during a failover and has no history to inherit. If the two betas were in step when the alpha left, they agree; whatever was in flight shows as a handful of conflicts, never as loss.
-- **A peer runs the pushed configuration, or its own — not both.** A configuration of its own alongside a pushed one is refused at startup.
+- **A peer runs the pushed configuration, or its own — not both.** A machine with a configuration of its own runs that, and is not a peer: a pushed `name` beside it is ignored, with a warning at startup.
 - **The menu bar app and `mi`** show the role only through `status`.
 - **Clocks.** Staleness is judged on the follower's clock against the leader's `renewed_at`. Seconds of skew do not matter; minutes do.
 

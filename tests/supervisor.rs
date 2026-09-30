@@ -4268,6 +4268,62 @@ fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
     });
 }
 
+/// A machine with a configuration of its own is never a peer: a `name` a
+/// leader pushed into its peering directory is ignored with a warning, and
+/// its own configuration runs. It used to refuse to start and tell the
+/// user to move one of the two aside — and a name a hostile leader pushed
+/// would have them move their own.
+#[test]
+fn a_stray_peer_name_beside_a_configuration_is_ignored_with_a_warning() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "first.txt", "first");
+    let home = world.directory("home");
+    let state = home.join(".autobahn");
+    fs::create_dir_all(state.join("peering")).expect("the peering directory");
+    fs::write(state.join("peering").join("name"), "hostile:/x").expect("a stray name");
+    fs::write(
+        state.join("config.toml"),
+        format!(
+            "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-safe\"\ninterval = 1\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .expect("configuration should be writable");
+    let log = world.path("watch.log");
+    let child = std::process::Command::new(agent_binary())
+        .args(["watch", "--log"])
+        .env("HOME", &home)
+        .env("AUTOBAHN_HOME", &state)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log).expect("a log"))
+        .spawn()
+        .expect("watch starts");
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Kill(child);
+    assert!(
+        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+        "its own configuration runs: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(child.0.try_wait().expect("waitable").is_none());
+    let said = fs::read_to_string(&log).expect("the log");
+    assert!(
+        said.contains("names this machine as a peer") && said.contains("is never a peer"),
+        "{said}"
+    );
+    assert!(!said.contains("aside"), "{said}");
+}
+
 #[test]
 fn watch_keeps_synchronizing_after_its_standard_output_closes() {
     // `autobahn watch | head -1`: the reader goes away, and every later

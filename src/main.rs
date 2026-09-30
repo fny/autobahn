@@ -1625,16 +1625,18 @@ fn run_peering(verb: PeeringVerb) -> Result<()> {
 /// service left as it was. A peer runs a pushed configuration instead of
 /// its own, and is not checked.
 fn check_startable(config: Option<PathBuf>) -> Result<()> {
-    if config.is_none() {
+    let path = match config.clone() {
+        Some(path) => path,
+        None => paths::default_config_path()?,
+    };
+    // A peer runs a pushed configuration, unless it has one of its own:
+    // then a pushed name is ignored, and its own is what starts.
+    if config.is_none() && !path.is_file() {
         let directory = autobahn::peering::directory()?;
         if autobahn::supervisor::peer::is_peer(&directory) {
             return Ok(());
         }
     }
-    let path = match config {
-        Some(path) => path,
-        None => paths::default_config_path()?,
-    };
     // The same checks the supervisor makes at startup. A running one
     // makes them again on every edit, but applies an edit that disables
     // every session rather than refusing it.
@@ -1748,19 +1750,24 @@ fn run_watch(
         None => paths::default_config_path()?,
     };
     // A peer — a machine some leader pushed a name to — runs the leader's
-    // configuration, turned around, and not one of its own. The two
-    // cannot run side by side yet, so a configuration of its own is
-    // refused rather than quietly ignored.
+    // configuration, turned around, and not one of its own. A machine with
+    // a configuration of its own is never a peer: the pushed name is
+    // ignored, with a warning, and its own configuration runs. Refusing to
+    // start instead once told the user to move one of the two aside — and
+    // a name a hostile leader pushed would have them move their own.
     if config.is_none() {
         let directory = autobahn::peering::directory()?;
-        if autobahn::supervisor::peer::is_peer(&directory) {
-            if config_path.is_file() {
-                bail!(
-                    "this machine is a peer of another autobahn (it holds {}), and a                      configuration of its own at {} cannot run alongside that yet; move one                      of them aside",
-                    directory.join("name").display(),
-                    config_path.display()
-                );
-            }
+        if autobahn::supervisor::peer::is_peer(&directory) && config_path.is_file() {
+            autobahn::complain!(
+                "warning: {} names this machine as a peer of another autobahn, but it has a \
+                 configuration of its own at {}, which is what runs: a machine with its own \
+                 configuration is never a peer. If you did not set this machine up as a \
+                 peer, delete {}",
+                directory.display(),
+                config_path.display(),
+                directory.join("name").display()
+            );
+        } else if autobahn::supervisor::peer::is_peer(&directory) {
             autobahn::logging::set_level(match debug {
                 true => Some(autobahn::logging::Level::Debug),
                 false => None,

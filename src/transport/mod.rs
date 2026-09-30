@@ -673,9 +673,11 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                             .unwrap_or_else(|error| error.into_inner())
                             .insert(channel, counted.clone());
                         let output = &output;
+                        let attached = policy.is_some();
                         crate::threads::spawn_deep_scoped(scope, move || {
                             serve_channel(
                                 channel, initialize, state_root, receiver, output, counted,
+                                attached,
                             )
                         });
                     }
@@ -834,6 +836,7 @@ fn reporting_scan<W: Write + Send, T>(
 /// Serves one channel: the endpoint is created here (answering the open),
 /// then requests are served in order, each answered on the shared writer.
 /// The thread ends when the dispatcher drops the channel's sender.
+#[allow(clippy::too_many_arguments)]
 fn serve_channel<W: Write + Send>(
     channel: u32,
     initialize: Initialize,
@@ -841,6 +844,7 @@ fn serve_channel<W: Write + Send>(
     requests: std::sync::mpsc::Receiver<Request>,
     output: &std::sync::Mutex<W>,
     counted: std::sync::Arc<crate::progress::SideProgress>,
+    attached: bool,
 ) {
     // Endpoint creation failures answer on the channel (the controller
     // would otherwise see only silence) without affecting the connection's
@@ -1000,6 +1004,14 @@ fn serve_channel<W: Write + Send>(
             } => open_copy(&peering_directory, &initialize.session, &mut copy)
                 .and_then(|copy| copy.checkpoint(generation, ancestor))
                 .map(|generation| Response::Recorded { generation }),
+            // An attached alpha has a configuration of its own, and a
+            // genuine leader never pushes it one: a pushed `name` there
+            // would have it start as a follower of whoever sent it. The
+            // lease and the ancestor records, which the handback needs,
+            // are taken as from any leader.
+            Request::PutPeeringFile { .. } if attached => Err(anyhow!(
+                "an attached alpha takes no pushed files: it runs its own configuration"
+            )),
             Request::PutPeeringFile { name, bytes } => peering_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
@@ -2152,6 +2164,27 @@ pub(crate) mod tests {
             assert!(
                 format!("{error:#}").contains("not one of this alpha's peering sessions"),
                 "{error:#}"
+            );
+        });
+
+        // A genuine leader never pushes the attached alpha a file, and a
+        // hostile one's is refused, with nothing written; the lease and the
+        // ancestor records the handback needs are taken as from any leader.
+        attach(&|client| {
+            let mut endpoint =
+                crate::endpoint::remote::RemoteEndpoint::connect(client, own.clone()).unwrap();
+            let error = endpoint
+                .put_peering_file("name", b"hostile:/x")
+                .expect_err("no pushes into an attached alpha");
+            assert!(
+                format!("{error:#}").contains("takes no pushed files"),
+                "{error:#}"
+            );
+            assert!(!state.join(crate::peering::DIRECTORY).join("name").exists());
+            let lease = crate::peering::Lease::new("box:/x", 4, std::time::Duration::from_secs(30));
+            assert_eq!(
+                endpoint.lease(&lease).expect("the lease is taken"),
+                crate::peering::LeaseAnswer::Accepted
             );
         });
 

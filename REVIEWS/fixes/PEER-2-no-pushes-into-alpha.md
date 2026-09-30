@@ -1,7 +1,7 @@
 # PEER-2: The attached alpha refuses pushed files
 
 **Findings:** new, found during the 2026-09-24 walkthrough. It is not in any of the six reviews.
-**Status:** deferred, not in v1. Documented in `docs/peering.md` with a workaround.
+**Status:** fixed, 2026-09-30. A channel served under the attach policy refuses `PutPeeringFile` and still takes the lease and ancestor records. At startup, a machine with its own configuration runs it and ignores a pushed `name` with a warning that suggests deleting the stray file, never the configuration; `check_startable` checks that configuration rather than skipping it.
 
 ## Problem
 

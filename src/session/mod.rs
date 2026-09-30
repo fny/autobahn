@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::endpoint::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
+use crate::endpoint::{
+    ChangeActivity, Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome,
+};
 pub mod ancestor;
 
 use crate::tree::{
@@ -905,25 +907,46 @@ impl Session {
     /// no evidence of a burst, which shortens the settle rather than
     /// lengthening it: cycles are idempotent, so the cost of cycling a
     /// little eagerly is work, never correctness.
+    ///
+    /// A file still open for writing is the one exception to "quiet means
+    /// done". A safe save — write a temporary file, flush it, rename it over
+    /// the original — goes silent during the flush, and a cycle then would
+    /// copy a temporary file that is renamed away before it arrives. So
+    /// while a side reports a file open for writing, the settle waits past
+    /// `maximum`, up to [`crate::endpoint::WRITE_GRACE`], for it to close.
+    /// A save that closes the moment it has written — most of them — waits
+    /// no longer than before.
     pub fn settle(&mut self, maximum: std::time::Duration, quiet: std::time::Duration) {
-        let deadline = std::time::Instant::now() + maximum;
+        let started = std::time::Instant::now();
+        let deadline = started + maximum;
+        let writing_deadline = started + crate::endpoint::WRITE_GRACE.max(maximum);
         let sample = |session: &mut Self| {
             (
                 session.alpha.change_activity(),
                 session.beta.change_activity(),
             )
         };
+        let writing = |sampled: &(Option<ChangeActivity>, Option<ChangeActivity>)| {
+            [sampled.0, sampled.1]
+                .iter()
+                .any(|side| side.is_some_and(|activity| activity.writing))
+        };
         let mut previous = sample(self);
-        while std::time::Instant::now() < deadline {
-            let slice = quiet.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        loop {
+            let limit = match writing(&previous) {
+                true => writing_deadline,
+                false => deadline,
+            };
+            let slice = quiet.min(limit.saturating_duration_since(std::time::Instant::now()));
             if slice.is_zero() {
                 break;
             }
             std::thread::sleep(slice);
             let current = sample(self);
-            // Neither side recorded anything new across the slice: whatever
-            // triggered this settle has finished arriving.
-            if current == previous {
+            // Neither side recorded anything new across the slice, and
+            // nothing is still being written: whatever triggered this
+            // settle has finished arriving.
+            if current == previous && !writing(&current) {
                 break;
             }
             previous = current;
@@ -1992,6 +2015,9 @@ mod tests {
     struct ScriptedEndpoint {
         snapshots: std::collections::VecDeque<crate::tree::Snapshot>,
         last: Option<crate::tree::Snapshot>,
+        /// What each `change_activity` sample returns, in turn; the last
+        /// one repeats. Empty reports nothing, as a remote endpoint does.
+        activity: std::collections::VecDeque<ChangeActivity>,
     }
 
     impl ScriptedEndpoint {
@@ -1999,11 +2025,20 @@ mod tests {
             ScriptedEndpoint {
                 snapshots: snapshots.into(),
                 last: None,
+                activity: std::collections::VecDeque::new(),
             }
         }
     }
 
     impl Endpoint for ScriptedEndpoint {
+        fn change_activity(&mut self) -> Option<ChangeActivity> {
+            match self.activity.len() {
+                0 => None,
+                1 => self.activity.front().copied(),
+                _ => self.activity.pop_front(),
+            }
+        }
+
         fn scan(&mut self) -> Result<crate::tree::Snapshot> {
             if let Some(next) = self.snapshots.pop_front() {
                 self.last = Some(next);
@@ -2218,6 +2253,79 @@ mod tests {
             preserves_executability: true,
             ..crate::tree::Snapshot::default()
         }
+    }
+
+    fn settling(alpha_activity: Vec<ChangeActivity>) -> (Session, tempfile::TempDir) {
+        let root = || scripted(Node::directory("", vec![file("shared", 1)]));
+        let mut alpha = ScriptedEndpoint::new(vec![root()]);
+        alpha.activity = alpha_activity.into();
+        let state = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            Box::new(alpha),
+            Box::new(ScriptedEndpoint::new(vec![root()])),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .expect("session should be creatable");
+        (session, state)
+    }
+
+    fn activity(events: u64, writing: bool) -> ChangeActivity {
+        ChangeActivity {
+            paths: 1,
+            incomplete: false,
+            events,
+            writing,
+        }
+    }
+
+    /// A safe save goes quiet while its temporary file is flushed: a quiet
+    /// slice then is not the end of the save while the file is still open
+    /// for writing. The settle waits for it to close, past its usual
+    /// ceiling — here twenty slices of a file flushing, then the close.
+    #[test]
+    fn a_file_still_open_for_writing_holds_the_settle_until_it_closes() {
+        let mut samples = vec![activity(1, true); 20];
+        samples.push(activity(2, false));
+        let (mut session, _state) = settling(samples);
+        let started = std::time::Instant::now();
+        session.settle(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(5),
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "{waited:?}"
+        );
+        assert!(waited < crate::endpoint::WRITE_GRACE, "{waited:?}");
+
+        // Nothing open: quiet after one slice, as before.
+        let (mut session, _state) = settling(vec![activity(1, false)]);
+        let started = std::time::Instant::now();
+        session.settle(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(5),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(25));
+    }
+
+    /// A file that stays open — a log, a database — holds a settle back no
+    /// longer than the grace.
+    #[test]
+    fn a_file_that_never_closes_holds_the_settle_for_the_grace_at_most() {
+        let (mut session, _state) = settling(vec![activity(1, true)]);
+        let started = std::time::Instant::now();
+        session.settle(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(5),
+        );
+        let waited = started.elapsed();
+        assert!(waited >= crate::endpoint::WRITE_GRACE, "{waited:?}");
+        assert!(
+            waited < crate::endpoint::WRITE_GRACE + std::time::Duration::from_millis(200),
+            "{waited:?}"
+        );
     }
 
     #[test]

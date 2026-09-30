@@ -417,6 +417,10 @@ pub(crate) struct ChangeWatcher {
     _watcher: notify::RecommendedWatcher,
     /// The changed paths recorded since the last scan consumed them.
     pending: Arc<Mutex<PendingChanges>>,
+    /// Every event seen, and the files still open for writing. Kept apart
+    /// from `pending`, which each scan empties: a file stays open across
+    /// scans.
+    writes: Arc<Mutex<WriteActivity>>,
     /// The root watched, and the identity of the directory it was when
     /// the watch was built.
     root: PathBuf,
@@ -434,6 +438,67 @@ pub(crate) struct ChangeWatcher {
     /// have preceded — on the test's schedule rather than the kernel's.
     #[cfg(test)]
     pub(crate) hold_events: Arc<Mutex<()>>,
+}
+
+/// Every event a watcher has seen, and which files are open for writing.
+#[derive(Default)]
+struct WriteActivity {
+    /// Events seen, of every kind.
+    events: u64,
+    /// Files created or written and not yet closed, with when that began.
+    open: std::collections::HashMap<PathBuf, std::time::Instant>,
+}
+
+impl WriteActivity {
+    /// Notes one backend event. `closes` says whether the backend reports
+    /// a writer closing a file: only then are files tracked as open, since
+    /// one that is never seen to close would hold every cycle back for the
+    /// full grace.
+    fn note(&mut self, event: &notify::Result<notify::Event>, closes: bool) {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, EventKind, ModifyKind, RenameMode,
+        };
+        self.events += 1;
+        let event = match event {
+            Ok(event) if !event.need_rescan() => event,
+            // Lost events: nothing known about what is open any more.
+            _ => {
+                self.open.clear();
+                return;
+            }
+        };
+        if !closes {
+            return;
+        }
+        match event.kind {
+            EventKind::Create(CreateKind::File) | EventKind::Modify(ModifyKind::Data(_)) => {
+                for path in &event.paths {
+                    self.open
+                        .entry(path.clone())
+                        .or_insert_with(std::time::Instant::now);
+                }
+            }
+            EventKind::Access(AccessKind::Close(AccessMode::Write)) | EventKind::Remove(_) => {
+                for path in &event.paths {
+                    self.open.remove(path);
+                }
+            }
+            // Renamed away: the old name is not being written any more.
+            EventKind::Modify(ModifyKind::Name(RenameMode::From | RenameMode::Both)) => {
+                if let Some(from) = event.paths.first() {
+                    self.open.remove(from);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a file has been open for writing for less than the grace,
+    /// forgetting any open longer than that.
+    fn writing(&mut self, grace: std::time::Duration) -> bool {
+        self.open.retain(|_, since| since.elapsed() < grace);
+        !self.open.is_empty()
+    }
 }
 
 impl PendingChanges {
@@ -476,6 +541,8 @@ impl ChangeWatcher {
         let root_identity = directory_identity(root);
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
         let recorder = Arc::clone(&pending);
+        let writes = Arc::new(Mutex::new(WriteActivity::default()));
+        let counter = Arc::clone(&writes);
         #[cfg(test)]
         let hold_events = Arc::new(Mutex::new(()));
         #[cfg(test)]
@@ -490,6 +557,12 @@ impl ChangeWatcher {
             notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
                 #[cfg(test)]
                 let _held = holding.lock().unwrap_or_else(|e| e.into_inner());
+                // FSEvents does not report a writer closing a file, so no
+                // file is tracked as open: counted, never waited for.
+                counter
+                    .lock()
+                    .expect("the writes lock is never poisoned")
+                    .note(&event, false);
                 recorder
                     .lock()
                     .expect("the pending lock is never poisoned")
@@ -507,6 +580,7 @@ impl ChangeWatcher {
         Ok(ChangeWatcher {
             _watcher: watcher,
             pending,
+            writes,
             root: root.to_path_buf(),
             root_identity,
             incomplete: Arc::new(Mutex::new(None)),
@@ -538,6 +612,7 @@ impl ChangeWatcher {
         // Taken before the walk, so a root replaced during it is noticed.
         let root_identity = directory_identity(root);
         let pending = Arc::new(Mutex::new(PendingChanges::default()));
+        let writes = Arc::new(Mutex::new(WriteActivity::default()));
         let incomplete = Arc::new(Mutex::new(None));
         // Events cross a channel to a thread that owns the watcher.
         // Extending the watch to a directory that just appeared needs the
@@ -551,6 +626,7 @@ impl ChangeWatcher {
         watch_tree(&watcher, root, root, &ignores, device)?;
 
         let recorder = Arc::clone(&pending);
+        let counter = Arc::clone(&writes);
         let failures = Arc::clone(&incomplete);
         let extender = Arc::downgrade(&watcher);
         #[cfg(test)]
@@ -614,6 +690,12 @@ impl ChangeWatcher {
                             }
                         }
                     }
+                    // inotify reports a writer closing a file, so files being
+                    // written are tracked until they close.
+                    counter
+                        .lock()
+                        .expect("the writes lock is never poisoned")
+                        .note(&event, true);
                     // Nothing beneath an ignored directory is watched here,
                     // so there is nothing to filter.
                     recorder
@@ -627,6 +709,7 @@ impl ChangeWatcher {
         Ok(ChangeWatcher {
             _watcher: watcher,
             pending,
+            writes,
             root: watched_root,
             root_identity,
             incomplete,
@@ -735,9 +818,17 @@ impl ChangeWatcher {
             .pending
             .lock()
             .expect("the pending lock is never poisoned");
+        let (paths, incomplete) = (pending.paths.len(), pending.incomplete);
+        drop(pending);
+        let mut writes = self
+            .writes
+            .lock()
+            .expect("the writes lock is never poisoned");
         crate::endpoint::ChangeActivity {
-            paths: pending.paths.len(),
-            incomplete: pending.incomplete,
+            paths,
+            incomplete,
+            events: writes.events,
+            writing: writes.writing(crate::endpoint::WRITE_GRACE),
         }
     }
 }
@@ -6420,6 +6511,48 @@ mod watch_tests {
         );
     }
 
+    /// The benchmark's safe save, and a careful editor's: write a
+    /// temporary file, flush it, close it, rename it over the original. The
+    /// watcher reports it open for writing until the close, so a settle
+    /// holds the cycle through the flush — which raises no event — and the
+    /// rename lands before anything is scanned.
+    #[test]
+    fn a_safe_save_is_open_for_writing_until_its_temporary_file_closes() {
+        use std::io::Write;
+        let root = tempfile::tempdir().expect("tempdir");
+        std::fs::write(root.path().join("big"), vec![1u8; 1 << 20]).unwrap();
+        let ignores = IgnoreSet::new(&[]).expect("ignores");
+        let watcher = ChangeWatcher::new(root.path(), ignores, true, || {}).expect("watch");
+        let reads = |deadline: Duration, wanted: bool| {
+            let end = Instant::now() + deadline;
+            while Instant::now() < end {
+                if watcher.activity().writing == wanted {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            false
+        };
+
+        let temporary = root.path().join("big.bench-tmp");
+        let mut file = std::fs::File::create(&temporary).unwrap();
+        file.write_all(&vec![2u8; 1 << 20]).unwrap();
+        file.sync_all().unwrap();
+        assert!(
+            reads(Duration::from_secs(3), true),
+            "a file written and not yet closed must read as open for writing"
+        );
+        // Quiet, and still open: the flush of a large file looks like this.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(watcher.activity().writing, "still open, still writing");
+        drop(file);
+        std::fs::rename(&temporary, root.path().join("big")).unwrap();
+        assert!(
+            reads(Duration::from_secs(3), false),
+            "closed and renamed: nothing is open for writing"
+        );
+    }
+
     /// Finding M-25: an ignored directory holding a re-inclusion is walked
     /// by the scanner, so it is watched too — whether it was there when
     /// the watch was built or appeared afterwards — while what it holds
@@ -7918,5 +8051,143 @@ mod supply_receive_tests {
         }
         data.truncate(length);
         data
+    }
+}
+
+#[cfg(test)]
+mod change_record_tests {
+    use super::*;
+    use crate::scan::IgnoreSet;
+
+    fn event(paths: &[&str]) -> notify::Result<notify::Event> {
+        let mut event = notify::Event::new(notify::EventKind::Any);
+        for path in paths {
+            event = event.add_path(PathBuf::from(path));
+        }
+        Ok(event)
+    }
+
+    /// What is strictly beneath a pruned directory is left out; the pruned
+    /// directory itself, anything outside one, and what a negation reaches
+    /// are kept — as the scanner reads them.
+    #[test]
+    fn only_what_no_scan_can_read_is_left_out() {
+        let ignores = IgnoreSet::new(&[
+            "target".to_string(),
+            "node_modules".to_string(),
+            "!node_modules/keep".to_string(),
+        ])
+        .unwrap();
+        let root = Path::new("/r");
+        let beneath = |path: &str| beneath_a_pruned_directory(root, &ignores, Path::new(path));
+        assert!(beneath("/r/target/debug/out"));
+        assert!(beneath("/r/src/target/x"));
+        assert!(!beneath("/r/target"));
+        assert!(!beneath("/r/src/main.rs"));
+        assert!(!beneath("/r/node_modules/keep/a"));
+        assert!(!beneath("/r/node_modules/keep/sub/b"));
+        assert!(!beneath("/r/node_modules/other"));
+        assert!(beneath("/r/node_modules/other/x"));
+        assert!(!beneath("/elsewhere/target/x"));
+
+        // A name ignored in one Unicode form and not the other is walked by
+        // a scanner using the other, so it is kept either way.
+        let composed = IgnoreSet::new(&["caf\u{e9}".to_string()]).unwrap();
+        let beneath = |path: &str| beneath_a_pruned_directory(root, &composed, Path::new(path));
+        assert!(beneath("/r/caf\u{e9}/x"));
+        assert!(!beneath("/r/cafe\u{301}/x"));
+        let decomposed = IgnoreSet::new(&["cafe\u{301}".to_string()]).unwrap();
+        let beneath = |path: &str| beneath_a_pruned_directory(root, &decomposed, Path::new(path));
+        assert!(!beneath("/r/cafe\u{301}/x"));
+    }
+
+    /// A path reported many times takes one place, so a file written in a
+    /// burst of appends cannot fill the record; distinct paths past the cap
+    /// still give it up.
+    #[test]
+    fn a_path_reported_again_is_recorded_once() {
+        let mut pending = PendingChanges::default();
+        for _ in 0..(2 * MAXIMUM_PENDING_PATHS) {
+            pending.record(event(&["/r/a", "/r/b"]), |_| true);
+        }
+        assert!(!pending.incomplete);
+        assert_eq!(
+            pending.paths,
+            vec![PathBuf::from("/r/a"), PathBuf::from("/r/b")]
+        );
+
+        let mut pending = PendingChanges::default();
+        for index in 0..=MAXIMUM_PENDING_PATHS {
+            pending.record(event(&[&format!("/r/{index}")]), |_| true);
+        }
+        assert!(pending.incomplete);
+        assert!(pending.paths.is_empty() && pending.seen.is_empty());
+
+        let mut pending = PendingChanges::default();
+        pending.record(event(&["/r/a", "/r/skip"]), |path| !path.ends_with("skip"));
+        assert_eq!(pending.paths, vec![PathBuf::from("/r/a")]);
+    }
+
+    fn event_of(kind: notify::EventKind, paths: &[&str]) -> notify::Result<notify::Event> {
+        let mut event = notify::Event::new(kind);
+        for path in paths {
+            event = event.add_path(PathBuf::from(path));
+        }
+        Ok(event)
+    }
+
+    /// A file is open for writing from its first write to its close, and
+    /// stops being so when it is renamed away, removed, or events are
+    /// lost; only a backend that reports closes tracks it at all.
+    #[test]
+    fn a_file_is_open_for_writing_from_its_first_write_to_its_close() {
+        use notify::event::{
+            AccessKind, AccessMode, CreateKind, DataChange, EventKind, ModifyKind, RemoveKind,
+            RenameMode,
+        };
+        let grace = std::time::Duration::from_secs(60);
+        let created = EventKind::Create(CreateKind::File);
+        let written = EventKind::Modify(ModifyKind::Data(DataChange::Any));
+        let closed = EventKind::Access(AccessKind::Close(AccessMode::Write));
+
+        let mut writes = WriteActivity::default();
+        writes.note(&event_of(created, &["/r/a.tmp"]), true);
+        writes.note(&event_of(written, &["/r/a.tmp"]), true);
+        assert!(writes.writing(grace));
+        writes.note(&event_of(closed, &["/r/a.tmp"]), true);
+        assert!(!writes.writing(grace));
+        assert_eq!(writes.events, 3);
+
+        // Renamed away while open, or removed: no longer being written.
+        writes.note(&event_of(written, &["/r/b.tmp"]), true);
+        writes.note(
+            &event_of(
+                EventKind::Modify(ModifyKind::Name(RenameMode::Both)),
+                &["/r/b.tmp", "/r/b"],
+            ),
+            true,
+        );
+        assert!(!writes.writing(grace));
+        writes.note(&event_of(written, &["/r/c"]), true);
+        writes.note(
+            &event_of(EventKind::Remove(RemoveKind::File), &["/r/c"]),
+            true,
+        );
+        assert!(!writes.writing(grace));
+
+        // Lost events forget everything open.
+        writes.note(&event_of(written, &["/r/d"]), true);
+        writes.note(&Err(notify::Error::generic("overflow")), true);
+        assert!(!writes.writing(grace));
+
+        // Past the grace, a file still open holds nothing back.
+        writes.note(&event_of(written, &["/r/log"]), true);
+        assert!(!writes.writing(std::time::Duration::ZERO));
+
+        // A backend without closes counts events and tracks nothing.
+        let mut fsevents = WriteActivity::default();
+        fsevents.note(&event_of(written, &["/r/a"]), false);
+        assert!(!fsevents.writing(grace));
+        assert_eq!(fsevents.events, 1);
     }
 }

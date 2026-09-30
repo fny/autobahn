@@ -132,6 +132,8 @@ Or build from source with `cargo build --release --locked` (Rust stable, Unix on
 
 Unix only: Linux (x86-64 and arm64) and macOS (Apple Silicon), with macOS a first-class target, not a build target. Transport is SSH. Roots must live on local filesystems; network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).
 
+**One difference on macOS.** Some programs save a file by writing a temporary copy and renaming it over the original; vim and JetBrains IDEs do. On Linux, Autobahn waits for the program to finish writing before it syncs the file, so it copies only the finished file. macOS does not say when a program has finished writing a file, so there a save like this of a large file can cost an extra round of work before it syncs: a fraction of a second, not an error. Details in [How it works](docs/how-it-works.md#the-settle-as-an-illustration).
+
 <!-- ─────────────────────────────────────────────────────────────────────
      The previous README follows, kept for merging. Delete it, and this
      marker, once everything worth keeping has moved up.

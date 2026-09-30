@@ -1177,7 +1177,11 @@ impl Desk {
                     })),
             )
             .when_some(session.error.as_ref(), |band, error| {
-                band.child(self.aside(crate::text::display_safe(error).to_string(), RED))
+                band.child(self.aside(
+                    format!("session-error-{}-{}", group.name, session.beta),
+                    &crate::text::display_safe(error),
+                    RED,
+                ))
             })
             // What is waiting reads across the card, the reason first.
             .when(open, |band| {
@@ -1200,10 +1204,12 @@ impl Desk {
                                 .pr(step(4.))
                                 .pb(step(0.5))
                                 .font_family(self.mono.clone())
-                                .text_size(px(11.))
-                                .text_color(rgb(DIM))
-                                .truncate()
-                                .child(path),
+                                .child(said(
+                                    format!("waiting-{}-{}-{path}", group.name, session.beta),
+                                    &path,
+                                    DIM,
+                                    11.,
+                                )),
                         );
                     }
                     band = band.child(div().h(step(1.5)));
@@ -1289,15 +1295,19 @@ impl Desk {
     }
 
     /// A line hanging under a session row, indented past its dot.
-    fn aside(&self, text: String, colour: u32) -> Div {
+    /// What a session is complaining about, under the row that says so.
+    ///
+    /// Selectable, like every other complaint: this is the sentence a
+    /// person takes to a search engine or a bug report, and retyping
+    /// "unsolicited response on channel 9" is nobody's idea of a
+    /// morning.
+    fn aside(&self, id: impl Into<SharedString>, text: &str, colour: u32) -> Div {
         div()
             .pl(step(8.))
             .pr(step(4.))
             .pb(step(2.))
             .font_family(self.mono.clone())
-            .text_size(px(11.))
-            .text_color(rgb(colour))
-            .child(text)
+            .child(said(id, text, colour, 11.))
     }
 
     /// The open session: the two roots, and the four things that can be
@@ -1801,6 +1811,8 @@ impl Desk {
             })
     }
 
+    /// A named root of the open session. The name is a label; the root
+    /// is a path, and a path is for copying, so it selects.
     fn pair(&self, name: &'static str, value: String) -> Div {
         div()
             .flex()
@@ -1819,9 +1831,7 @@ impl Desk {
                     .flex_1()
                     .min_w(px(0.))
                     .font_family(self.mono.clone())
-                    .text_size(px(12.))
-                    .truncate()
-                    .child(value),
+                    .child(said(format!("root-{name}"), &value, INK, 12.)),
             )
     }
 

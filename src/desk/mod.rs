@@ -2254,11 +2254,10 @@ impl Desk {
     fn switch(&self, part: &Section, key: &str, on: bool, cx: &mut Context<Self>) -> AnyElement {
         let section = part.clone();
         let key = key.to_owned();
+        // No tooltip: a switch that is on says what clicking it does by
+        // being a switch, and the sentence that used to sit here said
+        // the same thing in the file's own vocabulary.
         toggle_switch(SharedString::from(format!("switch-{key}")), on)
-            .tooltip(match on {
-                true => tip(t("tip.switch_on")),
-                false => tip(t("tip.switch_off")),
-            })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.put(
                     &Spot {

@@ -499,6 +499,7 @@ impl WriteActivity {
         self.open.retain(|_, since| since.elapsed() < grace);
         !self.open.is_empty()
     }
+
 }
 
 impl PendingChanges {
@@ -1193,7 +1194,7 @@ impl LocalEndpoint {
     fn begin_supply(
         &self,
         need: &mut StagingNeed,
-        alternatives: &mut Option<std::collections::HashMap<Digest, Vec<String>>>,
+        alternatives: &mut Alternatives,
     ) -> Result<SupplySource, String> {
         let digest = need.request.digest;
         let (path, file) = match self.open_scanned(&need.request.path, &digest) {
@@ -1282,18 +1283,33 @@ impl LocalEndpoint {
     /// content records the given digest. Only consulted when a supply
     /// attempt fails.
     ///
-    /// The paths are indexed by digest on the stream's first failure and
-    /// answered from the index after that. Walking the snapshot per failure
-    /// was 48 ms at 500k entries, so a burst of failures — a tree being
-    /// deleted while it is supplied — cost minutes: 10,000 of them, eight.
-    /// The index lives only as long as the stream, so an endpoint does not
-    /// hold every path twice while idle.
+    /// The stream's first few failures each walk the snapshot for the one
+    /// digest, allocating only for what they find: 6 ms at 400k entries.
+    /// Past that, the paths are indexed by digest once and answered from
+    /// the index. The index alone was 315 ms at 400k entries, paid for a
+    /// single failure — a safe save's temporary renamed away between the
+    /// scan and the supply, the common one, and one that no other path
+    /// can answer, since the content is nowhere else. Ten sessions over
+    /// one root each paid it at once. The index still bounds a burst of
+    /// failures — a tree deleted while it is supplied — where a walk per
+    /// failure, at the 48 ms it once cost, took minutes for 10,000. It
+    /// lives only as long as the stream, so an endpoint does not hold
+    /// every path twice while idle.
     fn digest_paths(
         &self,
-        alternatives: &mut Option<std::collections::HashMap<Digest, Vec<String>>>,
+        alternatives: &mut Alternatives,
         digest: &Digest,
         exclude: &str,
     ) -> Vec<String> {
+        let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) else {
+            return Vec::new();
+        };
+        if alternatives.index.is_none() && alternatives.searches < TARGETED_SEARCHES {
+            alternatives.searches += 1;
+            let mut found = Vec::new();
+            paths_with_digest(root, &mut Vec::new(), digest, exclude, &mut found);
+            return found;
+        }
         fn collect(
             node: &Node,
             path: &str,
@@ -1311,11 +1327,9 @@ impl LocalEndpoint {
                 _ => {}
             }
         }
-        let index = alternatives.get_or_insert_with(|| {
+        let index = alternatives.index.get_or_insert_with(|| {
             let mut index = std::collections::HashMap::new();
-            if let Some(root) = self.last_snapshot.as_ref().and_then(|s| s.root.as_ref()) {
-                collect(root, "", &mut index);
-            }
+            collect(root, "", &mut index);
             index
         });
         index
@@ -1699,7 +1713,7 @@ impl Endpoint for LocalEndpoint {
             needs,
             next: 0,
             current: None,
-            alternatives: None,
+            alternatives: Alternatives::default(),
         });
         Ok(())
     }
@@ -2103,9 +2117,53 @@ struct SupplyState {
     /// Where the rest of the current need's content comes from, once it
     /// has begun.
     current: Option<SupplySource>,
-    /// Scanned paths by digest, for a need whose own path cannot supply:
-    /// built on the stream's first such failure (`digest_paths`).
-    alternatives: Option<std::collections::HashMap<Digest, Vec<String>>>,
+    /// Where else a need whose own path cannot supply might find its
+    /// content (`digest_paths`).
+    alternatives: Alternatives,
+}
+
+/// A supply stream's search for other paths holding a need's content: how
+/// many targeted walks it has made, and the index by digest it builds once
+/// that many have not been enough.
+#[derive(Default)]
+struct Alternatives {
+    searches: usize,
+    index: Option<std::collections::HashMap<Digest, Vec<String>>>,
+}
+
+/// How many failures a supply stream answers by walking the snapshot for
+/// their digest before it indexes every path instead. A walk is about a
+/// fiftieth of the index, so this many cost a small part of it.
+const TARGETED_SEARCHES: usize = 4;
+
+/// Collects every file path beneath `node` recording `digest`, other than
+/// `exclude`. `names` is the path to `node`, component by component; a path
+/// is joined only for a match.
+fn paths_with_digest<'a>(
+    node: &'a Node,
+    names: &mut Vec<&'a str>,
+    digest: &Digest,
+    exclude: &str,
+    found: &mut Vec<String>,
+) {
+    match &node.content {
+        Content::File {
+            digest: recorded, ..
+        } if recorded == digest => {
+            let path = names.join("/");
+            if path != exclude {
+                found.push(path);
+            }
+        }
+        Content::Directory(children) => {
+            for child in children.iter() {
+                names.push(&child.name);
+                paths_with_digest(child, names, digest, exclude, found);
+                names.pop();
+            }
+        }
+        _ => {}
+    }
 }
 
 /// How many operations a delta's helper thread may run ahead of the
@@ -4832,6 +4890,43 @@ mod tests {
         assert!(!outcome.missing_staged_files);
         assert_eq!(read(&fixture.beta_root, "a.txt"), "shared content");
         assert_eq!(read(&fixture.beta_root, "b.txt"), "shared content");
+    }
+
+    /// A stream's first failures are answered by walking the snapshot for
+    /// their digest, and the rest from an index built once: either way,
+    /// every vanished path is supplied from its surviving duplicate,
+    /// however deep that lies.
+    #[test]
+    fn supply_recovers_every_vanished_path_past_the_targeted_searches() {
+        let mut fixture = Fixture::new();
+        let count = TARGETED_SEARCHES * 2 + 1;
+        for i in 0..count {
+            let content = format!("content {i}");
+            write(&fixture.alpha_root, &format!("a{i:02}.txt"), &content);
+            write(
+                &fixture.alpha_root,
+                &format!("z/deep/copy{i:02}.txt"),
+                &content,
+            );
+        }
+        let transitions = fixture.beta_transitions();
+        for i in 0..count {
+            fs::remove_file(fixture.alpha_root.join(format!("a{i:02}.txt")))
+                .expect("file should be removable");
+        }
+        fixture.stage(&transitions);
+        let outcome = fixture
+            .beta
+            .transition(transitions)
+            .expect("transition should succeed");
+        assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+        assert!(!outcome.missing_staged_files);
+        for i in 0..count {
+            assert_eq!(
+                read(&fixture.beta_root, &format!("a{i:02}.txt")),
+                format!("content {i}")
+            );
+        }
     }
 
     #[test]

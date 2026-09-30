@@ -1638,6 +1638,16 @@ impl<'a> Worker<'a> {
         }
         let side = self.peer_side();
         if let Some(session) = self.session.as_mut() {
+            // The copy the next leader takes up is brought level first,
+            // under this session's own leadership: a handoff on request
+            // may follow a cycle whose record never arrived.
+            if let Err(error) = session.level_the_copy() {
+                crate::complain!(
+                    "[{}] unable to bring the peer's ancestor copy level before handing on: \
+                     {error:#}",
+                    self.plan.display()
+                );
+            }
             session.set_leadership(
                 Some(crate::peering::Leadership {
                     leader: to.clone(),
@@ -1781,14 +1791,32 @@ impl<'a> Worker<'a> {
         }
         // Peering: the alpha is back and level. A beta leads only while
         // the alpha is away, so one settled cycle with the alpha attached
-        // hands the lead back to it.
+        // hands the lead back to it — once the alpha's copy of the ancestor
+        // is confirmed level too, since that copy is what the alpha takes
+        // up. A copy that cannot be brought level waits for the next
+        // settled cycle.
         if let (Ok((_, report)), Some(peering)) = (&result, self.peering) {
             if self.peer_side() == crate::peering::PeerSide::Alpha
                 && report.settled()
                 && matches!(peering.role(), crate::peering::Role::Leader { .. })
             {
-                if let Err(error) = peering.yield_to(crate::peering::ALPHA) {
-                    crate::complain!("[{}] unable to yield: {error:#}", self.plan.display());
+                let level = self
+                    .session
+                    .as_mut()
+                    .map_or(Ok(()), |session| session.level_the_copy());
+                match level {
+                    Err(error) => crate::complain!(
+                        "[{}] not handing the lead back yet: {error:#}",
+                        self.plan.display()
+                    ),
+                    Ok(()) => {
+                        if let Err(error) = peering.yield_to(crate::peering::ALPHA) {
+                            crate::complain!(
+                                "[{}] unable to yield: {error:#}",
+                                self.plan.display()
+                            );
+                        }
+                    }
                 }
             }
         }

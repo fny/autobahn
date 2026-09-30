@@ -824,6 +824,31 @@ impl Session {
         }
     }
 
+    /// Peering: brings the peer's copy of the ancestor level with this
+    /// session's — a checkpoint, when it stands at any other generation —
+    /// and confirms it. What a handoff leaves the next leader to adopt must
+    /// be this session's history as it stands, not one a record that failed
+    /// to arrive left behind: records are replicated best effort, and a
+    /// copy that lags by one is found out only by the next record.
+    pub fn level_the_copy(&mut self) -> Result<()> {
+        if self.leadership.is_none() {
+            return Ok(());
+        }
+        let generation = self.ancestor_store.generation();
+        if self.peer().peering_state()?.generation == Some(generation) {
+            return Ok(());
+        }
+        let ancestor = self.ancestor.clone();
+        let reached = self
+            .peer()
+            .ancestor_checkpoint(generation, ancestor.as_ref())?;
+        anyhow::ensure!(
+            reached == generation,
+            "the peer's ancestor copy stands at generation {reached}, not {generation}"
+        );
+        Ok(())
+    }
+
     /// Peering, after the ancestor advanced: sends the record to the beta,
     /// and a checkpoint if the copy could not apply it. Best effort — the
     /// ancestor is already recorded here, and a copy that misses a record
@@ -2140,6 +2165,109 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.transition(transitions)
         }
+    }
+
+    /// A handoff brings the peer's copy of the ancestor level first: a peer
+    /// already at the leader's generation is sent nothing, one elsewhere is
+    /// sent a checkpoint at it, and one that does not arrive there is an
+    /// error — the automatic handback then waits for the next settled cycle.
+    /// A session that does not lead replicates nothing.
+    #[test]
+    fn leveling_the_copy_checkpoints_a_peer_that_is_behind() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Copy {
+            reports: u64,
+            answers: Option<u64>,
+            checkpoints: Vec<u64>,
+        }
+        struct Peer(ScriptedEndpoint, Arc<Mutex<Copy>>);
+        impl Endpoint for Peer {
+            fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+                self.0.scan()
+            }
+            fn stage_begin(
+                &mut self,
+                files: Vec<FileRequest>,
+            ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+                self.0.stage_begin(files)
+            }
+            fn supply_open(&mut self, needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+                self.0.supply_open(needs)
+            }
+            fn supply_pull(
+                &mut self,
+                max_frames: usize,
+            ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+                self.0.supply_pull(max_frames)
+            }
+            fn stage_push(&mut self, frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+                self.0.stage_push(frames)
+            }
+            fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+                self.0.transition(transitions)
+            }
+            fn peering_state(&mut self) -> Result<crate::peering::State> {
+                Ok(crate::peering::State {
+                    lease: None,
+                    generation: Some(self.1.lock().unwrap().reports),
+                })
+            }
+            fn ancestor_checkpoint(&mut self, generation: u64, _: Option<&Node>) -> Result<u64> {
+                let mut copy = self.1.lock().unwrap();
+                copy.checkpoints.push(generation);
+                Ok(copy.answers.unwrap_or(generation))
+            }
+        }
+
+        let keep = tempfile::tempdir().unwrap();
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let base = || Node::directory("", vec![file("x", 1)]);
+        let copy = Arc::new(Mutex::new(Copy::default()));
+        let mut session = Session::new(
+            Box::new(ScriptedEndpoint::new(vec![scripted(base())])),
+            Box::new(Peer(
+                ScriptedEndpoint::new(vec![scripted(base())]),
+                copy.clone(),
+            )),
+            SyncMode::TwoWaySafe,
+            state,
+        )
+        .unwrap();
+        session.run_cycle().expect("the first cycle converges");
+        let generation = session.ancestor_store.generation();
+        assert!(generation > 0);
+
+        session
+            .level_the_copy()
+            .expect("nothing to level without leading");
+        assert!(copy.lock().unwrap().checkpoints.is_empty());
+
+        session.set_leadership(
+            Some(crate::peering::Leadership {
+                leader: crate::peering::ALPHA.into(),
+                term: 1,
+                ttl: std::time::Duration::from_secs(30),
+            }),
+            crate::peering::PeerSide::Beta,
+        );
+        copy.lock().unwrap().reports = generation;
+        session.level_the_copy().expect("already level");
+        assert!(copy.lock().unwrap().checkpoints.is_empty());
+
+        copy.lock().unwrap().reports = generation - 1;
+        session.level_the_copy().expect("brought level");
+        assert_eq!(copy.lock().unwrap().checkpoints, [generation]);
+
+        copy.lock().unwrap().answers = Some(0);
+        let error = session
+            .level_the_copy()
+            .expect_err("the copy did not arrive");
+        assert!(
+            format!("{error:#}").contains("stands at generation 0"),
+            "{error:#}"
+        );
     }
 
     /// Finding L-19: an endpoint — a remote one, or a buggy one — that

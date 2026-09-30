@@ -58,6 +58,14 @@ pub(crate) fn t(key: &str) -> &'static str {
 /// Random rather than in order: a person who opens this window twice
 /// a day should not read the same sentence every time.
 pub(crate) fn hint() -> &'static str {
+    hint_besides("")
+}
+
+/// The same, but never the one already showing.
+///
+/// A hint that is meant to change and does not looks like a window
+/// that failed to notice the click.
+pub(crate) fn hint_besides(showing: &str) -> &'static str {
     static EVERY: OnceLock<Vec<&'static str>> = OnceLock::new();
     let every = EVERY.get_or_init(|| {
         let mut said: Vec<&'static str> = catalogue()
@@ -70,16 +78,21 @@ pub(crate) fn hint() -> &'static str {
         said.sort();
         said
     });
-    if every.is_empty() {
-        return "";
-    }
+    let fresh: Vec<&&'static str> = every
+        .iter()
+        .filter(|said| **said != showing)
+        .collect();
+    let choosing: &[&&'static str] = match fresh.is_empty() {
+        true => return every.first().copied().unwrap_or(""),
+        false => &fresh,
+    };
     // No dependency for this: the clock is random enough to pick one of
     // half a dozen sentences, and nothing here needs to be unguessable.
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.subsec_nanos() as usize)
         .unwrap_or(0);
-    every[now % every.len()]
+    *choosing[now % choosing.len()]
 }
 
 /// The line for a key, with `{name}` replaced by what is given.
@@ -207,6 +220,16 @@ mod tests {
         for _ in 0..50 {
             let said = hint();
             assert!(every.contains(&said), "{said:?} is not one of the hints");
+        }
+        // Asked for one besides the one showing, it never gives that
+        // one back: a hint that is meant to change and does not looks
+        // like a window that did not notice the click.
+        for showing in &every {
+            for _ in 0..50 {
+                let next = hint_besides(showing);
+                assert_ne!(&next, showing);
+                assert!(every.contains(&next), "{next:?} is not one of the hints");
+            }
         }
     }
 

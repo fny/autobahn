@@ -618,6 +618,11 @@ impl Desk {
             })
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.pane = pane;
+                // A new pane is a new look at the window, which is the
+                // moment a second hint is worth reading. Never the one
+                // already there: a line that was meant to change and
+                // did not reads as a click that did not land.
+                this.hint = SharedString::from(crate::words::hint_besides(&this.hint));
                 this.settle(pane);
                 cx.notify();
             }))

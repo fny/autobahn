@@ -78,4 +78,4 @@ When one alpha fans out to several betas, each destination is its own session, a
 - [Configuration](./configuration.md) — where `mode` goes
 - [Conflicts](./conflicts.md) — settling a disagreement once it is reported
 - [Safety](./safety.md) — the deletions that are refused in every mode
-- [Peering](./peering.md) — failover for the star, dangerously experimental; known security and collision issues
+- [Peering](./peering.md) — failover for the star, dangerously experimental; known security issues

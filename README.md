@@ -94,7 +94,7 @@ There is also `autobahn mi`, a terminal view of every session, and an experiment
 
 Real, shipped, and still moving. Expect the wording, the keys and the shape to change between releases.
 
-- **Peering** (dangerously experimental) — a beta takes the lead when the alpha is away, and gives it back. It has known security and collision issues that are not fixed in this release; any peer that can lead is trusted with every other peer. Read [Peering](docs/peering.md) before enabling it.
+- **Peering** (dangerously experimental) — a beta takes the lead when the alpha is away, and gives it back. It has known security issues that are not fixed in this release; any peer that can lead is trusted with every other peer. Read [Peering](docs/peering.md) before enabling it.
 - **The menu bar app** and the **alert hook example** — see their pages.
 
 ## AI disclaimer

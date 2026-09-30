@@ -2401,8 +2401,11 @@ mod tests {
             .expect("records");
         let journal = fs::read(journal_path(&path)).unwrap();
 
-        let record = encode_record(store.generation, &JournalEntry::Intent(vec!["x".repeat(8192)]))
-            .unwrap();
+        let record = encode_record(
+            store.generation,
+            &JournalEntry::Intent(vec!["x".repeat(8192)]),
+        )
+        .unwrap();
         let error = store.append(&record, false).expect_err("over the limit");
         assert!(format!("{error:#}").contains("limit"), "{error:#}");
         assert_eq!(fs::read(journal_path(&path)).unwrap(), journal);

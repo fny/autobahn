@@ -3518,8 +3518,12 @@ fn a_peering_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
     let plan = plans[0].clone();
     let leader_directory = world.path("leader-peering");
     let context = || {
-        PeeringContext::for_alpha(world.path("config.toml"), leader_directory.clone())
-            .expect("a peering context")
+        PeeringContext::for_alpha(
+            world.path("config.toml"),
+            leader_directory.clone(),
+            autobahn::config::DEFAULT_PEERING_TTL,
+        )
+        .expect("a peering context")
     };
 
     let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
@@ -3612,8 +3616,12 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     let leader_directory = world.path("leader-peering");
     let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
         .with_peering(
-            PeeringContext::for_alpha(world.path("config.toml"), leader_directory.clone())
-                .expect("a peering context"),
+            PeeringContext::for_alpha(
+                world.path("config.toml"),
+                leader_directory.clone(),
+                autobahn::config::DEFAULT_PEERING_TTL,
+            )
+            .expect("a peering context"),
         )
         .run_once();
     assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
@@ -3639,8 +3647,12 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
 
     // A restart reads its own lease and comes back as a follower: it does
     // not connect, and the beta is still untouched.
-    let context = PeeringContext::for_alpha(world.path("config.toml"), leader_directory)
-        .expect("a peering context");
+    let context = PeeringContext::for_alpha(
+        world.path("config.toml"),
+        leader_directory,
+        autobahn::config::DEFAULT_PEERING_TTL,
+    )
+    .expect("a peering context");
     assert!(matches!(
         context.role(),
         autobahn::peering::Role::Follower { term: 9, .. }
@@ -3651,6 +3663,101 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     assert!(outcomes[0].result.is_err());
     assert!(!beta.join("hello.txt").exists());
     assert_eq!(world.status(&plan).expect("a status").state, "following");
+}
+
+/// While the alpha follows, its plain groups keep running: they are the
+/// alpha's alone, whoever leads the star. Only its peering sessions wait
+/// for the lead to come back.
+#[test]
+fn plain_groups_keep_running_while_the_alpha_follows() {
+    use autobahn::peering::{self, write_lease, Lease};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let plain = world.directory("plain");
+    let mirror = world.directory("plain-mirror");
+    let agent_home = world.directory("agent-home");
+    write(&alpha, "hello.txt", "hello");
+    let script = peering_agent_script(&world, &agent_home);
+    let plans = world.plans(&format!(
+        r#"
+        [groups.g]
+        mode = "peering-conflict-dangerously-experimental"
+        interval = 1
+        alpha = "{alpha}"
+        agent_command = "{script}"
+        betas = ["peer:{beta}"]
+
+        [groups.plain]
+        mode = "two-way-safe"
+        interval = 1
+        alpha = "{plain}"
+        betas = ["{mirror}"]
+        "#,
+        alpha = alpha.display(),
+        script = script.display(),
+        beta = beta.display(),
+        plain = plain.display(),
+        mirror = mirror.display(),
+    ));
+    let peering_plan = plans
+        .iter()
+        .find(|plan| plan.group == "g")
+        .expect("the peering group")
+        .clone();
+    // The beta led at term 9 while the alpha was away.
+    write_lease(
+        &agent_home.join(".autobahn").join("peering"),
+        &Lease::new(&peering_plan.beta_spec(), 9, Duration::from_secs(30)),
+    )
+    .expect("the beta's lease");
+    // There is no leader to attach to here: attaching fails at once.
+    let _attach = EnvironmentGuard::set(peering::ATTACH_COMMAND_VARIABLE, "false");
+
+    let stop = AtomicBool::new(false);
+    let alerts = autobahn::alerts::AlertPlan::default();
+    let directory = world.path("alpha-peering");
+    let state_root = world.state_root();
+    let config_path = world.path("config.toml");
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let run = scope.spawn(|| {
+            autobahn::supervisor::peer::run_alpha(
+                &config_path,
+                &directory,
+                &plans,
+                &alerts,
+                &state_root,
+                false,
+                &stop,
+                None,
+            )
+        });
+        assert!(
+            wait_until(Duration::from_secs(20), || world
+                .status(&peering_plan)
+                .is_some_and(|status| status.state == "following")),
+            "the alpha should be fenced and follow"
+        );
+        write(&plain, "while-following.txt", "plain");
+        assert!(
+            wait_until(Duration::from_secs(20), || mirror
+                .join("while-following.txt")
+                .exists()),
+            "the plain group should keep running while the alpha follows"
+        );
+        assert!(
+            !beta.join("hello.txt").exists(),
+            "the peering group writes nothing while it follows"
+        );
+        stop.store(true, Ordering::Relaxed);
+        run.join()
+            .expect("the alpha thread")
+            .expect("the alpha ran");
+    });
 }
 
 /// Peering, phase 4: a peer whose lease has been stale for its wait takes
@@ -3779,8 +3886,12 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         .unwrap();
         let outcomes = Supervisor::new(plans.clone(), world.path("alpha-state"), false)
             .with_peering(
-                PeeringContext::for_alpha(world.path("config.toml"), alpha_directory.clone())
-                    .expect("context"),
+                PeeringContext::for_alpha(
+                    world.path("config.toml"),
+                    alpha_directory.clone(),
+                    autobahn::config::DEFAULT_PEERING_TTL,
+                )
+                .expect("context"),
             )
             .run_once();
         assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);

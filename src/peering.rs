@@ -347,7 +347,10 @@ pub fn check_write(directory: &Path, accepted: &Lease) -> Result<LeaseLock> {
             }
             .into())
         }
-        None => bail!("the lease this channel was accepted at is gone from {}", directory.display()),
+        None => bail!(
+            "the lease this channel was accepted at is gone from {}",
+            directory.display()
+        ),
     };
     if let Some(receipt) = read_receipt(directory)? {
         if receipt.leader == current.leader && receipt.term == current.term {
@@ -410,13 +413,10 @@ pub fn is_pushable(name: &str) -> bool {
     let plain = |file: &str| !file.is_empty() && !file.contains('/') && file != "." && file != "..";
     match name {
         "config.toml" | "name" => true,
-        other => match (
-            other.strip_prefix("ignores/"),
-            other.strip_prefix("sessions/"),
-        ) {
-            (Some(file), _) | (_, Some(file)) => plain(file),
-            _ => false,
-        },
+        other => ["ignores/", "sessions/", "names/"]
+            .iter()
+            .find_map(|prefix| other.strip_prefix(prefix))
+            .is_some_and(plain),
     }
 }
 
@@ -604,6 +604,9 @@ mod tests {
         assert!(is_pushable("config.toml"));
         assert!(is_pushable("name"));
         assert!(is_pushable("ignores/node"));
+        assert!(is_pushable("names/work"));
+        assert!(!is_pushable("names/"));
+        assert!(!is_pushable("names/a/b"));
         assert!(!is_pushable("ignores/"));
         assert!(!is_pushable("ignores/../x"));
         assert!(!is_pushable("ignores/a/b"));
@@ -674,7 +677,10 @@ mod tests {
         let directory = keep.path().join(DIRECTORY);
         let ttl = Duration::from_secs(30);
         let higher = Lease::new("u@h:/x", 6, ttl);
-        assert_eq!(admit_lease(&directory, &higher).unwrap(), LeaseAnswer::Accepted);
+        assert_eq!(
+            admit_lease(&directory, &higher).unwrap(),
+            LeaseAnswer::Accepted
+        );
         assert_eq!(
             admit_lease(&directory, &Lease::new(ALPHA, 5, ttl)).unwrap(),
             LeaseAnswer::Refused {
@@ -722,7 +728,12 @@ mod tests {
             term: 5,
             received_at: now_seconds() - 31,
         };
-        write_file(&directory, RECEIPT_FILE, &serde_json::to_vec(&receipt).unwrap()).unwrap();
+        write_file(
+            &directory,
+            RECEIPT_FILE,
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
         let error = check_write(&directory, &accepted).expect_err("a lapsed lease");
         assert!(
             matches!(
@@ -792,7 +803,9 @@ mod tests {
                     });
                 }
             });
-            let written = read_pushed_file(&directory, "config.toml").unwrap().unwrap();
+            let written = read_pushed_file(&directory, "config.toml")
+                .unwrap()
+                .unwrap();
             assert!(contents.contains(&written), "a mixed or partial file");
         }
         let leftovers: Vec<_> = std::fs::read_dir(&directory)
@@ -845,7 +858,10 @@ mod tests {
             names.push(format!("f{generation:03}"));
             let tree = Node::directory(
                 "",
-                names.iter().map(|name| Node::directory(name, Vec::new())).collect(),
+                names
+                    .iter()
+                    .map(|name| Node::directory(name, Vec::new()))
+                    .collect(),
             );
             store
                 .record(
@@ -939,6 +955,11 @@ pub fn pushed_configuration(directory: &Path) -> Result<Option<(String, String)>
 /// alpha — its own root, as a local path — and the other betas stay as
 /// they were. Groups not in a peering mode are the alpha's business and
 /// are dropped.
+///
+/// This host's name is per group: two groups can reach it at two roots,
+/// and each pushes its own under `names/<group>`. `name` is the one the
+/// last group pushed, and stands in for a group that pushed none. The
+/// star leads under one name — a lease is per host — the first group's.
 pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<FollowerStar> {
     let mut config: crate::config::Config =
         toml::from_str(configuration).context("unable to parse the pushed configuration")?;
@@ -957,6 +978,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         }
     };
     let mut position: Option<usize> = None;
+    let mut leader: Option<String> = None;
     let mut groups = std::collections::BTreeMap::new();
     for (group_name, group) in &config.groups {
         let mode = group.mode.as_deref().or(config.defaults.mode.as_deref());
@@ -969,6 +991,11 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         if !peering {
             continue;
         }
+        let name = match read_pushed_file(directory, &format!("names/{group_name}"))? {
+            Some(pushed) => String::from_utf8(pushed).context("the pushed name is not UTF-8")?,
+            None => name.to_owned(),
+        };
+        let name = name.as_str();
         let Some(index) = group
             .betas
             .iter()
@@ -976,6 +1003,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         else {
             continue;
         };
+        leader.get_or_insert_with(|| name.to_owned());
         let own_path = name
             .rsplit_once(':')
             .map(|(_, path)| path.to_owned())
@@ -1006,7 +1034,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             None => index + 1,
         });
     }
-    let Some(position) = position else {
+    let (Some(position), Some(leader)) = (position, leader) else {
         bail!("{name:?} is not a beta of any peering group in the pushed configuration");
     };
     config.groups = groups;
@@ -1044,7 +1072,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         .min()
         .unwrap_or(Duration::from_secs(5));
     Ok(FollowerStar {
-        name: name.to_owned(),
+        name: leader,
         plans,
         position,
         interval,
@@ -1126,6 +1154,83 @@ mod star_tests {
         );
 
         assert!(derive_star(PUSHED, "nobody:/x", keep.path()).is_err());
+    }
+
+    /// Two groups reach one host at two roots. Each pushes its own name
+    /// for the host, and the host-wide one is whichever pushed last; the
+    /// star covers both groups, each from its own root, and fails over
+    /// both.
+    #[test]
+    fn two_groups_on_one_host_both_fail_over() {
+        const TWO: &str = r#"
+            [groups.docs]
+            mode = "peering-conflict-dangerously-experimental"
+            alpha = "/home/f/docs"
+            betas = ["box:/srv/docs", "other:/srv/docs"]
+
+            [groups.code]
+            mode = "peering-conflict-dangerously-experimental"
+            alpha = "/home/f/code"
+            betas = ["box:/srv/code"]
+        "#;
+        let pushed = |per_group: bool| {
+            let keep = tempfile::tempdir().expect("tempdir");
+            for group in ["docs", "code"] {
+                let session = crate::session::session_identifier(group, "box");
+                write_pushed_file(
+                    keep.path(),
+                    &format!("sessions/{group}"),
+                    session.as_bytes(),
+                )
+                .unwrap();
+                if per_group {
+                    let name = format!("box:/srv/{group}");
+                    write_pushed_file(keep.path(), &format!("names/{group}"), name.as_bytes())
+                        .unwrap();
+                }
+            }
+            keep
+        };
+        let roots = |star: &FollowerStar| -> std::collections::BTreeSet<(String, String)> {
+            star.plans
+                .iter()
+                .map(|plan| {
+                    // This host's own side is the local one: the alpha,
+                    // or the beta of the session with the attached alpha.
+                    let root = match (&plan.alpha, &plan.beta) {
+                        (crate::config::EndpointTarget::Local(root), _)
+                        | (_, crate::config::EndpointTarget::Local(root)) => root,
+                        _ => panic!("no side of {plan:?} is this host"),
+                    };
+                    (plan.group.clone(), root.to_string_lossy().into_owned())
+                })
+                .collect()
+        };
+
+        // The host-wide name is the one the last group pushed.
+        let keep = pushed(true);
+        let star = derive_star(TWO, "box:/srv/code", keep.path()).expect("a star");
+        assert_eq!(
+            roots(&star),
+            [("code", "/srv/code"), ("docs", "/srv/docs")]
+                .map(|(group, root)| (group.to_owned(), root.to_owned()))
+                .into(),
+            "{:?}",
+            star.plans
+        );
+        // It leads under one name, the first group's, and its place in
+        // the order is the best either group gives it.
+        assert_eq!(star.name, "box:/srv/code");
+        assert_eq!(star.position, 1);
+
+        // Without per-group names, only the group the host-wide name
+        // matches fails over: what a leader from before them pushed.
+        let keep = pushed(false);
+        let star = derive_star(TWO, "box:/srv/code", keep.path()).expect("a star");
+        assert_eq!(
+            roots(&star),
+            [("code".to_owned(), "/srv/code".to_owned())].into()
+        );
     }
 }
 

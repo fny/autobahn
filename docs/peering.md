@@ -2,12 +2,11 @@
 
 Failover for the star. The alpha leads, as it always has. When it is gone for long enough, the first beta that is up takes the lead, and the other betas keep syncing through it. When the alpha comes back, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes.
 
-> **Do not enable peering unless you accept the issues below.** A September 2026 review found security and collision issues in peering that are not fixed in this release. Any peer that can lead can run commands on every other peer, and on the alpha's machine through one path. Two leaders can write the same root at once in some timings. See [Known security issues](#known-security-issues) and [Known collision issues](#known-collision-issues).
+> **Do not enable peering unless you accept the issues below.** A September 2026 review found security issues in peering that are not fixed in this release. Any peer that can lead can run commands on every other peer, and on the alpha's machine through one path. See [Known security issues](#known-security-issues). The collision issues the same review found, where two leaders could write one root or failover could stall, are fixed.
 
-**Dangerously experimental** means four things here:
+**Dangerously experimental** means three things here:
 - The design is new, and the modes carry the words in their names so a configuration says so on its face.
 - The on-disk state under `peering/` may change shape between releases without a migration.
-- The fence described below does not yet hold in every timing. Peering can let two controllers write one root.
 - Peering trusts every peer that can lead with every other peer, including the alpha's machine. Use it only among machines that already trust each other with a shell.
 
 The old names, `peering-conflict-experimental`, `peering-alpha-experimental` and `[advanced.peering-experimental]`, are refused with a message pointing here. The rename is deliberate: turning peering on should mean reading this page.
@@ -68,7 +67,7 @@ On every cycle the leader keeps each peer able to lead:
 |---|---|
 | the lease | the peer knows who leads, and the agent can fence |
 | `config.toml`, `ignores/` | the peer knows the star |
-| `name` | the peer can find itself in the star |
+| `names/<group>`, `name` | the peer can find itself in each group's star; two groups can reach one host at two roots |
 | `sessions/<group>` | the peer knows the session's identifier |
 | the ancestor's journal records | the peer holds a copy of the last agreed state |
 
@@ -78,19 +77,21 @@ The last one is what makes a takeover clean. A leader without an ancestor reconc
 
 A peer reads its lease every interval. While the lease is fresh, or stale for less than the peer's wait, nothing happens. The wait is `failover_after` plus one `ttl` for every beta ahead of this one in the configuration's order — so the first live beta acts first, and nobody has to be asked. A blip never reaches the wait.
 
-When it is time, the peer writes a lease at the next term, and runs the leader's configuration turned around: itself as the alpha, every other beta as a beta. Its sessions present the new lease to each host on their first cycle. A host a newer term has already taken refuses it, and the peer steps down and follows again.
+When it is time, the peer writes a lease at the next term, and runs the leader's configuration turned around: itself as the alpha, every other beta as a beta. The configuration is the one last pushed: the peer derives its star again every interval while it follows, so a change the leader pushed meanwhile is the one the takeover runs. Its sessions present the new lease to each host on their first cycle. A host a newer term has already taken refuses it, and the peer steps down and follows again.
+
+A peer whose own lease names it leads at once at that term: it led and restarted, or the lead was handed to it.
 
 Two candidates acting at once — clocks a lifetime apart, say — present the same term to the same hosts. Each host keeps the first and refuses the second, because it admits a lease in one step under a lock.
 
 ### The alpha is never dialed
 
-The alpha is the one member that may be behind NAT, asleep, or on hotel wifi, so peering never assumes it can be reached. It dials. As leader it dials the betas, as it always has. While a beta leads, the alpha dials *the leader* and attaches: `ssh <leader> autobahn peering attach` bridges the alpha's own agent loop to the leading peer's attach socket, and the peer's supervisor takes that connection as the alpha's side of their session. The direction of the connection and the direction of the sync are independent.
+The alpha is the one member that may be behind NAT, asleep, or on hotel wifi, so peering never assumes it can be reached. It dials. As leader it dials the betas, as it always has. While a beta leads, the alpha dials *the leader* and attaches: `ssh <leader> autobahn peering attach` bridges the alpha's own agent loop to the leading peer's attach socket, and the peer's supervisor takes that connection as the alpha's side of their session. The direction of the connection and the direction of the sync are independent. The alpha's groups that do not peer keep running meanwhile: they are the alpha's alone, whoever leads the star.
 
 The session keeps the alpha on the alpha side, under the identifier the leader pushed, so the ancestor copy is the same session's and is adopted by whichever side leads next.
 
 ### The handoff
 
-The lead goes back to the alpha on its own: one settled cycle on the attached session hands it over at the next term. `autobahn peering yield --to alpha` does the same on request, from the leading peer. A handoff writes the local lease first, every session hands the new lease to its peer on its next attempt, and then the supervisor follows. A restart in the middle comes back as a follower, and the timeout takes it from there.
+The lead goes back to the alpha on its own: one settled cycle on the attached session hands it over at the next term. `autobahn peering yield --to alpha` does the same on request, from the leading peer. A handoff writes the local lease first, every running peering session hands the new lease to its peer on its next attempt, and then the supervisor follows. A paused session is not waited for. A restart in the middle comes back as a follower; the member the lease names leads as soon as the lease reaches it, and otherwise the timeout takes it from there.
 
 ## What `status` shows
 
@@ -112,7 +113,7 @@ While a peer follows, its sessions are in the state `following`. That is not tro
 
 ```sh
 autobahn peering yield --to alpha      # from the leading peer: hand the lead back now
-autobahn peering yield --to <spec>     # ...or to a named beta
+autobahn peering yield --to <spec>     # ...or to a named beta of the star; any other name is refused
 autobahn peering attach                # what the alpha runs over ssh; not for typing
 ```
 
@@ -137,18 +138,6 @@ A laptop that attaches to a leading beta therefore trusts that beta with the lap
 **A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
 
 **The attach socket does not check who connects.** On the leading beta, `~/.autobahn/peering/attach.sock` has no peer-credential check, no explicit permissions and no timeout. Unlike the control socket, it accepts any local process that can connect and send the alpha's greeting. On a multi-user host, another local user could pose as the alpha. Do not run a peering beta on a machine shared with users you do not trust.
-
-## Known collision issues
-
-These can let two controllers write one root, or leave a peer stuck, in some timings.
-
-- **Several peering groups share one identity.** Groups aimed at different roots on one host push different `name` files to the same place. The last push wins, so failover covers only part of the groups.
-- **A follower takes over with an old configuration.** A follower reads the pushed configuration once, before it starts following. Changes pushed while it follows are ignored at takeover.
-- **Handoff can stall or go to the wrong peer.**
-  - Handoff never completes while the leader has plain groups or a paused session.
-  - Plain groups stop while the alpha follows.
-  - `peering yield --to <beta>` does not check its target, so a typo leaves nobody leading until the timeout.
-  - Some leases ignore the configured `ttl`.
 
 ## What is not covered
 

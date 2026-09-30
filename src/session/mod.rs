@@ -940,7 +940,9 @@ impl Session {
     /// while a side reports a file open for writing, the settle waits past
     /// `maximum`, up to [`crate::endpoint::WRITE_GRACE`], for it to close.
     /// A save that closes the moment it has written — most of them — waits
-    /// no longer than before.
+    /// no longer than before. A save that begins after the settle is left
+    /// out by the scan itself ([`crate::scan::scan_deferring`]); waiting
+    /// here spares the cycle that would find nothing else to do.
     pub fn settle(&mut self, maximum: std::time::Duration, quiet: std::time::Duration) {
         let started = std::time::Instant::now();
         let deadline = started + maximum;

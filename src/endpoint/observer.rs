@@ -604,16 +604,17 @@ impl RootObserver {
         // change it may have walked straight past.
         let taken_at = self.signal.current();
 
-        let dirty = if want_full {
-            None
-        } else {
+        let (dirty, in_flight) = {
             let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            let in_flight = state.watcher.as_ref().map(|watcher| watcher.in_flight());
             // Only a whole watch's marks can stand for what changed.
             let watched = Self::watched(&state);
-            match (state.watcher.as_mut(), baseline) {
+            let dirty = match (state.watcher.as_mut(), baseline) {
+                _ if want_full => None,
                 (Some(watcher), Some(_)) if watched => watcher.take_dirty(&self.key.root, behavior),
                 _ => None,
-            }
+            };
+            (dirty, in_flight)
         };
 
         #[cfg(test)]
@@ -624,7 +625,15 @@ impl RootObserver {
             bail!("an injected walk failure");
         }
 
-        let snapshot = scan::scan(
+        // Files still being written are left for a later scan: a safe
+        // save's temporary read now is renamed away before a peer can ask
+        // for it. Their close and rename mark them as they happen; marked
+        // again here as well, so one whose writer goes quiet without
+        // closing it is read by the next scan all the same.
+        let still_writing = in_flight
+            .as_ref()
+            .map(|files| move |path: &Path| files.contains(path));
+        let (snapshot, deferred) = scan::scan_deferring(
             &self.key.root,
             baseline,
             &self.ignores,
@@ -635,8 +644,17 @@ impl RootObserver {
             rehash,
             progress,
             self.key.ignore_mounts,
+            still_writing
+                .as_ref()
+                .map(|check| check as scan::InFlight<'_>),
         )
         .with_context(|| format!("unable to scan {}", self.key.root.display()))?;
+        if !deferred.is_empty() {
+            let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(watcher) = state.watcher.as_ref() {
+                watcher.mark_pending(deferred);
+            }
+        }
         Ok((snapshot, taken_at, dirty.is_none()))
     }
 

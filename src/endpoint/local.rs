@@ -500,6 +500,33 @@ impl WriteActivity {
         !self.open.is_empty()
     }
 
+    /// Whether this file has been open for writing for less than the grace.
+    fn writing_to(&self, path: &Path, grace: std::time::Duration) -> bool {
+        self.open
+            .get(path)
+            .is_some_and(|since| since.elapsed() < grace)
+    }
+}
+
+/// A watcher's record of the files open for writing, for a scan to consult
+/// as it goes (see [`crate::scan::scan_deferring`]). Held apart from the
+/// watcher, so a scan asks without the observer's lock.
+#[derive(Clone)]
+pub(crate) struct InFlightFiles {
+    writes: Arc<Mutex<WriteActivity>>,
+}
+
+impl InFlightFiles {
+    /// Whether the file at `path` is still being written: opened for
+    /// writing less than [`crate::endpoint::WRITE_GRACE`] ago, and not yet
+    /// closed. A file held open longer than that is read as it stands, as
+    /// the settle stops waiting for it then too.
+    pub(crate) fn contains(&self, path: &Path) -> bool {
+        self.writes
+            .lock()
+            .expect("the writes lock is never poisoned")
+            .writing_to(path, crate::endpoint::WRITE_GRACE)
+    }
 }
 
 impl PendingChanges {
@@ -743,6 +770,13 @@ impl ChangeWatcher {
             .expect("the pending lock is never poisoned")
             .paths
             .clone()
+    }
+
+    /// The files open for writing, as a scan consults them.
+    pub(crate) fn in_flight(&self) -> InFlightFiles {
+        InFlightFiles {
+            writes: Arc::clone(&self.writes),
+        }
     }
 
     /// Records paths this process is about to change, exactly as the
@@ -6646,6 +6680,72 @@ mod watch_tests {
             reads(Duration::from_secs(3), false),
             "closed and renamed: nothing is open for writing"
         );
+    }
+
+    /// A scan while a safe save is under way leaves the save out: its
+    /// temporary, still open, is not in the snapshot — so a peer is never
+    /// sent to fetch it after the rename — and the file it replaces reads
+    /// as it was. Once the save closes and lands, the next scan has it.
+    #[test]
+    fn a_scan_leaves_out_a_safe_save_still_being_written() {
+        use crate::endpoint::Endpoint;
+        use std::io::Write;
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("page.txt"), b"before").unwrap();
+        let mut endpoint = super::LocalEndpoint::new(
+            root.clone(),
+            keep.path().join("staging"),
+            super::EndpointOptions::default(),
+        )
+        .expect("endpoint");
+        endpoint.scan().expect("the first scan");
+        let file_at = |snapshot: &crate::tree::Snapshot, name: &str| {
+            snapshot
+                .root
+                .as_ref()
+                .and_then(|root| root.child(name))
+                .map(|node| match &node.content {
+                    crate::tree::Content::File { digest, .. } => *digest,
+                    other => panic!("{name} is not a file: {other:?}"),
+                })
+        };
+
+        let temporary = root.join("page.txt.bench-tmp");
+        let mut file = std::fs::File::create(&temporary).unwrap();
+        file.write_all(b"after, and longer").unwrap();
+        file.sync_all().unwrap();
+        let end = Instant::now() + Duration::from_secs(3);
+        while !endpoint
+            .change_activity()
+            .is_some_and(|activity| activity.writing)
+        {
+            assert!(
+                Instant::now() < end,
+                "the save should read as being written"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let during = endpoint.scan().expect("a scan during the save");
+        assert_eq!(file_at(&during, "page.txt.bench-tmp"), None);
+        assert_eq!(
+            file_at(&during, "page.txt"),
+            Some(*blake3::hash(b"before").as_bytes())
+        );
+
+        drop(file);
+        std::fs::rename(&temporary, root.join("page.txt")).unwrap();
+        let end = Instant::now() + Duration::from_secs(3);
+        loop {
+            let after = endpoint.scan().expect("a scan after the save");
+            if file_at(&after, "page.txt") == Some(*blake3::hash(b"after, and longer").as_bytes()) {
+                assert_eq!(file_at(&after, "page.txt.bench-tmp"), None);
+                break;
+            }
+            assert!(Instant::now() < end, "the landed save should be scanned");
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     /// Finding M-25: an ignored directory holding a re-inclusion is walked

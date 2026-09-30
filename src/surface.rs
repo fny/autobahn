@@ -124,8 +124,47 @@ pub(crate) struct Side {
     /// Whether the first few kilobytes hold a NUL, which is how `diff`
     /// decides it will not print the file either.
     pub(crate) binary: bool,
+    /// Whether any execute bit is set, which is the scanner's own rule
+    /// (`scan::MODE_EXECUTABLE_MASK`). Two files the engine calls equal
+    /// must match here as well as in their digest, so a card that
+    /// compares only digests can say two sides agree when the thing
+    /// they disagree about is this.
+    pub(crate) executable: bool,
     /// Why there is nothing else to say: another machine, or gone.
     pub(crate) trouble: Option<String>,
+}
+
+/// What two sides that hash the same are actually disagreeing about.
+///
+/// Identical content is not a conflict: reconciliation compares digest
+/// *and* executability, and two entries equal in both never reach the
+/// conflicts pane at all — the ancestor simply advances. So a card
+/// showing two matching digests is looking at one of two other things,
+/// and saying "either choice keeps it" is wrong about the first.
+pub(crate) enum Agreement {
+    /// Same bytes, different mode. The choice decides whether the file
+    /// stays executable, which is exactly what is being conflicted over.
+    OnlyTheMode { executable: &'static str },
+    /// Same bytes, same mode. The conflict was recorded by an earlier
+    /// cycle and something has settled it since — a copy by hand, most
+    /// likely. Nothing needs choosing; the next cycle clears it.
+    Settled,
+}
+
+/// The verdict, when both sides hashed and hashed the same.
+pub(crate) fn agreement(alpha: &Side, beta: &Side) -> Option<Agreement> {
+    if alpha.digest.is_none() || alpha.digest != beta.digest {
+        return None;
+    }
+    match (alpha.executable, beta.executable) {
+        (true, false) => Some(Agreement::OnlyTheMode {
+            executable: alpha.name,
+        }),
+        (false, true) => Some(Agreement::OnlyTheMode {
+            executable: beta.name,
+        }),
+        _ => Some(Agreement::Settled),
+    }
 }
 
 /// Files larger than this are measured and dated but not hashed. Reading
@@ -146,6 +185,7 @@ pub(crate) fn inspect(name: &'static str, root: &str, path: &str) -> Side {
             modified: None,
             digest: None,
             binary: false,
+            executable: false,
             trouble: Some(t("conflicts.elsewhere").to_owned()),
         };
     };
@@ -159,11 +199,17 @@ pub(crate) fn inspect(name: &'static str, root: &str, path: &str) -> Side {
         modified: None,
         digest: None,
         binary: false,
+        executable: false,
         trouble: None,
     };
     match std::fs::symlink_metadata(&file) {
         Ok(metadata) => {
             side.size = Some(metadata.len());
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                side.executable = metadata.permissions().mode() & 0o111 != 0;
+            }
             side.modified = metadata
                 .modified()
                 .ok()
@@ -1210,6 +1256,42 @@ mod tests {
         assert_eq!(written.replace('\\', ""), said.replace('\\', ""));
     }
 
+    /// A matching digest does not mean "one file in two places". The
+    /// engine calls two entries equal only when the mode matches too,
+    /// so the card has to say which of the two remaining cases it is —
+    /// and for one of them "either choice keeps it" was wrong.
+    #[test]
+    fn two_sides_that_hash_the_same_still_say_what_differs() {
+        let side = |name: &'static str, digest: Option<&str>, executable: bool| Side {
+            name,
+            root: "/tmp".to_owned(),
+            place: format!("/tmp/{name}"),
+            file: None,
+            size: Some(1),
+            modified: None,
+            digest: digest.map(str::to_owned),
+            binary: true,
+            executable,
+            trouble: None,
+        };
+
+        // Same bytes, same mode: recorded earlier, settled since.
+        let both = agreement(&side("alpha", Some("aa"), false), &side("beta", Some("aa"), false));
+        assert!(matches!(both, Some(Agreement::Settled)));
+
+        // Same bytes, and the mode is the whole disagreement. The side
+        // that is executable is named, because the choice decides it.
+        let mode = agreement(&side("alpha", Some("aa"), false), &side("beta", Some("aa"), true));
+        assert!(
+            matches!(mode, Some(Agreement::OnlyTheMode { executable: "beta" })),
+            "the executable side is the one named"
+        );
+
+        // Different bytes, or a file too large to hash, says nothing.
+        assert!(agreement(&side("alpha", Some("aa"), false), &side("beta", Some("bb"), false)).is_none());
+        assert!(agreement(&side("alpha", None, false), &side("beta", None, false)).is_none());
+    }
+
     /// A complaint that names its key belongs under that key, and the
     /// filenames it offered are a choice rather than a sentence.
     #[test]
@@ -1427,4 +1509,5 @@ mod tests {
         assert!(Severity::Bad > Severity::Attention && Severity::Attention > Severity::Fine);
     }
 }
+
 

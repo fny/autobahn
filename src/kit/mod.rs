@@ -1704,8 +1704,11 @@ impl Desk {
             (Some(a), Some(b)) if b > a => Some("beta"),
             _ => None,
         };
-        let same = alpha.digest.is_some() && alpha.digest == beta.digest;
-        let name = item.path.rsplit('/').next().unwrap_or(&item.path).to_owned();
+        // Two sides that hash the same are not "one file in two places":
+        // reconciliation compares the mode too, so identical content and
+        // mode never reaches this pane. Say which of the two remaining
+        // cases it is.
+        let agreed = surface::agreement(alpha, beta);
         div()
             .id("binary")
             .flex_1()
@@ -1732,18 +1735,31 @@ impl Desk {
                     .child(self.side_card(alpha, newer == Some("alpha"), cx))
                     .child(self.side_card(beta, newer == Some("beta"), cx)),
             )
-            .when(same, |card| {
+            .when_some(agreed, |card, agreed| {
+                // Settled is good news and reads green. A mode that
+                // differs is the conflict itself, not a reassurance.
+                let (colour, words) = match agreed {
+                    surface::Agreement::Settled => {
+                        (GREEN, t("conflicts.settled").to_owned())
+                    }
+                    surface::Agreement::OnlyTheMode { executable } => (
+                        AMBER,
+                        fill("conflicts.only_the_mode", &[("name", executable)]),
+                    ),
+                };
                 card.child(
                     div()
                         .flex()
-                        .items_center()
+                        .items_baseline()
                         .gap(step(2.))
-                        .child(dot(GREEN))
+                        .max_w(px(680.))
+                        .child(div().flex_shrink_0().pt(px(4.)).child(dot(colour)))
                         .child(
                             div()
+                                .min_w(px(0.))
                                 .text_size(px(11.))
-                                .text_color(rgb(GREEN))
-                                .child(fill("conflicts.same", &[("name", &name)])),
+                                .text_color(rgb(colour))
+                                .child(words),
                         ),
                 )
             })

@@ -2,12 +2,12 @@
 
 Failover for the star. The alpha leads, as it always has. When it is gone for long enough, the first beta that is up takes the lead, and the other betas keep syncing through it. When the alpha comes back, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes.
 
-> **Do not enable peering unless you accept the issues below.** A September 2026 review found security issues in peering that are not fixed in this release. Any peer that can lead can run commands on every other peer, and on the alpha's machine through one path. See [Known security issues](#known-security-issues). The collision issues the same review found, where two leaders could write one root or failover could stall, are fixed.
+> **Do not enable peering unless you accept the issues below.** A September 2026 review found security issues in peering that are not fixed in this release. Any peer that can lead can run commands on every other peer; the alpha's machine it can reach only through what the alpha syncs with it. See [Known security issues](#known-security-issues). The collision issues the same review found, where two leaders could write one root or failover could stall, are fixed.
 
 **Dangerously experimental** means three things here:
 - The design is new, and the modes carry the words in their names so a configuration says so on its face.
 - The on-disk state under `peering/` may change shape between releases without a migration.
-- Peering trusts every peer that can lead with every other peer, including the alpha's machine. Use it only among machines that already trust each other with a shell.
+- Peering trusts every peer that can lead with a shell on every other beta, and with the alpha's synced folders. Use it only among machines that already trust each other that far.
 
 The old names, `peering-conflict-experimental`, `peering-alpha-experimental` and `[advanced.peering-experimental]`, are refused with a message pointing here. The rename is deliberate: turning peering on should mean reading this page.
 
@@ -121,7 +121,7 @@ autobahn peering attach                # what the alpha runs over ssh; not for t
 
 ## Known security issues
 
-These are open and will not be fixed before peering leaves this status.
+These are open. The first has a plan: SSH keys that can only run the agent, over folders each server allows, set up automatically (`REVIEWS/fixes/PEER-4-pushed-commands-and-roots.md`).
 
 **Every peer that can lead is trusted like a shell on every other peer.** A leader pushes its configuration to every follower, and a follower runs it when it takes the lead. Two consequences follow:
 - **Pushed commands.** A pushed group's `agent_command` is kept as written. A follower runs it when it next leads, even after the leader that pushed it has gone.

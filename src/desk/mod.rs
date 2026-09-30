@@ -150,6 +150,10 @@ pub struct Desk {
     section: Section,
     /// The field being edited, if any.
     editing: Option<Edit>,
+    /// Whether the loader's complaints are unfolded. Shut by default:
+    /// the line beside Save says there is one, which is all most of
+    /// them need to say.
+    showing_faults: bool,
     /// Whether this window is showing what it keeps back.
     ///
     /// Five clicks on the wordmark. Not a secret and not a password —
@@ -397,6 +401,7 @@ impl Desk {
             sheet: None,
             section: Section::Settings,
             editing: None,
+            showing_faults: false,
             unlocked: false,
             knocks: 0,
             knocked_at: None,
@@ -1459,7 +1464,17 @@ impl Desk {
             return empty(t("config.none"));
         };
         let path = sheet.path.clone();
-        let refused = sheet.refused.clone();
+        // While the loader is behind the typing its last word is about a
+        // document nobody is looking at any more, so nothing is drawn
+        // from it: the line beside Save says it is checking instead.
+        let checking = sheet.checking();
+        let refused = match checking {
+            true => None,
+            false => sheet.refused.clone(),
+        };
+        let faults = refused.as_deref().map(faults).unwrap_or_default();
+        let blamed = refused.as_deref().and_then(blamed);
+        let showing = self.showing_faults && refused.is_some();
         let pending = sheet.pending();
         let sections = self.sections();
         let open = self.section.clone();
@@ -1548,10 +1563,65 @@ impl Desk {
                         column.child(
                             div()
                                 .px(step(2.5))
-                                .pb(step(2.5))
+                                .pb(step(1.))
                                 .text_size(px(T_PILL))
                                 .text_color(rgb(AMBER))
                                 .child(counted("config.pending", pending, &[])),
+                        )
+                    })
+                    // What the loader thinks, in one line where the Save
+                    // it is refusing is — not a wall above the form.
+                    .when(checking, |column| {
+                        column.child(
+                            div()
+                                .px(step(2.5))
+                                .pb(step(2.5))
+                                .text_size(px(T_PILL))
+                                .text_color(rgb(FAINT))
+                                .child(t("config.checking")),
+                        )
+                    })
+                    .when(!faults.is_empty(), |column| {
+                        let where_ = blamed
+                            .as_ref()
+                            .map(Section::title)
+                            .unwrap_or_else(|| t("config.the_file").to_owned());
+                        column.child(
+                            div()
+                                .id("faults")
+                                .px(step(2.5))
+                                .pb(step(2.5))
+                                .flex()
+                                .items_baseline()
+                                .gap(step(1.5))
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .text_size(px(T_PILL))
+                                        .text_color(rgb(FAINT))
+                                        .child(match showing {
+                                            true => "\u{25be}",
+                                            false => "\u{25b8}",
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(T_PILL))
+                                        .text_color(rgb(RED))
+                                        .child(counted("config.faults", faults.len(), &[])),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(T_PILL))
+                                        .text_color(rgb(FAINT))
+                                        .truncate()
+                                        .child(where_),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.showing_faults = !this.showing_faults;
+                                    cx.notify();
+                                })),
                         )
                     })
                     .children(sections.into_iter().map(|section| {
@@ -1593,13 +1663,20 @@ impl Desk {
                     .flex()
                     .flex_col()
                     .gap(step(4.))
-                    .when_some(refused, |column, refused| {
+                    // Only when it was asked for, and never taller than
+                    // a third of the pane: the form is what this column
+                    // is for.
+                    .when(showing, |column| {
                         column.child(
                             div()
+                                .id("faults-detail")
+                                .max_h(px(220.))
+                                .overflow_y_scroll()
+                                .flex_shrink_0()
                                 .rounded(px(8.))
-                                .bg(tint(AMBER, 0x14))
+                                .bg(tint(RED, 0x10))
                                 .border_1()
-                                .border_color(tint(AMBER, 0x50))
+                                .border_color(tint(RED, 0x44))
                                 .p(step(3.5))
                                 .flex()
                                 .flex_col()
@@ -1608,16 +1685,16 @@ impl Desk {
                                     div()
                                         .text_size(px(T_META))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(AMBER))
+                                        .text_color(rgb(RED))
                                         .child(t("config.refused")),
                                 )
-                                .child(
+                                .children(faults.iter().map(|fault| {
                                     div()
                                         .font_family(self.mono.clone())
                                         .text_size(px(T_META))
                                         .text_color(rgb(DIM))
-                                        .child(crate::text::display_block(&refused)),
-                                ),
+                                        .child(crate::text::display_block(fault))
+                                })),
                         )
                     })
                     .children(self.form(cx)),
@@ -2658,10 +2735,14 @@ impl Desk {
                 self.report = Some(status_report(&selected, &self.state_root));
             }
             Err(error) => {
-                self.said = Some(fill(
-                    "status.config_refused",
-                    &[("error", &format!("{error:#}"))],
-                ));
+                // One line, and the first fault rather than every
+                // group's copy of it: the status bar has one line.
+                let said = format!("{error:#}");
+                let first = faults(&said)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| first_line(&said));
+                self.said = Some(fill("status.config_refused", &[("error", &first)]));
             }
         }
     }

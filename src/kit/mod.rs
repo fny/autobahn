@@ -375,6 +375,10 @@ pub struct Desk {
     typed_at: Option<Instant>,
     /// The form's own scroll, so Save can put the refusal in view.
     form: ScrollHandle,
+    /// Whether the loader's complaints are unfolded. Shut by default:
+    /// the line beside Save says there is one, which is all most of
+    /// them need to say.
+    showing_faults: bool,
     /// Whether this window is showing what it keeps back.
     ///
     /// Five clicks on the wordmark. Not a secret and not a password —
@@ -500,6 +504,7 @@ impl Desk {
             lists: std::collections::HashSet::new(),
             typed_at: None,
             form: ScrollHandle::new(),
+            showing_faults: false,
             unlocked: false,
             knocks: 0,
             knocked_at: None,
@@ -611,10 +616,14 @@ impl Desk {
                 self.report = Some(status_report(&selected, &self.state_root));
             }
             Err(error) => {
-                self.said = Some(fill(
-                    "status.config_refused",
-                    &[("error", &format!("{error:#}"))],
-                ));
+                // One line, and the first fault rather than every
+                // group's copy of it: the status bar has one line.
+                let said = format!("{error:#}");
+                let first = surface::faults(&said)
+                    .into_iter()
+                    .next()
+                    .unwrap_or_else(|| surface::first_line(&said));
+                self.said = Some(fill("status.config_refused", &[("error", &first)]));
             }
         }
     }
@@ -2192,7 +2201,17 @@ impl Desk {
             return empty(t("config.none"));
         };
         let path = sheet.path.clone();
-        let refused = sheet.refused().map(str::to_owned);
+        // While the loader is behind the typing its last word is about a
+        // document nobody is looking at any more, so nothing is drawn
+        // from it: the line beside Save says it is checking instead.
+        let checking = sheet.checking();
+        let refused = match checking {
+            true => None,
+            false => sheet.refused().map(str::to_owned),
+        };
+        let faults = refused.as_deref().map(surface::faults).unwrap_or_default();
+        let blamed = refused.as_deref().and_then(surface::blamed);
+        let showing = self.showing_faults && refused.is_some();
         let pending = sheet.pending();
         // The experimental tables are not listed at all until the
         // window has been let in; nothing points at a door either.
@@ -2275,11 +2294,18 @@ impl Desk {
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.take_the_fields(cx);
                                         this.save();
-                                        // Whatever the loader said is at
-                                        // the top of the form, which is
-                                        // not where a long section leaves
-                                        // you when you press Save.
-                                        this.form.set_offset(point(px(0.), px(0.)));
+                                        // Asking to save is asking why
+                                        // not, so a refusal unfolds and
+                                        // the top of the form — where it
+                                        // is drawn — comes into view.
+                                        let refused = this
+                                            .sheet
+                                            .as_ref()
+                                            .is_some_and(|sheet| sheet.refused().is_some());
+                                        if refused {
+                                            this.showing_faults = true;
+                                            this.form.set_offset(point(px(0.), px(0.)));
+                                        }
                                         cx.notify();
                                     })),
                             )
@@ -2310,10 +2336,68 @@ impl Desk {
                             div()
                                 .px(step(2.5))
                                 .flex_shrink_0()
-                                .when(room > Room::Tight, |line| line.pb(step(2.5)))
+                                .when(room > Room::Tight, |line| line.pb(step(1.)))
                                 .text_size(px(10.5))
                                 .text_color(rgb(AMBER))
                                 .child(counted("config.pending", pending, &[])),
+                        )
+                    })
+                    // What the loader thinks, in one line where the Save
+                    // it is refusing is — not a wall above the form.
+                    .when(checking, |column| {
+                        column.child(
+                            div()
+                                .px(step(2.5))
+                                .flex_shrink_0()
+                                .when(room > Room::Tight, |line| line.pb(step(2.5)))
+                                .text_size(px(10.5))
+                                .text_color(rgb(FAINT))
+                                .child(t("config.checking")),
+                        )
+                    })
+                    .when(!faults.is_empty(), |column| {
+                        let where_ = blamed
+                            .as_ref()
+                            .map(Section::title)
+                            .unwrap_or_else(|| t("config.the_file").to_owned());
+                        column.child(
+                            div()
+                                .id("faults")
+                                .mx(step(2.))
+                                .px(step(0.5))
+                                .flex_shrink_0()
+                                .when(room > Room::Tight, |line| line.mb(step(2.5)))
+                                .flex()
+                                .items_baseline()
+                                .gap(step(1.5))
+                                .cursor_pointer()
+                                .child(
+                                    div()
+                                        .text_size(px(9.))
+                                        .text_color(rgb(FAINT))
+                                        .child(match showing {
+                                            true => "\u{25be}",
+                                            false => "\u{25b8}",
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(rgb(RED))
+                                        .child(counted("config.faults", faults.len(), &[])),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.))
+                                        .text_color(rgb(FAINT))
+                                        .truncate()
+                                        .child(where_),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.showing_faults = !this.showing_faults;
+                                    cx.notify();
+                                })),
                         )
                     })
                     .children(sections.into_iter().map(|section| {
@@ -2337,6 +2421,9 @@ impl Desk {
                             })
                             .when(group, |row| row.child(dot(BLUE)))
                             .child(label)
+                            .when(blamed.as_ref() == Some(&section), |row| {
+                                row.child(div().flex_1()).child(dot(RED))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.section = section.clone();
                                 cx.notify();
@@ -2356,13 +2443,20 @@ impl Desk {
                     .flex()
                     .flex_col()
                     .gap(step(4.))
-                    .when_some(refused, |column, refused| {
+                    // Only when it was asked for, and never taller than
+                    // a third of the pane: the form is what this column
+                    // is for.
+                    .when(showing, |column| {
                         column.child(
                             div()
+                                .id("faults-detail")
+                                .max_h(px(220.))
+                                .overflow_y_scroll()
+                                .flex_shrink_0()
                                 .rounded(px(8.))
-                                .bg(tint(AMBER, 0x14))
+                                .bg(tint(RED, 0x10))
                                 .border_1()
-                                .border_color(tint(AMBER, 0x50))
+                                .border_color(tint(RED, 0x44))
                                 .p(step(3.5))
                                 .flex()
                                 .flex_col()
@@ -2371,16 +2465,16 @@ impl Desk {
                                     div()
                                         .text_size(px(11.))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(AMBER))
+                                        .text_color(rgb(RED))
                                         .child(t("config.refused")),
                                 )
-                                .child(
+                                .children(faults.iter().map(|fault| {
                                     div()
                                         .font_family(self.mono.clone())
                                         .text_size(px(11.))
                                         .text_color(rgb(DIM))
-                                        .child(crate::text::display_block(&refused)),
-                                ),
+                                        .child(crate::text::display_block(fault))
+                                })),
                         )
                     })
                     .children(self.form(window, cx)),
@@ -2952,13 +3046,24 @@ impl Desk {
             key: key.to_string(),
             item: None,
         };
-        // Quietly: the loader is too slow to run on every keystroke.
+        // A field being emptied is the one edit worth waiting for: it
+        // is how a person takes back a value the loader complained
+        // about, and holding the complaint on screen for another half
+        // second says the deletion did not work.
+        let cleared = value.is_none();
         if let Some(sheet) = &mut self.sheet {
-            if let Some(said) = sheet.later(&at, value) {
+            let said = match cleared {
+                true => sheet.put(&at, value),
+                false => sheet.later(&at, value),
+            };
+            if let Some(said) = said {
                 self.said = Some(said);
             }
         }
-        self.typed_at = Some(Instant::now());
+        self.typed_at = match cleared {
+            true => None,
+            false => Some(Instant::now()),
+        };
     }
 
     // ── what the window does to the fleet ────────────────────────────

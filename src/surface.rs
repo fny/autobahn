@@ -32,7 +32,7 @@ pub(crate) struct Conflict {
 }
 
 /// Which part of the file the form is showing.
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Section {
     /// The keys at the top of the file.
     Settings,
@@ -475,6 +475,58 @@ fn differ(was: &toml_edit::Table, now: &toml_edit::Table, changes: &mut usize) {
     }
 }
 
+/// The faults in a refusal, each said once.
+///
+/// The loader plans every group, so one bad value in `[defaults]` comes
+/// back once per group that inherits it — eight lines that differ only
+/// in a name. They are one fault, and a window that says "8 problems"
+/// about one wrong word has repeated the loader's mistake rather than
+/// reported it.
+pub(crate) fn faults(refusal: &str) -> Vec<String> {
+    let mut seen: Vec<String> = Vec::new();
+    for line in refusal.lines().skip(1) {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // "group 'aws': the defaults' ignore_files: …" is the same
+        // fault as the one for 'fny'; what follows the prefix is not.
+        let fault = match line.strip_prefix("group '") {
+            Some(rest) => match rest.split_once("': ") {
+                Some((_, said)) => said.to_owned(),
+                None => line.to_owned(),
+            },
+            None => line.to_owned(),
+        };
+        if !seen.contains(&fault) {
+            seen.push(fault);
+        }
+    }
+    seen
+}
+
+/// The section a refusal is about, when it names one.
+///
+/// A fault inherited from `[defaults]` is reported against every group
+/// that inherits it, and the group is not where anybody would go to fix
+/// it — the defaults are. That is why this looks for the defaults first.
+pub(crate) fn blamed(refusal: &str) -> Option<Section> {
+    if refusal.contains("the defaults'") || refusal.contains("defaults.") {
+        return Some(Section::Defaults);
+    }
+    for line in refusal.lines() {
+        if let Some(rest) = line.trim().strip_prefix("group '") {
+            if let Some((name, _)) = rest.split_once('\'') {
+                return Some(Section::Group(name.to_owned()));
+            }
+        }
+    }
+    if refusal.contains("advanced.") || refusal.contains("experimental.") {
+        return Some(Section::Advanced);
+    }
+    None
+}
+
 /// A value written back into the file: a number where the text is one,
 /// so `interval = 30` does not become `interval = "30"` and then fail
 /// to load.
@@ -723,7 +775,7 @@ impl Sheet {
                 ],
             )
         })?;
-        Ok(Sheet {
+        let mut sheet = Sheet {
             path,
             text,
             was: document.clone(),
@@ -731,7 +783,12 @@ impl Sheet {
             refused: None,
             stale: false,
             quiet: false,
-        })
+        };
+        // A file that already does not load says so when it is opened,
+        // not only once somebody edits it. This is the one slow call in
+        // reading a sheet, and it happens once.
+        sheet.ask();
+        Ok(sheet)
     }
 
     /// What the file holds for a key of a section.
@@ -880,6 +937,15 @@ impl Sheet {
         self.refused.as_deref()
     }
 
+    /// Whether the loader has not caught up with the typing yet.
+    ///
+    /// While this is true the last verdict is about a document nobody
+    /// is looking at any more, so a window shows nothing rather than
+    /// something that was true two letters ago.
+    pub(crate) fn checking(&self) -> bool {
+        self.stale
+    }
+
     /// Writes the edited document, if the loader takes it and nobody
     /// else has touched the file since it was read.
     pub(crate) fn save(&mut self) -> Option<String> {
@@ -953,6 +1019,34 @@ mod tests {
             .expect("the table is made")
             .insert("allow_root", toml_edit::value(true));
         assert!(fresh.to_string().contains("[experimental]"), "{fresh}");
+    }
+
+    /// Eight lines that differ only in a group name are one fault, and
+    /// the defaults are where somebody would go to fix it.
+    #[test]
+    fn one_bad_value_inherited_everywhere_is_one_fault() {
+        let every = ["aws", "fny", "gcloud"];
+        let refusal = format!(
+            "invalid configuration:\n{}",
+            every
+                .iter()
+                .map(|group| format!(
+                    "  group '{group}': the defaults' ignore_files: no ignore file \
+                     named \"asdfasdf\" in /Users/x/.autobahn/ignores"
+                ))
+                .collect::<Vec<String>>()
+                .join("\n")
+        );
+        let one = faults(&refusal);
+        assert_eq!(one.len(), 1, "{one:?}");
+        assert!(one[0].starts_with("the defaults' ignore_files"), "{one:?}");
+        assert_eq!(blamed(&refusal), Some(Section::Defaults));
+
+        // Two different faults stay two, and a group's own fault is
+        // blamed on the group.
+        let its_own = "invalid configuration:\n  group 'aws': invalid size 'asdf'\n                         group 'fny': no mode and the defaults specify none";
+        assert_eq!(faults(its_own).len(), 2);
+        assert_eq!(blamed(its_own), Some(Section::Group("aws".to_owned())));
     }
 
     /// A hidden key is still a key: if one is renamed in the structs the

@@ -1,7 +1,7 @@
 # PEER-1: Attach mode, the alpha serves its own settings only
 
 **Findings:** the root half of H-18 (KIMI ABN-H4); M-11 on the attach path.
-**Status:** deferred, not in v1. Peering is dangerously experimental and the risk is documented in `docs/peering.md`.
+**Status:** fixed, 2026-09-30. `AttachPolicy` (`src/transport/mod.rs`), built by `supervisor::attach_policy` from the alpha's own peering plans: the leader's `Initialize` selects the session and says whether the channel watches; every other field is the alpha's. Settings that differ from the alpha's are served as the alpha has them and said once. The channel cap is two per session (one to synchronize, one to watch).
 
 ## Problem
 

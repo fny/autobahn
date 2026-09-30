@@ -37,7 +37,7 @@ pub struct Handshake {
 /// The initialization request sent by the controller after the handshake.
 /// Policy travels with it so both endpoints of a session always operate
 /// under identical rules.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initialize {
     /// The synchronization root path on the agent's filesystem.
     pub root: String,

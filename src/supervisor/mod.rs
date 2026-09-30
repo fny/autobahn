@@ -2446,22 +2446,7 @@ fn open_session_endpoints(
                 path,
                 agent_command,
             } => {
-                let initialize = crate::protocol::Initialize {
-                    root: path.clone(),
-                    session: identifier.clone(),
-                    ignores: plan.ignores.clone(),
-                    symlink_mode: plan.symlink_mode,
-                    file_mode: plan.file_mode,
-                    directory_mode: plan.directory_mode,
-                    side: side.to_owned(),
-                    staging: plan.staging,
-                    max_file_size: plan.max_file_size,
-                    max_entry_count: plan.max_entry_count,
-                    default_owner: plan.default_owner.clone(),
-                    default_group: plan.default_group.clone(),
-                    ignore_mounts: plan.ignore_mounts,
-                    one_shot,
-                };
+                let initialize = initialize_for(plan, path, side, one_shot);
                 // Peering: an endpoint reached by attachment is a
                 // connection the peer opened to this supervisor. None
                 // waiting means the peer has not dialed in, which is the
@@ -2503,6 +2488,50 @@ fn open_session_endpoints(
     let alpha = endpoint(&plan.alpha, "alpha")?;
     let beta = endpoint(&plan.beta, "beta")?;
     Ok((alpha, beta))
+}
+
+/// How an agent is told to serve one side of a plan's session: at `root`,
+/// under the plan's settings.
+fn initialize_for(
+    plan: &SessionPlan,
+    root: &str,
+    side: &str,
+    one_shot: bool,
+) -> crate::protocol::Initialize {
+    crate::protocol::Initialize {
+        root: root.to_owned(),
+        session: plan.identifier(),
+        ignores: plan.ignores.clone(),
+        symlink_mode: plan.symlink_mode,
+        file_mode: plan.file_mode,
+        directory_mode: plan.directory_mode,
+        side: side.to_owned(),
+        staging: plan.staging,
+        max_file_size: plan.max_file_size,
+        max_entry_count: plan.max_entry_count,
+        default_owner: plan.default_owner.clone(),
+        default_group: plan.default_group.clone(),
+        ignore_mounts: plan.ignore_mounts,
+        one_shot,
+    }
+}
+
+/// What the alpha serves a leading beta it attaches to: each of its own
+/// peering sessions, its own side of it, as its own configuration has it.
+/// The leader's session keeps the alpha on the alpha side under the same
+/// identifier, so that is the side, and the session, it asks for.
+pub fn attach_policy(plans: &[SessionPlan]) -> crate::transport::AttachPolicy {
+    crate::transport::AttachPolicy::new(plans.iter().filter_map(|plan| {
+        let (Some(_), EndpointTarget::Local(root)) = (plan.peering, &plan.alpha) else {
+            return None;
+        };
+        Some(initialize_for(
+            plan,
+            &root.to_string_lossy(),
+            "alpha",
+            false,
+        ))
+    }))
 }
 
 /// The sessions to show, and what the running supervisor said about them.

@@ -412,9 +412,16 @@ pub fn run_alpha(
     let inner_stop = AtomicBool::new(false);
     std::thread::scope(|scope| -> Result<()> {
         let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
-        let outcome = alpha_roles(directory, &supervisor, interval, timing, stop, || {
-            watcher.is_finished()
-        });
+        let policy = super::attach_policy(plans);
+        let outcome = alpha_roles(
+            directory,
+            &supervisor,
+            &policy,
+            interval,
+            timing,
+            stop,
+            || watcher.is_finished(),
+        );
         inner_stop.store(true, Ordering::Relaxed);
         let watched = match watcher.join() {
             Ok(result) => result,
@@ -433,6 +440,7 @@ pub fn run_alpha(
 fn alpha_roles(
     directory: &Path,
     supervisor: &super::Supervisor,
+    policy: &crate::transport::AttachPolicy,
     interval: Duration,
     timing: crate::config::PeeringPlan,
     stop: &AtomicBool,
@@ -461,7 +469,7 @@ fn alpha_roles(
         // does when it hands the lead back, or dies.
         let destination = peering::destination_of(&leader).to_owned();
         let argv = peering::attach_argv(&destination);
-        if let Err(error) = crate::transport::attach_as_agent(&argv) {
+        if let Err(error) = crate::transport::attach_as_agent(&argv, policy) {
             crate::complain!("peering: the attachment to {leader} ended: {error:#}");
         }
         // The lease says whether the lead came back. A stale lease from a

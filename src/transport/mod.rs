@@ -473,7 +473,83 @@ impl Drop for Connection {
 /// controller going away without a shutdown frame) is a successful
 /// exit.
 pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> {
-    serve_agent_with(input, output, crate::paths::default_state_root())
+    serve_agent_with(input, output, crate::paths::default_state_root(), None)
+}
+
+/// What an alpha that attached to a leading beta serves it.
+///
+/// The leader never had any access to the alpha: the alpha dials it, and
+/// runs its own agent for it over that connection. So the leader chooses
+/// only which of the alpha's peering sessions a channel is for. What the
+/// endpoint is — its root, ignores, modes, owners and staging — is the
+/// alpha's own configuration for that session, whatever the leader asked
+/// for; a session the alpha does not run is refused, and so is a channel
+/// past what its sessions need.
+pub struct AttachPolicy {
+    /// The alpha's own initialization of each peering session, by session
+    /// identifier.
+    sessions: std::collections::HashMap<String, Initialize>,
+    /// The sessions a leader has asked for with other settings, said once.
+    warned: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// The channels one session opens on an attachment: one to synchronize,
+/// one to watch.
+const ATTACHED_CHANNELS_PER_SESSION: usize = 2;
+
+impl AttachPolicy {
+    /// A policy serving exactly these sessions, as initialized here.
+    pub fn new(sessions: impl IntoIterator<Item = Initialize>) -> AttachPolicy {
+        AttachPolicy {
+            sessions: sessions
+                .into_iter()
+                .map(|initialize| (initialize.session.clone(), initialize))
+                .collect(),
+            warned: Default::default(),
+        }
+    }
+
+    /// How many channels an attachment may hold open at once.
+    fn channel_limit(&self) -> usize {
+        self.sessions.len() * ATTACHED_CHANNELS_PER_SESSION
+    }
+
+    /// What to serve a leader's request for a channel: this alpha's own
+    /// initialization of the session it names. Only whether the channel
+    /// watches its root is the leader's to say. Settings that differ from
+    /// the alpha's — an edit made while the beta led, say — are served as
+    /// the alpha has them, and said once.
+    fn serve(&self, requested: Initialize) -> Result<Initialize> {
+        let Some(own) = self.sessions.get(&requested.session) else {
+            bail!(
+                "{:?} is not one of this alpha's peering sessions",
+                requested.session
+            );
+        };
+        let served = Initialize {
+            one_shot: requested.one_shot,
+            ..own.clone()
+        };
+        let asked = Initialize {
+            root: crate::paths::expand_tilde(&requested.root)
+                .map(|root| root.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| requested.root.clone()),
+            ..requested
+        };
+        if asked != served
+            && self
+                .warned
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(served.session.clone())
+        {
+            crate::complain!(
+                "peering: the leader asked for other settings for {}; serving this machine's own",
+                served.root
+            );
+        }
+        Ok(served)
+    }
 }
 
 /// [`serve_agent`] over an explicit state area, so that a test's agent
@@ -485,7 +561,7 @@ pub(crate) fn serve_agent_in<R: Read, W: Write + Send>(
     output: W,
     state_root: &std::path::Path,
 ) -> Result<()> {
-    serve_agent_with(input, output, Ok(state_root.to_path_buf()))
+    serve_agent_with(input, output, Ok(state_root.to_path_buf()), None)
 }
 
 /// The agent's side of the protocol, keeping its state under `state_root`.
@@ -495,6 +571,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
     input: R,
     output: W,
     state_root: Result<PathBuf>,
+    policy: Option<&AttachPolicy>,
 ) -> Result<()> {
     if let Ok(root) = &state_root {
         crate::scan::exclude_state_root(root);
@@ -558,6 +635,31 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                             )?;
                             continue;
                         }
+                        // An attached alpha serves its own sessions only,
+                        // as it configures them.
+                        let initialize = match policy {
+                            None => initialize,
+                            Some(policy) => {
+                                let served = match channels.len() < policy.channel_limit() {
+                                    true => policy.serve(initialize),
+                                    false => Err(anyhow!(
+                                        "an attached alpha holds at most {} channels open",
+                                        policy.channel_limit()
+                                    )),
+                                };
+                                match served {
+                                    Ok(served) => served,
+                                    Err(error) => {
+                                        serve_send(
+                                            &output,
+                                            channel,
+                                            Response::Error(format!("{error:#}")),
+                                        )?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         // Endpoint creation happens on the channel's own
                         // thread (it touches the filesystem, and the
                         // dispatcher must never block on one channel's
@@ -1404,8 +1506,9 @@ pub fn ssh_argv_for(destination: &str, remote_command: &str) -> Vec<String> {
 /// Peering: runs `argv` — the alpha's way to a leader, `ssh <leader>
 /// autobahn peering attach` by default — and serves as an agent over its
 /// stdio until the far side closes. The alpha is never dialed; this is
-/// how it makes itself an endpoint of a session a beta leads.
-pub fn attach_as_agent(argv: &[String]) -> Result<()> {
+/// how it makes itself an endpoint of a session a beta leads, serving
+/// only what `policy` says it runs.
+pub fn attach_as_agent(argv: &[String], policy: &AttachPolicy) -> Result<()> {
     let (program, arguments) = argv
         .split_first()
         .ok_or_else(|| anyhow!("the attach command is empty"))?;
@@ -1418,7 +1521,12 @@ pub fn attach_as_agent(argv: &[String]) -> Result<()> {
         .with_context(|| format!("unable to run {}", argv.join(" ")))?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let served = serve_agent(stdout, stdin);
+    let served = serve_agent_with(
+        stdout,
+        stdin,
+        crate::paths::default_state_root(),
+        Some(policy),
+    );
     let _ = child.wait();
     served
 }
@@ -1959,6 +2067,104 @@ pub(crate) mod tests {
             .expect("staging is readable")
             .collect();
         assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// An attached alpha serves the leader its own sessions as its own
+    /// configuration has them. A leader asking for another root, or for
+    /// none of the ignores, is served the alpha's; a session the alpha does
+    /// not run is refused, and so is a channel past what its sessions need.
+    #[test]
+    fn an_attached_alpha_serves_its_own_settings_only() {
+        use crate::endpoint::Endpoint;
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let elsewhere = keep.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(root.join("kept.txt"), b"kept").unwrap();
+        std::fs::write(root.join("secret.key"), b"ignored here").unwrap();
+        std::fs::write(elsewhere.join("private.txt"), b"not served").unwrap();
+        let own = Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier(&root.to_string_lossy(), "attached"),
+            ignores: vec!["*.key".into()],
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "alpha".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+            one_shot: false,
+        };
+        let policy = AttachPolicy::new([own.clone()]);
+        let state = keep.path().join("state");
+        let attach = |run: &dyn Fn(Connection)| {
+            let (client, agent) = connected_pair();
+            let (reader, writer, _) = agent.into_parts();
+            std::thread::scope(|scope| {
+                let served = scope
+                    .spawn(|| serve_agent_with(reader, writer, Ok(state.clone()), Some(&policy)));
+                run(client);
+                let _ = served.join();
+            });
+        };
+
+        attach(&|client| {
+            let hostile = Initialize {
+                root: "/".into(),
+                ignores: Vec::new(),
+                ..own.clone()
+            };
+            let mut endpoint = crate::endpoint::remote::RemoteEndpoint::connect(client, hostile)
+                .expect("the alpha's own session is served");
+            let snapshot = endpoint.scan().expect("scanned");
+            let tree = snapshot.root.expect("the configured root");
+            assert!(matches!(
+                tree.child("kept.txt").map(|node| &node.content),
+                Some(crate::tree::Content::File { .. })
+            ));
+            assert!(
+                matches!(
+                    tree.child("secret.key").map(|node| &node.content),
+                    Some(crate::tree::Content::Untracked)
+                ),
+                "the alpha's own ignores hold"
+            );
+            assert!(tree.child("private.txt").is_none());
+            assert!(
+                tree.child("etc").is_none(),
+                "not the root the leader asked for"
+            );
+        });
+
+        attach(&|client| {
+            let unknown = Initialize {
+                session: crate::session::session_identifier("x", "y"),
+                ..own.clone()
+            };
+            let error = crate::endpoint::remote::RemoteEndpoint::connect(client, unknown)
+                .err()
+                .expect("a session the alpha does not run");
+            assert!(
+                format!("{error:#}").contains("not one of this alpha's peering sessions"),
+                "{error:#}"
+            );
+        });
+
+        attach(&|client| {
+            let connection = crate::transport::mux::AgentConnection::connect(client).unwrap();
+            let _sync = connection.open(own.clone()).expect("the first channel");
+            let _watch = connection.open(own.clone()).expect("the second");
+            let error = connection.open(own.clone()).err().expect("one too many");
+            assert!(
+                format!("{error:#}").contains("at most 2 channels"),
+                "{error:#}"
+            );
+        });
     }
 
     /// A genuine session and side are served, under the agent's state area.

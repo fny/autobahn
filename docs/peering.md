@@ -127,11 +127,9 @@ These are open and will not be fixed before peering leaves this status.
 
 In the usual setup this grants nothing new, because a leader already holds an SSH login to every peer. It does mean you should peer only machines that would each trust the others with a shell. SSH keys locked to `command="autobahn agent"` do not contain a peering leader, and are not supported with peering.
 
-**While a beta leads, it controls the alpha's machine more than it should.** When the alpha attaches, it runs the full agent for the leader over a connection the alpha opened. The leader never needed any access to the alpha, yet today it can:
-- choose which directory on the alpha to sync, with any ignores, symlink handling and permissions;
-- push files into the alpha's `~/.autobahn/peering/`. A genuine leader never does this. A pushed `name` file makes the alpha refuse to start alongside its own configuration. If you then move your configuration aside as the error suggests, the alpha runs the pushed configuration instead, including its commands. If this happens, delete `~/.autobahn/peering/name` and keep your own configuration.
+**While a beta leads, it can push files into the alpha's machine.** A genuine leader never does this, but the alpha still accepts files into its `~/.autobahn/peering/`. A pushed `name` file makes the alpha refuse to start alongside its own configuration. If you then move your configuration aside as the error suggests, the alpha runs the pushed configuration instead, including its commands. If this happens, delete `~/.autobahn/peering/name` and keep your own configuration.
 
-A laptop that attaches to a leading beta therefore trusts that beta with the laptop user's files.
+When the alpha attaches, it serves the leader only its own peering sessions, as its own configuration has them: the root, ignores, modes, owners and staging are the alpha's, whatever the leader asks for. A leader can change files inside those roots, as any beta can in a two-way mode, and nothing outside them.
 
 **A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
 

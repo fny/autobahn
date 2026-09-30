@@ -268,6 +268,9 @@ pub struct Session {
     /// Peering: what this session presents to its peer when its
     /// supervisor leads. `None` for a plain mode, and for a follower.
     leadership: Option<crate::peering::Leadership>,
+    /// When `present_lease` last had the lease accepted, for renewing it
+    /// while the session waits between cycles.
+    lease_presented_at: Option<std::time::Instant>,
     /// Peering: which side the peer is. The beta, except for the session
     /// a beta that leads runs against the attached alpha.
     peer_side: crate::peering::PeerSide,
@@ -574,6 +577,7 @@ impl Session {
             settled_alpha: None,
             settled_beta: None,
             leadership: None,
+            lease_presented_at: None,
             peer_side: crate::peering::PeerSide::Beta,
             copy_checked: false,
             _lock: lock,
@@ -781,8 +785,11 @@ impl Session {
             return Ok(());
         };
         match self.peer().lease(&leadership.lease())? {
-            crate::peering::LeaseAnswer::Accepted => {}
+            crate::peering::LeaseAnswer::Accepted => {
+                self.lease_presented_at = Some(std::time::Instant::now());
+            }
             crate::peering::LeaseAnswer::Refused { current } => {
+                self.lease_presented_at = None;
                 return Err(crate::peering::Fenced { current }.into());
             }
         }
@@ -797,6 +804,24 @@ impl Session {
             self.copy_checked = true;
         }
         Ok(())
+    }
+
+    /// Peering: presents the lease again when a third of its lifetime has
+    /// passed since it was last accepted. A leading session calls this
+    /// while it waits between cycles, so an interval, a long idle spell or
+    /// anything else between cycles never lets the lease lapse and hand a
+    /// healthy leader's host to a follower. A refusal is `Fenced`.
+    pub fn renew_lease_if_due(&mut self) -> Result<()> {
+        let Some(leadership) = &self.leadership else {
+            return Ok(());
+        };
+        let due = self
+            .lease_presented_at
+            .is_none_or(|at| at.elapsed() >= leadership.ttl / 3);
+        match due {
+            true => self.present_lease(),
+            false => Ok(()),
+        }
     }
 
     /// Peering, after the ancestor advanced: sends the record to the beta,

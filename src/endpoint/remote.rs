@@ -81,6 +81,12 @@ pub struct RemoteEndpoint {
     digester: crate::tree::TreeDigester,
     /// Where this endpoint's scans report that they are running.
     progress: Option<Arc<crate::progress::SideProgress>>,
+    /// Peering: the lease this endpoint last had accepted, and when. Every
+    /// write re-presents it once a third of its lifetime has passed, so a
+    /// leader in the middle of a long transfer never lets it lapse — the
+    /// agent refuses a lapsed lease's writes, and followers take over a
+    /// lapsed lease's host.
+    presented: Option<(crate::peering::Lease, std::time::Instant)>,
 }
 
 /// Holds a side in its scanning state until the scan returns, however it
@@ -367,6 +373,7 @@ impl RemoteEndpoint {
             stage_begin_pending: false,
             stage_begin_answer: None,
             pending_pushes: 0,
+            presented: None,
             last_snapshot: None,
             last_encoding: None,
             digester: crate::tree::TreeDigester::default(),
@@ -442,8 +449,57 @@ impl RemoteEndpoint {
         // `transition`.)
         self.drain_pushes_to(0)?;
         match self.channel.exchange(request)? {
-            Response::Error(message) => Err(remote_error(message)),
+            Response::Error(message) => Err(self.fenced_or(message)),
             response => Ok(response),
+        }
+    }
+
+    /// Peering: re-presents the lease before a write once a third of its
+    /// lifetime has passed since it was last accepted. Not while a staging
+    /// request's answer is still owed, since the renewal's answer would be
+    /// read in its place; the next write renews instead.
+    fn renew_if_due(&mut self) -> Result<()> {
+        let Some((lease, at)) = &self.presented else {
+            return Ok(());
+        };
+        let lifetime = std::time::Duration::from_secs(lease.ttl_seconds);
+        if self.stage_begin_pending || at.elapsed() < lifetime / 3 {
+            return Ok(());
+        }
+        let renewed = crate::peering::Lease::new(&lease.leader, lease.term, lifetime);
+        match self.lease(&renewed)? {
+            crate::peering::LeaseAnswer::Accepted => Ok(()),
+            crate::peering::LeaseAnswer::Refused { current } => {
+                Err(crate::peering::Fenced { current }.into())
+            }
+        }
+    }
+
+    /// Peering: the error for a write the agent refused. A refusal that
+    /// says the channel is fenced is followed by one fresh presentation of
+    /// the lease: refused, the host is led by another controller, and the
+    /// cycle ends `Fenced` so the supervisor steps down at once; accepted,
+    /// the lease had only lapsed, it is renewed, and the refusal stands for
+    /// this cycle alone.
+    fn fenced_or(&mut self, message: String) -> anyhow::Error {
+        if !message.starts_with("fenced:") || self.stage_begin_pending {
+            return remote_error(message);
+        }
+        let Some((lease, _)) = self.presented.clone() else {
+            return remote_error(message);
+        };
+        let lifetime = std::time::Duration::from_secs(lease.ttl_seconds);
+        let renewed = crate::peering::Lease::new(&lease.leader, lease.term, lifetime);
+        match self.channel.exchange(Request::Lease(renewed.clone())) {
+            Ok(Response::Lease(crate::peering::LeaseAnswer::Refused { current })) => {
+                self.presented = None;
+                crate::peering::Fenced { current }.into()
+            }
+            Ok(Response::Lease(crate::peering::LeaseAnswer::Accepted)) => {
+                self.presented = Some((renewed, std::time::Instant::now()));
+                remote_error(message)
+            }
+            _ => remote_error(message),
         }
     }
 }
@@ -576,12 +632,21 @@ impl Endpoint for RemoteEndpoint {
 
     fn lease(&mut self, lease: &crate::peering::Lease) -> Result<crate::peering::LeaseAnswer> {
         match self.exchange(Request::Lease(lease.clone()))? {
-            Response::Lease(answer) => Ok(answer),
+            Response::Lease(answer) => {
+                self.presented = match &answer {
+                    crate::peering::LeaseAnswer::Accepted => {
+                        Some((lease.clone(), std::time::Instant::now()))
+                    }
+                    crate::peering::LeaseAnswer::Refused { .. } => None,
+                };
+                Ok(answer)
+            }
             response => Err(unexpected_response(&response, "lease")),
         }
     }
 
     fn ancestor_record(&mut self, generation: u64, changes: &[Change]) -> Result<u64> {
+        self.renew_if_due()?;
         let request = Request::AncestorRecord {
             generation,
             changes: changes.to_vec(),
@@ -593,6 +658,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn ancestor_checkpoint(&mut self, generation: u64, ancestor: Option<&Node>) -> Result<u64> {
+        self.renew_if_due()?;
         let request = Request::AncestorCheckpoint {
             generation,
             ancestor: ancestor.cloned(),
@@ -604,6 +670,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn put_peering_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+        self.renew_if_due()?;
         let request = Request::PutPeeringFile {
             name: name.to_owned(),
             bytes: bytes.to_vec(),
@@ -622,6 +689,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
+        self.renew_if_due()?;
         match self.exchange(Request::Rename(from.to_owned(), to.to_owned()))? {
             Response::Written => Ok(()),
             response => Err(unexpected_response(&response, "move entry")),
@@ -636,6 +704,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn stage_begin(&mut self, files: Vec<FileRequest>) -> Result<Vec<StagingNeed>> {
+        self.renew_if_due()?;
         match self.exchange(Request::StageBegin(files))? {
             Response::StageBegin(needs) => Ok(needs),
             response => Err(unexpected_response(&response, "stage begin")),
@@ -643,6 +712,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn stage_begin_nowait(&mut self, files: Vec<FileRequest>) -> Result<Option<Vec<StagingNeed>>> {
+        self.renew_if_due()?;
         // Owed acknowledgements first, so the request's answer is the
         // next response on the channel after them.
         self.drain_pushes_to(0)?;
@@ -683,6 +753,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn stage_push(&mut self, frames: Vec<TransferFrame>) -> Result<()> {
+        self.renew_if_due()?;
         match self.exchange(Request::StagePush(frames))? {
             Response::StagePushed => Ok(()),
             response => Err(unexpected_response(&response, "stage push")),
@@ -690,6 +761,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn stage_push_nowait(&mut self, frames: Vec<TransferFrame>) -> Result<()> {
+        self.renew_if_due()?;
         // Keep at most a window of unacknowledged pushes in flight; each
         // ack drained here corresponds (in order) to an earlier push. A
         // failure drains the whole window before surfacing, leaving the
@@ -720,6 +792,7 @@ impl Endpoint for RemoteEndpoint {
     }
 
     fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+        self.renew_if_due()?;
         // Sent before the owed push acknowledgements are collected, so the
         // request is on the wire while they are in flight; the answers are
         // then read in order, theirs and then this one. A failed push
@@ -734,7 +807,7 @@ impl Endpoint for RemoteEndpoint {
         let response = self.channel.receive_response();
         pushes?;
         match response? {
-            Response::Error(message) => Err(remote_error(message)),
+            Response::Error(message) => Err(self.fenced_or(message)),
             Response::Transition {
                 outcome,
                 generation,

@@ -316,7 +316,16 @@ impl PeeringShared {
             }
         }
         crate::note!("peering: handing the lead to {to} at term {next}");
-        crate::peering::write_lease(&self.directory, &crate::peering::Lease::new(to, next, ttl))?;
+        if let crate::peering::LeaseAnswer::Refused { current } = crate::peering::admit_lease(
+            &self.directory,
+            &crate::peering::Lease::new(to, next, ttl),
+        )? {
+            anyhow::bail!(
+                "{} leads at term {} on this host; there is no lead here to hand on",
+                current.leader,
+                current.term
+            );
+        }
         *handoff = Some((to.to_owned(), next));
         self.handed.store(0, Ordering::SeqCst);
         Ok(())
@@ -362,10 +371,19 @@ impl PeeringContext {
                     term,
                     crate::config::DEFAULT_PEERING_TTL,
                 );
-                crate::peering::write_lease(&directory, &lease)?;
-                crate::peering::Role::Leader {
-                    leader: crate::peering::ALPHA.to_owned(),
-                    term,
+                // Under the lease lock: a lease a beta wrote here since it
+                // was read is kept, and the alpha follows it.
+                match crate::peering::admit_lease(&directory, &lease)? {
+                    crate::peering::LeaseAnswer::Accepted => crate::peering::Role::Leader {
+                        leader: crate::peering::ALPHA.to_owned(),
+                        term,
+                    },
+                    crate::peering::LeaseAnswer::Refused { current } => {
+                        crate::peering::Role::Follower {
+                            leader: current.leader,
+                            term: current.term,
+                        }
+                    }
                 }
             }
             crate::peering::AlphaStart::Follow { lease } => crate::peering::Role::Follower {
@@ -443,7 +461,9 @@ impl PeeringContext {
             leader: current.leader.clone(),
             term: current.term,
         };
-        if let Err(error) = crate::peering::write_lease(&self.directory, current) {
+        // Admitted like any lease: recorded when it is newer than what
+        // this host holds, and never over a newer one.
+        if let Err(error) = crate::peering::admit_lease(&self.directory, current) {
             crate::complain!("peering: unable to record the lease locally: {error:#}");
         }
     }
@@ -999,10 +1019,9 @@ impl Supervisor {
             }
             if failed {
                 failures = failures.saturating_add(1);
-                let delay = backoff_delay(
-                    plan.interval,
-                    failures,
-                    jitter_percent(&identifier, failures),
+                let delay = peering_capped(
+                    plan,
+                    backoff_delay(plan.interval, failures, jitter_percent(&identifier, failures)),
                 );
                 worker.progress.rest(crate::progress::Phase::Retrying);
                 sleep_flagged(delay, stop, flags);
@@ -1120,10 +1139,13 @@ impl Supervisor {
                     );
                     worker.record_failure("errored", format!("internal error: {message}"));
                     let failures = panics.len() as u32;
-                    let delay = backoff_delay(
-                        plan.interval,
-                        failures,
-                        jitter_percent(&plan.identifier(), failures),
+                    let delay = peering_capped(
+                        plan,
+                        backoff_delay(
+                            plan.interval,
+                            failures,
+                            jitter_percent(&plan.identifier(), failures),
+                        ),
                     );
                     worker.progress.rest(crate::progress::Phase::Retrying);
                     sleep_flagged(delay, stop, &flags);
@@ -1745,6 +1767,14 @@ impl<'a> Worker<'a> {
                 return;
             }
             let slice = remaining.min(Duration::from_millis(500));
+            // A leading session keeps its lease fresh while it waits; a
+            // refusal ends the wait, and the attempt that follows steps the
+            // supervisor down.
+            if let Some(session) = self.session.as_mut() {
+                if session.renew_lease_if_due().is_err() {
+                    return;
+                }
+            }
             match self.session.as_mut() {
                 Some(session) => match session.await_change(slice) {
                     Ok(true) => {
@@ -3001,6 +3031,17 @@ const ALERT_POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// that sessions saturated at the cap stay spread out — without it, every
 /// session that failed together (a rebooting host, a dropped network)
 /// would retry together forever.
+/// A peering session's backoff, held under half its lease lifetime. A
+/// leader that backed off for the full five minutes after a blip let its
+/// lease lapse, and a follower took the lead from a healthy alpha; retrying
+/// within the lifetime renews the lease before anyone may act on it.
+fn peering_capped(plan: &SessionPlan, delay: Duration) -> Duration {
+    match plan.peering {
+        Some(peering) => delay.min(peering.ttl / 2),
+        None => delay,
+    }
+}
+
 fn backoff_delay(interval: Duration, consecutive_failures: u32, jitter_percent: u64) -> Duration {
     let factor = 1u32 << consecutive_failures.saturating_sub(1).min(16);
     let base = interval.saturating_mul(factor).min(MAXIMUM_BACKOFF);

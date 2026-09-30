@@ -4,8 +4,8 @@
 //! the lease a controller presents — and on the order betas take over in.
 //! This file plays the spec's leadership game with the real decision: every
 //! host is a directory with a real lease file, presented leases go through
-//! `read_lease` / `Lease::admits` / `write_lease` exactly as the agent's
-//! `Request::Lease` handler does, staleness is the real `is_stale_at` on a
+//! `admit_lease` exactly as the agent's `Request::Lease` handler does,
+//! staleness is the real `is_stale_at` on a
 //! simulated clock, and the reconciler makes every cycle's move. The same
 //! invariants the spec checks are asserted in Rust over random games, and
 //! the games are written out as traces that TLC validates against the spec
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use autobahn::endpoint::{achieved_changes, TransitionOutcome};
-use autobahn::peering::{read_lease, write_lease, Lease};
+use autobahn::peering::{admit_lease, read_lease, write_lease, Lease, LeaseAnswer};
 use autobahn::tree::{apply, reconcile, Change, Content, Digest, FileMetadata, Node, SyncMode};
 
 const PATHS: [&str; 2] = ["p", "q"];
@@ -208,13 +208,13 @@ impl Game {
     /// The agent's `Request::Lease` handling, exactly: admit and write, or
     /// refuse with what is held.
     fn present(&mut self, h: usize, presented: &Lease) -> bool {
-        let held = self.lease(h);
-        if !held.admits(presented) {
-            return false;
+        match admit_lease(&self.dirs[h], presented).expect("lease admitted") {
+            LeaseAnswer::Refused { .. } => false,
+            LeaseAnswer::Accepted => {
+                self.writers[h].insert((presented.leader.clone(), presented.term));
+                true
+            }
         }
-        self.put_lease(h, presented);
-        self.writers[h].insert((presented.leader.clone(), presented.term));
-        true
     }
 
     // ---------------------------------------------------------------- users

@@ -52,8 +52,20 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
         match follow(directory, &star, stop)? {
             Followed::Stopped => return Ok(()),
             Followed::TakeOver { term } => {
+                // Admitted under the lease lock, as the agent admits any
+                // lease: a rival that took this host at the same term or a
+                // later one first wins, and this peer follows on.
                 let lease = Lease::new(&star.name, term, star.timing.ttl);
-                peering::write_lease(directory, &lease)?;
+                if let peering::LeaseAnswer::Refused { current } =
+                    peering::admit_lease(directory, &lease)?
+                {
+                    crate::note!(
+                        "peering: {} took the lead at term {} first; following",
+                        current.leader,
+                        current.term
+                    );
+                    continue;
+                }
                 crate::note!(
                     "peering: the lease went stale; taking the lead as {} at term {term}",
                     star.name
@@ -173,20 +185,14 @@ fn lead(
             }
             if renewed.elapsed() >= ttl / 2 {
                 // Only a lease that still names this peer at this term is
-                // renewed. A handoff writes the next leader's lease here
-                // while the sessions are still passing it on; renewing
-                // over that would hand the lead back to nobody and have
-                // this peer take it up again from itself.
-                let still_mine = peering::read_lease(directory)
-                    .ok()
-                    .flatten()
-                    .is_some_and(|lease| lease.leader == name && lease.term == term);
-                if still_mine {
-                    if let Err(error) =
-                        peering::write_lease(directory, &Lease::new(&name, term, ttl))
-                    {
-                        crate::complain!("peering: unable to renew the lease locally: {error:#}");
-                    }
+                // renewed, and the check and the write are one step under
+                // the lease lock. A handoff writes the next leader's lease
+                // here while the sessions are still passing it on;
+                // renewing over that would hand the lead back to nobody and
+                // have this peer take it up again from itself.
+                if let Err(error) = peering::renew_own_lease(directory, &Lease::new(&name, term, ttl))
+                {
+                    crate::complain!("peering: unable to renew the lease locally: {error:#}");
                 }
                 renewed = std::time::Instant::now();
             }
@@ -313,7 +319,10 @@ pub fn run_alpha(
                         );
                         let ttl = Duration::from_secs(lease.ttl_seconds);
                         let next = peering::Lease::new(peering::ALPHA, lease.term + 1, ttl);
-                        peering::write_lease(directory, &next)?;
+                        // Under the lease lock: a beta that took the lead at
+                        // this term meanwhile keeps it, and the alpha
+                        // attaches to it on the next pass.
+                        let _ = peering::admit_lease(directory, &next)?;
                     }
                     _ => super::sleep_interruptible(interval, stop),
                 }

@@ -37,6 +37,20 @@ pub const DIRECTORY: &str = "peering";
 /// The lease file's name.
 const LEASE_FILE: &str = "lease.json";
 
+/// When this host received the lease it holds, on this host's clock:
+/// `{"leader", "term", "received_at"}`. Kept beside the lease rather than
+/// in it, because the lease crosses the wire and this does not. A write is
+/// refused once the lease has gone unrenewed for its lifetime by this
+/// clock, so no skew between the leader's clock and this one can let a
+/// lapsed leader write, or stop a live one.
+const RECEIPT_FILE: &str = "lease.received";
+
+/// The lock every lease decision takes: exclusively to admit a lease,
+/// shared for as long as a write checked against it runs. So a takeover
+/// cannot land between a write's check and the write, and two leases
+/// presented at once are decided one after the other.
+const LOCK_FILE: &str = "lease.lock";
+
 /// The leader's claim on a host, renewed on every cycle.
 ///
 /// A lease is compared by term first. A higher term is a newer leadership
@@ -222,11 +236,162 @@ pub fn read_lease(directory: &Path) -> Result<Option<Lease>> {
     }
 }
 
-/// Writes a lease, atomically: a controller that reads it sees the old
-/// lease or the new one, never a torn file.
+/// Writes a lease, atomically and durably: a controller that reads it sees
+/// the old lease or the new one, never a torn file, and one it was told was
+/// accepted survives a crash. Takes no lock and checks nothing; the agent
+/// admits leases with [`admit_lease`].
 pub fn write_lease(directory: &Path, lease: &Lease) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(lease).context("unable to encode the lease")?;
-    write_file(directory, LEASE_FILE, &bytes)
+    write_file(directory, LEASE_FILE, &bytes)?;
+    write_receipt(directory, lease)
+}
+
+/// The lease lock, held until dropped.
+#[derive(Debug)]
+pub struct LeaseLock {
+    _file: std::fs::File,
+}
+
+/// Takes the lease lock of a peering directory, creating both on demand.
+fn lock(directory: &Path, exclusive: bool) -> Result<LeaseLock> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("unable to create {}", directory.display()))?;
+    let path = directory.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("unable to open {}", path.display()))?;
+    let operation = match exclusive {
+        true => libc::LOCK_EX,
+        false => libc::LOCK_SH,
+    };
+    loop {
+        // Safety: a valid descriptor, owned by `file` for the lock's life;
+        // closing it releases the lock.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(LeaseLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).with_context(|| format!("unable to lock {}", path.display()));
+        }
+    }
+}
+
+/// The agent's answer to a presented lease, decided under the exclusive
+/// lock: the read, the check and the write are one step, so two leases
+/// presented at once — at one term, or a delayed lower term after a higher
+/// one — are decided in turn, and exactly one of two rivals is admitted.
+pub fn admit_lease(directory: &Path, lease: &Lease) -> Result<LeaseAnswer> {
+    let _lock = lock(directory, true)?;
+    match read_lease(directory)? {
+        Some(held) if !held.admits(lease) => Ok(LeaseAnswer::Refused { current: held }),
+        _ => {
+            write_lease(directory, lease)?;
+            Ok(LeaseAnswer::Accepted)
+        }
+    }
+}
+
+/// Renews a lease this host holds for itself, under the exclusive lock,
+/// only while the host still holds it at that leader and term: a handoff or
+/// a takeover that wrote a different lease is never renewed over. Whether
+/// it renewed.
+pub fn renew_own_lease(directory: &Path, lease: &Lease) -> Result<bool> {
+    let _lock = lock(directory, true)?;
+    let held = read_lease(directory)?;
+    if !held.is_some_and(|held| held.leader == lease.leader && held.term == lease.term) {
+        return Ok(false);
+    }
+    write_lease(directory, lease)?;
+    Ok(true)
+}
+
+/// Why a write checked against the lease was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteRefused {
+    /// Another leadership took the host since this channel's lease.
+    #[error(
+        "fenced: this host's lease is held by {} at term {}; the lease this channel was \
+         accepted at ({} at term {}) no longer holds",
+        current.leader, current.term, accepted.leader, accepted.term
+    )]
+    Superseded { current: Lease, accepted: Lease },
+    /// The lease went unrenewed for its lifetime, by this host's clock.
+    #[error(
+        "fenced: the lease of {} at term {} lapsed {}s ago on this host without renewal; \
+         present it again to write",
+        accepted.leader, accepted.term, lapsed.as_secs()
+    )]
+    Lapsed { accepted: Lease, lapsed: Duration },
+}
+
+/// Checks a write against the lease its channel was accepted at, under the
+/// shared lease lock, which the returned guard holds until the write is
+/// done: no lease can be admitted while it runs. Refused when the host's
+/// lease has moved on to another leader or term, or when it went unrenewed
+/// for its lifetime by this host's clock.
+pub fn check_write(directory: &Path, accepted: &Lease) -> Result<LeaseLock> {
+    let guard = lock(directory, false)?;
+    let held = read_lease(directory)?;
+    let current = match held {
+        Some(held) if held.leader == accepted.leader && held.term == accepted.term => held,
+        Some(held) => {
+            return Err(WriteRefused::Superseded {
+                current: held,
+                accepted: accepted.clone(),
+            }
+            .into())
+        }
+        None => bail!("the lease this channel was accepted at is gone from {}", directory.display()),
+    };
+    if let Some(receipt) = read_receipt(directory)? {
+        if receipt.leader == current.leader && receipt.term == current.term {
+            let lapsed = now_seconds()
+                .saturating_sub(receipt.received_at.saturating_add(current.ttl_seconds));
+            if lapsed > 0 {
+                return Err(WriteRefused::Lapsed {
+                    accepted: accepted.clone(),
+                    lapsed: Duration::from_secs(lapsed),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(guard)
+}
+
+/// When this host received its lease, by its own clock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Receipt {
+    leader: String,
+    term: u64,
+    received_at: u64,
+}
+
+fn write_receipt(directory: &Path, lease: &Lease) -> Result<()> {
+    let receipt = Receipt {
+        leader: lease.leader.clone(),
+        term: lease.term,
+        received_at: now_seconds(),
+    };
+    let bytes = serde_json::to_vec(&receipt).context("unable to encode the lease receipt")?;
+    write_file(directory, RECEIPT_FILE, &bytes)
+}
+
+fn read_receipt(directory: &Path) -> Result<Option<Receipt>> {
+    let path = directory.join(RECEIPT_FILE);
+    match std::fs::read(&path) {
+        // A receipt that does not parse is treated as absent: it only ever
+        // adds a refusal, never an admission.
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("unable to read {}", path.display())),
+    }
 }
 
 /// Writes one of the files the leader pushes: `config.toml`, `name`, or
@@ -256,23 +421,62 @@ pub fn is_pushable(name: &str) -> bool {
 }
 
 /// Writes a file under the peering directory by way of a temporary and a
-/// rename. The directory (and `ignores/`) is created on demand.
+/// rename, durably: the file and its directory are flushed before this
+/// returns. The directory (and `ignores/`) is created on demand.
+///
+/// The temporary is created fresh (`create_new`) under a name no other
+/// writer can hold. Named by process alone, two channels of one agent
+/// pushing the same file wrote into one temporary, and either rename could
+/// publish the other's bytes, or half of them.
 fn write_file(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = directory.join(name);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no directory", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("unable to create {}", parent.display()))?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&temporary, bytes)
-        .with_context(|| format!("unable to write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("unable to move {} into place", path.display()))?;
+    let (temporary, mut file) = loop {
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("unable to create {}", candidate.display()))
+            }
+        }
+    };
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("unable to write {}", temporary.display()));
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("unable to move {} into place", path.display()));
+    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("unable to flush {}", parent.display()))?;
     Ok(())
 }
 
@@ -428,6 +632,177 @@ mod tests {
         assert_eq!(read_pushed_file(&directory, "name").unwrap(), None);
     }
 
+    /// Two leases presented at once at one term, by two leaders, are
+    /// decided in turn under the lock: exactly one is admitted, and the
+    /// host holds the one that was.
+    #[test]
+    fn two_admissions_at_one_term_accept_exactly_one() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        admit_lease(&directory, &Lease::new(ALPHA, 1, ttl)).unwrap();
+        for round in 2..40 {
+            let barrier = std::sync::Barrier::new(2);
+            let answers: Vec<(String, LeaseAnswer)> = std::thread::scope(|scope| {
+                let rivals = ["u@one:/x", "u@two:/x"].map(|leader| {
+                    let (directory, barrier) = (&directory, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let lease = Lease::new(leader, round, ttl);
+                        (leader.to_owned(), admit_lease(directory, &lease).unwrap())
+                    })
+                });
+                rivals.map(|rival| rival.join().unwrap()).into()
+            });
+            let admitted: Vec<&String> = answers
+                .iter()
+                .filter(|(_, answer)| *answer == LeaseAnswer::Accepted)
+                .map(|(leader, _)| leader)
+                .collect();
+            assert_eq!(admitted.len(), 1, "round {round}: {answers:?}");
+            let held = read_lease(&directory).unwrap().unwrap();
+            assert_eq!((&held.leader, held.term), (admitted[0], round));
+        }
+    }
+
+    /// A lease presented late at a lower term — a delayed renewal from a
+    /// leader that has since been replaced — is refused, and the higher
+    /// lease stays in place.
+    #[test]
+    fn a_delayed_lower_term_never_replaces_a_higher_one() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        let higher = Lease::new("u@h:/x", 6, ttl);
+        assert_eq!(admit_lease(&directory, &higher).unwrap(), LeaseAnswer::Accepted);
+        assert_eq!(
+            admit_lease(&directory, &Lease::new(ALPHA, 5, ttl)).unwrap(),
+            LeaseAnswer::Refused {
+                current: higher.clone()
+            }
+        );
+        assert_eq!(read_lease(&directory).unwrap(), Some(higher));
+    }
+
+    /// A leader renews only its own lease: once a handoff or a takeover
+    /// wrote another, the renewal leaves it be.
+    #[test]
+    fn a_leader_renews_only_the_lease_it_holds() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        assert!(!renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
+        assert_eq!(read_lease(&directory).unwrap(), None);
+        admit_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap();
+        assert!(renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
+        let next = Lease::new(ALPHA, 4, ttl);
+        admit_lease(&directory, &next).unwrap();
+        assert!(!renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
+        assert_eq!(read_lease(&directory).unwrap(), Some(next));
+    }
+
+    /// A write is checked against the lease its channel was accepted at:
+    /// allowed while the host holds it, refused once another leadership
+    /// took the host — without the channel presenting anything — and
+    /// refused once the lease went unrenewed for its lifetime by this
+    /// host's clock, whatever the leader's clock wrote into it.
+    #[test]
+    fn a_write_is_refused_once_the_lease_it_rode_on_is_gone() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        let accepted = Lease::new(ALPHA, 5, ttl);
+        admit_lease(&directory, &accepted).unwrap();
+        drop(check_write(&directory, &accepted).expect("the lease holds"));
+
+        // Lapsed: received 31 seconds ago on this host and never renewed,
+        // though the leader's own clock says it renewed just now.
+        let receipt = Receipt {
+            leader: ALPHA.into(),
+            term: 5,
+            received_at: now_seconds() - 31,
+        };
+        write_file(&directory, RECEIPT_FILE, &serde_json::to_vec(&receipt).unwrap()).unwrap();
+        let error = check_write(&directory, &accepted).expect_err("a lapsed lease");
+        assert!(
+            matches!(
+                error.downcast_ref::<WriteRefused>(),
+                Some(WriteRefused::Lapsed { .. })
+            ),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").starts_with("fenced:"), "{error:#}");
+        // Renewed, it holds again.
+        admit_lease(&directory, &accepted).unwrap();
+        drop(check_write(&directory, &accepted).expect("renewed"));
+
+        // Superseded.
+        let newer = Lease::new("u@h:/x", 6, ttl);
+        admit_lease(&directory, &newer).unwrap();
+        let error = check_write(&directory, &accepted).expect_err("a superseded lease");
+        match error.downcast_ref::<WriteRefused>() {
+            Some(WriteRefused::Superseded { current, .. }) => assert_eq!(current, &newer),
+            other => panic!("expected a superseded lease, got {other:?}"),
+        }
+        assert!(format!("{error:#}").starts_with("fenced:"), "{error:#}");
+    }
+
+    /// While a write holds the lease lock, a new lease waits for it: the
+    /// write never lands after the host moved on to another leader.
+    #[test]
+    fn a_lease_waits_for_a_write_in_progress() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        let accepted = Lease::new(ALPHA, 5, ttl);
+        admit_lease(&directory, &accepted).unwrap();
+        let guard = check_write(&directory, &accepted).unwrap();
+        let admitted = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let rival = scope.spawn(|| {
+                admit_lease(&directory, &Lease::new("u@h:/x", 6, ttl)).unwrap();
+                admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !admitted.load(std::sync::atomic::Ordering::SeqCst),
+                "a lease was admitted while a write held the lock"
+            );
+            drop(guard);
+            rival.join().unwrap();
+        });
+        assert!(admitted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(check_write(&directory, &accepted).is_err());
+    }
+
+    /// Pushes of one file on several channels at once each write a
+    /// temporary of their own: the file ends up whole, as one of them
+    /// wrote it, and no temporary is left behind.
+    #[test]
+    fn concurrent_pushes_of_one_file_never_mix() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let contents: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'a' + i; 256 * 1024]).collect();
+        for _ in 0..10 {
+            std::thread::scope(|scope| {
+                for content in &contents {
+                    let directory = &directory;
+                    scope.spawn(move || {
+                        write_pushed_file(directory, "config.toml", content).unwrap();
+                    });
+                }
+            });
+            let written = read_pushed_file(&directory, "config.toml").unwrap().unwrap();
+            assert!(contents.contains(&written), "a mixed or partial file");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
     #[test]
     fn an_ancestor_copy_follows_records_and_takes_checkpoints() {
         let keep = tempfile::tempdir().expect("a temporary directory");
@@ -460,6 +835,7 @@ mod tests {
         assert_eq!(copy.generation(), 9);
         assert_eq!(copy.ancestor.as_ref().map(|n| n.children().len()), Some(2));
     }
+
 }
 
 /// The star as a follower sees it: the plans it would run as leader, and

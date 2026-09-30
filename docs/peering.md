@@ -54,7 +54,11 @@ The leader's claim on a host is a small file the leader renews on every cycle, t
 
 The term increases by one at every change of leader. **The agent refuses writes from a controller whose term is below the lease's**, and from a different leader at the same term. That refusal — the fence — is the whole safety argument. Reads still answer, so a fenced controller can see the tree it may no longer change.
 
-The design intent is that no root is ever written by two controllers, whatever the network does. The current code does not meet it. The fence is checked only when a controller presents a lease, not on every write, and taking a lease is not atomic. [Known collision issues](#known-collision-issues) lists the timings where two controllers can write.
+The agent checks the fence on every write, not only when a lease is presented. A write is refused once the host's lease names another leader or term, and once the lease has gone a whole `ttl` without renewal. That lifetime is measured from when this host received the lease, by its own clock, so skew between the leader's clock and the host's never matters. The check holds a lock for the length of the write, so a new lease is admitted between two writes, never during one.
+
+Admitting a lease is one step under the same lock: the host reads its lease, checks the one presented, and writes it, flushed to disk, before answering. Of two leases presented at once, exactly one is admitted.
+
+A leader re-presents its lease once a third of `ttl` has passed: before its next write, and while it waits for changes. A leader that pauses for longer comes back to a refusal, presents its lease again, and learns in one round trip whether it still leads.
 
 ### What the leader pushes
 
@@ -76,7 +80,7 @@ A peer reads its lease every interval. While the lease is fresh, or stale for le
 
 When it is time, the peer writes a lease at the next term, and runs the leader's configuration turned around: itself as the alpha, every other beta as a beta. Its sessions present the new lease to each host on their first cycle. A host a newer term has already taken refuses it, and the peer steps down and follows again.
 
-Two candidates acting at once — clocks a lifetime apart, say — present the same term to the same hosts. The intent is that each host keeps the first and refuses the second. Today a host can accept both, because it reads, checks and writes the lease without a lock. See [Known collision issues](#known-collision-issues).
+Two candidates acting at once — clocks a lifetime apart, say — present the same term to the same hosts. Each host keeps the first and refuses the second, because it admits a lease in one step under a lock.
 
 ### The alpha is never dialed
 
@@ -138,10 +142,7 @@ A laptop that attaches to a leading beta therefore trusts that beta with the lap
 
 These can let two controllers write one root, or leave a peer stuck, in some timings.
 
-- **An accepted channel is not fenced after a takeover.** A channel whose lease was accepted keeps writing until it next presents a lease. A leader that pauses mid-transfer, or runs a cycle longer than `ttl` plus `failover_after`, can keep writing after another peer has taken the lead.
-- **Taking a lease is not atomic.** Two candidates can both be accepted at the same term. A delayed write at a lower term can overwrite a higher one. Lease files are not fsynced, so a power loss can roll the term back.
 - **A newer ancestor can be replaced by an older replica.** If a peer's ancestor still lives only in its journal, adoption treats it as generation zero. An older replica then overwrites it, losing the history that tells a deliberate edit from an unchanged file.
-- **Temporary file names collide.** Peering state files are written through temporary names built from the process id only. Two channels in one agent can overwrite each other's lease, configuration or name file.
 - **Several peering groups share one identity.** Groups aimed at different roots on one host push different `name` files to the same place. The last push wins, so failover covers only part of the groups.
 - **A follower takes over with an old configuration.** A follower reads the pushed configuration once, before it starts following. Changes pushed while it follows are ignored at takeover.
 - **Handoff can stall or go to the wrong peer.**
@@ -149,7 +150,6 @@ These can let two controllers write one root, or leave a peer stuck, in some tim
   - Plain groups stop while the alpha follows.
   - `peering yield --to <beta>` does not check its target, so a typo leaves nobody leading until the timeout.
   - Some leases ignore the configured `ttl`.
-- **A healthy alpha can lose the lead.** Session backoff can reach several minutes, longer than the takeover wait. After a network blip of about a minute, a beta can take over from an alpha that is fine.
 - **An oversized ancestor record can wedge a follower.** A record over the 1 GiB read limit is still written, and every later open of that ancestor then fails until `reset`.
 
 ## What is not covered

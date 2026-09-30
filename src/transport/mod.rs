@@ -795,6 +795,12 @@ fn serve_channel<W: Write + Send>(
         .map(|root| root.join(crate::peering::DIRECTORY))
         .map_err(|error| anyhow!("{error:#}"));
     let mut fence: Option<crate::peering::Lease> = None;
+    // The lease this channel was last accepted at. Every write it asks for
+    // is checked against the host's lease, under the lease lock, for the
+    // whole of the write: a takeover through another channel, another
+    // controller's agent, or this host's own peer fences it at once,
+    // rather than at its next renewal.
+    let mut accepted: Option<crate::peering::Lease> = None;
     let mut copy: Option<crate::peering::AncestorCopy> = None;
     while let Ok(request) = requests.recv() {
         #[cfg(test)]
@@ -839,25 +845,46 @@ fn serve_channel<W: Write + Send>(
             }
             continue;
         }
+        // Held until this request's response is built: the lease cannot
+        // change hands while the write runs.
+        let _lease_guard = match (writes, &accepted, &peering_directory) {
+            (true, Some(lease), Ok(directory)) => {
+                match crate::peering::check_write(directory, lease) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        if let Some(crate::peering::WriteRefused::Superseded { current, .. }) =
+                            error.downcast_ref::<crate::peering::WriteRefused>()
+                        {
+                            fence = Some(current.clone());
+                        }
+                        if serve_send(output, channel, Response::Error(format!("{error:#}")))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
         let result = match request {
             Request::Lease(lease) => peering_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
-                .and_then(|directory| {
-                    let held = crate::peering::read_lease(directory)?;
-                    match held {
-                        Some(held) if !held.admits(&lease) => {
-                            fence = Some(held.clone());
-                            Ok(Response::Lease(crate::peering::LeaseAnswer::Refused {
-                                current: held,
-                            }))
+                .and_then(|directory| crate::peering::admit_lease(directory, &lease))
+                .map(|answer| {
+                    match &answer {
+                        crate::peering::LeaseAnswer::Refused { current } => {
+                            fence = Some(current.clone());
+                            accepted = None;
                         }
-                        _ => {
-                            crate::peering::write_lease(directory, &lease)?;
+                        crate::peering::LeaseAnswer::Accepted => {
                             fence = None;
-                            Ok(Response::Lease(crate::peering::LeaseAnswer::Accepted))
+                            accepted = Some(lease);
                         }
                     }
+                    Response::Lease(answer)
                 }),
             Request::AncestorRecord {
                 generation,

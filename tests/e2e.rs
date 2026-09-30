@@ -1189,6 +1189,15 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
         newer.lease(&Lease::new("u@h:/x", 6, ttl)).unwrap(),
         LeaseAnswer::Accepted
     );
+    // Before the old leader presents anything again, its next write is
+    // refused all the same, and ends its cycle fenced by the newer lease.
+    let error = endpoint
+        .put_peering_file("name", b"alpha")
+        .expect_err("a write under a superseded lease is refused");
+    match error.downcast_ref::<autobahn::peering::Fenced>() {
+        Some(fenced) => assert_eq!(fenced.current.term, 6),
+        None => panic!("the refusal should end the cycle fenced: {error:#}"),
+    }
     match endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap() {
         LeaseAnswer::Refused { current } => {
             assert_eq!(current.term, 6);

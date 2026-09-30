@@ -872,6 +872,145 @@ pub(crate) fn short_name(beta: &str) -> String {
     }
 }
 
+/// What can be asked of the login service, from a window.
+///
+/// The service is this user's own — the same launchd job or systemd unit
+/// `autobahn install` registers — so the window calls the library
+/// straight rather than shelling out to itself. Installing carries the
+/// config and state root the window was opened with: a service pointed
+/// at a different file than the form is editing is the one failure here
+/// that looks like nothing at all.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Order {
+    Start,
+    Stop,
+    Restart,
+    Install,
+    Uninstall,
+}
+
+impl Order {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Order::Start => t("service.start"),
+            Order::Stop => t("service.stop"),
+            Order::Restart => t("service.restart"),
+            Order::Install => t("service.install"),
+            Order::Uninstall => t("service.uninstall"),
+        }
+    }
+
+    pub(crate) fn about(self) -> &'static str {
+        match self {
+            Order::Start => t("tip.service_start"),
+            Order::Stop => t("tip.service_stop"),
+            Order::Restart => t("tip.service_restart"),
+            Order::Install => t("tip.service_install"),
+            Order::Uninstall => t("tip.service_uninstall"),
+        }
+    }
+
+    /// The word for what just happened, for the status line.
+    fn done(self) -> &'static str {
+        match self {
+            Order::Start => t("service.started"),
+            Order::Stop => t("service.stopped"),
+            Order::Restart => t("service.restarted"),
+            Order::Install => t("service.installed"),
+            Order::Uninstall => t("service.uninstalled"),
+        }
+    }
+}
+
+/// What the service is doing, or why that cannot be said.
+pub(crate) fn service_state() -> Option<crate::service::ServiceState> {
+    crate::service::state().ok()
+}
+
+/// The orders that make sense in a given state. An install that is
+/// already installed, or a stop of something that is not running, are
+/// not offered rather than offered and refused.
+pub(crate) fn orders(state: crate::service::ServiceState) -> Vec<Order> {
+    use crate::service::ServiceState::*;
+    match state {
+        NotInstalled => vec![Order::Install],
+        Stopped => vec![Order::Start, Order::Uninstall],
+        Running => vec![Order::Stop, Order::Restart, Order::Uninstall],
+    }
+}
+
+/// Carries one out, and says what happened either way.
+pub(crate) fn ask(order: Order, config: Option<&std::path::Path>, state_root: &std::path::Path) -> String {
+    let done = match order {
+        Order::Start => crate::service::start(),
+        Order::Stop => crate::service::stop(),
+        Order::Restart => crate::service::restart(),
+        // The window's own config and state root, not the defaults: a
+        // service watching a different file than this form edits would
+        // look like the form doing nothing.
+        Order::Install => crate::service::install(config, Some(state_root)),
+        Order::Uninstall => crate::service::uninstall(),
+    };
+    match done {
+        Ok(()) => order.done().to_owned(),
+        Err(error) => fill(
+            "service.refused",
+            &[("order", order.label()), ("error", &first_line(&format!("{error:#}")))],
+        ),
+    }
+}
+
+/// What the button that opens a file manager should be called, which is
+/// not the same word on every desktop.
+pub(crate) fn reveal_label() -> &'static str {
+    match cfg!(target_os = "macos") {
+        true => t("conflicts.reveal_finder"),
+        false => t("conflicts.reveal_folder"),
+    }
+}
+
+/// Shows a file where it lives, and says what happened.
+///
+/// macOS has one answer for this and Linux has none: there is no
+/// portable "open the folder and select this". The file managers that
+/// can do it are asked first, by name, and the fallback opens the
+/// folder and leaves the finding to the person — which is still better
+/// than the `open -R` this used to run everywhere, which on Linux is
+/// either missing or a program for opening virtual consoles.
+pub(crate) fn reveal(file: &std::path::Path) -> String {
+    #[cfg_attr(target_os = "macos", allow(unused_variables))]
+    let folder = file.parent().unwrap_or(file);
+    let shown = tilde(&file.display().to_string());
+    #[cfg(target_os = "macos")]
+    let tried: Vec<(&str, Vec<&std::ffi::OsStr>)> =
+        vec![("open", vec!["-R".as_ref(), file.as_os_str()])];
+    #[cfg(not(target_os = "macos"))]
+    let tried: Vec<(&str, Vec<&std::ffi::OsStr>)> = vec![
+        ("nautilus", vec!["--select".as_ref(), file.as_os_str()]),
+        ("dolphin", vec!["--select".as_ref(), file.as_os_str()]),
+        ("nemo", vec![file.as_os_str()]),
+        ("thunar", vec![folder.as_os_str()]),
+        ("xdg-open", vec![folder.as_os_str()]),
+    ];
+    let mut last = None;
+    for (program, arguments) in tried {
+        match std::process::Command::new(program).args(arguments).status() {
+            Ok(status) if status.success() => {
+                return fill("status.revealed", &[("path", &shown)]);
+            }
+            // A file manager that is not installed is not a failure to
+            // report; it is the next one's turn.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(status) => last = Some(status.to_string()),
+            Err(error) => last = Some(error.to_string()),
+        }
+    }
+    match last {
+        Some(why) => fill("status.finder_refused", &[("status", &why)]),
+        None => fill("status.no_file_manager", &[("path", &shown)]),
+    }
+}
+
 pub(crate) fn exe() -> PathBuf {
     std::env::current_exe().unwrap_or_else(|_| PathBuf::from("autobahn"))
 }

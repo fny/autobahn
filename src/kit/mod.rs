@@ -720,9 +720,18 @@ impl Desk {
     fn rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let waiting = self.waiting();
         let running = self.report.as_ref().map(|report| report.supervisor_running);
+        // What the service manager says, which is not the same question
+        // as whether a supervisor is answering: one can be registered
+        // and stopped, or running from a terminal with none registered.
+        let registered = surface::service_state();
         let (service, colour) = match running {
             Some(true) => (t("fleet.supervisor_running"), GREEN),
-            Some(false) => (t("fleet.supervisor_missing"), RED),
+            Some(false) => match registered {
+                Some(crate::service::ServiceState::NotInstalled) => {
+                    (t("service.not_installed"), RED)
+                }
+                _ => (t("fleet.supervisor_missing"), RED),
+            },
             None => (t("fleet.reading"), FAINT),
         };
         div()
@@ -803,6 +812,31 @@ impl Desk {
                             .child(dot(colour))
                             .child(div().text_size(px(11.)).text_color(rgb(DIM)).child(service)),
                     )
+                    // What can be done about it, from here: the same
+                    // launchd job or systemd unit `autobahn install`
+                    // registers, asked through the same library.
+                    .when_some(registered, |column, state| {
+                        column.child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap(step(1.))
+                                .children(surface::orders(state).into_iter().map(|order| {
+                                    Button::new(SharedString::from(format!(
+                                        "service-{}",
+                                        order.label()
+                                    )))
+                                    .xsmall()
+                                    .outline()
+                                    .label(order.label())
+                                    .tooltip(order.about())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.order(order);
+                                        cx.notify();
+                                    }))
+                                })),
+                        )
+                    })
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -812,6 +846,13 @@ impl Desk {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Asks the service manager for something, and says what came back.
+    fn order(&mut self, order: surface::Order) {
+        self.said = Some(surface::ask(order, self.config.as_deref(), &self.state_root));
+        // Whatever it did, the fleet is a different shape now.
+        self.read_at = None;
     }
 
     /// The panes as a row, when the window is too narrow for a rail.
@@ -1699,7 +1740,7 @@ impl Desk {
 
     fn binary_card(
         &self,
-        item: &Conflict,
+        _item: &Conflict,
         alpha: &Side,
         beta: &Side,
         cx: &mut Context<Self>,
@@ -1838,7 +1879,7 @@ impl Desk {
                         Button::new(SharedString::from(format!("reveal-{name}")))
                             .small()
                             .outline()
-                            .label(t("conflicts.reveal"))
+                            .label(surface::reveal_label())
                             .tooltip(t("tip.reveal"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.reveal(&file);
@@ -3384,14 +3425,7 @@ impl Desk {
     }
 
     fn reveal(&mut self, file: &std::path::Path) {
-        let shown = std::process::Command::new("open").arg("-R").arg(file).status();
-        self.said = Some(match shown {
-            Ok(status) if status.success() => {
-                fill("status.revealed", &[("path", &tilde(&file.display().to_string()))])
-            }
-            Ok(status) => fill("status.finder_refused", &[("status", &status.to_string())]),
-            Err(error) => fill("status.finder_unreachable", &[("error", &error.to_string())]),
-        });
+        self.said = Some(surface::reveal(file));
     }
 }
 

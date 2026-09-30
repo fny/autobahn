@@ -21,6 +21,10 @@ fn catalogue() -> &'static HashMap<String, String> {
     WORDS.get_or_init(|| {
         let mut words = HashMap::new();
         let Ok(document) = ENGLISH.parse::<toml::Table>() else {
+            // Every key would read as itself and the whole window would
+            // fill with `fleet.cycles_one`. It is a mistake somebody
+            // makes editing the file by hand, and it should be a failing
+            // test rather than a puzzle in front of them.
             return words;
         };
         // Two levels: a table per surface, a key per line. Flat enough
@@ -206,6 +210,20 @@ mod tests {
             })
             .collect();
         assert!(unused.is_empty(), "nothing asks for: {unused:?}");
+    }
+
+    /// The catalogue parses. Without this the loader returns an empty
+    /// map, every key reads as itself, and the window fills with
+    /// `fleet.cycles_one` — which is a stray quote somewhere in a file
+    /// anybody may edit, and should not take an afternoon to find.
+    #[test]
+    fn the_catalogue_is_a_file_that_parses() {
+        let document = ENGLISH
+            .parse::<toml::Table>()
+            .expect("assets/words/en.toml does not parse");
+        assert!(!document.is_empty());
+        assert!(!catalogue().is_empty(), "the catalogue loaded nothing");
+        assert_eq!(t("app.name"), "autobahn", "a known key reads as itself");
     }
 
     /// Every hint is offered, and an empty one is not a hint.

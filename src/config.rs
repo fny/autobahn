@@ -404,7 +404,11 @@ impl Config {
         };
         crate::logging::Level::parse(name)
             .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("unknown log level {name:?} (quiet, normal, or debug)"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "log: unknown log level {name:?} (available: quiet, normal, debug)"
+                )
+            })
     }
 }
 
@@ -1302,6 +1306,34 @@ impl Config {
                  hosts and a switch."
                     .to_owned(),
             );
+        }
+        // The two top-level keys that can be quietly wrong. Neither is
+        // worth refusing a file over — a hook may be written after the
+        // line that names it, and a host may come back — but a typo in
+        // either is silent for as long as nobody looks.
+        if let Some(command) = &self.on_alert {
+            let named = command.split_whitespace().next().unwrap_or_default();
+            let looks_like_a_path = named.starts_with('/') || named.starts_with('~');
+            if looks_like_a_path {
+                let path = crate::paths::expand_tilde(named).unwrap_or_else(|_| named.into());
+                if !path.exists() {
+                    warnings.push(format!(
+                        "on_alert: there is no {} to run; a session that needs a person \
+                         will say so in the log and nowhere else",
+                        path.display()
+                    ));
+                }
+            }
+        }
+        let known = self.known_hosts();
+        for host in &self.disabled_hosts {
+            if !known.iter().any(|name| name == host) {
+                warnings.push(format!(
+                    "disabled_hosts: no group names the host {host:?}, so disabling it \
+                     does nothing (available: {})",
+                    known.join(", ")
+                ));
+            }
         }
         let peering = match self.peering_plan() {
             Ok(plan) => Some(plan),

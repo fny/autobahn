@@ -89,6 +89,8 @@ pub(crate) struct Sheet {
     /// stands, and whether the next edit should skip asking.
     stale: bool,
     quiet: bool,
+    /// What the loader would take, and still say something about.
+    pub(crate) warned: Vec<String>,
 }
 
 /// Where one value lives in the file.
@@ -484,7 +486,14 @@ fn differ(was: &toml_edit::Table, now: &toml_edit::Table, changes: &mut usize) {
 /// reported it.
 pub(crate) fn faults(refusal: &str) -> Vec<String> {
     let mut seen: Vec<String> = Vec::new();
-    for line in refusal.lines().skip(1) {
+    // `plans` gathers its complaints under a heading; everything else
+    // the loader refuses a file for — a log level it does not know, a
+    // hook timing it cannot read — arrives as a sentence on its own.
+    let body = match refusal.lines().next() {
+        Some("invalid configuration:") => refusal.lines().skip(1),
+        _ => refusal.lines().skip(0),
+    };
+    for line in body {
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -522,41 +531,81 @@ pub(crate) struct At {
 }
 
 pub(crate) fn fault_at(fault: &str) -> Option<At> {
+    /// A name a key could have: nothing with a space or a quote in it.
+    fn keyish(word: &str) -> bool {
+        !word.is_empty()
+            && word
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+    }
+
     let (section, rest) = match fault.strip_prefix("the defaults' ") {
         Some(rest) => (Section::Defaults, rest),
-        None => {
-            let rest = fault.strip_prefix("group '")?;
-            let (name, rest) = rest.split_once("': ")?;
-            (Section::Group(name.to_owned()), rest)
-        }
+        None => match fault.strip_prefix("group '") {
+            Some(rest) => {
+                let (name, rest) = rest.split_once("': ")?;
+                (Section::Group(name.to_owned()), rest)
+            }
+            // No prefix at all: the head is either a bare key at the top
+            // of the file, or a dotted path into one of the experimental
+            // tables, whose last segment is the key.
+            None => {
+                let (head, said) = fault.split_once(": ")?;
+                let (table, key) = match head.rsplit_once('.') {
+                    Some((table, key)) => (table, key),
+                    None => ("", head),
+                };
+                if !keyish(key) {
+                    return None;
+                }
+                let section = match table {
+                    "" => Section::Settings,
+                    "experimental" | "advanced" => Section::Advanced,
+                    "experimental.alerts" | "advanced.alerts" => Section::Alerts,
+                    table if table.contains("peering") => Section::Peering,
+                    _ => return None,
+                };
+                return Some(offered(section, key.to_owned(), said.to_owned()));
+            }
+        },
     };
     // "key: what went wrong". A colon inside the complaint itself is
     // common, so only the first one counts, and only when what is in
     // front of it looks like a key rather than a sentence.
     let (key, said) = rest.split_once(": ")?;
-    if key.is_empty() || !key.chars().all(|c| c.is_ascii_lowercase() || c == '_') {
+    if !keyish(key) {
         return None;
     }
-    // "(available: a, b, c)" is a list of choices wearing a sentence.
-    let mut said = said.to_owned();
+    Some(offered(section, key.to_owned(), said.to_owned()))
+}
+
+/// The choices a complaint offered, taken out of the sentence it was
+/// hiding in: "(available: a, b, c)" is a list of words to pick from.
+fn offered(section: Section, key: String, said: String) -> At {
+    let mut said = said;
     let mut instead = Vec::new();
-    if let Some(open) = said.find("(available: ") {
-        if let Some(close) = said[open..].find(')') {
-            instead = said[open + 12..open + close]
-                .split(", ")
-                .map(str::trim)
-                .filter(|word| !word.is_empty())
-                .map(str::to_owned)
-                .collect();
-            said.replace_range(open..open + close + 1, "");
-        }
+    for opener in ["(available: ", "(expected one of: "] {
+        let Some(open) = said.find(opener) else {
+            continue;
+        };
+        let Some(close) = said[open..].find(')') else {
+            continue;
+        };
+        instead = said[open + opener.len()..open + close]
+            .split(", ")
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect();
+        said.replace_range(open..open + close + 1, "");
+        break;
     }
-    Some(At {
+    At {
         section,
-        key: key.to_owned(),
+        key,
         said: said.trim().trim_end_matches(&[' ', ','][..]).to_owned(),
         instead,
-    })
+    }
 }
 
 /// The section a refusal is about, when it names one.
@@ -598,10 +647,13 @@ pub(crate) fn number_or_text(text: &str) -> toml_edit::Item {
 /// `reload::load_bytes`, the very function a running supervisor reloads
 /// with, so the form cannot write a file that parses and is then
 /// refused by the daemon two seconds later.
-pub(crate) fn refusal(path: &std::path::Path, text: &str) -> Option<String> {
-    crate::supervisor::reload::load_bytes(path, text.as_bytes())
-        .err()
-        .map(|error| format!("{error:#}"))
+/// What the loader makes of a document: what it would refuse it for, or
+/// what it would load it and still say about it.
+pub(crate) fn refusal(path: &std::path::Path, text: &str) -> Result<Vec<String>, String> {
+    match crate::supervisor::reload::load_bytes(path, text.as_bytes()) {
+        Ok(loaded) => Ok(loaded.warnings),
+        Err(error) => Err(format!("{error:#}")),
+    }
 }
 
 /// The first line of a message, for a status bar that has one line.
@@ -835,6 +887,7 @@ impl Sheet {
             was: document.clone(),
             document,
             refused: None,
+            warned: Vec::new(),
             stale: false,
             quiet: false,
         };
@@ -938,7 +991,18 @@ impl Sheet {
     /// on a fleet this size is tens of milliseconds. Fine for a click.
     /// Not fine for a keystroke, which is what [`Sheet::later`] is for.
     fn ask(&mut self) {
-        self.refused = refusal(&self.path, &self.document.to_string());
+        match refusal(&self.path, &self.document.to_string()) {
+            Ok(warnings) => {
+                self.refused = None;
+                self.warned = warnings;
+            }
+            Err(refused) => {
+                self.refused = Some(refused);
+                // A file that does not load was never planned, so
+                // whatever it might also be warned about is unknown.
+                self.warned.clear();
+            }
+        }
         self.stale = false;
     }
 
@@ -998,6 +1062,11 @@ impl Sheet {
     /// something that was true two letters ago.
     pub(crate) fn checking(&self) -> bool {
         self.stale
+    }
+
+    /// What the loader would take the file but still say about it.
+    pub(crate) fn warned(&self) -> &[String] {
+        &self.warned
     }
 
     /// Writes the edited document, if the loader takes it and nobody
@@ -1075,6 +1144,17 @@ mod tests {
         assert!(fresh.to_string().contains("[experimental]"), "{fresh}");
     }
 
+    /// Not every refusal is a list under a heading. A file the loader
+    /// turns down for one thing says so in one sentence, and that
+    /// sentence is the fault — dropping it left the window with a red
+    /// dot and nothing to show for it.
+    #[test]
+    fn a_refusal_that_is_one_sentence_is_one_fault() {
+        let alone = "log: unknown log level \"loud\" (available: quiet, normal, debug)";
+        assert_eq!(faults(alone), vec![alone.to_owned()]);
+        assert_eq!(fault_at(alone).map(|at| at.key), Some("log".to_owned()));
+    }
+
     /// Eight lines that differ only in a group name are one fault, and
     /// the defaults are where somebody would go to fix it.
     #[test]
@@ -1128,6 +1208,35 @@ mod tests {
         // particular and must not be forced under a field.
         assert!(fault_at("group 'aws': a peering mode needs a local alpha").is_none());
         assert!(fault_at("sessions 'a' and 'b': endpoint nested").is_none());
+    }
+
+    /// The rest of the file: a bare key is the top of it, and a dotted
+    /// one names the table it is in.
+    #[test]
+    fn a_fault_anywhere_in_the_file_finds_its_field() {
+        let top = fault_at("log: unknown log level \"loud\" (available: quiet, normal, debug)")
+            .expect("a key at the top of the file");
+        assert_eq!(top.section, Section::Settings);
+        assert_eq!(top.key, "log");
+        assert_eq!(top.instead, vec!["quiet", "normal", "debug"]);
+
+        let timing = fault_at("experimental.alerts.settle_after: invalid duration 'soon'")
+            .expect("a key in the alert timing");
+        assert_eq!(timing.section, Section::Alerts);
+        assert_eq!(timing.key, "settle_after");
+
+        let lease = fault_at(
+            "experimental.peering-dangerously-experimental.ttl: invalid duration 'soon'",
+        )
+        .expect("a key in the lease timing");
+        assert_eq!(lease.section, Section::Peering);
+        assert_eq!(lease.key, "ttl");
+
+        let root = fault_at("experimental.allow_root: not a boolean").expect("a key in the table");
+        assert_eq!(root.section, Section::Advanced);
+
+        // And a sentence with a colon in it is still not a key.
+        assert!(fault_at("unable to read configuration /x: no such file").is_none());
     }
 
     /// A hidden key is still a key: if one is renamed in the structs the
@@ -1240,7 +1349,7 @@ mod tests {
         let path = std::path::Path::new("config.toml");
         let text = "[defaults]\nmode = \"two-way-conflict\"\n\n\
                     [groups.a]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
-        assert_eq!(refusal(path, text), None);
+        assert_eq!(refusal(path, text), Ok(Vec::new()));
 
         let mut document: toml_edit::DocumentMut = text.parse().unwrap();
         let table = table_for(&mut document, &Section::Group("a".to_owned())).unwrap();
@@ -1251,7 +1360,7 @@ mod tests {
         let broken = document.to_string();
         crate::config::Config::parse(path, &broken)
             .expect("serde takes it: a list of strings is a list of strings");
-        let complaint = refusal(path, &broken).expect("the loader does not");
+        let complaint = refusal(path, &broken).expect_err("the loader does not");
         assert!(complaint.contains("ignore"), "{complaint}");
     }
 

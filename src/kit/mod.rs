@@ -382,6 +382,8 @@ pub struct Desk {
     /// The complaints that belong to a field, by the field they belong
     /// to. Worked out once a frame, where the loader's verdict is read.
     at_fields: std::collections::HashMap<(Section, String), surface::At>,
+    /// The same, for what the loader would take and still remark on.
+    at_warned: std::collections::HashMap<(Section, String), surface::At>,
     /// Whether this window is showing what it keeps back.
     ///
     /// Five clicks on the wordmark. Not a secret and not a password —
@@ -509,6 +511,7 @@ impl Desk {
             form: ScrollHandle::new(),
             showing_faults: false,
             at_fields: std::collections::HashMap::new(),
+            at_warned: std::collections::HashMap::new(),
             unlocked: false,
             knocks: 0,
             knocked_at: None,
@@ -2224,6 +2227,18 @@ impl Desk {
             .map(|at| ((at.section.clone(), at.key.clone()), at))
             .collect();
         let homeless = faults.len() - self.at_fields.len();
+        // A warning is not a refusal — the loader would take the file —
+        // so it is amber where a fault is red, and it never stops Save.
+        // It lands the same way, at the key it is about.
+        self.at_warned = match checking {
+            true => std::collections::HashMap::new(),
+            false => sheet
+                .warned()
+                .iter()
+                .filter_map(|warning| surface::fault_at(warning))
+                .map(|at| ((at.section.clone(), at.key.clone()), at))
+                .collect(),
+        };
         let showing = self.showing_faults && refused.is_some();
         let pending = sheet.pending();
         // The experimental tables are not listed at all until the
@@ -2639,15 +2654,22 @@ impl Desk {
             .sheet
             .as_ref()
             .is_some_and(|sheet| sheet.changed(part, key));
+        let at = (part.clone(), key.to_owned());
+        let refused = self.at_fields.contains_key(&at);
         let fault = self
             .at_fields
-            .get(&(part.clone(), key.to_owned()))
+            .get(&at)
+            .or_else(|| self.at_warned.get(&at))
             .map(|at| surface::At {
                 section: at.section.clone(),
                 key: at.key.clone(),
                 said: at.said.clone(),
                 instead: at.instead.clone(),
             });
+        let ink = match refused {
+            true => RED,
+            false => AMBER,
+        };
         // A window that has not been let in is not offered the
         // experimental words — unless the file already holds one, in
         // which case hiding it would offer to change the setting to
@@ -2702,15 +2724,17 @@ impl Desk {
                                     // only in a count at the top — and a
                                     // key the loader is refusing says so
                                     // louder than one merely edited.
-                                    .when(touched && fault.is_none(), |name| {
-                                        name.text_color(rgb(AMBER))
+                                    .when(touched || fault.is_some(), |name| {
+                                        name.text_color(rgb(match fault.is_some() {
+                                            true => ink,
+                                            false => AMBER,
+                                        }))
                                     })
-                                    .when(fault.is_some(), |name| name.text_color(rgb(RED)))
                                     .child(key.to_owned()),
                             )
                             .when(touched || fault.is_some(), |row| {
                                 row.child(dot(match fault.is_some() {
-                                    true => RED,
+                                    true => ink,
                                     false => AMBER,
                                 }))
                             }),
@@ -2743,9 +2767,12 @@ impl Desk {
                                     .flex()
                                     .gap(step(1.5))
                                     .text_size(px(11.))
-                                    .text_color(rgb(RED))
+                                    .text_color(rgb(ink))
                                     .child(div().flex_shrink_0().child("\u{26a0}"))
-                                    .child(div().child(fault.said.clone())),
+                                    // A flex child will not wrap until it
+                                    // is allowed to be narrower than its
+                                    // text, which is what this says.
+                                    .child(div().min_w(px(0.)).child(fault.said.clone())),
                             )
                             .when(!fault.instead.is_empty(), |column| {
                                 column.child(
@@ -2803,9 +2830,14 @@ impl Desk {
                 .unwrap_or_default()
                 .to_owned();
             let set = held.is_some();
-            let default = match field["default"].as_str() {
-                Some(default) => default.to_owned(),
-                None => fallback.to_owned(),
+            // A value the file holds that is not one of these words has
+            // no row to select, and a control that then says "not in the
+            // file" about a line that is in the file is lying about it.
+            let unknown = set && !words.iter().any(|(word, _)| *word == now);
+            let default = match (unknown, field["default"].as_str()) {
+                (true, _) => now.clone(),
+                (false, Some(default)) => default.to_owned(),
+                (false, None) => fallback.to_owned(),
             };
             let list = self.choose(part, key, words, &now, window, cx);
             return div()
@@ -2824,9 +2856,10 @@ impl Desk {
                             div().w(px(260.)).flex_shrink_0().child(
                                 Select::new(&list)
                                     .menu_width(px(580.))
-                                    .placeholder(match default.is_empty() {
-                                        true => t("config.absent").to_owned(),
-                                        false => fill(
+                                    .placeholder(match (unknown, default.is_empty()) {
+                                        (true, _) => default.clone(),
+                                        (false, true) => t("config.absent").to_owned(),
+                                        (false, false) => fill(
                                             "config.default_is",
                                             &[("default", &default)],
                                         ),
@@ -2987,7 +3020,18 @@ impl Desk {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A field that takes one of a fixed set of words has no text
+        // block behind it — the offered word is simply the value.
         let Some(block) = self.fields.get(at).cloned() else {
+            self.put(
+                &Spot {
+                    section: at.0.clone(),
+                    key: at.1.clone(),
+                    item: None,
+                },
+                Some(toml_edit::value(word.to_owned())),
+            );
+            self.choices.remove(at);
             return;
         };
         let wrong = self

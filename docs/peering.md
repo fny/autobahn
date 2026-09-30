@@ -73,6 +73,8 @@ On every cycle the leader keeps each peer able to lead:
 
 The last one is what makes a takeover clean. A leader without an ancestor reconciles two trees with no history and calls every difference a conflict. With the copy, the new leader continues the same three-way session the old one ran. The copy is written with the ancestor's own durability, never through the scan cache.
 
+A host that comes to lead a session takes up the copy when the copy was written after its own history, since that is the later agreement. It compares when each was written rather than generation numbers: a copy that lagged when a beta took over carries on from where it lagged, so after a handback it can be the later record at the lower number. Both are on the one host and stamped by its clock, so the times compare. Records are sent best effort, one per cycle; a copy that misses one is found out by the next, and brought level before any handoff.
+
 ### The takeover
 
 A peer reads its lease every interval. While the lease is fresh, or stale for less than the peer's wait, nothing happens. The wait is `failover_after` plus one `ttl` for every beta ahead of this one in the configuration's order — so the first live beta acts first, and nobody has to be asked. A blip never reaches the wait.
@@ -91,7 +93,7 @@ The session keeps the alpha on the alpha side, under the identifier the leader p
 
 ### The handoff
 
-The lead goes back to the alpha on its own: one settled cycle on the attached session hands it over at the next term. `autobahn peering yield --to alpha` does the same on request, from the leading peer. A handoff writes the local lease first, every running peering session hands the new lease to its peer on its next attempt, and then the supervisor follows. A paused session is not waited for. A restart in the middle comes back as a follower; the member the lease names leads as soon as the lease reaches it, and otherwise the timeout takes it from there.
+The lead goes back to the alpha on its own: one settled cycle on the attached session hands it over at the next term. `autobahn peering yield --to alpha` does the same on request, from the leading peer. A handoff writes the local lease first, every running peering session brings its peer's copy of the ancestor level and hands the new lease to it on its next attempt, and then the supervisor follows. The lead goes back to the alpha on its own only once the alpha's copy is confirmed level. A paused session is not waited for. A restart in the middle comes back as a follower; the member the lease names leads as soon as the lease reaches it, and otherwise the timeout takes it from there.
 
 ## What `status` shows
 

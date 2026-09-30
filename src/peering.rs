@@ -878,11 +878,28 @@ mod tests {
         assert_eq!(AncestorStore::stored_generation(path).unwrap(), generations);
     }
 
-    /// Adoption compares the two stores' generations journal and all: a
-    /// newer local history that is only in its journal is kept over an
-    /// older copy, and a copy that is only a journal is still a copy.
+    /// Sets when a store was last written, checkpoint and journal alike.
+    fn written_at(path: &Path, seconds_ago: u64) {
+        let when = SystemTime::now() - Duration::from_secs(seconds_ago);
+        for file in [path.to_path_buf(), path.with_file_name("ancestor.journal")] {
+            if file.exists() {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(when)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Adoption takes the copy when it was written after the session's own
+    /// store — the later agreement — whatever the generations say, and
+    /// reads either store journal and all. A copy that lagged when a beta
+    /// took over carries on below the generation the alpha reached before
+    /// it left; it is still the later record, and is adopted.
     #[test]
-    fn adoption_reads_generations_from_the_journal_too() {
+    fn adoption_takes_the_later_agreement() {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let state_root = keep.path();
         let directory = state_root.join(DIRECTORY);
@@ -891,24 +908,34 @@ mod tests {
         let copy = ancestor_copy_path(&directory, &session).unwrap();
         std::fs::create_dir_all(own.parent().unwrap()).unwrap();
         std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        let generation = |path: &Path| AncestorStore::stored_generation(path).unwrap();
 
-        // A journal-only local ancestor at 10 is kept over a copy at 9.
-        journal_only(&own, 10);
-        journal_only(&copy, 9);
-        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
-        assert_eq!(AncestorStore::stored_generation(&own).unwrap(), 10);
-
-        // A journal-only copy at 9 is adopted over a local ancestor at 5.
-        AncestorStore::reset(&own).unwrap();
+        // No copy: nothing to adopt. No history of its own: the copy is.
         journal_only(&own, 5);
+        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
+        AncestorStore::reset(&own).unwrap();
+        journal_only(&copy, 3);
         assert!(adopt_newer_copy(state_root, &directory, &session).unwrap());
-        assert_eq!(AncestorStore::stored_generation(&own).unwrap(), 9);
+        assert_eq!(generation(&own), 3);
+
+        // Its own, written later, is kept — journal-only, and ahead or not.
+        AncestorStore::reset(&own).unwrap();
+        journal_only(&own, 10);
+        written_at(&copy, 60);
+        written_at(&own, 30);
+        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(generation(&own), 10);
+
+        // The copy, written later, is adopted — even at a lower generation:
+        // the histories parted, and the later one is the copy's.
+        AncestorStore::reset(&copy).unwrap();
+        journal_only(&copy, 9);
+        written_at(&own, 60);
+        written_at(&copy, 30);
+        assert!(adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(generation(&own), 9);
         let (_, adopted, _) = AncestorStore::open(&own).unwrap();
         assert_eq!(adopted.map(|tree| tree.children().len()), Some(9));
-
-        // No copy at all adopts nothing.
-        AncestorStore::reset(&copy).unwrap();
-        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
     }
 }
 
@@ -1326,19 +1353,33 @@ pub fn destination_of(leader: &str) -> &str {
 /// way; an alpha that gets the lead back adopts what the beta recorded
 /// meanwhile. Returns whether anything was adopted.
 ///
-/// Both generations are the store's own, journal and all: a store may be
-/// a checkpoint, a journal, or both, and one whose history is still only
-/// in its journal holds every generation it recorded. Read from the
-/// checkpoint alone, it stood at zero, and any older copy replaced it.
+/// Newer means written later, not a higher generation. Each store records
+/// the last state its session agreed on, and the later agreement is the
+/// one to continue from. Generations cannot say which that is once the
+/// two histories have parted: a copy that lagged when a beta took over
+/// carries on from where it lagged, and a history that was reset counts
+/// from one again, so either can be the later record at the lower
+/// number. The times are comparable because both stores are on this host
+/// and written by it — the copy by this host's agent, the session's by its
+/// supervisor — so one clock stamped both. A copy with no history is never
+/// adopted, and its history is read journal and all: a store may be a
+/// checkpoint, a journal, or both.
 pub fn adopt_newer_copy(state_root: &Path, directory: &Path, session: &str) -> Result<bool> {
     let copy = ancestor_copy_path(directory, session)?;
-    let copied = AncestorStore::stored_generation(&copy)?;
-    if copied == 0 {
+    if AncestorStore::stored_generation(&copy)? == 0 {
         return Ok(false);
     }
     let own = state_root.join("sessions").join(session).join("ancestor");
-    let held = AncestorStore::stored_generation(&own)?;
-    if copied <= held {
+    let newer = AncestorStore::stored_generation(&own)? == 0
+        || match (
+            AncestorStore::last_written(&copy)?,
+            AncestorStore::last_written(&own)?,
+        ) {
+            (Some(copied), Some(held)) => copied > held,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
+    if !newer {
         return Ok(false);
     }
     if let Some(parent) = own.parent() {

@@ -420,6 +420,31 @@ impl AncestorStore {
         Ok(peek(path)?.1)
     }
 
+    /// When the store at `path` was last written — its checkpoint or its
+    /// journal, whichever is later — by this host's clock; `None` for a
+    /// store that does not exist. Every write the store makes is a cycle's
+    /// agreed outcome (or a `resolve` stating one), so this is when it last
+    /// recorded an agreement.
+    pub(crate) fn last_written(path: &Path) -> Result<Option<std::time::SystemTime>> {
+        let mut latest = None;
+        for file in [path.to_path_buf(), journal_path(path)] {
+            match fs::metadata(&file) {
+                Ok(metadata) => {
+                    let modified = metadata.modified().with_context(|| {
+                        format!("unable to read when {} changed", file.display())
+                    })?;
+                    latest = latest.max(Some(modified));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("unable to inspect {}", file.display()))
+                }
+            }
+        }
+        Ok(latest)
+    }
+
     /// Replaces the store at `to` with the one at `from`: the journal is
     /// removed first and copied last, for the same reason `reset` orders
     /// its removals — a checkpoint alone is a state that was acknowledged

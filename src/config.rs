@@ -1341,17 +1341,29 @@ impl Config {
             if group.disabled {
                 continue;
             }
-            let (mode, peers) = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
-                Some(mode) => match parse_mode_spec(mode) {
+            // A complaint names the place somebody would go to fix it.
+            // For a value this group wrote that is the group; for one it
+            // inherited it is the defaults, and saying "group 'aws'"
+            // about a line in `[defaults]` sends them to the wrong table
+            // — once per group that inherits it.
+            let blame = |mine: bool, key: &str, message: &dyn std::fmt::Display| match mine {
+                true => format!("group '{name}': {key}: {message}"),
+                false => format!("the defaults' {key}: {message}"),
+            };
+            let (mode, peers) = match inherited(
+                group.mode.as_deref(),
+                self.defaults.mode.as_deref(),
+            ) {
+                Some((mode, mine)) => match parse_mode_spec(mode) {
                     Ok((mode, peers)) => (Some(mode), peers),
                     Err(message) => {
-                        errors.push(format!("group '{name}': mode: {message}"));
+                        errors.push(blame(mine, "mode", &message));
                         (None, false)
                     }
                 },
                 None => {
                     errors.push(format!(
-                        "group '{name}' has no mode and the defaults specify none"
+                        "group '{name}': mode: none here, and the defaults specify none either"
                     ));
                     (None, false)
                 }
@@ -1378,17 +1390,17 @@ impl Config {
                 }
             };
             if group.alpha.is_empty() {
-                errors.push(format!("group '{name}' has an empty alpha"));
+                errors.push(format!("group '{name}': alpha: cannot be empty"));
             }
             if group.betas.is_empty() {
-                errors.push(format!("group '{name}' has no betas"));
+                errors.push(format!("group '{name}': betas: a group needs at least one"));
             }
             let agent_command = match &group.agent_command {
                 None => None,
                 Some(command) => {
                     let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
                     if argv.is_empty() {
-                        errors.push(format!("group '{name}' has an empty agent_command"));
+                        errors.push(format!("group '{name}': agent_command: cannot be empty"));
                         None
                     } else {
                         Some(argv)
@@ -1409,14 +1421,18 @@ impl Config {
                         // in — a different tree under a service than in a
                         // shell.
                         errors.push(format!(
-                            "group '{name}' alpha '{}' must be an absolute (or ~-relative) path",
+                            "group '{name}': alpha: '{}' must be an absolute (or ~-relative) \
+                             path",
                             group.alpha
                         ));
                         None
                     }
                     Ok(target) => Some(target),
                     Err(message) => {
-                        errors.push(format!("group '{name}' alpha '{}': {message}", group.alpha));
+                        errors.push(format!(
+                            "group '{name}': alpha: '{}': {message}",
+                            group.alpha
+                        ));
                         None
                     }
                 }
@@ -1440,7 +1456,8 @@ impl Config {
             if peering.is_some() {
                 if let Some(EndpointTarget::Remote { .. }) = &alpha {
                     errors.push(format!(
-                        "group '{name}': a peering mode needs a local alpha; '{}' is remote",
+                        "group '{name}': mode: a peering mode needs a local alpha; '{}' is \
+                         remote",
                         group.alpha
                     ));
                     continue;
@@ -1460,26 +1477,24 @@ impl Config {
             // excluded, which is the point of having both.
             let mut ignores = Vec::new();
             let mut ignore_errors = Vec::new();
-            for (source, names) in [
-                ("the defaults'", &self.defaults.ignore_files),
-                ("its own", &group.ignore_files),
+            for (mine, names) in [
+                (false, &self.defaults.ignore_files),
+                (true, &group.ignore_files),
             ] {
                 for file in names {
                     match crate::scan::ignorefile::read(&ignore_directory, file) {
                         Ok(patterns) => ignores.extend(patterns),
                         Err(error) => {
-                            ignore_errors.push(format!("{source} ignore_files: {error:#}"))
+                            ignore_errors.push(blame(mine, "ignore_files", &format!("{error:#}")))
                         }
                     }
                 }
-                if source == "the defaults'" {
+                if !mine {
                     ignores.extend(self.defaults.ignores.iter().cloned());
                 }
             }
             ignores.extend(group.ignores.iter().cloned());
-            for error in ignore_errors {
-                errors.push(format!("group '{name}': {error}"));
-            }
+            errors.extend(ignore_errors);
             // Compile the combined patterns now, so a bad pattern is a
             // configuration error alongside the others rather than a runtime
             // failure discovered only by the affected session's worker.
@@ -1502,7 +1517,7 @@ impl Config {
                         compiled
                             .dead_negations()
                             .into_iter()
-                            .map(|dead| format!("group '{name}': {dead}")),
+                            .map(|dead| format!("group '{name}': ignores: {dead}")),
                     )
                 }
             }
@@ -1528,60 +1543,62 @@ impl Config {
                     continue;
                 }
             }
-            let symlink_mode = match group
-                .symlink_mode
-                .as_deref()
-                .or(self.defaults.symlink_mode.as_deref())
-            {
+            let symlink_mode = match inherited(
+                group.symlink_mode.as_deref(),
+                self.defaults.symlink_mode.as_deref(),
+            ) {
                 None => SymlinkMode::default(),
-                Some(mode) => match parse_symlink_mode(mode) {
+                Some((mode, mine)) => match parse_symlink_mode(mode) {
                     Ok(mode) => mode,
                     Err(message) => {
-                        errors.push(format!("group '{name}': symlink_mode: {message}"));
+                        errors.push(blame(mine, "symlink_mode", &message));
                         SymlinkMode::default()
                     }
                 },
             };
-            let mut permission = |value: Option<&str>, directory: bool| {
+            let mut permission = |held: Option<(&str, bool)>, directory: bool| {
                 let key = match directory {
                     true => "directory_mode",
                     false => "file_mode",
                 };
-                match value {
+                match held {
                     None => None,
-                    Some(mode) => match parse_permission_mode(mode, directory) {
+                    Some((mode, mine)) => match parse_permission_mode(mode, directory) {
                         Ok(bits) => Some(bits),
                         Err(message) => {
-                            errors.push(format!("group '{name}': {key}: {message}"));
+                            errors.push(blame(mine, key, &message));
                             None
                         }
                     },
                 }
             };
             let file_mode = permission(
-                group
-                    .file_mode
-                    .as_deref()
-                    .or(self.defaults.file_mode.as_deref()),
+                inherited(
+                    group.file_mode.as_deref(),
+                    self.defaults.file_mode.as_deref(),
+                ),
                 false,
             );
             let directory_mode = permission(
-                group
-                    .directory_mode
-                    .as_deref()
-                    .or(self.defaults.directory_mode.as_deref()),
+                inherited(
+                    group.directory_mode.as_deref(),
+                    self.defaults.directory_mode.as_deref(),
+                ),
                 true,
             );
-            let max_file_size = match group
-                .max_file_size
-                .as_ref()
-                .or(self.defaults.max_file_size.as_ref())
-            {
+            // The same question, for a value that is not a string:
+            // whichever table has it is the one to blame.
+            let size = match (&group.max_file_size, &self.defaults.max_file_size) {
+                (Some(spec), _) => Some((spec, true)),
+                (None, Some(spec)) => Some((spec, false)),
+                (None, None) => None,
+            };
+            let max_file_size = match size {
                 None => None,
-                Some(spec) => match parse_size(spec) {
+                Some((spec, mine)) => match parse_size(spec) {
                     Ok(bytes) => Some(bytes),
                     Err(message) => {
-                        errors.push(format!("group '{name}': max_file_size: {message}"));
+                        errors.push(blame(mine, "max_file_size", &message));
                         None
                     }
                 },
@@ -1591,53 +1608,52 @@ impl Config {
                 .ignore_mounts
                 .or(self.defaults.ignore_mounts)
                 .unwrap_or(true);
-            let staging = match group
-                .staging
-                .as_deref()
-                .or(self.defaults.staging.as_deref())
-            {
+            let staging = match inherited(
+                group.staging.as_deref(),
+                self.defaults.staging.as_deref(),
+            ) {
                 None => StagingMode::default(),
-                Some(mode) => match parse_staging_mode(mode) {
+                Some((mode, mine)) => match parse_staging_mode(mode) {
                     Ok(mode) => mode,
                     Err(message) => {
-                        errors.push(format!("group '{name}': staging: {message}"));
+                        errors.push(blame(mine, "staging", &message));
                         StagingMode::default()
                     }
                 },
             };
-            let mut ownership = |value: Option<&str>, kind: &str| match value {
+            let mut ownership = |held: Option<(&str, bool)>, key: &str| match held {
                 None => None,
-                Some("") => {
-                    errors.push(format!("group '{name}' has an empty {kind}"));
+                Some(("", mine)) => {
+                    errors.push(blame(mine, key, &"cannot be empty"));
                     None
                 }
-                Some(spec) => Some(spec.to_owned()),
+                Some((spec, _)) => Some(spec.to_owned()),
             };
             let default_owner = ownership(
-                group
-                    .default_owner
-                    .as_deref()
-                    .or(self.defaults.default_owner.as_deref()),
+                inherited(
+                    group.default_owner.as_deref(),
+                    self.defaults.default_owner.as_deref(),
+                ),
                 "default_owner",
             );
             let default_group = ownership(
-                group
-                    .default_group
-                    .as_deref()
-                    .or(self.defaults.default_group.as_deref()),
+                inherited(
+                    group.default_group.as_deref(),
+                    self.defaults.default_group.as_deref(),
+                ),
                 "default_group",
             );
 
             for beta in &group.betas {
                 if beta.is_empty() {
-                    errors.push(format!("group '{name}' has an empty beta"));
+                    errors.push(format!("group '{name}': betas: one of them is empty"));
                     continue;
                 }
                 let target =
                     match parse_endpoint(beta, Some(&inherited_path), agent_command.clone()) {
                         Ok(target) => target,
                         Err(message) => {
-                            errors.push(format!("group '{name}' beta '{beta}': {message}"));
+                            errors.push(format!("group '{name}': betas: '{beta}': {message}"));
                             continue;
                         }
                     };
@@ -1647,7 +1663,7 @@ impl Config {
                     // alpha already.
                     if peering.is_some() {
                         errors.push(format!(
-                            "group '{name}' beta '{beta}': a peering mode needs every beta on \
+                            "group '{name}': betas: '{beta}': a peering mode needs every beta on \
                              another host"
                         ));
                         continue;
@@ -1656,7 +1672,7 @@ impl Config {
                     // and the trap that catches unexpanded `~user` forms.
                     if !path.is_absolute() {
                         errors.push(format!(
-                            "group '{name}' beta '{beta}' must be an absolute (or ~-relative) \
+                            "group '{name}': betas: '{beta}' must be an absolute (or ~-relative) \
                              local path"
                         ));
                         continue;
@@ -1838,55 +1854,35 @@ impl Config {
     }
 }
 
+/// A value and whether this group is where it was written.
+///
+/// Every session setting falls back to `[defaults]`, and a complaint
+/// about an inherited value belongs to the defaults: that is where it
+/// is written and where it would be fixed. Saying "group 'aws'" about
+/// a line in `[defaults]` sends a person to the wrong table, once for
+/// every group that inherits it.
+fn inherited<'a>(own: Option<&'a str>, shared: Option<&'a str>) -> Option<(&'a str, bool)> {
+    match own {
+        Some(value) => Some((value, true)),
+        None => shared.map(|value| (value, false)),
+    }
+}
+
 /// Says each fault once, however many groups ran into it.
 ///
-/// Every group is planned in turn, so a bad value in `[defaults]` is
-/// found once per group that inherits it, and the file came back
-/// saying the same sentence eight times with a different name in
-/// front. That is one fault. It was never eight, and a person reading
-/// eight of them has to work out that it was one.
-///
-/// A fault the defaults caused is reported alone: the groups it
-/// reaches are every group, and naming them adds nothing. A fault two
-/// groups happen to share is reported once and names them, because
-/// there the group is where somebody would go to fix it.
+/// Every group is planned in turn, so a value in `[defaults]` is read
+/// once per group that inherits it. Each of those now blames the
+/// defaults rather than the group ([`inherited`]), which makes the
+/// eight copies identical — and identical is what this removes. A
+/// fault that really is a group's own keeps its group, and stays.
 fn fold(errors: Vec<String>) -> Vec<String> {
-    let mut order: Vec<String> = Vec::new();
-    let mut groups: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut said: Vec<String> = Vec::new();
     for line in errors {
-        let (group, fault) = match line.strip_prefix("group '") {
-            Some(rest) => match rest.split_once("': ") {
-                Some((group, fault)) => (Some(group.to_owned()), fault.to_owned()),
-                None => (None, line.clone()),
-            },
-            None => (None, line.clone()),
-        };
-        if !order.contains(&fault) {
-            order.push(fault.clone());
-        }
-        let seen = groups.entry(fault).or_default();
-        if let Some(group) = group {
-            if !seen.contains(&group) {
-                seen.push(group);
-            }
+        if !said.contains(&line) {
+            said.push(line);
         }
     }
-    order
-        .into_iter()
-        .map(|fault| {
-            let named = groups.get(&fault).cloned().unwrap_or_default();
-            // Inherited: the defaults are where it is written and where
-            // it would be fixed, so the groups are not worth naming.
-            if fault.starts_with("the defaults' ") {
-                return fault;
-            }
-            match named.len() {
-                0 => fault,
-                1 => format!("group '{}': {fault}", named[0]),
-                _ => format!("groups {}: {fault}", named.join(", ")),
-            }
-        })
-        .collect()
+    said
 }
 
 /// Parses a symbolic link mode name.
@@ -2953,23 +2949,66 @@ mod tests {
         assert!(error.contains("max_file_size: invalid size"), "{error}");
     }
 
-    /// A fault two groups happen to share is still about those groups,
-    /// so it names them rather than pretending it came from above.
+    /// A fault a group wrote itself keeps its group; only the copies
+    /// an inherited value makes are identical, and those collapse.
     #[test]
-    fn a_fault_two_groups_share_names_them_once() {
+    fn a_groups_own_fault_keeps_its_group() {
         let folded = fold(vec![
-            "group 'a': mode: unknown mode 'sideways'".to_owned(),
-            "group 'b': mode: unknown mode 'sideways'".to_owned(),
-            "group 'c': has an empty alpha".to_owned(),
-            "the defaults' ignore_files: no ignore file named \"x\"".to_owned(),
+            "the defaults' mode: unknown mode 'sideways'".to_owned(),
+            "the defaults' mode: unknown mode 'sideways'".to_owned(),
+            "group 'c': mode: unknown mode 'elsewhere'".to_owned(),
         ]);
-        assert_eq!(folded.len(), 3, "{folded:?}");
-        assert_eq!(folded[0], "groups a, b: mode: unknown mode 'sideways'");
-        assert_eq!(folded[1], "group 'c': has an empty alpha");
-        assert_eq!(
-            folded[2],
-            "the defaults' ignore_files: no ignore file named \"x\""
+        assert_eq!(folded.len(), 2, "{folded:?}");
+        assert_eq!(folded[0], "the defaults' mode: unknown mode 'sideways'");
+        assert_eq!(folded[1], "group 'c': mode: unknown mode 'elsewhere'");
+    }
+
+    /// An inherited value is the defaults' to answer for, whichever
+    /// group happened to read it.
+    #[test]
+    fn an_inherited_fault_names_the_defaults_not_the_group() {
+        let error = format!(
+            "{:#}",
+            parse(
+                r#"
+                [defaults]
+                mode = "two-way-conflict"
+                symlink_mode = "sideways"
+
+                [groups.a]
+                alpha = "/tmp/a"
+                betas = ["/tmp/b"]
+
+                [groups.b]
+                alpha = "/tmp/c"
+                betas = ["/tmp/d"]
+                "#,
+            )
+            .plans()
+            .expect_err("a bad symlink mode is refused")
         );
+        assert!(error.contains("the defaults' symlink_mode:"), "{error}");
+        assert!(!error.contains("group 'a'"), "{error}");
+        assert_eq!(error.matches("unknown symlink mode").count(), 1, "{error}");
+
+        // And a group that writes its own bad value answers for it.
+        let its_own = format!(
+            "{:#}",
+            parse(
+                r#"
+                [defaults]
+                mode = "two-way-conflict"
+
+                [groups.a]
+                alpha = "/tmp/a"
+                betas = ["/tmp/b"]
+                symlink_mode = "sideways"
+                "#,
+            )
+            .plans()
+            .expect_err("a bad symlink mode is refused")
+        );
+        assert!(its_own.contains("group 'a': symlink_mode:"), "{its_own}");
     }
 
     #[test]
@@ -3278,10 +3317,10 @@ mod tests {
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(error.contains("unknown mode 'sideways'"), "{error}");
         assert!(error.contains("expected one of"), "{error}");
-        assert!(error.contains("'first' has no betas"), "{error}");
-        assert!(error.contains("'second' has an empty alpha"), "{error}");
+        assert!(error.contains("'first': betas: a group needs at least one"), "{error}");
+        assert!(error.contains("'second': alpha: cannot be empty"), "{error}");
         assert!(
-            error.contains("'second' has no mode and the defaults specify none"),
+            error.contains("'second': mode: none here, and the defaults specify none"),
             "{error}"
         );
     }
@@ -4139,7 +4178,7 @@ betas = ["build.example.com:/tmp/beta"]
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(
-            error.contains("alpha 'relative/alpha' must be an absolute"),
+            error.contains("alpha: 'relative/alpha' must be an absolute"),
             "{error}"
         );
         assert!(

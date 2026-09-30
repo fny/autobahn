@@ -2754,12 +2754,6 @@ impl Desk {
                                         .flex_wrap()
                                         .items_center()
                                         .gap(step(1.5))
-                                        .child(
-                                            div()
-                                                .text_size(px(10.5))
-                                                .text_color(rgb(FAINT))
-                                                .child(t("config.there_is")),
-                                        )
                                         .children(fault.instead.iter().map(|word| {
                                             let taken = word.clone();
                                             let at = at.clone();

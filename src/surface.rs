@@ -494,21 +494,14 @@ pub(crate) fn faults(refusal: &str) -> Vec<String> {
         _ => refusal.lines().skip(0),
     };
     for line in body {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // "group 'aws': the defaults' ignore_files: …" is the same
-        // fault as the one for 'fny'; what follows the prefix is not.
-        let fault = match line.strip_prefix("group '") {
-            Some(rest) => match rest.split_once("': ") {
-                Some((_, said)) => said.to_owned(),
-                None => line.to_owned(),
-            },
-            None => line.to_owned(),
-        };
-        if !seen.contains(&fault) {
-            seen.push(fault);
+        // Whole lines, kept whole. The loader blames the table a value
+        // was written in, so the copies an inherited value used to make
+        // are already identical — and the `group 'x': ` in front of a
+        // group's own fault is not noise to cut off, it is how
+        // `fault_at` knows whose field to put it under.
+        let line = line.trim().to_owned();
+        if !line.is_empty() && !seen.contains(&line) {
+            seen.push(line);
         }
     }
     seen
@@ -1182,16 +1175,9 @@ mod tests {
     /// the defaults are where somebody would go to fix it.
     #[test]
     fn one_bad_value_inherited_everywhere_is_one_fault() {
-        let every = ["aws", "fny", "gcloud"];
         let refusal = format!(
             "invalid configuration:\n{}",
-            every
-                .iter()
-                .map(|group| format!(
-                    "  group '{group}': the defaults' ignore_files: no ignore file \
-                     named \"asdfasdf\" in /Users/x/.autobahn/ignores"
-                ))
-                .collect::<Vec<String>>()
+            ["  the defaults' ignore_files: no ignore file named \"asdfasdf\" in /x"; 3]
                 .join("\n")
         );
         let one = faults(&refusal);
@@ -1199,10 +1185,15 @@ mod tests {
         assert!(one[0].starts_with("the defaults' ignore_files"), "{one:?}");
         assert_eq!(blamed(&refusal), Some(Section::Defaults));
 
-        // Two different faults stay two, and a group's own fault is
-        // blamed on the group.
-        let its_own = "invalid configuration:\n  group 'aws': invalid size 'asdf'\n                         group 'fny': no mode and the defaults specify none";
-        assert_eq!(faults(its_own).len(), 2);
+        // Two different faults stay two, and a group's own fault keeps
+        // the group in front of it — which is how it finds its field.
+        let its_own = "invalid configuration:\n  group 'aws': max_file_size: invalid size \
+                       'asdf'\n  group 'fny': mode: unknown mode 'sideways'";
+        let both = faults(its_own);
+        assert_eq!(both.len(), 2, "{both:?}");
+        let at = fault_at(&both[0]).expect("a group's own key");
+        assert_eq!(at.section, Section::Group("aws".to_owned()));
+        assert_eq!(at.key, "max_file_size");
         assert_eq!(blamed(its_own), Some(Section::Group("aws".to_owned())));
     }
 

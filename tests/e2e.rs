@@ -1269,6 +1269,15 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
     };
     assert_eq!(endpoint.ancestor_record(4, &[addition]).unwrap(), 4);
     assert_eq!(endpoint.peering_state().unwrap().generation, Some(4));
+    // The copy names who wrote it — the leader this channel was accepted
+    // as — which is what a host checks before it takes the copy up.
+    let session = autobahn::session::session_identifier(&root.to_string_lossy(), "peering-e2e");
+    assert_eq!(
+        autobahn::peering::copy_writer(&autobahn::peering::directory().unwrap(), &session)
+            .unwrap()
+            .as_deref(),
+        Some("alpha")
+    );
 
     // A fresh connection sees what the host holds: the copy survived.
     let mut again = connect();

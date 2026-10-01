@@ -73,7 +73,7 @@ On every cycle the leader keeps each peer able to lead:
 
 The last one is what makes a takeover clean. A leader without an ancestor reconciles two trees with no history and calls every difference a conflict. With the copy, the new leader continues the same three-way session the old one ran. The copy is written with the ancestor's own durability, never through the scan cache.
 
-A host that comes to lead a session takes up the copy when the copy was written after its own history, since that is the later agreement. It compares when each was written rather than generation numbers: a copy that lagged when a beta took over carries on from where it lagged, so after a handback it can be the later record at the lower number. Both are on the one host and stamped by its clock, so the times compare. Records are sent best effort, one per cycle; a copy that misses one is found out by the next, and brought level before any handoff.
+A host that comes to lead a session takes up the copy when the copy was written after its own history, since that is the later agreement. It compares when each was written rather than generation numbers: a copy that lagged when a beta took over carries on from where it lagged, so after a handback it can be the later record at the lower number. Both are on the one host and stamped by its clock, so the times compare. Before taking a copy up, the host checks who wrote it and what it says about the host's own files; see [Known security issues](#known-security-issues). Records are sent best effort, one per cycle; a copy that misses one is found out by the next, and brought level before any handoff.
 
 ### The takeover
 
@@ -131,7 +131,7 @@ In the usual setup this grants nothing new, because a leader already holds an SS
 
 **While a beta leads, it can change what the alpha syncs with it, and nothing else there.** When the alpha attaches, it serves the leader only its own peering sessions, as its own configuration has them: the root, ignores, modes, owners and staging are the alpha's, whatever the leader asks for, and the alpha takes no pushed files. A leader can change files inside those roots, as any beta can in a two-way mode, and nothing outside them.
 
-**A leader can send false ancestor history.** The replicated ancestor is taken as the record of the last agreed state. A dishonest leader can use it to steer later reconciliation into wrong changes inside the synced tree. This is the same boundary as a dishonest agent in any mode; see [Safety](./safety.md).
+**A leader's account of the history is checked, not proven.** The replicated ancestor is a leader's record of the last agreed state, and a leader can be wrong or lie. A host takes up a copy only from the member its session is with — the agent notes who wrote every copy — and sets aside every path where the copy records something other than what the host holds and the host's file has not changed since the copy was written: those paths are reconciled as new, so a disagreement is a conflict, never one side overwriting the other on the copy's word. What is left is a leader stating things that are true of the host's own tree, which is no more than it could do by changing its own files and letting the session carry the change, as any two-way peer can. See [Safety](./safety.md).
 
 ## What is not covered
 

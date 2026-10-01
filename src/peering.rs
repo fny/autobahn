@@ -507,7 +507,16 @@ pub fn ancestor_copy_path(directory: &Path, session: &str) -> Result<PathBuf> {
 pub(crate) struct AncestorCopy {
     store: AncestorStore,
     ancestor: Option<Node>,
+    /// The copy's directory, where the file naming its writer is.
+    directory: PathBuf,
+    /// Who last wrote the copy, as that file has it.
+    writer: Option<String>,
 }
+
+/// The file beside a session's ancestor copy naming the leader that wrote
+/// it last: its lease's name, or nothing for a channel that presented no
+/// lease.
+const WRITER_FILE: &str = "writer";
 
 impl AncestorCopy {
     /// Opens (or starts) the copy for `session` under `directory`.
@@ -519,7 +528,30 @@ impl AncestorCopy {
         }
         let (store, ancestor, _unresolved) = AncestorStore::open(&path)
             .with_context(|| format!("unable to open the ancestor copy at {}", path.display()))?;
-        Ok(AncestorCopy { store, ancestor })
+        let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let writer = std::fs::read_to_string(directory.join(WRITER_FILE)).ok();
+        Ok(AncestorCopy {
+            store,
+            ancestor,
+            directory,
+            writer,
+        })
+    }
+
+    /// Records who is writing the copy, before anything they send is
+    /// applied: the leader whose lease the channel was accepted at, or
+    /// nobody for one that presented none. A host takes up a copy only
+    /// from the member its session is with (`adopt_newer_copy`), so this is
+    /// what keeps a leader from writing history for a session it is not
+    /// part of.
+    pub(crate) fn written_by(&mut self, leader: Option<&str>) -> Result<()> {
+        let leader = leader.unwrap_or_default();
+        if self.writer.as_deref() == Some(leader) {
+            return Ok(());
+        }
+        write_file(&self.directory, WRITER_FILE, leader.as_bytes())?;
+        self.writer = Some(leader.to_owned());
+        Ok(())
     }
 
     /// The generation the copy stands at; zero for a copy that holds
@@ -893,6 +925,31 @@ mod tests {
         }
     }
 
+    /// Adopts `session`'s copy as written by `writer`, with this side
+    /// holding exactly what the copy records, so that only when it was
+    /// written, and by whom, decide.
+    fn adopt_as(state_root: &Path, session: &str, writer: Option<&str>) -> Adoption {
+        let directory = state_root.join(DIRECTORY);
+        let copy = ancestor_copy_path(&directory, session).unwrap();
+        if let Some(writer) = writer {
+            write_file(copy.parent().unwrap(), WRITER_FILE, writer.as_bytes()).unwrap();
+        }
+        adopt_newer_copy(
+            state_root,
+            &directory,
+            session,
+            "box:/x",
+            state_root,
+            || {
+                Ok(crate::tree::Snapshot {
+                    root: crate::session::ancestor::peek(&copy).unwrap().0,
+                    ..Default::default()
+                })
+            },
+        )
+        .unwrap()
+    }
+
     /// Adoption takes the copy when it was written after the session's own
     /// store — the later agreement — whatever the generations say, and
     /// reads either store journal and all. A copy that lagged when a beta
@@ -909,13 +966,19 @@ mod tests {
         std::fs::create_dir_all(own.parent().unwrap()).unwrap();
         std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
         let generation = |path: &Path| AncestorStore::stored_generation(path).unwrap();
+        let adopted = Adoption::Adopted {
+            set_aside: Vec::new(),
+        };
 
         // No copy: nothing to adopt. No history of its own: the copy is.
         journal_only(&own, 5);
-        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(
+            adopt_as(state_root, &session, Some("box:/x")),
+            Adoption::Kept
+        );
         AncestorStore::reset(&own).unwrap();
         journal_only(&copy, 3);
-        assert!(adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(adopt_as(state_root, &session, Some("box:/x")), adopted);
         assert_eq!(generation(&own), 3);
 
         // Its own, written later, is kept — journal-only, and ahead or not.
@@ -923,7 +986,10 @@ mod tests {
         journal_only(&own, 10);
         written_at(&copy, 60);
         written_at(&own, 30);
-        assert!(!adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(
+            adopt_as(state_root, &session, Some("box:/x")),
+            Adoption::Kept
+        );
         assert_eq!(generation(&own), 10);
 
         // The copy, written later, is adopted — even at a lower generation:
@@ -932,10 +998,126 @@ mod tests {
         journal_only(&copy, 9);
         written_at(&own, 60);
         written_at(&copy, 30);
-        assert!(adopt_newer_copy(state_root, &directory, &session).unwrap());
+        assert_eq!(adopt_as(state_root, &session, Some("box:/x")), adopted);
         assert_eq!(generation(&own), 9);
-        let (_, adopted, _) = AncestorStore::open(&own).unwrap();
-        assert_eq!(adopted.map(|tree| tree.children().len()), Some(9));
+        let (_, taken, _) = AncestorStore::open(&own).unwrap();
+        assert_eq!(taken.map(|tree| tree.children().len()), Some(9));
+    }
+
+    /// Only the member a session is with writes its copy here: one written
+    /// by another leader — planting history for a session it is not part
+    /// of — or through a channel that presented no lease is refused, and
+    /// this host's own history is left as it was. The member is known by
+    /// its host, whichever of its roots its lease names.
+    #[test]
+    fn a_copy_written_by_anyone_but_the_partner_is_refused() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let state_root = keep.path();
+        let session = crate::session::session_identifier("a", "b");
+        let copy = ancestor_copy_path(&state_root.join(DIRECTORY), &session).unwrap();
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        journal_only(&copy, 4);
+        let own = state_root.join("sessions").join(&session).join("ancestor");
+        for writer in [None, Some(""), Some("other:/x"), Some(ALPHA)] {
+            match adopt_as(state_root, &session, writer) {
+                Adoption::Refused(why) => assert!(why.contains("box:/x"), "{writer:?}: {why}"),
+                other => panic!("{writer:?}: {other:?}"),
+            }
+            assert!(!own.exists() && !own.with_file_name("ancestor.journal").exists());
+        }
+        assert!(matches!(
+            adopt_as(state_root, &session, Some("box:/srv/other-root")),
+            Adoption::Adopted { .. }
+        ));
+    }
+
+    /// A copy is checked against what this side holds. Where it records
+    /// something else and this side's file has not changed since the copy
+    /// was written, that path is set aside — forgotten, so the next cycle
+    /// reconciles it as new — while what agrees, and what changed here
+    /// since, is taken up as recorded.
+    #[test]
+    fn a_copy_that_disagrees_with_this_side_has_those_paths_set_aside() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let state_root = keep.path().join("state");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for (name, content) in [
+            ("agreed.txt", "agreed"),
+            ("claimed.txt", "as it is here"),
+            ("edited.txt", "before"),
+            ("only-here.txt", "new here"),
+        ] {
+            std::fs::write(root.join(name), content).unwrap();
+        }
+        std::fs::write(root.join("sub/kept.txt"), "kept").unwrap();
+        let file = |name: &str, content: &str| Node {
+            name: name.into(),
+            content: crate::tree::Content::File {
+                digest: *blake3::hash(content.as_bytes()).as_bytes(),
+                executable: false,
+                metadata: Default::default(),
+            },
+        };
+        // The copy's account: one file as it is, one as it is not, one as
+        // it was before an edit made after the copy, and one that is not
+        // here at all.
+        let history = Node::directory(
+            "",
+            vec![
+                file("agreed.txt", "agreed"),
+                file("claimed.txt", "something this side never held"),
+                file("edited.txt", "before"),
+                file("gone.txt", "never here either"),
+                Node::directory("sub", vec![file("kept.txt", "kept")]),
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(2100));
+        let session = crate::session::session_identifier("a", "b");
+        let directory = state_root.join(DIRECTORY);
+        let copy = ancestor_copy_path(&directory, &session).unwrap();
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        let (mut store, _, _) = AncestorStore::open(&copy).unwrap();
+        store.checkpoint_at(7, Some(&history)).unwrap();
+        drop(store);
+        write_file(copy.parent().unwrap(), WRITER_FILE, b"box:/x").unwrap();
+        std::fs::write(root.join("edited.txt"), "after the copy").unwrap();
+
+        let scan = || {
+            crate::scan::scan(
+                &root,
+                None,
+                &crate::scan::IgnoreSet::default(),
+                &crate::scan::FilesystemBehavior::default(),
+                crate::scan::SymlinkMode::default(),
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
+        };
+        let adoption =
+            adopt_newer_copy(&state_root, &directory, &session, "box:/x", &root, scan).unwrap();
+        assert_eq!(
+            adoption,
+            Adoption::Adopted {
+                set_aside: vec![
+                    "claimed.txt".into(),
+                    "gone.txt".into(),
+                    "only-here.txt".into()
+                ],
+            }
+        );
+        let own = state_root.join("sessions").join(&session).join("ancestor");
+        let (_, taken, _) = AncestorStore::open(&own).unwrap();
+        let taken = taken.expect("adopted");
+        let names: Vec<&str> = taken
+            .children()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert_eq!(names, ["agreed.txt", "edited.txt", "sub"]);
     }
 }
 
@@ -1347,11 +1529,23 @@ pub fn destination_of(leader: &str) -> &str {
         .unwrap_or(leader)
 }
 
+/// What became of a session's ancestor copy when the session started.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Adoption {
+    /// No copy, or none newer than this host's own history: nothing to do.
+    Kept,
+    /// The copy was taken up. The paths listed were set aside: the copy
+    /// records them differently from what this host holds, and this host's
+    /// files there have not changed since the copy was written.
+    Adopted { set_aside: Vec<String> },
+    /// The copy was not taken up, and why.
+    Refused(String),
+}
+
 /// Brings a session's ancestor level with the copy a leader pushed here,
-/// when the copy is newer: the session directory's store is replaced by
-/// the copy's files. A beta that starts to lead seeds its sessions this
-/// way; an alpha that gets the lead back adopts what the beta recorded
-/// meanwhile. Returns whether anything was adopted.
+/// when the copy is newer and can be trusted as far as this host can tell.
+/// A beta that starts to lead seeds its sessions this way; an alpha that
+/// gets the lead back adopts what the beta recorded meanwhile.
 ///
 /// Newer means written later, not a higher generation. Each store records
 /// the last state its session agreed on, and the later agreement is the
@@ -1364,28 +1558,189 @@ pub fn destination_of(leader: &str) -> &str {
 /// supervisor — so one clock stamped both. A copy with no history is never
 /// adopted, and its history is read journal and all: a store may be a
 /// checkpoint, a journal, or both.
-pub fn adopt_newer_copy(state_root: &Path, directory: &Path, session: &str) -> Result<bool> {
+///
+/// Then two checks, since a copy is a leader's account of what was agreed
+/// and a leader can be wrong, or lie:
+///
+/// - **Who wrote it.** Only the member the session is with, `partner`,
+///   writes its copy on this host; the agent notes the writer of every
+///   copy from the channel's lease. One written by anyone else is refused:
+///   a leader could otherwise plant history for a session it is not part
+///   of, and have this host's stale files overwrite the other side's.
+/// - **What it says about this host.** A history is agreed by both sides,
+///   so where it records something other than what this host holds, this
+///   host's file must have changed since the copy was written — told by
+///   the file's change time, or its directory's for one that is gone, on
+///   the clock that stamped the copy. Where it has not, the copy is no
+///   record of anything this host agreed to, and that path is set aside:
+///   forgotten, so the next cycle reconciles it as new — a conflict if the
+///   two sides differ, never one side overwriting the other on the word of
+///   the copy. `scan_own` scans this host's side, at `root`, when a copy
+///   is to be taken up.
+///
+/// What is left is a partner stating things true of this host's own tree:
+/// no more than it could do by changing its own side and letting the
+/// session carry the change, which any two-way peer can.
+pub fn adopt_newer_copy(
+    state_root: &Path,
+    directory: &Path,
+    session: &str,
+    partner: &str,
+    root: &Path,
+    scan_own: impl FnOnce() -> Result<crate::tree::Snapshot>,
+) -> Result<Adoption> {
     let copy = ancestor_copy_path(directory, session)?;
     if AncestorStore::stored_generation(&copy)? == 0 {
-        return Ok(false);
+        return Ok(Adoption::Kept);
     }
     let own = state_root.join("sessions").join(session).join("ancestor");
+    let copied_at = AncestorStore::last_written(&copy)?;
     let newer = AncestorStore::stored_generation(&own)? == 0
-        || match (
-            AncestorStore::last_written(&copy)?,
-            AncestorStore::last_written(&own)?,
-        ) {
+        || match (copied_at, AncestorStore::last_written(&own)?) {
             (Some(copied), Some(held)) => copied > held,
             (_, None) => true,
             (None, Some(_)) => false,
         };
     if !newer {
-        return Ok(false);
+        return Ok(Adoption::Kept);
+    }
+    let writer = copy_writer(directory, session)?;
+    if writer.as_deref().map(destination_of) != Some(destination_of(partner)) {
+        return Ok(Adoption::Refused(format!(
+            "it was written by {}, not by {partner}, the member this session is with",
+            match writer.as_deref() {
+                None | Some("") => "a controller that presented no lease".to_owned(),
+                Some(writer) => writer.to_owned(),
+            }
+        )));
+    }
+    let (history, _) = crate::session::ancestor::peek(&copy)?;
+    let local = scan_own().context("unable to scan this side to check the ancestor copy")?;
+    let since = copied_at.unwrap_or(UNIX_EPOCH);
+    let mut set_aside = Vec::new();
+    disagreements(
+        history.as_ref(),
+        local.root.as_ref(),
+        &mut Vec::new(),
+        &mut set_aside,
+    );
+    set_aside.retain(|path| !changed_since(root, path, since));
+    if set_aside.iter().any(String::is_empty) {
+        return Ok(Adoption::Refused(
+            "it records this side's root as something other than what it is, and the root has \
+             not changed since"
+                .to_owned(),
+        ));
     }
     if let Some(parent) = own.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
     }
     AncestorStore::copy_store(&copy, &own)?;
-    Ok(true)
+    if !set_aside.is_empty() {
+        let (mut store, adopted, _) = AncestorStore::open(&own)?;
+        store.forget(adopted.as_ref(), &set_aside)?;
+    }
+    Ok(Adoption::Adopted { set_aside })
+}
+
+/// Who last wrote a session's ancestor copy on this host, if anyone was
+/// recorded: a leader's lease name, or empty for a channel with no lease.
+pub fn copy_writer(directory: &Path, session: &str) -> Result<Option<String>> {
+    let copy = ancestor_copy_path(directory, session)?;
+    let path = copy
+        .parent()
+        .map(|parent| parent.join(WRITER_FILE))
+        .unwrap_or_default();
+    match std::fs::read_to_string(&path) {
+        Ok(writer) => Ok(Some(writer)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("unable to read {}", path.display())),
+    }
+}
+
+/// Collects the paths where a history and this host's tree disagree about
+/// synchronized content: a different file, link or kind of entry, or an
+/// entry one has and the other lacks. What this host does not synchronize
+/// here — ignored, too large, unreadable — is no disagreement: the history
+/// may hold it from before, and says nothing this host can check.
+fn disagreements<'a>(
+    history: Option<&'a Node>,
+    local: Option<&'a Node>,
+    path: &mut Vec<&'a str>,
+    found: &mut Vec<String>,
+) {
+    use crate::tree::Content;
+    if let Some(Content::Untracked | Content::Problematic { .. }) = local.map(|node| &node.content)
+    {
+        return;
+    }
+    let agree = match (
+        history.map(|node| &node.content),
+        local.map(|node| &node.content),
+    ) {
+        (None, None) => true,
+        (Some(Content::Directory(recorded)), Some(Content::Directory(held))) => {
+            let names: std::collections::BTreeSet<&str> = recorded
+                .iter()
+                .chain(held.iter())
+                .map(|child| child.name.as_str())
+                .collect();
+            for name in names {
+                path.push(name);
+                disagreements(
+                    recorded.iter().find(|child| child.name == name),
+                    held.iter().find(|child| child.name == name),
+                    path,
+                    found,
+                );
+                path.pop();
+            }
+            true
+        }
+        (
+            Some(Content::File {
+                digest: recorded,
+                executable: recorded_executable,
+                ..
+            }),
+            Some(Content::File {
+                digest: held,
+                executable: held_executable,
+                ..
+            }),
+        ) => recorded == held && recorded_executable == held_executable,
+        (Some(Content::Symlink { target: recorded }), Some(Content::Symlink { target: held })) => {
+            recorded == held
+        }
+        _ => false,
+    };
+    if !agree {
+        found.push(path.join("/"));
+    }
+}
+
+/// Whether this host's entry at `path` under `root` changed at or after
+/// `since`, by its change time — which nothing sets back, unlike a
+/// modification time — or, for an entry that is gone, its nearest
+/// directory's, which a removal or rename moves. A second's slack covers
+/// timestamp granularity; a copy written within it of a change is taken to
+/// know of the change.
+fn changed_since(root: &Path, path: &str, since: SystemTime) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let slack = Duration::from_secs(1);
+    let mut probe = root.join(path);
+    loop {
+        if let Ok(metadata) = std::fs::symlink_metadata(&probe) {
+            let changed = UNIX_EPOCH
+                + Duration::new(
+                    metadata.ctime().max(0) as u64,
+                    metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
+                );
+            return changed + slack >= since;
+        }
+        if probe == root || !probe.pop() {
+            return false;
+        }
+    }
 }

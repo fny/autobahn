@@ -996,13 +996,19 @@ fn serve_channel<W: Write + Send>(
                 generation,
                 changes,
             } => open_copy(&peering_directory, &initialize.session, &mut copy)
-                .and_then(|copy| copy.record(generation, &changes))
+                .and_then(|copy| {
+                    copy.written_by(accepted.as_ref().map(|lease| lease.leader.as_str()))?;
+                    copy.record(generation, &changes)
+                })
                 .map(|generation| Response::Recorded { generation }),
             Request::AncestorCheckpoint {
                 generation,
                 ancestor,
             } => open_copy(&peering_directory, &initialize.session, &mut copy)
-                .and_then(|copy| copy.checkpoint(generation, ancestor))
+                .and_then(|copy| {
+                    copy.written_by(accepted.as_ref().map(|lease| lease.leader.as_str()))?;
+                    copy.checkpoint(generation, ancestor)
+                })
                 .map(|generation| Response::Recorded { generation }),
             // An attached alpha has a configuration of its own, and a
             // genuine leader never pushes it one: a pushed `name` there

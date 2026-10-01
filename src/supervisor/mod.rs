@@ -2338,24 +2338,66 @@ fn connect(
     // with a remote agent — endpoint construction is expensive, can block
     // on the network, and has remote side effects.
     let lock = SessionLock::acquire(state_directory.clone())?;
-    // Peering: a copy of this session's ancestor that a leader pushed here
-    // and that is newer than what this directory holds is adopted — under
-    // the lock, before the store is opened. A beta that starts to lead
-    // seeds its session this way; an alpha that gets the lead back takes
-    // up what the beta recorded meanwhile.
-    if let (Some(directory), Some(_)) = (peering_directory, plan.peering) {
-        if crate::peering::adopt_newer_copy(state_root, directory, &identifier)? {
-            crate::note!(
-                "[{}] adopted the ancestor copy a leader pushed",
-                plan.display()
-            );
-        }
-    }
     // The pair lock is independent of the state root, so two supervisors
     // pointed at different state directories cannot own the same trees.
     let pair_lock =
         crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
-    let (alpha, beta) = open_session_endpoints(plan, state_root, pool, one_shot)?;
+    let (mut alpha, mut beta) = open_session_endpoints(plan, state_root, pool, one_shot)?;
+    // Peering: a copy of this session's ancestor that a leader pushed here
+    // and that is newer than what this directory holds is adopted — under
+    // the lock, before the store is opened. A beta that starts to lead
+    // seeds its session this way; an alpha that gets the lead back takes
+    // up what the beta recorded meanwhile. The copy is checked against
+    // this side first, scanned through the endpoint the session is about
+    // to use, so the scan is the session's first one too.
+    if let (Some(directory), Some(_)) = (peering_directory, plan.peering) {
+        let (partner, root, own): (String, _, &mut Box<dyn Endpoint + Send>) =
+            match (&plan.alpha, &plan.beta) {
+                (_, EndpointTarget::Local(root)) => {
+                    (crate::peering::ALPHA.to_owned(), root.clone(), &mut beta)
+                }
+                (EndpointTarget::Local(root), _) => (plan.beta_spec(), root.clone(), &mut alpha),
+                _ => anyhow::bail!("a peering session has a side on this host"),
+            };
+        let adopted = crate::peering::adopt_newer_copy(
+            state_root,
+            directory,
+            &identifier,
+            &partner,
+            &root,
+            || own.scan(),
+        )?;
+        match adopted {
+            crate::peering::Adoption::Kept => {}
+            crate::peering::Adoption::Adopted { set_aside } if set_aside.is_empty() => {
+                crate::note!(
+                    "[{}] adopted the ancestor copy a leader pushed",
+                    plan.display()
+                );
+            }
+            crate::peering::Adoption::Adopted { set_aside } => crate::complain!(
+                "[{}] adopted the ancestor copy a leader pushed, setting aside {} path(s) it \
+                 records unlike this side, which has not changed there since: {}{}; the next \
+                 cycle reconciles them as new",
+                plan.display(),
+                set_aside.len(),
+                set_aside
+                    .iter()
+                    .take(5)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match set_aside.len() > 5 {
+                    true => ", …",
+                    false => "",
+                }
+            ),
+            crate::peering::Adoption::Refused(why) => crate::complain!(
+                "[{}] not taking up the ancestor copy a leader pushed: {why}",
+                plan.display()
+            ),
+        }
+    }
     let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);

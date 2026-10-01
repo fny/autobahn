@@ -753,6 +753,11 @@ impl Render for Desk {
                     })
                     .child(self.footer()),
             )
+            // A dialog is drawn by whoever renders this layer, and
+            // `Root` is not that whoever: it holds the active dialogs
+            // and leaves putting them on the screen to the view. Open
+            // one without this and nothing happens, visibly or at all.
+            .children(Root::render_dialog_layer(window, cx))
     }
 }
 

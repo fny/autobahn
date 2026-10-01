@@ -77,8 +77,8 @@ reveal_folder = "Show the folder"
 # How much of itself the app shows.
 [presence]
 both = "Both"
-window = "Window"
-menubar = "Menu bar"
+window = "App"
+menubar = "Menu Bar"
 at_next_launch = "kept; the menu bar item follows at the next launch"
 unwritable = "could not write the preference: {error}"
 
@@ -165,13 +165,12 @@ advanced_peering = "peering · dangerously experimental"
 
 # Adding, renaming and removing a group.
 [group]
-add = "New group"
-rename = "Rename"
-remove = "Remove"
+add = "+ New group"
+sure = "remove?"
+yes = "yes"
 name_it = "a name for the group"
 make = "Make it"
 cancel = "Cancel"
-removing = "Remove the group {name}? Its state stays until `autobahn clean` takes it."
 removed = "{name} is out of the file; run `autobahn clean` to take its state too"
 made = "{name} is in the file — give it an alpha and a beta, then save"
 renamed = "{name} it is"
@@ -235,7 +234,7 @@ word_chosen = "{about}\n\nClick again to take the key out of the file, so it is 
 
 # The menu bar item: the same fleet, said in a menu.
 [menu]
-open_window = "Open the window"
+open_window = "Open the app"
 service_start = "Start service"
 service_stop = "Stop service"
 service_restart = "Restart service"

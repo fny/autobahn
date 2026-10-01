@@ -186,12 +186,12 @@ jobs:
         # Every build happens before the certificate exists: a dependency's
         # build script or proc macro that runs while the identity is usable
         # could sign anything as us. Nothing after the import compiles.
-        run: apps/macos/build.sh --unsigned
+        run: apps/tray/build.sh --unsigned
       - name: The app must report the tag's version
         # build.sh writes both keys from Cargo.toml, which the version job
         # has already matched to the tag; this checks what actually ships.
         run: |
-          plist=apps/macos/Autobahn.app/Contents/Info.plist
+          plist=apps/tray/Autobahn.app/Contents/Info.plist
           for key in CFBundleShortVersionString CFBundleVersion; do
             value=$(/usr/libexec/PlistBuddy -c "Print :$key" "$plist")
             if [ "$value" != "${GITHUB_REF_NAME#v}" ]; then
@@ -231,7 +231,7 @@ jobs:
           AUTOBAHN_NOTARY_KEY: ${{ runner.temp }}/notary.p8
           AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           AUTOBAHN_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
-        run: apps/macos/notarize-cli.sh autobahn-darwin-aarch64 autobahn-darwin-x86_64
+        run: apps/tray/notarize-cli.sh autobahn-darwin-aarch64 autobahn-darwin-x86_64
       - name: Sign, notarise and staple the app
         # --sign-only compiles nothing: it signs the bundle built above.
         env:
@@ -239,7 +239,7 @@ jobs:
           AUTOBAHN_NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
           AUTOBAHN_NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER_ID }}
           AUTOBAHN_RELEASE_ZIP: Autobahn-macos-aarch64.zip
-        run: apps/macos/release.sh --sign-only apps/macos/Autobahn.app
+        run: apps/tray/release.sh --sign-only apps/tray/Autobahn.app
       - name: Remove the credentials
         # Whether the build passed or failed. The runner is discarded after
         # the job anyway; this is so nothing outlives the step that needed it.

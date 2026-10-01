@@ -10,7 +10,7 @@
 # It wraps the same binary the terminal runs: the app is a way to launch
 # `autobahn tray`, not a second implementation of it.
 #
-#   apps/macos/build.sh [--unsigned] [path/to/Autobahn.app]
+#   apps/tray/build.sh [--unsigned] [path/to/Autobahn.app]
 #
 # --unsigned stops at the assembled bundle, touching no keychain: the
 # release builds that way before its certificate exists, so no build
@@ -27,8 +27,8 @@ case "${1:-}" in -*) usage ;; esac
 APP="${1:-}"
 if [ -n "$APP" ] && [[ "$APP" != /* ]]; then APP="$PWD/$APP"; fi
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-source apps/macos/plist.sh
-APP="${APP:-apps/macos/Autobahn.app}"
+source apps/tray/plist.sh
+APP="${APP:-apps/tray/Autobahn.app}"
 # The version the app reports is Cargo.toml's, read before the build so a
 # manifest without one costs a second rather than a compile.
 VERSION=$(crate_version Cargo.toml)
@@ -66,7 +66,7 @@ else
     cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
     ICON_NAME=autobahn
 fi
-render_info_plist apps/macos/Info.plist "$APP/Contents/Info.plist" "$VERSION" "$ICON_NAME"
+render_info_plist apps/tray/Info.plist "$APP/Contents/Info.plist" "$VERSION" "$ICON_NAME"
 # macOS tags a copied executable with com.apple.provenance, and codesign
 # refuses a bundle carrying one — with errSecInternalComponent, which
 # says nothing about attributes and sends you looking at the key instead.
@@ -75,7 +75,7 @@ render_info_plist apps/macos/Info.plist "$APP/Contents/Info.plist" "$VERSION" "$
 xattr -cr "$APP"
 if [ "$SIGN" = no ]; then
     echo "built $APP, unsigned"
-    echo "  apps/macos/release.sh --sign-only $APP    # sign, notarise and staple it"
+    echo "  apps/tray/release.sh --sign-only $APP    # sign, notarise and staple it"
     exit 0
 fi
 # Signed with the best identity in the keychain. An unsigned bundle is

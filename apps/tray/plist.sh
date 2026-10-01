@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # Sourced by build.sh: the version the app claims, and the Info.plist that
-# claims it. Plain shell and sed, no Apple tools, so apps/macos/test.sh
+# claims it. Plain shell and sed, no Apple tools, so apps/tray/test.sh
 # can check both on any machine.
 
 # Prints the [package] version from the Cargo.toml given. Only that table's:

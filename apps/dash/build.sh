@@ -6,8 +6,8 @@
 # that only ever arrives by scp or by autobahn itself, neither of which
 # quarantines anything. A downloaded copy would be refused, and should be.
 #
-#   apps/personal/build.sh            # builds "Autobahn Dash.app"
-#   open "apps/personal/Autobahn Dash.app"
+#   apps/dash/build.sh            # builds "Autobahn Dash.app"
+#   open "apps/dash/Autobahn Dash.app"
 #
 # The binary goes to target/dash, never target/release: the login service
 # runs the latter through a symlink, and a personal build must not replace
@@ -16,7 +16,7 @@ set -eu
 cd "$(dirname "$0")/../.."
 
 TARGET="${AUTOBAHN_DASH_TARGET:-target/dash}"
-APP="apps/personal/Autobahn Dash.app"
+APP="apps/dash/Autobahn Dash.app"
 
 # GPUI Kit wants a newer compiler than the repository's default.
 cargo +1.98.0 build --release --features dash --target-dir "$TARGET" --bin autobahn-dash

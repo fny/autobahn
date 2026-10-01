@@ -57,7 +57,7 @@ tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2"
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
 # The dash: a window over the fleet, personal and unshipped. Its own
-# binary, autobahn-dash, bundled by apps/personal/build.sh.
+# binary, autobahn-dash, bundled by apps/dash/build.sh.
 dash = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 
 [dev-dependencies]

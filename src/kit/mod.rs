@@ -2302,6 +2302,56 @@ impl Desk {
                         ),
                 ),
             )
+            // The things that are about the whole state root rather
+            // than any one group.
+            .child(
+                self.block(t("service.housekeeping"))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(step(1.5))
+                            .child(
+                                Button::new("flush-all")
+                                    .small()
+                                    .outline()
+                                    .label(t("service.flush_all"))
+                                    .tooltip(t("tip.flush_all"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.everything(Verb::Flush);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("verify-all")
+                                    .small()
+                                    .outline()
+                                    .label(t("service.verify_all"))
+                                    .tooltip(t("tip.verify_all"))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.everything(Verb::Verify);
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Button::new("clean")
+                                    .small()
+                                    .outline()
+                                    .label(t("service.clean"))
+                                    .tooltip(t("tip.clean"))
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.ask_clean(window, cx);
+                                    })),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .max_w(px(620.))
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(t("service.housekeeping_about")),
+                    ),
+            )
             // Which build this is, and how to stop it being this one.
             .child(
                 self.block(t("service.version"))
@@ -2320,6 +2370,13 @@ impl Desk {
                             )),
                     )
                     .child(
+                        div()
+                            .max_w(px(620.))
+                            .text_size(px(11.))
+                            .text_color(rgb(FAINT))
+                            .child(t("service.update_about")),
+                    )
+                    .child(
                         div().flex().child(
                             Button::new("update")
                                 .small()
@@ -2334,6 +2391,76 @@ impl Desk {
                     ),
             )
             .into_any_element()
+    }
+
+    /// Wakes or re-reads every session, rather than one.
+    fn everything(&mut self, verb: Verb) {
+        let request = match verb {
+            Verb::Flush => crate::supervisor::control::ControlRequest::Flush(
+                crate::supervisor::control::Selector::default(),
+            ),
+            Verb::Verify => crate::supervisor::control::ControlRequest::Verify(
+                crate::supervisor::control::Selector::default(),
+            ),
+            // Pause and Resume are a session's, not the fleet's.
+            _ => return,
+        };
+        self.said = Some(
+            match crate::supervisor::control::send(&self.state_root, &request) {
+                Ok(_) => fill("service.asked_everything", &[("done", verb.done())]),
+                Err(error) => format!("{error:#}"),
+            },
+        );
+        self.read_at = None;
+    }
+
+    /// Asks before taking state away, and says what it will not touch.
+    fn ask_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let desk = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let desk = desk.clone();
+            alert
+                .title(t("service.clean_title"))
+                .description(t("service.cleaning"))
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text(t("service.clean")),
+                )
+                .on_ok(move |_, _, cx| {
+                    if let Some(desk) = desk.upgrade() {
+                        desk.update(cx, |desk, cx| {
+                            desk.clean(cx);
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+        });
+        cx.notify();
+    }
+
+    /// Removes the state of sessions the configuration no longer names.
+    ///
+    /// The command's own, not a second implementation of it: walking a
+    /// state root and deciding what is nobody's is three hundred lines
+    /// that already exist and are already tested.
+    fn clean(&mut self, cx: &mut Context<Self>) {
+        self.said = Some(t("service.cleaning_now").to_owned());
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move { surface::ran(&["clean", "--yes"], config.as_deref()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.said = Some(done);
+                this.read_at = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// One titled block of the service pane.

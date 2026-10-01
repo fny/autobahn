@@ -1039,8 +1039,58 @@ pub(crate) fn reveal(file: &std::path::Path) -> String {
     }
 }
 
+/// The `autobahn` command, for the things a window asks it to do.
+///
+/// Not `current_exe`, which is what this used to be: the kit window is
+/// its own binary, so every `resolve` and `diff` it ran was handed to
+/// `autobahn-desk-kit`, which answered "unknown argument resolve" and
+/// looked like a button that did nothing. The command is looked for
+/// beside this executable first — a bundle, a target directory, a
+/// `~/.local/bin` all put the two together — and then left to PATH.
 pub(crate) fn exe() -> PathBuf {
-    std::env::current_exe().unwrap_or_else(|_| PathBuf::from("autobahn"))
+    let here = std::env::current_exe().ok();
+    if let Some(here) = &here {
+        if here.file_name().is_some_and(|name| name == "autobahn") {
+            return here.clone();
+        }
+        if let Some(beside) = here.parent().map(|folder| folder.join("autobahn")) {
+            if beside.is_file() {
+                return beside;
+            }
+        }
+    }
+    PathBuf::from("autobahn")
+}
+
+/// Runs one of the command's own subcommands and says what it said.
+///
+/// The window does the small things itself, through the library; the
+/// large ones — a clean that walks the state root, a resolve that moves
+/// files — are the command's, and asking it is how they stay one
+/// implementation rather than two.
+pub(crate) fn ran(arguments: &[&str], config: Option<&std::path::Path>) -> String {
+    let mut command = std::process::Command::new(exe());
+    command.args(arguments);
+    if let Some(path) = config {
+        command.arg("--config").arg(path);
+    }
+    match command.output() {
+        Ok(done) if done.status.success() => {
+            let said = String::from_utf8_lossy(&done.stdout);
+            match said.trim().lines().last() {
+                Some(line) if !line.trim().is_empty() => line.trim().to_owned(),
+                _ => fill("status.ran", &[("command", &arguments.join(" "))]),
+            }
+        }
+        Ok(done) => {
+            let complained = String::from_utf8_lossy(&done.stderr);
+            first_line(complained.trim())
+        }
+        Err(error) => fill(
+            "status.unreachable_command",
+            &[("error", &error.to_string())],
+        ),
+    }
 }
 
 /// How much a state needs a person, in the order the fleet sorts by.

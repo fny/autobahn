@@ -2344,13 +2344,12 @@ impl Desk {
                                     })),
                             ),
                     )
-                    .child(
-                        div()
-                            .max_w(px(620.))
-                            .text_size(px(11.))
-                            .text_color(rgb(FAINT))
-                            .child(t("service.housekeeping_about")),
-                    ),
+                    // What each of the three does, because none of them
+                    // says so by its name and two of them do nothing at
+                    // all without a supervisor to hear them.
+                    .child(self.note(t("service.flush_all"), t("service.flush_about")))
+                    .child(self.note(t("service.verify_all"), t("service.verify_about")))
+                    .child(self.note(t("service.clean"), t("service.clean_about"))),
             )
             // Which build this is, and how to stop it being this one.
             .child(
@@ -2461,6 +2460,26 @@ impl Desk {
             .ok();
         })
         .detach();
+    }
+
+    /// One action explained: its name, and what pressing it does.
+    fn note(&self, name: &'static str, words: &'static str) -> Div {
+        div()
+            .flex()
+            // The name belongs beside the first line of what it says,
+            // not beside the middle of it.
+            .items_start()
+            .gap(step(2.5))
+            .max_w(px(700.))
+            .text_size(px(11.))
+            .child(
+                div()
+                    .w(px(112.))
+                    .flex_shrink_0()
+                    .text_color(rgb(DIM))
+                    .child(name),
+            )
+            .child(div().min_w(px(0.)).text_color(rgb(FAINT)).child(words))
     }
 
     /// One titled block of the service pane.

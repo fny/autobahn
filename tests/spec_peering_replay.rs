@@ -761,7 +761,7 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
     let cfg = format!(
         "SPECIFICATION TSpec\nCONSTANTS\n{}    v1 = v1\n    v2 = v2\n    Betas = {{{}}}\n    Order <- TOrder\n    Paths <- TPaths\n    \
          Values = {{v1, v2}}\n    NoFile = NoFile\n    Dir = Dir\n    Mode = \"{mode_name}\"\n    MaxEdits = {}\n    MaxFailures = {}\n    \
-         MaxChanges = {}\n    Flaky = TRUE\nCHECK_DEADLOCK TRUE\n",
+         MaxChanges = {}\n    Flaky = TRUE\n    Lies = FALSE\n    MaxLies = 0\nCHECK_DEADLOCK TRUE\n",
         betas.iter().map(|b| format!("    {b} = {b}\n")).collect::<String>(),
         betas.join(", "),
         game.edits,

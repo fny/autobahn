@@ -295,6 +295,12 @@ struct Passing {
     running: std::collections::BTreeSet<String>,
     /// The sessions that have handed the handoff's lease on.
     handed: std::collections::BTreeSet<String>,
+    /// Of the running sessions, those with the attached alpha; and those
+    /// that have finished a cycle with it while this supervisor led. The
+    /// lead goes back to the alpha only once every one has, so that each of
+    /// the alpha's groups is level with it before it leads them again.
+    attached: std::collections::BTreeSet<String>,
+    cycled: std::collections::BTreeSet<String>,
 }
 
 impl PeeringShared {
@@ -387,13 +393,29 @@ impl PeeringShared {
     }
 
     /// A peering session started running, or stopped: paused, or ended.
-    fn set_running(&self, session: &str, running: bool) {
+    fn set_running(&self, session: &str, running: bool, attached: bool) {
         let mut passing = self.passing();
         match running {
             true => passing.running.insert(session.to_owned()),
             false => passing.running.remove(session),
         };
+        match (running, attached) {
+            (true, true) => passing.attached.insert(session.to_owned()),
+            _ => passing.attached.remove(session),
+        };
         self.follow_once_passed(&mut passing);
+    }
+
+    /// A session with the attached alpha finished a cycle with it.
+    fn cycled_with_alpha(&self, session: &str) {
+        self.passing().cycled.insert(session.to_owned());
+    }
+
+    /// Whether every running session with the attached alpha has finished
+    /// a cycle with it.
+    fn every_attached_session_cycled(&self) -> bool {
+        let passing = self.passing();
+        passing.attached.is_subset(&passing.cycled)
     }
 
     /// Completes the handoff once every running session has passed it on:
@@ -593,6 +615,8 @@ impl PeeringContext {
 struct PassingPlace {
     shared: Option<Arc<PeeringShared>>,
     session: String,
+    /// Whether the session is with the attached alpha.
+    attached: bool,
 }
 
 impl PassingPlace {
@@ -603,6 +627,11 @@ impl PassingPlace {
                 _ => None,
             },
             session: plan.identifier(),
+            attached: matches!(
+                &plan.alpha,
+                EndpointTarget::Remote { destination, .. }
+                    if crate::peering::attached_name(destination).is_some()
+            ),
         };
         place.set(true);
         place
@@ -610,7 +639,7 @@ impl PassingPlace {
 
     fn set(&self, running: bool) {
         if let Some(shared) = &self.shared {
-            shared.set_running(&self.session, running);
+            shared.set_running(&self.session, running, self.attached);
         }
     }
 }
@@ -1868,8 +1897,16 @@ impl<'a> Worker<'a> {
         // up. A copy that cannot be brought level waits for the next
         // settled cycle.
         if let (Ok((_, report)), Some(peering)) = (&result, self.peering) {
+            if self.peer_side() == crate::peering::PeerSide::Alpha {
+                peering.shared.cycled_with_alpha(&self.plan.identifier());
+            }
+            // And not before every other group with the alpha has had a
+            // cycle with it too: the first of them to settle would
+            // otherwise hand the lead back while the rest were still
+            // waiting out a retry, unsynced with the alpha until it led.
             if self.peer_side() == crate::peering::PeerSide::Alpha
                 && report.settled()
+                && peering.shared.every_attached_session_cycled()
                 && matches!(peering.role(), crate::peering::Role::Leader { .. })
             {
                 let level = self
@@ -2597,22 +2634,25 @@ fn open_session_endpoints(
                 // waiting means the peer has not dialed in, which is the
                 // ordinary unreachable case and backs off like one.
                 if let Some(name) = crate::peering::attached_name(destination) {
-                    let Some(connection) = pool.take_attachment(name) else {
+                    let Some(connection) = pool.attachment(name) else {
                         return Err(crate::endpoint::remote::Unreachable {
                             destination: destination.clone(),
                         }
                         .into());
                     };
                     return Ok(Box::new(
-                        crate::endpoint::remote::RemoteEndpoint::connect(connection, initialize)
-                            .map_err(|error| {
-                                crate::complain!(
-                                    "the attached {name} could not be connected: {error:#}"
-                                );
-                                crate::endpoint::remote::Unreachable {
-                                    destination: destination.clone(),
-                                }
-                            })?,
+                        crate::endpoint::remote::RemoteEndpoint::on_connection(
+                            &connection,
+                            initialize,
+                        )
+                        .map_err(|error| {
+                            crate::complain!(
+                                "the attached {name} could not be connected: {error:#}"
+                            );
+                            crate::endpoint::remote::Unreachable {
+                                destination: destination.clone(),
+                            }
+                        })?,
                     ));
                 }
                 // Sessions sharing a spawn command share one pooled
@@ -3804,28 +3844,48 @@ mod tests {
             term: 4,
         };
         for session in ["a", "b", "c", "d"] {
-            shared.set_running(session, true);
+            shared.set_running(session, true, false);
         }
-        shared.set_running("c", false);
+        shared.set_running("c", false, false);
         shared.yield_to("box:/x").expect("yields");
         shared.handed_one("a");
-        shared.set_running("d", false);
-        shared.set_running("c", true);
+        shared.set_running("d", false, false);
+        shared.set_running("c", true, false);
         assert!(matches!(shared.role(), crate::peering::Role::Leader { .. }));
         shared.handed_one("c");
         assert!(matches!(shared.role(), crate::peering::Role::Leader { .. }));
         // The last running session pauses rather than passing it on.
-        shared.set_running("b", false);
+        shared.set_running("b", false, false);
         assert_eq!(shared.role(), follower);
         assert_eq!(shared.handoff(), None);
 
         // Every session paused: nothing to wait for.
         let keep = tempfile::tempdir().expect("a temporary directory");
         let shared = leading_alpha(&keep.path().join("peering"), Duration::from_secs(30));
-        shared.set_running("a", true);
-        shared.set_running("a", false);
+        shared.set_running("a", true, false);
+        shared.set_running("a", false, false);
         shared.yield_to("box:/x").expect("yields");
         assert_eq!(shared.role(), follower);
+    }
+
+    /// The lead goes back to the alpha only once every running session
+    /// with the attached alpha has finished a cycle with it; a session
+    /// that stops running is not waited for.
+    #[test]
+    fn the_handback_waits_for_every_group_with_the_alpha() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let shared = leading_alpha(&keep.path().join("peering"), Duration::from_secs(30));
+        shared.set_running("one", true, true);
+        shared.set_running("two", true, true);
+        shared.set_running("beta-beta", true, false);
+        shared.cycled_with_alpha("one");
+        assert!(!shared.every_attached_session_cycled());
+        shared.set_running("two", false, true);
+        assert!(shared.every_attached_session_cycled(), "a stopped session");
+        shared.set_running("two", true, true);
+        assert!(!shared.every_attached_session_cycled());
+        shared.cycled_with_alpha("two");
+        assert!(shared.every_attached_session_cycled());
     }
 
     /// `peering yield --to` names a member of the star, or is refused

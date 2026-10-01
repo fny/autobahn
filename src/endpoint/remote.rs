@@ -356,7 +356,15 @@ impl RemoteEndpoint {
     /// connection: exchanges handshakes (enforcing version equality) and
     /// opens one channel with the session's root and policy.
     pub fn connect(connection: Connection, initialize: Initialize) -> Result<RemoteEndpoint> {
-        let connection = AgentConnection::connect(connection)?;
+        RemoteEndpoint::on_connection(&AgentConnection::connect(connection)?, initialize)
+    }
+
+    /// An endpoint on a connection already established, which it shares:
+    /// its own two channels, one to synchronize and one to watch.
+    pub fn on_connection(
+        connection: &AgentConnection,
+        initialize: Initialize,
+    ) -> Result<RemoteEndpoint> {
         let channel = connection.open(initialize.clone())?;
         let watch = connection.open(initialize)?;
         Ok(RemoteEndpoint::from_channel(channel).with_watch(watch))

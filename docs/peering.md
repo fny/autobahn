@@ -87,13 +87,13 @@ Two candidates acting at once — clocks a lifetime apart, say — present the s
 
 ### The alpha is never dialed
 
-The alpha is the one member that may be behind NAT, asleep, or on hotel wifi, so peering never assumes it can be reached. It dials. As leader it dials the betas, as it always has. While a beta leads, the alpha dials *the leader* and attaches: `ssh <leader> autobahn peering attach` bridges the alpha's own agent loop to the leading peer's attach socket, and the peer's supervisor takes that connection as the alpha's side of their session. The direction of the connection and the direction of the sync are independent. The alpha's groups that do not peer keep running meanwhile: they are the alpha's alone, whoever leads the star.
+The alpha is the one member that may be behind NAT, asleep, or on hotel wifi, so peering never assumes it can be reached. It dials. As leader it dials the betas, as it always has. While a beta leads, the alpha dials *the leader* and attaches: `ssh <leader> autobahn peering attach` bridges the alpha's own agent loop to the leading peer's attach socket, and the peer's supervisor takes that connection as the alpha's side of their session. The direction of the connection and the direction of the sync are independent. The alpha dials in once, and every group it shares with the leader syncs over that one connection, each on channels of its own. The alpha's groups that do not peer keep running meanwhile: they are the alpha's alone, whoever leads the star.
 
 The session keeps the alpha on the alpha side, under the identifier the leader pushed, so the ancestor copy is the same session's and is adopted by whichever side leads next.
 
 ### The handoff
 
-The lead goes back to the alpha on its own: one settled cycle on the attached session hands it over at the next term. `autobahn peering yield --to alpha` does the same on request, from the leading peer. A handoff writes the local lease first, every running peering session brings its peer's copy of the ancestor level and hands the new lease to it on its next attempt, and then the supervisor follows. The lead goes back to the alpha on its own only once the alpha's copy is confirmed level. A paused session is not waited for. A restart in the middle comes back as a follower; the member the lease names leads as soon as the lease reaches it, and otherwise the timeout takes it from there.
+The lead goes back to the alpha on its own, at the next term, once every one of the alpha's groups with the leader has had a cycle with it and one of them has settled. `autobahn peering yield --to alpha` does the same on request, from the leading peer. A handoff writes the local lease first, every running peering session brings its peer's copy of the ancestor level and hands the new lease to it on its next attempt, and then the supervisor follows. The lead goes back to the alpha on its own only once the alpha's copy is confirmed level. A paused session is not waited for. A restart in the middle comes back as a follower; the member the lease names leads as soon as the lease reaches it, and otherwise the timeout takes it from there.
 
 ## What `status` shows
 

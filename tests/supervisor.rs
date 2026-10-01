@@ -4167,6 +4167,146 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     });
 }
 
+/// The alpha dials in to a leading beta once, and every peering group it
+/// shares with that beta syncs over the one connection, each session on
+/// channels of its own. Taken whole by the first session, the connection
+/// left the alpha's other groups unsynced until the lead came back.
+#[test]
+fn every_group_syncs_over_the_alphas_one_attachment() {
+    use autobahn::peering::{self, Lease};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let world = World::new();
+    let alphas = [world.directory("alpha1"), world.directory("alpha2")];
+    let peers = [world.directory("peer1"), world.directory("peer2")];
+    let peer_home = world.directory("peer-home");
+    write(&peers[0], "from-peer1.txt", "p1");
+    write(&peers[1], "from-peer2.txt", "p2");
+    let peer_script = peering_agent_script(&world, &peer_home);
+    let configuration = format!(
+        r#"
+        [advanced.peering-dangerously-experimental]
+        ttl = "2s"
+        failover_after = "2s"
+
+        [groups.g1]
+        mode = "peering-conflict-dangerously-experimental"
+        interval = 1
+        alpha = "{a1}"
+        agent_command = "{script}"
+        betas = ["peer:{p1}"]
+
+        [groups.g2]
+        mode = "peering-conflict-dangerously-experimental"
+        interval = 1
+        alpha = "{a2}"
+        agent_command = "{script}"
+        betas = ["peer:{p2}"]
+        "#,
+        a1 = alphas[0].display(),
+        a2 = alphas[1].display(),
+        script = peer_script.display(),
+        p1 = peers[0].display(),
+        p2 = peers[1].display(),
+    );
+    let plans = world.plans(&configuration);
+    let plan = |group: &str| {
+        plans
+            .iter()
+            .find(|plan| plan.group == group)
+            .expect("the group's plan")
+            .clone()
+    };
+    let directory = peer_home.join(".autobahn").join("peering");
+    peering::write_pushed_file(&directory, "config.toml", configuration.as_bytes()).unwrap();
+    for (group, root) in [("g1", &peers[0]), ("g2", &peers[1])] {
+        let name = format!("peer:{}", root.display());
+        peering::write_pushed_file(&directory, &format!("names/{group}"), name.as_bytes()).unwrap();
+        peering::write_pushed_file(&directory, "name", name.as_bytes()).unwrap();
+        peering::write_pushed_file(
+            &directory,
+            &format!("sessions/{group}"),
+            plan(group).identifier().as_bytes(),
+        )
+        .unwrap();
+    }
+    peering::write_lease(
+        &directory,
+        &Lease {
+            leader: peering::ALPHA.to_owned(),
+            term: 3,
+            renewed_at: peering::now_seconds().saturating_sub(120),
+            ttl_seconds: 2,
+        },
+    )
+    .unwrap();
+    let alpha_directory = peering::directory().expect("the alpha's peering directory");
+    peering::write_lease(
+        &alpha_directory,
+        &Lease::new(peering::ALPHA, 3, Duration::from_secs(30)),
+    )
+    .unwrap();
+    let socket = directory.join(peering::ATTACH_SOCKET);
+    let _attach = EnvironmentGuard::set(
+        peering::ATTACH_COMMAND_VARIABLE,
+        format!(
+            "{} peering attach --socket {}",
+            agent_binary(),
+            socket.display()
+        ),
+    );
+
+    let stop = AtomicBool::new(false);
+    let peer_state = world.state_root();
+    let alpha_state = world.path("alpha-state");
+    let alerts = autobahn::alerts::AlertPlan::default();
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let peer =
+            scope.spawn(|| autobahn::supervisor::peer::run(&directory, &peer_state, false, &stop));
+        assert!(wait_until(Duration::from_secs(20), || socket.exists()));
+        let alpha = scope.spawn(|| {
+            autobahn::supervisor::peer::run_alpha(
+                &world.path("config.toml"),
+                &alpha_directory,
+                &plans,
+                &alerts,
+                &alpha_state,
+                false,
+                &stop,
+                None,
+            )
+        });
+        // Each group's copy of its ancestor on the alpha is written by the
+        // leading beta's session with the attached alpha, after a cycle
+        // over the attachment: both, for both groups.
+        let written_by_the_peer = |group: &str| {
+            peering::copy_writer(&alpha_directory, &plan(group).identifier())
+                .ok()
+                .flatten()
+                .is_some_and(|writer| writer.starts_with("peer:"))
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || written_by_the_peer("g1")
+                && written_by_the_peer("g2")),
+            "both groups should sync with the alpha while the beta leads: g1 {}, g2 {}",
+            written_by_the_peer("g1"),
+            written_by_the_peer("g2")
+        );
+        assert!(wait_until(Duration::from_secs(30), || alphas[0]
+            .join("from-peer1.txt")
+            .exists()
+            && alphas[1].join("from-peer2.txt").exists()));
+        stop.store(true, Ordering::Relaxed);
+        peer.join().expect("the peer thread").expect("the peer ran");
+        alpha
+            .join()
+            .expect("the alpha thread")
+            .expect("the alpha ran");
+    });
+}
+
 #[test]
 fn a_healthy_group_is_one_line_in_status_and_trouble_is_shown_in_full() {
     let world = World::new();

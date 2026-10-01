@@ -125,11 +125,9 @@ pub fn badge(waiting: usize) {
         return;
     };
     let tile = NSApplication::sharedApplication(mtm).dockTile();
-    unsafe {
-        match waiting {
-            0 => tile.setBadgeLabel(None),
-            count => tile.setBadgeLabel(Some(&NSString::from_str(&count.to_string()))),
-        }
+    match waiting {
+        0 => tile.setBadgeLabel(None),
+        count => tile.setBadgeLabel(Some(&NSString::from_str(&count.to_string()))),
     }
 }
 

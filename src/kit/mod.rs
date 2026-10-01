@@ -3336,26 +3336,35 @@ impl Desk {
                     .or_else(|| default.as_bool())
                     .unwrap_or(false);
                 let set = held.is_some();
+                let at = (part.clone(), key.to_owned());
+                let named = key.to_owned();
                 let key = key.to_owned();
                 let section = section.clone();
                 div()
                     .flex()
                     .items_center()
                     .gap(step(2.5))
+                    // A key the file does not hold is a third state, and
+                    // a switch has two positions. Drawn faint, it reads
+                    // as a value nobody chose — which is what it is —
+                    // and the one beside it that somebody did chose
+                    // reads as deliberate without having to be read.
                     .child(
-                        Switch::new(SharedString::from(format!("switch-{key}")))
-                            .checked(now)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.put(
-                                    &Spot {
-                                        section: section.clone(),
-                                        key: key.clone(),
-                                        item: None,
-                                    },
-                                    Some(toml_edit::value(!now)),
-                                );
-                                cx.notify();
-                            })),
+                        div().when(!set, |held| held.opacity(0.45)).child(
+                            Switch::new(SharedString::from(format!("switch-{named}")))
+                                .checked(now)
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.put(
+                                        &Spot {
+                                            section: section.clone(),
+                                            key: key.clone(),
+                                            item: None,
+                                        },
+                                        Some(toml_edit::value(!now)),
+                                    );
+                                    cx.notify();
+                                })),
+                        ),
                     )
                     .when(!set, |row| {
                         row.child(
@@ -3367,6 +3376,23 @@ impl Desk {
                                     Some(false) => t("config.absent_off").to_owned(),
                                     None => t("config.absent").to_owned(),
                                 }),
+                        )
+                    })
+                    // The way back to the third state, which a two-state
+                    // control cannot otherwise reach. The same Unset a
+                    // dropdown offers, so a field that is set offers one
+                    // way to stop being set, whatever kind of field.
+                    .when(set, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("unset-switch-{named}")))
+                                .small()
+                                .ghost()
+                                .label(t("config.unset"))
+                                .tooltip(t("tip.unset"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.unset(&at);
+                                    cx.notify();
+                                })),
                         )
                     })
                     .into_any_element()

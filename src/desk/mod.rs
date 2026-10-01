@@ -2212,7 +2212,14 @@ impl Desk {
                     .flex()
                     .items_center()
                     .gap(step(2.5))
-                    .child(self.switch(part, key, now, cx))
+                    // A key the file does not hold is a third state, and
+                    // a switch has two positions. Drawn faint, it reads
+                    // as a value nobody chose — which is what it is.
+                    .child(
+                        div()
+                            .when(!set, |held| held.opacity(0.45))
+                            .child(self.switch(part, key, now, cx)),
+                    )
                     .when(!set, |row| {
                         row.child(
                             div()
@@ -2223,6 +2230,26 @@ impl Desk {
                                     Some(false) => t("config.absent_off"),
                                     None => t("config.absent"),
                                 }),
+                        )
+                    })
+                    // The way back to the third state, which a two-state
+                    // control cannot otherwise reach.
+                    .when(set, |row| {
+                        let at = (part.clone(), key.to_owned());
+                        row.child(
+                            button(format!("unset-switch-{key}"), t("config.unset"))
+                                .tooltip(tip(t("tip.unset")))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.put(
+                                        &Spot {
+                                            section: at.0.clone(),
+                                            key: at.1.clone(),
+                                            item: None,
+                                        },
+                                        None,
+                                    );
+                                    cx.notify();
+                                })),
                         )
                     })
                     .into_any_element()

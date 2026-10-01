@@ -52,7 +52,7 @@ That makes a scan cost the size of the change instead of the size of the tree. I
 So the design bounds the damage rather than assuming the events are complete:
 
 - If the kernel queue overflows, or the record grows past 8192 paths, the watcher discards its paths and demands a full scan (`src/endpoint/local.rs`).
-- A full scan runs at least every 120 seconds regardless (`FULL_WALK_INTERVAL`, `src/power.rs`). This is the ceiling on how long a missed event can persist. With `power_saver_experimental`, it is 10 minutes while the machine is on battery.
+- A full scan runs at least every 120 seconds regardless (`FULL_WALK_INTERVAL`, `src/power.rs`). This is the ceiling on how long a missed event can persist. With `power_saver_experimental`, it is 10 minutes while the machine is on battery. While a watch stands, this timed walk runs on its own thread beside the scans (`RootObserver::begin_audit`, `src/endpoint/observer.rs`). Every path where it disagrees with the recorded tree is marked as an event would have marked it, and the next scan reads it. Run inside a scan, it held every session over the root for the length of the walk, about a second on a 505,000-file tree.
 - A transition problem clears the record (`src/endpoint/local.rs`). The filesystem disagreed with the tree, so the tree is proven stale.
 - A root that cannot be watched at all still works. It falls back to the interval.
 

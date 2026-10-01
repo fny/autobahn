@@ -41,6 +41,17 @@
 //! is watched only in part, reuses nothing, and every scan walks — though
 //! a walk begun after a caller asked serves that caller too, so callers
 //! arriving together still share one.
+//!
+//! # The timed full walk
+//!
+//! A watched root is still walked in full every two minutes, for the events
+//! a watch can lose without a word. That walk is an **audit**: it runs on
+//! its own thread, beside the scans, and what it finds that the baseline
+//! does not record is marked as changed, exactly as an event would have
+//! marked it, for the next scan to read. Run inside a scan instead, it held
+//! that scan — and every session waiting on it — for the length of the
+//! walk: on a 505,000-file tree, about a second in every two minutes, on
+//! the source and on each destination alike.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -59,9 +70,11 @@ use crate::tree::Snapshot;
 /// retrying only aggravates.
 const WATCH_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The longest a scan may be served without a full walk behind it, bounding
-/// how long a missed filesystem event can persist: two minutes, or ten on
-/// battery with `power_saver_experimental` (`crate::power`).
+/// How often a watched root is walked in full, bounding how long a missed
+/// filesystem event can persist: two minutes, or ten on battery with
+/// `power_saver_experimental` (`crate::power`). The bound is this plus the
+/// length of the walk, which runs beside the scans (see
+/// [`RootObserver::begin_audit`]).
 fn full_scan_interval() -> Duration {
     crate::power::full_walk_interval()
 }
@@ -155,6 +168,8 @@ struct State {
     /// Set while a scan is running, so concurrent callers wait for it
     /// rather than each walking the tree.
     scanning: bool,
+    /// Set while a timed full walk runs beside the scans, so only one does.
+    auditing: bool,
 }
 
 /// A published scan.
@@ -199,6 +214,10 @@ pub struct RootObserver {
     cache_path: PathBuf,
     /// The background writer for that cache.
     writer: crate::persist::StateWriter,
+    /// This observer, for the audit thread to report back to. Held weakly,
+    /// so an audit under way does not keep alive an observer every session
+    /// has let go of.
+    me: Weak<RootObserver>,
     /// A test seam invoked between the walk and its publication, so the
     /// generation gate — a snapshot must never be served as current across
     /// a change it did not observe — can be exercised at the one moment it
@@ -214,6 +233,10 @@ pub struct RootObserver {
     /// dirty marks: the moment a failure could lose them.
     #[cfg(test)]
     pub(crate) fail_walk: std::sync::atomic::AtomicBool,
+    /// A test seam run on the audit's thread before it walks, so a test
+    /// can hold an audit under way, or let one finish, on its own schedule.
+    #[cfg(test)]
+    pub(crate) before_audit: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl RootObserver {
@@ -442,6 +465,10 @@ impl RootObserver {
             let (baseline, behavior, want_full, walk, running) = {
                 let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 let arrived = *arrived.get_or_insert(state.walks_begun);
+                // A verifying scan walks in full itself.
+                if !rehash {
+                    self.begin_audit(&mut state);
+                }
 
                 // Serve the published scan while its generation still
                 // stands: nothing has happened to the tree since it was
@@ -457,7 +484,7 @@ impl RootObserver {
                 if !rehash {
                     if let Some(published) = &state.published {
                         let current = published.generation == self.signal.current()
-                            && !self.full_scan_due(&state)
+                            && !self.full_walk_owed(&state)
                             && Self::watched(&state);
                         if current || published.walk > arrived {
                             self.within_limit(&published.snapshot, max_entry_count)?;
@@ -481,7 +508,7 @@ impl RootObserver {
                 }
                 state.scanning = true;
                 state.walks_begun += 1;
-                let want_full = rehash || self.full_scan_due(&state);
+                let want_full = rehash || self.full_walk_owed(&state);
                 (
                     state.baseline.clone(),
                     state.behavior.unwrap_or_default(),
@@ -576,16 +603,116 @@ impl RootObserver {
         Ok(())
     }
 
-    /// Whether the next scan must be a full walk regardless of the watch:
-    /// no full walk is on record (none has completed, or a new watch, a
-    /// failed or refused incremental walk, or a distrusted baseline has
-    /// cleared the record), or the last finished at least
-    /// [`full_scan_interval`] ago.
-    fn full_scan_due(&self, state: &State) -> bool {
+    /// Whether the next scan must itself be a full walk, regardless of the
+    /// watch: no full walk is on record (none has completed, or a new
+    /// watch, a failed or refused walk, or a distrusted baseline has
+    /// cleared the record), or the timed one is due and no audit is
+    /// walking in its place.
+    fn full_walk_owed(&self, state: &State) -> bool {
         match state.last_full_scan {
-            Some(last) => last.elapsed() >= full_scan_interval(),
+            Some(last) => last.elapsed() >= full_scan_interval() && !state.auditing,
             None => true,
         }
+    }
+
+    /// Starts the timed full walk on its own thread, if it is due and the
+    /// scans can go on without it.
+    ///
+    /// They can when a whole watch stands behind the baseline: the walk then
+    /// looks only for what the watch failed to report, and the scans keep
+    /// reading what it did report. With no full walk on record there is no
+    /// baseline to trust, and without a whole watch every scan walks in
+    /// full anyway, so either way the scan walks itself. So does it when no
+    /// thread can be started.
+    ///
+    /// Nothing the audit finds is published. When its walk is done it
+    /// compares it with the baseline as it stands then, and marks each path
+    /// at which they differ, as an event would have, so the next scan reads
+    /// them — once the generation it then advances has refused the
+    /// published scan as current. A path changed while the walk ran either
+    /// raised an event of its own, and marking it again costs one re-read,
+    /// or raised none, and is exactly what the audit is for.
+    fn begin_audit(&self, state: &mut State) {
+        let Some(replaces) = state.last_full_scan else {
+            return;
+        };
+        if state.auditing || replaces.elapsed() < full_scan_interval() || !Self::watched(state) {
+            return;
+        }
+        let Some(baseline) = state.baseline.clone() else {
+            return;
+        };
+        let audit = Audit {
+            key: self.key.clone(),
+            ignores: self.ignores.clone(),
+            behavior: state.behavior.unwrap_or_default(),
+            baseline,
+            began: Instant::now(),
+            replaces,
+            #[cfg(test)]
+            before: self
+                .before_audit
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
+        };
+        let observer = Weak::clone(&self.me);
+        let started = std::thread::Builder::new()
+            .stack_size(crate::threads::DEEP_STACK)
+            .spawn(move || audit.run(observer));
+        state.auditing = started.is_ok();
+    }
+
+    /// Takes in an audit's walk: `None` when it failed.
+    fn finish_audit(&self, audit: &Audit, walked: Option<Snapshot>) {
+        // Compared with the baseline as it stands now rather than as it
+        // stood when the walk began: whatever the scans since have recorded
+        // is what the next one starts from, so that is what has to agree
+        // with the disk. Outside the lock, which a cycle may be waiting on.
+        let found = walked.map(|walked| {
+            let recorded = self
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .baseline
+                .clone();
+            let mut found = Vec::new();
+            differing_paths(
+                "",
+                recorded
+                    .as_ref()
+                    .and_then(|recorded| recorded.root.as_ref()),
+                walked.root.as_ref(),
+                &mut found,
+            );
+            found
+        });
+
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.auditing = false;
+        // The record is the audit's to renew only if nothing has replaced
+        // it meanwhile: cleared — by a new watch, say — it is owed a walk
+        // of its own, and renewed by such a walk it is already newer.
+        let renewable = state.last_full_scan == Some(audit.replaces);
+        let Some(paths) = found else {
+            // The next scan walks in full, and meets whatever failed here
+            // itself.
+            if renewable {
+                state.last_full_scan = None;
+            }
+            return;
+        };
+        if renewable {
+            state.last_full_scan = Some(audit.began);
+        }
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(watcher) = state.watcher.as_ref() {
+            watcher.mark_pending(paths.iter().map(|path| self.key.root.join(path)));
+        }
+        drop(state);
+        self.signal.advance();
     }
 
     /// Walks the tree, returning the snapshot, the generation it reflects,
@@ -770,6 +897,114 @@ impl RootObserver {
     }
 }
 
+/// A timed full walk, run beside the scans (see
+/// [`RootObserver::begin_audit`]), with everything it needs taken when it
+/// began: the observer is not held while it walks.
+struct Audit {
+    key: ObserverKey,
+    ignores: IgnoreSet,
+    behavior: FilesystemBehavior,
+    /// The baseline as it stood when the audit began, where the walk's
+    /// unchanged files take their digests.
+    baseline: Snapshot,
+    /// When the audit began, which becomes the last full walk on record.
+    began: Instant,
+    /// The record it renews, which it may renew only while it stands.
+    replaces: Instant,
+    #[cfg(test)]
+    before: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+impl Audit {
+    /// Walks, and reports to the observer if it is still there. A walk that
+    /// fails or panics reports a failure, so the observer is never left
+    /// waiting on an audit that is no longer running.
+    fn run(self, observer: Weak<RootObserver>) {
+        #[cfg(test)]
+        if let Some(before) = &self.before {
+            before();
+        }
+        let walked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.walk()))
+            .ok()
+            .and_then(Result::ok);
+        if let Some(observer) = observer.upgrade() {
+            observer.finish_audit(&self, walked);
+        }
+    }
+
+    /// Walks the whole tree.
+    fn walk(&self) -> Result<Snapshot> {
+        let (walked, _) = scan::scan_deferring(
+            &self.key.root,
+            Some(&self.baseline),
+            &self.ignores,
+            &self.behavior,
+            self.key.symlink_mode,
+            self.key.max_file_size,
+            None,
+            false,
+            None,
+            self.key.ignore_mounts,
+            None,
+        )?;
+        Ok(walked)
+    }
+}
+
+/// Collects the topmost root-relative paths at which `walked` differs from
+/// `recorded`. A file's scan metadata counts, unlike in a content diff, so
+/// the re-read a mark asks for renews a stale record as a full walk would.
+fn differing_paths(
+    path: &str,
+    recorded: Option<&crate::tree::Node>,
+    walked: Option<&crate::tree::Node>,
+    found: &mut Vec<String>,
+) {
+    use crate::tree::Content;
+    // An unchanged subtree shares its baseline's storage, so it is passed
+    // over in constant time.
+    if crate::tree::nodes_share_storage(recorded, walked) {
+        return;
+    }
+    let (Some(recorded), Some(walked)) = (recorded, walked) else {
+        found.push(path.to_owned());
+        return;
+    };
+    match (&recorded.content, &walked.content) {
+        (Content::Directory(before), Content::Directory(after)) => {
+            let (mut i, mut j) = (0, 0);
+            while i < before.len() || j < after.len() {
+                let order = match (before.get(i), after.get(j)) {
+                    (Some(b), Some(a)) => b.name.cmp(&a.name),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    _ => std::cmp::Ordering::Greater,
+                };
+                let (b, a) = match order {
+                    std::cmp::Ordering::Less => (before.get(i), None),
+                    std::cmp::Ordering::Greater => (None, after.get(j)),
+                    std::cmp::Ordering::Equal => (before.get(i), after.get(j)),
+                };
+                let name = b.or(a).map(|node| node.name.as_str()).unwrap_or_default();
+                differing_paths(&crate::tree::path_join(path, name), b, a, found);
+                i += usize::from(b.is_some());
+                j += usize::from(a.is_some());
+            }
+        }
+        (
+            Content::File {
+                metadata: before, ..
+            },
+            Content::File {
+                metadata: after, ..
+            },
+        ) if before != after => {
+            found.push(path.to_owned());
+        }
+        _ if !recorded.content_equal(walked, false) => found.push(path.to_owned()),
+        _ => {}
+    }
+}
+
 /// The observers currently in use, one per distinct root and scan policy.
 ///
 /// Weak references, so an observer lives exactly as long as the endpoints
@@ -789,7 +1024,7 @@ pub fn observer_for(
     if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
         return existing;
     }
-    let observer = Arc::new(RootObserver {
+    let observer = Arc::new_cyclic(|me| RootObserver {
         key: key.clone(),
         ignores,
         watch_wanted: std::sync::atomic::AtomicBool::new(false),
@@ -808,16 +1043,20 @@ pub fn observer_for(
             baseline_generation: 0,
             last_full_scan: None,
             scanning: false,
+            auditing: false,
         }),
         scanned: Condvar::new(),
         cache_path,
         writer: crate::persist::StateWriter::new(),
+        me: Weak::clone(me),
         #[cfg(test)]
         after_walk: Mutex::new(None),
         #[cfg(test)]
         suppress_watching: std::sync::atomic::AtomicBool::new(false),
         #[cfg(test)]
         fail_walk: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(test)]
+        before_audit: Mutex::new(None),
     });
     // A cold start seeds the baseline from the persisted cache, so the first
     // scan of a process re-digests only what changed since the last one.
@@ -966,9 +1205,7 @@ mod tests {
         }
     }
 
-    /// Waits for `condition`, polling, for up to ten seconds. Used only by
-    /// the Linux watch tests.
-    #[cfg(target_os = "linux")]
+    /// Waits for `condition`, polling, for up to ten seconds.
     fn eventually(mut condition: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline {
@@ -1231,6 +1468,187 @@ mod tests {
         );
     }
 
+    // ── the timed full walk ─────────────────────────────────────────
+
+    /// Makes the timed full walk due, as two minutes without one would.
+    fn make_audit_due(observer: &RootObserver) {
+        observer.state.lock().unwrap().last_full_scan = Some(
+            Instant::now()
+                .checked_sub(full_scan_interval())
+                .expect("the clock has run for longer than the interval"),
+        );
+    }
+
+    /// Holds every audit at its start until the returned sender is dropped.
+    fn hold_audits(observer: &RootObserver) -> std::sync::mpsc::Sender<()> {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let released = Mutex::new(released);
+        *observer.before_audit.lock().unwrap() = Some(Arc::new(move || {
+            let _ = released
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv_timeout(Duration::from_secs(30));
+        }));
+        release
+    }
+
+    fn auditing(observer: &RootObserver) -> bool {
+        observer.state.lock().unwrap().auditing
+    }
+
+    /// The timed full walk runs beside the scans: a scan while it is under
+    /// way still reads what the watch reported, and does not wait for it.
+    /// It used to run inside a scan, holding every session over the root
+    /// for the length of the walk.
+    #[test]
+    fn a_timed_full_walk_does_not_hold_up_a_scan() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        let release = hold_audits(&observer);
+        make_audit_due(&observer);
+        write_observed(&observer, &root.join("file.txt"), "after!");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let scanning = Arc::clone(&observer);
+        std::thread::spawn(move || {
+            let _ = sender.send(
+                scanning
+                    .scan(None, None)
+                    .map(|(snapshot, _)| digest_at(&snapshot, "file.txt")),
+            );
+        });
+        let scanned = receiver
+            .recv_timeout(Duration::from_secs(10))
+            .expect("a scan waited for the timed full walk");
+        assert_eq!(
+            scanned.expect("scans"),
+            Some(*blake3::hash(b"after!").as_bytes()),
+            "a scan beside the audit missed a reported write"
+        );
+        assert!(
+            auditing(&observer),
+            "the timed full walk ran inside the scan"
+        );
+
+        drop(release);
+        assert!(
+            eventually(|| !auditing(&observer)),
+            "the audit never finished"
+        );
+    }
+
+    /// What the timed full walk is for: a change no event reported. The
+    /// audit marks it, and wakes the scans, so the next one reads it.
+    #[test]
+    fn an_audit_finds_a_change_no_event_reported() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        std::fs::create_dir(root.join("kept")).expect("creates");
+        std::fs::write(root.join("kept/file.txt"), b"kept").expect("writes");
+        let observer = harness_observer(&root);
+        let first = settle(&observer);
+
+        // Held events stand for lost ones: none reaches the observer while
+        // the hold lasts, so only the audit can report these.
+        let hold = event_hold(&observer);
+        let held = hold.lock().unwrap();
+        std::fs::write(root.join("file.txt"), b"after!").expect("writes");
+        std::fs::write(root.join("new.txt"), b"new").expect("writes");
+        std::fs::remove_dir_all(root.join("kept")).expect("removes");
+
+        make_audit_due(&observer);
+        let before = observer.generation();
+        let (missed, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&missed, "file.txt"),
+            digest_at(&first, "file.txt"),
+            "an event got past the hold"
+        );
+        assert!(
+            eventually(|| !auditing(&observer)),
+            "the audit never finished"
+        );
+        assert!(
+            observer.generation() > before,
+            "the audit's finding woke no one"
+        );
+
+        let (found, _) = observer.scan(None, None).expect("scans");
+        assert_eq!(
+            digest_at(&found, "file.txt"),
+            Some(*blake3::hash(b"after!").as_bytes()),
+            "a changed file the audit found never reached a scan"
+        );
+        assert!(
+            node_at(&found, "new.txt").is_some(),
+            "a new file was missed"
+        );
+        assert!(
+            node_at(&found, "kept").is_none(),
+            "a removed directory was missed"
+        );
+        drop(held);
+    }
+
+    /// An audit that finishes renews the record, so the next is two
+    /// minutes off and no scan walks in its place.
+    #[test]
+    fn an_audit_renews_the_full_walk_on_record() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        make_audit_due(&observer);
+        observer.scan(None, None).expect("scans");
+        assert!(
+            eventually(|| !auditing(&observer)),
+            "the audit never finished"
+        );
+        let state = observer.state.lock().unwrap();
+        assert!(
+            !observer.full_walk_owed(&state),
+            "a finished audit left the walk owed"
+        );
+    }
+
+    /// A record cleared while an audit walks — by a new watch, a failed
+    /// walk, or a distrusted baseline — is owed a full walk of its own, as
+    /// the scan that next runs. The audit must not renew it.
+    #[test]
+    fn an_audit_does_not_renew_a_record_cleared_while_it_walked() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let root = keep.path().join("root");
+        std::fs::create_dir(&root).expect("root");
+        std::fs::write(root.join("file.txt"), b"before").expect("writes");
+        let observer = harness_observer(&root);
+        settle(&observer);
+
+        let release = hold_audits(&observer);
+        make_audit_due(&observer);
+        observer.scan(None, None).expect("scans");
+        assert!(auditing(&observer), "no audit began");
+        observer.distrust_baseline();
+
+        drop(release);
+        assert!(
+            eventually(|| !auditing(&observer)),
+            "the audit never finished"
+        );
+        assert!(
+            observer.state.lock().unwrap().last_full_scan.is_none(),
+            "an audit renewed a record cleared while it walked"
+        );
+    }
+
     // ── what the watch covers ───────────────────────────────────────
 
     /// Finding M-25: the scanner walks into an ignored directory that
@@ -1478,8 +1896,13 @@ mod tests {
                         std::thread::sleep(Duration::from_millis(20));
                         observer.invalidate(["file.txt"]);
                     }
-                    // A scan by either of two sessions.
+                    // A scan by either of two sessions, a third of them
+                    // with the timed full walk due, so audits run beside
+                    // everything else.
                     2..=4 => {
+                        if pick % 3 == 0 {
+                            make_audit_due(&observer);
+                        }
                         let (snapshot, generation) = observer.scan(None, None).expect("scans");
                         check(&snapshot, truth, own, step, "a scan")?;
                         folds.push((snapshot, generation));

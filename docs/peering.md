@@ -123,11 +123,7 @@ autobahn peering attach                # what the alpha runs over ssh; not for t
 
 These are open. The first has a plan: SSH keys that can only run the agent, over folders each server allows, set up automatically (`REVIEWS/fixes/PEER-4-pushed-commands-and-roots.md`).
 
-**Every peer that can lead is trusted like a shell on every other peer.** A leader pushes its configuration to every follower, and a follower runs it when it takes the lead. Two consequences follow:
-- **Pushed commands.** A pushed group's `agent_command` is kept as written. A follower runs it when it next leads, even after the leader that pushed it has gone.
-- **Pushed roots.** A follower's own root comes from the `name` file the leader pushes. A leader can point a follower at any of that follower's directories.
-
-In the usual setup this grants nothing new, because a leader already holds an SSH login to every peer. It does mean you should peer only machines that would each trust the others with a shell. SSH keys locked to `command="autobahn agent"` do not contain a peering leader, and are not supported with peering.
+**Every peer that can lead holds an SSH login to every other beta.** Any beta must be able to take over, so each reaches the others with ordinary keys, and a key that logs in is a shell. A follower no longer runs a command its leader pushed — it ignores the pushed configuration's `agent_command`, and takes its own from [`host.toml`](./configuration.md#this-machines-own-settings) — and a pushed `name` outside the folders a follower's `host.toml` allows is refused. But a leader with a shell needs neither. Peer only machines that would each trust the others with a shell, or restrict the keys: see [Restricted keys](#restricted-keys).
 
 **While a beta leads, it can change what the alpha syncs with it, and nothing else there.** When the alpha attaches, it serves the leader only its own peering sessions, as its own configuration has them: the root, ignores, modes, owners and staging are the alpha's, whatever the leader asks for, and the alpha takes no pushed files. A leader can change files inside those roots, as any beta can in a two-way mode, and nothing outside them.
 

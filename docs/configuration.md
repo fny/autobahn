@@ -137,6 +137,8 @@ The running supervisor reads the file every two seconds and acts on an edit once
 roots = ["~/Workspace", "/srv/shared"]
 ```
 
+`agent_command` is what a peering beta leading from this machine runs to reach the other peers, in place of ssh — a group's `agent_command`, for testing and custom transports. A leader's pushed configuration never sets it: a follower ignores any `agent_command` the leader's configuration carries, since it would otherwise run, at takeover, a command this machine never chose.
+
 Without `roots`, or without the file, an agent serves any folder its user can reach, as it always has. With it, a root is judged where it really is, through every symbolic link on the way, and a root outside every listed folder is refused: the session fails to connect, and says why. A file that does not parse refuses everything, so a typo never lifts a restriction.
 
 ## See also

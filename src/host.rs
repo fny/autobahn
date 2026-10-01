@@ -9,6 +9,11 @@
 //! # The folders an agent on this machine serves, and the only ones a peer
 //! # leading from here may sync as its own. Without the key, any.
 //! roots = ["~/Workspace"]
+//! # What a peer leading from here runs to reach the other peers, in place
+//! # of ssh: a group's `agent_command`, for testing and custom transports.
+//! # A leader's pushed configuration never sets it: that would be a command
+//! # run here that this machine did not choose.
+//! agent_command = "/usr/local/bin/my-transport autobahn agent"
 //! ```
 
 use std::path::{Component, Path, PathBuf};
@@ -24,6 +29,7 @@ pub const FILE: &str = "host.toml";
 #[serde(deny_unknown_fields)]
 struct Written {
     roots: Option<Vec<String>>,
+    agent_command: Option<String>,
 }
 
 /// This machine's settings, as `host.toml` gives them.
@@ -33,6 +39,8 @@ pub struct HostSettings {
     path: PathBuf,
     /// The folders served, resolved; `None` for no restriction.
     roots: Option<Vec<PathBuf>>,
+    /// How a peer leading from here reaches the other peers, if not by ssh.
+    agent_command: Option<String>,
 }
 
 impl HostSettings {
@@ -44,7 +52,11 @@ impl HostSettings {
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(HostSettings { path, roots: None })
+                return Ok(HostSettings {
+                    path,
+                    roots: None,
+                    agent_command: None,
+                })
             }
             Err(error) => {
                 return Err(error).with_context(|| format!("unable to read {}", path.display()))
@@ -64,7 +76,17 @@ impl HostSettings {
                     .collect::<Result<Vec<_>>>()?,
             ),
         };
-        Ok(HostSettings { path, roots })
+        Ok(HostSettings {
+            path,
+            roots,
+            agent_command: written.agent_command,
+        })
+    }
+
+    /// How a peer leading from here reaches the other peers, when this
+    /// machine says: in place of the ssh every connection uses otherwise.
+    pub fn agent_command(&self) -> Option<&str> {
+        self.agent_command.as_deref()
     }
 
     /// Refuses a root outside the folders this machine serves. The root is

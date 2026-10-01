@@ -3815,6 +3815,13 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     let name = format!("peer:{}", peer_root.display());
     let peering_directory = peer_home.join(".autobahn").join("peering");
     peering::write_pushed_file(&peering_directory, "config.toml", pushed.as_bytes()).unwrap();
+    // The pushed agent_command is never run: how this peer reaches the
+    // other beta is its own to say.
+    fs::write(
+        peer_home.join(".autobahn").join("host.toml"),
+        format!("agent_command = {:?}\n", other_script.display().to_string()),
+    )
+    .unwrap();
     peering::write_pushed_file(&peering_directory, "name", name.as_bytes()).unwrap();
     // The alpha's lease, last renewed a while ago.
     let stale = Lease {

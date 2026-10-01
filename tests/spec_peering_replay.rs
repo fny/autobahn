@@ -63,6 +63,11 @@ struct Game {
     /// and as a replica (`copy`), each with a generation.
     own: Vec<Vec<(Tree, u64)>>,
     copy: Vec<Vec<(Tree, u64)>>,
+    /// Whether each host's copy was written after its own store: the spec's
+    /// `later`, which adoption asks instead of comparing generations.
+    later: Vec<Vec<bool>>,
+    /// What a host held where a copy it adopted disagreed.
+    disputed: BTreeSet<(Host, &'static str, &'static str)>,
     /// A leading beta's ancestors with the other betas.
     bb: Vec<Vec<Tree>>,
     conflicts: Vec<Vec<BTreeSet<&'static str>>>,
@@ -143,6 +148,8 @@ impl Game {
             myterm: (0..hosts).map(|h| if h == 0 { 1 } else { 0 }).collect(),
             own: vec![vec![(Tree::new(), 0); betas]; hosts],
             copy: vec![vec![(Tree::new(), 0); betas]; hosts],
+            later: vec![vec![false; betas]; hosts],
+            disputed: BTreeSet::new(),
             bb: vec![vec![Tree::new(); betas]; betas],
             conflicts: vec![vec![BTreeSet::new(); hosts]; hosts],
             writers: vec![BTreeSet::new(); hosts],
@@ -300,11 +307,7 @@ impl Game {
         let lease = self.lease_of(Host::Beta(i), term);
         self.put_lease(h, &lease);
         self.leading[h] = true;
-        // adopt_newer_copy: the copy stands in for what is held only if it
-        // is newer.
-        if self.copy[h][i].1 > self.own[h][i].1 {
-            self.own[h][i] = self.copy[h][i].clone();
-        }
+        self.adopt(h, i);
         self.bb[i] = vec![Tree::new(); self.betas];
         self.changes += 1;
         self.steps.push(format!("takeover b{} term {term}", i + 1));
@@ -325,19 +328,51 @@ impl Game {
         if !self.up[lh] || !self.leading[lh] || self.tree[0] != self.tree[lh] {
             return false;
         }
+        // Session::level_the_copy: the handback waits for the alpha's copy
+        // to be level with the leader's ancestor.
+        if self.copy[0][lh - 1] != self.own[lh][lh - 1] {
+            return false;
+        }
         let term = self.lease(0).term + 1;
         self.myterm[0] = term;
         let lease = self.lease_of(Host::Alpha, term);
         self.put_lease(0, &lease);
         self.leading[0] = true;
         for b in 0..self.betas {
-            if self.copy[0][b].1 > self.own[0][b].1 {
-                self.own[0][b] = self.copy[0][b].clone();
-            }
+            self.adopt(0, b);
         }
         self.changes += 1;
         self.steps.push(format!("handoff to alpha term {term}"));
         true
+    }
+
+    /// adopt_newer_copy, as the spec's `Adopted`: host `h` takes up its copy
+    /// of the (alpha, b) ancestor when the copy holds history and was
+    /// written after its own store, or it has none — less every path where
+    /// the copy disagrees with the host's tree, which is set aside for the
+    /// next cycle to reconcile as new.
+    fn adopt(&mut self, h: usize, b: usize) {
+        let (copied, generation) = self.copy[h][b].clone();
+        if generation == 0 || !(self.own[h][b].1 == 0 || self.later[h][b]) {
+            return;
+        }
+        let mut taken = Tree::new();
+        for &p in &PATHS {
+            match (copied.get(p), self.tree[h].get(p)) {
+                (recorded, held) if recorded == held => {
+                    if let Some(&v) = recorded {
+                        taken.insert(p, v);
+                    }
+                }
+                (_, held) => {
+                    if let Some(&v) = held {
+                        self.disputed.insert((Self::host(h), p, v));
+                    }
+                }
+            }
+        }
+        self.own[h][b] = (taken, generation);
+        self.later[h][b] = false;
     }
 
     /// Time passes: leases held go stale unless renewed by a cycle.
@@ -409,15 +444,17 @@ impl Game {
         let y_before = self.tree[beta_side].clone();
         self.tree[alpha_side] = x2.clone();
         self.tree[beta_side] = y2.clone();
-        let bump = |store: &mut (Tree, u64)| {
+        // A store written moves its copy to before it.
+        let bump = |store: &mut (Tree, u64), later: &mut bool| {
             if store.0 != a2 {
                 *store = (a2.clone(), store.1 + 1);
+                *later = false;
             }
         };
         if c == 0 {
-            bump(&mut self.own[0][h - 1]);
+            bump(&mut self.own[0][h - 1], &mut self.later[0][h - 1]);
         } else if h == 0 {
-            bump(&mut self.own[c][c - 1]);
+            bump(&mut self.own[c][c - 1], &mut self.later[c][c - 1]);
         } else {
             self.bb[c - 1][h - 1] = a2.clone();
         }
@@ -459,7 +496,11 @@ impl Game {
             return false;
         }
         let b = if h == 0 { c - 1 } else { h - 1 };
+        if self.copy[h][b] == self.own[c][b] {
+            return false;
+        }
         self.copy[h][b] = self.own[c][b].clone();
+        self.later[h][b] = true;
         self.steps.push(format!(
             "replicate {}→{}",
             Self::host(c).name(),
@@ -498,6 +539,19 @@ impl Game {
             assert!(
                 ok,
                 "{context}: {v} written on {} at {p} is gone and unaccounted for\n{}",
+                host.name(),
+                self.report()
+            );
+        }
+        // DisputedKept: what a host held where a copy it adopted disagreed
+        // is never lost.
+        for &(host, p, v) in &self.disputed {
+            let ok = self.present_anywhere(p, v)
+                || self.superseded.contains(&(p, v))
+                || self.discarded.iter().any(|d| d.1 == p && d.2 == v);
+            assert!(
+                ok,
+                "{context}: {v} held on {} at {p}, set aside on adoption, is gone\n{}",
                 host.name(),
                 self.report()
             );

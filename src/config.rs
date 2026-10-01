@@ -269,11 +269,11 @@ const DEFAULT_SETTLE_AFTER: Duration = Duration::from_secs(15 * 60);
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Whether the running supervisor re-reads this file and applies an
-    /// edit in place. On unless said otherwise; off, an edit lands on
+    /// Whether the supervisor reloads this file on a change without a
+    /// restart. On unless said otherwise; off, an edit lands on
     /// `restart` as it used to.
     #[serde(default = "default_reload")]
-    pub reload: bool,
+    pub live_reload: bool,
     /// Run when a session needs a person. The only hook — which states are
     /// alerting is in the message it is handed, not in which hook fires.
     ///
@@ -308,18 +308,14 @@ pub struct Config {
     #[serde(default)]
     pub groups: BTreeMap<String, Group>,
     /// Tuning that has a correct value already.
-    ///
-    /// Spelled `[advanced]` until it was not. The old name is still
-    /// read, so no file on any machine had to be edited for this; a
-    /// file carrying both is refused as the duplicate it is.
-    #[serde(default, alias = "advanced")]
+    #[serde(default)]
     pub experimental: Advanced,
     /// What is worth saying about this configuration without refusing
     /// it, gathered once per load by [`warnings`](Self::warnings) however
     /// many times its sessions are planned.
     #[serde(skip)]
     warnings: std::sync::OnceLock<Vec<String>>,
-    /// Where `ignore_files` entries are looked up when set: a peer runs the
+    /// Where `file:` entries in `ignores` are looked up when set: a peer runs the
     /// leader's pushed configuration against the pushed ignore files,
     /// not against its own `~/.autobahn/ignores`. Never read from the
     /// file itself.
@@ -412,7 +408,7 @@ impl Config {
     }
 }
 
-/// The `[advanced.alerts]` section: how long things must hold, how long to
+/// The `[experimental.alerts]` section: how long things must hold, how long to
 /// wait, and how long before a hook is given up on.
 ///
 /// These are not preferences. They are the values that make the alerter
@@ -466,12 +462,14 @@ pub struct Defaults {
     /// The default synchronization mode.
     pub mode: Option<String>,
     /// Ignore patterns prepended to every group's own.
+    ///
+    /// An entry beginning `file:` names a file of patterns instead of
+    /// being one: `file:Rust.gitignore` is read from `~/.autobahn/ignores`,
+    /// and `file:~/mine` or `file:/etc/mine` from where it says. Its
+    /// patterns are spliced in where the entry sits, so the order on
+    /// screen is the order that applies.
     #[serde(default)]
     pub ignores: Vec<String>,
-    /// Names of files in `~/.autobahn/ignores` whose patterns are applied
-    /// before every group's own, in the order written.
-    #[serde(default)]
-    pub ignore_files: Vec<String>,
     /// The default interval, in seconds, between synchronization cycles.
     pub interval: Option<u64>,
     /// The default durability class for the ancestor journal: "process"
@@ -526,50 +524,43 @@ pub struct Group {
     /// The beta destinations (remote `[user@]host[:path]` or local paths).
     #[serde(default)]
     pub betas: Vec<String>,
-    /// The synchronization mode (falls back to the defaults).
+    /// The synchronization mode.
     pub mode: Option<String>,
     /// Ignore patterns, appended to the defaults' patterns.
+    ///
+    /// An entry beginning `file:` names a file of patterns instead of
+    /// being one — see the defaults' `ignores`.
     #[serde(default)]
     pub ignores: Vec<String>,
-    /// Names of files in `~/.autobahn/ignores`, applied after the
-    /// defaults' patterns and before this group's own.
-    #[serde(default)]
-    pub ignore_files: Vec<String>,
-    /// The interval, in seconds, between cycles (falls back to the defaults).
+    /// The interval, in seconds, between cycles.
     pub interval: Option<u64>,
-    /// The durability class for the ancestor journal (falls back to the
-    /// defaults): "process" or "power".
+    /// The durability class for the ancestor journal: "process" or "power".
     pub durability: Option<String>,
-    /// The symbolic link treatment (`ignore`, `portable`, or `raw`; falls
-    /// back to the defaults).
+    /// The symbolic link treatment: `ignore`, `portable`, or `raw`.
     pub symlink_mode: Option<String>,
-    /// The permission bits (octal) for created files (falls back to the
-    /// defaults).
+    /// The permission bits (octal) for created files.
     pub file_mode: Option<String>,
-    /// The permission bits (octal) for created directories (falls back to
-    /// the defaults).
+    /// The permission bits (octal) for created directories.
     pub directory_mode: Option<String>,
-    /// The per-file size limit (falls back to the defaults): larger files
-    /// are left on disk but excluded from synchronization.
+    /// The per-file size limit: larger files are left on disk but
+    /// excluded from synchronization.
     pub max_file_size: Option<SizeSpec>,
-    /// The limit on entries per root (falls back to the defaults). A scan
-    /// exceeding it fails the session's cycle.
+    /// The limit on entries per root. A scan exceeding it fails the
+    /// session's cycle.
     pub max_entry_count: Option<u64>,
-    /// Whether mounts inside the roots are left alone (falls back to the
-    /// defaults, then to `true`).
+    /// Whether mounts inside the roots are left alone.
     pub ignore_mounts: Option<bool>,
     /// The staging placement: `state` (the session state directory),
     /// `beside-root` (a sibling of the synchronization root, guaranteeing
     /// same-filesystem renames), or `inside-root` (within the root itself,
-    /// for roots on otherwise unwritable-home hosts). Falls back to the
-    /// defaults.
+    /// for roots on otherwise unwritable-home hosts).
     pub staging: Option<String>,
     /// The owner (name or `id:N`) for created entries, applied by each
-    /// endpoint on its own host (falls back to the defaults). Requires the
-    /// endpoint to have chown rights.
+    /// endpoint on its own host. Requires the endpoint to have chown
+    /// rights.
     pub default_owner: Option<String>,
     /// The group (name or `id:N`) for created entries, applied by each
-    /// endpoint on its own host (falls back to the defaults).
+    /// endpoint on its own host.
     pub default_group: Option<String>,
     /// Turns the whole group off: it plans no sessions at all, as though
     /// it were not written. Its state and its status records stay where
@@ -1161,7 +1152,7 @@ impl Config {
         if self.alerts.is_some() {
             bail!(
                 "invalid configuration:\n  [alerts] has moved: put `on_alert` at the top \
-                 level, and anything else that was in [alerts] under [advanced.alerts]. \
+                 level, and anything else that was in [alerts] under [experimental.alerts]. \
                  The per-state hold times are now built in, so [alerts.after] can usually \
                  just be deleted."
             );
@@ -1224,13 +1215,13 @@ impl Config {
         })
     }
 
-    /// The peering timing, from `[advanced.peering-dangerously-experimental]` and the
+    /// The peering timing, from `[experimental.peering-dangerously-experimental]` and the
     /// built-in defaults. Resolved whether or not any group is in a
     /// peering mode: a bad value is a configuration error either way.
     pub fn peering_plan(&self) -> Result<PeeringPlan> {
         if self.experimental.retired_peering.is_some() {
             bail!(
-                "invalid configuration:\n  [advanced.peering-experimental] was renamed to \
+                "invalid configuration:\n  [experimental.peering-experimental] was renamed to \
                  [experimental.peering-dangerously-experimental]: peering has known security \
                  and collision issues. Read docs/peering.md before enabling it."
             );
@@ -1498,30 +1489,27 @@ impl Config {
                 _ => group.alpha.clone(),
             };
 
-            // Widest first, narrowest last, because the last matching
-            // pattern decides: the defaults' files, then the defaults'
-            // own patterns, then the group's files, then the group's own.
-            // A group can therefore re-include something a shared file
-            // excluded, which is the point of having both.
+            // The defaults, then the group, each read straight down: the
+            // last matching pattern decides, so a group re-includes what
+            // the defaults excluded, and within one list the order on
+            // screen is the order that applies. A `file:` entry puts the
+            // file's patterns exactly where the entry sits.
             let mut ignores = Vec::new();
             let mut ignore_errors = Vec::new();
-            for (mine, names) in [
-                (false, &self.defaults.ignore_files),
-                (true, &group.ignore_files),
-            ] {
-                for file in names {
-                    match crate::scan::ignorefile::read(&ignore_directory, file) {
+            for (mine, entries) in [(false, &self.defaults.ignores), (true, &group.ignores)] {
+                for entry in entries {
+                    let Some(file) = entry.strip_prefix(IGNORE_FILE) else {
+                        ignores.push(entry.clone());
+                        continue;
+                    };
+                    match crate::scan::ignorefile::read(&ignore_directory, file.trim()) {
                         Ok(patterns) => ignores.extend(patterns),
                         Err(error) => {
-                            ignore_errors.push(blame(mine, "ignore_files", &format!("{error:#}")))
+                            ignore_errors.push(blame(mine, "ignores", &format!("{error:#}")))
                         }
                     }
                 }
-                if !mine {
-                    ignores.extend(self.defaults.ignores.iter().cloned());
-                }
             }
-            ignores.extend(group.ignores.iter().cloned());
             errors.extend(ignore_errors);
             // Compile the combined patterns now, so a bad pattern is a
             // configuration error alongside the others rather than a runtime
@@ -2232,9 +2220,16 @@ pub fn parse_word<'a>(words: &'a [Word], what: &str, given: &str) -> Result<&'a 
 /// which puts `acknowledge_secrets` above `alpha` and `disabled` nowhere
 /// near the mode it qualifies. This is the reading order; anything not
 /// named here follows, alphabetically.
+/// What marks an `ignores` entry as naming a file of patterns rather
+/// than being one.
+///
+/// A prefix rather than a second key, because the two used to be two
+/// lists applied in an order nobody could see.
+pub const IGNORE_FILE: &str = "file:";
+
 pub const ORDER: &[&str] = &[
     // The top of the file.
-    "reload",
+    "live_reload",
     "log",
     "on_alert",
     "disabled_hosts",
@@ -2245,7 +2240,6 @@ pub const ORDER: &[&str] = &[
     "mode",
     "disabled",
     "ignores",
-    "ignore_files",
     "ignore_mounts",
     "max_file_size",
     "max_entry_count",
@@ -2293,7 +2287,8 @@ pub fn unit(key: &str) -> Option<&'static str> {
         "ttl" | "timeout" => "a length of time: 30s · 5m · 2h",
         key if key.ends_with("_after") => "a length of time: 30s · 5m · 2h",
         "alpha" => "a path, or user@host:path",
-        "betas" | "disabled_hosts" | "ignores" | "ignore_files" => "one to a line",
+        "betas" | "disabled_hosts" => "one to a line",
+        "ignores" => "one to a line; file:Rust.gitignore reads a file of them",
         "on_alert" | "agent_command" => "a shell command",
         _ => return None,
     })
@@ -2335,7 +2330,7 @@ pub fn widget(key: &str) -> Option<&'static str> {
     Some(match key {
         "alpha" => "endpoint",
         "betas" => "endpoints",
-        "ignores" | "ignore_files" => "patterns",
+        "ignores" => "patterns",
         "disabled_hosts" => "hosts",
         "on_alert" => "command",
         "agent_command" => "command",
@@ -2686,7 +2681,7 @@ mod tests {
     #[ignore = "a look at the schema, not a check"]
     fn show_the_schema() {
         let document = schema();
-        for key in ["reload", "disabled_hosts", "log", "on_alert"] {
+        for key in ["live_reload", "disabled_hosts", "log", "on_alert"] {
             println!("{key}: {}", document["properties"][key]);
         }
         println!("betas: {}", document["$defs"]["Group"]["properties"]["betas"]);
@@ -2834,7 +2829,7 @@ mod tests {
             "{:#}",
             parse(
                 r#"
-                [advanced.peering-experimental]
+                [experimental.peering-experimental]
                 ttl = "30s"
 
                 [groups.g]
@@ -2893,7 +2888,7 @@ mod tests {
             r#"
             on_alert = "notify me"
 
-            [advanced.alerts]
+            [experimental.alerts]
             alert_after = "1s"
             "#,
         );
@@ -2908,37 +2903,63 @@ mod tests {
         }
     }
 
-    /// The section was called `[advanced]` first. Every configuration on
-    /// every machine says that, and none of them was going to be edited
-    /// for a word, so the old spelling still loads and still means the
-    /// same table. A file that writes both is a file that says one thing
-    /// twice, and is refused.
+    /// `file:` splices a file's patterns in where the entry sits, so one
+    /// list says everything and says it in order. The two keys this
+    /// replaced were applied files-then-patterns at each level, which
+    /// nothing on screen showed.
     #[test]
-    fn the_name_that_section_had_before_still_reads() {
-        use crate::alerts::Alert;
-        let config = parse(
+    fn a_file_entry_is_read_where_it_sits() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let ignores = keep.path().join("ignores");
+        std::fs::create_dir_all(&ignores).expect("the directory is made");
+        std::fs::write(ignores.join("Rust.gitignore"), "target/\n*.rlib\n").expect("written");
+
+        let mut config = parse(
             r#"
-            on_alert = "notify me"
+            [defaults]
+            mode = "two-way-conflict"
+            ignores = ["*.log", "file:Rust.gitignore", "!keep.log"]
 
-            [advanced]
-            allow_root = true
-
-            [advanced.alerts]
-            coalesce_after = "5s"
+            [groups.g]
+            alpha = "/tmp/a"
+            betas = ["/tmp/b"]
             "#,
         );
-        assert!(config.experimental.allow_root);
-        let plan = config.alert_plan().expect("a plan");
-        assert_eq!(plan.coalesce_after, Duration::from_secs(5));
-        // And the built-in table is still underneath it.
-        assert_eq!(plan.after(Alert::Errored), Duration::from_secs(120));
+        config.ignore_directory = Some(ignores);
+        let plans = config.plans().expect("the configuration plans");
+        assert_eq!(
+            plans[0].ignores,
+            vec!["*.log", "target/", "*.rlib", "!keep.log"],
+            "the file's patterns land where the entry was written",
+        );
+    }
 
-        let both = Config::parse(
-            std::path::Path::new("config.toml"),
-            "[experimental]\nallow_root = true\n\n[advanced]\nallow_root = false\n",
-        )
-        .expect_err("a file that writes the section twice is refused");
-        assert!(format!("{both:#}").contains("duplicate field"), "{both:#}");
+    /// A `file:` naming nothing is a configuration error, caught when the
+    /// file is read rather than when a session first walks a tree.
+    #[test]
+    fn a_file_entry_that_names_nothing_is_refused() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let ignores = keep.path().join("ignores");
+        std::fs::create_dir_all(&ignores).expect("the directory is made");
+        std::fs::write(ignores.join("Rust.gitignore"), "target/\n").expect("written");
+
+        let mut config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-conflict"
+            ignores = ["file:Nope.gitignore"]
+
+            [groups.g]
+            alpha = "/tmp/a"
+            betas = ["/tmp/b"]
+            "#,
+        );
+        config.ignore_directory = Some(ignores);
+        let refused = format!("{:#}", config.plans().expect_err("it is refused"));
+        assert!(refused.contains("ignores"), "{refused}");
+        assert!(refused.contains("Nope.gitignore"), "{refused}");
+        // And it says what there is, so the fix is one word away.
+        assert!(refused.contains("Rust.gitignore"), "{refused}");
     }
 
     /// One bad value in `[defaults]` is one fault, however many groups
@@ -3075,7 +3096,7 @@ mod tests {
         let error = format!("{:#}", config.alert_plan().expect_err("retired"));
         assert!(error.contains("[alerts] has moved"), "{error}");
         assert!(error.contains("top level"), "{error}");
-        assert!(error.contains("[advanced.alerts]"), "{error}");
+        assert!(error.contains("[experimental.alerts]"), "{error}");
     }
 
     #[test]
@@ -3084,7 +3105,7 @@ mod tests {
             r#"
             on_alert = "notify me"
 
-            [advanced.alerts.after]
+            [experimental.alerts.after]
             exploded = "1m"
             "#,
         );
@@ -4389,7 +4410,7 @@ betas = ["build.example.com:/tmp/beta"]
     fn peering_timing_is_read_defaulted_and_checked() {
         let config = parse(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             ttl = "10s"
             failover_after = 45
             [groups.g]
@@ -4404,7 +4425,7 @@ betas = ["build.example.com:/tmp/beta"]
 
         let config = parse(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             ttl = "60s"
             failover_after = "30s"
             [groups.g]
@@ -4421,7 +4442,7 @@ betas = ["build.example.com:/tmp/beta"]
         // peering group: an unknown key is refused everywhere.
         let result: std::result::Result<Config, _> = toml::from_str(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             lease = "10s"
             "#,
         );

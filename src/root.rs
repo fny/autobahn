@@ -110,7 +110,7 @@ pub fn config_allows_root(path: &Path) -> bool {
         .ok()
         .and_then(|text| text.parse::<toml::Table>().ok())
         .and_then(|table| {
-            let section = table.get("experimental").or_else(|| table.get("advanced"))?;
+            let section = table.get("experimental")?;
             section.get("allow_root")?.as_bool()
         })
         .unwrap_or(false)
@@ -192,7 +192,7 @@ mod tests {
         std::fs::write(&path, "[experimental]\nallow_root = false\n").unwrap();
         assert!(!config_allows_root(&path));
         // The name this section had before still says it.
-        std::fs::write(&path, "[advanced]\nallow_root = true\n").unwrap();
+        std::fs::write(&path, "[experimental]\nallow_root = true\n").unwrap();
         assert!(config_allows_root(&path));
         std::fs::write(&path, "not toml [").unwrap();
         assert!(!config_allows_root(&path));

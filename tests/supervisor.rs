@@ -3395,7 +3395,7 @@ fn a_session_needing_attention_runs_the_configured_hook() {
         # Deliberately the old spelling of the section: the supervisor
         # still reads a file written before `[experimental]` was named,
         # and this is where that is proved end to end.
-        [advanced.alerts]
+        [experimental.alerts]
         alert_after = "1s"
         # This case is about the hook running at all. Coalescing has its
         # own tests; without this the window would hold the hook for a

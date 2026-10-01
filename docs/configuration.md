@@ -50,14 +50,13 @@ Eight keys. Unknown keys are refused at startup, not ignored — here and in eve
 | `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. `autobahn disable --host <host>` edits it for you. |
 | `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
 | `power_saver_experimental` | bool | `false` | On battery, walk each local root in full every 10 minutes instead of every 2. That walk is the backstop for changes the watcher never reported, and on a laptop it is almost all of autobahn's idle cost; the price is that such a change can take up to 10 minutes to be found. The power source is read at most once a minute, and the log says when it changes. A remote beta's agent is unaffected. Experimental: the name will change. |
-| `reload` | bool | `true` | Whether the running supervisor re-reads this file and applies an edit in place. See [Editing it while it runs](#editing-it-while-it-runs). |
+| `live_reload` | bool | `true` | Whether the supervisor reloads this file on a change without a restart. See [Editing it while it runs](#editing-it-while-it-runs). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
 | `[experimental.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
 | `[experimental.peering-dangerously-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
 | `experimental.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
 
-`[experimental]` was called `[advanced]`. The old name is still read and still means the same table, so nothing has to be edited; write only one of the two, because a file that names both is refused as the duplicate it is.
 
 Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log`, `power_saver_experimental` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
@@ -72,7 +71,6 @@ Fourteen keys live in both `[defaults]` and any group, with the group winning. F
 | `disabled` | group | `false` | Turns the group off: no sessions, and its settings are not checked. State is kept, so turning it back on resumes. `autobahn disable --group <name>` sets it. Not to be confused with the top-level `disabled_hosts`. |
 | `mode` | both | required | Synchronization mode. See [Modes](./modes.md). No default — direction is never guessed. |
 | `ignores` | both | `[]` | Gitignore-style patterns. Defaults' patterns apply first, then the group's. See [Ignores](./ignores.md). |
-| `ignore_files` | both | `[]` | Files of patterns, by name or path. See [Ignores](./ignores.md). |
 | `interval` | both | `5` | Seconds between heartbeat cycles. Watching makes this a fallback, not the reaction time. Floored at 1. |
 | `symlink_mode` | both | `"raw"` | `raw` (sync verbatim), `portable` (validate portability), or `ignore`. |
 | `file_mode` / `directory_mode` | both | `600` / `700` | Octal permissions for created files and directories. |
@@ -127,7 +125,7 @@ The running supervisor reads the file every two seconds and acts on an edit once
 - **It loads.** The sessions wind down between cycles and start again under the new configuration, in the same process: groups added start, groups removed stop, and a group whose settings changed starts over from its kept state. `status` and `mi` show the new sessions; `autobahn watch` on a terminal repaints with them.
 - **It is refused.** The sessions keep running under the configuration that last loaded, and the refusal is said everywhere the supervisor speaks: the log, `status` (a line above the sessions), `mi` (a line under the sign), the tray (a line in the menu, and a notification), and `on_alert` (one firing, `AUTOBAHN_STATES=config`, `AUTOBAHN_EVENT=config`). The line stands until the file loads again. Nothing is retried in the meantime, and the next edit is judged on its own.
 
-`reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
+`live_reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
 
 ## See also
 

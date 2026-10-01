@@ -19,11 +19,13 @@ Patterns are compiled once, at startup, and a bad one is a configuration error r
 
 ## Where patterns come from
 
-Widest first, and last match wins, so a group can re-include something a shared file excluded:
+The defaults, then the group, each read straight down the list. Last match wins, so a group can re-include something the defaults excluded:
 
 ```
-defaults.ignore_files  →  defaults.ignores  →  group.ignore_files  →  group.ignores
+defaults.ignores  →  group.ignores
 ```
+
+Within one list the order written is the order applied, including the files a `file:` entry pulls in.
 
 ## Ignore files
 
@@ -31,13 +33,20 @@ A useful ignore list for a language ecosystem runs to dozens of lines, which is 
 
 ```toml
 [defaults]
-ignore_files = ["common.gitignore"]
+ignores = ["file:common.gitignore"]
 
 [groups.work]
-ignore_files = ["Rust.gitignore", "~/dotfiles/node.gitignore"]
+ignores = [
+  "file:Rust.gitignore",
+  "target/",
+  "!target/keep-me",
+  "file:~/dotfiles/node.gitignore",
+]
 ```
 
-An entry is one of two things, decided by whether it looks like a path:
+An entry beginning `file:` names a file of patterns rather than being one. Its patterns are read in where the entry sits, so a pattern after it can re-include something it excluded — which the two separate keys this replaced could not express.
+
+What follows `file:` is one of two things, decided by whether it looks like a path:
 
 - A bare file name is a file in `~/.autobahn/ignores`, named exactly. Nothing is appended, and the directory is not searched for something close, so `"Rust"` does not find `Rust.gitignore`.
 - Anything with a separator, or starting with `~`, is a path taken as written; `~/` expands against the home directory.
@@ -68,6 +77,6 @@ An ignore says which files synchronization carries, not which files exist. Delet
 
 ## See also
 
-- [Configuration](./configuration.md) — the `ignores` and `ignore_files` keys
+- [Configuration](./configuration.md) — the `ignores` key
 - [Overlapping and nested roots](./nesting.md) — ignoring an inner root
 - [Safety](./safety.md) — what is never removed

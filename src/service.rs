@@ -530,7 +530,7 @@ pub fn stop() -> Result<()> {
 }
 
 /// Stops and starts the registered service — after an upgrade of the
-/// binary, or a configuration edit when `reload = false`.
+/// binary, or a configuration edit when `live_reload = false`.
 pub fn restart() -> Result<()> {
     if state()? == ServiceState::NotInstalled {
         bail!(

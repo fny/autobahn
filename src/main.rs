@@ -192,7 +192,7 @@ enum Command {
     /// login; `uninstall` makes it stay gone.
     Stop,
     /// Stop and start the login service — after an upgrade, or after a
-    /// configuration edit when the configuration sets `reload = false`.
+    /// configuration edit when the configuration sets `live_reload = false`.
     Restart,
     /// Everything that needs you: conflicts, blocked paths, and halts,
     /// grouped by cause with the command that clears each one.
@@ -4018,7 +4018,7 @@ fn run_availability(
             );
         }
     }
-    println!("  a running supervisor applies it; with `reload = false`, `autobahn restart`");
+    println!("  a running supervisor applies it; with `live_reload = false`, `autobahn restart`");
     Ok(())
 }
 

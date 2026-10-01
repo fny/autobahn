@@ -7,10 +7,10 @@
 //!
 //! ```toml
 //! [defaults]
-//! ignore_files = ["common.gitignore"]
+//! ignores = ["file:common.gitignore"]
 //!
 //! [groups.work]
-//! ignore_files = ["Rust.gitignore", "Node.gitignore"]
+//! ignores = ["file:Rust.gitignore", "file:Node.gitignore"]
 //! ```
 //!
 //! A name is the file's name exactly, extension and capitals included.

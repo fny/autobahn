@@ -26,7 +26,10 @@ use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::text::{SelectionFormat, TextView};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::{Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode};
+use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
+use gpui_kit::component::{
+    Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
@@ -398,9 +401,6 @@ pub struct Desk {
     /// The group the name in that field would rename, when it is a
     /// rename rather than a new one.
     renaming: Option<String>,
-    /// The group a Remove is waiting on a second click for. Nothing
-    /// that takes settings out of a file happens on one click.
-    removing: Option<String>,
     /// Whether the loader's complaints are unfolded. Shut by default:
     /// the line beside Save says there is one, which is all most of
     /// them need to say.
@@ -554,7 +554,6 @@ impl Desk {
             presence,
             naming: None,
             renaming: None,
-            removing: None,
             showing_faults: false,
             at_fields: std::collections::HashMap::new(),
             at_warned: std::collections::HashMap::new(),
@@ -2666,9 +2665,6 @@ impl Desk {
                             Section::Group(name) => Some(name.clone()),
                             _ => None,
                         };
-                        let asking = name.as_deref().is_some_and(|name| {
-                            self.removing.as_deref() == Some(name)
-                        });
                         let crew = SharedString::from(format!("row-{label}"));
                         div()
                             .id(SharedString::from(format!("section-{label}")))
@@ -2692,76 +2688,42 @@ impl Desk {
                             .when(blamed.as_ref() == Some(&section), |row| row.child(dot(RED)))
                             .when_some(name.clone(), |row, name| {
                                 let renaming = name.clone();
-                                let arming = name.clone();
-                                row
-                                    // Asking is a state of the row, so it
-                                    // stays visible while it is asked.
-                                    .when(asking, |row| {
-                                        row.child(
-                                            div()
-                                                .text_size(px(10.5))
-                                                .text_color(rgb(FAINT))
-                                                .child(t("group.sure")),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!("yes-{name}")))
-                                                .px(step(1.))
-                                                .text_size(px(10.5))
-                                                .text_color(rgb(RED))
-                                                .child(t("group.yes"))
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    cx.stop_propagation();
-                                                    this.drop(&name);
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    })
-                                    .when(!asking, |row| {
-                                        row.child(
-                                            div()
-                                                .id(SharedString::from(format!(
-                                                    "edit-{renaming}"
-                                                )))
-                                                .text_color(rgba(0x00000000))
-                                                .group_hover(crew.clone(), |glyph| {
-                                                    glyph.text_color(rgb(FAINT))
-                                                })
-                                                .hover(|glyph| glyph.text_color(rgb(INK)))
-                                                .text_size(px(11.))
-                                                .child("\u{270e}")
-                                                .on_click(cx.listener(move |this, _, window, cx| {
-                                                    // The row beneath selects a
-                                                    // section; this does not.
-                                                    cx.stop_propagation();
-                                                    this.rename_from(&renaming, window, cx);
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!("drop-{arming}")))
-                                                .text_color(rgba(0x00000000))
-                                                .group_hover(crew.clone(), |glyph| {
-                                                    glyph.text_color(rgb(FAINT))
-                                                })
-                                                .hover(|glyph| glyph.text_color(rgb(RED)))
-                                                .text_size(px(11.))
-                                                .child("\u{2715}")
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    // Without this the row's own
-                                                    // handler runs next and clears
-                                                    // what this just armed.
-                                                    cx.stop_propagation();
-                                                    this.removing = Some(arming.clone());
-                                                    cx.notify();
-                                                })),
-                                        )
-                                    })
+                                let dropping = name.clone();
+                                row.child(
+                                    div()
+                                        .id(SharedString::from(format!("edit-{renaming}")))
+                                        .text_color(rgba(0x00000000))
+                                        .group_hover(crew.clone(), |glyph| {
+                                            glyph.text_color(rgb(FAINT))
+                                        })
+                                        .hover(|glyph| glyph.text_color(rgb(INK)))
+                                        .text_size(px(11.))
+                                        .child("\u{270e}")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            // The row beneath selects a section;
+                                            // this does not.
+                                            cx.stop_propagation();
+                                            this.ask_rename(&renaming, window, cx);
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .id(SharedString::from(format!("drop-{dropping}")))
+                                        .text_color(rgba(0x00000000))
+                                        .group_hover(crew.clone(), |glyph| {
+                                            glyph.text_color(rgb(FAINT))
+                                        })
+                                        .hover(|glyph| glyph.text_color(rgb(RED)))
+                                        .text_size(px(11.))
+                                        .child("\u{2715}")
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.ask_drop(&dropping, window, cx);
+                                        })),
+                                )
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.section = section.clone();
-                                this.removing = None;
                                 cx.notify();
                             }))
                     }))
@@ -2829,75 +2791,100 @@ impl Desk {
             .into_any_element()
     }
 
-    /// The line that makes a group: a button, or a field and two more.
+    /// The one row under the list: a plus that opens the naming dialog.
     fn naming(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(field) = self.naming.clone() else {
-            return div()
-                .pt(step(2.))
-                .px(step(1.5))
-                // A flex row, so the button is the width of its label
-                // rather than the width of the column it sits in.
-                .flex()
-                .child(
-                    Button::new("new-group")
-                        .small()
-                        .ghost()
-                        .label(t("group.add"))
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            let field = cx.new(|cx| {
-                                TextareaState::new(window, cx).placeholder(t("group.name_it"))
-                            });
-                            field.update(cx, |field, cx| field.focus(window, cx));
-                            this.naming = Some(field);
-                            this.renaming = None;
-                            cx.notify();
-                        })),
-                )
-                .into_any_element();
-        };
         div()
             .pt(step(2.))
             .px(step(1.5))
+            // A flex row, so the button is the width of its label
+            // rather than the width of the column it sits in.
             .flex()
-            .flex_col()
-            .gap(step(1.5))
-            .child(Textarea::new(&field).bordered(true))
             .child(
-                div()
-                    .flex()
-                    .gap(step(1.5))
-                    .child(
-                        Button::new("make-group")
-                            .xsmall()
-                            .primary()
-                            .label(t("group.make"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.make(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        Button::new("cancel-group")
-                            .xsmall()
-                            .ghost()
-                            .label(t("group.cancel"))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.naming = None;
-                                cx.notify();
-                            })),
-                    ),
+                Button::new("new-group")
+                    .small()
+                    .ghost()
+                    .label(t("group.add"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.ask_name(None, window, cx);
+                    })),
             )
             .into_any_element()
     }
 
-    /// Starts a rename: the naming field, with the old name in it.
-    fn rename_from(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let held = name.to_owned();
-        let field = cx.new(|cx| TextareaState::new(window, cx).default_value(held.clone()));
+    /// Asks for a name — for a group being made, or one being renamed.
+    ///
+    /// A dialog rather than a field under the list: naming a group is a
+    /// thing a person starts and finishes, and a window that keeps the
+    /// rest of itself live underneath invites them to wander off and
+    /// leave a half-typed name sitting in a corner.
+    fn ask_name(&mut self, from: Option<&str>, window: &mut Window, cx: &mut Context<Self>) {
+        let held = from.map(str::to_owned);
+        let field = cx.new(|cx| {
+            let field = TextareaState::new(window, cx).placeholder(t("group.name_it"));
+            match &held {
+                Some(name) => field.default_value(name.clone()),
+                None => field,
+            }
+        });
         field.update(cx, |field, cx| field.focus(window, cx));
-        self.naming = Some(field);
-        self.renaming = Some(held);
-        self.removing = None;
+        self.naming = Some(field.clone());
+        self.renaming = held.clone();
+        let desk = cx.entity().downgrade();
+        let title = match held.is_some() {
+            true => t("group.rename_title"),
+            false => t("group.new_title"),
+        };
+        window.open_dialog(cx, move |dialog: Dialog, _, _| {
+            let desk = desk.clone();
+            dialog
+                .title(title)
+                .child(Textarea::new(&field).bordered(true))
+                .button_props(
+                    DialogButtonProps::default()
+                        .show_cancel(true)
+                        .ok_text(t("group.make")),
+                )
+                .on_ok(move |_, _, cx| {
+                    if let Some(desk) = desk.upgrade() {
+                        desk.update(cx, |desk, cx| {
+                            desk.make(cx);
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+        });
+        cx.notify();
+    }
+
+    /// The same, for the pencil on a row.
+    fn ask_rename(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.ask_name(Some(name), window, cx);
+    }
+
+    /// Asks before a group leaves the file, and says what it cannot do.
+    fn ask_drop(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let name = name.to_owned();
+        let desk = cx.entity().downgrade();
+        let question = fill("group.removing", &[("name", &name)]);
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let desk = desk.clone();
+            let name = name.clone();
+            alert
+                .title(t("group.remove_title"))
+                .description(question.clone())
+                .show_cancel(true)
+                .on_ok(move |_, _, cx| {
+                    if let Some(desk) = desk.upgrade() {
+                        desk.update(cx, |desk, cx| {
+                            desk.drop(&name);
+                            cx.notify();
+                        });
+                    }
+                    true
+                })
+        });
+        cx.notify();
     }
 
     /// Makes the group the field names, or renames the open one to it.
@@ -2941,7 +2928,6 @@ impl Desk {
             None => {
                 self.said = Some(fill("group.removed", &[("name", name)]));
                 self.section = Section::Settings;
-                self.removing = None;
                 self.fields.clear();
                 self.choices.clear();
                 self.lists.clear();

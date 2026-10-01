@@ -1217,6 +1217,13 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             .rsplit_once(':')
             .map(|(_, path)| path.to_owned())
             .unwrap_or_else(|| name.to_owned());
+        // The leader names this host's own root in the pushed name; what
+        // this host lets be synced is its own to say.
+        if let Some(state_root) = directory.parent() {
+            crate::host::HostSettings::load(state_root)?
+                .check_root(&crate::paths::expand_tilde(&own_path)?)
+                .with_context(|| format!("group {group_name}: the pushed name {name:?}"))?;
+        }
         // The other betas as they were, and the configured alpha as a
         // beta spec reached by attachment — so the star is never empty,
         // and the attached plan gets every setting the group carries.
@@ -1390,6 +1397,26 @@ mod star_tests {
             "{:?}",
             star.plans
         );
+    }
+
+    /// The leader names a follower's own root in the pushed name; with the
+    /// follower's `host.toml` naming the folders it serves, a name outside
+    /// them refuses the star, naming the group.
+    #[test]
+    fn a_pushed_root_outside_what_this_host_serves_is_refused() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let state = keep.path().join("state");
+        let directory = state.join(DIRECTORY);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(state.join(crate::host::FILE), "roots = [\"/srv\"]\n").unwrap();
+        let error = derive_star(PUSHED, "ubuntu@vm:/home/faraz/Workspace/Voltai", &directory)
+            .expect_err("outside /srv");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("group g") && message.contains("outside the folders"),
+            "{message}"
+        );
+        derive_star(PUSHED, "box2:/srv/ws", &directory).expect("inside /srv");
     }
 
     /// Two groups reach one host at two roots. Each pushes its own name

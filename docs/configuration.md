@@ -127,6 +127,18 @@ The running supervisor reads the file every two seconds and acts on an edit once
 
 `reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
 
+## This machine's own settings
+
+`~/.autobahn/host.toml` holds what a machine allows, whoever asks. It is read by that machine alone: no controller sends it and no leader pushes it, so it holds against both. It is not a configuration — a machine with `config.toml` runs its own sessions, and a peering beta has none — so any machine can have one, controller or server.
+
+```toml
+# The folders an agent on this machine serves, whichever controller connects,
+# and the only ones a peering beta leading from here syncs as its own.
+roots = ["~/Workspace", "/srv/shared"]
+```
+
+Without `roots`, or without the file, an agent serves any folder its user can reach, as it always has. With it, a root is judged where it really is, through every symbolic link on the way, and a root outside every listed folder is refused: the session fails to connect, and says why. A file that does not parse refuses everything, so a typo never lifts a restriction.
+
 ## See also
 
 - [Modes](./modes.md) — which to pick, and what each does case by case

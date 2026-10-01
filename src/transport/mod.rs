@@ -1488,6 +1488,8 @@ fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Res
     // that a configuration like `alpha = "~/project"` fanned out to several
     // hosts lands in each host's own home rather than a literal `~`.
     let root = crate::paths::expand_tilde(&initialize.root)?;
+    // What this machine serves is its own to say, whoever is asking.
+    crate::host::HostSettings::load(state_root)?.check_root(&root)?;
     let staging_area = state_root.join("staging");
     let state_staging = staging_area.join(format!("{}-{}", initialize.session, initialize.side));
     let staging_root = crate::endpoint::local::staging_root_for(
@@ -2204,6 +2206,50 @@ pub(crate) mod tests {
                 "{error:#}"
             );
         });
+    }
+
+    /// What an agent serves is its machine's to say: with `host.toml`
+    /// naming the folders served, a root outside them is refused, whoever
+    /// asks, and one inside is served.
+    #[test]
+    fn an_agent_serves_only_the_folders_its_machine_allows() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state = keep.path().join("state");
+        let served = keep.path().join("served");
+        let elsewhere = keep.path().join("elsewhere");
+        for directory in [&state, &served, &elsewhere] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            state.join(crate::host::FILE),
+            format!("roots = [{:?}]\n", served.display()),
+        )
+        .unwrap();
+        let initialize = |root: &std::path::Path| Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier("a", "b"),
+            ignores: Vec::new(),
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "beta".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+            one_shot: true,
+        };
+        let error = create_endpoint(&initialize(&elsewhere), &Ok(state.clone()))
+            .err()
+            .expect("outside what this machine serves");
+        assert!(
+            format!("{error:#}").contains("outside the folders"),
+            "{error:#}"
+        );
+        create_endpoint(&initialize(&served.join("project")), &Ok(state))
+            .expect("inside what this machine serves");
     }
 
     /// A genuine session and side are served, under the agent's state area.

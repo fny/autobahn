@@ -472,20 +472,11 @@ impl Bar {
             (None, None) => {}
         }
         if let Some(tray) = &self.tray {
+            // The icon is the whole signal: its colour says whether
+            // anything needs a person, and the tooltip says what. A name
+            // beside it only repeated the colour and moved every other
+            // menu bar item along as groups came and went.
             let _ = tray.set_tooltip(Some(fill("menu.tooltip", &[("summary", &summary)])));
-            // The menu bar carries the name of whatever needs attention.
-            // One group is named outright; several are the worst one and
-            // a count, because the menu bar is not a place for a list.
-            let troubled = troubled_groups(report);
-            let title = match troubled.split_first() {
-                None => None,
-                Some((first, [])) => Some(first.clone()),
-                Some((first, rest)) => Some(fill(
-                    "menu.and_more",
-                    &[("first", first), ("count", &rest.len().to_string())],
-                )),
-            };
-            tray.set_title(title.as_deref());
         }
 
         for (group, items) in report.groups.iter().zip(model.groups.iter_mut()) {
@@ -1098,39 +1089,6 @@ pub(crate) fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
             )
         })
         .collect()
-}
-
-/// The groups that need a person, worst first.
-///
-/// The coloured dot says *that* something is wrong; this says *which*,
-/// beside the icon, without opening the menu. It mirrors the states
-/// `health_of` treats as trouble, so the name and the colour can never
-/// disagree about whether there is a problem.
-pub(crate) fn troubled_groups(report: &StatusReport) -> Vec<String> {
-    if !report.supervisor_running {
-        return Vec::new();
-    }
-    // Lower ranks are worse, so the group named first is the one to look
-    // at first.
-    let rank = |state: &str| match state {
-        "halted" | "unreachable" | "errored" => Some(0u8),
-        "conflicts" | "blocked" => Some(1u8),
-        _ => None,
-    };
-    let mut troubled: Vec<(u8, String)> = report
-        .groups
-        .iter()
-        .filter_map(|group| {
-            group
-                .sessions
-                .iter()
-                .filter_map(|session| rank(session.state.as_str()))
-                .min()
-                .map(|worst| (worst, group.name.clone()))
-        })
-        .collect();
-    troubled.sort_by_key(|(worst, _)| *worst);
-    troubled.into_iter().map(|(_, name)| name).collect()
 }
 
 /// How a group is named in the menu: its root, its name, and — when it is

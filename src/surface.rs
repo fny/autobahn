@@ -337,7 +337,6 @@ pub(crate) fn holds(field: &serde_json::Value) -> Holds {
 pub(crate) const SILENT_AT_THE_TOP: &[&str] = &[
     "groups",
     "defaults",
-    "advanced",
     "experimental",
     "disabled",
     "alerts",
@@ -418,25 +417,12 @@ pub(crate) fn table_for<'a>(
     }
 }
 
-/// The `[experimental]` table, or the `[advanced]` one a file written
-/// before the rename already has.
-///
-/// Whichever is there is the one written to. Making the new one beside
-/// the old would leave a file saying the same thing twice, which the
-/// parser refuses as a duplicate — so an old file stays an old file
-/// until somebody renames the header themselves.
+/// The `[experimental]` table, made if the file has none.
 fn experimental<'a>(
     document: &'a mut toml_edit::DocumentMut,
 ) -> Option<&'a mut toml_edit::Table> {
-    let name = match document.contains_key("experimental") {
-        true => "experimental",
-        false => match document.contains_key("advanced") {
-            true => "advanced",
-            false => "experimental",
-        },
-    };
     document
-        .entry(name)
+        .entry("experimental")
         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
 }
@@ -447,12 +433,7 @@ fn in_document(
     section: &Section,
     key: &str,
 ) -> Option<toml_edit::Item> {
-    // Read from whichever spelling the file has, as the parser does.
-    let tuning = || {
-        document
-            .get("experimental")
-            .or_else(|| document.get("advanced"))
-    };
+    let tuning = || document.get("experimental");
     let table: &toml_edit::Item = match section {
         Section::Settings => document.as_item(),
         Section::Defaults => document.get("defaults")?,
@@ -550,7 +531,7 @@ pub(crate) fn faults(refusal: &str) -> Vec<String> {
 /// One fault, matched to the field it is about.
 ///
 /// The loader names the key it was reading — "the defaults'
-/// ignore_files: …", "group 'aws': max_file_size: …" — which is what
+/// ignores: …", "group 'aws': max_file_size: …" — which is what
 /// lets a form put the complaint under the control that caused it
 /// rather than in a paragraph at the top of the pane.
 ///
@@ -593,8 +574,8 @@ pub(crate) fn fault_at(fault: &str) -> Option<At> {
                 }
                 let section = match table {
                     "" => Section::Settings,
-                    "experimental" | "advanced" => Section::Advanced,
-                    "experimental.alerts" | "advanced.alerts" => Section::Alerts,
+                    "experimental" => Section::Advanced,
+                    "experimental.alerts" => Section::Alerts,
                     table if table.contains("peering") => Section::Peering,
                     _ => return None,
                 };
@@ -1033,27 +1014,165 @@ pub(crate) fn reveal(file: &std::path::Path) -> String {
     }
 }
 
-/// The `autobahn` command, for the things a window asks it to do.
+/// Every directory worth asking, in the order it is worth asking it.
+///
+/// A window opened from the Finder inherits almost no PATH — not the
+/// shell's, and in particular not `~/.local/bin`, which is where the
+/// installer puts the command. So these are asked for by name. PATH is
+/// asked as well, in `found`, for a window started from a terminal; it
+/// is not listed here because a developer's PATH is thirty entries of
+/// noise and the welcome pane has to be readable.
+pub(crate) fn looked_in() -> Vec<PathBuf> {
+    let mut places = Vec::new();
+    let mut add = |folder: PathBuf| {
+        if !places.contains(&folder) {
+            places.push(folder);
+        }
+    };
+    if let Some(beside) = std::env::current_exe()
+        .ok()
+        .and_then(|here| here.parent().map(std::path::Path::to_path_buf))
+    {
+        add(beside);
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        add(PathBuf::from(&home).join(".local").join("bin"));
+    }
+    add(PathBuf::from("/usr/local/bin"));
+    add(PathBuf::from("/opt/homebrew/bin"));
+    places
+}
+
+/// Whether a file is there and can be run. A directory of the right
+/// name, or a file with no execute bit, is not the command.
+fn runnable(path: &std::path::Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .is_ok_and(|about| about.is_file() && about.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    path.is_file()
+}
+
+/// The `autobahn` command, if this machine has one.
 ///
 /// Not `current_exe`, which is what this used to be: the kit window is
 /// its own binary, so every `resolve` and `diff` it ran was handed to
 /// `autobahn-dash`, which answered "unknown argument resolve" and
-/// looked like a button that did nothing. The command is looked for
-/// beside this executable first — a bundle, a target directory, a
-/// `~/.local/bin` all put the two together — and then left to PATH.
-pub(crate) fn exe() -> PathBuf {
-    let here = std::env::current_exe().ok();
-    if let Some(here) = &here {
+/// looked like a button that did nothing.
+pub(crate) fn found() -> Option<PathBuf> {
+    if let Some(here) = std::env::current_exe().ok() {
         if here.file_name().is_some_and(|name| name == "autobahn") {
-            return here.clone();
-        }
-        if let Some(beside) = here.parent().map(|folder| folder.join("autobahn")) {
-            if beside.is_file() {
-                return beside;
-            }
+            return Some(here);
         }
     }
-    PathBuf::from("autobahn")
+    let on_path = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect::<Vec<PathBuf>>())
+        .unwrap_or_default();
+    looked_in()
+        .into_iter()
+        .chain(on_path)
+        .map(|folder| folder.join("autobahn"))
+        .find(|candidate| runnable(candidate))
+}
+
+/// The command, or its bare name — which fails the same way every other
+/// missing command does, and is what the welcome pane exists to avoid.
+pub(crate) fn exe() -> PathBuf {
+    found().unwrap_or_else(|| PathBuf::from("autobahn"))
+}
+
+/// Whether there is anything to shell out to at all. Every button in
+/// the window that is not the welcome pane depends on this.
+pub(crate) fn installed() -> bool {
+    found().is_some()
+}
+
+/// The installer, as it was when this window was built.
+///
+/// Embedded rather than fetched: running a shell script downloaded at
+/// the moment of use would put the weakest link at the end of the
+/// chain. The release it downloads is still checked — the script tests
+/// every file against the release's SHA256SUMS, and against the
+/// signing key when minisign is installed — but the script doing the
+/// checking is the one that shipped here.
+pub(crate) const INSTALLER: &str = include_str!("../scripts/install.sh");
+
+/// The same thing by hand, for somebody who would rather read it first.
+pub(crate) const INSTALL_LINE: &str =
+    "curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh";
+
+/// Where the installer's account of itself is kept. The log pane tails
+/// this like any other log, which is how the install is watched.
+pub(crate) fn install_log(state_root: &std::path::Path) -> PathBuf {
+    state_root.join("install.log")
+}
+
+/// Runs the embedded installer, with everything it says going to
+/// `install.log` as it is said rather than at the end.
+///
+/// The script's own default directory is `~/.local/bin`, so no
+/// `--bin-dir` is passed: this is the documented one-liner, run from
+/// here. It takes as long as a download takes, so it belongs on a
+/// background thread.
+pub(crate) fn install(state_root: &std::path::Path) -> Result<PathBuf, String> {
+    use std::io::Write;
+    let blame = |what: &str, error: std::io::Error| format!("{what}: {error}");
+    std::fs::create_dir_all(state_root).map_err(|error| blame("the state root", error))?;
+
+    // Written where it can be read afterwards, and removed when it is
+    // done: a script that runs is a script somebody may want to see.
+    let script = std::env::temp_dir().join(format!("autobahn-install-{}.sh", std::process::id()));
+    std::fs::write(&script, INSTALLER).map_err(|error| blame("the installer", error))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700));
+    }
+
+    let path = install_log(state_root);
+    let log = std::fs::File::create(&path).map_err(|error| blame("the install log", error))?;
+    let errors = log.try_clone().map_err(|error| blame("the install log", error))?;
+
+    // The child writes straight into the file, so the log grows while
+    // the install runs rather than arriving in one piece at the end.
+    let mut command = std::process::Command::new("sh");
+    command.arg(&script);
+    command.stdout(std::process::Stdio::from(log));
+    command.stderr(std::process::Stdio::from(errors));
+    // A window started from the Finder has almost no PATH, and the
+    // script needs curl, tar and uname. The inherited PATH is kept
+    // after them so a terminal's own answer still wins where it has one.
+    let inherited = std::env::var("PATH").unwrap_or_default();
+    command.env("PATH", format!("/usr/bin:/bin:/usr/sbin:/sbin:{inherited}"));
+
+    let status = command.status().map_err(|error| blame("sh", error));
+    let _ = std::fs::remove_file(&script);
+    let status = status?;
+
+    let mut note = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&path)
+        .map_err(|error| blame("the install log", error))?;
+    match found() {
+        Some(command) if status.success() => {
+            let _ = writeln!(note, "installed: {}", command.display());
+            Ok(command)
+        }
+        Some(command) => {
+            let _ = writeln!(note, "the installer failed, but a command is here: {}", command.display());
+            Ok(command)
+        }
+        None => {
+            let _ = writeln!(note, "the installer finished and no command is here");
+            Err(fill(
+                "welcome.install_failed",
+                &[("status", &status.to_string())],
+            ))
+        }
+    }
 }
 
 /// Runs one of the command's own subcommands and says what it said.
@@ -1470,27 +1589,10 @@ impl Sheet {
 mod tests {
     use super::*;
 
-    /// An edit must not turn one section into two. A file written before
-    /// the rename says `[advanced]`, the parser still reads it, and a
-    /// window that wrote `[experimental]` beside it would leave a file
-    /// that names the same table twice — which the parser refuses, on
-    /// the next save, for a change the person did not make.
+    /// A file with no experimental table gets one under the name the
+    /// section has now.
     #[test]
-    fn a_file_that_says_advanced_goes_on_saying_advanced() {
-        let path = std::path::Path::new("config.toml");
-        let text = "[advanced]\nallow_root = false\n\n\
-                    [groups.notes]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
-        let mut document: toml_edit::DocumentMut = text.parse().expect("the file parses");
-
-        table_for(&mut document, &Section::Alerts)
-            .expect("the table is there")
-            .insert("coalesce_after", toml_edit::value("5s"));
-        let written = document.to_string();
-        assert!(written.contains("[advanced.alerts]"), "{written}");
-        assert!(!written.contains("[experimental"), "{written}");
-        crate::config::Config::parse(path, &written).expect("the parser takes it");
-
-        // A file with neither gets the name the section has now.
+    fn a_fresh_file_gets_the_name_the_section_has() {
         let mut fresh: toml_edit::DocumentMut = "".parse().expect("an empty file parses");
         table_for(&mut fresh, &Section::Advanced)
             .expect("the table is made")
@@ -1515,12 +1617,12 @@ mod tests {
     fn one_bad_value_inherited_everywhere_is_one_fault() {
         let refusal = format!(
             "invalid configuration:\n{}",
-            ["  the defaults' ignore_files: no ignore file named \"asdfasdf\" in /x"; 3]
+            ["  the defaults' ignores: no ignore file named \"asdfasdf\" in /x"; 3]
                 .join("\n")
         );
         let one = faults(&refusal);
         assert_eq!(one.len(), 1, "{one:?}");
-        assert!(one[0].starts_with("the defaults' ignore_files"), "{one:?}");
+        assert!(one[0].starts_with("the defaults' ignores"), "{one:?}");
         assert_eq!(blamed(&refusal), Some(Section::Defaults));
 
         // Two different faults stay two, and a group's own fault keeps
@@ -1589,12 +1691,12 @@ mod tests {
     #[test]
     fn a_fault_that_names_its_key_lands_on_that_field() {
         let at = fault_at(
-            "the defaults' ignore_files: no ignore file named \"asdfasdf\" in \
+            "the defaults' ignores: no ignore file named \"asdfasdf\" in \
              /Users/x/.autobahn/ignores (available: Node.gitignore, Rust.gitignore)",
         )
         .expect("it names a key");
         assert_eq!(at.section, Section::Defaults);
-        assert_eq!(at.key, "ignore_files");
+        assert_eq!(at.key, "ignores");
         assert_eq!(at.instead, vec!["Node.gitignore", "Rust.gitignore"]);
         assert!(!at.said.contains("available"), "{}", at.said);
         assert!(at.said.starts_with("no ignore file named"), "{}", at.said);

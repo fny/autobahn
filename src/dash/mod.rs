@@ -30,7 +30,8 @@ use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
 use gpui_kit::component::{
-    Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode, WindowExt as _,
+    Disableable as _, Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode,
+    WindowExt as _,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -112,6 +113,10 @@ impl Room {
 /// The panes, in the order the rail lists them.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
+    /// Only ever listed when there is no `autobahn` to talk to, which is
+    /// the one state where none of the other panes can say anything
+    /// true.
+    Welcome,
     Groups,
     Hosts,
     Conflicts,
@@ -123,6 +128,7 @@ enum Pane {
 impl Pane {
     fn title(self) -> &'static str {
         match self {
+            Pane::Welcome => t("pane.welcome"),
             Pane::Groups => t("pane.groups"),
             Pane::Hosts => t("pane.hosts"),
             Pane::Conflicts => t("pane.conflicts"),
@@ -136,6 +142,7 @@ impl Pane {
     /// there is nothing to draw and nothing to ship.
     fn icon(self) -> IconName {
         match self {
+            Pane::Welcome => IconName::SquareTerminal,
             Pane::Groups => IconName::Folder,
             Pane::Hosts => IconName::Network,
             Pane::Conflicts => IconName::TriangleAlert,
@@ -150,6 +157,7 @@ impl Pane {
     /// sentence saying so is a sentence in the way.
     fn about(self) -> &'static str {
         match self {
+            Pane::Welcome => t("pane.welcome_about"),
             Pane::Groups => "",
             Pane::Conflicts => t("pane.conflicts_about"),
             Pane::Config => t("pane.config_about"),
@@ -210,6 +218,7 @@ fn open_window(
                         None => (pane, None),
                     };
                     dash.pane = match pane {
+                        "welcome" => Pane::Welcome,
                         "conflicts" => Pane::Conflicts,
                         "config" => Pane::Config,
                         "log" => Pane::Log,
@@ -220,7 +229,7 @@ fn open_window(
                     if let Some(section) = section {
                         dash.section = match section {
                             "defaults" => Section::Defaults,
-                            "advanced" => Section::Advanced,
+                            "experimental" => Section::Advanced,
                             "alerts" => Section::Alerts,
                             "peering" => Section::Peering,
                             "settings" => Section::Settings,
@@ -429,6 +438,13 @@ pub struct Dash {
     knocked_at: Option<Instant>,
     shape: serde_json::Value,
     said: Option<String>,
+    /// Whether there is an `autobahn` to talk to. Read once at the
+    /// start and again after an install, because it is the answer to
+    /// "is this window of any use yet".
+    ready: bool,
+    /// Whether an install is running. The button it came from is not
+    /// offered twice, and the log is what says how it is going.
+    installing: bool,
 }
 
 /// Runs the window until it is closed.
@@ -530,11 +546,21 @@ impl Dash {
             .find(|name| names.iter().any(|known| known == name))
             .unwrap_or("Menlo");
         let presence = crate::dock::read(&state_root);
+        // Every other pane shells out to `autobahn` for what it shows.
+        // With no command to shell out to they are all empty in the same
+        // uninformative way, so the window opens on the one pane that can
+        // explain why.
+        let ready = surface::installed();
         let mut dash = Dash {
             config,
             mono: SharedString::from(mono.to_owned()),
             state_root,
-            pane: Pane::Groups,
+            pane: match ready {
+                true => Pane::Groups,
+                false => Pane::Welcome,
+            },
+            ready,
+            installing: false,
             room: Room::Wide,
             report: None,
             read_at: None,
@@ -580,7 +606,10 @@ impl Dash {
                 let carried = this.update(cx, |this, cx| {
                     // A tailing log asks for a frame of its own: the reading
                     // itself needs a window, and only `render` has one.
-                    if this.refresh_if_due() || (this.log_tail && this.pane == Pane::Log) {
+                    if this.installing
+                        || this.refresh_if_due()
+                        || (this.log_tail && this.pane == Pane::Log)
+                    {
                         cx.notify();
                     }
                     if this.quiet_for(SETTLE_AFTER) {
@@ -736,6 +765,11 @@ impl Render for Dash {
         let pane = self.pane;
         let room = Room::of(window);
         self.room = room;
+        // Nothing else in this window can say anything true without a
+        // command to ask, so nothing else is drawn.
+        if !self.ready || pane == Pane::Welcome {
+            return div().size_full().child(self.splash(cx));
+        }
         div()
             .size_full()
             .flex()
@@ -752,6 +786,7 @@ impl Render for Dash {
                     .child(self.header())
                     .when(room == Room::Tight, |column| column.child(self.tabs(cx)))
                     .child(match pane {
+                        Pane::Welcome => self.splash(cx),
                         Pane::Groups => self.groups(cx),
                         Pane::Conflicts => self.conflicts(cx),
                         Pane::Config => self.config_pane(window, cx),
@@ -2518,6 +2553,143 @@ impl Dash {
         .detach();
     }
 
+    // ── the splash ───────────────────────────────────────────────────
+
+    /// The whole window, before there is anything to show in it.
+    ///
+    /// The icon, a greeting, and one button. Everything else people
+    /// might want — where it looked, what the installer checks, how to
+    /// do it by hand — is a question for somebody who hits a problem,
+    /// not something to read on the way in.
+    fn splash(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let mark = std::sync::Arc::new(gpui::Image::from_bytes(
+            gpui::ImageFormat::Png,
+            crate::icon::IMAGE.to_vec(),
+        ));
+        // One line, under the button, for whatever the screen last had
+        // to say: the installer talking, or an answer to the last click.
+        let note = match (self.installing, &self.said) {
+            (true, _) => Some(self.install_line()),
+            (false, Some(said)) => Some(SharedString::from(said.clone())),
+            (false, None) => None,
+        };
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .gap(step(6.))
+            .bg(rgb(GROUND))
+            .text_color(rgb(INK))
+            .child(img(mark).size(px(104.)))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(step(1.5))
+                    .child(
+                        div()
+                            .text_size(px(21.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(t("welcome.greeting")),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.5))
+                            .text_color(rgb(DIM))
+                            .child(t("welcome.tagline")),
+                    ),
+            )
+            .child(
+                Button::new("welcome-install")
+                    .primary()
+                    .label(match self.installing {
+                        true => t("welcome.installing"),
+                        false => t("welcome.install_now"),
+                    })
+                    .disabled(self.installing)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.install(cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("welcome-by-hand")
+                    .xsmall()
+                    .ghost()
+                    .label(t("welcome.by_hand"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            surface::INSTALL_LINE.to_owned(),
+                        ));
+                        this.said = Some(t("welcome.copied").to_owned());
+                        cx.notify();
+                    })),
+            )
+            .children(note.map(|note| {
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(FAINT))
+                    .child(note)
+            }))
+            .into_any_element()
+    }
+
+    /// The last thing the installer said, for the one line the splash
+    /// has room for.
+    fn install_line(&self) -> SharedString {
+        std::fs::read_to_string(surface::install_log(&self.state_root))
+            .ok()
+            .and_then(|text| {
+                text.lines()
+                    .rev()
+                    .find(|line| !line.trim().is_empty())
+                    .map(|line| SharedString::from(line.trim().to_owned()))
+            })
+            .unwrap_or_else(|| SharedString::from(t("welcome.starting")))
+    }
+
+    /// Runs the embedded installer off the main thread. The splash stays
+    /// up until it is done, because until it is done there is still
+    /// nothing else to show.
+    fn install(&mut self, cx: &mut Context<Self>) {
+        if self.installing {
+            return;
+        }
+        self.installing = true;
+        let state_root = self.state_root.clone();
+        cx.spawn(async move |this, cx| {
+            // The window's own poll loop asks for a frame while this
+            // runs, which is what keeps the line under the button up to
+            // date without a second timer here.
+            let done = cx
+                .background_executor()
+                .spawn(async move { surface::install(&state_root) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.installing = false;
+                this.ready = surface::installed();
+                this.said = Some(match done {
+                    Ok(command) => fill(
+                        "welcome.installed",
+                        &[("path", &tilde(&command.display().to_string()))],
+                    ),
+                    Err(why) => why,
+                });
+                // Everything the other panes show came back empty while
+                // there was nothing to ask; ask again now.
+                this.pane = Pane::Groups;
+                this.read_at = None;
+                this.log = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     // ── the log ──────────────────────────────────────────────────────
 
     /// The supervisor's account, in a block that selects and searches:
@@ -2559,19 +2731,6 @@ impl Dash {
                     .border_color(rgb(LINE))
                     .bg(rgb(SUNK))
                     .child(
-                        Button::new("errors-only")
-                            .small()
-                            .when(self.errors_only, |button| button.primary())
-                            .when(!self.errors_only, |button| button.outline())
-                            .label(t("log.errors_only"))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.errors_only = !this.errors_only;
-                                this.log = None;
-                                this.read_log(window, cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
                         Button::new("tail")
                             .small()
                             .when(self.log_tail, |button| button.primary())
@@ -2584,6 +2743,19 @@ impl Dash {
                                     this.log = None;
                                     this.read_log(window, cx);
                                 }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new("errors-only")
+                            .small()
+                            .when(self.errors_only, |button| button.primary())
+                            .when(!self.errors_only, |button| button.outline())
+                            .label(t("log.errors_only"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.errors_only = !this.errors_only;
+                                this.log = None;
+                                this.read_log(window, cx);
                                 cx.notify();
                             })),
                     )

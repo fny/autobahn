@@ -2396,3 +2396,51 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
         "deep"
     );
 }
+
+/// A restricted key's forced command: `autobahn gate` runs the agent a
+/// controller asks for — exactly as it asks — and the controller speaks to
+/// it as to any agent; a shell command is refused, saying it met a gate.
+#[test]
+fn a_gate_runs_the_agent_asked_for_and_refuses_a_shell() {
+    use autobahn::transport::mux::AgentConnection;
+    use autobahn::transport::Connection;
+    use std::process::{Command, Stdio};
+
+    let keep = tempfile::tempdir().expect("tempdir");
+    let home = keep.path().join("home");
+    let bin = home.join(".autobahn").join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let binary = env!("CARGO_BIN_EXE_autobahn");
+    fs::copy(
+        binary,
+        bin.join(format!("autobahn-{}", autobahn::protocol::version())),
+    )
+    .unwrap();
+    let gate = |requested: &str| {
+        let mut command = Command::new(binary);
+        command
+            .arg("gate")
+            .env("HOME", &home)
+            .env("SSH_ORIGINAL_COMMAND", requested)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+
+    let refused = gate("cat ~/.ssh/id_ed25519").output().unwrap();
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains(autobahn::gate::REFUSAL), "{said}");
+
+    let mut child = gate(&autobahn::transport::install::versioned_remote_command())
+        .spawn()
+        .unwrap();
+    let connection = Connection::from_streams(
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stdin.take().unwrap()),
+    );
+    AgentConnection::connect(connection).expect("the gated agent answers the handshake");
+    let _ = child.kill();
+    let _ = child.wait();
+}

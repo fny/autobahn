@@ -556,7 +556,17 @@ fn establish_ssh(destination: &str) -> Result<AgentConnection> {
     // that this failure is "the host is not there" rather than "something
     // went wrong", and deciding that by searching the message for a phrase
     // means any rewording of the message silently reclassifies the session.
-    let installed = transport::install::ensure_agent(destination).map_err(|error| {
+    // A server whose key runs only autobahn's gate refuses the installer's
+    // shell commands, and says so: it is asked to install this build's
+    // release itself instead.
+    let installed = match transport::install::ensure_agent(destination) {
+        Err(error) if format!("{error:#}").contains(crate::gate::REFUSAL) => {
+            transport::install::install_through_gate(destination)
+                .map(|()| transport::install::Installed::through_gate())
+        }
+        other => other,
+    }
+    .map_err(|error| {
         anyhow::Error::new(Unreachable {
             destination: destination.to_owned(),
         })

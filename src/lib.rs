@@ -26,6 +26,7 @@ pub mod alerts;
 pub mod config;
 pub mod endpoint;
 pub mod fsutil;
+pub mod gate;
 pub mod host;
 pub mod icon;
 pub mod invocation;

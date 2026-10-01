@@ -366,6 +366,11 @@ enum Command {
     /// exact version, which the controller enforces. It is not an API,
     /// and nothing but autobahn should drive it.
     Agent,
+    /// What a restricted key runs: the agent, `peering attach`, or a signed
+    /// install, as `SSH_ORIGINAL_COMMAND` asks — nothing else. Set as the
+    /// forced command of a peering key in `authorized_keys`.
+    #[command(hide = true)]
+    Gate,
     /// Remove state left behind by sessions the configuration no longer
     /// describes: their ancestors, status records, staged content, and
     /// endpoint locks. State for a running session is never touched, and
@@ -682,6 +687,7 @@ fn main() {
     }
     let result = match cli.command {
         Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
+        Command::Gate => autobahn::gate::run(),
         Command::Peering { verb } => run_peering(verb),
         Command::Watch {
             config,

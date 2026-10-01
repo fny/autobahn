@@ -20,7 +20,7 @@
 #           rendered at the grid size and given the margin, a third of its
 #           pixels differ from actool's, so it is not a substitute.
 #
-# The app bundle does not use these files: apps/macos/build.sh compiles
+# The app bundle does not use these files: apps/tray/build.sh compiles
 # assets/Autobahn.icon with actool at build time, which also carries the
 # dark and tinted variants. These are for everything else, and are committed so a
 # plain `cargo build` needs neither Xcode nor a Mac. Rerun this whenever

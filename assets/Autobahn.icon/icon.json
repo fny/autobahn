@@ -1,6 +1,9 @@
 {
   "fill" : {
-    "automatic-gradient" : "extended-gray:0.00000,1.00000",
+    "linear-gradient" : [
+      "extended-gray:0.00000,1.00000",
+      "extended-gray:0.25000,1.00000"
+    ],
     "orientation" : {
       "start" : {
         "x" : 0.5,
@@ -16,17 +19,9 @@
     {
       "layers" : [
         {
-          "glass" : false,
-          "hidden" : false,
-          "image-name" : "Autobahn Transparent.png",
-          "name" : "Autobahn Transparent",
-          "position" : {
-            "scale" : 0.6,
-            "translation-in-points" : [
-              4.899999999999977,
-              0
-            ]
-          }
+          "glass" : true,
+          "image-name" : "autobahn-1024.png",
+          "name" : "autobahn-1024"
         }
       ],
       "shadow" : {

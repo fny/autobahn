@@ -146,9 +146,7 @@ mod tests {
         // Every surface that speaks: the two windows, what they share,
         // and the menu bar.
         let sources = [
-            include_str!("desk/mod.rs"),
-            include_str!("desk/area.rs"),
-            include_str!("kit/mod.rs"),
+            include_str!("dash/mod.rs"),
             include_str!("surface.rs"),
             include_str!("menubar.rs"),
         ];
@@ -190,9 +188,7 @@ mod tests {
     #[test]
     fn the_catalogue_says_only_what_is_asked_for() {
         let sources = concat!(
-            include_str!("desk/mod.rs"),
-            include_str!("desk/area.rs"),
-            include_str!("kit/mod.rs"),
+            include_str!("dash/mod.rs"),
             include_str!("surface.rs"),
             include_str!("menubar.rs"),
         );
@@ -255,8 +251,8 @@ mod tests {
     #[test]
     fn a_line_takes_what_is_put_into_it() {
         assert_eq!(
-            fill("status.copied", &[("text", "one line")]),
-            "copied: one line"
+            fill("status.ran", &[("command", "clean --yes")]),
+            "clean --yes finished"
         );
         assert_eq!(t("not.a.key"), "not.a.key");
     }
@@ -268,7 +264,7 @@ mod tests {
         assert_eq!(count("fleet.cycles", 2, &[]), "2 cycles");
         assert_eq!(count("hosts.session", 1, &[]), "1 session");
         assert_eq!(count("hosts.session", 9, &[]), "9 sessions");
-        assert_eq!(count("config.entries", 1, &[]), "1 entry");
+        assert_eq!(count("pane.group", 1, &[]), "1 group");
         assert_eq!(
             count("fleet.cycles", 6764, &[("count", "6,764")]),
             "6,764 cycles",

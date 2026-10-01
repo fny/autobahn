@@ -1,4 +1,4 @@
-//! `autobahn-desk-kit`: the window again, drawn with GPUI Kit.
+//! `autobahn-dash`: the window again, drawn with GPUI Kit.
 //!
 //! A second binary rather than a second command, because the kit brings
 //! its own GPUI and two of them must not meet in one process. Everything
@@ -19,7 +19,7 @@ fn main() -> anyhow::Result<()> {
             "--shoot" => shoot = arguments.next().map(Into::into),
             "--pane" => pane = arguments.next(),
             "--help" | "-h" => {
-                println!("autobahn-desk-kit [--config <file>] [--state-root <directory>]");
+                println!("autobahn-dash [--config <file>] [--state-root <directory>]");
                 return Ok(());
             }
             other => anyhow::bail!("unknown argument {other}"),
@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         None => autobahn::paths::default_state_root()?,
     };
     match shoot {
-        Some(directory) => autobahn::kit::shoot(config, state_root, directory, pane),
-        None => autobahn::kit::run(config, state_root),
+        Some(directory) => autobahn::dash::shoot(config, state_root, directory, pane),
+        None => autobahn::dash::run(config, state_root),
     }
 }

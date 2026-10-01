@@ -1,36 +1,43 @@
 #!/bin/sh
-# Autobahn Desk — a window over the fleet, for this machine only.
+# Autobahn Dash — a window over the fleet, for this machine only.
 #
 # Personal and unshipped: no Developer ID, no notarisation, no release
 # asset, no mention in docs/. An ad-hoc signature is enough for a bundle
 # that only ever arrives by scp or by autobahn itself, neither of which
 # quarantines anything. A downloaded copy would be refused, and should be.
 #
-#   apps/personal/build.sh            # builds "Autobahn Desk.app"
-#   open "apps/personal/Autobahn Desk.app"
+#   apps/personal/build.sh            # builds "Autobahn Dash.app"
+#   open "apps/personal/Autobahn Dash.app"
 #
-# The binary goes to target/desk, never target/release: the login service
+# The binary goes to target/dash, never target/release: the login service
 # runs the latter through a symlink, and a personal build must not replace
 # what supervises the fleet.
 set -eu
 cd "$(dirname "$0")/../.."
 
-TARGET="${AUTOBAHN_DESK_TARGET:-target/desk}"
-APP="apps/personal/Autobahn Desk.app"
+TARGET="${AUTOBAHN_DASH_TARGET:-target/dash}"
+APP="apps/personal/Autobahn Dash.app"
 
-cargo build --release --features desk --target-dir "$TARGET"
+# GPUI Kit wants a newer compiler than the repository's default.
+cargo +1.98.0 build --release --features dash --target-dir "$TARGET" --bin autobahn-dash
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$TARGET/release/autobahn" "$APP/Contents/MacOS/autobahn-desk"
+cp "$TARGET/release/autobahn-dash" "$APP/Contents/MacOS/autobahn-dash"
 
-# The bundle runs the window directly: `desk` is hidden from --help, and
-# this is the only thing that should ever pass it.
-cat > "$APP/Contents/MacOS/Autobahn Desk" <<'LAUNCH'
+# The command goes in beside it: the window shells out to `autobahn` for
+# the work that is the command's — resolve, diff, clean — and finds it by
+# looking next to itself first.
+if [ -x target/release/autobahn ]; then
+    cp target/release/autobahn "$APP/Contents/MacOS/autobahn"
+fi
+
+# The bundle is the window; there is no subcommand to pass.
+cat > "$APP/Contents/MacOS/Autobahn Dash" <<'LAUNCH'
 #!/bin/sh
-exec "$(dirname "$0")/autobahn-desk" desk "$@"
+exec "$(dirname "$0")/autobahn-dash" "$@"
 LAUNCH
-chmod +x "$APP/Contents/MacOS/Autobahn Desk"
+chmod +x "$APP/Contents/MacOS/Autobahn Dash"
 
 # The same icon the tray app wears, compiled the same way: Assets.car
 # carries the Icon Composer rendering macOS 26 draws, and the committed
@@ -52,10 +59,10 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Autobahn Desk</string>
-  <key>CFBundleDisplayName</key><string>Autobahn Desk</string>
-  <key>CFBundleIdentifier</key><string>party.voltai.autobahn.desk</string>
-  <key>CFBundleExecutable</key><string>Autobahn Desk</string>
+  <key>CFBundleName</key><string>Autobahn Dash</string>
+  <key>CFBundleDisplayName</key><string>Autobahn Dash</string>
+  <key>CFBundleIdentifier</key><string>party.voltai.autobahn.dash</string>
+  <key>CFBundleExecutable</key><string>Autobahn Dash</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$VERSION</string>
   <key>CFBundleVersion</key><string>$VERSION</string>

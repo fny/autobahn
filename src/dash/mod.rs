@@ -1,14 +1,16 @@
-//! The window over the fleet, drawn with GPUI Kit.
+//! The dash: the window over the fleet.
 //!
-//! The same four panes over the same seam as `crate::desk`, and the same
-//! words — but on the kit's own GPUI, with its components underneath:
-//! text that selects, a field that behaves like every other field on
-//! this machine, and a theme to hang the palette on.
+//! A dashboard is what the gauges of a road vehicle have been called
+//! since the board that stopped mud being dashed up by the horses, and
+//! that is what this is: a light per session, the conflicts waiting,
+//! the log, the file, and the service that drives it all.
 //!
-//! Nothing below the window is duplicated. The fleet still comes from
-//! `supervisor::status_report`, the actions still go through the control
-//! socket and the CLI, the form is still generated from
-//! `config::schema`, and every line of English still comes from
+//! It draws through GPUI Kit's components — text that selects, fields
+//! that behave like every other field on this machine, dialogs, a
+//! theme to hang the palette on — and owns nothing underneath. The
+//! fleet comes from `supervisor::status_report`, the actions go through
+//! the control socket and the command, the form is generated from
+//! `config::schema`, and every line of English comes from
 //! `assets/words/en.toml`.
 
 mod ink;
@@ -197,8 +199,8 @@ fn open_window(
     };
     let window = cx
         .open_window(options, |window, cx| {
-            let desk = cx.new(|cx| {
-                let mut desk = Desk::new(config, state_root, cx);
+            let dash = cx.new(|cx| {
+                let mut dash = Dash::new(config, state_root, cx);
                 if let Some(pane) = pane.as_deref() {
                     // `config:defaults` opens the configuration on one of
                     // its sections, which is the only way a picture of a
@@ -207,7 +209,7 @@ fn open_window(
                         Some((pane, section)) => (pane, Some(section)),
                         None => (pane, None),
                     };
-                    desk.pane = match pane {
+                    dash.pane = match pane {
                         "conflicts" => Pane::Conflicts,
                         "config" => Pane::Config,
                         "log" => Pane::Log,
@@ -216,7 +218,7 @@ fn open_window(
                         _ => Pane::Groups,
                     };
                     if let Some(section) = section {
-                        desk.section = match section {
+                        dash.section = match section {
                             "defaults" => Section::Defaults,
                             "advanced" => Section::Advanced,
                             "alerts" => Section::Alerts,
@@ -230,15 +232,15 @@ fn open_window(
                     // section the pane is already showing otherwise. The
                     // environment says so too, which is how a picture of
                     // one gets taken without a hand on the mouse.
-                    desk.unlocked = matches!(
-                        desk.section,
+                    dash.unlocked = matches!(
+                        dash.section,
                         Section::Advanced | Section::Alerts | Section::Peering
                     ) || std::env::var("AUTOBAHN_DESK_EXPERIMENTAL").is_ok();
-                    desk.settle(desk.pane, window, cx);
+                    dash.settle(dash.pane, window, cx);
                 }
-                desk
+                dash
             });
-            cx.new(|cx| Root::new(desk, window, cx))
+            cx.new(|cx| Root::new(dash, window, cx))
         })
         .expect("unable to open the window");
     // The theme is the window's, not only the application's.
@@ -348,7 +350,7 @@ impl SearchableListItem for Choice {
 type Choices = SelectState<SearchableVec<Choice>>;
 
 /// What the window is showing.
-pub struct Desk {
+pub struct Dash {
     config: Option<PathBuf>,
     /// The face anything a person compares is set in.
     mono: SharedString,
@@ -520,7 +522,7 @@ fn run_with(
     Ok(())
 }
 
-impl Desk {
+impl Dash {
     fn new(config: Option<PathBuf>, state_root: PathBuf, cx: &mut Context<Self>) -> Self {
         let names = cx.text_system().all_font_names();
         let mono = ["SF Mono", "Menlo", "Monaco"]
@@ -528,7 +530,7 @@ impl Desk {
             .find(|name| names.iter().any(|known| known == name))
             .unwrap_or("Menlo");
         let presence = crate::dock::read(&state_root);
-        let mut desk = Desk {
+        let mut dash = Dash {
             config,
             mono: SharedString::from(mono.to_owned()),
             state_root,
@@ -568,7 +570,7 @@ impl Desk {
             shape: crate::config::schema(),
             said: None,
         };
-        desk.refresh();
+        dash.refresh();
         cx.spawn(async move |this, cx| {
             loop {
                 // The kit's GPUI hands out its timers through the
@@ -594,7 +596,7 @@ impl Desk {
             }
         })
         .detach();
-        desk
+        dash
     }
 
     // ── the seam, which is the other window's ────────────────────────
@@ -729,7 +731,7 @@ impl Desk {
     }
 }
 
-impl Render for Desk {
+impl Render for Dash {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.pane;
         let room = Room::of(window);
@@ -767,7 +769,7 @@ impl Render for Desk {
     }
 }
 
-impl Desk {
+impl Dash {
     fn rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let waiting = self.waiting();
         let running = self.report.as_ref().map(|report| report.supervisor_running);
@@ -1333,7 +1335,7 @@ impl Desk {
 }
 
 
-impl Desk {
+impl Dash {
     /// What a pane needs read before it is looked at.
     fn settle(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         match pane {
@@ -2415,9 +2417,9 @@ impl Desk {
 
     /// Asks before taking state away, and says what it will not touch.
     fn ask_clean(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let desk = cx.entity().downgrade();
+        let dash = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let desk = desk.clone();
+            let dash = dash.clone();
             alert
                 .title(t("service.clean_title"))
                 .description(t("service.cleaning"))
@@ -2427,9 +2429,9 @@ impl Desk {
                         .ok_text(t("service.clean")),
                 )
                 .on_ok(move |_, _, cx| {
-                    if let Some(desk) = desk.upgrade() {
-                        desk.update(cx, |desk, cx| {
-                            desk.clean(cx);
+                    if let Some(dash) = dash.upgrade() {
+                        dash.update(cx, |dash, cx| {
+                            dash.clean(cx);
                             cx.notify();
                         });
                     }
@@ -3139,13 +3141,13 @@ impl Desk {
         field.update(cx, |field, cx| field.focus(window, cx));
         self.naming = Some(field.clone());
         self.renaming = held.clone();
-        let desk = cx.entity().downgrade();
+        let dash = cx.entity().downgrade();
         let title = match held.is_some() {
             true => t("group.rename_title"),
             false => t("group.new_title"),
         };
         window.open_dialog(cx, move |dialog: Dialog, _, _| {
-            let desk = desk.clone();
+            let dash = dash.clone();
             dialog
                 .title(title)
                 .child(Textarea::new(&field).bordered(true))
@@ -3155,9 +3157,9 @@ impl Desk {
                         .ok_text(t("group.make")),
                 )
                 .on_ok(move |_, _, cx| {
-                    if let Some(desk) = desk.upgrade() {
-                        desk.update(cx, |desk, cx| {
-                            desk.make(cx);
+                    if let Some(dash) = dash.upgrade() {
+                        dash.update(cx, |dash, cx| {
+                            dash.make(cx);
                             cx.notify();
                         });
                     }
@@ -3175,19 +3177,19 @@ impl Desk {
     /// Asks before a group leaves the file, and says what it cannot do.
     fn ask_drop(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let name = name.to_owned();
-        let desk = cx.entity().downgrade();
+        let dash = cx.entity().downgrade();
         let question = fill("group.removing", &[("name", &name)]);
         window.open_alert_dialog(cx, move |alert, _, _| {
-            let desk = desk.clone();
+            let dash = dash.clone();
             let name = name.clone();
             alert
                 .title(t("group.remove_title"))
                 .description(question.clone())
                 .show_cancel(true)
                 .on_ok(move |_, _, cx| {
-                    if let Some(desk) = desk.upgrade() {
-                        desk.update(cx, |desk, cx| {
-                            desk.drop(&name);
+                    if let Some(dash) = dash.upgrade() {
+                        dash.update(cx, |dash, cx| {
+                            dash.drop(&name);
                             cx.notify();
                         });
                     }

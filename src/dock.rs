@@ -51,13 +51,13 @@ impl Presence {
     }
 }
 
-/// Where the desk keeps what is its own.
+/// Where the dash keeps what is its own.
 ///
 /// Not in `config.toml`: that file is the fleet's, it is read by the
 /// supervisor on every machine, and whether this window draws an icon
 /// is nobody's business but this machine's.
 pub fn preferences(state_root: &std::path::Path) -> std::path::PathBuf {
-    state_root.join("desk.toml")
+    state_root.join("dash.toml")
 }
 
 /// What the file says, or the default when it says nothing.
@@ -80,7 +80,7 @@ pub fn read(state_root: &std::path::Path) -> Presence {
 pub fn write(state_root: &std::path::Path, presence: Presence) -> Option<String> {
     let path = preferences(state_root);
     let text = format!(
-        "# How much of itself Autobahn Desk shows: both, window, menubar.\n\
+        "# How much of itself the dash shows: both, window, menubar.\n\
          presence = \"{}\"\n",
         presence.word()
     );

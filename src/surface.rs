@@ -1,16 +1,10 @@
 //! What a window over the fleet is, apart from its drawing.
 //!
-//! Two windows draw this: `crate::desk` on GPUI, `crate::kit` on GPUI
-//! Kit. Neither owns any of it. The sections of the configuration file
-//! and how a value is written back, what a conflict's two sides hold,
-//! what a session is waiting on and how it is grouped, the words for a
-//! size or an age — all of it is here, where it can be tested without
-//! opening a window and cannot drift between the two.
-
-// Two windows draw this, and neither uses all of it: the one on GPUI
-// has a log filter the kit's does not, the kit's has a text block that
-// needs none of the first one's caret arithmetic. What one of them does
-// not call is not dead — it is drawn by the other.
+//! `crate::dash` draws it and owns none of it. The sections of the
+//! configuration file and how a value is written back, what a
+//! conflict's two sides hold, what a session is waiting on and how it
+//! is grouped, the words for a size or an age — all of it is here,
+//! where it can be tested without opening a window.
 #![allow(dead_code)]
 
 use std::path::PathBuf;
@@ -366,7 +360,7 @@ pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "peering-dangerously-
 ///
 /// They are drawn at the foot of the section they belong to, under the
 /// same heading as `[experimental]`, and only for a window that has
-/// been let in. See `Desk::unlocked` in either window.
+/// been let in. See `Dash::unlocked`.
 pub(crate) const EXPERIMENTAL: &[&str] = &[
     "power_saver_experimental",
     "interval",
@@ -1043,7 +1037,7 @@ pub(crate) fn reveal(file: &std::path::Path) -> String {
 ///
 /// Not `current_exe`, which is what this used to be: the kit window is
 /// its own binary, so every `resolve` and `diff` it ran was handed to
-/// `autobahn-desk-kit`, which answered "unknown argument resolve" and
+/// `autobahn-dash`, which answered "unknown argument resolve" and
 /// looked like a button that did nothing. The command is looked for
 /// beside this executable first — a bundle, a target directory, a
 /// `~/.local/bin` all put the two together — and then left to PATH.

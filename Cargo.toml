@@ -29,7 +29,6 @@ notify-rust = { version = "4", optional = true }
 toml_edit = "0.25.15"
 minisign-verify = "0.3"
 image = { version = "0.25.10", default-features = false, features = ["png"], optional = true }
-gpui = { version = "0.2", optional = true }
 schemars = { version = "1", optional = true }
 # The other window: the same fleet drawn with GPUI Kit, which brings
 # its own GPUI. Kept behind its own feature and its own binary, so the
@@ -55,12 +54,11 @@ objc2-foundation = { version = "0.3", optional = true, default-features = false,
 
 [features]
 tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
-# A window over the fleet, personal and unshipped: apps/personal.
-desk = ["dep:gpui", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
-# The window again, on GPUI Kit. Its own binary: autobahn-desk-kit.
-desk-kit = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
+# The dash: a window over the fleet, personal and unshipped. Its own
+# binary, autobahn-dash, bundled by apps/personal/build.sh.
+dash = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 
 [dev-dependencies]
 proptest = "1"
@@ -86,6 +84,6 @@ codegen-units = 1
 mimalloc = { version = "0.1", default-features = false }
 
 [[bin]]
-name = "autobahn-desk-kit"
-path = "src/kit/main.rs"
-required-features = ["desk-kit"]
+name = "autobahn-dash"
+path = "src/dash/main.rs"
+required-features = ["dash"]

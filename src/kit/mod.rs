@@ -114,6 +114,7 @@ enum Pane {
     Hosts,
     Conflicts,
     Log,
+    Service,
     Config,
 }
 
@@ -124,6 +125,7 @@ impl Pane {
             Pane::Hosts => t("pane.hosts"),
             Pane::Conflicts => t("pane.conflicts"),
             Pane::Log => t("pane.log"),
+            Pane::Service => t("pane.service"),
             Pane::Config => t("pane.config"),
         }
     }
@@ -136,6 +138,7 @@ impl Pane {
             Pane::Hosts => IconName::Network,
             Pane::Conflicts => IconName::TriangleAlert,
             Pane::Log => IconName::FileText,
+            Pane::Service => IconName::Cpu,
             Pane::Config => IconName::Settings,
         }
     }
@@ -149,6 +152,7 @@ impl Pane {
             Pane::Conflicts => t("pane.conflicts_about"),
             Pane::Config => t("pane.config_about"),
             Pane::Log => t("pane.log_about"),
+            Pane::Service => t("pane.service_about"),
             Pane::Hosts => t("pane.hosts_about"),
         }
     }
@@ -207,6 +211,7 @@ fn open_window(
                         "conflicts" => Pane::Conflicts,
                         "config" => Pane::Config,
                         "log" => Pane::Log,
+                        "service" => Pane::Service,
                         "hosts" => Pane::Hosts,
                         _ => Pane::Groups,
                     };
@@ -749,6 +754,7 @@ impl Render for Desk {
                         Pane::Conflicts => self.conflicts(cx),
                         Pane::Config => self.config_pane(window, cx),
                         Pane::Log => self.log_pane(window, cx),
+                        Pane::Service => self.service_pane(cx),
                         Pane::Hosts => self.hosts(cx),
                     })
                     .child(self.footer()),
@@ -839,6 +845,7 @@ impl Desk {
                     .child(self.nav(Pane::Hosts, None, cx))
                     .child(self.nav(Pane::Conflicts, Some(waiting), cx))
                     .child(self.nav(Pane::Log, None, cx))
+                    .child(self.nav(Pane::Service, None, cx))
                     .child(self.nav(Pane::Config, Some(self.pending()), cx)),
             )
             .child(div().flex_1())
@@ -857,72 +864,10 @@ impl Desk {
                             .child(dot(colour))
                             .child(div().text_size(px(11.)).text_color(rgb(DIM)).child(service)),
                     )
-                    // What can be done about it, from here: the same
-                    // launchd job or systemd unit `autobahn install`
-                    // registers, asked through the same library.
-                    .when_some(registered, |column, state| {
-                        column.child(
-                            div()
-                                .flex()
-                                .flex_wrap()
-                                .gap(step(1.))
-                                .children(surface::orders(state).into_iter().map(|order| {
-                                    Button::new(SharedString::from(format!(
-                                        "service-{}",
-                                        order.label()
-                                    )))
-                                    .xsmall()
-                                    .outline()
-                                    .label(order.label())
-                                    .tooltip(order.about())
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.order(order);
-                                        cx.notify();
-                                    }))
-                                })),
-                        )
-                    })
-                    // How much of itself this app shows. Kept in the
-                    // state root rather than the fleet's configuration:
-                    // whether this machine draws an icon is nobody
-                    // else's business.
-                    .child(
-                        div()
-                            .flex()
-                            .gap(step(1.))
-                            .children(
-                                [
-                                    crate::dock::Presence::Both,
-                                    crate::dock::Presence::Window,
-                                    crate::dock::Presence::Menubar,
-                                ]
-                                .into_iter()
-                                .map(|presence| {
-                                    let chosen = presence == self.presence;
-                                    Button::new(SharedString::from(format!(
-                                        "presence-{}",
-                                        presence.word()
-                                    )))
-                                    .xsmall()
-                                    .when(chosen, |button| button.primary())
-                                    .when(!chosen, |button| button.ghost())
-                                    .label(t(match presence {
-                                        crate::dock::Presence::Both => "presence.both",
-                                        crate::dock::Presence::Window => "presence.window",
-                                        crate::dock::Presence::Menubar => "presence.menubar",
-                                    }))
-                                    .tooltip(t(match presence {
-                                        crate::dock::Presence::Both => "tip.presence_both",
-                                        crate::dock::Presence::Window => "tip.presence_window",
-                                        crate::dock::Presence::Menubar => "tip.presence_menubar",
-                                    }))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.show_as(presence);
-                                        cx.notify();
-                                    }))
-                                }),
-                            ),
-                    )
+                    // What can be done about any of it is the Service
+                    // pane. A rail that held the fix as well as the
+                    // complaint held an app's settings in a corner
+                    // meant for the fleet's facts.
                     .child(
                         div()
                             .text_size(px(10.5))
@@ -979,6 +924,7 @@ impl Desk {
             .child(self.nav(Pane::Hosts, None, cx))
             .child(self.nav(Pane::Conflicts, Some(waiting), cx))
             .child(self.nav(Pane::Log, None, cx))
+            .child(self.nav(Pane::Service, None, cx))
             .child(self.nav(Pane::Config, Some(pending), cx))
             .into_any_element()
     }
@@ -2209,6 +2155,219 @@ impl Desk {
                     ),
             )
             .into_any_element()
+    }
+
+    // ── the service ──────────────────────────────────────────────────
+
+    /// The supervisor on this machine, and the app around it.
+    ///
+    /// Everything here is about this installation rather than the
+    /// fleet: whether a supervisor is running now, whether one comes
+    /// back at the next login, how much of itself the app shows, and
+    /// which build it is. The other panes are about the groups.
+    fn service_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let registered = surface::service_state();
+        let running = self.report.as_ref().map(|report| report.supervisor_running);
+        let installed = !matches!(registered, Some(crate::service::ServiceState::NotInstalled));
+        let (state, colour) = match running {
+            Some(true) => (t("fleet.supervisor_running"), GREEN),
+            Some(false) if !installed => (t("service.not_installed"), RED),
+            Some(false) => (t("fleet.supervisor_missing"), RED),
+            None => (t("fleet.reading"), FAINT),
+        };
+        div()
+            .id("service")
+            .flex_1()
+            .min_h(px(0.))
+            .overflow_y_scroll()
+            .px(step(6.))
+            .py(step(5.))
+            .flex()
+            .flex_col()
+            .gap(step(6.))
+            // What it is doing now.
+            .child(
+                self.block(t("service.supervisor"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(step(2.))
+                            .child(dot(colour))
+                            .child(div().text_size(px(12.5)).text_color(rgb(DIM)).child(state)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .gap(step(1.5))
+                            .children(
+                                registered
+                                    .map(surface::orders)
+                                    .unwrap_or_default()
+                                    .into_iter()
+                                    // Install and Uninstall are the switch
+                                    // below, said once rather than twice.
+                                    .filter(|order| {
+                                        !matches!(
+                                            order,
+                                            surface::Order::Install | surface::Order::Uninstall
+                                        )
+                                    })
+                                    .map(|order| {
+                                        Button::new(SharedString::from(format!(
+                                            "service-{}",
+                                            order.label()
+                                        )))
+                                        .small()
+                                        .outline()
+                                        .label(order.label())
+                                        .tooltip(order.about())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.order(order);
+                                            cx.notify();
+                                        }))
+                                    }),
+                            ),
+                    ),
+            )
+            // Whether it comes back tomorrow, which is the same question
+            // as whether a login service is registered at all.
+            .child(
+                self.block(t("service.at_login")).child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(step(2.5))
+                        .child(
+                            Switch::new("at-login")
+                                .checked(installed)
+                                .tooltip(t("tip.at_login"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.order(match installed {
+                                        true => surface::Order::Uninstall,
+                                        false => surface::Order::Install,
+                                    });
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(FAINT))
+                                .child(match installed {
+                                    true => t("service.at_login_on"),
+                                    false => t("service.at_login_off"),
+                                }),
+                        ),
+                ),
+            )
+            // How much of itself the app shows.
+            .child(
+                self.block(t("service.showing")).child(
+                    div()
+                        .flex()
+                        .gap(step(1.5))
+                        .children(
+                            [
+                                crate::dock::Presence::Both,
+                                crate::dock::Presence::Window,
+                                crate::dock::Presence::Menubar,
+                            ]
+                            .into_iter()
+                            .map(|presence| {
+                                let chosen = presence == self.presence;
+                                Button::new(SharedString::from(format!(
+                                    "presence-{}",
+                                    presence.word()
+                                )))
+                                .small()
+                                .when(chosen, |button| button.primary())
+                                .when(!chosen, |button| button.outline())
+                                .label(t(match presence {
+                                    crate::dock::Presence::Both => "presence.both",
+                                    crate::dock::Presence::Window => "presence.window",
+                                    crate::dock::Presence::Menubar => "presence.menubar",
+                                }))
+                                .tooltip(t(match presence {
+                                    crate::dock::Presence::Both => "tip.presence_both",
+                                    crate::dock::Presence::Window => "tip.presence_window",
+                                    crate::dock::Presence::Menubar => "tip.presence_menubar",
+                                }))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.show_as(presence);
+                                    cx.notify();
+                                }))
+                            }),
+                        ),
+                ),
+            )
+            // Which build this is, and how to stop it being this one.
+            .child(
+                self.block(t("service.version"))
+                    .child(
+                        div()
+                            .font_family(self.mono.clone())
+                            // The heading says which build; the line says
+                            // what it is. Saying "this build is" under a
+                            // heading reading "this build" is one of them
+                            // too many.
+                            .child(said(
+                                "service-build",
+                                &crate::protocol::version(),
+                                DIM,
+                                12.,
+                            )),
+                    )
+                    .child(
+                        div().flex().child(
+                            Button::new("update")
+                                .small()
+                                .outline()
+                                .label(t("service.update"))
+                                .tooltip(t("tip.service_update"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.update(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// One titled block of the service pane.
+    fn block(&self, title: &'static str) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(step(2.))
+            .child(
+                div()
+                    .text_size(px(10.5))
+                    .text_color(rgb(FAINT))
+                    .child(title),
+            )
+    }
+
+    /// Downloads a release over this one. It takes as long as a download
+    /// takes, so it happens off the main thread and the window says so
+    /// while it runs.
+    fn update(&mut self, cx: &mut Context<Self>) {
+        self.said = Some(t("service.updating").to_owned());
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async { surface::update() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.said = Some(done);
+                this.read_at = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ── the log ──────────────────────────────────────────────────────

@@ -960,6 +960,34 @@ pub(crate) fn ask(order: Order, config: Option<&std::path::Path>, state_root: &s
     }
 }
 
+/// Downloads the latest release over this one, and says what happened.
+///
+/// The same work `autobahn update` does, through the same library: the
+/// command and the agent bundle the controller streams to hosts, with
+/// the login service pointed at the new binary and restarted. It takes
+/// as long as a download takes, so a window calls it off the main
+/// thread and shows what came back.
+pub(crate) fn update() -> String {
+    match crate::update::run(crate::update::Options {
+        version: None,
+        bin_dir: None,
+        no_agents: false,
+        dry_run: false,
+        // A service registered against the old path keeps working only
+        // if it is pointed at the new one.
+        retarget: true,
+    }) {
+        Ok(()) => t("service.updated").to_owned(),
+        Err(error) => fill(
+            "service.refused",
+            &[
+                ("order", t("service.update")),
+                ("error", &first_line(&format!("{error:#}"))),
+            ],
+        ),
+    }
+}
+
 /// What the button that opens a file manager should be called, which is
 /// not the same word on every desktop.
 pub(crate) fn reveal_label() -> &'static str {

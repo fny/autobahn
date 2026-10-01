@@ -767,6 +767,18 @@ impl Session {
         }
     }
 
+    /// Peering, with `manage_keys`: the peer host's peering key and host
+    /// keys, the key made if it had none.
+    pub fn peer_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+        self.peer().peering_keys()
+    }
+
+    /// Peering, with `manage_keys`: installs the other betas' keys on the
+    /// peer host.
+    pub fn install_peers(&mut self, authorized: &[String], known_hosts: &[String]) -> Result<()> {
+        self.peer().install_peers(authorized, known_hosts)
+    }
+
     /// Peering: writes the files a follower needs onto the beta's host.
     pub fn push_peering_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
         for (name, bytes) in files {

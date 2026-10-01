@@ -197,6 +197,11 @@ fn lead(
 ) -> Result<()> {
     let name = star.name.clone();
     let ttl = star.timing.ttl;
+    // The other betas are dialed with this host's peering key, when the
+    // alpha set one up, and the host keys it handed out.
+    crate::transport::set_peering_ssh_options(
+        crate::peerkeys::ssh_options(directory).unwrap_or_default(),
+    );
     let context =
         super::PeeringContext::for_leader(directory.to_path_buf(), name.clone(), term, ttl);
     let supervisor =
@@ -396,6 +401,7 @@ pub fn run_alpha(
         .unwrap_or(crate::config::PeeringPlan {
             ttl: crate::config::DEFAULT_PEERING_TTL,
             failover_after: crate::config::DEFAULT_PEERING_FAILOVER_AFTER,
+            manage_keys: false,
         });
     let context = super::PeeringContext::for_alpha(
         config_path.to_path_buf(),

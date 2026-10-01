@@ -1,7 +1,7 @@
 # PEER-4: Pushed `agent_command` and pushed roots, and locked-down SSH keys
 
 **Findings:** H-20 (KIMI ABN-H2, DEEPSEEK I2), H-21 (KIMI ABN-H3, GLM L4).
-**Status:** planned, 2026-09-30, as the restricted-keys feature below. Not yet scheduled; until it lands, the documented boundary stands. PEER-1, PEER-2 and PEER-3 come first.
+**Status:** built, 2026-10-01, in four parts: `host.toml` with `roots` (part 1); the gate, with installs from signed releases only (part 2); no pushed `agent_command` (part 3); and `manage_keys`, with the alpha setting up each beta's key on the others (part 4). Pinned roots were not built: `roots` in `host.toml` bounds a pushed `name` instead. The `rekey` verb was not built: deleting a beta's key has the alpha make and hand out a new one. Documented in `docs/peering.md` under Restricted keys.
 
 ## Problem
 

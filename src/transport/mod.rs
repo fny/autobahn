@@ -370,6 +370,7 @@ impl Connection {
     pub fn ssh_argv(host: &str, remote_command: Option<&str>) -> Vec<String> {
         let mut argv = vec![ssh_binary()];
         argv.extend(ssh_options().into_iter().map(str::to_owned));
+        argv.extend(peering_ssh_options());
         // The option terminator keeps a hostile host specification (one
         // beginning with `-`) from being parsed as an SSH option such as
         // `ProxyCommand`, which would mean local command execution.
@@ -473,7 +474,22 @@ impl Drop for Connection {
 /// controller going away without a shutdown frame) is a successful
 /// exit.
 pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> {
-    serve_agent_with(input, output, crate::paths::default_state_root(), None)
+    serve_agent_with(
+        input,
+        output,
+        crate::paths::default_state_root(),
+        None,
+        crate::gate::gated(),
+    )
+}
+
+/// What a channel may not do, by how its connection came about.
+#[derive(Clone, Copy)]
+struct ChannelLimits {
+    /// The alpha's attachment to a leader: no pushed files.
+    attached: bool,
+    /// An agent a gate ran, for a restricted key: no key management.
+    gated: bool,
 }
 
 /// What an alpha that attached to a leading beta serves it.
@@ -561,7 +577,7 @@ pub(crate) fn serve_agent_in<R: Read, W: Write + Send>(
     output: W,
     state_root: &std::path::Path,
 ) -> Result<()> {
-    serve_agent_with(input, output, Ok(state_root.to_path_buf()), None)
+    serve_agent_with(input, output, Ok(state_root.to_path_buf()), None, false)
 }
 
 /// The agent's side of the protocol, keeping its state under `state_root`.
@@ -572,6 +588,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
     output: W,
     state_root: Result<PathBuf>,
     policy: Option<&AttachPolicy>,
+    gated: bool,
 ) -> Result<()> {
     if let Ok(root) = &state_root {
         crate::scan::exclude_state_root(root);
@@ -673,11 +690,13 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                             .unwrap_or_else(|error| error.into_inner())
                             .insert(channel, counted.clone());
                         let output = &output;
-                        let attached = policy.is_some();
+                        let limits = ChannelLimits {
+                            attached: policy.is_some(),
+                            gated,
+                        };
                         crate::threads::spawn_deep_scoped(scope, move || {
                             serve_channel(
-                                channel, initialize, state_root, receiver, output, counted,
-                                attached,
+                                channel, initialize, state_root, receiver, output, counted, limits,
                             )
                         });
                     }
@@ -844,8 +863,9 @@ fn serve_channel<W: Write + Send>(
     requests: std::sync::mpsc::Receiver<Request>,
     output: &std::sync::Mutex<W>,
     counted: std::sync::Arc<crate::progress::SideProgress>,
-    attached: bool,
+    limits: ChannelLimits,
 ) {
+    let ChannelLimits { attached, gated } = limits;
     // Endpoint creation failures answer on the channel (the controller
     // would otherwise see only silence) without affecting the connection's
     // other channels.
@@ -939,6 +959,8 @@ fn serve_channel<W: Write + Send>(
                 | Request::AncestorRecord { .. }
                 | Request::AncestorCheckpoint { .. }
                 | Request::PutPeeringFile { .. }
+                | Request::PeeringKeys
+                | Request::InstallPeers { .. }
         );
         if let (true, Some(held)) = (writes, &fence) {
             let response = Response::Error(format!(
@@ -1022,6 +1044,31 @@ fn serve_channel<W: Write + Send>(
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
                 .and_then(|directory| crate::peering::write_pushed_file(directory, &name, &bytes))
+                .map(|()| Response::Written),
+            // Keys are managed only over the user's own login: an agent a
+            // gate ran, for a peering key, refuses, so that no peering key
+            // can widen its own access.
+            Request::PeeringKeys | Request::InstallPeers { .. } if gated => Err(anyhow!(
+                "an agent run by the gate manages no keys: a peering key cannot widen its own \
+                 access"
+            )),
+            Request::PeeringKeys => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| crate::peerkeys::ensure_key(directory))
+                .map(Response::PeeringKeys),
+            Request::InstallPeers {
+                authorized,
+                known_hosts,
+            } => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| {
+                    let home = std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .ok_or_else(|| anyhow!("no home directory to find ~/.ssh in"))?;
+                    crate::peerkeys::install_peers(&home, directory, &authorized, &known_hosts)
+                })
                 .map(|()| Response::Written),
             Request::PeeringState => peering_directory
                 .as_ref()
@@ -1523,6 +1570,26 @@ pub fn ssh_argv_for(destination: &str, remote_command: &str) -> Vec<String> {
     Connection::ssh_argv(destination, Some(remote_command))
 }
 
+/// The ssh options a beta leading from this process dials the others
+/// with: its peering key and the peering `known_hosts`
+/// ([`crate::peerkeys::ssh_options`]). Empty anywhere else.
+static PEERING_SSH_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Sets the ssh options every connection this process makes carries, for a
+/// beta about to lead: its peering key, if it has one.
+pub fn set_peering_ssh_options(options: Vec<String>) {
+    *PEERING_SSH_OPTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = options;
+}
+
+fn peering_ssh_options() -> Vec<String> {
+    PEERING_SSH_OPTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
 /// Peering: runs `argv` — the alpha's way to a leader, `ssh <leader>
 /// autobahn peering attach` by default — and serves as an agent over its
 /// stdio until the far side closes. The alpha is never dialed; this is
@@ -1546,6 +1613,7 @@ pub fn attach_as_agent(argv: &[String], policy: &AttachPolicy) -> Result<()> {
         stdin,
         crate::paths::default_state_root(),
         Some(policy),
+        false,
     );
     let _ = child.wait();
     served
@@ -2126,8 +2194,9 @@ pub(crate) mod tests {
             let (client, agent) = connected_pair();
             let (reader, writer, _) = agent.into_parts();
             std::thread::scope(|scope| {
-                let served = scope
-                    .spawn(|| serve_agent_with(reader, writer, Ok(state.clone()), Some(&policy)));
+                let served = scope.spawn(|| {
+                    serve_agent_with(reader, writer, Ok(state.clone()), Some(&policy), false)
+                });
                 run(client);
                 let _ = served.join();
             });
@@ -2250,6 +2319,58 @@ pub(crate) mod tests {
         );
         create_endpoint(&initialize(&served.join("project")), &Ok(state))
             .expect("inside what this machine serves");
+    }
+
+    /// An agent a gate ran manages no keys: a peering key cannot make a
+    /// key, nor install one, whoever holds it.
+    #[test]
+    fn a_gated_agent_manages_no_keys() {
+        use crate::endpoint::Endpoint;
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = keep.path().join("state");
+        let initialize = Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier("a", "b"),
+            ignores: Vec::new(),
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "beta".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+            one_shot: true,
+        };
+        let (client, agent) = connected_pair();
+        let (reader, writer, _) = agent.into_parts();
+        std::thread::scope(|scope| {
+            let served =
+                scope.spawn(|| serve_agent_with(reader, writer, Ok(state.clone()), None, true));
+            let mut endpoint =
+                crate::endpoint::remote::RemoteEndpoint::connect(client, initialize).unwrap();
+            for error in [
+                endpoint
+                    .peering_keys()
+                    .map(|_| ())
+                    .expect_err("no key made"),
+                endpoint
+                    .install_peers(&[], &[])
+                    .expect_err("no key installed"),
+            ] {
+                assert!(format!("{error:#}").contains("cannot widen"), "{error:#}");
+            }
+            assert!(!state
+                .join(crate::peering::DIRECTORY)
+                .join(crate::peerkeys::KEY_FILE)
+                .exists());
+            drop(endpoint);
+            let _ = served.join();
+        });
     }
 
     /// A genuine session and side are served, under the agent's state area.

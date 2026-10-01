@@ -244,6 +244,8 @@ impl Owed {
             Request::AncestorCheckpoint { .. } => "an ancestor checkpoint",
             Request::PutPeeringFile { .. } => "a peering file",
             Request::PeeringState => "a peering state query",
+            Request::PeeringKeys => "a peering key",
+            Request::InstallPeers { .. } => "the peers' keys",
         };
         let grace = match request {
             Request::AwaitChanges { milliseconds, .. } => Duration::from_millis(*milliseconds),

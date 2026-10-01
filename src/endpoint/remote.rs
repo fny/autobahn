@@ -698,6 +698,26 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
+    fn peering_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+        self.renew_if_due()?;
+        match self.exchange(Request::PeeringKeys)? {
+            Response::PeeringKeys(keys) => Ok(keys),
+            response => Err(unexpected_response(&response, "peering keys")),
+        }
+    }
+
+    fn install_peers(&mut self, authorized: &[String], known_hosts: &[String]) -> Result<()> {
+        self.renew_if_due()?;
+        let request = Request::InstallPeers {
+            authorized: authorized.to_vec(),
+            known_hosts: known_hosts.to_vec(),
+        };
+        match self.exchange(request)? {
+            Response::Written => Ok(()),
+            response => Err(unexpected_response(&response, "written")),
+        }
+    }
+
     fn rename(&mut self, from: &str, to: &str) -> Result<()> {
         self.renew_if_due()?;
         match self.exchange(Request::Rename(from.to_owned(), to.to_owned()))? {
@@ -1075,6 +1095,7 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Lease(_) => "lease",
         Response::Recorded { .. } => "recorded",
         Response::PeeringState(_) => "peering state",
+        Response::PeeringKeys(_) => "peering keys",
         Response::ScanProgress { .. } => "scan progress",
         Response::ScanChanges(_) => "scan changes",
     }

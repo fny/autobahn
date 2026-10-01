@@ -3665,6 +3665,99 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     assert_eq!(world.status(&plan).expect("a status").state, "following");
 }
 
+/// With `manage_keys`, the alpha sets up the betas' keys to one another
+/// over the logins it already has: each beta makes a key of its own, and is
+/// given every other beta's, forced through the gate, inside autobahn's
+/// block of its `authorized_keys` — with the gate itself, and the others'
+/// host keys. Never its own.
+#[test]
+fn the_alpha_gives_each_beta_the_others_keys_through_the_gate() {
+    use autobahn::supervisor::PeeringContext;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let homes = [world.directory("one-home"), world.directory("two-home")];
+    let roots = [world.directory("one"), world.directory("two")];
+    let scripts = [peering_agent_script(&world, &homes[0]), {
+        let script = world.path("peering-agent-two.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nHOME={home} exec {agent} agent\n",
+                home = homes[1].display(),
+                agent = agent_binary()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        script
+    }];
+    let plans = world.plans(&format!(
+        r#"
+        [advanced.peering-dangerously-experimental]
+        manage_keys = true
+
+        [groups.g1]
+        mode = "peering-conflict-dangerously-experimental"
+        alpha = "{alpha}/g1"
+        agent_command = "{one_script}"
+        betas = ["one:{one}"]
+
+        [groups.g2]
+        mode = "peering-conflict-dangerously-experimental"
+        alpha = "{alpha}/g2"
+        agent_command = "{two_script}"
+        betas = ["two:{two}"]
+        "#,
+        alpha = alpha.display(),
+        one_script = scripts[0].display(),
+        two_script = scripts[1].display(),
+        one = roots[0].display(),
+        two = roots[1].display(),
+    ));
+    fs::create_dir_all(alpha.join("g1")).unwrap();
+    fs::create_dir_all(alpha.join("g2")).unwrap();
+    let supervisor = Supervisor::new(plans, world.state_root(), false).with_peering(
+        PeeringContext::for_alpha(
+            world.path("config.toml"),
+            world.path("alpha-peering"),
+            autobahn::config::DEFAULT_PEERING_TTL,
+        )
+        .expect("a peering context"),
+    );
+    // Twice: the first pass learns each beta's key, and whichever beta was
+    // given its block first is given it again with the other's in it.
+    assert_all_synchronized(&supervisor.run_once());
+    assert_all_synchronized(&supervisor.run_once());
+
+    let public = |home: &Path| {
+        let text = fs::read_to_string(home.join(".autobahn/peering/id_ed25519.pub"))
+            .expect("a peering key was made");
+        let mut words = text.split_whitespace();
+        format!("{} {}", words.next().unwrap(), words.next().unwrap())
+    };
+    for (index, home) in homes.iter().enumerate() {
+        let other = &homes[1 - index];
+        let authorized = fs::read_to_string(home.join(".ssh/authorized_keys"))
+            .expect("autobahn's block was written");
+        assert!(
+            authorized.contains(&format!("{} {}", autobahn::peerkeys::FORCED, public(other))),
+            "{authorized}"
+        );
+        assert!(
+            !authorized.contains(&public(home)),
+            "never its own: {authorized}"
+        );
+        assert!(home
+            .join(".autobahn/bin")
+            .join(autobahn::peerkeys::GATE_BINARY)
+            .is_file());
+        assert!(home.join(".autobahn/peering/known_hosts").is_file());
+    }
+}
+
 /// While the alpha follows, its plain groups keep running: they are the
 /// alpha's alone, whoever leads the star. Only its peering sessions wait
 /// for the lead to come back.

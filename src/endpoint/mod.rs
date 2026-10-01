@@ -387,6 +387,18 @@ pub trait Endpoint: Send {
         anyhow::bail!("this endpoint does not take part in peering")
     }
 
+    /// Peering, with `manage_keys`: the host's peering key, made if it has
+    /// none, and its SSH host keys.
+    fn peering_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
+    /// Peering, with `manage_keys`: installs the other betas' keys on the
+    /// host, forced through the gate, and their host keys.
+    fn install_peers(&mut self, _authorized: &[String], _known_hosts: &[String]) -> Result<()> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
     /// A monotone measure of how much change this endpoint has recorded but
     /// not yet had consumed by a scan, used to tell a burst of writes from a
     /// single one. Two samples that agree mean nothing arrived in between.

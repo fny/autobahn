@@ -278,6 +278,9 @@ struct PeeringShared {
     members: Mutex<Vec<String>>,
     /// A handoff, and the sessions that pass it on.
     passing: Mutex<Passing>,
+    /// With `manage_keys`: every beta's peering key and host keys, by
+    /// host, as its session learned them.
+    keys: Mutex<std::collections::BTreeMap<String, crate::peerkeys::HostKeys>>,
 }
 
 /// A handoff in progress, and who has passed it on. Each running peering
@@ -302,6 +305,7 @@ impl PeeringShared {
             role: Mutex::new(role),
             members: Mutex::new(Vec::new()),
             passing: Mutex::new(Passing::default()),
+            keys: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -1506,6 +1510,12 @@ struct Worker<'a> {
     pushed: Option<[u8; 32]>,
     /// The handoff this worker has already handed on, if any.
     handed: Option<(String, u64)>,
+    /// With `manage_keys`: whether this session's beta told its keys since
+    /// the session connected, the digest of the keys it was last given,
+    /// and the last complaint, said once.
+    keys_learned: bool,
+    keys_given: Option<blake3::Hash>,
+    keys_complaint: Option<String>,
     /// Whether this worker runs a single pass, which never waits for a
     /// change, so its endpoints watch nothing.
     one_shot: bool,
@@ -1538,6 +1548,9 @@ impl<'a> Worker<'a> {
             peering: None,
             pushed: None,
             handed: None,
+            keys_learned: false,
+            keys_given: None,
+            keys_complaint: None,
             one_shot: false,
             resolutions: Vec::new(),
             #[cfg(test)]
@@ -1728,6 +1741,65 @@ impl<'a> Worker<'a> {
         }
     }
 
+    /// Peering, with `manage_keys`, as the alpha: learns this session's
+    /// beta's keys, and gives it every other beta's, forced through the
+    /// gate, whenever what it should hold changes. Best effort: a failure
+    /// is said once and costs nothing but the keys.
+    fn manage_keys(&mut self) {
+        let (Some(peering), Some(plan)) = (self.peering, self.plan.peering) else {
+            return;
+        };
+        let alpha_leads = matches!(
+            peering.role(),
+            crate::peering::Role::Leader { ref leader, .. } if leader == crate::peering::ALPHA
+        );
+        if !plan.manage_keys || !alpha_leads {
+            return;
+        }
+        let outcome = (|| -> Result<()> {
+            let Some(session) = self.session.as_mut() else {
+                return Ok(());
+            };
+            let host = crate::peering::destination_of(&self.plan.beta_spec()).to_owned();
+            if !self.keys_learned {
+                let keys = session.peer_keys()?;
+                peering
+                    .shared
+                    .keys
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(host.clone(), keys);
+                self.keys_learned = true;
+            }
+            let known = peering
+                .shared
+                .keys
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let (authorized, known_hosts) = crate::peerkeys::block_for(&host, &known);
+            let digest = blake3::hash(format!("{authorized:?}{known_hosts:?}").as_bytes());
+            if self.keys_given != Some(digest) {
+                session.install_peers(&authorized, &known_hosts)?;
+                self.keys_given = Some(digest);
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.keys_complaint = None,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if self.keys_complaint.as_ref() != Some(&message) {
+                    crate::complain!(
+                        "[{}] unable to set up the peering keys: {message}",
+                        self.plan.display()
+                    );
+                    self.keys_complaint = Some(message);
+                }
+            }
+        }
+    }
+
     /// Peering, once the session is up: pushes the follower's files when
     /// they have changed since the last push.
     fn push_files(&mut self) -> Result<()> {
@@ -1852,6 +1924,8 @@ impl<'a> Worker<'a> {
             );
             session.set_progress(self.progress.clone());
             self.session = Some(session);
+            // A new connection, perhaps to a host that made a new key.
+            self.keys_learned = false;
         }
         let leading = leadership.is_some();
         let side = self.peer_side();
@@ -1866,6 +1940,7 @@ impl<'a> Worker<'a> {
             session.present_lease()?;
             if side == crate::peering::PeerSide::Beta {
                 self.push_files()?;
+                self.manage_keys();
             }
         }
         #[cfg(test)]
@@ -3683,6 +3758,7 @@ mod tests {
         let timing = crate::config::PeeringPlan {
             ttl: crate::config::DEFAULT_PEERING_TTL,
             failover_after: crate::config::DEFAULT_PEERING_FAILOVER_AFTER,
+            manage_keys: false,
         };
         plan.peering = Some(timing);
         let outage = Duration::from_secs(90);

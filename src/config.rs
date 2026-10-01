@@ -365,6 +365,9 @@ pub struct PeeringAdvanced {
     /// How long a candidate waits after the lease went stale before it
     /// takes the lead. This is the blip window.
     pub failover_after: Option<DurationSpec>,
+    /// Whether the alpha sets up the betas' keys to one another itself:
+    /// each a key of its own, forced through the gate on every other.
+    pub manage_keys: Option<bool>,
 }
 
 /// Peering timing, resolved: what the supervisor runs with.
@@ -374,6 +377,8 @@ pub struct PeeringPlan {
     pub ttl: Duration,
     /// How long a candidate waits past a stale lease before it leads.
     pub failover_after: Duration,
+    /// Whether the alpha sets up the betas' keys to one another.
+    pub manage_keys: bool,
 }
 
 /// The lease lifetime as shipped: six missed five-second cycles.
@@ -1259,6 +1264,7 @@ impl Config {
         Ok(PeeringPlan {
             ttl,
             failover_after,
+            manage_keys: advanced.manage_keys.unwrap_or(false),
         })
     }
 

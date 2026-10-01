@@ -2,12 +2,12 @@
 
 Failover for the star. The alpha leads, as it always has. When it is gone for long enough, the first beta that is up takes the lead, and the other betas keep syncing through it. When the alpha comes back, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes.
 
-> **Do not enable peering unless you accept the issues below.** A September 2026 review found security issues in peering that are not fixed in this release. Any peer that can lead can run commands on every other peer; the alpha's machine it can reach only through what the alpha syncs with it. See [Known security issues](#known-security-issues). The collision issues the same review found, where two leaders could write one root or failover could stall, are fixed.
+> **Do not enable peering unless you accept the issues below.** A September 2026 review found security issues in peering that are not fixed in this release. Unless [restricted keys](#restricted-keys) are on, any peer that can lead can run commands on every other beta; the alpha's machine it can reach only through what the alpha syncs with it. See [Known security issues](#known-security-issues). The collision issues the same review found, where two leaders could write one root or failover could stall, are fixed.
 
 **Dangerously experimental** means three things here:
 - The design is new, and the modes carry the words in their names so a configuration says so on its face.
 - The on-disk state under `peering/` may change shape between releases without a migration.
-- Peering trusts every peer that can lead with a shell on every other beta, and with the alpha's synced folders. Use it only among machines that already trust each other that far.
+- Peering trusts every peer that can lead with the folders it syncs, on every member, and — unless [restricted keys](#restricted-keys) are on — with a shell on every other beta. Use it only among machines that already trust each other that far.
 
 The old names, `peering-conflict-experimental`, `peering-alpha-experimental` and `[advanced.peering-experimental]`, are refused with a message pointing here. The rename is deliberate: turning peering on should mean reading this page.
 
@@ -119,11 +119,36 @@ autobahn peering yield --to <spec>     # ...or to a named beta of the star; any 
 autobahn peering attach                # what the alpha runs over ssh; not for typing
 ```
 
+## Restricted keys
+
+Any beta must be able to take the lead, so each reaches every other over SSH. With ordinary keys that is a shell on every beta from every beta: one compromised beta is all of them. With `manage_keys`, the alpha sets up keys between the betas that can run autobahn and nothing else:
+
+```toml
+[advanced.peering-dangerously-experimental]
+manage_keys = true
+```
+
+On its next cycles as leader, over the logins it already has:
+
+1. Each beta makes a key pair of its own, `~/.autobahn/peering/id_ed25519`, with `ssh-keygen`, and hands back the public half and its SSH host keys. Private keys never leave the machine that made them.
+2. Each beta is given every *other* beta's public key, in a block of its `~/.ssh/authorized_keys` that autobahn owns and rewrites whole on every change — nothing outside the block is touched — each line forced through the gate: `restrict,command="$HOME/.autobahn/bin/autobahn-gate gate"`. It is also given the other betas' host keys, in `~/.autobahn/peering/known_hosts`, and the gate itself.
+3. A beta that leads dials the others with its peering key, tried first, and with those host keys beside your own `known_hosts`.
+
+The gate runs only the agent, exactly as autobahn asks for it, `autobahn peering attach`, and `autobahn gate install <release> <version>`. That last one installs an agent from autobahn's signed release, downloaded and checked on the beta itself: a controller behind the gate names a release and never sends a binary. A build that is not a release cannot be installed that way, so install its agent by hand. An agent run by the gate refuses to manage keys, so a peering key cannot widen its own access: only the alpha does that, over your own login.
+
+What else to know:
+- **Folders, too.** A key restricted to the agent still reaches every folder its user can. Bound that on each beta with `roots` in [`host.toml`](./configuration.md#this-machines-own-settings).
+- **Managed elsewhere.** Where `authorized_keys` is a symbolic link, the lines are not written, and the alpha's log gives them for you to add.
+- **A new key.** Delete `~/.autobahn/peering/id_ed25519` on a beta, and the alpha makes and hands out a new one on its next connection there.
+- **A beta removed** from the configuration leaves the others' blocks when the alpha runs the edited configuration.
+- **What it does not restrict.** A compromised beta can still change the files it syncs, as any two-way peer can. The alpha's own keys are as powerful as you make them.
+- **Addresses.** `from=` restrictions are not added: the address one beta reaches another from is not always the one the alpha sees.
+
 ## Known security issues
 
-These are open. The first has a plan: SSH keys that can only run the agent, over folders each server allows, set up automatically (`REVIEWS/fixes/PEER-4-pushed-commands-and-roots.md`).
+These are open.
 
-**Every peer that can lead holds an SSH login to every other beta.** Any beta must be able to take over, so each reaches the others with ordinary keys, and a key that logs in is a shell. A follower no longer runs a command its leader pushed — it ignores the pushed configuration's `agent_command`, and takes its own from [`host.toml`](./configuration.md#this-machines-own-settings) — and a pushed `name` outside the folders a follower's `host.toml` allows is refused. But a leader with a shell needs neither. Peer only machines that would each trust the others with a shell, or restrict the keys: see [Restricted keys](#restricted-keys).
+**Without restricted keys, every peer that can lead holds a shell on every other beta.** Any beta must be able to take over, so each reaches the others, and with ordinary keys a login is a shell. Turn on [restricted keys](#restricted-keys), and bound the folders each beta serves with `roots` in [`host.toml`](./configuration.md#this-machines-own-settings); otherwise peer only machines that would each trust the others with a shell. Either way, a follower never runs a command its leader pushed — it ignores the pushed configuration's `agent_command` and takes its own from `host.toml` — and refuses a pushed `name` outside the folders its `host.toml` allows.
 
 **While a beta leads, it can change what the alpha syncs with it, and nothing else there.** When the alpha attaches, it serves the leader only its own peering sessions, as its own configuration has them: the root, ignores, modes, owners and staging are the alpha's, whatever the leader asks for, and the alpha takes no pushed files. A leader can change files inside those roots, as any beta can in a two-way mode, and nothing outside them.
 

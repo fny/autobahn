@@ -661,6 +661,7 @@ fn takeover_waits_grow_with_position() {
     let timing = autobahn::config::PeeringPlan {
         ttl: Duration::from_secs(30),
         failover_after: Duration::from_secs(120),
+        manage_keys: false,
     };
     let waits: Vec<Duration> = (1..=4)
         .map(|position| autobahn::peering::takeover_wait(position, &timing))

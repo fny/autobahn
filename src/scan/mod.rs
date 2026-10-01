@@ -357,15 +357,16 @@ pub fn scan(
 /// or written, and not yet closed. See [`scan_deferring`].
 pub type InFlight<'a> = &'a (dyn Fn(&Path) -> bool + Sync);
 
-/// [`scan`], leaving out what is still being written.
+/// [`scan`], leaving out new files still being written.
 ///
-/// A file that is new or changed since the baseline, and that `in_flight`
-/// says is still open for writing, is not read: it keeps the baseline's
-/// entry when it has one, and is left out when it is new. Its content is
-/// not there yet — a safe save's temporary is renamed away the moment it
-/// closes, and one scanned before then is asked for when it no longer
-/// exists — while the entry it had is never taken for a deletion. The
-/// paths deferred this way are returned, for the caller to scan again; a
+/// A file the baseline does not hold, and that `in_flight` says is still
+/// open for writing, is not read: it is left out, as not there yet. A safe
+/// save's temporary is exactly this, and is renamed away the moment it
+/// closes, so one scanned before then is asked for when it no longer
+/// exists. A file the baseline holds is read as it stands, as ever: a
+/// watcher reports a close after the close, and an existing file's old
+/// entry kept on that report would read a finished write as never made.
+/// The paths left out are returned, for the caller to scan again; a
 /// writer's close and rename mark them anyway, as the watcher sees them.
 #[allow(clippy::too_many_arguments)] // a scan is configured, not builder-shaped
 pub fn scan_deferring(
@@ -1215,8 +1216,8 @@ impl<'a> Scanner<'a> {
         content
     }
 
-    /// A file entry's node: scanned, or — while it is still being written —
-    /// the entry as it was, or none, left for a later scan.
+    /// A file entry's node: scanned, or — a new file still being written —
+    /// none, left for a later scan.
     fn file_entry(
         &mut self,
         name: String,
@@ -1224,42 +1225,12 @@ impl<'a> Scanner<'a> {
         metadata: &Metadata,
         baseline: Option<&Node>,
     ) -> Option<Node> {
-        if !self.still_being_written(disk_path, metadata, baseline) {
-            let content = self.scan_file(disk_path, metadata, baseline);
-            return Some(Node { name, content });
+        if baseline.is_none() && self.in_flight.is_some_and(|in_flight| in_flight(disk_path)) {
+            self.deferred.push(disk_path.to_path_buf());
+            return None;
         }
-        self.deferred.push(disk_path.to_path_buf());
-        let kept = baseline?;
-        // Counted as the baseline counted it, so a full scan's totals still
-        // describe the tree it returns.
-        if let Content::File { metadata, .. } = &kept.content {
-            self.files += 1;
-            self.total_file_size += metadata.size;
-        }
-        Some(Node {
-            name,
-            content: kept.content.clone(),
-        })
-    }
-
-    /// Whether the file at `disk_path` is new or changed since the baseline
-    /// and still open for writing, so that reading it now would read content
-    /// that is not there yet. A file whose metadata still matches the
-    /// baseline has not been written since, whoever holds it open, and is
-    /// not asked about.
-    fn still_being_written(
-        &self,
-        disk_path: &Path,
-        metadata: &Metadata,
-        baseline: Option<&Node>,
-    ) -> bool {
-        let Some(in_flight) = self.in_flight else {
-            return false;
-        };
-        let unchanged = !self.rehash
-            && reusable_digest(baseline, &file_metadata(metadata), self.baseline_scanned_at)
-                .is_some();
-        !unchanged && in_flight(disk_path)
+        let content = self.scan_file(disk_path, metadata, baseline);
+        Some(Node { name, content })
     }
 
     /// Scans the file at `disk_path`, whose (already fetched) metadata is
@@ -1714,13 +1685,13 @@ mod tests {
         );
     }
 
-    /// A file still being written is not read. A new one — a safe save's
-    /// temporary — is left out, and a changed one keeps the entry it had,
-    /// so it never reads as deleted. Both come back to be scanned again,
-    /// while a file whose metadata has not moved is read as ever, whoever
-    /// holds it open.
+    /// A new file still being written — a safe save's temporary — is left
+    /// out, and comes back to be scanned again. A file the baseline holds is
+    /// read as it stands, whatever the watcher says about it: its report of
+    /// a close lags the close, and the old entry would read a finished write
+    /// as never made.
     #[test]
-    fn a_file_still_being_written_is_left_for_a_later_scan() {
+    fn a_new_file_still_being_written_is_left_for_a_later_scan() {
         let directory = tempdir().expect("tempdir");
         let root = directory.path();
         write(root, "kept.txt", "kept");
@@ -1760,16 +1731,19 @@ mod tests {
             root.join("edited.txt"),
             root.join("edited.txt.bench-tmp"),
         ];
-        let (snapshot, mut deferred) = scan_with(Some(&baseline), &|path: &Path| {
+        let (snapshot, deferred) = scan_with(Some(&baseline), &|path: &Path| {
             open.iter().any(|open| open == path)
         });
         let tree = snapshot.root.as_ref().expect("root");
         assert!(tree.child("edited.txt.bench-tmp").is_none());
-        assert_eq!(file_content(tree, "edited.txt").0, digest_of("before"));
+        assert_eq!(
+            file_content(tree, "edited.txt").0,
+            digest_of("after, and longer"),
+            "a file the baseline holds is read as it stands"
+        );
         assert_eq!(file_content(tree, "kept.txt").0, digest_of("kept"));
-        assert_eq!((snapshot.files, snapshot.total_file_size), (2, 10));
-        deferred.sort();
-        assert_eq!(deferred, [open[1].clone(), open[2].clone()]);
+        assert_eq!((snapshot.files, snapshot.total_file_size), (2, 21));
+        assert_eq!(deferred, [open[2].clone()]);
 
         // Closed: read as it stands.
         let (snapshot, deferred) = scan_with(Some(&snapshot), &|_| false);

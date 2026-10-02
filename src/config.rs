@@ -4115,7 +4115,14 @@ betas = ["build.example.com:/tmp/beta"]
             .split(['(', ')', ':', ',', ' ', '\'', '\n'])
             .filter(|word| word.contains("-way-"))
             .collect();
-        assert!(names.len() >= 6, "{advertised}");
+        // Counted from the table rather than written down: a mode added
+        // or dropped should not need this number edited, which is how it
+        // came to say six when there were five.
+        let expected = MODES
+            .iter()
+            .filter(|known| known.name.contains("-way-"))
+            .count();
+        assert_eq!(names.len(), expected, "{advertised}");
         for name in names {
             let mode = parse_mode(name).expect("an advertised mode parses");
             assert_eq!(

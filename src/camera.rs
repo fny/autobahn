@@ -70,8 +70,7 @@ mod mac {
             size: CGSize { width, height },
         };
         unsafe {
-            let image =
-                CGWindowListCreateImage(rect, ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0, 0);
+            let image = CGWindowListCreateImage(rect, ON_SCREEN_ONLY | EXCLUDE_DESKTOP, 0, 0);
             if image.is_null() {
                 return Err(anyhow!("the window server handed back no image"));
             }
@@ -121,6 +120,5 @@ mod mac {
         Err(anyhow!("photographing the window is macOS only"))
     }
 }
-
 
 pub(crate) use mac::grab;

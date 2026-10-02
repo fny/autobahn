@@ -30,7 +30,9 @@ fn catalogue() -> &'static HashMap<String, String> {
         // Two levels: a table per surface, a key per line. Flat enough
         // to read as a file, grouped enough to find anything in it.
         for (surface, table) in document {
-            let Some(table) = table.as_table() else { continue };
+            let Some(table) = table.as_table() else {
+                continue;
+            };
             for (key, value) in table {
                 if let Some(text) = value.as_str() {
                     words.insert(format!("{surface}.{key}"), text.to_owned());
@@ -82,10 +84,7 @@ pub(crate) fn hint_besides(showing: &str) -> &'static str {
         said.sort();
         said
     });
-    let fresh: Vec<&&'static str> = every
-        .iter()
-        .filter(|said| **said != showing)
-        .collect();
+    let fresh: Vec<&&'static str> = every.iter().filter(|said| **said != showing).collect();
     let choosing: &[&&'static str] = match fresh.is_empty() {
         true => return every.first().copied().unwrap_or(""),
         false => &fresh,
@@ -176,12 +175,19 @@ mod tests {
                 }
             }
         }
-        assert!(asked.len() > 50, "the surfaces ask for {} keys", asked.len());
+        assert!(
+            asked.len() > 50,
+            "the surfaces ask for {} keys",
+            asked.len()
+        );
         let missing: Vec<&String> = asked
             .iter()
             .filter(|key| !catalogue().contains_key(*key))
             .collect();
-        assert!(missing.is_empty(), "not in assets/words/en.toml: {missing:?}");
+        assert!(
+            missing.is_empty(),
+            "not in assets/words/en.toml: {missing:?}"
+        );
     }
 
     /// A key nobody asks for is a line nobody reads.

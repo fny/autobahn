@@ -21,14 +21,14 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
 use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, InputHighlighter, Textarea, TextareaState,
 };
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
-use gpui_kit::component::text::{SelectionFormat, TextView};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
-use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
+use gpui_kit::component::text::{SelectionFormat, TextView};
 use gpui_kit::component::{
     Disableable as _, Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode,
     WindowExt as _,
@@ -38,8 +38,8 @@ use gpui_kit::*;
 
 use crate::supervisor::{status_report, GroupReport, SessionReport, StatusReport};
 use crate::surface::{
-    self, first_sentence, holds, tilde, Conflict, Holds, Section, Sheet, Side, Spot,
-    EXPERIMENTAL, SILENT_AT_THE_TOP, SILENT_IN_ADVANCED,
+    self, first_sentence, holds, tilde, Conflict, Holds, Section, Sheet, Side, Spot, EXPERIMENTAL,
+    SILENT_AT_THE_TOP, SILENT_IN_ADVANCED,
 };
 use crate::words::{count as counted, fill, t};
 
@@ -473,68 +473,70 @@ fn run_with(
     gpui_kit::application()
         .with_assets(gpui_kit::assets::Assets)
         .run(move |cx: &mut App| {
-        gpui_kit::init(cx);
-        cx.activate(true);
-        let config = config.clone();
-        let state_root = state_root.clone();
-        let wanted = shots.as_ref().and_then(|(_, pane)| pane.clone());
-        // What this machine asked for: a window, a menu bar item, or
-        // both. A screenshot always wants the window, whatever the
-        // file says.
-        let presence = match shots.is_some() {
-            true => crate::dock::Presence::Both,
-            false => crate::dock::read(&state_root),
-        };
-        crate::dock::in_the_dock(presence.opens_a_window());
-        let window = open_window(
-            config.clone(),
-            state_root.clone(),
-            wanted,
-            presence.opens_a_window(),
-            cx,
-        );
-        if shots.is_none() && presence.takes_the_menu_bar() {
-            // The same item in the menu bar the other window puts
-            // there, from the same code: one poll, one notifier, and
-            // "Open the window" when this one has been closed.
-            match crate::menubar::Bar::start(config.clone(), state_root.clone(), || {}) {
-                Ok(mut bar) => {
-                    bar.window = true;
-                    bar.appear();
-                    cx.set_global(Menubar(bar));
-                    watch_the_bar(config.clone(), state_root.clone(), cx);
+            gpui_kit::init(cx);
+            cx.activate(true);
+            let config = config.clone();
+            let state_root = state_root.clone();
+            let wanted = shots.as_ref().and_then(|(_, pane)| pane.clone());
+            // What this machine asked for: a window, a menu bar item, or
+            // both. A screenshot always wants the window, whatever the
+            // file says.
+            let presence = match shots.is_some() {
+                true => crate::dock::Presence::Both,
+                false => crate::dock::read(&state_root),
+            };
+            crate::dock::in_the_dock(presence.opens_a_window());
+            let window = open_window(
+                config.clone(),
+                state_root.clone(),
+                wanted,
+                presence.opens_a_window(),
+                cx,
+            );
+            if shots.is_none() && presence.takes_the_menu_bar() {
+                // The same item in the menu bar the other window puts
+                // there, from the same code: one poll, one notifier, and
+                // "Open the window" when this one has been closed.
+                match crate::menubar::Bar::start(config.clone(), state_root.clone(), || {}) {
+                    Ok(mut bar) => {
+                        bar.window = true;
+                        bar.appear();
+                        cx.set_global(Menubar(bar));
+                        watch_the_bar(config.clone(), state_root.clone(), cx);
+                    }
+                    Err(error) => eprintln!(
+                        "{}",
+                        fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
+                    ),
                 }
-                Err(error) => eprintln!(
-                    "{}",
-                    fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
-                ),
             }
-        }
-        let Some((directory, pane)) = shots.clone() else { return };
-        cx.spawn(async move |cx| {
-            let sleep = cx.background_executor().timer(Duration::from_millis(900));
-            sleep.await;
-            let name = pane.clone().unwrap_or_else(|| "groups".to_owned());
-            let path = directory.join(format!("kit-{name}.png"));
-            let taken = window.update(cx, |_, window, _| {
-                let bounds = window.bounds();
-                crate::camera::grab(
-                    bounds.origin.x.to_f64(),
-                    bounds.origin.y.to_f64(),
-                    bounds.size.width.to_f64(),
-                    bounds.size.height.to_f64(),
-                )
-                .and_then(|frame| Ok(frame.save(&path)?))
-            });
-            match taken {
-                Ok(Ok(())) => println!("{}", path.display()),
-                Ok(Err(error)) => eprintln!("unable to photograph: {error:#}"),
-                Err(error) => eprintln!("the window went away: {error}"),
-            }
-            cx.update(|cx| cx.quit());
-        })
-        .detach();
-    });
+            let Some((directory, pane)) = shots.clone() else {
+                return;
+            };
+            cx.spawn(async move |cx| {
+                let sleep = cx.background_executor().timer(Duration::from_millis(900));
+                sleep.await;
+                let name = pane.clone().unwrap_or_else(|| "groups".to_owned());
+                let path = directory.join(format!("kit-{name}.png"));
+                let taken = window.update(cx, |_, window, _| {
+                    let bounds = window.bounds();
+                    crate::camera::grab(
+                        bounds.origin.x.to_f64(),
+                        bounds.origin.y.to_f64(),
+                        bounds.size.width.to_f64(),
+                        bounds.size.height.to_f64(),
+                    )
+                    .and_then(|frame| Ok(frame.save(&path)?))
+                });
+                match taken {
+                    Ok(Ok(())) => println!("{}", path.display()),
+                    Ok(Err(error)) => eprintln!("unable to photograph: {error:#}"),
+                    Err(error) => eprintln!("the window went away: {error}"),
+                }
+                cx.update(|cx| cx.quit());
+            })
+            .detach();
+        });
     Ok(())
 }
 
@@ -934,7 +936,11 @@ impl Dash {
 
     /// Asks the service manager for something, and says what came back.
     fn order(&mut self, order: surface::Order) {
-        self.said = Some(surface::ask(order, self.config.as_deref(), &self.state_root));
+        self.said = Some(surface::ask(
+            order,
+            self.config.as_deref(),
+            &self.state_root,
+        ));
         // Whatever it did, the fleet is a different shape now.
         self.read_at = None;
     }
@@ -1043,29 +1049,26 @@ impl Dash {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(self.pane.title()),
                     )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(FAINT))
-                            .child(match self.report {
-                                None => self.pane.about().to_owned(),
-                                // A pane with nothing to say about itself
-                                // takes the shorter line, rather than the
-                                // longer one with a separator hanging off
-                                // the end of it.
-                                Some(_) => fill(
-                                    match self.pane.about().is_empty() {
-                                        true => "pane.counted_bare",
-                                        false => "pane.counted",
-                                    },
-                                    &[
-                                        ("groups", &counted("pane.group", groups, &[])),
-                                        ("sessions", &counted("pane.session", sessions, &[])),
-                                        ("about", self.pane.about()),
-                                    ],
-                                ),
-                            }),
-                    ),
+                    .child(div().text_size(px(11.)).text_color(rgb(FAINT)).child(
+                        match self.report {
+                            None => self.pane.about().to_owned(),
+                            // A pane with nothing to say about itself
+                            // takes the shorter line, rather than the
+                            // longer one with a separator hanging off
+                            // the end of it.
+                            Some(_) => fill(
+                                match self.pane.about().is_empty() {
+                                    true => "pane.counted_bare",
+                                    false => "pane.counted",
+                                },
+                                &[
+                                    ("groups", &counted("pane.group", groups, &[])),
+                                    ("sessions", &counted("pane.session", sessions, &[])),
+                                    ("about", self.pane.about()),
+                                ],
+                            ),
+                        },
+                    )),
             )
             .child(
                 div()
@@ -1126,12 +1129,13 @@ impl Dash {
                         // Nothing to say is a place to teach something:
                         // one of the hints, chosen when the window
                         // opened, rather than the same sentence for ever.
-                        None => div().text_color(rgb(FAINT)).truncate().child(
-                            match self.room {
+                        None => div()
+                            .text_color(rgb(FAINT))
+                            .truncate()
+                            .child(match self.room {
                                 Room::Tight => tilde(&self.state_root.display().to_string()),
                                 _ => self.hint.to_string(),
-                            },
-                        ),
+                            }),
                     }),
             )
             .child(
@@ -1199,10 +1203,7 @@ impl Dash {
                             .child(group.name.clone()),
                     )
                     .when(!group.role.is_empty(), |head| {
-                        head.child(pill(
-                            format!("{} · term {}", group.role, group.term),
-                            BLUE,
-                        ))
+                        head.child(pill(format!("{} · term {}", group.role, group.term), BLUE))
                     })
                     .child(
                         div()
@@ -1281,18 +1282,18 @@ impl Dash {
                     })
                     .when(room > Room::Tight, |row| {
                         row.child(
-                        div()
-                            .w(px(100.))
-                            .flex_shrink_0()
-                            .text_right()
-                            .font_family(self.mono.clone())
-                            .text_size(px(11.))
-                            .text_color(rgb(DIM))
-                            .child(counted(
-                                "fleet.cycles",
-                                session.cycles as usize,
-                                &[("count", &thousands(session.cycles))],
-                            )),
+                            div()
+                                .w(px(100.))
+                                .flex_shrink_0()
+                                .text_right()
+                                .font_family(self.mono.clone())
+                                .text_size(px(11.))
+                                .text_color(rgb(DIM))
+                                .child(counted(
+                                    "fleet.cycles",
+                                    session.cycles as usize,
+                                    &[("count", &thousands(session.cycles))],
+                                )),
                         )
                     })
                     .child(
@@ -1368,7 +1369,6 @@ impl Dash {
             .into_any_element()
     }
 }
-
 
 impl Dash {
     /// What a pane needs read before it is looked at.
@@ -1563,84 +1563,90 @@ impl Dash {
             .flex_1()
             .min_h(px(0.))
             .flex()
-            .when(!showing_detail, |pane| pane.child(
-                div()
-                    .id("queue")
-                    .when(room > Room::Tight, |queue| queue.w(px(352.)).flex_shrink_0())
-                    .when(room == Room::Tight, |queue| queue.flex_1().min_w(px(0.)))
-                    .h_full()
-                    .overflow_y_scroll()
-                    .p(step(3.))
-                    .flex()
-                    .flex_col()
-                    .gap(step(0.5))
-                    .border_r_1()
-                    .border_color(rgb(LINE))
-                    .bg(rgb(SUNK))
-                    .children(waiting.into_iter().enumerate().map(|(index, item)| {
-                        let chosen = open.as_ref() == Some(&item);
-                        let name = item
-                            .path
-                            .rsplit('/')
-                            .next()
-                            .unwrap_or(&item.path)
-                            .to_owned();
-                        let where_ = match item.path.rsplit_once('/') {
-                            Some((directory, _)) => format!("{} · {directory}/", item.group),
-                            None => item.group.clone(),
-                        };
-                        let colour = match item.blocked {
-                            true => RED,
-                            false => AMBER,
-                        };
-                        let word = match item.blocked {
-                            true => t("conflicts.blocked"),
-                            false => t("conflicts.conflict"),
-                        };
-                        let taken = item.clone();
-                        div()
-                            .id(SharedString::from(format!("waiting-{index}")))
-                            .px(step(2.5))
-                            .py(step(1.5))
-                            .rounded(px(6.))
-                            .cursor_pointer()
-                            .flex()
-                            .flex_col()
-                            .gap(px(1.))
-                            .when(chosen, |row| row.bg(rgb(RAISED)))
-                            .hover(|row| row.bg(rgb(PANEL)))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(step(1.5))
-                                    .child(dot(colour))
-                                    .child(
-                                        div()
-                                            .flex_1()
-                                            .min_w(px(0.))
-                                            .font_family(self.mono.clone())
-                                            .text_size(px(12.5))
-                                            .truncate()
-                                            .child(crate::text::display_safe(&name).to_string()),
-                                    )
-                                    .child(pill(word, colour)),
-                            )
-                            .child(
-                                div()
-                                    .pl(step(3.5))
-                                    .font_family(self.mono.clone())
-                                    .text_size(px(10.5))
-                                    .text_color(rgb(FAINT))
-                                    .truncate()
-                                    .child(where_),
-                            )
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                this.open_conflict(taken.clone());
-                                cx.notify();
-                            }))
-                    })),
-            ))
+            .when(!showing_detail, |pane| {
+                pane.child(
+                    div()
+                        .id("queue")
+                        .when(room > Room::Tight, |queue| {
+                            queue.w(px(352.)).flex_shrink_0()
+                        })
+                        .when(room == Room::Tight, |queue| queue.flex_1().min_w(px(0.)))
+                        .h_full()
+                        .overflow_y_scroll()
+                        .p(step(3.))
+                        .flex()
+                        .flex_col()
+                        .gap(step(0.5))
+                        .border_r_1()
+                        .border_color(rgb(LINE))
+                        .bg(rgb(SUNK))
+                        .children(waiting.into_iter().enumerate().map(|(index, item)| {
+                            let chosen = open.as_ref() == Some(&item);
+                            let name = item
+                                .path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&item.path)
+                                .to_owned();
+                            let where_ = match item.path.rsplit_once('/') {
+                                Some((directory, _)) => format!("{} · {directory}/", item.group),
+                                None => item.group.clone(),
+                            };
+                            let colour = match item.blocked {
+                                true => RED,
+                                false => AMBER,
+                            };
+                            let word = match item.blocked {
+                                true => t("conflicts.blocked"),
+                                false => t("conflicts.conflict"),
+                            };
+                            let taken = item.clone();
+                            div()
+                                .id(SharedString::from(format!("waiting-{index}")))
+                                .px(step(2.5))
+                                .py(step(1.5))
+                                .rounded(px(6.))
+                                .cursor_pointer()
+                                .flex()
+                                .flex_col()
+                                .gap(px(1.))
+                                .when(chosen, |row| row.bg(rgb(RAISED)))
+                                .hover(|row| row.bg(rgb(PANEL)))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(step(1.5))
+                                        .child(dot(colour))
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .min_w(px(0.))
+                                                .font_family(self.mono.clone())
+                                                .text_size(px(12.5))
+                                                .truncate()
+                                                .child(
+                                                    crate::text::display_safe(&name).to_string(),
+                                                ),
+                                        )
+                                        .child(pill(word, colour)),
+                                )
+                                .child(
+                                    div()
+                                        .pl(step(3.5))
+                                        .font_family(self.mono.clone())
+                                        .text_size(px(10.5))
+                                        .text_color(rgb(FAINT))
+                                        .truncate()
+                                        .child(where_),
+                                )
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.open_conflict(taken.clone());
+                                    cx.notify();
+                                }))
+                        })),
+                )
+            })
             .when(room > Room::Tight || showing_detail, |pane| {
                 pane.child(match self.conflict.clone() {
                     None => empty(t("conflicts.pick")),
@@ -1701,16 +1707,12 @@ impl Dash {
                     )
                     // The path is what a person takes to a shell, so it
                     // selects like the complaints in the form do.
-                    .child(
-                        div()
-                            .font_family(self.mono.clone())
-                            .child(said(
-                                "conflict-path",
-                                &crate::text::display_safe(&item.path),
-                                INK,
-                                13.,
-                            )),
-                    )
+                    .child(div().font_family(self.mono.clone()).child(said(
+                        "conflict-path",
+                        &crate::text::display_safe(&item.path),
+                        INK,
+                        13.,
+                    )))
                     .child(
                         div()
                             .text_size(px(11.))
@@ -1751,10 +1753,7 @@ impl Dash {
                                     Button::new("keep-beta")
                                         .small()
                                         .outline()
-                                        .label(fill(
-                                            "conflicts.keep_beta",
-                                            &[("name", &keep_host)],
-                                        ))
+                                        .label(fill("conflicts.keep_beta", &[("name", &keep_host)]))
                                         .tooltip(t("tip.keep_beta"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let keep = host.host.clone();
@@ -1870,9 +1869,7 @@ impl Dash {
                 // Settled is good news and reads green. A mode that
                 // differs is the conflict itself, not a reassurance.
                 let (colour, words) = match agreed {
-                    surface::Agreement::Settled => {
-                        (GREEN, t("conflicts.settled").to_owned())
-                    }
+                    surface::Agreement::Settled => (GREEN, t("conflicts.settled").to_owned()),
                     surface::Agreement::OnlyTheMode { executable } => (
                         AMBER,
                         fill("conflicts.only_the_mode", &[("name", executable)]),
@@ -1922,7 +1919,9 @@ impl Dash {
                             .font_weight(FontWeight::SEMIBOLD)
                             .child(side.name),
                     )
-                    .when(newer, |head| head.child(pill(t("conflicts.written_last"), BLUE)))
+                    .when(newer, |head| {
+                        head.child(pill(t("conflicts.written_last"), BLUE))
+                    })
                     .when_some(side.trouble.clone(), |head, trouble| {
                         head.child(pill(trouble, AMBER))
                     }),
@@ -1936,18 +1935,22 @@ impl Dash {
                     .child(surface::tail(&side.root, 3)),
             )
             .child(div().h(step(0.5)))
-            .child(self.pair(
-                t("conflicts.size"),
-                side.size
-                    .map(surface::human_size)
-                    .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
-            ))
-            .child(self.pair(
-                t("conflicts.written"),
-                side.modified
-                    .map(|at| crate::logging::stamp(at as libc::time_t))
-                    .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
-            ))
+            .child(
+                self.pair(
+                    t("conflicts.size"),
+                    side.size
+                        .map(surface::human_size)
+                        .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
+                ),
+            )
+            .child(
+                self.pair(
+                    t("conflicts.written"),
+                    side.modified
+                        .map(|at| crate::logging::stamp(at as libc::time_t))
+                        .unwrap_or_else(|| t("conflicts.unknown").to_owned()),
+                ),
+            )
             .child(self.pair(
                 t("conflicts.digest"),
                 match (&side.digest, side.size) {
@@ -2161,12 +2164,7 @@ impl Dash {
                                     .lines()
                                     .enumerate()
                                     .map(|(nth, line)| {
-                                        div().child(said(
-                                            format!("bundle-{nth}"),
-                                            line,
-                                            DIM,
-                                            11.,
-                                        ))
+                                        div().child(said(format!("bundle-{nth}"), line, DIM, 11.))
                                     })
                                     .collect::<Vec<_>>(),
                             ),
@@ -2234,38 +2232,34 @@ impl Dash {
                             .child(div().text_size(px(12.5)).text_color(rgb(DIM)).child(state)),
                     )
                     .child(
-                        div()
-                            .flex()
-                            .flex_wrap()
-                            .gap(step(1.5))
-                            .children(
-                                registered
-                                    .map(surface::orders)
-                                    .unwrap_or_default()
-                                    .into_iter()
-                                    // Install and Uninstall are the switch
-                                    // below, said once rather than twice.
-                                    .filter(|order| {
-                                        !matches!(
-                                            order,
-                                            surface::Order::Install | surface::Order::Uninstall
-                                        )
-                                    })
-                                    .map(|order| {
-                                        Button::new(SharedString::from(format!(
-                                            "service-{}",
-                                            order.label()
-                                        )))
-                                        .small()
-                                        .outline()
-                                        .label(order.label())
-                                        .tooltip(order.about())
-                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.order(order);
-                                            cx.notify();
-                                        }))
-                                    }),
-                            ),
+                        div().flex().flex_wrap().gap(step(1.5)).children(
+                            registered
+                                .map(surface::orders)
+                                .unwrap_or_default()
+                                .into_iter()
+                                // Install and Uninstall are the switch
+                                // below, said once rather than twice.
+                                .filter(|order| {
+                                    !matches!(
+                                        order,
+                                        surface::Order::Install | surface::Order::Uninstall
+                                    )
+                                })
+                                .map(|order| {
+                                    Button::new(SharedString::from(format!(
+                                        "service-{}",
+                                        order.label()
+                                    )))
+                                    .small()
+                                    .outline()
+                                    .label(order.label())
+                                    .tooltip(order.about())
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.order(order);
+                                        cx.notify();
+                                    }))
+                                }),
+                        ),
                     ),
             )
             // Whether it comes back tomorrow, which is the same question
@@ -2288,36 +2282,27 @@ impl Dash {
                                     cx.notify();
                                 })),
                         )
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(FAINT))
-                                .child(match installed {
-                                    true => t("service.at_login_on"),
-                                    false => t("service.at_login_off"),
-                                }),
-                        ),
+                        .child(div().text_size(px(11.)).text_color(rgb(FAINT)).child(
+                            match installed {
+                                true => t("service.at_login_on"),
+                                false => t("service.at_login_off"),
+                            },
+                        )),
                 ),
             )
             // How much of itself the app shows.
             .child(
                 self.block(t("service.showing")).child(
-                    div()
-                        .flex()
-                        .gap(step(1.5))
-                        .children(
-                            [
-                                crate::dock::Presence::Both,
-                                crate::dock::Presence::Window,
-                                crate::dock::Presence::Menubar,
-                            ]
-                            .into_iter()
-                            .map(|presence| {
-                                let chosen = presence == self.presence;
-                                Button::new(SharedString::from(format!(
-                                    "presence-{}",
-                                    presence.word()
-                                )))
+                    div().flex().gap(step(1.5)).children(
+                        [
+                            crate::dock::Presence::Both,
+                            crate::dock::Presence::Window,
+                            crate::dock::Presence::Menubar,
+                        ]
+                        .into_iter()
+                        .map(|presence| {
+                            let chosen = presence == self.presence;
+                            Button::new(SharedString::from(format!("presence-{}", presence.word())))
                                 .small()
                                 .when(chosen, |button| button.primary())
                                 .when(!chosen, |button| button.outline())
@@ -2335,8 +2320,8 @@ impl Dash {
                                     this.show_as(presence);
                                     cx.notify();
                                 }))
-                            }),
-                        ),
+                        }),
+                    ),
                 ),
             )
             // The things that are about the whole state root rather
@@ -2398,12 +2383,7 @@ impl Dash {
                             // what it is. Saying "this build is" under a
                             // heading reading "this build" is one of them
                             // too many.
-                            .child(said(
-                                "service-build",
-                                &crate::protocol::version(),
-                                DIM,
-                                12.,
-                            )),
+                            .child(said("service-build", &crate::protocol::version(), DIM, 12.)),
                     )
                     .child(
                         div()
@@ -2521,16 +2501,12 @@ impl Dash {
 
     /// One titled block of the service pane.
     fn block(&self, title: &'static str) -> Div {
-        div()
-            .flex()
-            .flex_col()
-            .gap(step(2.))
-            .child(
-                div()
-                    .text_size(px(10.5))
-                    .text_color(rgb(FAINT))
-                    .child(title),
-            )
+        div().flex().flex_col().gap(step(2.)).child(
+            div()
+                .text_size(px(10.5))
+                .text_color(rgb(FAINT))
+                .child(title),
+        )
     }
 
     /// Downloads a release over this one. It takes as long as a download
@@ -2628,12 +2604,7 @@ impl Dash {
                         cx.notify();
                     })),
             )
-            .children(note.map(|note| {
-                div()
-                    .text_size(px(11.))
-                    .text_color(rgb(FAINT))
-                    .child(note)
-            }))
+            .children(note.map(|note| div().text_size(px(11.)).text_color(rgb(FAINT)).child(note)))
             .into_any_element()
     }
 
@@ -3107,20 +3078,18 @@ impl Dash {
                                 .items_baseline()
                                 .gap(step(1.5))
                                 .cursor_pointer()
+                                .child(div().text_size(px(9.)).text_color(rgb(FAINT)).child(
+                                    match showing {
+                                        true => "\u{25be}",
+                                        false => "\u{25b8}",
+                                    },
+                                ))
                                 .child(
-                                    div()
-                                        .text_size(px(9.))
-                                        .text_color(rgb(FAINT))
-                                        .child(match showing {
-                                            true => "\u{25be}",
-                                            false => "\u{25b8}",
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_size(px(11.))
-                                        .text_color(rgb(RED))
-                                        .child(counted("config.faults", homeless, &[])),
+                                    div().text_size(px(11.)).text_color(rgb(RED)).child(counted(
+                                        "config.faults",
+                                        homeless,
+                                        &[],
+                                    )),
                                 )
                                 .child(
                                     div()
@@ -3213,8 +3182,7 @@ impl Dash {
                     }))
                     // Making a group: a name, and the two keys it cannot
                     // load without, left empty for the form to ask for.
-                    .child(self.naming(window, cx))
-                    ,
+                    .child(self.naming(window, cx)),
             )
             .child(
                 div()
@@ -3390,7 +3358,9 @@ impl Dash {
 
     /// Makes the group the field names, or renames the open one to it.
     fn make(&mut self, cx: &mut Context<Self>) {
-        let Some(field) = self.naming.clone() else { return };
+        let Some(field) = self.naming.clone() else {
+            return;
+        };
         let name = field.read(cx).value().to_string();
         let name = name.trim().to_owned();
         let from = self.renaming.clone();
@@ -3476,7 +3446,12 @@ impl Dash {
     }
 
     /// The fields of one table, in the order the file writes them.
-    fn run(&mut self, part: &Section, window: &mut Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    fn run(
+        &mut self,
+        part: &Section,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let properties = match part {
             Section::Settings => self.shape.get("properties").cloned(),
             Section::Defaults => self.shape["$defs"]["Defaults"].get("properties").cloned(),
@@ -3625,7 +3600,9 @@ impl Dash {
         div()
             .flex()
             .gap(step(4.))
-            .when(self.room == Room::Tight, |field| field.flex_col().gap(step(1.5)))
+            .when(self.room == Room::Tight, |field| {
+                field.flex_col().gap(step(1.5))
+            })
             .child(
                 div()
                     .when(self.room > Room::Tight, |name| {
@@ -3786,16 +3763,15 @@ impl Dash {
                             // these take, and no wider: a control the
                             // width of the pane reads as a text field.
                             div().w(px(260.)).flex_shrink_0().child(
-                                Select::new(&list)
-                                    .menu_width(px(580.))
-                                    .placeholder(match (unknown, default.is_empty()) {
+                                Select::new(&list).menu_width(px(580.)).placeholder(
+                                    match (unknown, default.is_empty()) {
                                         (true, _) => default.clone(),
                                         (false, true) => t("config.absent").to_owned(),
-                                        (false, false) => fill(
-                                            "config.default_is",
-                                            &[("default", &default)],
-                                        ),
-                                    }),
+                                        (false, false) => {
+                                            fill("config.default_is", &[("default", &default)])
+                                        }
+                                    },
+                                ),
                             ),
                         )
                         .when(set, |row| {
@@ -3863,16 +3839,13 @@ impl Dash {
                         ),
                     )
                     .when(!set, |row| {
-                        row.child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(rgb(FAINT))
-                                .child(match default.as_bool() {
-                                    Some(true) => t("config.absent_on").to_owned(),
-                                    Some(false) => t("config.absent_off").to_owned(),
-                                    None => t("config.absent").to_owned(),
-                                }),
-                        )
+                        row.child(div().text_size(px(11.)).text_color(rgb(FAINT)).child(
+                            match default.as_bool() {
+                                Some(true) => t("config.absent_on").to_owned(),
+                                Some(false) => t("config.absent_off").to_owned(),
+                                None => t("config.absent").to_owned(),
+                            },
+                        ))
                     })
                     // The way back to the third state, which a two-state
                     // control cannot otherwise reach. The same Unset a
@@ -4134,10 +4107,8 @@ impl Dash {
         // Whether this is a list is the schema's answer, kept from when
         // the block was built: a one-line list is still a list, and
         // guessing from the text turns it into a string.
-        let list = self.lists.contains(at)
-            || held
-                .as_ref()
-                .is_some_and(|item| item.as_array().is_some());
+        let list =
+            self.lists.contains(at) || held.as_ref().is_some_and(|item| item.as_array().is_some());
         let value = match list {
             true => {
                 let mut array = toml_edit::Array::new();
@@ -4210,7 +4181,10 @@ impl Dash {
                 self.diff = None;
                 fill(
                     "status.kept",
-                    &[("keep", keep), ("path", &crate::text::display_safe(&item.path))],
+                    &[
+                        ("keep", keep),
+                        ("path", &crate::text::display_safe(&item.path)),
+                    ],
                 )
             }
             Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),

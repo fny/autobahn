@@ -476,9 +476,7 @@ impl<'m> Reconciler<'m> {
 
         // Alpha and beta disagree at this path; dispatch by mode.
         match self.policy.mode {
-            SyncMode::TwoWaySafe
-            | SyncMode::TwoWayResolved
-            | SyncMode::TwoWayStrict => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
                 self.handle_disagreement_bidirectional(path, ancestor, alpha, beta)
             }
             SyncMode::OneWaySafe => {
@@ -1077,12 +1075,7 @@ mod tests {
             ],
         );
         for (alpha, beta) in [(&emptied, &ancestor), (&ancestor, &emptied)] {
-            let result = reconcile(
-                Some(&ancestor),
-                Some(alpha),
-                Some(beta),
-                guarding(8),
-            );
+            let result = reconcile(Some(&ancestor), Some(alpha), Some(beta), guarding(8));
             assert_eq!(result.conflicts.len(), 1, "{result:?}");
             assert_eq!(result.conflicts[0].root, "data");
             assert!(
@@ -1117,12 +1110,7 @@ mod tests {
         let ancestor = dir("", vec![file("readme", 9, false), large(9)]);
         let gone = dir("", vec![file("readme", 9, false)]);
 
-        let result = reconcile(
-            Some(&ancestor),
-            Some(&gone),
-            Some(&ancestor),
-            guarding(8),
-        );
+        let result = reconcile(Some(&ancestor), Some(&gone), Some(&ancestor), guarding(8));
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert!(result.beta_transitions.is_empty(), "{result:?}");
         assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
@@ -1132,12 +1120,7 @@ mod tests {
         assert_eq!(restore.new.as_ref().expect("restored").children().len(), 9);
 
         // Symmetric.
-        let result = reconcile(
-            Some(&ancestor),
-            Some(&ancestor),
-            Some(&gone),
-            guarding(8),
-        );
+        let result = reconcile(Some(&ancestor), Some(&ancestor), Some(&gone), guarding(8));
         assert_eq!(result.beta_transitions.len(), 1);
         assert!(result.beta_transitions[0].new.is_some());
 
@@ -1153,12 +1136,7 @@ mod tests {
 
         // A small directory is deleted in the paranoid mode too.
         let ancestor = dir("", vec![file("readme", 9, false), large(3)]);
-        let result = reconcile(
-            Some(&ancestor),
-            Some(&gone),
-            Some(&ancestor),
-            guarding(8),
-        );
+        let result = reconcile(Some(&ancestor), Some(&gone), Some(&ancestor), guarding(8));
         assert!(result.alpha_transitions.is_empty());
         assert_eq!(result.beta_transitions.len(), 1);
         assert!(result.beta_transitions[0].new.is_none());
@@ -1173,12 +1151,7 @@ mod tests {
         let ancestor = dir("", vec![file("readme", 9, false), large(9)]);
         let gone = dir("", vec![file("readme", 9, false)]);
         let emptied = dir("", vec![file("readme", 9, false), dir("data", vec![])]);
-        let result = reconcile(
-            Some(&ancestor),
-            Some(&gone),
-            Some(&emptied),
-            guarding(8),
-        );
+        let result = reconcile(Some(&ancestor), Some(&gone), Some(&emptied), guarding(8));
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert!(result.alpha_transitions.is_empty(), "{result:?}");
         assert_eq!(result.beta_transitions.len(), 1, "{result:?}");
@@ -1197,12 +1170,7 @@ mod tests {
             (1..=9).map(|i| file(&format!("f{i}"), i, false)).collect();
         edited_children[0] = file("f1", 42, false);
         let edited = dir("", vec![dir("data", edited_children)]);
-        let result = reconcile(
-            Some(&ancestor),
-            Some(&gone),
-            Some(&edited),
-            guarding(8),
-        );
+        let result = reconcile(Some(&ancestor), Some(&gone), Some(&edited), guarding(8));
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
         assert_eq!(result.alpha_transitions[0].path, "data");

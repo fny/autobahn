@@ -25,8 +25,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::config::SessionPlan;
 use crate::supervisor::{status_report, StatusReport};
-use crate::words::{count as counted, fill, t};
 use crate::text::display_safe;
+use crate::words::{count as counted, fill, t};
 
 /// How often the report is refreshed.
 pub(crate) const POLL: Duration = Duration::from_secs(3);
@@ -693,7 +693,6 @@ impl Bar {
     }
 }
 
-
 /// Runs one action by invoking the CLI — the same command a terminal
 /// would, so the app cannot resolve differently than the user could.
 pub(crate) fn run_action(
@@ -1016,7 +1015,10 @@ pub(crate) fn summary_of(report: &StatusReport, queued: usize) -> String {
     ] {
         let n = how_many(state);
         if n > 0 {
-            parts.push(fill("menu.counted", &[("count", &n.to_string()), ("word", word)]));
+            parts.push(fill(
+                "menu.counted",
+                &[("count", &n.to_string()), ("word", word)],
+            ));
         }
     }
     parts.join(", ")
@@ -1103,7 +1105,11 @@ pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {
     };
     fill(
         "menu.group",
-        &[("alpha", &group.alpha), ("name", &group.name), ("role", &role)],
+        &[
+            ("alpha", &group.alpha),
+            ("name", &group.name),
+            ("role", &role),
+        ],
     )
 }
 
@@ -1111,7 +1117,10 @@ pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {
 ///
 /// The same states `health_of` treats as trouble, so a group's dot and the
 /// icon's colour can never disagree.
-pub(crate) fn group_health(group: &crate::supervisor::GroupReport, supervisor_running: bool) -> Health {
+pub(crate) fn group_health(
+    group: &crate::supervisor::GroupReport,
+    supervisor_running: bool,
+) -> Health {
     if !supervisor_running {
         return Health::Idle;
     }
@@ -1411,7 +1420,11 @@ mod menu_tests {
         assert!(summary.contains("supervisor not responding"), "{summary}");
         assert!(!summary.contains("restart needed"), "{summary}");
         let warning = warning_of(&report(true), None).expect("a warning");
-        assert!(warning.line.contains("answered nothing"), "{}", warning.line);
+        assert!(
+            warning.line.contains("answered nothing"),
+            "{}",
+            warning.line
+        );
         assert!(!warning.line.contains("another build"), "{}", warning.line);
 
         assert!(!summary_of(&report(false), 0).contains("not responding"));
@@ -1438,10 +1451,22 @@ mod menu_tests {
             supervisor_unresponsive: false,
         };
         let warning = warning_of(&report, None).expect("a warning");
-        assert!(warning.line.starts_with("⚠ configuration refused:"), "{}", warning.line);
+        assert!(
+            warning.line.starts_with("⚠ configuration refused:"),
+            "{}",
+            warning.line
+        );
         assert!(warning.line.contains("line 1"), "{}", warning.line);
-        assert!(warning.line.ends_with("click for details"), "{}", warning.line);
-        assert!(!warning.line.contains('\n') && !warning.line.contains("\\n"), "{}", warning.line);
+        assert!(
+            warning.line.ends_with("click for details"),
+            "{}",
+            warning.line
+        );
+        assert!(
+            !warning.line.contains('\n') && !warning.line.contains("\\n"),
+            "{}",
+            warning.line
+        );
         // The whole message keeps its shape, for the file a click opens.
         assert!(warning.whole.contains("mdoe"), "{}", warning.whole);
         assert!(warning.whole.contains('\n'), "{}", warning.whole);

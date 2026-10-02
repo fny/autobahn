@@ -88,7 +88,11 @@ fn runs_for(line: &str, at: usize, out: &mut Vec<(Range<usize>, HighlightStyle)>
         cut += start + word.len() + 1;
     }
     // Everything left is prose: bright, unless the line was chatter.
-    push(out, cut..line.len(), paint(if chatter { FAINT } else { INK }));
+    push(
+        out,
+        cut..line.len(),
+        paint(if chatter { FAINT } else { INK }),
+    );
 }
 
 /// The log's highlighter: no grammar, no incremental state worth keeping.
@@ -174,8 +178,8 @@ mod tests {
     // `test` macro with it, and the attribute below would then expand into
     // itself for ever.
     use super::{LogInk, AMBER, BLUE, FAINT, INK, RED};
-    use gpui_kit::{HighlightStyle, Rgba};
     use gpui_kit::component::input::{HighlightStyleResolver, InputHighlighter};
+    use gpui_kit::{HighlightStyle, Rgba};
 
     fn colour_of(line: &str, needle: &str) -> Option<u32> {
         let runs = LogInk::read(line);

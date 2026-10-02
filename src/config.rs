@@ -401,13 +401,9 @@ impl Config {
         let Some(name) = &self.log else {
             return Ok(None);
         };
-        crate::logging::Level::parse(name)
-            .map(Some)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "log: unknown log level {name:?} (available: quiet, normal, debug)"
-                )
-            })
+        crate::logging::Level::parse(name).map(Some).ok_or_else(|| {
+            anyhow::anyhow!("log: unknown log level {name:?} (available: quiet, normal, debug)")
+        })
     }
 }
 
@@ -1020,9 +1016,7 @@ impl OwnState {
 /// by default, it would escape the cross-session nesting check.
 fn alpha_is_written(mode: SyncMode) -> bool {
     match mode {
-        SyncMode::TwoWaySafe
-        | SyncMode::TwoWayResolved
-        | SyncMode::TwoWayStrict => true,
+        SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => true,
         SyncMode::OneWaySafe | SyncMode::OneWayReplica => false,
     }
 }
@@ -1405,24 +1399,22 @@ impl Config {
                 true => format!("group '{name}': {key}: {message}"),
                 false => format!("the defaults' {key}: {message}"),
             };
-            let (mode, peers) = match inherited(
-                group.mode.as_deref(),
-                self.defaults.mode.as_deref(),
-            ) {
-                Some((mode, mine)) => match parse_mode_spec(mode) {
-                    Ok((mode, peers)) => (Some(mode), peers),
-                    Err(message) => {
-                        errors.push(blame(mine, "mode", &message));
+            let (mode, peers) =
+                match inherited(group.mode.as_deref(), self.defaults.mode.as_deref()) {
+                    Some((mode, mine)) => match parse_mode_spec(mode) {
+                        Ok((mode, peers)) => (Some(mode), peers),
+                        Err(message) => {
+                            errors.push(blame(mine, "mode", &message));
+                            (None, false)
+                        }
+                    },
+                    None => {
+                        errors.push(format!(
+                            "group '{name}': mode: none here, and the defaults specify none either"
+                        ));
                         (None, false)
                     }
-                },
-                None => {
-                    errors.push(format!(
-                        "group '{name}': mode: none here, and the defaults specify none either"
-                    ));
-                    (None, false)
-                }
-            };
+                };
             // Peering is a property of the plan, not of reconciliation:
             // the mode word carries it, the timing comes from the section.
             let peering = match (peers, peering) {
@@ -1551,9 +1543,9 @@ impl Config {
             // configuration error alongside the others rather than a runtime
             // failure discovered only by the affected session's worker.
             match IgnoreSet::new(&ignores) {
-                Err(error) => {
-                    errors.push(format!("group '{name}': ignores: invalid pattern: {error:#}"))
-                }
+                Err(error) => errors.push(format!(
+                    "group '{name}': ignores: invalid pattern: {error:#}"
+                )),
                 // A line that cannot ever do anything is a mistake worth
                 // refusing, not a preference: combining ignore files
                 // written independently is exactly how they appear, and
@@ -1663,19 +1655,17 @@ impl Config {
             let guard_directory_deletes_over = group
                 .guard_directory_deletes_over
                 .or(self.defaults.guard_directory_deletes_over);
-            let staging = match inherited(
-                group.staging.as_deref(),
-                self.defaults.staging.as_deref(),
-            ) {
-                None => StagingMode::default(),
-                Some((mode, mine)) => match parse_staging_mode(mode) {
-                    Ok(mode) => mode,
-                    Err(message) => {
-                        errors.push(blame(mine, "staging", &message));
-                        StagingMode::default()
-                    }
-                },
-            };
+            let staging =
+                match inherited(group.staging.as_deref(), self.defaults.staging.as_deref()) {
+                    None => StagingMode::default(),
+                    Some((mode, mine)) => match parse_staging_mode(mode) {
+                        Ok(mode) => mode,
+                        Err(message) => {
+                            errors.push(blame(mine, "staging", &message));
+                            StagingMode::default()
+                        }
+                    },
+                };
             let mut ownership = |held: Option<(&str, bool)>, key: &str| match held {
                 None => None,
                 Some(("", mine)) => {
@@ -2501,10 +2491,7 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
 
 /// Returns the canonical name of a synchronization mode.
 pub fn mode_name(mode: SyncMode) -> &'static str {
-    match MODES
-        .iter()
-        .find(|row| row.mode == mode && !row.peering)
-    {
+    match MODES.iter().find(|row| row.mode == mode && !row.peering) {
         Some(row) => row.name,
         // Unreachable while every mode has a row of its own: the table
         // is the list of modes, not a view of it.
@@ -2703,7 +2690,9 @@ mod tests {
         // table reader, so the table is checked against that reader.
         for word in DURABILITY {
             assert_eq!(
-                parse_word(DURABILITY, "durability", word.word).unwrap().word,
+                parse_word(DURABILITY, "durability", word.word)
+                    .unwrap()
+                    .word,
                 word.word
             );
         }
@@ -2721,10 +2710,15 @@ mod tests {
         for key in ["live_reload", "disabled_hosts", "log", "on_alert"] {
             println!("{key}: {}", document["properties"][key]);
         }
-        println!("betas: {}", document["$defs"]["Group"]["properties"]["betas"]);
-        println!("ignores: {}", document["$defs"]["Group"]["properties"]["ignores"]);
+        println!(
+            "betas: {}",
+            document["$defs"]["Group"]["properties"]["betas"]
+        );
+        println!(
+            "ignores: {}",
+            document["$defs"]["Group"]["properties"]["ignores"]
+        );
     }
-
 
     /// The schema is the structs the parser uses, with the tables
     /// written onto it — not a second description that can fall behind.
@@ -3403,8 +3397,14 @@ mod tests {
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(error.contains("unknown mode 'sideways'"), "{error}");
         assert!(error.contains("expected one of"), "{error}");
-        assert!(error.contains("'first': betas: a group needs at least one"), "{error}");
-        assert!(error.contains("'second': alpha: cannot be empty"), "{error}");
+        assert!(
+            error.contains("'first': betas: a group needs at least one"),
+            "{error}"
+        );
+        assert!(
+            error.contains("'second': alpha: cannot be empty"),
+            "{error}"
+        );
         assert!(
             error.contains("'second': mode: none here, and the defaults specify none"),
             "{error}"

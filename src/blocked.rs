@@ -33,4 +33,3 @@ pub fn parts(entry: &str) -> (&str, &str, &str) {
     let cause = message.rsplit(": ").next().unwrap_or(message);
     (side, path, cause)
 }
-

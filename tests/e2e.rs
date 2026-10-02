@@ -317,9 +317,7 @@ fn beta_addition_semantics_by_mode() {
         harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe
-            | SyncMode::TwoWayResolved
-            | SyncMode::TwoWayStrict => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
                 assert!(alpha_added.exists(), "{mode:?}: addition should propagate");
                 harness.assert_trees_equal("beta addition");
             }
@@ -353,9 +351,7 @@ fn beta_modification_semantics_by_mode() {
         let report = harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe
-            | SyncMode::TwoWayResolved
-            | SyncMode::TwoWayStrict => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
                 let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
                 assert_eq!(alpha_content, "modified on beta", "{mode:?}");
                 harness.assert_trees_equal("beta modification");

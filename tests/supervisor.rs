@@ -3698,7 +3698,7 @@ fn the_alpha_gives_each_beta_the_others_keys_through_the_gate() {
     }];
     let plans = world.plans(&format!(
         r#"
-        [advanced.peering-dangerously-experimental]
+        [experimental.peering-dangerously-experimental]
         manage_keys = true
 
         [groups.g1]
@@ -4188,7 +4188,7 @@ fn every_group_syncs_over_the_alphas_one_attachment() {
     let peer_script = peering_agent_script(&world, &peer_home);
     let configuration = format!(
         r#"
-        [advanced.peering-dangerously-experimental]
+        [experimental.peering-dangerously-experimental]
         ttl = "2s"
         failover_after = "2s"
 

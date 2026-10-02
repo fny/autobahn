@@ -592,7 +592,7 @@ mod tests {
     fn push(directory: &Path, betas: &str) {
         let configuration = format!(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             ttl = "2s"
             failover_after = "2s"
 

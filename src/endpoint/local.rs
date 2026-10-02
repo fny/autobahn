@@ -2546,7 +2546,7 @@ impl<'a> Transitioner<'a> {
         while claimed + 1 < count
             && self
                 .helpers
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                     free.checked_sub(1)
                 })
                 .is_ok()
@@ -2960,7 +2960,7 @@ impl<'a> Transitioner<'a> {
                 // Counted down atomically: the publish that takes the
                 // count to zero is the last use, whichever thread it is on.
                 let before = count
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |uses| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |uses| {
                         Some(uses.saturating_sub(1))
                     })
                     .unwrap_or(0);

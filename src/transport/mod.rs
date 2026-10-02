@@ -370,6 +370,7 @@ impl Connection {
     pub fn ssh_argv(host: &str, remote_command: Option<&str>) -> Vec<String> {
         let mut argv = vec![ssh_binary()];
         argv.extend(ssh_options().into_iter().map(str::to_owned));
+        argv.extend(peering_ssh_options());
         // The option terminator keeps a hostile host specification (one
         // beginning with `-`) from being parsed as an SSH option such as
         // `ProxyCommand`, which would mean local command execution.
@@ -473,7 +474,98 @@ impl Drop for Connection {
 /// controller going away without a shutdown frame) is a successful
 /// exit.
 pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> {
-    serve_agent_with(input, output, crate::paths::default_state_root())
+    serve_agent_with(
+        input,
+        output,
+        crate::paths::default_state_root(),
+        None,
+        crate::gate::gated(),
+    )
+}
+
+/// What a channel may not do, by how its connection came about.
+#[derive(Clone, Copy)]
+struct ChannelLimits {
+    /// The alpha's attachment to a leader: no pushed files.
+    attached: bool,
+    /// An agent a gate ran, for a restricted key: no key management.
+    gated: bool,
+}
+
+/// What an alpha that attached to a leading beta serves it.
+///
+/// The leader never had any access to the alpha: the alpha dials it, and
+/// runs its own agent for it over that connection. So the leader chooses
+/// only which of the alpha's peering sessions a channel is for. What the
+/// endpoint is — its root, ignores, modes, owners and staging — is the
+/// alpha's own configuration for that session, whatever the leader asked
+/// for; a session the alpha does not run is refused, and so is a channel
+/// past what its sessions need.
+pub struct AttachPolicy {
+    /// The alpha's own initialization of each peering session, by session
+    /// identifier.
+    sessions: std::collections::HashMap<String, Initialize>,
+    /// The sessions a leader has asked for with other settings, said once.
+    warned: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+
+/// The channels one session opens on an attachment: one to synchronize,
+/// one to watch.
+const ATTACHED_CHANNELS_PER_SESSION: usize = 2;
+
+impl AttachPolicy {
+    /// A policy serving exactly these sessions, as initialized here.
+    pub fn new(sessions: impl IntoIterator<Item = Initialize>) -> AttachPolicy {
+        AttachPolicy {
+            sessions: sessions
+                .into_iter()
+                .map(|initialize| (initialize.session.clone(), initialize))
+                .collect(),
+            warned: Default::default(),
+        }
+    }
+
+    /// How many channels an attachment may hold open at once.
+    fn channel_limit(&self) -> usize {
+        self.sessions.len() * ATTACHED_CHANNELS_PER_SESSION
+    }
+
+    /// What to serve a leader's request for a channel: this alpha's own
+    /// initialization of the session it names. Only whether the channel
+    /// watches its root is the leader's to say. Settings that differ from
+    /// the alpha's — an edit made while the beta led, say — are served as
+    /// the alpha has them, and said once.
+    fn serve(&self, requested: Initialize) -> Result<Initialize> {
+        let Some(own) = self.sessions.get(&requested.session) else {
+            bail!(
+                "{:?} is not one of this alpha's peering sessions",
+                requested.session
+            );
+        };
+        let served = Initialize {
+            one_shot: requested.one_shot,
+            ..own.clone()
+        };
+        let asked = Initialize {
+            root: crate::paths::expand_tilde(&requested.root)
+                .map(|root| root.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| requested.root.clone()),
+            ..requested
+        };
+        if asked != served
+            && self
+                .warned
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(served.session.clone())
+        {
+            crate::complain!(
+                "peering: the leader asked for other settings for {}; serving this machine's own",
+                served.root
+            );
+        }
+        Ok(served)
+    }
 }
 
 /// [`serve_agent`] over an explicit state area, so that a test's agent
@@ -485,7 +577,7 @@ pub(crate) fn serve_agent_in<R: Read, W: Write + Send>(
     output: W,
     state_root: &std::path::Path,
 ) -> Result<()> {
-    serve_agent_with(input, output, Ok(state_root.to_path_buf()))
+    serve_agent_with(input, output, Ok(state_root.to_path_buf()), None, false)
 }
 
 /// The agent's side of the protocol, keeping its state under `state_root`.
@@ -495,6 +587,8 @@ fn serve_agent_with<R: Read, W: Write + Send>(
     input: R,
     output: W,
     state_root: Result<PathBuf>,
+    policy: Option<&AttachPolicy>,
+    gated: bool,
 ) -> Result<()> {
     if let Ok(root) = &state_root {
         crate::scan::exclude_state_root(root);
@@ -558,6 +652,31 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                             )?;
                             continue;
                         }
+                        // An attached alpha serves its own sessions only,
+                        // as it configures them.
+                        let initialize = match policy {
+                            None => initialize,
+                            Some(policy) => {
+                                let served = match channels.len() < policy.channel_limit() {
+                                    true => policy.serve(initialize),
+                                    false => Err(anyhow!(
+                                        "an attached alpha holds at most {} channels open",
+                                        policy.channel_limit()
+                                    )),
+                                };
+                                match served {
+                                    Ok(served) => served,
+                                    Err(error) => {
+                                        serve_send(
+                                            &output,
+                                            channel,
+                                            Response::Error(format!("{error:#}")),
+                                        )?;
+                                        continue;
+                                    }
+                                }
+                            }
+                        };
                         // Endpoint creation happens on the channel's own
                         // thread (it touches the filesystem, and the
                         // dispatcher must never block on one channel's
@@ -571,9 +690,13 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                             .unwrap_or_else(|error| error.into_inner())
                             .insert(channel, counted.clone());
                         let output = &output;
+                        let limits = ChannelLimits {
+                            attached: policy.is_some(),
+                            gated,
+                        };
                         crate::threads::spawn_deep_scoped(scope, move || {
                             serve_channel(
-                                channel, initialize, state_root, receiver, output, counted,
+                                channel, initialize, state_root, receiver, output, counted, limits,
                             )
                         });
                     }
@@ -732,6 +855,7 @@ fn reporting_scan<W: Write + Send, T>(
 /// Serves one channel: the endpoint is created here (answering the open),
 /// then requests are served in order, each answered on the shared writer.
 /// The thread ends when the dispatcher drops the channel's sender.
+#[allow(clippy::too_many_arguments)]
 fn serve_channel<W: Write + Send>(
     channel: u32,
     initialize: Initialize,
@@ -739,7 +863,9 @@ fn serve_channel<W: Write + Send>(
     requests: std::sync::mpsc::Receiver<Request>,
     output: &std::sync::Mutex<W>,
     counted: std::sync::Arc<crate::progress::SideProgress>,
+    limits: ChannelLimits,
 ) {
+    let ChannelLimits { attached, gated } = limits;
     // Endpoint creation failures answer on the channel (the controller
     // would otherwise see only silence) without affecting the connection's
     // other channels.
@@ -795,6 +921,12 @@ fn serve_channel<W: Write + Send>(
         .map(|root| root.join(crate::peering::DIRECTORY))
         .map_err(|error| anyhow!("{error:#}"));
     let mut fence: Option<crate::peering::Lease> = None;
+    // The lease this channel was last accepted at. Every write it asks for
+    // is checked against the host's lease, under the lease lock, for the
+    // whole of the write: a takeover through another channel, another
+    // controller's agent, or this host's own peer fences it at once,
+    // rather than at its next renewal.
+    let mut accepted: Option<crate::peering::Lease> = None;
     let mut copy: Option<crate::peering::AncestorCopy> = None;
     while let Ok(request) = requests.recv() {
         #[cfg(test)]
@@ -827,6 +959,8 @@ fn serve_channel<W: Write + Send>(
                 | Request::AncestorRecord { .. }
                 | Request::AncestorCheckpoint { .. }
                 | Request::PutPeeringFile { .. }
+                | Request::PeeringKeys
+                | Request::InstallPeers { .. }
         );
         if let (true, Some(held)) = (writes, &fence) {
             let response = Response::Error(format!(
@@ -839,42 +973,102 @@ fn serve_channel<W: Write + Send>(
             }
             continue;
         }
+        // Held until this request's response is built: the lease cannot
+        // change hands while the write runs.
+        let _lease_guard = match (writes, &accepted, &peering_directory) {
+            (true, Some(lease), Ok(directory)) => {
+                match crate::peering::check_write(directory, lease) {
+                    Ok(guard) => Some(guard),
+                    Err(error) => {
+                        if let Some(crate::peering::WriteRefused::Superseded { current, .. }) =
+                            error.downcast_ref::<crate::peering::WriteRefused>()
+                        {
+                            fence = Some(current.clone());
+                        }
+                        if serve_send(output, channel, Response::Error(format!("{error:#}")))
+                            .is_err()
+                        {
+                            return;
+                        }
+                        continue;
+                    }
+                }
+            }
+            _ => None,
+        };
         let result = match request {
             Request::Lease(lease) => peering_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
-                .and_then(|directory| {
-                    let held = crate::peering::read_lease(directory)?;
-                    match held {
-                        Some(held) if !held.admits(&lease) => {
-                            fence = Some(held.clone());
-                            Ok(Response::Lease(crate::peering::LeaseAnswer::Refused {
-                                current: held,
-                            }))
+                .and_then(|directory| crate::peering::admit_lease(directory, &lease))
+                .map(|answer| {
+                    match &answer {
+                        crate::peering::LeaseAnswer::Refused { current } => {
+                            fence = Some(current.clone());
+                            accepted = None;
                         }
-                        _ => {
-                            crate::peering::write_lease(directory, &lease)?;
+                        crate::peering::LeaseAnswer::Accepted => {
                             fence = None;
-                            Ok(Response::Lease(crate::peering::LeaseAnswer::Accepted))
+                            accepted = Some(lease);
                         }
                     }
+                    Response::Lease(answer)
                 }),
             Request::AncestorRecord {
                 generation,
                 changes,
             } => open_copy(&peering_directory, &initialize.session, &mut copy)
-                .and_then(|copy| copy.record(generation, &changes))
+                .and_then(|copy| {
+                    copy.written_by(accepted.as_ref().map(|lease| lease.leader.as_str()))?;
+                    copy.record(generation, &changes)
+                })
                 .map(|generation| Response::Recorded { generation }),
             Request::AncestorCheckpoint {
                 generation,
                 ancestor,
             } => open_copy(&peering_directory, &initialize.session, &mut copy)
-                .and_then(|copy| copy.checkpoint(generation, ancestor))
+                .and_then(|copy| {
+                    copy.written_by(accepted.as_ref().map(|lease| lease.leader.as_str()))?;
+                    copy.checkpoint(generation, ancestor)
+                })
                 .map(|generation| Response::Recorded { generation }),
+            // An attached alpha has a configuration of its own, and a
+            // genuine leader never pushes it one: a pushed `name` there
+            // would have it start as a follower of whoever sent it. The
+            // lease and the ancestor records, which the handback needs,
+            // are taken as from any leader.
+            Request::PutPeeringFile { .. } if attached => Err(anyhow!(
+                "an attached alpha takes no pushed files: it runs its own configuration"
+            )),
             Request::PutPeeringFile { name, bytes } => peering_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
                 .and_then(|directory| crate::peering::write_pushed_file(directory, &name, &bytes))
+                .map(|()| Response::Written),
+            // Keys are managed only over the user's own login: an agent a
+            // gate ran, for a peering key, refuses, so that no peering key
+            // can widen its own access.
+            Request::PeeringKeys | Request::InstallPeers { .. } if gated => Err(anyhow!(
+                "an agent run by the gate manages no keys: a peering key cannot widen its own \
+                 access"
+            )),
+            Request::PeeringKeys => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| crate::peerkeys::ensure_key(directory))
+                .map(Response::PeeringKeys),
+            Request::InstallPeers {
+                authorized,
+                known_hosts,
+            } => peering_directory
+                .as_ref()
+                .map_err(|e| anyhow!("{e:#}"))
+                .and_then(|directory| {
+                    let home = std::env::var_os("HOME")
+                        .map(PathBuf::from)
+                        .ok_or_else(|| anyhow!("no home directory to find ~/.ssh in"))?;
+                    crate::peerkeys::install_peers(&home, directory, &authorized, &known_hosts)
+                })
                 .map(|()| Response::Written),
             Request::PeeringState => peering_directory
                 .as_ref()
@@ -1341,6 +1535,8 @@ fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Res
     // that a configuration like `alpha = "~/project"` fanned out to several
     // hosts lands in each host's own home rather than a literal `~`.
     let root = crate::paths::expand_tilde(&initialize.root)?;
+    // What this machine serves is its own to say, whoever is asking.
+    crate::host::HostSettings::load(state_root)?.check_root(&root)?;
     let staging_area = state_root.join("staging");
     let state_staging = staging_area.join(format!("{}-{}", initialize.session, initialize.side));
     let staging_root = crate::endpoint::local::staging_root_for(
@@ -1374,11 +1570,32 @@ pub fn ssh_argv_for(destination: &str, remote_command: &str) -> Vec<String> {
     Connection::ssh_argv(destination, Some(remote_command))
 }
 
+/// The ssh options a beta leading from this process dials the others
+/// with: its peering key and the peering `known_hosts`
+/// ([`crate::peerkeys::ssh_options`]). Empty anywhere else.
+static PEERING_SSH_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Sets the ssh options every connection this process makes carries, for a
+/// beta about to lead: its peering key, if it has one.
+pub fn set_peering_ssh_options(options: Vec<String>) {
+    *PEERING_SSH_OPTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = options;
+}
+
+fn peering_ssh_options() -> Vec<String> {
+    PEERING_SSH_OPTIONS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .clone()
+}
+
 /// Peering: runs `argv` — the alpha's way to a leader, `ssh <leader>
 /// autobahn peering attach` by default — and serves as an agent over its
 /// stdio until the far side closes. The alpha is never dialed; this is
-/// how it makes itself an endpoint of a session a beta leads.
-pub fn attach_as_agent(argv: &[String]) -> Result<()> {
+/// how it makes itself an endpoint of a session a beta leads, serving
+/// only what `policy` says it runs.
+pub fn attach_as_agent(argv: &[String], policy: &AttachPolicy) -> Result<()> {
     let (program, arguments) = argv
         .split_first()
         .ok_or_else(|| anyhow!("the attach command is empty"))?;
@@ -1391,7 +1608,13 @@ pub fn attach_as_agent(argv: &[String]) -> Result<()> {
         .with_context(|| format!("unable to run {}", argv.join(" ")))?;
     let stdin = child.stdin.take().expect("piped stdin");
     let stdout = child.stdout.take().expect("piped stdout");
-    let served = serve_agent(stdout, stdin);
+    let served = serve_agent_with(
+        stdout,
+        stdin,
+        crate::paths::default_state_root(),
+        Some(policy),
+        false,
+    );
     let _ = child.wait();
     served
 }
@@ -1932,6 +2155,222 @@ pub(crate) mod tests {
             .expect("staging is readable")
             .collect();
         assert!(staged.is_empty(), "{staged:?}");
+    }
+
+    /// An attached alpha serves the leader its own sessions as its own
+    /// configuration has them. A leader asking for another root, or for
+    /// none of the ignores, is served the alpha's; a session the alpha does
+    /// not run is refused, and so is a channel past what its sessions need.
+    #[test]
+    fn an_attached_alpha_serves_its_own_settings_only() {
+        use crate::endpoint::Endpoint;
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        let elsewhere = keep.path().join("elsewhere");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(root.join("kept.txt"), b"kept").unwrap();
+        std::fs::write(root.join("secret.key"), b"ignored here").unwrap();
+        std::fs::write(elsewhere.join("private.txt"), b"not served").unwrap();
+        let own = Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier(&root.to_string_lossy(), "attached"),
+            ignores: vec!["*.key".into()],
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "alpha".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+            one_shot: false,
+        };
+        let policy = AttachPolicy::new([own.clone()]);
+        let state = keep.path().join("state");
+        let attach = |run: &dyn Fn(Connection)| {
+            let (client, agent) = connected_pair();
+            let (reader, writer, _) = agent.into_parts();
+            std::thread::scope(|scope| {
+                let served = scope.spawn(|| {
+                    serve_agent_with(reader, writer, Ok(state.clone()), Some(&policy), false)
+                });
+                run(client);
+                let _ = served.join();
+            });
+        };
+
+        attach(&|client| {
+            let hostile = Initialize {
+                root: "/".into(),
+                ignores: Vec::new(),
+                ..own.clone()
+            };
+            let mut endpoint = crate::endpoint::remote::RemoteEndpoint::connect(client, hostile)
+                .expect("the alpha's own session is served");
+            let snapshot = endpoint.scan().expect("scanned");
+            let tree = snapshot.root.expect("the configured root");
+            assert!(matches!(
+                tree.child("kept.txt").map(|node| &node.content),
+                Some(crate::tree::Content::File { .. })
+            ));
+            assert!(
+                matches!(
+                    tree.child("secret.key").map(|node| &node.content),
+                    Some(crate::tree::Content::Untracked)
+                ),
+                "the alpha's own ignores hold"
+            );
+            assert!(tree.child("private.txt").is_none());
+            assert!(
+                tree.child("etc").is_none(),
+                "not the root the leader asked for"
+            );
+        });
+
+        attach(&|client| {
+            let unknown = Initialize {
+                session: crate::session::session_identifier("x", "y"),
+                ..own.clone()
+            };
+            let error = crate::endpoint::remote::RemoteEndpoint::connect(client, unknown)
+                .err()
+                .expect("a session the alpha does not run");
+            assert!(
+                format!("{error:#}").contains("not one of this alpha's peering sessions"),
+                "{error:#}"
+            );
+        });
+
+        // A genuine leader never pushes the attached alpha a file, and a
+        // hostile one's is refused, with nothing written; the lease and the
+        // ancestor records the handback needs are taken as from any leader.
+        attach(&|client| {
+            let mut endpoint =
+                crate::endpoint::remote::RemoteEndpoint::connect(client, own.clone()).unwrap();
+            let error = endpoint
+                .put_peering_file("name", b"hostile:/x")
+                .expect_err("no pushes into an attached alpha");
+            assert!(
+                format!("{error:#}").contains("takes no pushed files"),
+                "{error:#}"
+            );
+            assert!(!state.join(crate::peering::DIRECTORY).join("name").exists());
+            let lease = crate::peering::Lease::new("box:/x", 4, std::time::Duration::from_secs(30));
+            assert_eq!(
+                endpoint.lease(&lease).expect("the lease is taken"),
+                crate::peering::LeaseAnswer::Accepted
+            );
+        });
+
+        attach(&|client| {
+            let connection = crate::transport::mux::AgentConnection::connect(client).unwrap();
+            let _sync = connection.open(own.clone()).expect("the first channel");
+            let _watch = connection.open(own.clone()).expect("the second");
+            let error = connection.open(own.clone()).err().expect("one too many");
+            assert!(
+                format!("{error:#}").contains("at most 2 channels"),
+                "{error:#}"
+            );
+        });
+    }
+
+    /// What an agent serves is its machine's to say: with `host.toml`
+    /// naming the folders served, a root outside them is refused, whoever
+    /// asks, and one inside is served.
+    #[test]
+    fn an_agent_serves_only_the_folders_its_machine_allows() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state = keep.path().join("state");
+        let served = keep.path().join("served");
+        let elsewhere = keep.path().join("elsewhere");
+        for directory in [&state, &served, &elsewhere] {
+            std::fs::create_dir_all(directory).unwrap();
+        }
+        std::fs::write(
+            state.join(crate::host::FILE),
+            format!("roots = [{:?}]\n", served.display()),
+        )
+        .unwrap();
+        let initialize = |root: &std::path::Path| Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier("a", "b"),
+            ignores: Vec::new(),
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "beta".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+            one_shot: true,
+        };
+        let error = create_endpoint(&initialize(&elsewhere), &Ok(state.clone()))
+            .err()
+            .expect("outside what this machine serves");
+        assert!(
+            format!("{error:#}").contains("outside the folders"),
+            "{error:#}"
+        );
+        create_endpoint(&initialize(&served.join("project")), &Ok(state))
+            .expect("inside what this machine serves");
+    }
+
+    /// An agent a gate ran manages no keys: a peering key cannot make a
+    /// key, nor install one, whoever holds it.
+    #[test]
+    fn a_gated_agent_manages_no_keys() {
+        use crate::endpoint::Endpoint;
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = keep.path().join("state");
+        let initialize = Initialize {
+            root: root.to_string_lossy().into_owned(),
+            session: crate::session::session_identifier("a", "b"),
+            ignores: Vec::new(),
+            symlink_mode: crate::scan::SymlinkMode::Raw,
+            file_mode: None,
+            directory_mode: None,
+            side: "beta".into(),
+            staging: Default::default(),
+            max_file_size: None,
+            max_entry_count: None,
+            ignore_mounts: true,
+            default_owner: None,
+            default_group: None,
+            one_shot: true,
+        };
+        let (client, agent) = connected_pair();
+        let (reader, writer, _) = agent.into_parts();
+        std::thread::scope(|scope| {
+            let served =
+                scope.spawn(|| serve_agent_with(reader, writer, Ok(state.clone()), None, true));
+            let mut endpoint =
+                crate::endpoint::remote::RemoteEndpoint::connect(client, initialize).unwrap();
+            for error in [
+                endpoint
+                    .peering_keys()
+                    .map(|_| ())
+                    .expect_err("no key made"),
+                endpoint
+                    .install_peers(&[], &[])
+                    .expect_err("no key installed"),
+            ] {
+                assert!(format!("{error:#}").contains("cannot widen"), "{error:#}");
+            }
+            assert!(!state
+                .join(crate::peering::DIRECTORY)
+                .join(crate::peerkeys::KEY_FILE)
+                .exists());
+            drop(endpoint);
+            let _ = served.join();
+        });
     }
 
     /// A genuine session and side are served, under the agent's state area.

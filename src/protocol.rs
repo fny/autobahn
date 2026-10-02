@@ -37,7 +37,7 @@ pub struct Handshake {
 /// The initialization request sent by the controller after the handshake.
 /// Policy travels with it so both endpoints of a session always operate
 /// under identical rules.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Initialize {
     /// The synchronization root path on the agent's filesystem.
     pub root: String,
@@ -183,6 +183,17 @@ pub enum Request {
     PutPeeringFile { name: String, bytes: Vec<u8> },
     /// Peering: what the host holds for this session.
     PeeringState,
+    /// Peering, with `manage_keys`: the host's peering key, made if it has
+    /// none, and its SSH host keys.
+    PeeringKeys,
+    /// Peering, with `manage_keys`: the other betas' keys for the host's
+    /// `authorized_keys`, each forced through the gate, and their host keys
+    /// for its peering `known_hosts`. A gated agent refuses this and
+    /// `PeeringKeys`.
+    InstallPeers {
+        authorized: Vec<String>,
+        known_hosts: Vec<String>,
+    },
 }
 
 /// The header of a snapshot sent as a delta.
@@ -267,6 +278,8 @@ pub enum Response {
     Recorded { generation: u64 },
     /// What the host holds for the channel's session.
     PeeringState(crate::peering::State),
+    /// The host's peering key and host keys.
+    PeeringKeys(crate::peerkeys::HostKeys),
     /// How far a scan still running has got: sent every half second or
     /// so, only once it has run that long, and always before the scan's
     /// own answer. The controller counts it and keeps reading.
@@ -371,7 +384,7 @@ pub enum MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 16;
+pub const COMPATIBILITY_EPOCH: u32 = 17;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.

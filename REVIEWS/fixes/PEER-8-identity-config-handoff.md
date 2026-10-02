@@ -1,7 +1,11 @@
 # PEER-8: Host identity, stale follower config, handoff and backoff
 
 **Findings:** M-43 (ASTRA F21), M-44 (ASTRA F22), M-45 (OPUS, related peering bugs).
-**Status:** deferred, not in v1. Documented in `docs/peering.md`.
+**Status:** fixed, 2026-09-30. The backoff cap landed with PEER-6. Notes on the rest:
+- The leader pushes `names/<group>` beside the host-wide `name`, which still says the host is a peer. A star leads under one name, since a lease is per host: the first group's.
+- A follower derives its star again every interval while it follows, not only before a takeover, so its wait follows a pushed change too. A push that does not derive keeps the last star that did.
+- The alpha keeps one supervisor across roles. While it follows, its peering sessions wait for the lead, and its plain groups keep running.
+- A follower whose own lease names it now leads at once at that term, as `spec/Peering.tla` already has it. Without that, a correct `yield --to <beta>` also left nobody leading until the timeout.
 
 ## Problem
 

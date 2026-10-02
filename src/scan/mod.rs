@@ -337,16 +337,64 @@ pub fn scan(
     progress: Option<&crate::progress::SideProgress>,
     ignore_mounts: bool,
 ) -> Result<Snapshot> {
+    scan_deferring(
+        root,
+        baseline,
+        ignores,
+        behavior,
+        symlink_mode,
+        max_file_size,
+        dirty,
+        rehash,
+        progress,
+        ignore_mounts,
+        None,
+    )
+    .map(|(snapshot, _)| snapshot)
+}
+
+/// Asks whether the file at a path on disk is still being written: created
+/// or written, and not yet closed. See [`scan_deferring`].
+pub type InFlight<'a> = &'a (dyn Fn(&Path) -> bool + Sync);
+
+/// [`scan`], leaving out new files still being written.
+///
+/// A file the baseline does not hold, and that `in_flight` says is still
+/// open for writing, is not read: it is left out, as not there yet. A safe
+/// save's temporary is exactly this, and is renamed away the moment it
+/// closes, so one scanned before then is asked for when it no longer
+/// exists. A file the baseline holds is read as it stands, as ever: a
+/// watcher reports a close after the close, and an existing file's old
+/// entry kept on that report would read a finished write as never made.
+/// The paths left out are returned, for the caller to scan again; a
+/// writer's close and rename mark them anyway, as the watcher sees them.
+#[allow(clippy::too_many_arguments)] // a scan is configured, not builder-shaped
+pub fn scan_deferring(
+    root: &Path,
+    baseline: Option<&Snapshot>,
+    ignores: &IgnoreSet,
+    behavior: &FilesystemBehavior,
+    symlink_mode: SymlinkMode,
+    max_file_size: Option<u64>,
+    dirty: Option<&DirtyPaths>,
+    rehash: bool,
+    progress: Option<&crate::progress::SideProgress>,
+    ignore_mounts: bool,
+    in_flight: Option<InFlight<'_>>,
+) -> Result<(Snapshot, Vec<PathBuf>)> {
     // Probe the root without following symbolic links. A missing root isn't
     // an error — it's a legitimate (and common) synchronization state.
     let metadata = match fs::symlink_metadata(root) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == ErrorKind::NotFound => {
-            return Ok(Snapshot {
-                root: None,
-                preserves_executability: behavior.preserves_executability,
-                ..Snapshot::default()
-            });
+            return Ok((
+                Snapshot {
+                    root: None,
+                    preserves_executability: behavior.preserves_executability,
+                    ..Snapshot::default()
+                },
+                Vec::new(),
+            ));
         }
         Err(error) => {
             return Err(error).with_context(|| {
@@ -395,6 +443,7 @@ pub fn scan(
     );
     scanner.device = metadata.dev();
     scanner.ignore_mounts = ignore_mounts;
+    scanner.in_flight = in_flight;
     let content = scanner.scan_directory(root, "", baseline_root, dirty.map(|d| &d.root));
     scanner.publish();
     let root_node = Node {
@@ -462,7 +511,7 @@ pub fn scan(
             snapshot.directories + snapshot.files + snapshot.symlinks,
         ));
     }
-    Ok(snapshot)
+    Ok((snapshot, std::mem::take(&mut scanner.deferred)))
 }
 
 /// Recomputes a snapshot's statistics from its hierarchy: every
@@ -560,6 +609,11 @@ struct Scanner<'a> {
     /// The depth past which a directory is not walked. See
     /// [`MAX_SCAN_DEPTH`].
     max_depth: usize,
+    /// Whether a file is still being written. See [`scan_deferring`].
+    in_flight: Option<InFlight<'a>>,
+    /// The files left for a later scan because they were still being
+    /// written.
+    deferred: Vec<PathBuf>,
 }
 
 /// What probing a listed entry established.
@@ -632,6 +686,8 @@ impl<'a> Scanner<'a> {
             state_roots,
             depth: 0,
             max_depth: max_scan_depth(),
+            in_flight: None,
+            deferred: Vec::new(),
         }
     }
 
@@ -655,6 +711,7 @@ impl<'a> Scanner<'a> {
         forked.device = self.device;
         forked.ignore_mounts = self.ignore_mounts;
         forked.max_depth = self.max_depth;
+        forked.in_flight = self.in_flight;
         forked
     }
 
@@ -666,6 +723,7 @@ impl<'a> Scanner<'a> {
         self.symlinks += forked.symlinks;
         self.total_file_size += forked.total_file_size;
         self.mount_points.append(&mut forked.mount_points);
+        self.deferred.append(&mut forked.deferred);
     }
 
     /// Claims a helper thread for a subtree, if one is free.
@@ -883,8 +941,11 @@ impl<'a> Scanner<'a> {
                 Probed::Vanished => {}
                 Probed::Settled(content) => children.push(Pending::Done(Node { name, content })),
                 Probed::File(metadata) => {
-                    let content = self.scan_file(&entry_path, &metadata, baseline_child);
-                    children.push(Pending::Done(Node { name, content }));
+                    if let Some(node) =
+                        self.file_entry(name, &entry_path, &metadata, baseline_child)
+                    {
+                        children.push(Pending::Done(node));
+                    }
                 }
                 Probed::Symlink => {
                     let content = self.scan_symlink(&entry_path, &child_path);
@@ -1052,7 +1113,9 @@ impl<'a> Scanner<'a> {
         let content = match self.probe_entry(entry_path, child_path) {
             Probed::Vanished => return None,
             Probed::Settled(content) => content,
-            Probed::File(metadata) => self.scan_file(entry_path, &metadata, baseline),
+            Probed::File(metadata) => {
+                return self.file_entry(name, entry_path, &metadata, baseline)
+            }
             Probed::Symlink => self.scan_symlink(entry_path, child_path),
             Probed::Directory { region, device } => {
                 self.walk(entry_path, child_path, baseline, dirty, region, device)
@@ -1151,6 +1214,23 @@ impl<'a> Scanner<'a> {
         self.within_ignored = outer;
         self.device = outer_device;
         content
+    }
+
+    /// A file entry's node: scanned, or — a new file still being written —
+    /// none, left for a later scan.
+    fn file_entry(
+        &mut self,
+        name: String,
+        disk_path: &Path,
+        metadata: &Metadata,
+        baseline: Option<&Node>,
+    ) -> Option<Node> {
+        if baseline.is_none() && self.in_flight.is_some_and(|in_flight| in_flight(disk_path)) {
+            self.deferred.push(disk_path.to_path_buf());
+            return None;
+        }
+        let content = self.scan_file(disk_path, metadata, baseline);
+        Some(Node { name, content })
     }
 
     /// Scans the file at `disk_path`, whose (already fetched) metadata is
@@ -1603,6 +1683,77 @@ mod tests {
             digest_of("version-TWO"),
             "a same-granule rewrite went unobserved"
         );
+    }
+
+    /// A new file still being written — a safe save's temporary — is left
+    /// out, and comes back to be scanned again. A file the baseline holds is
+    /// read as it stands, whatever the watcher says about it: its report of
+    /// a close lags the close, and the old entry would read a finished write
+    /// as never made.
+    #[test]
+    fn a_new_file_still_being_written_is_left_for_a_later_scan() {
+        let directory = tempdir().expect("tempdir");
+        let root = directory.path();
+        write(root, "kept.txt", "kept");
+        write(root, "edited.txt", "before");
+        let moment = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
+        for name in ["kept.txt", "edited.txt"] {
+            fs::File::options()
+                .write(true)
+                .open(root.join(name))
+                .expect("file should open")
+                .set_modified(moment)
+                .expect("mtime should be settable");
+        }
+        let scan_with = |baseline: Option<&Snapshot>, in_flight: InFlight<'_>| {
+            scan_deferring(
+                root,
+                baseline,
+                &IgnoreSet::default(),
+                &FilesystemBehavior::default(),
+                SymlinkMode::default(),
+                None,
+                None,
+                false,
+                None,
+                true,
+                Some(in_flight),
+            )
+            .expect("scan should succeed")
+        };
+        let (baseline, deferred) = scan_with(None, &|_| false);
+        assert!(deferred.is_empty());
+
+        write(root, "edited.txt", "after, and longer");
+        write(root, "edited.txt.bench-tmp", "a save in progress");
+        let open = [
+            root.join("kept.txt"),
+            root.join("edited.txt"),
+            root.join("edited.txt.bench-tmp"),
+        ];
+        let (snapshot, deferred) = scan_with(Some(&baseline), &|path: &Path| {
+            open.iter().any(|open| open == path)
+        });
+        let tree = snapshot.root.as_ref().expect("root");
+        assert!(tree.child("edited.txt.bench-tmp").is_none());
+        assert_eq!(
+            file_content(tree, "edited.txt").0,
+            digest_of("after, and longer"),
+            "a file the baseline holds is read as it stands"
+        );
+        assert_eq!(file_content(tree, "kept.txt").0, digest_of("kept"));
+        assert_eq!((snapshot.files, snapshot.total_file_size), (2, 21));
+        assert_eq!(deferred, [open[2].clone()]);
+
+        // Closed: read as it stands.
+        let (snapshot, deferred) = scan_with(Some(&snapshot), &|_| false);
+        let tree = snapshot.root.as_ref().expect("root");
+        assert!(deferred.is_empty());
+        assert_eq!(
+            file_content(tree, "edited.txt").0,
+            digest_of("after, and longer")
+        );
+        assert!(tree.child("edited.txt.bench-tmp").is_some());
     }
 
     /// An incremental scan hands on digests it adopted, which earlier

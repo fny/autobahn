@@ -95,6 +95,15 @@ def find_tainted(records, plan=None):
             # The offered load was not what the report claims; every
             # latency sample this tool-run produced is suspect.
             tainted.setdefault(key, "background_load_failure")
+        elif kind == "workload" and record.get("attempts") and not record.get("samples"):
+            # A whole window in which not one edit landed measured the
+            # harness, or a tool that had stopped, not latency. Counted as
+            # censored it became a p99 "over two minutes" in the headline:
+            # bench-1790564569 had seven such windows, all a harness fault
+            # (a narrow cell watching every destination of a fan-out
+            # group), and both tools alike. Left out here and listed with
+            # its reason, so a real stall is still in plain view.
+            tainted.setdefault(key, "nothing_landed")
         elif kind == "job_start":
             # A job that ran with more destinations than its cell asked
             # for was a different cell — a fan-out under a pairwise name.
@@ -164,6 +173,14 @@ def window_rows(series, start, end):
     return inside, (baseline or (inside[0] if inside else None))
 
 
+def consistent(rows):
+    """Whether a sampler's rows could have come from one sampler: time
+    never goes back, and cumulative CPU never falls. Several samplers
+    interleaved in one log — what a destination's series was on fan-out
+    groups before job.py stopped samplers everywhere — break both."""
+    return all(b[0] >= a[0] and b[2] >= a[2] for a, b in zip(rows, rows[1:]))
+
+
 def windowed(resources, phase, host):
     """Peak RSS and mean CPU inside one phase window for one host, with
     the CPU baseline taken from the last sample at or before the window's
@@ -185,8 +202,12 @@ def windowed(resources, phase, host):
     inside, baseline = window_rows(series, start, end)
     if len(inside) < 2:
         return None
-    peak_rss = max(row[1] for row in inside)
     per_host = resources.get("series", {}).get("remote_by_host") if host == "remote" else None
+    # A series that could not have come from one sampler yields nothing:
+    # its peak and its CPU would be sums of samplers, not a measurement.
+    if not all(consistent(own) for own in (per_host or [resources.get("series", {}).get(host, [])])):
+        return {"inconsistent": True}
+    peak_rss = max(row[1] for row in inside)
     if per_host:
         rate = 0.0
         for own in per_host:
@@ -335,6 +356,7 @@ def main():
     settled_runs = {run_key(r) for r in records
                     if r.get("measurement") == "idle_window" and r.get("settled")}
     resources = defaultdict(lambda: defaultdict(list))
+    inconsistent = set()
     for record in records:
         if record.get("measurement") != "resources":
             continue
@@ -348,7 +370,9 @@ def main():
                 continue
             for host in ("local", "remote"):
                 sliced = windowed(record, phase, host)
-                if sliced:
+                if sliced and sliced.get("inconsistent"):
+                    inconsistent.add((record.get("job"), record.get("tool"), host))
+                elif sliced:
                     key = (record["cell"], record["tool"], phase, host)
                     resources[key]["peak_rss_kb"].append(sliced["peak_rss_kb"])
                     resources[key]["cpu"].append(sliced["cpu_percent_of_core"])
@@ -400,6 +424,10 @@ def main():
             }
             for (cell, tool, phase, host), values in sorted(resources.items())
         },
+        # Tool-runs whose sampler series could not have come from one
+        # sampler, and so gave no resource figures for that side.
+        "inconsistent_resource_series": sorted(
+            f"{job}/{tool}/{host}" for job, tool, host in inconsistent),
         "tainted_runs": {f"{job}/{tool}": reason
                          for (job, tool), reason in sorted(tainted.items()) if job},
         "problems": problems,

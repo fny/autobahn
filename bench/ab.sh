@@ -126,15 +126,16 @@ scrub() {
 
 # The harness: the measurement plane, compiled so its own overhead is
 # small and measured rather than large and guessed.
-# Existence is not the test — a build tree synchronized from another
-# platform leaves a binary that cannot execute here — so the harness is
-# rebuilt whenever the one present does not run.
-BM="$HERE/harness/target/release/benchmark"
-if ! "$BM" manifest cheap "$HERE" >/dev/null 2>&1; then
-    echo "building the harness..."
-    (cd "$HERE/harness" && CARGO_TARGET_DIR="$HERE/harness/target" cargo build --release >/dev/null 2>&1) \
-        || { echo "harness build failed" >&2; exit 1; }
-fi
+# Built on every run, which is a no-op when it is current, into a target
+# directory of this platform's own. Running whatever binary was present
+# used a build from before the harness last changed — the observer gained
+# a required --root, and a stale build refused it as an unknown command —
+# and a build tree synchronized from another platform holds a binary that
+# cannot run here at all.
+HARNESS_TARGET="$HERE/harness/target/$(uname -s)-$(uname -m)"
+BM="$HARNESS_TARGET/release/benchmark"
+(cd "$HERE/harness" && CARGO_TARGET_DIR="$HARNESS_TARGET" cargo build --release --quiet) \
+    || { echo "harness build failed" >&2; exit 1; }
 
 # --remote runs the tool's agent over SSH but keeps everything else here,
 # so HOST has to see this machine's filesystem. Proven, not assumed: HOST
@@ -259,6 +260,14 @@ leg() {
 import json, sys
 name, cold, path = sys.argv[1:4]
 d = json.load(open(path))
+# A leg that measured nothing has no percentiles to print or compare, and
+# formatting them crashed the report with a traceback. Too short a window
+# is the usual cause: the harness spends its first seconds warming up.
+if not d.get("samples") or d.get("p50_ms") is None:
+    print(f"FAIL: leg {name}: no latency samples in the window "
+          f"({d.get('warmup_samples', 0)} warm-up only); try a longer --seconds",
+          file=sys.stderr)
+    sys.exit(1)
 print(f"  {name:10s} cold={cold:>6s}s  n={d.get('samples'):>4}  censored={d.get('censored', 0)}  "
       f"p50={d.get('p50_ms'):>6}  p90={d.get('p90_ms'):>6}  p99={d.get('p99_ms'):>7}")
 PY

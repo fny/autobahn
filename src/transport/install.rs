@@ -44,15 +44,24 @@ use crate::protocol;
 /// 127 on Linux, 126 on macOS), and the caller installs it: any failed
 /// first connection triggers an installation, whatever the exit status.
 pub fn versioned_remote_command() -> String {
-    let version = protocol::version();
-    let mut branches = String::new();
-    for (platform, path) in agent_candidates() {
-        if let Some(digest) = file_digest(&path) {
-            branches.push_str(&format!(
-                "{platform}) exec \"$HOME/.autobahn/bin/autobahn-{version}-{digest}\" agent;; "
-            ));
-        }
-    }
+    let branches: Vec<(String, String)> = agent_candidates()
+        .into_iter()
+        .filter_map(|(platform, path)| Some((platform, file_digest(&path)?)))
+        .collect();
+    agent_script(&protocol::version(), &branches)
+}
+
+/// The remote command running agent `version`, by platform: each of
+/// `branches` names a platform and the digest of the binary installed for
+/// it. [`crate::gate`] builds it again from what it parses out of a
+/// request, and runs the agent only for a request that is exactly this.
+pub(crate) fn agent_script(version: &str, branches: &[(String, String)]) -> String {
+    let branches: String = branches
+        .iter()
+        .map(|(platform, digest)| {
+            format!("{platform}) exec \"$HOME/.autobahn/bin/autobahn-{version}-{digest}\" agent;; ")
+        })
+        .collect();
     // Run by `sh` whatever the login shell is: the script is POSIX, and a
     // login shell like fish would not parse it. Single-quoted as one word;
     // nothing inside it holds a single quote.
@@ -61,6 +70,39 @@ pub fn versioned_remote_command() -> String {
          case $m in arm64) m=aarch64;; amd64) m=x86_64;; esac; \
          case $s-$m in {branches}*) exec \"$HOME/.autobahn/bin/autobahn-{version}\" agent;; esac'"
     )
+}
+
+/// Asks a server whose key runs only [`crate::gate`] to install this
+/// build's agent itself, from autobahn's signed release of this version:
+/// the controller names a release, and never sends a binary through a key
+/// that may only run the agent. A build that is not a release cannot be
+/// installed this way, and the gate says so.
+pub fn install_through_gate(destination: &str) -> Result<()> {
+    let request = format!(
+        "autobahn gate install v{} {}",
+        env!("CARGO_PKG_VERSION"),
+        protocol::version()
+    );
+    let argv = crate::transport::ssh_argv_for(destination, &request);
+    let (program, arguments) = argv
+        .split_first()
+        .ok_or_else(|| anyhow!("the ssh command is empty"))?;
+    let mut command = Command::new(program);
+    command.args(arguments);
+    let output = run_within(
+        command,
+        None,
+        upload_timeout(64 << 20),
+        "installing the agent through the gate",
+    )?;
+    if !output.status.success() {
+        bail!(
+            "{destination} runs only autobahn's gate, which could not install this build's \
+             agent: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// The first `digest_length` hex digits of a binary's blake3: enough to
@@ -264,6 +306,15 @@ pub struct Installed {
 }
 
 impl Installed {
+    /// An agent a gate installed from a signed release: nothing local was
+    /// its source.
+    pub fn through_gate() -> Installed {
+        Installed {
+            platform: "the gate's".to_owned(),
+            source: PathBuf::from("a signed release"),
+        }
+    }
+
     /// How the source file should be described when the agent it produced
     /// turns out to be the wrong version: the path, and how old it is.
     ///
@@ -345,7 +396,7 @@ fn platform_name(system: &str, machine: &str) -> String {
 /// rather than used directly. Without this the two namings never match on
 /// a Mac, and a Mac controller cannot serve as its own agent for another
 /// Mac — the case that is supposed to need no bundle at all.
-fn local_platform() -> String {
+pub(crate) fn local_platform() -> String {
     let system = match std::env::consts::OS {
         "macos" => "darwin",
         other => other,

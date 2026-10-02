@@ -7,3 +7,5 @@
 cc d3bcaeed70cc336e505642da2310ae1e73928e559973e16955603e4b55ea31c9 # shrinks to operations = [7, 0, 4, 3, 0, 2, 2, 1, 2, 1]
 cc c9edb49b6a16f1cec747116d39fb43fc9492dac4244369201d12205570fa3c82 # shrinks to operations = [7, 1, 4, 7, 4, 0, 7, 5, 4]
 cc 012133b34377c6cf9247ae44d646b13c8c7996b44379edf9940553813465ea45 # shrinks to operations = [2, 0, 2, 5, 2]
+cc a53ea71df920591c805fafc6af1b061abcf2fc4046a4aa9025398557b35d934c # shrinks to operations = [(1, 29), (2, 4), (3, 56), (5, 25), (4, 56), (7, 16), (4, 10), (1, 11), (2, 38), (6, 48), (5, 55), (6, 35)]
+cc 58d52e7b6e4f51ff370c9fad4c810c574321cdd1f6d56859a926a058f836582e # shrinks to operations = [(4, 27), (7, 38), (6, 57), (1, 14), (0, 9), (4, 19), (7, 61), (3, 53), (1, 30), (2, 12), (8, 38)]

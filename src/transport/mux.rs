@@ -244,6 +244,8 @@ impl Owed {
             Request::AncestorCheckpoint { .. } => "an ancestor checkpoint",
             Request::PutPeeringFile { .. } => "a peering file",
             Request::PeeringState => "a peering state query",
+            Request::PeeringKeys => "a peering key",
+            Request::InstallPeers { .. } => "the peers' keys",
         };
         let grace = match request {
             Request::AwaitChanges { milliseconds, .. } => Duration::from_millis(*milliseconds),
@@ -862,21 +864,31 @@ pub struct AgentPool {
     /// How long a session waits on another's establishment, when not
     /// [`POOL_WAIT_TIMEOUT`].
     wait_timeout: Option<std::time::Duration>,
-    /// Peering: connections that dialed *in*, by the peer's name, waiting
-    /// for the session that will use them. The configured alpha attaches
-    /// to a beta that leads this way, since the alpha is never dialed.
-    attachments: Mutex<HashMap<String, super::Connection>>,
+    /// Peering: connections that dialed *in*, by the peer's name. The
+    /// configured alpha attaches to a beta that leads this way, since the
+    /// alpha is never dialed; each of its sessions opens its own channels
+    /// on the one connection, as sessions share a pooled one.
+    attachments: Mutex<HashMap<String, AgentConnection>>,
 }
 
 impl AgentPool {
-    /// Peering: offers a connection a peer opened to this supervisor. A
-    /// later offer for the same name replaces an earlier one that was
-    /// never taken — the peer reconnected.
+    /// Peering: offers a connection a peer opened to this supervisor. Its
+    /// handshake is made here, and the connection kept for every session
+    /// with that peer to open its channels on. A later offer for the same
+    /// name replaces an earlier one — the peer reconnected — and sessions
+    /// still on the old one find it gone when they next fail.
     pub fn offer_attachment(&self, name: &str, connection: super::Connection) {
-        self.attachments
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(name.to_owned(), connection);
+        match AgentConnection::connect(connection) {
+            Ok(connection) => {
+                self.attachments
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(name.to_owned(), connection);
+            }
+            Err(error) => crate::complain!(
+                "peering: the attached {name} did not complete its handshake: {error:#}"
+            ),
+        }
     }
 
     /// Keeps only the slots whose key `keep` accepts. A slot removed here
@@ -889,12 +901,25 @@ impl AgentPool {
             .retain(|key, _| keep(key));
     }
 
-    /// Peering: takes the connection a peer opened, if one is waiting.
-    pub fn take_attachment(&self, name: &str) -> Option<super::Connection> {
-        self.attachments
+    /// Peering: the connection a peer opened, while it is alive. It stays
+    /// here for the next session: one connection serves every session with
+    /// the peer, each on channels of its own. Taken by the first session,
+    /// it left the peer's other groups with nothing to sync over until the
+    /// lead came back. A dead one is forgotten, and sessions wait for the
+    /// peer to dial in again.
+    pub fn attachment(&self, name: &str) -> Option<AgentConnection> {
+        let mut attachments = self
+            .attachments
             .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .remove(name)
+            .unwrap_or_else(|error| error.into_inner());
+        match attachments.get(name) {
+            Some(connection) if connection.usable() => Some(connection.clone()),
+            Some(_) => {
+                attachments.remove(name);
+                None
+            }
+            None => None,
+        }
     }
 }
 

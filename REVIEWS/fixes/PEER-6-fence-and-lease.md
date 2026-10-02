@@ -1,7 +1,11 @@
 # PEER-6: Make the fence hold, and make taking a lease atomic
 
 **Findings:** H-9 (ASTRA F04, OPUS H7, GLM L5), H-10 (ASTRA F05, OPUS H7), M-42 (ASTRA F20).
-**Status:** deferred, not in v1. Documented in `docs/peering.md` under the collision issues.
+**Status:** fixed, 2026-09-30. Two departures from the proposal:
+- A lease lapses a `ttl` after the agent *received* it, by the agent's clock, rather than a `ttl` after the leader's `renewed_at`. Skew between the two clocks then never matters.
+- The controller re-presents its lease once a third of `ttl` has passed, before its next write and while it waits for changes, rather than on a separate timer. A refusal that says "fenced" is followed by one fresh presentation, so a lapse costs one cycle and a takeover ends the cycle at once.
+
+Also here, from PEER-8: peering sessions cap their backoff at half a `ttl`, so a network blip never outlasts the takeover wait.
 
 ## Problem
 

@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 
-use crate::endpoint::{Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome};
+use crate::endpoint::{
+    ChangeActivity, Endpoint, FileRequest, StagingNeed, TransferFrame, TransitionOutcome,
+};
 pub mod ancestor;
 
 use crate::tree::{
@@ -266,6 +268,9 @@ pub struct Session {
     /// Peering: what this session presents to its peer when its
     /// supervisor leads. `None` for a plain mode, and for a follower.
     leadership: Option<crate::peering::Leadership>,
+    /// When `present_lease` last had the lease accepted, for renewing it
+    /// while the session waits between cycles.
+    lease_presented_at: Option<std::time::Instant>,
     /// Peering: which side the peer is. The beta, except for the session
     /// a beta that leads runs against the attached alpha.
     peer_side: crate::peering::PeerSide,
@@ -588,6 +593,7 @@ impl Session {
             settled_alpha: None,
             settled_beta: None,
             leadership: None,
+            lease_presented_at: None,
             peer_side: crate::peering::PeerSide::Beta,
             copy_checked: false,
             _lock: lock,
@@ -778,6 +784,18 @@ impl Session {
         }
     }
 
+    /// Peering, with `manage_keys`: the peer host's peering key and host
+    /// keys, the key made if it had none.
+    pub fn peer_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+        self.peer().peering_keys()
+    }
+
+    /// Peering, with `manage_keys`: installs the other betas' keys on the
+    /// peer host.
+    pub fn install_peers(&mut self, authorized: &[String], known_hosts: &[String]) -> Result<()> {
+        self.peer().install_peers(authorized, known_hosts)
+    }
+
     /// Peering: writes the files a follower needs onto the beta's host.
     pub fn push_peering_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
         for (name, bytes) in files {
@@ -796,8 +814,11 @@ impl Session {
             return Ok(());
         };
         match self.peer().lease(&leadership.lease())? {
-            crate::peering::LeaseAnswer::Accepted => {}
+            crate::peering::LeaseAnswer::Accepted => {
+                self.lease_presented_at = Some(std::time::Instant::now());
+            }
             crate::peering::LeaseAnswer::Refused { current } => {
+                self.lease_presented_at = None;
                 return Err(crate::peering::Fenced { current }.into());
             }
         }
@@ -811,6 +832,49 @@ impl Session {
             }
             self.copy_checked = true;
         }
+        Ok(())
+    }
+
+    /// Peering: presents the lease again when a third of its lifetime has
+    /// passed since it was last accepted. A leading session calls this
+    /// while it waits between cycles, so an interval, a long idle spell or
+    /// anything else between cycles never lets the lease lapse and hand a
+    /// healthy leader's host to a follower. A refusal is `Fenced`.
+    pub fn renew_lease_if_due(&mut self) -> Result<()> {
+        let Some(leadership) = &self.leadership else {
+            return Ok(());
+        };
+        let due = self
+            .lease_presented_at
+            .is_none_or(|at| at.elapsed() >= leadership.ttl / 3);
+        match due {
+            true => self.present_lease(),
+            false => Ok(()),
+        }
+    }
+
+    /// Peering: brings the peer's copy of the ancestor level with this
+    /// session's — a checkpoint, when it stands at any other generation —
+    /// and confirms it. What a handoff leaves the next leader to adopt must
+    /// be this session's history as it stands, not one a record that failed
+    /// to arrive left behind: records are replicated best effort, and a
+    /// copy that lags by one is found out only by the next record.
+    pub fn level_the_copy(&mut self) -> Result<()> {
+        if self.leadership.is_none() {
+            return Ok(());
+        }
+        let generation = self.ancestor_store.generation();
+        if self.peer().peering_state()?.generation == Some(generation) {
+            return Ok(());
+        }
+        let ancestor = self.ancestor.clone();
+        let reached = self
+            .peer()
+            .ancestor_checkpoint(generation, ancestor.as_ref())?;
+        anyhow::ensure!(
+            reached == generation,
+            "the peer's ancestor copy stands at generation {reached}, not {generation}"
+        );
         Ok(())
     }
 
@@ -922,25 +986,48 @@ impl Session {
     /// no evidence of a burst, which shortens the settle rather than
     /// lengthening it: cycles are idempotent, so the cost of cycling a
     /// little eagerly is work, never correctness.
+    ///
+    /// A file still open for writing is the one exception to "quiet means
+    /// done". A safe save — write a temporary file, flush it, rename it over
+    /// the original — goes silent during the flush, and a cycle then would
+    /// copy a temporary file that is renamed away before it arrives. So
+    /// while a side reports a file open for writing, the settle waits past
+    /// `maximum`, up to [`crate::endpoint::WRITE_GRACE`], for it to close.
+    /// A save that closes the moment it has written — most of them — waits
+    /// no longer than before. A save that begins after the settle is left
+    /// out by the scan itself ([`crate::scan::scan_deferring`]); waiting
+    /// here spares the cycle that would find nothing else to do.
     pub fn settle(&mut self, maximum: std::time::Duration, quiet: std::time::Duration) {
-        let deadline = std::time::Instant::now() + maximum;
+        let started = std::time::Instant::now();
+        let deadline = started + maximum;
+        let writing_deadline = started + crate::endpoint::WRITE_GRACE.max(maximum);
         let sample = |session: &mut Self| {
             (
                 session.alpha.change_activity(),
                 session.beta.change_activity(),
             )
         };
+        let writing = |sampled: &(Option<ChangeActivity>, Option<ChangeActivity>)| {
+            [sampled.0, sampled.1]
+                .iter()
+                .any(|side| side.is_some_and(|activity| activity.writing))
+        };
         let mut previous = sample(self);
-        while std::time::Instant::now() < deadline {
-            let slice = quiet.min(deadline.saturating_duration_since(std::time::Instant::now()));
+        loop {
+            let limit = match writing(&previous) {
+                true => writing_deadline,
+                false => deadline,
+            };
+            let slice = quiet.min(limit.saturating_duration_since(std::time::Instant::now()));
             if slice.is_zero() {
                 break;
             }
             std::thread::sleep(slice);
             let current = sample(self);
-            // Neither side recorded anything new across the slice: whatever
-            // triggered this settle has finished arriving.
-            if current == previous {
+            // Neither side recorded anything new across the slice, and
+            // nothing is still being written: whatever triggered this
+            // settle has finished arriving.
+            if current == previous && !writing(&current) {
                 break;
             }
             previous = current;
@@ -2008,6 +2095,9 @@ mod tests {
     struct ScriptedEndpoint {
         snapshots: std::collections::VecDeque<crate::tree::Snapshot>,
         last: Option<crate::tree::Snapshot>,
+        /// What each `change_activity` sample returns, in turn; the last
+        /// one repeats. Empty reports nothing, as a remote endpoint does.
+        activity: std::collections::VecDeque<ChangeActivity>,
     }
 
     impl ScriptedEndpoint {
@@ -2015,11 +2105,20 @@ mod tests {
             ScriptedEndpoint {
                 snapshots: snapshots.into(),
                 last: None,
+                activity: std::collections::VecDeque::new(),
             }
         }
     }
 
     impl Endpoint for ScriptedEndpoint {
+        fn change_activity(&mut self) -> Option<ChangeActivity> {
+            match self.activity.len() {
+                0 => None,
+                1 => self.activity.front().copied(),
+                _ => self.activity.pop_front(),
+            }
+        }
+
         fn scan(&mut self) -> Result<crate::tree::Snapshot> {
             if let Some(next) = self.snapshots.pop_front() {
                 self.last = Some(next);
@@ -2094,6 +2193,109 @@ mod tests {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.transition(transitions)
         }
+    }
+
+    /// A handoff brings the peer's copy of the ancestor level first: a peer
+    /// already at the leader's generation is sent nothing, one elsewhere is
+    /// sent a checkpoint at it, and one that does not arrive there is an
+    /// error — the automatic handback then waits for the next settled cycle.
+    /// A session that does not lead replicates nothing.
+    #[test]
+    fn leveling_the_copy_checkpoints_a_peer_that_is_behind() {
+        use std::sync::{Arc, Mutex};
+        #[derive(Default)]
+        struct Copy {
+            reports: u64,
+            answers: Option<u64>,
+            checkpoints: Vec<u64>,
+        }
+        struct Peer(ScriptedEndpoint, Arc<Mutex<Copy>>);
+        impl Endpoint for Peer {
+            fn scan(&mut self) -> Result<crate::tree::Snapshot> {
+                self.0.scan()
+            }
+            fn stage_begin(
+                &mut self,
+                files: Vec<FileRequest>,
+            ) -> Result<Vec<crate::endpoint::StagingNeed>> {
+                self.0.stage_begin(files)
+            }
+            fn supply_open(&mut self, needs: Vec<crate::endpoint::StagingNeed>) -> Result<()> {
+                self.0.supply_open(needs)
+            }
+            fn supply_pull(
+                &mut self,
+                max_frames: usize,
+            ) -> Result<Vec<crate::endpoint::TransferFrame>> {
+                self.0.supply_pull(max_frames)
+            }
+            fn stage_push(&mut self, frames: Vec<crate::endpoint::TransferFrame>) -> Result<()> {
+                self.0.stage_push(frames)
+            }
+            fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
+                self.0.transition(transitions)
+            }
+            fn peering_state(&mut self) -> Result<crate::peering::State> {
+                Ok(crate::peering::State {
+                    lease: None,
+                    generation: Some(self.1.lock().unwrap().reports),
+                })
+            }
+            fn ancestor_checkpoint(&mut self, generation: u64, _: Option<&Node>) -> Result<u64> {
+                let mut copy = self.1.lock().unwrap();
+                copy.checkpoints.push(generation);
+                Ok(copy.answers.unwrap_or(generation))
+            }
+        }
+
+        let keep = tempfile::tempdir().unwrap();
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let base = || Node::directory("", vec![file("x", 1)]);
+        let copy = Arc::new(Mutex::new(Copy::default()));
+        let mut session = Session::new(
+            Box::new(ScriptedEndpoint::new(vec![scripted(base())])),
+            Box::new(Peer(
+                ScriptedEndpoint::new(vec![scripted(base())]),
+                copy.clone(),
+            )),
+            SyncMode::TwoWaySafe,
+            state,
+        )
+        .unwrap();
+        session.run_cycle().expect("the first cycle converges");
+        let generation = session.ancestor_store.generation();
+        assert!(generation > 0);
+
+        session
+            .level_the_copy()
+            .expect("nothing to level without leading");
+        assert!(copy.lock().unwrap().checkpoints.is_empty());
+
+        session.set_leadership(
+            Some(crate::peering::Leadership {
+                leader: crate::peering::ALPHA.into(),
+                term: 1,
+                ttl: std::time::Duration::from_secs(30),
+            }),
+            crate::peering::PeerSide::Beta,
+        );
+        copy.lock().unwrap().reports = generation;
+        session.level_the_copy().expect("already level");
+        assert!(copy.lock().unwrap().checkpoints.is_empty());
+
+        copy.lock().unwrap().reports = generation - 1;
+        session.level_the_copy().expect("brought level");
+        assert_eq!(copy.lock().unwrap().checkpoints, [generation]);
+
+        copy.lock().unwrap().answers = Some(0);
+        let error = session
+            .level_the_copy()
+            .expect_err("the copy did not arrive");
+        assert!(
+            format!("{error:#}").contains("stands at generation 0"),
+            "{error:#}"
+        );
     }
 
     /// Finding L-19: an endpoint — a remote one, or a buggy one — that
@@ -2234,6 +2436,79 @@ mod tests {
             preserves_executability: true,
             ..crate::tree::Snapshot::default()
         }
+    }
+
+    fn settling(alpha_activity: Vec<ChangeActivity>) -> (Session, tempfile::TempDir) {
+        let root = || scripted(Node::directory("", vec![file("shared", 1)]));
+        let mut alpha = ScriptedEndpoint::new(vec![root()]);
+        alpha.activity = alpha_activity.into();
+        let state = tempfile::tempdir().unwrap();
+        let session = Session::new(
+            Box::new(alpha),
+            Box::new(ScriptedEndpoint::new(vec![root()])),
+            SyncMode::TwoWaySafe,
+            state.path().to_path_buf(),
+        )
+        .expect("session should be creatable");
+        (session, state)
+    }
+
+    fn activity(events: u64, writing: bool) -> ChangeActivity {
+        ChangeActivity {
+            paths: 1,
+            incomplete: false,
+            events,
+            writing,
+        }
+    }
+
+    /// A safe save goes quiet while its temporary file is flushed: a quiet
+    /// slice then is not the end of the save while the file is still open
+    /// for writing. The settle waits for it to close, past its usual
+    /// ceiling — here twenty slices of a file flushing, then the close.
+    #[test]
+    fn a_file_still_open_for_writing_holds_the_settle_until_it_closes() {
+        let mut samples = vec![activity(1, true); 20];
+        samples.push(activity(2, false));
+        let (mut session, _state) = settling(samples);
+        let started = std::time::Instant::now();
+        session.settle(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(5),
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= std::time::Duration::from_millis(100),
+            "{waited:?}"
+        );
+        assert!(waited < crate::endpoint::WRITE_GRACE, "{waited:?}");
+
+        // Nothing open: quiet after one slice, as before.
+        let (mut session, _state) = settling(vec![activity(1, false)]);
+        let started = std::time::Instant::now();
+        session.settle(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(5),
+        );
+        assert!(started.elapsed() < std::time::Duration::from_millis(25));
+    }
+
+    /// A file that stays open — a log, a database — holds a settle back no
+    /// longer than the grace.
+    #[test]
+    fn a_file_that_never_closes_holds_the_settle_for_the_grace_at_most() {
+        let (mut session, _state) = settling(vec![activity(1, true)]);
+        let started = std::time::Instant::now();
+        session.settle(
+            std::time::Duration::from_millis(25),
+            std::time::Duration::from_millis(5),
+        );
+        let waited = started.elapsed();
+        assert!(waited >= crate::endpoint::WRITE_GRACE, "{waited:?}");
+        assert!(
+            waited < crate::endpoint::WRITE_GRACE + std::time::Duration::from_millis(200),
+            "{waited:?}"
+        );
     }
 
     #[test]

@@ -387,6 +387,18 @@ pub trait Endpoint: Send {
         anyhow::bail!("this endpoint does not take part in peering")
     }
 
+    /// Peering, with `manage_keys`: the host's peering key, made if it has
+    /// none, and its SSH host keys.
+    fn peering_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
+    /// Peering, with `manage_keys`: installs the other betas' keys on the
+    /// host, forced through the gate, and their host keys.
+    fn install_peers(&mut self, _authorized: &[String], _known_hosts: &[String]) -> Result<()> {
+        anyhow::bail!("this endpoint does not take part in peering")
+    }
+
     /// A monotone measure of how much change this endpoint has recorded but
     /// not yet had consumed by a scan, used to tell a burst of writes from a
     /// single one. Two samples that agree mean nothing arrived in between.
@@ -408,7 +420,29 @@ pub struct ChangeActivity {
     /// Whether the record was abandoned in favour of a full rescan, which
     /// is itself a change in state worth noticing.
     pub incomplete: bool,
+    /// Every event the watcher has seen. `paths` counts a path once, so a
+    /// large file written in many chunks leaves it still; this moves with
+    /// every chunk, which is what tells a burst from its end.
+    pub events: u64,
+    /// Whether a file is open for writing: created or written, not yet
+    /// closed, and for less than [`WRITE_GRACE`]. Only a watcher that is
+    /// told when a writer closes a file can say so (inotify can; FSEvents
+    /// cannot, and says false).
+    pub writing: bool,
 }
+
+/// The longest a file being written holds a cycle back.
+///
+/// A program saving safely writes a temporary file, flushes it to disk and
+/// renames it over the original. The flush can take a large file tens or
+/// hundreds of milliseconds and raises no event, so a quiet-period settle
+/// took it for the end of the save: the cycle scanned the temporary file,
+/// planned to copy it, and found it renamed away — a whole wasted cycle,
+/// most of a 350 ms patch in the benchmark, against 30 ms for the patch
+/// itself. Waiting for the writer to close the file lets the rename land
+/// first. A file held open longer — a log, a database, a download — stops
+/// holding anything back after this long, and syncs as it always did.
+pub const WRITE_GRACE: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// What a watching endpoint raises to wake the session sleeping on it.
 ///

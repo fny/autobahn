@@ -1186,6 +1186,15 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
         newer.lease(&Lease::new("u@h:/x", 6, ttl)).unwrap(),
         LeaseAnswer::Accepted
     );
+    // Before the old leader presents anything again, its next write is
+    // refused all the same, and ends its cycle fenced by the newer lease.
+    let error = endpoint
+        .put_peering_file("name", b"alpha")
+        .expect_err("a write under a superseded lease is refused");
+    match error.downcast_ref::<autobahn::peering::Fenced>() {
+        Some(fenced) => assert_eq!(fenced.current.term, 6),
+        None => panic!("the refusal should end the cycle fenced: {error:#}"),
+    }
     match endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap() {
         LeaseAnswer::Refused { current } => {
             assert_eq!(current.term, 6);
@@ -1257,6 +1266,15 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
     };
     assert_eq!(endpoint.ancestor_record(4, &[addition]).unwrap(), 4);
     assert_eq!(endpoint.peering_state().unwrap().generation, Some(4));
+    // The copy names who wrote it — the leader this channel was accepted
+    // as — which is what a host checks before it takes the copy up.
+    let session = autobahn::session::session_identifier(&root.to_string_lossy(), "peering-e2e");
+    assert_eq!(
+        autobahn::peering::copy_writer(&autobahn::peering::directory().unwrap(), &session)
+            .unwrap()
+            .as_deref(),
+        Some("alpha")
+    );
 
     // A fresh connection sees what the host holds: the copy survived.
     let mut again = connect();
@@ -2374,4 +2392,52 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
         fs::read_to_string(copied.join("f")).expect("the leaf should be synchronized"),
         "deep"
     );
+}
+
+/// A restricted key's forced command: `autobahn gate` runs the agent a
+/// controller asks for — exactly as it asks — and the controller speaks to
+/// it as to any agent; a shell command is refused, saying it met a gate.
+#[test]
+fn a_gate_runs_the_agent_asked_for_and_refuses_a_shell() {
+    use autobahn::transport::mux::AgentConnection;
+    use autobahn::transport::Connection;
+    use std::process::{Command, Stdio};
+
+    let keep = tempfile::tempdir().expect("tempdir");
+    let home = keep.path().join("home");
+    let bin = home.join(".autobahn").join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let binary = env!("CARGO_BIN_EXE_autobahn");
+    fs::copy(
+        binary,
+        bin.join(format!("autobahn-{}", autobahn::protocol::version())),
+    )
+    .unwrap();
+    let gate = |requested: &str| {
+        let mut command = Command::new(binary);
+        command
+            .arg("gate")
+            .env("HOME", &home)
+            .env("SSH_ORIGINAL_COMMAND", requested)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    };
+
+    let refused = gate("cat ~/.ssh/id_ed25519").output().unwrap();
+    assert!(!refused.status.success());
+    let said = String::from_utf8_lossy(&refused.stderr);
+    assert!(said.contains(autobahn::gate::REFUSAL), "{said}");
+
+    let mut child = gate(&autobahn::transport::install::versioned_remote_command())
+        .spawn()
+        .unwrap();
+    let connection = Connection::from_streams(
+        Box::new(child.stdout.take().unwrap()),
+        Box::new(child.stdin.take().unwrap()),
+    );
+    AgentConnection::connect(connection).expect("the gated agent answers the handshake");
+    let _ = child.kill();
+    let _ = child.wait();
 }

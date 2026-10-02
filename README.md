@@ -101,6 +101,8 @@ on_alert = "~/.autobahn/on-alert.sh"   # written for you by `autobahn init`
 
 None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them beta features.
 
+**Peering** (dangerously experimental) — a beta takes the lead when the alpha is away, and gives it back. It has known security issues that are not fixed in this release; any peer that can lead is trusted with every other peer. Read [Peering](docs/peering.md) before enabling it.
+
 ## AI Disclaimer
 
 This project was heavily vibe coded, and with great vibe coding comes great responsibility. So I have: scanned every line in this repo, run extensive soak testing, used Autobahn myself for weeks, had guardrail-free models run security scans, and put it through thousands of benchmark runs. Most of the internal documentation was first drafted by LLMs. Please forgive the lingering Claudeisms.
@@ -126,3 +128,5 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 ## Limitations
 
 Unix only: Linux (x86-64 and arm64) and macOS (Apple Silicon), with macOS a first-class target rather than a build target. Transport is SSH. Roots must live on local filesystems: network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).
+
+**One difference on macOS.** Some programs save a file by writing a temporary copy and renaming it over the original; vim and JetBrains IDEs do. On Linux, Autobahn waits for the program to finish writing before it syncs the file, so it copies only the finished file. macOS does not say when a program has finished writing a file, so there a save like this of a large file can cost an extra round of work before it syncs: a fraction of a second, not an error. Details in [How it works](docs/how-it-works.md#the-settle-as-an-illustration).

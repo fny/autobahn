@@ -54,7 +54,7 @@ Eight keys. Unknown keys are refused at startup, not ignored — here and in eve
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
 | `[experimental.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
-| `[experimental.peering-dangerously-experimental]` | table | — | Peering timing: `ttl`, `failover_after`. Correct as shipped. See [Peering](./peering.md). |
+| `[experimental.peering-dangerously-experimental]` | table | — | Peering timing, `ttl` and `failover_after`, correct as shipped; and `manage_keys`, off unless set, for the alpha to set up the betas' keys to one another, each restricted to autobahn. See [Peering](./peering.md#restricted-keys). |
 | `experimental.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
 
 
@@ -127,6 +127,20 @@ The running supervisor reads the file every two seconds and acts on an edit once
 - **It is refused.** The sessions keep running under the configuration that last loaded, and the refusal is said everywhere the supervisor speaks: the log, `status` (a line above the sessions), `mi` (a line under the sign), the tray (a line in the menu, and a notification), and `on_alert` (one firing, `AUTOBAHN_STATES=config`, `AUTOBAHN_EVENT=config`). The line stands until the file loads again. Nothing is retried in the meantime, and the next edit is judged on its own.
 
 `live_reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
+
+## This machine's own settings
+
+`~/.autobahn/host.toml` holds what a machine allows, whoever asks. It is read by that machine alone: no controller sends it and no leader pushes it, so it holds against both. It is not a configuration — a machine with `config.toml` runs its own sessions, and a peering beta has none — so any machine can have one, controller or server.
+
+```toml
+# The folders an agent on this machine serves, whichever controller connects,
+# and the only ones a peering beta leading from here syncs as its own.
+roots = ["~/Workspace", "/srv/shared"]
+```
+
+`agent_command` is what a peering beta leading from this machine runs to reach the other peers, in place of ssh — a group's `agent_command`, for testing and custom transports. A leader's pushed configuration never sets it: a follower ignores any `agent_command` the leader's configuration carries, since it would otherwise run, at takeover, a command this machine never chose.
+
+Without `roots`, or without the file, an agent serves any folder its user can reach, as it always has. With it, a root is judged where it really is, through every symbolic link on the way, and a root outside every listed folder is refused: the session fails to connect, and says why. A file that does not parse refuses everything, so a typo never lifts a restriction.
 
 ## See also
 

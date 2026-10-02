@@ -3520,8 +3520,12 @@ fn a_peering_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
     let plan = plans[0].clone();
     let leader_directory = world.path("leader-peering");
     let context = || {
-        PeeringContext::for_alpha(world.path("config.toml"), leader_directory.clone())
-            .expect("a peering context")
+        PeeringContext::for_alpha(
+            world.path("config.toml"),
+            leader_directory.clone(),
+            autobahn::config::DEFAULT_PEERING_TTL,
+        )
+        .expect("a peering context")
     };
 
     let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
@@ -3614,8 +3618,12 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     let leader_directory = world.path("leader-peering");
     let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
         .with_peering(
-            PeeringContext::for_alpha(world.path("config.toml"), leader_directory.clone())
-                .expect("a peering context"),
+            PeeringContext::for_alpha(
+                world.path("config.toml"),
+                leader_directory.clone(),
+                autobahn::config::DEFAULT_PEERING_TTL,
+            )
+            .expect("a peering context"),
         )
         .run_once();
     assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
@@ -3641,8 +3649,12 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
 
     // A restart reads its own lease and comes back as a follower: it does
     // not connect, and the beta is still untouched.
-    let context = PeeringContext::for_alpha(world.path("config.toml"), leader_directory)
-        .expect("a peering context");
+    let context = PeeringContext::for_alpha(
+        world.path("config.toml"),
+        leader_directory,
+        autobahn::config::DEFAULT_PEERING_TTL,
+    )
+    .expect("a peering context");
     assert!(matches!(
         context.role(),
         autobahn::peering::Role::Follower { term: 9, .. }
@@ -3653,6 +3665,194 @@ fn a_fenced_peering_leader_steps_down_and_stays_down() {
     assert!(outcomes[0].result.is_err());
     assert!(!beta.join("hello.txt").exists());
     assert_eq!(world.status(&plan).expect("a status").state, "following");
+}
+
+/// With `manage_keys`, the alpha sets up the betas' keys to one another
+/// over the logins it already has: each beta makes a key of its own, and is
+/// given every other beta's, forced through the gate, inside autobahn's
+/// block of its `authorized_keys` — with the gate itself, and the others'
+/// host keys. Never its own.
+#[test]
+fn the_alpha_gives_each_beta_the_others_keys_through_the_gate() {
+    use autobahn::supervisor::PeeringContext;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let homes = [world.directory("one-home"), world.directory("two-home")];
+    let roots = [world.directory("one"), world.directory("two")];
+    let scripts = [peering_agent_script(&world, &homes[0]), {
+        let script = world.path("peering-agent-two.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nHOME={home} exec {agent} agent\n",
+                home = homes[1].display(),
+                agent = agent_binary()
+            ),
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&script).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+        fs::set_permissions(&script, permissions).unwrap();
+        script
+    }];
+    let plans = world.plans(&format!(
+        r#"
+        [advanced.peering-dangerously-experimental]
+        manage_keys = true
+
+        [groups.g1]
+        mode = "peering-conflict-dangerously-experimental"
+        alpha = "{alpha}/g1"
+        agent_command = "{one_script}"
+        betas = ["one:{one}"]
+
+        [groups.g2]
+        mode = "peering-conflict-dangerously-experimental"
+        alpha = "{alpha}/g2"
+        agent_command = "{two_script}"
+        betas = ["two:{two}"]
+        "#,
+        alpha = alpha.display(),
+        one_script = scripts[0].display(),
+        two_script = scripts[1].display(),
+        one = roots[0].display(),
+        two = roots[1].display(),
+    ));
+    fs::create_dir_all(alpha.join("g1")).unwrap();
+    fs::create_dir_all(alpha.join("g2")).unwrap();
+    let supervisor = Supervisor::new(plans, world.state_root(), false).with_peering(
+        PeeringContext::for_alpha(
+            world.path("config.toml"),
+            world.path("alpha-peering"),
+            autobahn::config::DEFAULT_PEERING_TTL,
+        )
+        .expect("a peering context"),
+    );
+    // Twice: the first pass learns each beta's key, and whichever beta was
+    // given its block first is given it again with the other's in it.
+    assert_all_synchronized(&supervisor.run_once());
+    assert_all_synchronized(&supervisor.run_once());
+
+    let public = |home: &Path| {
+        let text = fs::read_to_string(home.join(".autobahn/peering/id_ed25519.pub"))
+            .expect("a peering key was made");
+        let mut words = text.split_whitespace();
+        format!("{} {}", words.next().unwrap(), words.next().unwrap())
+    };
+    for (index, home) in homes.iter().enumerate() {
+        let other = &homes[1 - index];
+        let authorized = fs::read_to_string(home.join(".ssh/authorized_keys"))
+            .expect("autobahn's block was written");
+        assert!(
+            authorized.contains(&format!("{} {}", autobahn::peerkeys::FORCED, public(other))),
+            "{authorized}"
+        );
+        assert!(
+            !authorized.contains(&public(home)),
+            "never its own: {authorized}"
+        );
+        assert!(home
+            .join(".autobahn/bin")
+            .join(autobahn::peerkeys::GATE_BINARY)
+            .is_file());
+        assert!(home.join(".autobahn/peering/known_hosts").is_file());
+    }
+}
+
+/// While the alpha follows, its plain groups keep running: they are the
+/// alpha's alone, whoever leads the star. Only its peering sessions wait
+/// for the lead to come back.
+#[test]
+fn plain_groups_keep_running_while_the_alpha_follows() {
+    use autobahn::peering::{self, write_lease, Lease};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    let plain = world.directory("plain");
+    let mirror = world.directory("plain-mirror");
+    let agent_home = world.directory("agent-home");
+    write(&alpha, "hello.txt", "hello");
+    let script = peering_agent_script(&world, &agent_home);
+    let plans = world.plans(&format!(
+        r#"
+        [groups.g]
+        mode = "peering-conflict-dangerously-experimental"
+        interval = 1
+        alpha = "{alpha}"
+        agent_command = "{script}"
+        betas = ["peer:{beta}"]
+
+        [groups.plain]
+        mode = "two-way-safe"
+        interval = 1
+        alpha = "{plain}"
+        betas = ["{mirror}"]
+        "#,
+        alpha = alpha.display(),
+        script = script.display(),
+        beta = beta.display(),
+        plain = plain.display(),
+        mirror = mirror.display(),
+    ));
+    let peering_plan = plans
+        .iter()
+        .find(|plan| plan.group == "g")
+        .expect("the peering group")
+        .clone();
+    // The beta led at term 9 while the alpha was away.
+    write_lease(
+        &agent_home.join(".autobahn").join("peering"),
+        &Lease::new(&peering_plan.beta_spec(), 9, Duration::from_secs(30)),
+    )
+    .expect("the beta's lease");
+    // There is no leader to attach to here: attaching fails at once.
+    let _attach = EnvironmentGuard::set(peering::ATTACH_COMMAND_VARIABLE, "false");
+
+    let stop = AtomicBool::new(false);
+    let alerts = autobahn::alerts::AlertPlan::default();
+    let directory = world.path("alpha-peering");
+    let state_root = world.state_root();
+    let config_path = world.path("config.toml");
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let run = scope.spawn(|| {
+            autobahn::supervisor::peer::run_alpha(
+                &config_path,
+                &directory,
+                &plans,
+                &alerts,
+                &state_root,
+                false,
+                &stop,
+                None,
+            )
+        });
+        assert!(
+            wait_until(Duration::from_secs(20), || world
+                .status(&peering_plan)
+                .is_some_and(|status| status.state == "following")),
+            "the alpha should be fenced and follow"
+        );
+        write(&plain, "while-following.txt", "plain");
+        assert!(
+            wait_until(Duration::from_secs(20), || mirror
+                .join("while-following.txt")
+                .exists()),
+            "the plain group should keep running while the alpha follows"
+        );
+        assert!(
+            !beta.join("hello.txt").exists(),
+            "the peering group writes nothing while it follows"
+        );
+        stop.store(true, Ordering::Relaxed);
+        run.join()
+            .expect("the alpha thread")
+            .expect("the alpha ran");
+    });
 }
 
 /// Peering, phase 4: a peer whose lease has been stale for its wait takes
@@ -3710,6 +3910,13 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     let name = format!("peer:{}", peer_root.display());
     let peering_directory = peer_home.join(".autobahn").join("peering");
     peering::write_pushed_file(&peering_directory, "config.toml", pushed.as_bytes()).unwrap();
+    // The pushed agent_command is never run: how this peer reaches the
+    // other beta is its own to say.
+    fs::write(
+        peer_home.join(".autobahn").join("host.toml"),
+        format!("agent_command = {:?}\n", other_script.display().to_string()),
+    )
+    .unwrap();
     peering::write_pushed_file(&peering_directory, "name", name.as_bytes()).unwrap();
     // The alpha's lease, last renewed a while ago.
     let stale = Lease {
@@ -3781,8 +3988,12 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         .unwrap();
         let outcomes = Supervisor::new(plans.clone(), world.path("alpha-state"), false)
             .with_peering(
-                PeeringContext::for_alpha(world.path("config.toml"), alpha_directory.clone())
-                    .expect("context"),
+                PeeringContext::for_alpha(
+                    world.path("config.toml"),
+                    alpha_directory.clone(),
+                    autobahn::config::DEFAULT_PEERING_TTL,
+                )
+                .expect("context"),
             )
             .run_once();
         assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
@@ -3949,6 +4160,146 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
             .expect("written");
         assert_eq!(status.standing, "fresh", "{status:?}");
 
+        stop.store(true, Ordering::Relaxed);
+        peer.join().expect("the peer thread").expect("the peer ran");
+        alpha
+            .join()
+            .expect("the alpha thread")
+            .expect("the alpha ran");
+    });
+}
+
+/// The alpha dials in to a leading beta once, and every peering group it
+/// shares with that beta syncs over the one connection, each session on
+/// channels of its own. Taken whole by the first session, the connection
+/// left the alpha's other groups unsynced until the lead came back.
+#[test]
+fn every_group_syncs_over_the_alphas_one_attachment() {
+    use autobahn::peering::{self, Lease};
+    use std::sync::atomic::AtomicBool;
+    use std::time::Duration;
+
+    let world = World::new();
+    let alphas = [world.directory("alpha1"), world.directory("alpha2")];
+    let peers = [world.directory("peer1"), world.directory("peer2")];
+    let peer_home = world.directory("peer-home");
+    write(&peers[0], "from-peer1.txt", "p1");
+    write(&peers[1], "from-peer2.txt", "p2");
+    let peer_script = peering_agent_script(&world, &peer_home);
+    let configuration = format!(
+        r#"
+        [advanced.peering-dangerously-experimental]
+        ttl = "2s"
+        failover_after = "2s"
+
+        [groups.g1]
+        mode = "peering-conflict-dangerously-experimental"
+        interval = 1
+        alpha = "{a1}"
+        agent_command = "{script}"
+        betas = ["peer:{p1}"]
+
+        [groups.g2]
+        mode = "peering-conflict-dangerously-experimental"
+        interval = 1
+        alpha = "{a2}"
+        agent_command = "{script}"
+        betas = ["peer:{p2}"]
+        "#,
+        a1 = alphas[0].display(),
+        a2 = alphas[1].display(),
+        script = peer_script.display(),
+        p1 = peers[0].display(),
+        p2 = peers[1].display(),
+    );
+    let plans = world.plans(&configuration);
+    let plan = |group: &str| {
+        plans
+            .iter()
+            .find(|plan| plan.group == group)
+            .expect("the group's plan")
+            .clone()
+    };
+    let directory = peer_home.join(".autobahn").join("peering");
+    peering::write_pushed_file(&directory, "config.toml", configuration.as_bytes()).unwrap();
+    for (group, root) in [("g1", &peers[0]), ("g2", &peers[1])] {
+        let name = format!("peer:{}", root.display());
+        peering::write_pushed_file(&directory, &format!("names/{group}"), name.as_bytes()).unwrap();
+        peering::write_pushed_file(&directory, "name", name.as_bytes()).unwrap();
+        peering::write_pushed_file(
+            &directory,
+            &format!("sessions/{group}"),
+            plan(group).identifier().as_bytes(),
+        )
+        .unwrap();
+    }
+    peering::write_lease(
+        &directory,
+        &Lease {
+            leader: peering::ALPHA.to_owned(),
+            term: 3,
+            renewed_at: peering::now_seconds().saturating_sub(120),
+            ttl_seconds: 2,
+        },
+    )
+    .unwrap();
+    let alpha_directory = peering::directory().expect("the alpha's peering directory");
+    peering::write_lease(
+        &alpha_directory,
+        &Lease::new(peering::ALPHA, 3, Duration::from_secs(30)),
+    )
+    .unwrap();
+    let socket = directory.join(peering::ATTACH_SOCKET);
+    let _attach = EnvironmentGuard::set(
+        peering::ATTACH_COMMAND_VARIABLE,
+        format!(
+            "{} peering attach --socket {}",
+            agent_binary(),
+            socket.display()
+        ),
+    );
+
+    let stop = AtomicBool::new(false);
+    let peer_state = world.state_root();
+    let alpha_state = world.path("alpha-state");
+    let alerts = autobahn::alerts::AlertPlan::default();
+    std::thread::scope(|scope| {
+        let _guard = StopGuard(&stop);
+        let peer =
+            scope.spawn(|| autobahn::supervisor::peer::run(&directory, &peer_state, false, &stop));
+        assert!(wait_until(Duration::from_secs(20), || socket.exists()));
+        let alpha = scope.spawn(|| {
+            autobahn::supervisor::peer::run_alpha(
+                &world.path("config.toml"),
+                &alpha_directory,
+                &plans,
+                &alerts,
+                &alpha_state,
+                false,
+                &stop,
+                None,
+            )
+        });
+        // Each group's copy of its ancestor on the alpha is written by the
+        // leading beta's session with the attached alpha, after a cycle
+        // over the attachment: both, for both groups.
+        let written_by_the_peer = |group: &str| {
+            peering::copy_writer(&alpha_directory, &plan(group).identifier())
+                .ok()
+                .flatten()
+                .is_some_and(|writer| writer.starts_with("peer:"))
+        };
+        assert!(
+            wait_until(Duration::from_secs(30), || written_by_the_peer("g1")
+                && written_by_the_peer("g2")),
+            "both groups should sync with the alpha while the beta leads: g1 {}, g2 {}",
+            written_by_the_peer("g1"),
+            written_by_the_peer("g2")
+        );
+        assert!(wait_until(Duration::from_secs(30), || alphas[0]
+            .join("from-peer1.txt")
+            .exists()
+            && alphas[1].join("from-peer2.txt").exists()));
         stop.store(true, Ordering::Relaxed);
         peer.join().expect("the peer thread").expect("the peer ran");
         alpha
@@ -4157,6 +4508,62 @@ fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
             .expect("the watcher should stop cleanly")
             .expect("supervision should succeed");
     });
+}
+
+/// A machine with a configuration of its own is never a peer: a `name` a
+/// leader pushed into its peering directory is ignored with a warning, and
+/// its own configuration runs. It used to refuse to start and tell the
+/// user to move one of the two aside — and a name a hostile leader pushed
+/// would have them move their own.
+#[test]
+fn a_stray_peer_name_beside_a_configuration_is_ignored_with_a_warning() {
+    let world = World::new();
+    let alpha = world.directory("alpha");
+    let beta = world.directory("beta");
+    write(&alpha, "first.txt", "first");
+    let home = world.directory("home");
+    let state = home.join(".autobahn");
+    fs::create_dir_all(state.join("peering")).expect("the peering directory");
+    fs::write(state.join("peering").join("name"), "hostile:/x").expect("a stray name");
+    fs::write(
+        state.join("config.toml"),
+        format!(
+            "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-safe\"\ninterval = 1\nbetas = [\"{}\"]\n",
+            alpha.display(),
+            beta.display()
+        ),
+    )
+    .expect("configuration should be writable");
+    let log = world.path("watch.log");
+    let child = std::process::Command::new(agent_binary())
+        .args(["watch", "--log"])
+        .env("HOME", &home)
+        .env("AUTOBAHN_HOME", &state)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log).expect("a log"))
+        .spawn()
+        .expect("watch starts");
+    struct Kill(std::process::Child);
+    impl Drop for Kill {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut child = Kill(child);
+    assert!(
+        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+        "its own configuration runs: {}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(child.0.try_wait().expect("waitable").is_none());
+    let said = fs::read_to_string(&log).expect("the log");
+    assert!(
+        said.contains("names this machine as a peer") && said.contains("is never a peer"),
+        "{said}"
+    );
+    assert!(!said.contains("aside"), "{said}");
 }
 
 #[test]

@@ -87,4 +87,4 @@ When an Alpha syncs concurrently to multiple Betas, each pair runs an independen
 * [Configuration](./configuration.md) — How to set the `mode` parameter.
 * [Conflicts](./conflicts.md) — Resolving and settling flagged file collisions.
 * [Safety](./safety.md) — Root-level safeguards against accidental wipeouts.
-* [Peering](./peering.md) — Automatic leader failover setup and edge cases.
+* [Peering](./peering.md) — Automatic leader failover setup and edge cases. Dangerously experimental, with known security issues.

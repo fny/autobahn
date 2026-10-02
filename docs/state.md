@@ -7,6 +7,7 @@ Everything autobahn keeps lives under one directory, `~/.autobahn`, on every mac
 | path | holds |
 |---|---|
 | `config.toml` | the configuration — the source of truth |
+| `host.toml` | what this machine allows, whoever asks: the folders its agent serves — see [This machine's own settings](./configuration.md#this-machines-own-settings) |
 | `sessions/<id>/` | each session's ancestor and journal: what was last agreed between its two roots |
 | `status/<id>.json` | what each session is doing, or last did; what `status` reads |
 | `sessions/<id>/mounts` | the mount points each side's scans last found inside the roots, so one that goes away is known to have been one — see `ignore_mounts` in [Configuration](./configuration.md#session-settings) |

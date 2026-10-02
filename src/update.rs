@@ -1482,6 +1482,77 @@ fn workspace(state_root: &Path) -> Result<crate::fsutil::PrivateTempDir> {
     crate::fsutil::private_tempdir_in(state_root)
 }
 
+/// Installs release `tag`'s build for this machine as an agent at `target`,
+/// for [`crate::gate`]: a server behind a key that runs only the gate
+/// installs from a release itself, and never runs a binary a controller
+/// sent. The download is checked as `update` checks one — against the
+/// release's checksums, and those against their signature from autobahn's
+/// release key, for this release; a release from before signing is
+/// refused, since the key is all that vouches for it here — and is put in
+/// place only after it has run on this machine and reported `version`'s
+/// release. Returns what it reported.
+pub fn install_release_agent(tag: &str, version: &str, target: &Path) -> Result<String> {
+    let state_root = resolve_state_root()?;
+    install_release_agent_from(
+        &Source::discover(Some(tag.to_owned())),
+        &Trust::release()?,
+        &state_root,
+        &release_platform()?,
+        tag,
+        version,
+        target,
+    )
+}
+
+/// [`install_release_agent`], from a given source, under given keys.
+fn install_release_agent_from(
+    source: &dyn Fetch,
+    trust: &Trust,
+    state_root: &Path,
+    platform: &str,
+    tag: &str,
+    version: &str,
+    target: &Path,
+) -> Result<String> {
+    let work = workspace(state_root)?;
+    let asset = format!("autobahn-{platform}");
+    let staged = work.path().join(&asset);
+    source
+        .fetch(&asset, &staged)
+        .with_context(|| format!("unable to download the {platform} build of {tag}"))?;
+    let staged_sums = work.path().join(CHECKSUMS_ASSET);
+    source
+        .fetch(CHECKSUMS_ASSET, &staged_sums)
+        .with_context(|| format!("unable to download {tag}'s {CHECKSUMS_ASSET}"))?;
+    let sums = std::fs::read_to_string(&staged_sums)
+        .with_context(|| format!("unable to read {}", staged_sums.display()))?;
+    let staged_signature = work.path().join(SIGNATURE_ASSET);
+    let signature = source
+        .fetch(SIGNATURE_ASSET, &staged_signature)
+        .ok()
+        .and_then(|()| std::fs::read_to_string(&staged_signature).ok());
+    match check_signature(sums.as_bytes(), signature.as_deref(), Some(tag), trust)? {
+        Signed::Verified => {}
+        Signed::OldUnsignedRelease => bail!(
+            "{tag} predates signed releases, and a server behind a restricted key installs \
+             only what autobahn's release key vouches for"
+        ),
+    }
+    let binary = Verified::open(&staged, &asset, &sums)?;
+    let incoming = Incoming::stage(&binary, target)?;
+    drop(binary);
+    let reported = run_reports_version(incoming.path())?;
+    let wanted = version.split('+').next().unwrap_or(version);
+    if reported != wanted {
+        bail!(
+            "{tag} reports {reported}, not {wanted}: the controller asking is not a build of \
+             that release. Nothing was installed; install its agent by hand"
+        );
+    }
+    incoming.place(target, &target.with_extension("previous"))?;
+    Ok(reported)
+}
+
 /// Whether a program is on the PATH, which is `command -v` without a
 /// shell.
 fn have(program: &str) -> bool {
@@ -1928,6 +1999,113 @@ zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz  autobahn-linux
                 ..Self::lenient()
             }
         }
+    }
+
+    /// A release signed with a throwaway key: one small script, listed in
+    /// its checksums under every platform's name, so that the release has
+    /// a build for whichever machine runs the test.
+    mod gate_release {
+        pub const KEY: &str = include_str!("../tests/fixtures/release-signing/gate/c.pub");
+        pub const SUMS: &str = include_str!("../tests/fixtures/release-signing/gate/SHA256SUMS");
+        pub const SIGNATURE: &str =
+            include_str!("../tests/fixtures/release-signing/gate/SHA256SUMS.minisig");
+        pub const AGENT: &str = include_str!("../tests/fixtures/release-signing/gate/agent.sh");
+        pub const TAG: &str = "v9.9.9";
+    }
+
+    /// The release as a source, with its build replaced, or its signature
+    /// left out, as a test says.
+    fn gate_release(agent: &str, signed: bool) -> Release {
+        let release = Release(tempfile::tempdir().expect("temporary directory"));
+        let asset = format!("autobahn-{}", release_platform().unwrap());
+        std::fs::write(release.0.path().join(asset), agent).unwrap();
+        std::fs::write(release.0.path().join(CHECKSUMS_ASSET), gate_release::SUMS).unwrap();
+        if signed {
+            std::fs::write(
+                release.0.path().join(SIGNATURE_ASSET),
+                gate_release::SIGNATURE,
+            )
+            .unwrap();
+        }
+        release
+    }
+
+    /// A gate installs an agent from a signed release only: checked against
+    /// the release's checksums and their signature, run here, and reporting
+    /// the release asked for. A release with no signature is refused even
+    /// where `update` would take it as old, and so is one whose build is not
+    /// what was asked for, or not what was published.
+    #[test]
+    fn a_gate_installs_only_a_signed_release_of_the_version_asked_for() {
+        let keep = tempfile::tempdir().expect("temporary directory");
+        let state = keep.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let target = keep.path().join("bin").join("autobahn-9.9.9+e16");
+        let trust = Trust {
+            keys: vec![minisign_verify::PublicKey::decode(gate_release::KEY.trim()).unwrap()],
+            last_unsigned: LAST_UNSIGNED_RELEASE,
+        };
+        let platform = release_platform().unwrap();
+        let install = |release: &Release, version: &str, trust: &Trust| {
+            install_release_agent_from(
+                release,
+                trust,
+                &state,
+                &platform,
+                gate_release::TAG,
+                version,
+                &target,
+            )
+        };
+
+        let error = install(
+            &gate_release(gate_release::AGENT, true),
+            "9.9.8+e16",
+            &trust,
+        )
+        .expect_err("another version");
+        assert!(
+            format!("{error:#}").contains("reports 9.9.9, not 9.9.8"),
+            "{error:#}"
+        );
+        assert!(!target.exists());
+
+        let tampered = gate_release::AGENT.replace("exit 1", "exit 2");
+        let error = install(&gate_release(&tampered, true), "9.9.9+e16", &trust)
+            .expect_err("not the published build");
+        assert!(
+            format!("{error:#}").contains("checksum mismatch"),
+            "{error:#}"
+        );
+        assert!(!target.exists());
+
+        let lenient = Trust {
+            keys: trust.keys.clone(),
+            last_unsigned: (u64::MAX, u64::MAX, u64::MAX),
+        };
+        let error = install(
+            &gate_release(gate_release::AGENT, false),
+            "9.9.9+e16",
+            &lenient,
+        )
+        .expect_err("unsigned");
+        assert!(
+            format!("{error:#}").contains("predates signed releases"),
+            "{error:#}"
+        );
+        assert!(!target.exists());
+
+        let reported = install(
+            &gate_release(gate_release::AGENT, true),
+            "9.9.9+e16",
+            &trust,
+        )
+        .expect("a signed release of the version asked for");
+        assert_eq!(reported, "9.9.9");
+        let mode = std::os::unix::fs::PermissionsExt::mode(
+            &std::fs::metadata(&target).unwrap().permissions(),
+        );
+        assert_eq!(mode & 0o111, 0o111, "installed executable");
     }
 
     #[test]

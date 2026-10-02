@@ -268,26 +268,50 @@ pub struct PeeringContext {
 struct PeeringShared {
     /// This machine's own peering directory.
     directory: PathBuf,
+    /// The lease lifetime, as configured: every lease this supervisor
+    /// writes carries it.
+    ttl: Duration,
     /// The role.
     role: Mutex<crate::peering::Role>,
-    /// A handoff in progress: who leads next, at what term. Each worker
-    /// hands its peer the new lease on its next attempt; when every
-    /// session has, the role becomes follower.
-    handoff: Mutex<Option<(String, u64)>>,
-    /// How many sessions have handed the new lease on.
-    handed: std::sync::atomic::AtomicUsize,
-    /// How many sessions there are to hand it on.
-    sessions: std::sync::atomic::AtomicUsize,
+    /// Who the lead may be handed to: the alpha, and every beta this
+    /// supervisor's peering sessions reach.
+    members: Mutex<Vec<String>>,
+    /// A handoff, and the sessions that pass it on.
+    passing: Mutex<Passing>,
+    /// With `manage_keys`: every beta's peering key and host keys, by
+    /// host, as its session learned them.
+    keys: Mutex<std::collections::BTreeMap<String, crate::peerkeys::HostKeys>>,
+}
+
+/// A handoff in progress, and who has passed it on. Each running peering
+/// session hands its peer the new lease on its next attempt; when every
+/// one has, the role becomes follower. A paused session has nothing to
+/// hand on and is not waited for, and a plain session never has.
+#[derive(Default)]
+struct Passing {
+    /// Who leads next, at what term.
+    handoff: Option<(String, u64)>,
+    /// The peering sessions that are running: not paused, not stopped.
+    running: std::collections::BTreeSet<String>,
+    /// The sessions that have handed the handoff's lease on.
+    handed: std::collections::BTreeSet<String>,
+    /// Of the running sessions, those with the attached alpha; and those
+    /// that have finished a cycle with it while this supervisor led. The
+    /// lead goes back to the alpha only once every one has, so that each of
+    /// the alpha's groups is level with it before it leads them again.
+    attached: std::collections::BTreeSet<String>,
+    cycled: std::collections::BTreeSet<String>,
 }
 
 impl PeeringShared {
-    fn new(directory: PathBuf, role: crate::peering::Role) -> PeeringShared {
+    fn new(directory: PathBuf, role: crate::peering::Role, ttl: Duration) -> PeeringShared {
         PeeringShared {
             directory,
+            ttl,
             role: Mutex::new(role),
-            handoff: Mutex::new(None),
-            handed: std::sync::atomic::AtomicUsize::new(0),
-            sessions: std::sync::atomic::AtomicUsize::new(0),
+            members: Mutex::new(Vec::new()),
+            passing: Mutex::new(Passing::default()),
+            keys: Mutex::new(std::collections::BTreeMap::new()),
         }
     }
 
@@ -298,52 +322,130 @@ impl PeeringShared {
             .clone()
     }
 
+    fn passing(&self) -> std::sync::MutexGuard<'_, Passing> {
+        self.passing
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
     /// Starts a handoff to `to` at the next term. The local lease says so
-    /// at once, so a restart in the middle does not come back leading.
-    fn yield_to(&self, to: &str, ttl: Duration) -> Result<()> {
+    /// at once, so a restart in the middle does not come back leading. A
+    /// name that is not a member of the star is refused: handed to a typo,
+    /// the lead would sit with nobody until a follower's wait ran out.
+    fn yield_to(&self, to: &str) -> Result<()> {
         let role = self.role();
-        let crate::peering::Role::Leader { term, .. } = role else {
+        let crate::peering::Role::Leader { leader, term } = role else {
             anyhow::bail!("not leading; nothing to yield");
         };
-        let next = term + 1;
-        let mut handoff = self
-            .handoff
+        if to == leader {
+            anyhow::bail!("{to} already leads");
+        }
+        let members = self
+            .members
             .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        if let Some((current, at)) = &*handoff {
+            .unwrap_or_else(|error| error.into_inner())
+            .clone();
+        if !members.iter().any(|member| member == to) {
+            anyhow::bail!(
+                "{to:?} is not a member of this star; the lead can go to {}",
+                members
+                    .iter()
+                    .filter(|member| **member != leader)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let next = term + 1;
+        let mut passing = self.passing();
+        if let Some((current, at)) = &passing.handoff {
             if current == to && *at == next {
                 return Ok(());
             }
         }
         crate::note!("peering: handing the lead to {to} at term {next}");
-        crate::peering::write_lease(&self.directory, &crate::peering::Lease::new(to, next, ttl))?;
-        *handoff = Some((to.to_owned(), next));
-        self.handed.store(0, Ordering::SeqCst);
+        if let crate::peering::LeaseAnswer::Refused { current } = crate::peering::admit_lease(
+            &self.directory,
+            &crate::peering::Lease::new(to, next, self.ttl),
+        )? {
+            anyhow::bail!(
+                "{} leads at term {} on this host; there is no lead here to hand on",
+                current.leader,
+                current.term
+            );
+        }
+        passing.handoff = Some((to.to_owned(), next));
+        passing.handed.clear();
+        self.follow_once_passed(&mut passing);
         Ok(())
     }
 
     /// The handoff in progress, if any.
     fn handoff(&self) -> Option<(String, u64)> {
-        self.handoff
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone()
+        self.passing().handoff.clone()
     }
 
-    /// One session handed the lease on. When every session has, the
-    /// supervisor follows.
-    fn handed_one(&self) {
-        let handed = self.handed.fetch_add(1, Ordering::SeqCst) + 1;
-        if handed >= self.sessions.load(Ordering::SeqCst) {
-            let handoff = self
-                .handoff
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .take();
-            if let Some((to, term)) = handoff {
+    /// One session handed the lease on.
+    fn handed_one(&self, session: &str) {
+        let mut passing = self.passing();
+        passing.handed.insert(session.to_owned());
+        self.follow_once_passed(&mut passing);
+    }
+
+    /// A peering session started running, or stopped: paused, or ended.
+    fn set_running(&self, session: &str, running: bool, attached: bool) {
+        let mut passing = self.passing();
+        match running {
+            true => passing.running.insert(session.to_owned()),
+            false => passing.running.remove(session),
+        };
+        match (running, attached) {
+            (true, true) => passing.attached.insert(session.to_owned()),
+            _ => passing.attached.remove(session),
+        };
+        self.follow_once_passed(&mut passing);
+    }
+
+    /// A session with the attached alpha finished a cycle with it.
+    fn cycled_with_alpha(&self, session: &str) {
+        self.passing().cycled.insert(session.to_owned());
+    }
+
+    /// Whether every running session with the attached alpha has finished
+    /// a cycle with it.
+    fn every_attached_session_cycled(&self) -> bool {
+        let passing = self.passing();
+        passing.attached.is_subset(&passing.cycled)
+    }
+
+    /// Completes the handoff once every running session has passed it on:
+    /// the supervisor follows the leader it named.
+    fn follow_once_passed(&self, passing: &mut Passing) {
+        if passing.handoff.is_none() || !passing.running.is_subset(&passing.handed) {
+            return;
+        }
+        if let Some((to, term)) = passing.handoff.take() {
+            *self.role.lock().unwrap_or_else(|error| error.into_inner()) =
+                crate::peering::Role::Follower { leader: to, term };
+        }
+    }
+
+    /// Leads again as the alpha at `term`, the lease having come back to
+    /// it: admitted under the lease lock like any lease, so a newer one a
+    /// beta holds here is never written over. Whether it leads.
+    fn lead_as_alpha(&self, term: u64) -> Result<bool> {
+        let lease = crate::peering::Lease::new(crate::peering::ALPHA, term, self.ttl);
+        match crate::peering::admit_lease(&self.directory, &lease)? {
+            crate::peering::LeaseAnswer::Accepted => {
+                self.passing().handoff = None;
                 *self.role.lock().unwrap_or_else(|error| error.into_inner()) =
-                    crate::peering::Role::Follower { leader: to, term };
+                    crate::peering::Role::Leader {
+                        leader: crate::peering::ALPHA.to_owned(),
+                        term,
+                    };
+                Ok(true)
             }
+            crate::peering::LeaseAnswer::Refused { .. } => Ok(false),
         }
     }
 }
@@ -354,18 +456,27 @@ impl PeeringContext {
     /// term, unless that file says a beta led while it was away — then it
     /// follows, and stays a follower until a later phase hands the lead
     /// back.
-    pub fn for_alpha(config_path: PathBuf, directory: PathBuf) -> Result<PeeringContext> {
+    pub fn for_alpha(
+        config_path: PathBuf,
+        directory: PathBuf,
+        ttl: Duration,
+    ) -> Result<PeeringContext> {
         let role = match crate::peering::alpha_term(&directory)? {
             crate::peering::AlphaStart::Lead { term } => {
-                let lease = crate::peering::Lease::new(
-                    crate::peering::ALPHA,
-                    term,
-                    crate::config::DEFAULT_PEERING_TTL,
-                );
-                crate::peering::write_lease(&directory, &lease)?;
-                crate::peering::Role::Leader {
-                    leader: crate::peering::ALPHA.to_owned(),
-                    term,
+                let lease = crate::peering::Lease::new(crate::peering::ALPHA, term, ttl);
+                // Under the lease lock: a lease a beta wrote here since it
+                // was read is kept, and the alpha follows it.
+                match crate::peering::admit_lease(&directory, &lease)? {
+                    crate::peering::LeaseAnswer::Accepted => crate::peering::Role::Leader {
+                        leader: crate::peering::ALPHA.to_owned(),
+                        term,
+                    },
+                    crate::peering::LeaseAnswer::Refused { current } => {
+                        crate::peering::Role::Follower {
+                            leader: current.leader,
+                            term: current.term,
+                        }
+                    }
                 }
             }
             crate::peering::AlphaStart::Follow { lease } => crate::peering::Role::Follower {
@@ -377,7 +488,7 @@ impl PeeringContext {
             config_path,
             ignores_directory: crate::paths::default_state_root()?
                 .join(crate::scan::ignorefile::DIRECTORY),
-            shared: Arc::new(PeeringShared::new(directory.clone(), role)),
+            shared: Arc::new(PeeringShared::new(directory.clone(), role, ttl)),
             directory,
         })
     }
@@ -385,13 +496,19 @@ impl PeeringContext {
     /// The context for a beta that took the lead: it leads as `leader`
     /// (its own spec) at `term`, runs the pushed configuration, and
     /// pushes the pushed ignore files on.
-    pub fn for_leader(directory: PathBuf, leader: String, term: u64) -> PeeringContext {
+    pub fn for_leader(
+        directory: PathBuf,
+        leader: String,
+        term: u64,
+        ttl: Duration,
+    ) -> PeeringContext {
         PeeringContext {
             config_path: directory.join("config.toml"),
             ignores_directory: directory.join(crate::scan::ignorefile::DIRECTORY),
             shared: Arc::new(PeeringShared::new(
                 directory.clone(),
                 crate::peering::Role::Leader { leader, term },
+                ttl,
             )),
             directory,
         }
@@ -411,13 +528,19 @@ impl PeeringContext {
     /// every session presents that lease to its peer on its next attempt,
     /// and then the supervisor follows.
     pub fn yield_to(&self, to: &str) -> Result<()> {
-        self.shared.yield_to(to, crate::config::DEFAULT_PEERING_TTL)
+        self.shared.yield_to(to)
+    }
+
+    /// Takes the lead back as the alpha at `term`, once the lease names the
+    /// alpha again. Whether it leads.
+    pub fn lead_as_alpha(&self, term: u64) -> Result<bool> {
+        self.shared.lead_as_alpha(term)
     }
 
     /// A handle the control socket can call to yield.
     fn yield_handle(&self) -> control::YieldHandle {
         let shared = self.shared.clone();
-        Arc::new(move |to: &str| shared.yield_to(to, crate::config::DEFAULT_PEERING_TTL))
+        Arc::new(move |to: &str| shared.yield_to(to))
     }
 
     /// Steps down: another controller holds `current` on some host. The
@@ -443,7 +566,9 @@ impl PeeringContext {
             leader: current.leader.clone(),
             term: current.term,
         };
-        if let Err(error) = crate::peering::write_lease(&self.directory, current) {
+        // Admitted like any lease: recorded when it is newer than what
+        // this host holds, and never over a newer one.
+        if let Err(error) = crate::peering::admit_lease(&self.directory, current) {
             crate::complain!("peering: unable to record the lease locally: {error:#}");
         }
     }
@@ -460,7 +585,11 @@ impl PeeringContext {
         let config = std::fs::read(&self.config_path)
             .with_context(|| format!("unable to read {}", self.config_path.display()))?;
         files.push(("config.toml".to_owned(), config));
+        // The name twice: per group, since two groups can reach one host
+        // at two roots, and host-wide, which is what says the host is a
+        // peer at all.
         files.push(("name".to_owned(), beta_spec.as_bytes().to_vec()));
+        files.push((format!("names/{group}"), beta_spec.as_bytes().to_vec()));
         files.push((format!("sessions/{group}"), identifier.as_bytes().to_vec()));
         let ignores = &self.ignores_directory;
         if let Ok(entries) = std::fs::read_dir(ignores) {
@@ -479,6 +608,51 @@ impl PeeringContext {
         Ok(files)
     }
 }
+
+/// A peering session's place among those a handoff waits for: taken while
+/// its worker runs, given up while it is paused and when it ends — a
+/// panic included, or a halted session would hold every handoff forever.
+struct PassingPlace {
+    shared: Option<Arc<PeeringShared>>,
+    session: String,
+    /// Whether the session is with the attached alpha.
+    attached: bool,
+}
+
+impl PassingPlace {
+    fn new(peering: &Option<PeeringContext>, plan: &SessionPlan) -> PassingPlace {
+        let place = PassingPlace {
+            shared: match (peering, plan.peering) {
+                (Some(peering), Some(_)) => Some(peering.shared.clone()),
+                _ => None,
+            },
+            session: plan.identifier(),
+            attached: matches!(
+                &plan.alpha,
+                EndpointTarget::Remote { destination, .. }
+                    if crate::peering::attached_name(destination).is_some()
+            ),
+        };
+        place.set(true);
+        place
+    }
+
+    fn set(&self, running: bool) {
+        if let Some(shared) = &self.shared {
+            shared.set_running(&self.session, running, self.attached);
+        }
+    }
+}
+
+impl Drop for PassingPlace {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+/// How often a session waiting on the lead, or a peer's loop, looks at the
+/// role again.
+pub(crate) const ROLE_POLL: Duration = Duration::from_millis(250);
 
 /// The error a worker's attempt ends with while its supervisor follows:
 /// nothing was connected, nothing was written.
@@ -566,12 +740,37 @@ impl Supervisor {
     /// Adopts a peering context, so that sessions in a peering mode lead
     /// (or follow) rather than run as plain sessions.
     pub fn with_peering(mut self, peering: PeeringContext) -> Supervisor {
-        peering
+        // Who the lead may be handed to: the alpha, and the beta of every
+        // peering session this supervisor runs — except the session with
+        // the attached alpha, whose beta is the alpha already.
+        let mut members = vec![crate::peering::ALPHA.to_owned()];
+        for plan in self.plans.iter().filter(|plan| plan.peering.is_some()) {
+            let attached = matches!(
+                &plan.beta,
+                crate::config::EndpointTarget::Remote { destination, .. }
+                    if crate::peering::attached_name(destination).is_some()
+            );
+            let spec = plan.beta_spec();
+            if !attached && !members.contains(&spec) {
+                members.push(spec);
+            }
+        }
+        *peering
             .shared
-            .sessions
-            .store(self.plans.len(), Ordering::SeqCst);
+            .members
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = members;
         self.peering = Some(peering);
         self
+    }
+
+    /// Peering: takes the lead back as the alpha at `term`. Whether it
+    /// leads; a supervisor without peering never does.
+    pub fn lead_as_alpha(&self, term: u64) -> Result<bool> {
+        match &self.peering {
+            Some(peering) => peering.lead_as_alpha(term),
+            None => Ok(false),
+        }
     }
 
     /// Peering: offers a connection a peer opened to this supervisor, for
@@ -962,10 +1161,15 @@ impl Supervisor {
         worker.progress = progress.clone();
         worker.published = Some(published.clone());
         let identifier = plan.identifier();
+        // Peering: a handoff waits for this session while it runs, and not
+        // while it is paused or once it has ended, however it ends.
+        let place = PassingPlace::new(&self.peering, plan);
         let mut failures = 0u32;
         while !stop.load(Ordering::Relaxed) {
             if flags.paused.load(Ordering::Relaxed) {
+                place.set(false);
                 worker.hold_paused(flags, stop);
+                place.set(true);
                 continue;
             }
             if flags.reset.swap(false, Ordering::Relaxed) {
@@ -997,12 +1201,19 @@ impl Supervisor {
             if let Err(error) = worker.conclude(&result) {
                 crate::complain!("[{}] unable to record status: {error:#}", plan.display());
             }
-            if failed {
+            if worker.waiting_on_the_lead() {
+                failures = 0;
+                worker.progress.rest(crate::progress::Phase::Waiting);
+                worker.await_the_lead(stop, flags);
+            } else if failed {
                 failures = failures.saturating_add(1);
-                let delay = backoff_delay(
-                    plan.interval,
-                    failures,
-                    jitter_percent(&identifier, failures),
+                let delay = peering_capped(
+                    plan,
+                    backoff_delay(
+                        plan.interval,
+                        failures,
+                        jitter_percent(&identifier, failures),
+                    ),
                 );
                 worker.progress.rest(crate::progress::Phase::Retrying);
                 sleep_flagged(delay, stop, flags);
@@ -1120,10 +1331,13 @@ impl Supervisor {
                     );
                     worker.record_failure("errored", format!("internal error: {message}"));
                     let failures = panics.len() as u32;
-                    let delay = backoff_delay(
-                        plan.interval,
-                        failures,
-                        jitter_percent(&plan.identifier(), failures),
+                    let delay = peering_capped(
+                        plan,
+                        backoff_delay(
+                            plan.interval,
+                            failures,
+                            jitter_percent(&plan.identifier(), failures),
+                        ),
                     );
                     worker.progress.rest(crate::progress::Phase::Retrying);
                     sleep_flagged(delay, stop, &flags);
@@ -1325,6 +1539,12 @@ struct Worker<'a> {
     pushed: Option<[u8; 32]>,
     /// The handoff this worker has already handed on, if any.
     handed: Option<(String, u64)>,
+    /// With `manage_keys`: whether this session's beta told its keys since
+    /// the session connected, the digest of the keys it was last given,
+    /// and the last complaint, said once.
+    keys_learned: bool,
+    keys_given: Option<blake3::Hash>,
+    keys_complaint: Option<String>,
     /// Whether this worker runs a single pass, which never waits for a
     /// change, so its endpoints watch nothing.
     one_shot: bool,
@@ -1357,6 +1577,9 @@ impl<'a> Worker<'a> {
             peering: None,
             pushed: None,
             handed: None,
+            keys_learned: false,
+            keys_given: None,
+            keys_complaint: None,
             one_shot: false,
             resolutions: Vec::new(),
             #[cfg(test)]
@@ -1457,6 +1680,16 @@ impl<'a> Worker<'a> {
         }
         let side = self.peer_side();
         if let Some(session) = self.session.as_mut() {
+            // The copy the next leader takes up is brought level first,
+            // under this session's own leadership: a handoff on request
+            // may follow a cycle whose record never arrived.
+            if let Err(error) = session.level_the_copy() {
+                crate::complain!(
+                    "[{}] unable to bring the peer's ancestor copy level before handing on: \
+                     {error:#}",
+                    self.plan.display()
+                );
+            }
             session.set_leadership(
                 Some(crate::peering::Leadership {
                     leader: to.clone(),
@@ -1473,8 +1706,38 @@ impl<'a> Worker<'a> {
             }
         }
         self.handed = Some((to.clone(), term));
-        peering.shared.handed_one();
+        peering.shared.handed_one(&self.plan.identifier());
         Err(Following { leader: to, term }.into())
+    }
+
+    /// Peering: whether this session has nothing to do until the role
+    /// changes — the supervisor follows, or a handoff is under way that
+    /// this session has already passed on.
+    fn waiting_on_the_lead(&self) -> bool {
+        let (Some(peering), Some(_)) = (self.peering, self.plan.peering) else {
+            return false;
+        };
+        match peering.role() {
+            crate::peering::Role::Follower { .. } => true,
+            crate::peering::Role::Leader { .. } => peering
+                .shared
+                .handoff()
+                .is_some_and(|handoff| self.handed.as_ref() == Some(&handoff)),
+            crate::peering::Role::Off => false,
+        }
+    }
+
+    /// Peering: waits while this session has nothing to do until the role
+    /// changes, so a follower's sessions neither spin nor back off: they
+    /// take the lead up again as soon as the supervisor does.
+    fn await_the_lead(&self, stop: &AtomicBool, flags: &control::WorkerControl) {
+        while !stop.load(Ordering::Relaxed)
+            && !flags.paused.load(Ordering::Relaxed)
+            && !flags.wake.swap(false, Ordering::Relaxed)
+            && self.waiting_on_the_lead()
+        {
+            flags.bell.wait(ROLE_POLL);
+        }
     }
 
     /// Peering: the supervisor's role as it applies to this plan — `Off`
@@ -1504,6 +1767,65 @@ impl<'a> Worker<'a> {
                 term,
                 ttl: plan.ttl,
             })),
+        }
+    }
+
+    /// Peering, with `manage_keys`, as the alpha: learns this session's
+    /// beta's keys, and gives it every other beta's, forced through the
+    /// gate, whenever what it should hold changes. Best effort: a failure
+    /// is said once and costs nothing but the keys.
+    fn manage_keys(&mut self) {
+        let (Some(peering), Some(plan)) = (self.peering, self.plan.peering) else {
+            return;
+        };
+        let alpha_leads = matches!(
+            peering.role(),
+            crate::peering::Role::Leader { ref leader, .. } if leader == crate::peering::ALPHA
+        );
+        if !plan.manage_keys || !alpha_leads {
+            return;
+        }
+        let outcome = (|| -> Result<()> {
+            let Some(session) = self.session.as_mut() else {
+                return Ok(());
+            };
+            let host = crate::peering::destination_of(&self.plan.beta_spec()).to_owned();
+            if !self.keys_learned {
+                let keys = session.peer_keys()?;
+                peering
+                    .shared
+                    .keys
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .insert(host.clone(), keys);
+                self.keys_learned = true;
+            }
+            let known = peering
+                .shared
+                .keys
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone();
+            let (authorized, known_hosts) = crate::peerkeys::block_for(&host, &known);
+            let digest = blake3::hash(format!("{authorized:?}{known_hosts:?}").as_bytes());
+            if self.keys_given != Some(digest) {
+                session.install_peers(&authorized, &known_hosts)?;
+                self.keys_given = Some(digest);
+            }
+            Ok(())
+        })();
+        match outcome {
+            Ok(()) => self.keys_complaint = None,
+            Err(error) => {
+                let message = format!("{error:#}");
+                if self.keys_complaint.as_ref() != Some(&message) {
+                    crate::complain!(
+                        "[{}] unable to set up the peering keys: {message}",
+                        self.plan.display()
+                    );
+                    self.keys_complaint = Some(message);
+                }
+            }
         }
     }
 
@@ -1570,14 +1892,40 @@ impl<'a> Worker<'a> {
         }
         // Peering: the alpha is back and level. A beta leads only while
         // the alpha is away, so one settled cycle with the alpha attached
-        // hands the lead back to it.
+        // hands the lead back to it — once the alpha's copy of the ancestor
+        // is confirmed level too, since that copy is what the alpha takes
+        // up. A copy that cannot be brought level waits for the next
+        // settled cycle.
         if let (Ok((_, report)), Some(peering)) = (&result, self.peering) {
+            if self.peer_side() == crate::peering::PeerSide::Alpha {
+                peering.shared.cycled_with_alpha(&self.plan.identifier());
+            }
+            // And not before every other group with the alpha has had a
+            // cycle with it too: the first of them to settle would
+            // otherwise hand the lead back while the rest were still
+            // waiting out a retry, unsynced with the alpha until it led.
             if self.peer_side() == crate::peering::PeerSide::Alpha
                 && report.settled()
+                && peering.shared.every_attached_session_cycled()
                 && matches!(peering.role(), crate::peering::Role::Leader { .. })
             {
-                if let Err(error) = peering.yield_to(crate::peering::ALPHA) {
-                    crate::complain!("[{}] unable to yield: {error:#}", self.plan.display());
+                let level = self
+                    .session
+                    .as_mut()
+                    .map_or(Ok(()), |session| session.level_the_copy());
+                match level {
+                    Err(error) => crate::complain!(
+                        "[{}] not handing the lead back yet: {error:#}",
+                        self.plan.display()
+                    ),
+                    Ok(()) => {
+                        if let Err(error) = peering.yield_to(crate::peering::ALPHA) {
+                            crate::complain!(
+                                "[{}] unable to yield: {error:#}",
+                                self.plan.display()
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1613,6 +1961,8 @@ impl<'a> Worker<'a> {
             );
             session.set_progress(self.progress.clone());
             self.session = Some(session);
+            // A new connection, perhaps to a host that made a new key.
+            self.keys_learned = false;
         }
         let leading = leadership.is_some();
         let side = self.peer_side();
@@ -1627,6 +1977,7 @@ impl<'a> Worker<'a> {
             session.present_lease()?;
             if side == crate::peering::PeerSide::Beta {
                 self.push_files()?;
+                self.manage_keys();
             }
         }
         #[cfg(test)]
@@ -1745,6 +2096,14 @@ impl<'a> Worker<'a> {
                 return;
             }
             let slice = remaining.min(Duration::from_millis(500));
+            // A leading session keeps its lease fresh while it waits; a
+            // refusal ends the wait, and the attempt that follows steps the
+            // supervisor down.
+            if let Some(session) = self.session.as_mut() {
+                if session.renew_lease_if_due().is_err() {
+                    return;
+                }
+            }
             match self.session.as_mut() {
                 Some(session) => match session.await_change(slice) {
                     Ok(true) => {
@@ -2091,24 +2450,66 @@ fn connect(
     // with a remote agent — endpoint construction is expensive, can block
     // on the network, and has remote side effects.
     let lock = SessionLock::acquire(state_directory.clone())?;
-    // Peering: a copy of this session's ancestor that a leader pushed here
-    // and that is newer than what this directory holds is adopted — under
-    // the lock, before the store is opened. A beta that starts to lead
-    // seeds its session this way; an alpha that gets the lead back takes
-    // up what the beta recorded meanwhile.
-    if let (Some(directory), Some(_)) = (peering_directory, plan.peering) {
-        if crate::peering::adopt_newer_copy(state_root, directory, &identifier)? {
-            crate::note!(
-                "[{}] adopted the ancestor copy a leader pushed",
-                plan.display()
-            );
-        }
-    }
     // The pair lock is independent of the state root, so two supervisors
     // pointed at different state directories cannot own the same trees.
     let pair_lock =
         crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
-    let (alpha, beta) = open_session_endpoints(plan, state_root, pool, one_shot)?;
+    let (mut alpha, mut beta) = open_session_endpoints(plan, state_root, pool, one_shot)?;
+    // Peering: a copy of this session's ancestor that a leader pushed here
+    // and that is newer than what this directory holds is adopted — under
+    // the lock, before the store is opened. A beta that starts to lead
+    // seeds its session this way; an alpha that gets the lead back takes
+    // up what the beta recorded meanwhile. The copy is checked against
+    // this side first, scanned through the endpoint the session is about
+    // to use, so the scan is the session's first one too.
+    if let (Some(directory), Some(_)) = (peering_directory, plan.peering) {
+        let (partner, root, own): (String, _, &mut Box<dyn Endpoint + Send>) =
+            match (&plan.alpha, &plan.beta) {
+                (_, EndpointTarget::Local(root)) => {
+                    (crate::peering::ALPHA.to_owned(), root.clone(), &mut beta)
+                }
+                (EndpointTarget::Local(root), _) => (plan.beta_spec(), root.clone(), &mut alpha),
+                _ => anyhow::bail!("a peering session has a side on this host"),
+            };
+        let adopted = crate::peering::adopt_newer_copy(
+            state_root,
+            directory,
+            &identifier,
+            &partner,
+            &root,
+            || own.scan(),
+        )?;
+        match adopted {
+            crate::peering::Adoption::Kept => {}
+            crate::peering::Adoption::Adopted { set_aside } if set_aside.is_empty() => {
+                crate::note!(
+                    "[{}] adopted the ancestor copy a leader pushed",
+                    plan.display()
+                );
+            }
+            crate::peering::Adoption::Adopted { set_aside } => crate::complain!(
+                "[{}] adopted the ancestor copy a leader pushed, setting aside {} path(s) it \
+                 records unlike this side, which has not changed there since: {}{}; the next \
+                 cycle reconciles them as new",
+                plan.display(),
+                set_aside.len(),
+                set_aside
+                    .iter()
+                    .take(5)
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                match set_aside.len() > 5 {
+                    true => ", …",
+                    false => "",
+                }
+            ),
+            crate::peering::Adoption::Refused(why) => crate::complain!(
+                "[{}] not taking up the ancestor copy a leader pushed: {why}",
+                plan.display()
+            ),
+        }
+    }
     let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);
@@ -2228,43 +2629,31 @@ fn open_session_endpoints(
                 path,
                 agent_command,
             } => {
-                let initialize = crate::protocol::Initialize {
-                    root: path.clone(),
-                    session: identifier.clone(),
-                    ignores: plan.ignores.clone(),
-                    symlink_mode: plan.symlink_mode,
-                    file_mode: plan.file_mode,
-                    directory_mode: plan.directory_mode,
-                    side: side.to_owned(),
-                    staging: plan.staging,
-                    max_file_size: plan.max_file_size,
-                    max_entry_count: plan.max_entry_count,
-                    default_owner: plan.default_owner.clone(),
-                    default_group: plan.default_group.clone(),
-                    ignore_mounts: plan.ignore_mounts,
-                    one_shot,
-                };
+                let initialize = initialize_for(plan, path, side, one_shot);
                 // Peering: an endpoint reached by attachment is a
                 // connection the peer opened to this supervisor. None
                 // waiting means the peer has not dialed in, which is the
                 // ordinary unreachable case and backs off like one.
                 if let Some(name) = crate::peering::attached_name(destination) {
-                    let Some(connection) = pool.take_attachment(name) else {
+                    let Some(connection) = pool.attachment(name) else {
                         return Err(crate::endpoint::remote::Unreachable {
                             destination: destination.clone(),
                         }
                         .into());
                     };
                     return Ok(Box::new(
-                        crate::endpoint::remote::RemoteEndpoint::connect(connection, initialize)
-                            .map_err(|error| {
-                                crate::complain!(
-                                    "the attached {name} could not be connected: {error:#}"
-                                );
-                                crate::endpoint::remote::Unreachable {
-                                    destination: destination.clone(),
-                                }
-                            })?,
+                        crate::endpoint::remote::RemoteEndpoint::on_connection(
+                            &connection,
+                            initialize,
+                        )
+                        .map_err(|error| {
+                            crate::complain!(
+                                "the attached {name} could not be connected: {error:#}"
+                            );
+                            crate::endpoint::remote::Unreachable {
+                                destination: destination.clone(),
+                            }
+                        })?,
                     ));
                 }
                 // Sessions sharing a spawn command share one pooled
@@ -2285,6 +2674,50 @@ fn open_session_endpoints(
     let alpha = endpoint(&plan.alpha, "alpha")?;
     let beta = endpoint(&plan.beta, "beta")?;
     Ok((alpha, beta))
+}
+
+/// How an agent is told to serve one side of a plan's session: at `root`,
+/// under the plan's settings.
+fn initialize_for(
+    plan: &SessionPlan,
+    root: &str,
+    side: &str,
+    one_shot: bool,
+) -> crate::protocol::Initialize {
+    crate::protocol::Initialize {
+        root: root.to_owned(),
+        session: plan.identifier(),
+        ignores: plan.ignores.clone(),
+        symlink_mode: plan.symlink_mode,
+        file_mode: plan.file_mode,
+        directory_mode: plan.directory_mode,
+        side: side.to_owned(),
+        staging: plan.staging,
+        max_file_size: plan.max_file_size,
+        max_entry_count: plan.max_entry_count,
+        default_owner: plan.default_owner.clone(),
+        default_group: plan.default_group.clone(),
+        ignore_mounts: plan.ignore_mounts,
+        one_shot,
+    }
+}
+
+/// What the alpha serves a leading beta it attaches to: each of its own
+/// peering sessions, its own side of it, as its own configuration has it.
+/// The leader's session keeps the alpha on the alpha side under the same
+/// identifier, so that is the side, and the session, it asks for.
+pub fn attach_policy(plans: &[SessionPlan]) -> crate::transport::AttachPolicy {
+    crate::transport::AttachPolicy::new(plans.iter().filter_map(|plan| {
+        let (Some(_), EndpointTarget::Local(root)) = (plan.peering, &plan.alpha) else {
+            return None;
+        };
+        Some(initialize_for(
+            plan,
+            &root.to_string_lossy(),
+            "alpha",
+            false,
+        ))
+    }))
 }
 
 /// The sessions to show, and what the running supervisor said about them.
@@ -3009,6 +3442,17 @@ fn backoff_delay(interval: Duration, consecutive_failures: u32, jitter_percent: 
     base + jitter
 }
 
+/// A peering session's backoff, held under half its lease lifetime. A
+/// leader that backed off for the full five minutes after a blip let its
+/// lease lapse, and a follower took the lead from a healthy alpha; retrying
+/// within the lifetime renews the lease before anyone may act on it.
+fn peering_capped(plan: &SessionPlan, delay: Duration) -> Duration {
+    match plan.peering {
+        Some(peering) => delay.min(peering.ttl / 2),
+        None => delay,
+    }
+}
+
 /// Derives a jitter percentage (0–24) from the session identifier and the
 /// retry round, spreading retry schedules without any runtime randomness.
 /// Mixing the round in decorrelates sessions from one retry to the next, so
@@ -3341,6 +3785,138 @@ mod tests {
             .map(|round| jitter_percent("session-x", round))
             .collect();
         assert!(varied.len() > 1, "jitter should vary across rounds");
+    }
+
+    /// A 90-second outage never costs a healthy alpha the lead. However
+    /// many attempts failed during it, a peering session retries within
+    /// half a lease lifetime of the network coming back, and so renews the
+    /// lease on every beta before the first of them may act — which it
+    /// may only a lifetime plus the wait after the last renewal.
+    #[test]
+    fn a_ninety_second_outage_does_not_cause_a_takeover() {
+        let root = tempfile::tempdir().expect("a temporary directory");
+        let mut plan = planned(root.path(), &[("g", "")]).remove(0);
+        let timing = crate::config::PeeringPlan {
+            ttl: crate::config::DEFAULT_PEERING_TTL,
+            failover_after: crate::config::DEFAULT_PEERING_FAILOVER_AFTER,
+            manage_keys: false,
+        };
+        plan.peering = Some(timing);
+        let outage = Duration::from_secs(90);
+        let first_beta = timing.ttl + crate::peering::takeover_wait(1, &timing);
+        for failures in 1..=64 {
+            let jitter = jitter_percent(&plan.identifier(), failures);
+            let retry = peering_capped(&plan, backoff_delay(plan.interval, failures, jitter));
+            assert!(retry <= timing.ttl / 2, "{failures}: {retry:?}");
+            assert!(outage + retry < first_beta, "{failures}: {retry:?}");
+        }
+        // A plain session keeps its full backoff.
+        plan.peering = None;
+        assert_eq!(
+            peering_capped(&plan, backoff_delay(plan.interval, 64, 0)),
+            MAXIMUM_BACKOFF
+        );
+    }
+
+    fn leading_alpha(directory: &Path, ttl: Duration) -> PeeringShared {
+        let shared = PeeringShared::new(
+            directory.to_path_buf(),
+            crate::peering::Role::Leader {
+                leader: crate::peering::ALPHA.to_owned(),
+                term: 3,
+            },
+            ttl,
+        );
+        *shared.members.lock().unwrap() =
+            vec![crate::peering::ALPHA.to_owned(), "box:/x".to_owned()];
+        shared
+    }
+
+    /// A handoff waits for the peering sessions that are running, each
+    /// to pass it on: not for one paused before it started, nor for one
+    /// paused while it was under way — but for one that resumed meanwhile,
+    /// which has a lease to hand on again.
+    #[test]
+    fn a_handoff_completes_with_a_paused_session() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let shared = leading_alpha(&keep.path().join("peering"), Duration::from_secs(30));
+        let follower = crate::peering::Role::Follower {
+            leader: "box:/x".to_owned(),
+            term: 4,
+        };
+        for session in ["a", "b", "c", "d"] {
+            shared.set_running(session, true, false);
+        }
+        shared.set_running("c", false, false);
+        shared.yield_to("box:/x").expect("yields");
+        shared.handed_one("a");
+        shared.set_running("d", false, false);
+        shared.set_running("c", true, false);
+        assert!(matches!(shared.role(), crate::peering::Role::Leader { .. }));
+        shared.handed_one("c");
+        assert!(matches!(shared.role(), crate::peering::Role::Leader { .. }));
+        // The last running session pauses rather than passing it on.
+        shared.set_running("b", false, false);
+        assert_eq!(shared.role(), follower);
+        assert_eq!(shared.handoff(), None);
+
+        // Every session paused: nothing to wait for.
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let shared = leading_alpha(&keep.path().join("peering"), Duration::from_secs(30));
+        shared.set_running("a", true, false);
+        shared.set_running("a", false, false);
+        shared.yield_to("box:/x").expect("yields");
+        assert_eq!(shared.role(), follower);
+    }
+
+    /// The lead goes back to the alpha only once every running session
+    /// with the attached alpha has finished a cycle with it; a session
+    /// that stops running is not waited for.
+    #[test]
+    fn the_handback_waits_for_every_group_with_the_alpha() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let shared = leading_alpha(&keep.path().join("peering"), Duration::from_secs(30));
+        shared.set_running("one", true, true);
+        shared.set_running("two", true, true);
+        shared.set_running("beta-beta", true, false);
+        shared.cycled_with_alpha("one");
+        assert!(!shared.every_attached_session_cycled());
+        shared.set_running("two", false, true);
+        assert!(shared.every_attached_session_cycled(), "a stopped session");
+        shared.set_running("two", true, true);
+        assert!(!shared.every_attached_session_cycled());
+        shared.cycled_with_alpha("two");
+        assert!(shared.every_attached_session_cycled());
+    }
+
+    /// `peering yield --to` names a member of the star, or is refused
+    /// with nothing written: handed to a typo, the lead would sit with
+    /// nobody until a follower's wait ran out. The lease a yield writes
+    /// carries the configured lifetime.
+    #[test]
+    fn a_yield_to_an_unknown_member_is_refused() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let directory = keep.path().join("peering");
+        let shared = leading_alpha(&directory, Duration::from_secs(10));
+        let error = shared.yield_to("box:/typo").expect_err("not a member");
+        assert!(
+            format!("{error:#}").contains("not a member")
+                && format!("{error:#}").contains("box:/x"),
+            "{error:#}"
+        );
+        let error = shared
+            .yield_to(crate::peering::ALPHA)
+            .expect_err("the alpha already leads");
+        assert!(format!("{error:#}").contains("already leads"), "{error:#}");
+        assert_eq!(crate::peering::read_lease(&directory).unwrap(), None);
+        assert!(matches!(shared.role(), crate::peering::Role::Leader { .. }));
+
+        shared.yield_to("box:/x").expect("a member");
+        let lease = crate::peering::read_lease(&directory).unwrap().unwrap();
+        assert_eq!(
+            (lease.leader.as_str(), lease.term, lease.ttl_seconds),
+            ("box:/x", 4, 10)
+        );
     }
 
     /// An endpoint whose scans always present the same content and whose

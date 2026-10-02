@@ -47,6 +47,56 @@ def job_records(name, destinations, betas, cold_s):
     ]
 
 
+class NothingLanded(unittest.TestCase):
+    def test_a_window_where_nothing_landed_is_left_out_and_listed(self):
+        spec = {"job": "cell-r0", "cell": {"name": "cell-1", "betas": 1},
+                "tools": ["autobahn"]}
+        def window(job, samples, attempts, censored):
+            return {"measurement": "workload", "job": job, "cell": "cell-1",
+                    "tool": "autobahn", "direction": "sub5k:a-to-b",
+                    "samples_ms": [12.0] * samples, "samples": samples,
+                    "attempts": attempts, "censored": censored}
+        records = [
+            {"measurement": "job_start", "job": "cell-r0", "cell": "cell-1", "spec": spec,
+             "destinations": ["dest1"]},
+            window("cell-r0", 50, 50, 0),
+            {"measurement": "job_complete", "job": "cell-r0", "statuses": {"autobahn": "ok"}},
+            {"measurement": "job_start", "job": "cell-r1", "cell": "cell-1",
+             "spec": {**spec, "job": "cell-r1"}, "destinations": ["dest1"]},
+            window("cell-r1", 0, 115, 115),
+            {"measurement": "job_complete", "job": "cell-r1", "statuses": {"autobahn": "ok"}},
+        ]
+        report = report_for(records)
+        row = report["latency"]["cell-1/autobahn/sub5k:a-to-b"]
+        self.assertEqual(row["runs"], 1)
+        self.assertEqual(row["censored"], 0)
+        self.assertEqual(row["excluded"], [{"job": "cell-r1", "reason": "nothing_landed"}])
+        self.assertEqual(report["tainted_runs"], {"cell-r1/autobahn": "nothing_landed"})
+
+
+class InconsistentSeries(unittest.TestCase):
+    def test_interleaved_samplers_give_no_resource_figures(self):
+        spec = {"job": "fan-r0", "cell": {"name": "fan", "betas": 2}, "tools": ["autobahn"]}
+        clean = [[t, 1000, 100 + t, 1] for t in range(0, 30)]
+        # Two samplers in one log: time and cumulative CPU both jump back.
+        mixed = [[t, 1000, 100 + t, 1] for t in range(0, 30)] + [[5, 9000, 50, 3]]
+        record = {"measurement": "resources", "job": "fan-r0", "cell": "fan",
+                  "tool": "autobahn",
+                  "phases": {"workload": {"start": 2, "end": 20}},
+                  "series": {"local": clean, "remote": clean,
+                             "remote_by_host": [clean, mixed], "remote_hosts": 2}}
+        records = [
+            {"measurement": "job_start", "job": "fan-r0", "cell": "fan", "spec": spec,
+             "destinations": ["dest1", "dest2"]},
+            record,
+            {"measurement": "job_complete", "job": "fan-r0", "statuses": {"autobahn": "ok"}},
+        ]
+        report = report_for(records)
+        self.assertIn("fan/autobahn/workload/local", report["resources"])
+        self.assertNotIn("fan/autobahn/workload/remote", report["resources"])
+        self.assertEqual(report["inconsistent_resource_series"], ["fan-r0/autobahn/remote"])
+
+
 class ColdSyncExclusion(unittest.TestCase):
     def test_a_verified_job_with_the_wrong_destination_count_is_left_out(self):
         records = (job_records("clean-r0", 1, 1, 10.0)

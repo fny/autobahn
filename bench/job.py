@@ -30,6 +30,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import time
 
@@ -182,13 +183,28 @@ def peer_ip():
 
 
 def peer_ips():
-    """Every destination's private address, in destination order. The
-    orchestrator writes one per line."""
+    """This job's destinations' private addresses, in destination order.
+    The orchestrator writes one per line for every machine in the group.
+
+    Trimmed to the cell's width, as `destinations` is: a group is sized
+    for its widest cell, and a 1-beta cell on a fan-out group that
+    watched every address waited for each edit to land on ten machines
+    while one was synchronized. None ever did, so every attempt of the
+    window was censored, for both tools alike — seven jobs of
+    bench-1790564569 measured nothing a-to-b that way."""
     if LOCAL:
         return ["127.0.0.1"]
     with open(f"{BENCH}/peer-ip") as handle:
         listed = [line.strip() for line in handle if line.strip()]
-    return listed or ["127.0.0.1"]
+    if not listed:
+        return ["127.0.0.1"]
+    if WIDTH is None:
+        return listed
+    if len(listed) < WIDTH:
+        raise RuntimeError(
+            f"cell wants {WIDTH} destination(s), the group lists "
+            f"{len(listed)} address(es)")
+    return listed[:WIDTH]
 
 
 def self_ip():
@@ -230,7 +246,23 @@ def kill_tools():
         return
     run("pkill -x autobahn; pkill -x mutagen; true")
     on_every_destination("pkill '^autobahn-'; pkill -x mutagen-agent; true")
-    time.sleep(2)
+    # Waited out rather than slept past: a tool ending ten sessions over a
+    # large tree can take longer than any fixed pause (mutagen's daemon
+    # outlived two seconds on two coldsync-chromium-fan repeats of
+    # bench-1790564569, and each was thrown away as a hygiene failure).
+    # What is still there after the grace is killed outright, and the
+    # hygiene check that follows still has the last word.
+    local, remote = "pgrep -x autobahn; pgrep -x mutagen", "pgrep '^autobahn-'; pgrep -x mutagen-agent"
+    deadline = time.time() + KILL_GRACE_SECONDS
+    while time.time() < deadline:
+        if not (run(f"{local}; true").stdout.strip()
+                or any(result.stdout.strip()
+                       for result in on_every_destination(f"{remote}; true"))):
+            return
+        time.sleep(0.5)
+    run("pkill -9 -x autobahn; pkill -9 -x mutagen; true")
+    on_every_destination("pkill -9 '^autobahn-'; pkill -9 -x mutagen-agent; true")
+    time.sleep(1)
 
 
 def destroy_tool_state(emitter):
@@ -286,8 +318,15 @@ def restore_sources(corpora):
     """Restores every file a workload may have edited from the pristine
     copy baked into the image, so each tool (and each job on this pair)
     starts from identical source content. The set of restorable files is
-    exactly the union of all partitions — nothing else is ever edited."""
+    exactly the union of all partitions — nothing else is ever edited.
+
+    Nothing else is ever *edited*, but a burst cell adds whole modules
+    (`burst-N`, see `run_burst`). Those are removed here too: left in
+    place, they made the next tool's source, and every later job's on the
+    pair, a larger tree than the corpus it was recorded as — and a
+    pre-seeded cell after one failed its seed check outright."""
     for corpus in corpora:
+        remove_bursts(corpus)
         pristine = f"{HOME}/corpus-pristine/{corpus}"
         if not os.path.isdir(pristine):
             if LOCAL:
@@ -528,9 +567,21 @@ def await_reconvergence(corpora, timeout_seconds=600):
 # ── samplers ─────────────────────────────────────────────────────────
 
 def stop_samplers():
+    """Stops every sampler, here and on every destination — the same set
+    `start_samplers` starts them on.
+
+    Stopping them on the first destination only, as this did from when
+    fan-out cells began starting them everywhere (d38f8fc), left every
+    earlier sampler running on the other nine: each kept writing into
+    the log the next one had just truncated, so a destination's series
+    became several samplers' rows interleaved, of other tool-runs and
+    other process patterns. Every fan-out cell's remote CPU and peak RSS
+    was meaningless (bench-1790564569: 10,337% of a core for an idle
+    autobahn), while pairwise cells, whose one destination is the first,
+    were unaffected."""
     # The bracket keeps the pattern from matching its own shell wrapper.
     run(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
-    peer(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
+    on_every_destination(f"pkill -f '{BINARY} [s]ampler' 2>/dev/null; true")
 
 
 def start_samplers(tool):
@@ -676,6 +727,25 @@ BURST_REPEATS = 5
 BURST_TIMEOUT_SECONDS = 600
 
 
+# How long the tools get to exit after being asked to, before they are
+# killed outright.
+KILL_GRACE_SECONDS = 30
+
+
+def remove_bursts(corpus):
+    """Removes the modules a burst copied into a source corpus."""
+    source = f"{CORPUS}/{corpus}"
+    if not os.path.isdir(source):
+        return
+    for name in os.listdir(source):
+        if re.fullmatch(r"burst-[0-9]+", name):
+            path = os.path.join(source, name)
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path)
+            else:
+                os.unlink(path)
+
+
 def run_burst(cell, emitter, tool):
     """A burst of new files, several times: one top-level module of each
     corpus copied in beside the others, and the wall time until every
@@ -721,6 +791,8 @@ def run_burst(cell, emitter, tool):
         time.sleep(2)
     emitter.emit({"measurement": "burst", "tool": tool, "files_per_burst": files,
                   "walls_s": walls, "cycle_seconds": cycle_seconds or None})
+    for corpus in corpora:
+        remove_bursts(corpus)
 
 
 def run_workload(cell, emitter, tool, nonce):

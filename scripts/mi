@@ -209,7 +209,7 @@ narrate "rm -rf replica/*    # as if a mount vanished"
 rm -rf "${REPLICA:?}"/*
 pause_briefly 6
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
-narrate "# primary is untouched:"
+narrate "# the primary is untouched:"
 show find "$PRIMARY" -type f
 
 stop_supervisor

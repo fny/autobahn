@@ -51,7 +51,7 @@ Liveness configurations use `Flaky = FALSE`. After user activity and failures st
 
 A new leader adopts an ancestor copy if it is `later` than its local store. The implementation compares local write times because generation numbers become incomparable after lagging copies advance independently.
 
-The model sets aside copy paths that disagree with local content and reconciles them as new. Primary resumes leadership only after its copy catches up.
+The model sets aside copy paths that disagree with local content and reconciles them as new. The primary resumes leadership only after its copy catches up.
 
 `DisputedKept` checks preservation of local values disputed by adopted copies. `Peering_conflict_lies.cfg` allows one arbitrary copy from a buggy or dishonest partner and uses one edit to bound the larger state space.
 

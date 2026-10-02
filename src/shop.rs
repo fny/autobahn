@@ -777,7 +777,7 @@ impl Shop {
 /// sharpest case is a deletion: one side has the file and the other does
 /// not. Naming only the path leaves the reader to go and look.
 ///
-/// "ours" and "theirs" rather than primary and the destination's name,
+/// "ours" and "theirs" rather than the primary and the destination's name,
 /// because those are the words on the keys that settle it.
 fn sides(session: &SessionReport, path: &str) -> String {
     let Some(detail) = session

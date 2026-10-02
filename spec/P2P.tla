@@ -28,7 +28,7 @@
 (* where the copy disagrees with the host's own tree: forgotten, so the  *)
 (* next cycle reconciles it as new. (The implementation keeps the copy's *)
 (* record where the host's file changed since the copy was written; that *)
-(* only keeps an honest record the host has since moved past.) The primary *)
+(* only keeps an honest record the host has since moved past.) the primary *)
 (* takes the lead back only once its copy is level with the leader's.   *)
 (* With Lies, a partner may write any copy at all, a bounded number of   *)
 (* times: a buggy or dishonest leader. A session between two replicas       *)
@@ -217,7 +217,7 @@ Handoff ==
 (* Sessions *)
 
 \* In the primary mode, the configured primary's version wins wherever the
-\* primary is involved, whoever leads; between two replicas, the leader's does.
+\* the primary is involved, whoever leads; between two replicas, the leader's does.
 PrimarySide(c, h) == IF h = "primary" THEN "primary" ELSE c
 ReplicaSide(c, h) == IF h = "primary" THEN c ELSE h
 

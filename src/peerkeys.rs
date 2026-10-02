@@ -7,7 +7,7 @@
 //! 1. each replica makes a key pair of its own under its p2p directory and
 //!    hands back the public half, with its SSH host keys
 //!    ([`ensure_key`]); private keys never leave the host that made them;
-//! 2. each replica is given every *other* replica's public key, in a marked block
+//! 2. each replica is given every *other* the replica's public key, in a marked block
 //!    of its `~/.ssh/authorized_keys` that autobahn owns, each line forced
 //!    through the gate ([`crate::gate`]); a p2p `known_hosts` holding
 //!    the other replicas' host keys; and the gate itself ([`install_peers`]);

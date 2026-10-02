@@ -1177,7 +1177,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
 
     // The name is matched against each replica entry as the leader would
     // have spelled it in full: an entry without a path inherits the
-    // primary's, which is how the leader's plans named this host.
+    // the primary's, which is how the leader's plans named this host.
     let full = |entry: &str, primary: &str| -> String {
         let host_end = entry.find(':').unwrap_or(entry.len());
         if host_end < entry.len() {

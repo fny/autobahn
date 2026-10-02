@@ -366,8 +366,8 @@ fn replica_modification_semantics_by_mode() {
                 harness.assert_trees_equal("replica modification");
             }
             SyncMode::OneWaySafe => {
-                // The modification is preserved on replica (reported as a
-                // conflict) and never reaches primary.
+                // The modification is preserved on the replica (reported as a
+                // conflict) and never reaches the primary.
                 let replica_content = fs::read_to_string(harness.replica.join(path)).unwrap();
                 assert_eq!(replica_content, "modified on replica");
                 let primary_content = fs::read_to_string(harness.primary.join(path)).unwrap();
@@ -540,12 +540,12 @@ fn root_deletion_halts_for_safety() {
         SafetyHalt::RootDeletion | SafetyHalt::RootEmptied
     ));
 
-    // Replica must be untouched.
+    // The replica must be untouched.
     assert!(harness.replica.join("dir0/nested/file0.txt").exists());
 }
 
 /// M-33: the one-way modes built a deletion's expected old content from
-/// replica's raw scan, ignored entries included. The endpoint refused to
+/// the replica's raw scan, ignored entries included. The endpoint refused to
 /// remove the untracked `.git` it was told to expect, the directory
 /// survived, and the next cycle proposed the same deletion, forever.
 #[test]
@@ -860,7 +860,7 @@ impl Harness {
 }
 
 /// The change a cut or crashed cycle carries, and the oracle every
-/// recovery from one answers to. Primary holds a file to rewrite, one to
+/// recovery from one answers to. The primary holds a file to rewrite, one to
 /// delete, and one to replace with a directory; the change rewrites,
 /// creates, deletes and replaces them.
 struct CutScenario {
@@ -898,7 +898,7 @@ impl CutScenario {
         harness.assert_trees_equal("pre-cut convergence");
     }
 
-    /// The user's change on primary, which the next cycle carries.
+    /// The user's change on the primary, which the next cycle carries.
     fn change(&self, harness: &Harness) {
         fs::write(harness.primary.join("modify.txt"), &self.new_bytes).unwrap();
         fs::write(harness.primary.join("created.bin"), &self.created).unwrap();
@@ -985,7 +985,7 @@ impl CutScenario {
             if path == GONE.0 && !on_primary && !on_replica {
                 // An interrupted cycle drops the provenance of every path
                 // it announced, so the file replica still holds reads as a
-                // creation there and comes back to primary. Undoing a
+                // creation there and comes back to the primary. Undoing a
                 // deletion loses nothing; only the old bytes may return.
                 continue;
             }
@@ -1094,7 +1094,7 @@ fn the_cut_oracle_fails_a_rollback_of_the_latest_version() {
 }
 
 /// A restart inside the window the journal announces: the process dies
-/// after the intent is recorded — before replica's transition, after it, or
+/// after the intent is recorded — before the replica's transition, after it, or
 /// after every transition but before the achieved ancestor record — and
 /// a fresh session recovers over the same state. The same oracle as the
 /// cut sweep. The death is a panic out of the cycle hook, which unwinds
@@ -1313,11 +1313,11 @@ mod collisions {
         fs::read_to_string(root.join(PATH)).unwrap_or_else(|e| panic!("{}: {e}", root.display()))
     }
 
-    /// Primary's edit is on its way to replica; replica is edited after its scan
+    /// The primary's edit is on its way to the replica; the replica is edited after its scan
     /// and before the publish. The publish must refuse — the file on disk
     /// is not the one the transition was validated against — and the
     /// next cycle sees two edits of one file: a conflict in safe mode,
-    /// primary's version in resolved mode.
+    /// the primary's version in resolved mode.
     #[test]
     fn a_write_on_replica_before_its_publish_is_refused_not_overwritten() {
         for transport in BOTH {
@@ -1376,7 +1376,7 @@ mod collisions {
         }
     }
 
-    /// The mirror image: replica's edit is on its way to primary, and primary is
+    /// The mirror image: the replica's edit is on its way to the primary, and the primary is
     /// edited before the publish.
     #[test]
     fn a_write_on_primary_before_its_publish_is_refused_not_overwritten() {
@@ -1456,7 +1456,7 @@ mod collisions {
                     "{context}: halted: {error:#}"
                 );
             }
-            // Replica never holds content the ancestor would misdescribe:
+            // The replica never holds content the ancestor would misdescribe:
             // either the old version, or the new one, never a mix.
             let now = read(&harness.replica);
             assert!(
@@ -1476,10 +1476,10 @@ mod collisions {
         }
     }
 
-    /// Primary deleted the file; replica edits it before the deletion is
+    /// Primary deleted the file; the replica edits it before the deletion is
     /// applied. The deletion must be refused, and the edit then wins over
     /// the deletion — the reconciler's rule for a modification against a
-    /// deletion — landing back on primary.
+    /// deletion — landing back on the primary.
     #[test]
     fn a_write_on_replica_racing_a_deletion_keeps_the_edit() {
         for transport in BOTH {
@@ -1540,7 +1540,7 @@ mod collisions {
         root.join(path).exists()
     }
 
-    /// Primary turned the file into a directory; replica edits the file before
+    /// Primary turned the file into a directory; the replica edits the file before
     /// the replacement lands. The replacement is refused — the file is not
     /// the one validated against — and the next cycle sees a file edited
     /// on one side and replaced by a directory on the other: a conflict in
@@ -1598,10 +1598,10 @@ mod collisions {
         }
     }
 
-    /// The other way round: primary's edit is on its way, and replica turns the
+    /// The other way round: the primary's edit is on its way, and replica turns the
     /// file into a directory before it lands. The edit is refused — there
     /// is no file to replace — and the next cycle sees the same two-sided
-    /// change: a conflict, or primary's file back in place of the directory.
+    /// change: a conflict, or the primary's file back in place of the directory.
     #[test]
     fn a_file_replaced_by_a_directory_on_replica_while_primary_edits_it() {
         for transport in BOTH {
@@ -1655,9 +1655,9 @@ mod collisions {
     }
 
     /// Both sides create the same new name, primary as a directory and replica
-    /// as a file, replica's landing while primary's is on its way. The creation
+    /// as a file, the replica's landing while the primary's is on its way. The creation
     /// is refused — something is already there — and the next cycle sees
-    /// two creations: a conflict, or primary's directory.
+    /// two creations: a conflict, or the primary's directory.
     #[test]
     fn a_name_created_as_a_file_on_replica_while_primary_creates_a_directory() {
         const NEW: &str = "dir0/nested/fresh";
@@ -1712,9 +1712,9 @@ mod collisions {
     }
 
     /// Primary renamed the file — a deletion at the old name and a creation
-    /// at the new one — and replica edits the old name before the deletion
+    /// at the new one — and the replica edits the old name before the deletion
     /// lands. The deletion is refused, the creation goes through, and the
-    /// next cycle carries the edit back to primary: an edit against a
+    /// next cycle carries the edit back to the primary: an edit against a
     /// deletion keeps the edit. Both names end up on both sides.
     #[test]
     fn a_file_edited_on_replica_while_primary_renames_it() {
@@ -1759,7 +1759,7 @@ mod collisions {
 
                 harness.settle(&context);
                 if strict {
-                    // Primary's deletion is final: the rename stands, the
+                    // The primary's deletion is final: the rename stands, the
                     // edit is gone.
                     assert!(
                         !exists(&harness.primary, PATH),
@@ -1782,7 +1782,7 @@ mod collisions {
         }
     }
 
-    /// Primary's edit is on its way, and replica renames the file away before
+    /// The primary's edit is on its way, and the replica renames the file away before
     /// it lands. Whatever the racing cycle makes of a replacement with
     /// nothing to replace, the edit must end up under the old name on both
     /// sides and the renamed copy under the new one — no version of the
@@ -1831,12 +1831,12 @@ mod collisions {
         }
     }
 
-    /// Primary renamed a whole directory, and replica writes a new file into the
+    /// Primary renamed a whole directory, and the replica writes a new file into the
     /// old one before its removal lands. The removal is refused (the
     /// directory no longer holds what was validated), the new name arrives
     /// beside it, and the next cycle keeps the new file: a creation inside
     /// a directory the other side deleted wins over the deletion, which —
-    /// by the reconciler's rule — brings the whole directory back to primary.
+    /// by the reconciler's rule — brings the whole directory back to the primary.
     /// Nothing is lost; the rename is undone rather than the file.
     #[test]
     fn a_file_added_on_replica_inside_a_directory_primary_renames() {
@@ -1883,9 +1883,9 @@ mod collisions {
         }
     }
 
-    /// A write on replica right after primary's edit was published there. The
+    /// A write on the replica right after the primary's edit was published there. The
     /// cycle completes as a clean propagation; the write is a fresh replica
-    /// edit that the next cycle carries to primary — which is only true if
+    /// edit that the next cycle carries to the primary — which is only true if
     /// the endpoint re-announces the paths it just wrote, so the scan
     /// after does not adopt the tree it published.
     #[test]
@@ -1953,11 +1953,11 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_replica_scan() {
     }
     assert!(quiet, "the pair never went quiet");
 
-    // Primary's edit lands during a wait, not before one. Every wait ends
-    // with replica's watch request running out at the same moment, and its
+    // The primary's edit lands during a wait, not before one. Every wait ends
+    // with the replica's watch request running out at the same moment, and its
     // "nothing changed" answer arriving just after: from then until the
-    // next wait asks again, replica's watch is not standing, and a cycle
-    // rightly scans it. Edited a second into a wait, replica's request has
+    // next wait asks again, the replica's watch is not standing, and a cycle
+    // rightly scans it. Edited a second into a wait, the replica's request has
     // been renewed and has most of its time left when the cycle runs.
     let primary_file = harness.primary.join("dir0/nested/file0.txt");
     let editor = std::thread::spawn(move || {
@@ -1983,12 +1983,12 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_replica_scan() {
     assert_eq!(report.replica_transitions, 1);
     harness.assert_trees_equal("after the skipped scan");
 
-    // Replica changes: its watch answers, and a cycle scans it. Not always
-    // the very next one — a wake from primary's side, or a late event from
+    // The replica changes: its watch answers, and a cycle scans it. Not always
+    // the very next one — a wake from the primary's side, or a late event from
     // an earlier transition, can bring a cycle (even one that scans replica)
     // before the kernel has reported this edit; the watch fires moments
     // later and a cycle after carries it. Never lost, only late: so the
-    // test waits for the edit to land on primary, within a bound, and
+    // test waits for the edit to land on the primary, within a bound, and
     // separately requires that some cycle on the way scanned replica.
     const EDIT: &str = "dir1/nested/file1.txt";
     fs::write(harness.replica.join(EDIT), "edited on replica").unwrap();
@@ -2003,7 +2003,7 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_replica_scan() {
         if left.is_zero() {
             break;
         }
-        // A quiet wait is not a failure: the cycle after it reuses replica's
+        // A quiet wait is not a failure: the cycle after it reuses the replica's
         // snapshot, and the bound decides.
         session
             .await_change(left.min(std::time::Duration::from_secs(5)))
@@ -2084,7 +2084,7 @@ mod fan_out_races {
         })
     }
 
-    /// Both replicas edit the same file. The second session to reach primary
+    /// Both replicas edit the same file. The second session to reach the primary
     /// finds it already changed by the first and is refused; nothing is
     /// overwritten, and the pair is a conflict on its next cycle.
     #[test]
@@ -2133,8 +2133,8 @@ mod fan_out_races {
         }
     }
 
-    /// The replicas edit different files. Both land on primary, in either
-    /// order, and each replica then gets the other's through primary.
+    /// The replicas edit different files. Both land on the primary, in either
+    /// order, and each replica then gets the other's through the primary.
     #[test]
     fn two_replicas_edit_different_files_and_both_land() {
         for transport in BOTH {
@@ -2210,7 +2210,7 @@ mod fan_out_races {
 
             // Session 1 carries a primary edit to replica1; while its scans are
             // done and before it moves anything, session 2 lands replica2's
-            // edit of another file on primary.
+            // edit of another file on the primary.
             fs::write(harness.primary.join(PATH), "primary edit").unwrap();
             fs::write(replica2.join(OTHER), "from replica2").unwrap();
             look_again(&mut [&mut s1, &mut s2]);
@@ -2225,7 +2225,7 @@ mod fan_out_races {
             );
             assert_eq!(read(&harness.replica, PATH), "primary edit", "{context}");
 
-            // What session 2 landed on primary reaches replica1 on the cycles
+            // What session 2 landed on the primary reaches replica1 on the cycles
             // that follow, as the watcher reports it, and never as a
             // conflict. (Session 1's own writes may wake it first, so it
             // cycles on each wake until the edit arrives.)
@@ -2306,7 +2306,7 @@ mod unreadable_ancestor {
         harness.cycle_ok();
         damage(&harness);
         // A deletion the lost ancestor knew about: without it, the file on
-        // replica would look new and come back.
+        // the replica would look new and come back.
         fs::remove_file(harness.primary.join("dir0/nested/file0.txt")).unwrap();
 
         let error = harness.cycle().expect_err("differing sides must halt");

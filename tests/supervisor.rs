@@ -198,7 +198,7 @@ fn repeated_one_way_edits_keep_synchronizing_through_a_real_agent() {
     assert_eq!(read(&replica, "dir0/file0.txt"), "initial");
 
     // Round after round of one-directional edits: only primary changes, so
-    // replica's every scan after the first reports itself unchanged.
+    // the replica's every scan after the first reports itself unchanged.
     // Each round makes exactly one modification and one creation; the
     // created names lie outside the range the fixture already wrote.
     for round in 1..=5 {
@@ -383,7 +383,7 @@ fn per_group_modes_are_respected() {
     assert_eq!(status.state, "conflicts");
     assert_eq!(status.conflicts, vec!["shared.txt".to_owned()]);
 
-    // The same divergence under two-way-primary resolves in primary's favor
+    // The same divergence under two-way-primary resolves in the primary's favor
     // (a fresh state root gives the mode change a clean baseline).
     let resolved_world = World::new();
     let plans = resolved_world.plans(&configuration.replace("two-way-conflict", "two-way-primary"));
@@ -776,7 +776,7 @@ fn state_persists_across_supervisor_runs() {
     assert_all_synchronized(&world.run_once(plans.clone()));
     assert_eq!(read(&replica, "remove.txt"), "remove");
 
-    // Delete on primary, then run a *fresh* supervisor over the same state
+    // Delete on the primary, then run a *fresh* supervisor over the same state
     // root: only a persisted ancestor lets it see a deletion rather than a
     // one-sided file (which two-way-conflict would copy back).
     fs::remove_file(primary.join("remove.txt")).expect("file should be removable");
@@ -1495,7 +1495,7 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
             }),
             "the pause should be recorded"
         );
-        // Delete a synchronized file on primary while paused; nothing moves.
+        // Delete a synchronized file on the primary while paused; nothing moves.
         fs::remove_file(primary.join("second.txt")).expect("file should be removable");
         std::thread::sleep(Duration::from_millis(500));
         assert!(
@@ -1504,7 +1504,7 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
         );
 
         // Reset while paused, then resume: with the ancestor discarded, the
-        // deletion is forgotten and replica's copy flows back to primary.
+        // deletion is forgotten and the replica's copy flows back to the primary.
         let response = control::send(&world.state_root(), &ControlRequest::Reset(selector()))
             .expect("reset should send");
         assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
@@ -2243,7 +2243,7 @@ fn cli(world: &World, config: &Path, args: &[&str]) -> (bool, String) {
     (output.status.success(), text)
 }
 
-/// A fan-out in conflict three ways: one file edited differently on primary
+/// A fan-out in conflict three ways: one file edited differently on the primary
 /// and on each of two destinations.
 fn three_way_conflict(world: &World) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
     let primary = world.directory("primary");
@@ -2315,7 +2315,7 @@ fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
     let (config, primary, b1, b2) = three_way_conflict(&world);
     let b1_spec = b1.to_string_lossy().to_string();
     // Addressed by a path inside the root, and keeping b1's version: it
-    // must reach primary *and* b2, whose own conflict is settled by it.
+    // must reach the primary *and* b2, whose own conflict is settled by it.
     let file = primary.join("notes.txt").to_string_lossy().to_string();
     let (ok, text) = cli(
         &world,
@@ -2324,7 +2324,7 @@ fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
     );
     assert!(ok, "{text}");
     // Resolution retires the losing versions; the cycle carries the winner.
-    // Two cycles, because b2's copy reaches it through primary.
+    // Two cycles, because b2's copy reaches it through the primary.
     cli(&world, &config, &["sync"]);
     cli(&world, &config, &["sync"]);
     for root in [&primary, &b1, &b2] {
@@ -2348,7 +2348,7 @@ fn resolve_keeping_both_renames_the_loser_aside() {
     // the losing side and nothing has to be moved to preserve it.
     assert_eq!(read(&b1, "notes.txt.b1"), "v-b1");
     assert_eq!(read(&b2, "notes.txt.b2"), "v-b2");
-    // Everything else is ordinary propagation: primary's version fills the
+    // Everything else is ordinary propagation: the primary's version fills the
     // names the renames vacated, and each aside reaches the other roots.
     cli(&world, &config, &["sync"]);
     cli(&world, &config, &["sync"]);
@@ -2589,7 +2589,7 @@ fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
         cli(&world, &config, &["sync"]);
     }
 
-    // Primary's version won everywhere, and the loser's tree went whole —
+    // The primary's version won everywhere, and the loser's tree went whole —
     // resolution follows the same rule the cycle does, so a `.git` inside
     // the losing version is no more of an obstacle here than there.
     assert_eq!(read(&primary, "project"), "primary's file");
@@ -2621,7 +2621,7 @@ fn one_pair(world: &World, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
 }
 
 /// Resolving a path both sides already agree on retires nothing. Before
-/// the guard it retired replica's copy, and the next cycle read that as a
+/// the guard it retired the replica's copy, and the next cycle read that as a
 /// deletion against an unchanged primary and took the file from both sides.
 #[test]
 fn resolving_an_in_sync_path_twice_keeps_it_everywhere() {
@@ -2704,8 +2704,8 @@ fn keeping_an_unchanged_side_makes_every_side_match_it() {
     }
 }
 
-/// A one-way mode never carries replica's content to primary, so retiring
-/// primary's copy cannot make replica's version win.
+/// A one-way mode never carries the replica's content to the primary, so retiring
+/// the primary's copy cannot make the replica's version win.
 #[test]
 fn keeping_replica_in_a_one_way_mode_is_refused() {
     let world = World::new();
@@ -2723,9 +2723,9 @@ fn keeping_replica_in_a_one_way_mode_is_refused() {
     assert_eq!(read(&replica, "keep.txt"), "original");
 }
 
-/// In two-way-primary-strict primary's deletion beats replica's edit, so stage 1
-/// refused to keep replica there. With the path forgotten, replica's version is
-/// a creation, which flows to primary in that mode like any other.
+/// In two-way-primary-strict the primary's deletion beats the replica's edit, so stage 1
+/// refused to keep replica there. With the path forgotten, the replica's version is
+/// a creation, which flows to the primary in that mode like any other.
 #[test]
 fn keeping_replica_in_the_strict_mode_wins() {
     let world = World::new();
@@ -2818,8 +2818,8 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
         _ => assert!(text.contains("settled 1 of 1"), "{label}: {text}"),
     }
 
-    // The loser's version, kept aside, reaches primary too — except in the
-    // one mode that never carries replica's additions.
+    // The loser's version, kept aside, reaches the primary too — except in the
+    // one mode that never carries the replica's additions.
     let aside_roots: Vec<&PathBuf> = match mode {
         "one-way-conflict" => vec![&replica],
         _ => vec![&primary, &replica],
@@ -2942,7 +2942,7 @@ fn keeping_an_unchanged_destination_reaches_every_other_one() {
     );
     assert!(ok, "{text}");
     assert!(text.contains("settled 1 of 1"), "{text}");
-    // Two cycles to reach b2 through primary, then one more to be sure.
+    // Two cycles to reach b2 through the primary, then one more to be sure.
     for _ in 0..3 {
         assert!(cli(&world, &config, &["sync"]).0);
     }
@@ -3179,9 +3179,9 @@ fn no_color_on_a_terminal_takes_the_colour_away() {
     assert!(plain.contains("\x1b[1m"), "{plain:?}");
 }
 
-/// Keeping one destination's version where primary has no copy at all:
-/// primary's side has nothing to retire, and the other destination must
-/// still be checked as though primary already holds the winner's version,
+/// Keeping one destination's version where the primary has no copy at all:
+/// the primary's side has nothing to retire, and the other destination must
+/// still be checked as though the primary already holds the winner's version,
 /// which is what it will hold once the winning session has run.
 #[test]
 fn keeping_a_destination_where_primary_has_no_copy_settles_the_fan_out() {
@@ -3354,7 +3354,7 @@ fn a_supervised_session_reports_what_it_is_doing() {
         // These are what a later scan is measured against; without them
         // there is no honest estimate, only elapsed time. Waited for, not
         // read at once: the session can be caught waiting right after the
-        // cycle that filled replica, before any scan of replica since — its total
+        // cycle that filled replica, before any scan of the replica since — its total
         // is then the empty root it first saw, until the next cycle (a
         // heartbeat, at most a second here) scans it again.
         let totals = || {
@@ -3793,7 +3793,7 @@ fn the_primary_gives_each_replica_the_others_keys_through_the_gate() {
 }
 
 /// While the primary follows, its plain groups keep running: they are the
-/// primary's alone, whoever leads the star. Only its p2p sessions wait
+/// the primary's alone, whoever leads the star. Only its p2p sessions wait
 /// for the lead to come back.
 #[test]
 fn plain_groups_keep_running_while_the_primary_follows() {

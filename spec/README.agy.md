@@ -10,7 +10,7 @@ Autobahn formally models its synchronization invariants and failover peering pro
 Models state transitions over hierarchical filesystem paths across one Primary and multiple Replicas:
 - Preserves well-formed trees under all concurrent operations.
 - Validates non-destructive reconciliation under `two-way-conflict`.
-- Proves Primary precedence under `two-way-primary` and `two-way-primary-strict`.
+- Proves the primary's precedence under `two-way-primary` and `two-way-primary-strict`.
 - Verifies system convergence once external modifications cease.
 
 ### 2. Peering & Automated Failover (`Peering.tla`)

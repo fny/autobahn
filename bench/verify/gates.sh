@@ -44,7 +44,7 @@ kill -0 "$AUTOBAHN" 2>/dev/null \
 # A pre-seeded destination matches immediately, so a manifest comparison
 # proves nothing about whether the session is running yet. Wait for the
 # session itself: one completed reconcile, then a canary edit that actually
-# lands on replica. The first cycle over 505k entries scans both sides, walks
+# lands on the replica. The first cycle over 505k entries scans both sides, walks
 # the whole tree, and writes the initial ancestor, which takes minutes.
 # A completed cycle announces itself; the sharing probe this used to wait
 # on was removed once it had answered its question.

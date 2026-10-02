@@ -4,15 +4,15 @@ Autobahn is designed around formal correctness invariants to prevent silent data
 
 ## Core Principles: Three-Way Reconciliation
 
-Two filesystem endpoints cannot determine provenance in isolation. If Primary holds version $A$ and Replica holds version $B$, neither endpoint can tell which side was updated and which side is stale.
+Two filesystem endpoints cannot determine provenance in isolation. If the primary holds version $A$ and the replica holds version $B$, neither endpoint can tell which side was updated and which side is stale.
 
 Autobahn maintains a third artifact: the **Ancestor Baseline**, which records the last mutually agreed state. Changes are evaluated against this ancestor:
 
 | Primary vs. Ancestor | Replica vs. Ancestor | Reconciliation Action (`two-way-conflict`) |
 | :--- | :--- | :--- |
 | Unchanged | Unchanged | No operation. |
-| Modified | Unchanged | Propagate Primary modification to Replica. |
-| Unchanged | Modified | Propagate Replica modification to Primary. |
+| Modified | Unchanged | Propagate the primary's modification to the replica. |
+| Unchanged | Modified | Propagate the replica's modification to the primary. |
 | Modified | Modified | **Conflict detected:** Propagation pauses on path; both versions preserved. |
 
 This three-way model allows Autobahn to differentiate intentional deletions from files that never existed, ensuring deletions are never propagated without historical proof.

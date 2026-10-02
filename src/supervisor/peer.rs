@@ -370,7 +370,7 @@ fn greet(
 ///
 /// One supervisor runs throughout. While it follows, its p2p sessions
 /// wait for the lead and its plain groups keep running: they are the
-/// primary's alone, whoever leads the star.
+/// the primary's alone, whoever leads the star.
 #[allow(clippy::too_many_arguments)]
 pub fn run_primary(
     config_path: &Path,
@@ -472,7 +472,7 @@ fn primary_roles(
         }
         // The lease says whether the lead came back. A stale lease from a
         // replica that died is taken over as a replica would take it — the
-        // primary is the head of the order, so it waits only the configured
+        // the primary is the head of the order, so it waits only the configured
         // time.
         let now = p2p::now_seconds();
         match p2p::read_lease(directory)? {

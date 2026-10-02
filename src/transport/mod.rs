@@ -498,7 +498,7 @@ struct ChannelLimits {
 /// runs its own agent for it over that connection. So the leader chooses
 /// only which of the primary's p2p sessions a channel is for. What the
 /// endpoint is — its root, ignores, modes, owners and staging — is the
-/// primary's own configuration for that session, whatever the leader asked
+/// the primary's own configuration for that session, whatever the leader asked
 /// for; a session the primary does not run is refused, and so is a channel
 /// past what its sessions need.
 pub struct AttachPolicy {

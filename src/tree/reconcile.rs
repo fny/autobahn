@@ -16,11 +16,11 @@ pub struct Reconciliation {
     /// Changes to apply to the ancestor (beyond those implied by successful
     /// transitions).
     pub ancestor_changes: Vec<Change>,
-    /// Transitions to perform on primary.
+    /// Transitions to perform on the primary.
     pub primary_transitions: Vec<Change>,
-    /// Transitions to perform on replica.
+    /// Transitions to perform on the replica.
     pub replica_transitions: Vec<Change>,
-    /// Conflicts between primary and replica.
+    /// Conflicts between the primary and replica.
     pub conflicts: Vec<Conflict>,
 }
 
@@ -667,10 +667,10 @@ impl<'m> Reconciler<'m> {
             }
             return;
         } else if primary_non_deletion.is_empty() {
-            // Primary only deleted here, and replica edited or added. The edit
+            // The primary only deleted here, and the replica edited or added. The edit
             // wins: a deletion carries nothing to weigh against it, and
             // letting it win would destroy the only copy. In the strict
-            // mode primary's deletion is final, and replica is made to match.
+            // mode the primary's deletion is final, and the replica is made to match.
             if self.policy.mode == SyncMode::TwoWayStrict {
                 let replica_unsynchronizable = blocking(
                     path,
@@ -716,7 +716,7 @@ impl<'m> Reconciler<'m> {
         }
 
         // Both sides have non-deletion changes: conflict, or forced
-        // resolution in primary's favor in resolved mode.
+        // resolution in the primary's favor in resolved mode.
         if self.policy.mode == SyncMode::TwoWaySafe {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
@@ -753,8 +753,8 @@ impl<'m> Reconciler<'m> {
         primary: Option<&Node>,
         replica: Option<&Node>,
     ) {
-        // If replica's synchronizable portion is unmodified or purely deleted,
-        // overwrite it with primary's content (unless replica carries
+        // If the replica's synchronizable portion is unmodified or purely deleted,
+        // overwrite it with the primary's content (unless the replica carries
         // unsynchronizable content, which indicates a conflict, reported
         // with a synthetic primary change).
         let replica_sync = synchronized(replica);
@@ -787,9 +787,9 @@ impl<'m> Reconciler<'m> {
             return;
         }
 
-        // Replica has non-deletion changes. If primary is nil or untracked, and
+        // The replica has non-deletion changes. If primary is nil or untracked, and
         // it's not the case that both the ancestor and replica are directories,
-        // then nil out the ancestor and leave replica's content in place (the
+        // then nil out the ancestor and leave the replica's content in place (the
         // core of one-way-conflict semantics: replica-side creations and
         // modifications survive).
         let ancestor_is_directory =
@@ -829,7 +829,7 @@ impl<'m> Reconciler<'m> {
         replica: Option<&Node>,
     ) {
         // Primary carrying untracked content cannot be mirrored — and must
-        // not read as "nothing", which would delete replica's copy of content
+        // not read as "nothing", which would delete the replica's copy of content
         // that synchronization merely excludes (an oversized file, say).
         // It surfaces as a conflict, matching the treatment of replica-side
         // content that mirroring can't remove.
@@ -852,8 +852,8 @@ impl<'m> Reconciler<'m> {
             return;
         }
 
-        // Exact mirroring: overwrite replica with primary's synchronizable
-        // content, unless replica carries unsynchronizable content (which can't
+        // Exact mirroring: overwrite replica with the primary's synchronizable
+        // content, unless the replica carries unsynchronizable content (which can't
         // be removed), in which case indicate a conflict.
         let replica_sync = synchronized(replica);
         let replica_unsynchronizable = blocking(
@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(result.replica_transitions.len(), 1, "{result:?}");
         assert!(
             result.replica_transitions[0].new.is_none(),
-            "the deletion must propagate to replica, not resurrect"
+            "the deletion must propagate to the replica, not resurrect"
         );
     }
 
@@ -1290,7 +1290,7 @@ mod tests {
         );
         assert!(mirror.primary_transitions.is_empty());
         assert_eq!(mirror.replica_transitions.len(), 1);
-        // The mirror overwrites the replica modification with primary content.
+        // The mirror overwrites the replica modification with the primary content.
         assert!(mirror.replica_transitions[0]
             .new
             .as_ref()
@@ -1348,14 +1348,14 @@ mod tests {
         let ancestor = dir("", vec![file("a", 1, false), file("b", 1, false)]);
         let primary = dir("", vec![file("b", 1, false)]);
         let replica = dir("", vec![file("a", 2, false), file("b", 1, false)]);
-        // Every other two-way mode brings the edit back to primary.
+        // Every other two-way mode brings the edit back to the primary.
         for mode in [SyncMode::TwoWaySafe, SyncMode::TwoWayResolved] {
             let result = reconcile(Some(&ancestor), Some(&primary), Some(&replica), mode);
             assert!(result.conflicts.is_empty(), "{mode:?}");
             assert_eq!(result.primary_transitions.len(), 1, "{mode:?}");
             assert!(result.replica_transitions.is_empty(), "{mode:?}");
         }
-        // Strict removes it from replica.
+        // Strict removes it from the replica.
         let result = reconcile(
             Some(&ancestor),
             Some(&primary),
@@ -1367,7 +1367,7 @@ mod tests {
         assert_eq!(result.replica_transitions.len(), 1);
         assert_eq!(result.replica_transitions[0].path, "a");
         assert!(result.replica_transitions[0].new.is_none());
-        // And still carries a replica addition to primary, as any two-way mode.
+        // And still carries a replica addition to the primary, as any two-way mode.
         let replica = dir("", vec![file("b", 1, false), file("c", 5, false)]);
         let result = reconcile(
             Some(&ancestor),
@@ -1381,9 +1381,9 @@ mod tests {
 
     /// The row of `docs/modes.md`'s table for "primary deletes a file replica
     /// edited", one assertion per cell. The one-way modes never write to
-    /// primary, so in `one-way-conflict` replica's edit stays on replica and
-    /// synchronization forgets the file, as if replica had created it; it is
-    /// not reported, since there is nothing of primary's to overwrite it.
+    /// primary, so in `one-way-conflict` the replica's edit stays on the replica and
+    /// synchronization forgets the file, as if the replica had created it; it is
+    /// not reported, since there is nothing of the primary's to overwrite it.
     #[test]
     fn primary_deleting_a_file_replica_edited_matches_the_modes_table() {
         let ancestor = dir("", vec![file("a", 1, false), file("b", 1, false)]);
@@ -1408,16 +1408,16 @@ mod tests {
                 && result.replica_transitions[0].new.is_none()
         };
 
-        // two-way-conflict: replica's edit comes back to primary.
+        // two-way-conflict: the replica's edit comes back to the primary.
         let result = run(SyncMode::TwoWaySafe);
         assert!(restores_to_primary(&result), "{result:?}");
-        // two-way-primary: replica's edit comes back to primary.
+        // two-way-primary: the replica's edit comes back to the primary.
         let result = run(SyncMode::TwoWayResolved);
         assert!(restores_to_primary(&result), "{result:?}");
-        // two-way-primary-strict: deleted on replica too.
+        // two-way-primary-strict: deleted on the replica too.
         let result = run(SyncMode::TwoWayStrict);
         assert!(deletes_on_replica(&result), "{result:?}");
-        // one-way-conflict: replica's edit stays on replica, unreported, and the
+        // one-way-conflict: the replica's edit stays on the replica, unreported, and the
         // ancestor forgets the file.
         let result = run(SyncMode::OneWaySafe);
         assert!(result.conflicts.is_empty(), "{result:?}");
@@ -1426,14 +1426,14 @@ mod tests {
         assert_eq!(result.ancestor_changes.len(), 1, "{result:?}");
         assert_eq!(result.ancestor_changes[0].path, "a");
         assert!(result.ancestor_changes[0].new.is_none());
-        // one-way-primary: deleted on replica too.
+        // one-way-primary: deleted on the replica too.
         let result = run(SyncMode::OneWayMirror);
         assert!(deletes_on_replica(&result), "{result:?}");
     }
 
     #[test]
     fn deletion_versus_modification_repropagates_content() {
-        // Primary deleted a file; replica modified it: the modification wins on
+        // The primary deleted a file; replica modified it: the modification wins on
         // both sides (deletion is the losing side of the conflict).
         let ancestor = dir("", vec![file("a", 1, false)]);
         let primary = dir("", vec![]);
@@ -1475,7 +1475,7 @@ mod tests {
     /// `ignore` mode — is a change reconciliation cannot see, and it
     /// blocks the deletion of the directory around it. Reproduced before
     /// the fix in `two-way-conflict`: primary grew `d/a` past the limit, replica
-    /// deleted `d`, and the "both purely deletions" branch deleted primary's
+    /// deleted `d`, and the "both purely deletions" branch deleted the primary's
     /// edited file.
     #[test]
     fn an_entry_excluded_since_the_ancestor_blocks_the_deletion_around_it() {
@@ -1511,7 +1511,7 @@ mod tests {
             );
         }
         // Primary excluded `a`, replica deleted `d`: a conflict in the two-way
-        // modes, and primary is never touched.
+        // modes, and the primary is never touched.
         for mode in MODES {
             let result = reconcile(Some(&ancestor), Some(&excluded), Some(&deleted), mode);
             assert!(
@@ -1769,7 +1769,7 @@ mod tests {
     /// Whatever a side holds that the ancestor does not vouch for — an
     /// edit, a creation, an entry turned untracked — survives on that side
     /// or stands under a conflict. The exceptions are the modes' own
-    /// policy: primary overwrites replica's synchronizable content in the
+    /// policy: primary overwrites the replica's synchronizable content in the
     /// primary-wins modes, and an ignored entry the ancestor never held goes
     /// with a directory deleted around it (`docs/ignores.md`; which of
     /// those the endpoint may really remove is its own decision).
@@ -1777,7 +1777,7 @@ mod tests {
     /// And every synchronizable change a side made reaches the other side
     /// or stands under a conflict, unless the other side holds untracked
     /// content there (which neither offers nor receives changes) or the
-    /// change is replica's in a one-way mode, where replica's changes stay put.
+    /// change is the replica's in a one-way mode, where the replica's changes stay put.
     fn silent_losses(
         mode: SyncMode,
         ancestor: Option<&Node>,
@@ -2041,7 +2041,7 @@ mod tests {
             }
         }
 
-        /// The one-way modes never write to primary, whatever they see.
+        /// The one-way modes never write to the primary, whatever they see.
         #[test]
         fn one_way_modes_never_touch_primary(
             ancestor_spec in instructions(),

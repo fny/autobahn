@@ -99,9 +99,9 @@ pub struct Unsynchronizable {
 pub struct ConflictDetail {
     /// The root-relative path.
     pub path: String,
-    /// Primary's side.
+    /// The primary's side.
     pub primary: ConflictSide,
-    /// Replica's side.
+    /// The replica's side.
     pub replica: ConflictSide,
 }
 
@@ -123,9 +123,9 @@ pub struct SessionStatus {
     /// The number of cycles completed since the supervisor started this
     /// session.
     pub cycles: u64,
-    /// The transitions applied to primary and replica by the most recent cycle.
+    /// The transitions applied to the primary and replica by the most recent cycle.
     pub last_primary_transitions: usize,
-    /// The transitions applied to replica by the most recent cycle.
+    /// The transitions applied to the replica by the most recent cycle.
     pub last_replica_transitions: usize,
     /// The root paths of any conflicts reported by the most recent cycle.
     pub conflicts: Vec<String>,
@@ -146,12 +146,12 @@ pub struct SessionStatus {
     pub error: Option<String>,
     /// When this status was recorded, in seconds since the Unix epoch.
     pub updated_at: u64,
-    /// The entry count primary's last completed scan reported, which is what
+    /// The entry count the primary's last completed scan reported, which is what
     /// the next run's first scan is measured against for an estimate.
     /// Absent in records written before this field existed.
     #[serde(default)]
     pub primary_entries: u64,
-    /// The entry count replica's last completed scan reported.
+    /// The entry count the replica's last completed scan reported.
     #[serde(default)]
     pub replica_entries: u64,
     /// Files and bytes moved over the session's life, carried across
@@ -188,9 +188,9 @@ pub struct SessionOutcome {
 pub struct CycleDigest {
     /// The number of cycles run.
     pub cycles: u64,
-    /// The total transitions applied to primary.
+    /// The total transitions applied to the primary.
     pub primary_transitions: usize,
-    /// The total transitions applied to replica.
+    /// The total transitions applied to the replica.
     pub replica_transitions: usize,
     /// The number of conflicts reported by the final cycle.
     pub conflicts: usize,
@@ -536,7 +536,7 @@ impl P2pContext {
     }
 
     /// Steps down: another controller holds `current` on some host. The
-    /// primary's own lease file records it too, so a restart does not come
+    /// the primary's own lease file records it too, so a restart does not come
     /// back leading.
     fn step_down(&self, current: &crate::p2p::Lease) {
         let mut role = self
@@ -1760,7 +1760,7 @@ impl<'a> Worker<'a> {
     }
 
     /// P2P, with `manage_keys`, as the primary: learns this session's
-    /// replica's keys, and gives it every other replica's, forced through the
+    /// the replica's keys, and gives it every other replica's, forced through the
     /// gate, whenever what it should hold changes. Best effort: a failure
     /// is said once and costs nothing but the keys.
     fn manage_keys(&mut self) {
@@ -4488,7 +4488,7 @@ mod tests {
                 .recv_timeout(Duration::from_secs(20))
                 .expect("a cycle starts");
 
-            // Replica's copy as `resolve` reads it.
+            // The replica's copy as `resolve` reads it.
             let pool = AgentPool::default();
             let (_, mut reader) = open_endpoints(&plan, &state, &pool).expect("endpoints open");
             let root = reader.scan().expect("replica scans").root;
@@ -4545,7 +4545,7 @@ mod tests {
                             == Some("primary's edit")
                     })
                 })),
-                "the kept version reaches replica"
+                "the kept version reaches the replica"
             );
             stop.store(true, Ordering::Relaxed);
             watcher

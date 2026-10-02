@@ -4422,14 +4422,14 @@ mod tests {
         }
 
         /// Scans both endpoints and returns the changes that would bring replica
-        /// into agreement with primary.
+        /// into agreement with the primary.
         fn replica_transitions(&mut self) -> Vec<Change> {
             let primary = self.primary.scan().expect("primary scan should succeed");
             let replica = self.replica.scan().expect("replica scan should succeed");
             diff(replica.root.as_ref(), primary.root.as_ref())
         }
 
-        /// Drives a complete staging exchange from primary into replica, exactly
+        /// Drives a complete staging exchange from the primary into the replica, exactly
         /// as the session controller does (with a deliberately small batch
         /// size, so that per-file buffers are drained across several pulls).
         fn stage(&mut self, transitions: &[Change]) -> Vec<StagingNeed> {
@@ -5033,7 +5033,7 @@ mod tests {
 
         let transitions = fixture.replica_transitions();
         let needs = fixture.stage(&transitions);
-        // Every file needs transferring: replica is empty, so nothing can be
+        // Every file needs transferring: the replica is empty, so nothing can be
         // satisfied locally. (The empty file is a need too, and arrives as a
         // bare end-of-file frame.)
         assert_eq!(needs.len(), 4);
@@ -5063,7 +5063,7 @@ mod tests {
         );
         assert!(fixture.replica_root.join("empty").is_dir());
 
-        // A rescan of replica agrees with primary's hierarchy, and a further
+        // A rescan of the replica agrees with the primary's hierarchy, and a further
         // reconciliation has nothing left to do.
         let further = fixture.replica_transitions();
         assert!(further.is_empty(), "{further:?}");
@@ -5168,8 +5168,8 @@ mod tests {
             .replica
             .stage_begin(requests)
             .expect("staging should begin");
-        // The content already exists in replica's root, so nothing is needed
-        // from primary at all.
+        // The content already exists in the replica's root, so nothing is needed
+        // from the primary at all.
         assert!(needs.is_empty(), "{needs:?}");
         assert!(fixture.replica.staged_path(&digest).exists());
 
@@ -6103,7 +6103,7 @@ mod tests {
         let fixture = Fixture::new();
         fs::write(fixture.primary_root.join("wanted.txt"), b"wanted").unwrap();
         fs::write(fixture.primary_root.join("held.txt"), b"held").unwrap();
-        // Replica already holds `held`, so it will decline that digest.
+        // The replica already holds `held`, so it will decline that digest.
         fs::write(fixture.replica_root.join("held.txt"), b"held").unwrap();
         let mut primary = fixture.primary;
         let mut replica = fixture.replica;
@@ -6154,7 +6154,7 @@ mod tests {
         replica.stage_finish().unwrap();
 
         // `wanted` landed from the stream; `held` was never needed and its
-        // unrequested copy went nowhere — replica's own is untouched.
+        // unrequested copy went nowhere — the replica's own is untouched.
         let outcome = replica
             .transition(vec![Change {
                 path: "wanted.txt".into(),
@@ -6250,8 +6250,8 @@ mod tests {
             .expect("the converge transition applies");
 
         // The change the racing scan will straddle. The write is announced
-        // to primary's observer the way any writer in the tool would: without
-        // the announcement, this scan can legitimately serve primary's
+        // to the primary's observer the way any writer in the tool would: without
+        // the announcement, this scan can legitimately serve the primary's
         // published snapshot while the kernel's event is still in flight,
         // the diff comes back empty, and the test races itself instead of
         // the transition.
@@ -8014,8 +8014,8 @@ mod supply_receive_tests {
     }
 
     impl Pair {
-        /// Scans both sides and begins staging replica's requests for every
-        /// file primary holds, opening primary's supply of what replica needs.
+        /// Scans both sides and begins staging the replica's requests for every
+        /// file primary holds, opening the primary's supply of what replica needs.
         fn begin(&mut self) -> Vec<StagingNeed> {
             let primary = self.primary.scan().expect("scan should succeed");
             let replica = self.replica.scan().expect("scan should succeed");
@@ -8238,7 +8238,7 @@ mod supply_receive_tests {
         let needs = pair.begin();
         assert_eq!(needs.len(), 3);
         assert!(needs.iter().all(|need| !need.signature.is_empty()));
-        // Replica's base for two.bin goes short after its signature was taken.
+        // The replica's base for two.bin goes short after its signature was taken.
         File::options()
             .write(true)
             .open(pair.replica_root.join("two.bin"))

@@ -680,7 +680,7 @@ mod tests {
     #[test]
     fn a_side_without_a_history_borrows_its_peers_total() {
         let progress = Progress::default();
-        // Replica has finished a full scan before; primary never has.
+        // The replica has finished a full scan before; the primary never has.
         progress.replica.end(Some(1_000));
         progress.primary.begin(true);
         let snapshot = progress.snapshot();
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn a_total_a_running_scan_has_passed_is_not_reported() {
         let progress = Progress::default();
-        // Replica has only ever scanned an empty tree; primary, scanning a real
+        // The replica has only ever scanned an empty tree; primary, scanning a real
         // one, would otherwise be shown as "30,000 of ~1 entries".
         progress.replica.end(Some(1));
         progress.primary.begin(true);
@@ -790,7 +790,7 @@ mod tests {
             side.since
                 .store(now_millis().saturating_sub(10_000), Ordering::Relaxed);
         }
-        // Primary is half done (10s left); replica a quarter (30s left).
+        // The primary is half done (10s left); replica a quarter (30s left).
         progress.primary.advance(5_000, 0);
         progress.replica.advance(2_500, 0);
         let snapshot = progress.snapshot();
@@ -799,7 +799,7 @@ mod tests {
         assert_eq!(snapshot.remaining_seconds, Some(30));
 
         // A side that cannot be estimated makes the phase unknowable
-        // rather than shorter: reporting primary's ten seconds while replica
+        // rather than shorter: reporting the primary's ten seconds while replica
         // has an unknown number left would be a promise, not an estimate.
         progress.replica.begin(false);
         assert_eq!(progress.snapshot().remaining_seconds, None);

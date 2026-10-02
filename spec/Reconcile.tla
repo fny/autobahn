@@ -59,14 +59,14 @@ Kept(a, t, q) == Changed(a, t, q) \ Removed(a, t, q)
 \* "conflict" for neither. The reconciler's handle_disagreement, for the
 \* two-way modes.
 Decide(a, x, y, q) ==
-    IF Changed(a, y, q) = {} THEN "primary"          \* replica untouched: primary's
-    ELSE IF Changed(a, x, q) = {} THEN "replica"      \* primary untouched: replica's
+    IF Changed(a, y, q) = {} THEN "primary"          \* replica untouched: the primary's
+    ELSE IF Changed(a, x, q) = {} THEN "replica"      \* primary untouched: the replica's
     ELSE IF Kept(a, x, q) = {} /\ Kept(a, y, q) = {} THEN
         \* both only removed: the union of the removals — whichever side
         \* is gone at the top of the unit is what the other side becomes
         IF x[q] = NoFile THEN "primary" ELSE "replica"
-    ELSE IF Kept(a, y, q) = {} THEN "primary"        \* replica only removed
-    ELSE IF Kept(a, x, q) = {} THEN                \* primary only removed
+    ELSE IF Kept(a, y, q) = {} THEN "primary"        \* the replica only removed
+    ELSE IF Kept(a, x, q) = {} THEN                \* the primary only removed
         IF Mode = "strict" THEN "primary" ELSE "replica"
     ELSE IF Mode = "conflict" THEN "conflict" ELSE "primary"
 

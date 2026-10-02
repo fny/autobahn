@@ -139,18 +139,18 @@ enum ModeArgument {
     /// reported and left alone.
     #[value(name = "two-way-conflict")]
     TwoWaySafe,
-    /// Both directions; a file changed on both sides takes primary's
+    /// Both directions; a file changed on both sides takes the primary's
     /// version, silently.
     #[value(name = "two-way-primary")]
     TwoWayResolved,
-    /// two-way-primary, and primary's deletion of a file replica edited wins too.
+    /// two-way-primary, and the primary's deletion of a file replica edited wins too.
     #[value(name = "two-way-primary-strict")]
     TwoWayStrict,
-    /// Primary to replica; a change replica made itself is kept and reported as a
+    /// Primary to the replica; a change replica made itself is kept and reported as a
     /// conflict.
     #[value(name = "one-way-conflict")]
     OneWaySafe,
-    /// Primary to replica; replica becomes an exact copy, its own changes
+    /// Primary to the replica; the replica becomes an exact copy, its own changes
     /// discarded.
     #[value(name = "one-way-primary", alias = "mirror")]
     OneWayMirror,
@@ -316,7 +316,7 @@ enum Command {
     /// Resolve conflicts by choosing which side's version wins.
     ///
     /// The winner is named by what `status` calls it: `primary`, or a
-    /// destination's host (or local path). Its content is put on primary and
+    /// destination's host (or local path). Its content is put on the primary and
     /// every other destination, so one command settles a conflict across
     /// a whole fan-out. `both` keeps the winner in place and renames the
     /// other side's version aside as `<name>.<side>` before propagating.
@@ -1842,7 +1842,7 @@ fn run_watch(
                 // P2P, when any group asks for it. This machine is the
                 // configured primary of every such group (the configuration
                 // says so), so it leads — unless its own lease file says a
-                // replica led while it was away.
+                // the replica led while it was away.
                 let p2p = loaded.plans.iter().any(|plan| plan.p2p.is_some());
                 if p2p {
                     autobahn::supervisor::peer::run_primary(
@@ -2784,7 +2784,7 @@ fn run_diff(
         let a = primary.read_file(&path)?;
         let b = replica.read_file(&path)?;
         if a == b {
-            println!("{}: identical on primary and {}", path, plan.host);
+            println!("{}: identical on the primary and {}", path, plan.host);
             continue;
         }
         // Both sides go into a private directory of their own under the
@@ -3266,17 +3266,17 @@ fn run_resolve(
 
     // Which side of each session loses. The winner keeps its version
     // untouched; every other copy in the group is retired, including
-    // primary's when a destination wins, since primary is how the winning
+    // the primary's when a destination wins, since the primary is how the winning
     // content reaches the group's other destinations.
     //
-    // Primary wins (or both sides are kept, in which case primary's copy stays
-    // put and replica's moves aside): only each replica loses. A destination
-    // wins, so primary loses — and primary is retired *there*, on the winning
+    // The primary wins (or both sides are kept, in which case the primary's copy stays
+    // put and the replica's moves aside): only each replica loses. A destination
+    // wins, so the primary loses — and the primary is retired *there*, on the winning
     // session, for two reasons. Every session opens its own handle on
     // primary, so the retirement has to happen through exactly one of them;
     // and that is the session that will carry the winning content back to
     // primary, from which the group's other destinations then take it. Every
-    // other destination loses too: its copy and primary's both go, the pair
+    // other destination loses too: its copy and the primary's both go, the pair
     // reads as a deletion on both sides, which clears the ancestor entry,
     // and the winner's content then arrives as ordinary new content.
     struct Loser {
@@ -3316,9 +3316,9 @@ fn run_resolve(
             Winner::Replica(w) if w == index => (true, "primary".to_owned()),
             _ => (false, plan.host.clone()),
         };
-        // When primary's version or both are kept, only paths that conflict
+        // When the primary's version or both are kept, only paths that conflict
         // on this session are touched. When a destination's is, every side
-        // of the group is: primary's copy must go for the winning content to
+        // of the group is: the primary's copy must go for the winning content to
         // reach it, and every other destination's ancestor forgets the
         // path, so whatever it holds there that differs goes too, or the
         // winner would arrive there as a conflict.
@@ -3449,7 +3449,7 @@ fn run_resolve(
     }
 
     // The paths each session's ancestor forgets, as the retirements stand:
-    // every one a loser is retired at on that session's sides — primary's
+    // every one a loser is retired at on that session's sides — the primary's
     // copy is on every session's — with the name a copy is moved aside to.
     let forgets_of = |losers: &[Loser], index: usize| -> Vec<String> {
         let mut forget = std::collections::BTreeSet::new();
@@ -3555,9 +3555,9 @@ fn run_resolve(
             };
 
             // Both sides as the retirement leaves them. When a destination
-            // wins, primary's copy is gone on the winning session; on every
+            // wins, the primary's copy is gone on the winning session; on every
             // other session the worst order is assumed, the one in which
-            // primary already holds the winner's version when that session
+            // the primary already holds the winner's version when that session
             // next runs.
             let scanned = match (winner, replica_loser) {
                 (Winner::Replica(w), None) if w != index => {
@@ -3636,7 +3636,7 @@ fn run_resolve(
                 let on_primary = same(node_at(primary_final.as_ref(), path), kept);
                 let on_replica = same(node_at(replica_final.as_ref(), path), kept);
                 // Where a destination wins, a session other than the
-                // winner's needs only to leave primary's new version alone;
+                // winner's needs only to leave the primary's new version alone;
                 // it reaches that destination on a later cycle.
                 let survives = match winner {
                     Winner::Replica(w) if w != index => on_primary,
@@ -3700,7 +3700,7 @@ fn run_resolve(
     // the engine here rather than call `remove_dir_all`.
     //
     // One part per session: what its ancestor forgets, and which losing
-    // copies on its sides go. The part that retires primary's copy goes last
+    // copies on its sides go. The part that retires the primary's copy goes last
     // (see `ResolutionPart::last`).
     use autobahn::session::{Retirement, Settlement, Side};
     use autobahn::supervisor::control::PartState;
@@ -3882,8 +3882,8 @@ fn run_resolve(
     // it once the parts are in.
     //
     // Only the sessions touched are flushed. One that agreed already has
-    // nothing to carry; and where primary was retired, the winning session
-    // is among the touched, and its cycle's write to primary wakes every
+    // nothing to carry; and where the primary was retired, the winning session
+    // is among the touched, and its cycle's write to the primary wakes every
     // other session over that primary as any change there does.
     let flushes: Vec<ControlRequest> = touched
         .iter()

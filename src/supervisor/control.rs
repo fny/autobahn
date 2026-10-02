@@ -88,11 +88,11 @@ pub struct ResolutionPart {
     pub settlement: crate::session::Settlement,
     /// Whether this part waits for every other part of its resolution.
     ///
-    /// The part that retires primary's copy, when a destination's version
+    /// The part that retires the primary's copy, when a destination's version
     /// is kept, is applied last: until every other destination's ancestor
-    /// has forgotten the path and its losing copy is gone, primary's gap
+    /// has forgotten the path and its losing copy is gone, the primary's gap
     /// would read there as a deletion against an edited copy — and an edit
-    /// beats a deletion, so the losing version would come back to primary
+    /// beats a deletion, so the losing version would come back to the primary
     /// and win. It is not applied at all if another part failed, and it
     /// leaves alone a path another part's copy was refused at.
     pub last: bool,
@@ -214,7 +214,7 @@ pub struct Selector {
     pub group: Option<String>,
     /// The destination within the group, as `status` names it: a host,
     /// which selects every replica on it, or a replica's specification (a local
-    /// replica's path, or `host:path`), which selects that one (all
+    /// the replica's path, or `host:path`), which selects that one (all
     /// destinations when absent).
     pub host: Option<String>,
     /// The one session to select, by key (any when absent).

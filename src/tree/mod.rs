@@ -147,22 +147,22 @@ pub enum SyncMode {
     /// Bidirectional synchronization that surfaces conflicts without
     /// resolving them.
     TwoWaySafe,
-    /// Bidirectional synchronization that resolves conflicts in primary's
+    /// Bidirectional synchronization that resolves conflicts in the primary's
     /// favor.
     TwoWayResolved,
-    /// `TwoWayResolved` without its one exception: primary wins every
-    /// collision, including one where primary's side of it is a deletion.
+    /// `TwoWayResolved` without its one exception: the primary wins every
+    /// collision, including one where the primary's side of it is a deletion.
     /// In `TwoWayResolved` a deletion never beats an edit, since it
-    /// carries no content to weigh against one; here primary's word is
+    /// carries no content to weigh against one; here the primary's word is
     /// final, and what replica edited under a name primary removed is removed
-    /// on replica too. Replica's own additions still flow to primary, which is
+    /// on the replica too. The replica's own additions still flow to the primary, which is
     /// what keeps this two-way.
     TwoWayStrict,
-    /// Unidirectional (primary to replica) synchronization that refuses to
+    /// Unidirectional (primary to the replica) synchronization that refuses to
     /// overwrite or reverse-propagate replica-side changes.
     OneWaySafe,
-    /// Unidirectional (primary to replica) synchronization that maintains replica as
-    /// an exact mirror of primary.
+    /// Unidirectional (primary to the replica) synchronization that maintains replica as
+    /// an exact mirror of the primary.
     OneWayMirror,
 }
 
@@ -186,14 +186,14 @@ impl Change {
     }
 }
 
-/// A conflict between changes made on primary and replica.
+/// A conflict between changes made on the primary and replica.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conflict {
     /// The root path of the conflict.
     pub root: String,
-    /// The relevant changes on primary.
+    /// The relevant changes on the primary.
     pub primary_changes: Vec<Change>,
-    /// The relevant changes on replica.
+    /// The relevant changes on the replica.
     pub replica_changes: Vec<Change>,
 }
 

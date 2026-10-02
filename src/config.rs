@@ -68,12 +68,15 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 # The mode is a direction, and what happens when both sides changed one
 # file. There is no default: direction is never guessed.
 #
-#   two-way-conflict   both ways; a clash is reported and nothing is touched
-#   two-way-primary      both ways; primary's version wins a clash, silently
-#   two-way-primary-strict  as above, and primary's deletion of a file replica
-#                      edited wins too (in two-way-primary the edit survives)
-#   one-way-conflict   primary to replica; an edit on replica is reported, not overwritten
-#   one-way-primary      primary to replica; replica is made identical (also spelled "mirror")
+#   two-way-conflict        both ways; a clash is reported and nothing is touched
+#   two-way-primary         both ways; the primary's version wins a clash, silently
+#   two-way-primary-strict  as above, and the primary's deletion of a file the
+#                           replica edited wins too (in two-way-primary the edit
+#                           survives)
+#   one-way-conflict        primary to replica; an edit on the replica is reported,
+#                           not overwritten
+#   one-way-primary         primary to replica; the replica is made identical (also
+#                           spelled "mirror")
 #
 # Dangerously experimental: as the two-way modes, and a replica takes the lead
 # while the primary is away. Known security and collision issues are open;
@@ -1488,7 +1491,7 @@ impl Config {
                 }
             }
             // The path a remote replica inherits when it names none: the
-            // primary's path portion, as written.
+            // the primary's path portion, as written.
             let inherited_path = match &primary {
                 Some(EndpointTarget::Remote { path, .. }) => path.clone(),
                 _ => group.primary.clone(),
@@ -1683,7 +1686,7 @@ impl Config {
                 if let EndpointTarget::Local(path) = &target {
                     // A peer is a machine that can take the lead. A local
                     // path is this machine again, and this machine is the
-                    // primary already.
+                    // the primary already.
                     if p2p.is_some() {
                         errors.push(format!(
                             "group '{name}': replicas: '{replica}': a p2p mode needs every replica on \
@@ -2033,7 +2036,7 @@ pub const MODES: &[ModeName] = &[
         also: &[],
         mode: SyncMode::TwoWayResolved,
         p2p: false,
-        about: "Both ways, and primary wins a collision — except that a deletion never beats an edit.",
+        about: "Both ways, and the primary wins a collision — except that a deletion never beats an edit.",
     },
     ModeName {
         name: "two-way-primary-strict",
@@ -2047,28 +2050,28 @@ pub const MODES: &[ModeName] = &[
         also: &[],
         mode: SyncMode::OneWaySafe,
         p2p: false,
-        about: "Primary to replica only. A file changed on replica is reported rather than overwritten.",
+        about: "Primary to replica only. A file changed on the replica is reported rather than overwritten.",
     },
     ModeName {
         name: "one-way-primary",
         also: &["mirror"],
         mode: SyncMode::OneWayMirror,
         p2p: false,
-        about: "Primary to replica only, and replica is made to match — what rsync --delete does.",
+        about: "Primary to replica only, and the replica is made to match — what rsync --delete does.",
     },
     ModeName {
         name: "p2p-conflict-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWaySafe,
         p2p: true,
-        about: "two-way-conflict, and a replica may take the lead while primary is away. Known security and collision issues: read docs/p2p.md first.",
+        about: "two-way-conflict, and a replica may take the lead while the primary is away. Known security and collision issues: read docs/p2p.md first.",
     },
     ModeName {
         name: "p2p-primary-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWayResolved,
         p2p: true,
-        about: "two-way-primary, and a replica may take the lead while primary is away. Known security and collision issues: read docs/p2p.md first.",
+        about: "two-way-primary, and a replica may take the lead while the primary is away. Known security and collision issues: read docs/p2p.md first.",
     },
 ];
 
@@ -3562,7 +3565,7 @@ replicas = ["build.example.com:/tmp/replica"]
 
     #[test]
     fn overlapping_roots_within_a_session_are_rejected() {
-        // Reproduced before it was fixed: with replica containing primary, mirror
+        // Reproduced before it was fixed: with the replica containing primary, mirror
         // mode read its own output as replica-side divergence and recursively
         // deleted the primary root through the replica path.
         for (primary, replica, how) in [

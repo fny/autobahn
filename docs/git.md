@@ -38,15 +38,15 @@ merge or rebase.
 ## Operational Considerations
 
 ### Working Tree and Index Alignment
-When a branch checkout occurs on Primary (`git checkout feature`), the changed working tree files and `HEAD` reference synchronize to Replica within milliseconds. However, because `.git/index` is excluded, Git on Replica still has the prior commit's cached stat entries.
-- Running `git status` on Replica may temporarily display modified files.
-- Run `git reset` (mixed reset) on Replica to refresh the local index against `HEAD`.
+When a branch checkout occurs on the primary (`git checkout feature`), the changed working tree files and `HEAD` reference synchronize to the replica within milliseconds. However, because `.git/index` is excluded, Git on the replica still has the prior commit's cached stat entries.
+- Running `git status` on the replica may temporarily display modified files.
+- Run `git reset` (mixed reset) on the replica to refresh the local index against `HEAD`.
 
 ### Garbage Collection (`git gc`)
 `git gc` repacks loose objects into unified packfiles. While Autobahn safely propagates packfiles, run `git gc` on one host at a time, avoiding concurrent active commits on opposing endpoints.
 
 ### Concurrent Branch Commits
-If both Primary and Replica commit to the same branch simultaneously during a single synchronization interval, a conflict is flagged on the corresponding ref file under `.git/refs/heads/<branch>`. Resolve the ref via `autobahn resolve`, then align the losing endpoint with `git reset --hard`.
+If both the primary and the replica commit to the same branch simultaneously during a single synchronization interval, a conflict is flagged on the corresponding ref file under `.git/refs/heads/<branch>`. Resolve the ref via `autobahn resolve`, then align the losing endpoint with `git reset --hard`.
 
 ### Git Linked Worktrees
 Linked worktrees created via `git worktree add` embed absolute filesystem paths into `.git/worktrees/`. To synchronize linked worktrees across machines with differing directory paths, enable relative worktree paths (requires Git 2.48+):

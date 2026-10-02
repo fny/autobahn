@@ -186,7 +186,7 @@ Identical-root sharing relies on generations and lease validation, rather than e
 
 ## I7. Reconciliation never destroys silently
 
-**Statement.** Two-way conflict mode reports competing non-deletion changes and restores an edit against a deletion. One-way conflict mode preserves replica-only changes without copying them to primary.
+**Statement.** Two-way conflict mode reports competing non-deletion changes and restores an edit against a deletion. One-way conflict mode preserves replica-only changes without copying them to the primary.
 
 Primary-winning policies intentionally discard some competing changes. See [Modes](../modes.md).
 

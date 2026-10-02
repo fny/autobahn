@@ -1,9 +1,9 @@
 # Multi-Host Failover Peering (Dangerously Experimental)
 
-Autobahn supports automatic failover in star topologies. The primary coordinates synchronization during normal operation. If Primary becomes unreachable for an extended period, an eligible target node (`replica`) assumes temporary leadership, coordinating synchronization across remaining peers. When Primary reconnects, leadership yields back to Primary automatically.
+Autobahn supports automatic failover in star topologies. The primary coordinates synchronization during normal operation. If the primary becomes unreachable for an extended period, an eligible replica assumes temporary leadership, coordinating synchronization across remaining peers. When the primary reconnects, leadership goes back to it automatically.
 
 > [!WARNING]
-> Peering is classified as **dangerously experimental**. Because leadership transition requires peer-to-peer communication across Replica hosts, enabling peering requires explicit trust across all member machines unless you use SSH in restricted mode. Review [Security Boundaries & Access Control](#security-boundaries--access-control) prior to deployment.
+> Peering is classified as **dangerously experimental**. Because leadership transition requires peer-to-peer communication across the replica hosts, enabling peering requires explicit trust across all member machines unless you use SSH in restricted mode. Review [Security Boundaries & Access Control](#security-boundaries--access-control) prior to deployment.
 
 ## Configuration
 
@@ -27,7 +27,7 @@ manage_keys    = true      # Automatically provisions restricted SSH keys
 ```
 
 - `peering-conflict-dangerously-experimental`: Standard `two-way-conflict` reconciliation with automated failover.
-- `peering-primary-dangerously-experimental`: `two-way-primary` reconciliation where Primary's  version (the current leader's version) retains precedence whenever Primary is involved.
+- `peering-primary-dangerously-experimental`: `two-way-primary` reconciliation where the primary's  version (the current leader's version) retains precedence whenever the primary is involved.
 - `ttl` must equal or exceed twice the group `interval`.
 - Peer nodes run `autobahn watch` or `autobahn install` **without local configuration**; the active leader dynamically replicates required configuration and state.
 
@@ -51,25 +51,25 @@ To ensure clean failover without treating the existing tree as un-synchronized, 
 When a Replica assumes leadership, it adopts the replicated ancestor, allowing three-way reconciliation to proceed without false conflicts or data loss.
 
 ### Failover Sequence
-1. Replica nodes monitor the local lease.
-2. If Primary's lease expires and remains unrenewed for `failover_after + (index * ttl)`, the candidate node increments the term and publishes a new lease.
-3. The new leader initiates a reversed supervisor topology, treating itself as Primary and remaining nodes as Replicas.
+1. Each replica monitors its local lease.
+2. If the primary's lease expires and remains unrenewed for `failover_after + (index * ttl)`, the candidate node increments the term and publishes a new lease.
+3. The new leader initiates a reversed supervisor topology, treating itself as the primary and the remaining nodes as its replicas.
 
 ### Reverse Connection Attachment
-Because Primary may reside behind NAT, a firewall, or dynamic networking, Replicas never dial Primary directly.
-- Upon reconnecting, Primary initiates an outbound SSH tunnel to the current leader:
+Because the primary may reside behind NAT, a firewall, or dynamic networking, replicas never dial it directly.
+- Upon reconnecting, the primary initiates an outbound SSH tunnel to the current leader:
   ```sh
   ssh <leader> autobahn p2p attach
   ```
 - The leader routes synchronization frames through this reverse channel.
-- Once synchronized, the leader voluntarily yields leadership back to Primary via an orderly handoff (`autobahn peering yield --to primary`).
+- Once synchronized, the leader voluntarily yields leadership back to the primary via an orderly handoff (`autobahn peering yield --to primary`).
 
 ---
 
 ## Security Boundaries & Access Control
 
 ### Restricted SSH Keys (`manage_keys = true`)
-By default, inter-peer communication over SSH grants full shell execution rights across Replica hosts. Enabling `manage_keys = true` enforces strict command containment:
+By default, inter-peer communication over SSH grants full shell execution rights across the replica hosts. Enabling `manage_keys = true` enforces strict command containment:
 1. Each Replica generates a dedicated key pair (`~/.autobahn/peering/id_ed25519`).
 2. Public keys are registered in `~/.ssh/authorized_keys` restricted to the Autobahn security gate:
    ```

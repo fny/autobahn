@@ -85,20 +85,20 @@ impl SafetyHalt {
 /// A report of one synchronization cycle.
 #[derive(Debug, Default)]
 pub struct CycleReport {
-    /// The number of transitions applied to primary.
+    /// The number of transitions applied to the primary.
     pub primary_transitions: usize,
-    /// The number of transitions applied to replica.
+    /// The number of transitions applied to the replica.
     pub replica_transitions: usize,
     /// Conflicts identified during reconciliation (left unresolved in safe
     /// modes).
     pub conflicts: Vec<Conflict>,
-    /// Scan problems from primary.
+    /// Scan problems from the primary.
     pub primary_scan_problems: Vec<Problem>,
-    /// Scan problems from replica.
+    /// Scan problems from the replica.
     pub replica_scan_problems: Vec<Problem>,
-    /// Transition problems from primary.
+    /// Transition problems from the primary.
     pub primary_transition_problems: Vec<Problem>,
-    /// Transition problems from replica.
+    /// Transition problems from the replica.
     pub replica_transition_problems: Vec<Problem>,
     /// Whether or not either endpoint reported missing staged content
     /// (warranting an immediate follow-up cycle).
@@ -107,10 +107,10 @@ pub struct CycleReport {
     /// and digest, across both endpoints. A follow-up that reports the same
     /// pair again is not looking at a changing file.
     pub missing_staged: Vec<crate::endpoint::FileRequest>,
-    /// Whether primary's scan was skipped on the strength of a standing
+    /// Whether the primary's scan was skipped on the strength of a standing
     /// watch, its last snapshot standing in.
     pub primary_scan_skipped: bool,
-    /// Whether replica's scan was skipped, in the same way.
+    /// Whether the replica's scan was skipped, in the same way.
     pub replica_scan_skipped: bool,
 }
 
@@ -145,13 +145,13 @@ impl CycleReport {
 pub enum CyclePoint {
     /// Both scans are in hand; nothing has been reconciled or moved.
     AfterScans,
-    /// Replica's content is staged; its transition is about to be sent.
+    /// The replica's content is staged; its transition is about to be sent.
     BeforeReplicaTransition,
-    /// Replica's transition has answered.
+    /// The replica's transition has answered.
     AfterReplicaTransition,
-    /// Primary's content is staged; its transition is about to be sent.
+    /// The primary's content is staged; its transition is about to be sent.
     BeforePrimaryTransition,
-    /// Primary's transition has answered.
+    /// The primary's transition has answered.
     AfterPrimaryTransition,
     /// Every transition has answered; the ancestor is about to be recorded.
     BeforeRecord,
@@ -261,9 +261,9 @@ pub struct Session {
     /// scans reproduce [`settled_primary`](Self::settled_primary) and
     /// [`settled_replica`](Self::settled_replica).
     quiesced: bool,
-    /// Primary's hierarchy as of the last quiesced cycle.
+    /// The primary's hierarchy as of the last quiesced cycle.
     settled_primary: Option<Node>,
-    /// Replica's hierarchy as of the last quiesced cycle.
+    /// The replica's hierarchy as of the last quiesced cycle.
     settled_replica: Option<Node>,
     /// P2P: what this session presents to its peer when its
     /// supervisor leads. `None` for a plain mode, and for a follower.
@@ -1229,7 +1229,7 @@ impl Session {
         // window: it mutates neither tree, it is the longest phase of a
         // large cycle, and a crash there must recover as the clean
         // propagation it still is rather than as conflict noise. When both
-        // sides have transitions, primary's staging runs after replica's
+        // sides have transitions, the primary's staging runs after the replica's
         // transition, and so inside the window.
         let intended: Vec<String> = reconciliation
             .primary_transitions
@@ -1239,8 +1239,8 @@ impl Session {
             .collect();
         let mut intent_recorded = false;
 
-        // Stage and transition each side. Content flowing to replica is
-        // supplied by primary and vice versa.
+        // Stage and transition each side. Content flowing to the replica is
+        // supplied by the primary and vice versa.
         let replica_outcome = if reconciliation.replica_transitions.is_empty() {
             None
         } else {
@@ -1928,7 +1928,7 @@ mod tests {
             Some(&ancestor)
         ));
         // A root holding everything under one directory is exactly the
-        // shape the original guard missed: reproduced deleting replica's
+        // shape the original guard missed: reproduced deleting the replica's
         // whole copy before the guard counted recursive entries.
         let single = Node::directory(
             "",
@@ -1984,8 +1984,8 @@ mod tests {
 
     /// Reproduced before the fix: an ancestor of twenty files, primary down
     /// to one untracked `.DS_Store`, replica untouched. The halt did not fire,
-    /// because primary's root had a child, and reconciliation deleted all
-    /// twenty files from replica — in every mode, the paranoid one included.
+    /// because the primary's root had a child, and reconciliation deleted all
+    /// twenty files from the replica — in every mode, the paranoid one included.
     #[test]
     fn a_root_emptied_down_to_an_ignored_entry_halts_in_every_mode() {
         let full = || Node::directory("", (1..=20).map(|i| file(&format!("f{i}"), i)).collect());
@@ -2406,7 +2406,7 @@ mod tests {
         let new_content = || Node::directory("", vec![file("target", 2)]);
 
         // Cycle one converges on the old content; cycle two propagates the
-        // new content to replica and then "crashes" at the seam.
+        // new content to the replica and then "crashes" at the seam.
         {
             let primary =
                 ScriptedEndpoint::new(vec![scripted(old_content()), scripted(new_content())]);
@@ -2425,7 +2425,7 @@ mod tests {
         }
 
         // While the tool was down, the user deliberately reverted primary.
-        // Replica holds the propagated new content (the transition landed).
+        // The replica holds the propagated new content (the transition landed).
         let transitions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let primary = CountingEndpoint {
             inner: ScriptedEndpoint::new(vec![scripted(old_content())]),
@@ -2568,7 +2568,7 @@ mod tests {
         let settled = Node::directory("", vec![file("shared", 1)]);
         let edited = Node::directory("", vec![file("shared", 2)]);
         // Two identical scans settle the session; the third carries a real
-        // change on primary, which must not be skipped.
+        // change on the primary, which must not be skipped.
         let primary = ScriptedEndpoint::new(vec![
             scripted(settled.clone()),
             scripted(settled.clone()),
@@ -2592,8 +2592,8 @@ mod tests {
         assert!(!session.run_cycle().expect("cycle should succeed").changed());
         assert!(session.quiesced, "two identical cycles should settle");
 
-        // Primary's edit arrives on a settled session: the shortcut must not
-        // fire, because primary's storage no longer matches what settled.
+        // The primary's edit arrives on a settled session: the shortcut must not
+        // fire, because the primary's storage no longer matches what settled.
         let report = session.run_cycle().expect("cycle should succeed");
         assert_eq!(report.replica_transitions, 1, "the edit was not propagated");
         assert_eq!(applied.load(std::sync::atomic::Ordering::Relaxed), 1);
@@ -2682,17 +2682,17 @@ mod tests {
         )
         .expect("the session should construct");
 
-        // Cycle 1 creates the file on replica and establishes the ancestor.
+        // Cycle 1 creates the file on the replica and establishes the ancestor.
         let report = session.run_cycle().expect("cycle 1");
         assert_eq!(report.replica_transitions, 1);
 
-        // Cycle 2: replica's spurious bit is grafted away; nothing propagates
-        // (without propagation this would emit a transition to primary).
+        // Cycle 2: the replica's spurious bit is grafted away; nothing propagates
+        // (without propagation this would emit a transition to the primary).
         let report = session.run_cycle().expect("cycle 2");
         assert!(!report.changed(), "{report:?}");
         assert!(report.conflicts.is_empty());
 
-        // Cycle 3: primary makes a *real* executability change. Replica's copy
+        // Cycle 3: the primary makes a *real* executability change. The replica's copy
         // holds the same bytes, so the preserving peer vouches for the new
         // bit directly — the sides agree immediately, with no transition
         // and no conflict (the case a purely ancestor-based graft would
@@ -2741,7 +2741,7 @@ mod tests {
             // long since when someone resolves a conflict they can see.
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            // Replica's copy as resolve would read it.
+            // The replica's copy as resolve would read it.
             let mut reader = endpoint("replica");
             let scanned = reader.scan().unwrap().root;
             let expectation = crate::tree::node_at(scanned.as_ref(), "keep.txt")
@@ -3177,7 +3177,7 @@ mod tests {
                 );
             }
         }
-        // The edit made on replica while the crash was in flight is never lost.
+        // The edit made on the replica while the crash was in flight is never lost.
         assert_eq!(read_or_absent(&replica_root, "replica_own.txt"), Some(own));
 
         // Faults during staging precede the intent record, so recovery owes
@@ -3259,7 +3259,7 @@ mod tests {
         .unwrap();
 
         // The corrupted cycle: staging discards the mismatched content, so
-        // the transition reports it missing and nothing lands on replica —
+        // the transition reports it missing and nothing lands on the replica —
         // wrong bytes above all.
         let report = session.run_cycle().expect("a corrupted cycle still runs");
         assert_untorn(&replica_root, "payload.bin", &[None, Some(content.clone())]);
@@ -3361,8 +3361,8 @@ mod tests {
 
     #[test]
     fn a_mount_is_left_alone_on_both_sides_and_unplugging_it_moves_nothing() {
-        // Primary has something mounted at `mnt`, which its scan left out;
-        // replica has a real directory there with its own file in it.
+        // The primary has something mounted at `mnt`, which its scan left out;
+        // the replica has a real directory there with its own file in it.
         let primary_first = mounted(
             Node::directory("", vec![file("a", 1), untracked("mnt")]),
             &["mnt"],

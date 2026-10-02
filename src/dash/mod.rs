@@ -538,6 +538,42 @@ fn run_with(
     Ok(())
 }
 
+/// Starts the menu bar's item for this process, or says why there is
+/// none.
+///
+/// The menu bar's platform code is not the window's: it reaches for
+/// toolkits and daemons the window never asked for, and a refusal
+/// from any of them is a reason to run without the item, not a reason
+/// for the window not to open. `Bar::start` reports most of that as an
+/// `Err`, but a panic in code neither of us owns — the menu bar's
+/// Linux backends, before GTK had been started (#12) — is not caught
+/// by a `match`, so the whole attempt is fenced here and read back as
+/// the same message. The panic still says its piece on the way past;
+/// this only keeps it from being the last thing the process says.
+fn start_the_bar(config: Option<PathBuf>, state_root: PathBuf) -> Result<crate::menubar::Bar> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut bar = crate::menubar::Bar::start(config, state_root, || {})?;
+        bar.window = true;
+        bar.appear();
+        Ok(bar)
+    }))
+    .unwrap_or_else(|panic| Err(anyhow::anyhow!(said_by_a_panic(panic))))
+}
+
+/// What a panic said, when it said anything. A panic can carry any
+/// `Send` payload, and the two that reach here in practice are a
+/// `&'static str` from `assert!` and a `String` somebody built; a
+/// panic with nothing to say still deserves a line of its own.
+fn said_by_a_panic(panic: Box<dyn std::any::Any + Send>) -> String {
+    match panic.downcast_ref::<&'static str>() {
+        Some(said) => (*said).to_owned(),
+        None => match panic.downcast_ref::<String>() {
+            Some(said) => said.clone(),
+            None => "the menu bar panicked".to_owned(),
+        },
+    }
+}
+
 impl Dash {
     fn new(config: Option<PathBuf>, state_root: PathBuf, cx: &mut Context<Self>) -> Self {
         let names = cx.text_system().all_font_names();

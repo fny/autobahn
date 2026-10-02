@@ -242,6 +242,15 @@ impl Bar {
         if self.tray.is_some() {
             return;
         }
+        // GTK first, on Linux: the backends under the item cannot so
+        // much as make a menu before it, and neither surface starts it
+        // on the way up. A machine that cannot start it — no display, a
+        // bare ssh session — is told so and goes without the item
+        // rather than not running at all.
+        if let Err(error) = start_gtk() {
+            eprintln!("unable to put an item in the menu bar: {error}");
+            return;
+        }
         let menu = Menu::new();
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -1244,6 +1253,47 @@ pub(crate) fn menu_bar_ink(_tray: Option<&TrayIcon>) -> Ink {
     (142, 142, 147)
 }
 
+/// Starts GTK, which the menu bar's backends on this platform are
+/// written against.
+///
+/// GTK will not so much as make a menu before it has been started, and
+/// neither surface starts it on the way up — the dash draws with GPUI
+/// and the tray with winit — so the first either hears of it is the
+/// item being put in the bar, which used to be a panic that took the
+/// process down before any window opened (#12). Started here instead:
+/// once, because asking twice is an error to GTK; on the thread that
+/// asks, because GTK answers for the thread it was started on and no
+/// other; and the outcome is kept, because a machine that cannot start
+/// it — no display, a bare ssh session — would otherwise be asked
+/// again on every refresh, and the answer does not change.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+fn start_gtk() -> std::result::Result<(), String> {
+    static STARTED: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    STARTED
+        .get_or_init(|| gtk::init().map_err(|error| error.to_string()))
+        .clone()
+}
+
+/// Nothing to start elsewhere: macOS and Windows have backends of their
+/// own, which come up with the item.
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    target_os = "openbsd"
+)))]
+fn start_gtk() -> std::result::Result<(), String> {
+    Ok(())
+}
+
 /// The Autobahn sign — two lanes to the horizon under a bridge — in the
 /// menu bar's ink, with the health in a dot at the corner, drawn in code
 /// so there is no asset to ship or lose.
@@ -1464,6 +1514,29 @@ mod menu_tests {
             supervisor_mismatch: None,
             supervisor_unresponsive: false,
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod bar_tests {
+    use super::*;
+
+    /// The menu bar's Linux backends are GTK, and GTK will not so much
+    /// as make a menu before it has been started. The dash draws with
+    /// GPUI and the tray with winit, and neither starts GTK on the way
+    /// up, so nothing has started it by the time the item is put in the
+    /// bar — and the tray backend reaches for a `gtk::Menu` anyway,
+    /// which is a panic that takes the process down before any window
+    /// opens (#12). Appearing has to be survivable: an item in the bar
+    /// when the machine allows one, and none, said on stderr, when it
+    /// does not.
+    #[test]
+    fn appearing_starts_gtk_or_does_without_an_item() {
+        let own = tempfile::tempdir().expect("a temporary state root");
+        let mut bar = Bar::start(None, own.path().to_owned(), || {}).expect("a bar");
+        bar.appear();
+        // The item went in, or the attempt was refused and said so on
+        // stderr; what it may not do is take the process with it.
     }
 }
 

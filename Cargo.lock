@@ -608,6 +608,7 @@ dependencies = [
  "clap",
  "globset",
  "gpui-kit",
+ "gtk",
  "image",
  "libc",
  "libmimalloc-sys",

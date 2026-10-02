@@ -548,13 +548,22 @@ fn run_with(
 /// Nothing from a failed attempt is kept for the window to poll, and
 /// the usual panic hook still reports where it failed.
 fn start_the_bar(config: Option<PathBuf>, state_root: PathBuf) -> Result<crate::menubar::Bar> {
-    std::panic::catch_unwind(|| {
+    // `catch_unwind` catches the panic but does not stop the hook that
+    // runs first, so a caught one still prints its message and whatever
+    // backtrace is asked for — the frightening half of #12, followed by
+    // a calm sentence saying it was handled. The hook is silenced for
+    // the length of the call and put back after, and what the panic said
+    // is recovered from the payload instead.
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let started = std::panic::catch_unwind(|| {
         let mut bar = crate::menubar::Bar::start(config, state_root, || {})?;
         bar.window = true;
         bar.appear()?;
         Ok(bar)
-    })
-    .unwrap_or_else(|panic| Err(anyhow::anyhow!(said_by_a_panic(panic))))
+    });
+    std::panic::set_hook(hook);
+    started.unwrap_or_else(|panic| Err(anyhow::anyhow!(said_by_a_panic(panic))))
 }
 
 /// What a panic said, when it said anything. A panic can carry any

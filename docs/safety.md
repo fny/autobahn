@@ -60,7 +60,7 @@ Autobahn's safety invariants are verified through automated testing pipelines:
 - **Crash Point Enumeration:** The ancestor journal is truncated at every byte offset to ensure crash-recovery mechanisms consistently yield valid states.
 - **Fault-Injection & Mutation Testing:** Key validation checks in the source code are systematically disabled in mutation tests to confirm test suites detect the breakage.
 - **Schedule Interleaving Sweeps:** Multi-threaded randomized test runners simulate race conditions between scanner invalidations and file transitions.
-- **Formal Independent Security Audits:** Documented in [`REVIEWS/`](../REVIEWS/README.md).
+- **Formal Independent Security Audits:** What they found is fixed, or written down in [accepted risks](./correctness/accepted-risks.md).
 
 ## Operational Boundaries
 

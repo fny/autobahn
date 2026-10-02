@@ -1122,7 +1122,7 @@ pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {
         &[
             ("alpha", &group.alpha),
             ("name", &group.name),
-            ("role", &role),
+            ("role", role),
         ],
     )
 }

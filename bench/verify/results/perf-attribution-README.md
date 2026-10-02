@@ -1,5 +1,7 @@
 # Where the source's CPU actually goes, and whether the rising marginal is contention
 
+> Historical measurement record for the setup and build described below. Conclusions and source references belong to that run. See the [current benchmark](../../../docs/benchmarks.md) for the latest published matrix.
+
 Two measurements requested in the payload-cache review (`docs/reviews/supply-sharing-review-fable.md`).
 
 ## What could not be measured, and the substitute

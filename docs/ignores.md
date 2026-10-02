@@ -55,6 +55,8 @@ A relative path is refused. The supervisor runs under a login service, whose wor
 
 Naming files, rather than loading whatever the directory holds, is deliberate. Order *is* meaning: `!gradle-wrapper.jar` followed by `*.jar` is not the same list as the reverse. A directory scan would order them by whatever the filesystem returned, and dropping in a new file would silently change what the existing ones mean. A written list is an order someone chose and can see.
 
+Bare file names use `$AUTOBAHN_HOME/ignores` when `AUTOBAHN_HOME` is set, otherwise `~/.autobahn/ignores`. A command's `--state-root` override does not move this shared pattern library. Ignore files are read when the configuration is loaded; changing only an ignore file does not trigger the config watcher. Restart the supervisor or also change `config.toml` to reload the patterns.
+
 ## Negations inside an ignored directory
 
 A negation reaches inside an ignored directory. `vendor` followed by `!vendor/keep.txt` walks `vendor` after all, with everything in it ignored except `keep.txt` — the same result as `vendor/*` with the negation, so the two spellings agree.
@@ -74,6 +76,8 @@ Combining files written independently has one failure the reader cannot see by l
 ## Ignores and deletion
 
 An ignore says which files synchronization carries, not which files exist. Deleting the directory above an ignored path takes the ignored path with it, because a deletion is an instruction about the directory and obeying it halfway would leave a tree that is neither deleted nor synchronized. Ignored content is never *overwritten*, though — "do not synchronize this" cannot become "replace it with the peer's copy". See [Overlapping and nested roots](./nesting.md) for what this means when an ignored path is another session's root.
+
+This deletion rule applies to pattern-ignored content. Files excluded only by size, file type, or symlink mode are left standing with a problem reported. Unreadable content, and previously synchronized content that has since become excluded, can block the parent deletion as a conflict.
 
 ## See also
 

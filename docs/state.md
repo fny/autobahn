@@ -1,12 +1,14 @@
 # State
 
-Everything autobahn keeps lives under one directory, `~/.autobahn`, on every machine it touches. Removing it is a full uninstall (aside from the binary itself).
+Autobahn keeps configuration and session state under `~/.autobahn` by default, on every machine it touches. Run `autobahn uninstall` before removing state: deleting this directory does not unregister the login service or remove installed binaries and apps. Alternate staging locations and managed SSH keys also live outside it.
 
 `AUTOBAHN_HOME` moves that directory, whole: the installer puts the agent bundle there, and every command reads its configuration and state from there. `autobahn install` writes the variable into the login service it registers, since a service inherits nothing from the shell it was installed from; re-run it after changing the variable. The variable is the controller's own — a remote host keeps its agent under its own `~/.autobahn` regardless. `--state-root` and `--config` on a command still override it.
 
 | path | holds |
 |---|---|
 | `config.toml` | the configuration — the source of truth |
+| `dash.toml` | this machine's Dash display preference (`presence = "both"`, `"window"`, or `"menubar"`), separate from the fleet configuration |
+| `install.log` | the desktop app's installer output |
 | `host.toml` | what this machine allows, whoever asks: the folders its agent serves — see [This machine's own settings](./configuration.md#this-machines-own-settings) |
 | `sessions/<id>/` | each session's ancestor and journal: what was last agreed between its two roots |
 | `status/<id>.json` | what each session is doing, or last did; what `status` reads |

@@ -21,15 +21,17 @@ When no `on_alert` hook is configured, the tray raises desktop notifications its
 
 It is a view over `status --json`, polled every few seconds, and holds no state of its own. macOS is the supported platform. On Linux it is an unverified, build-it-yourself experiment; see [On Linux](#on-linux-experimental-unverified).
 
+The separate [Dash app](./app.md) includes a window and an optional menu bar. This page describes the standalone `autobahn tray` app.
+
 ## Starting it
 
-Open `apps/tray/Autobahn.app`, or drag it to `/Applications` and open it there. **It does not start at login on its own**: add it under System Settings → General → Login Items. The supervisor is separate and already survives logout through `autobahn install`; the app only watches it.
+Open `apps/tray/Autobahn.app`, or drag it to `/Applications` and open it there. **It does not start at login on its own**: add it under System Settings → General → Login Items. The supervisor is separate: `autobahn install` registers it to start at login, independently of the tray. The app only watches it.
 
 From a terminal, `autobahn tray` runs the same menu bar app — but only in a binary built with `--features tray`. A plain build answers that it has no menu bar app. `build.sh` builds that binary into `target/tray` (`AUTOBAHN_TRAY_TARGET` moves it), never `target/release`: the login service runs `target/release/autobahn` through a symlink, and an app build must not replace it.
 
 ## On Linux (experimental, unverified)
 
-> **Build it yourself, at your own risk.** No release includes a Linux tray, and CI never builds one. Nobody has confirmed that the steps below build it, or that it runs once built. It can break between versions without anyone noticing.
+> **Build it yourself, at your own risk.** The tagged CLI releases do not include a standalone Linux tray, and ordinary CI does not build the `tray` feature on Linux. The separate Dash workflow builds its shared menu bar code on Linux, which does not validate the standalone tray event loop. Nobody has confirmed that the steps below build it, or that it runs once built. It can break between versions without anyone noticing.
 
 The tray code is shared with macOS. On Linux, desktop notifications go through the freedesktop notification service, and "Show diff" opens the diff with `xdg-open`.
 
@@ -49,8 +51,8 @@ The tray code is shared with macOS. On Linux, desktop notifications go through t
 
 ```sh
 git clone https://github.com/fny/autobahn && cd autobahn
-cargo build --release --locked --features tray
-target/release/autobahn tray
+CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
+target/tray/release/autobahn tray
 ```
 
 The tray watches a supervisor; it does not run one. Start one first with `autobahn watch`, or with `autobahn install` for a login service.
@@ -60,7 +62,7 @@ Do not build into the directory a login service runs from: `build.sh` on macOS a
 **Known problems**
 
 - **It may build but never show an icon.** On Linux the tray libraries need GTK started on the thread that runs the event loop, and the code does not start it today. This is expected from the libraries' documentation, not observed.
-- **It pulls in about 170 more crates**, mostly GTK 3 bindings. Those bindings are no longer maintained, and `glib 0.18` has a soundness advisory. The published command-line tool and agent contain none of this.
+- **It adds GTK 3 and desktop notification dependencies.** These optional dependencies are absent from the plain command-line tool and agent; see `Cargo.lock` and `deny.toml` for the pinned versions and advisory policy.
 - **It does not start at login.** Add `autobahn tray` to your desktop's autostart settings.
 
 If you get it working, the exact packages, desktop and steps are worth reporting, so this section can drop "unverified."
@@ -71,7 +73,7 @@ The app's icon is `assets/Autobahn.icon`, an Icon Composer bundle. Edit it in Ic
 
 `scripts/build-icon.sh` regenerates the committed files from the bundle: `assets/autobahn.icns` and `assets/notification.png` — the icon every alert wears, embedded in the binary — both from `actool`, and `assets/autobahn.png`, the artwork at 1024 pixels. That last one comes from Icon Composer's exporter, `ictool`, and is full bleed: the squircle runs edge to edge, which suits a README or a website but is about a quarter larger than an app icon should be. Rerun the script after changing the bundle.
 
-The menu bar glyph is not this icon. It is the Autobahn sign, drawn in code in `src/tray.rs`; `assets/sign.svg` is the same shape at full size.
+The menu bar glyph is not this icon. It is the Autobahn sign, drawn in code in `src/menubar.rs`; `assets/sign.svg` is the same shape at full size.
 
 ## Signing and notarising
 

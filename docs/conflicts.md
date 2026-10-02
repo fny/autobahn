@@ -23,6 +23,8 @@ autobahn resolve project a.rs b.rs c.rs --keep alpha  # several at once, one pas
 autobahn resolve ~/project --all --keep boite     # every conflict in the group
 ```
 
+`conflicts` is an alias of `issues`; it also reports blocked paths and halted sessions. Conflicts can concern executable bits, symbolic links, or file/directory differences, so equal content hashes do not always mean there is nothing to resolve.
+
 ## Naming a winner
 
 A winner is named as `status` names it: `alpha`, or a destination's host (or path). Its version reaches alpha and every other destination, so one command settles a conflict across a whole fan-out — including destinations whose own conflict was with a *third* version.
@@ -31,9 +33,9 @@ It asks before it acts, unless you pass `--yes` (`-y`).
 
 ## How `resolve` works
 
-What it does is retire the *losing* version, not copy the winning one: the losing side's copy is removed, or moved aside for `--keep both`, and the next cycle carries the winner across. That is why it settles a conflict between a file and a whole directory, which no amount of copying bytes can do — reconciliation already propagates one side's content over the other's deletion, for a file, a symbolic link, or a tree alike.
+What it does is retire the *losing* version, not copy the winning one: the losing side's copy is removed, or moved aside for `--keep both`, and the ancestor forgets that path. The next cycle treats the retained winner as a creation and carries it across, even when its content matches the old ancestor. That is why it settles a conflict between a file and a whole directory, which no amount of copying bytes can do — reconciliation already propagates one side's content over the other's deletion, for a file, a symbolic link, or a tree alike.
 
-Two things follow. The removal goes through the same transition path a cycle uses, so an entry that changed since the command started is refused and reported rather than destroyed; run the command again to settle it. And the winner arrives on the next cycle, so the command flushes the supervisor before returning. Without a supervisor running, run `autobahn sync` once. Nothing here touches the ancestor.
+Two things follow. The removal goes through the same transition path a cycle uses, so an entry that changed since the command started is refused and reported rather than destroyed; run the command again to settle it. And the winner arrives on the next cycle, so the command flushes the supervisor before returning. Without a supervisor running, run `autobahn sync` once. Only the settled paths are forgotten; unrelated ancestor history is kept. With a live supervisor, settlement runs through its control socket under the session's ownership; otherwise the command takes the session locks itself.
 
 ## Reading a long list
 

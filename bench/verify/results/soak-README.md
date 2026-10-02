@@ -1,5 +1,7 @@
 # Soak, 29 August 2026
 
+> Historical measurement record for the setup and build described below. Conclusions and source references belong to that run. See the [current benchmark](../../../docs/benchmarks.md) for the latest published matrix.
+
 Two hours of continuous editing against a 62,952-file tree, one source and one destination on separate machines, sampling both every thirty seconds.
 
 This is the first soak that produced latency data. The two before it measured resources only, because the probe was misconfigured; see the end of this file for what was wrong, since all of it was in the harness rather than in the tool.

@@ -1,5 +1,7 @@
 # What scales with tree size on the latency path
 
+> Historical measurement record for the setup and build described below. Conclusions and source references belong to that run. See the [current benchmark](../../../docs/benchmarks.md) for the latest published matrix.
+
 Single-edit latency measured 45.7ms over 6,636 entries and 61.8ms over 62,952. The 16ms difference implied a per-entry term worth understanding, because at Chromium's half a million entries it would dominate everything else.
 
 All of this is source-side CPU and disk, so it measures locally with no network and no fan-out confound. Harness: `examples/cycle_cost.rs`. It scans a corpus, edits one file, rescans, and times each whole-tree phase of the resulting cycle.

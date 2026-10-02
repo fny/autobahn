@@ -1,6 +1,6 @@
 # Releases
 
-Autobahn ships three things. They ship independently. A build that refreshes one of them does not refresh the other two.
+The tagged release ships three components. They are installed independently. A build that refreshes one of them does not refresh the other two.
 
 | what | where it comes from | where it lands |
 |---|---|---|
@@ -11,6 +11,8 @@ Autobahn ships three things. They ship independently. A build that refreshes one
 A plain `cargo build --release --locked` gives you a new controller only. The menu bar app keeps the binary it was built with. The agent bundle in `~/.autobahn/agents` keeps the binaries the installer put there.
 
 Remote hosts are different again. The controller runs the agent at `~/.autobahn/bin/autobahn-<version>-<digest>` on the host, and uploads one only if that path fails to run. `<version>` is the package version plus the compatibility epoch, which `protocol::version()` writes as `0.4.0+e16`; `<digest>` is the first twelve hex digits of the binary's blake3. So a host takes a new agent whenever the bytes the controller would send change — a new release, or a rebuild at the same version — and never the same bytes twice.
+
+The experimental [Dash app](./app.md) has a separate build workflow, `.github/workflows/dash.yml`. It runs on qualifying pushes to `desk-kit` or by manual dispatch, builds for macOS arm64 and Linux x86-64/arm64, and publishes successful builds to the moving `dash-latest` prerelease. These archives carry a companion `autobahn` command and checksums, but are unsigned and are not part of `autobahn update` or the signed `v*` release pipeline below.
 
 ## The release pipeline
 
@@ -55,7 +57,7 @@ autobahn update --version v0.5.0-dev.1
 
 The agent path holds the package version. Give the prerelease its own package version, and the agent path moves with it.
 
-Set `version = "0.5.0-dev.1"` in `Cargo.toml` and tag `v0.5.0-dev.1`. The agent path becomes `~/.autobahn/bin/autobahn-0.5.0-dev.1+e16`. No host has that file. Each host installs the new agent on its next connection. The old agent stays in place, so a controller that is still on `0.4.0` keeps working.
+Set `version = "0.5.0-dev.1"` in `Cargo.toml` and tag `v0.5.0-dev.1`. The agent path becomes `~/.autobahn/bin/autobahn-0.5.0-dev.1+e16-<digest>`. No host has that file. Each host installs the new agent on its next connection. The old agent stays in place, so a controller that is still on `0.4.0` keeps working.
 
 Do not bump the epoch for this. The version string already changed, and the version string is what the handshake compares.
 

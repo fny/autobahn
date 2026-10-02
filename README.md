@@ -8,22 +8,20 @@ Keep your files in sync as fast as you or an agent edits them across a fleet of 
 curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
-You can also point your agent at [INSTALL.md](INSTALL.md) for interactive installation or use the GUI:
-
-<<put image of installation view in autobahn next to example view of groups>>
+Point your coding agent at [INSTALL.md](INSTALL.md) for interactive setup, or see [Autobahn Dash](docs/app.md) for the experimental desktop app.
 
 ## The Problem
 
-- Browsing and files over SSH or NFS is clunky.
+- Browsing files over SSH or NFS is clunky.
 - Agents that run `--dangerously` should do it in a VM elsewhere, but you can't use your local tools.
-- Sync tools handle big trees require gigs of RAM, or a cloud account, or both.
+- Some sync tools require gigs of RAM for big trees, or a cloud account, or both.
 
 ## Why Autobahn
 
-- **Fast as hell.** Changes propage in about 50 ms on a 40,000-file tree, and under 200 ms on a half-million-file Chromium checkout.
-- **Lightweight.** 33 MB of memory for 40,000 files, 249 MB for Chromium. 0.2% of a core while idle.
-- **Safe.** Different sync modes to pick the risk you want per group, all verified empirically and by proof.
-- **Secure.** Audited to death by Kimi 3 and GLM 5.3.
+- **Fast as hell.** The September 2026 Linux benchmark measured 13.4 ms median for a small-file edit on the 50k subset with ten editors, and 23.8 ms on a half-million-file Chromium checkout with one editor.
+- **Lightweight.** That benchmark measured 479 MiB of peak controller memory on the Chromium single-editor workload, versus 2,081 MiB for mutagen, and 0.1% of a core while idle.
+- **Safe.** Choose a sync policy per group, backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
+- **Reviewed.** Security findings and fixes are recorded in [REVIEWS](REVIEWS/README.md); [known residual risks](docs/correctness/RETAINED.md) remain.
 - **Privacy first.** No cloud service, no account, no third party.
 
 ## Start here
@@ -33,7 +31,7 @@ After you [install Autobahn](INSTALL.md) you need to set up your configuration. 
 ```toml
 # ~/.autobahn/config.toml
 
-[defaults]                  # inherited by every group; any key can be
+[defaults]                  # inherited by every group; settings can be overridden
 mode = "two-way-conflict"   # sync modes explained below
 ignores = [".git", "node_modules"]
 
@@ -54,7 +52,7 @@ autobahn install            # or install as a login service
 
 ## Sync Modes
 
-Joy has several modes depending on how hands off you want to be. I reccomend `two-way-conflict` which resolves changes on its own unless two files don't match up.
+Autobahn has five core modes. Start with `two-way-conflict`: it propagates changes in either direction and reports competing edits for you to resolve.
 
 | Mode | Policy | Best For... |
 | --- | --- | --- |
@@ -63,7 +61,7 @@ Joy has several modes depending on how hands off you want to be. I reccomend `tw
 | `two-way-alpha-strict` | Alpha wins (strict) | Alpha is authoritative, and Alpha's deletions must override Beta's edits. |
 | `one-way-conflict` | Beta changes pause | Deployments where Beta generates local files (logs, caches) that Alpha must not touch. |
 | `one-way-alpha`<br>*(alias: `mirror`)* | Alpha mirrors strictly | Backups and releases where Beta must be an exact, identical replica of Alpha. |
-| `peering-*-dangerously-experimental` | Conflict or Alpha | Multi-node failover when Alpha goes offline. *(See [Peering](./peering.md))* |
+| `peering-*-dangerously-experimental` | Conflict or Alpha | Multi-node failover when Alpha goes offline. *(See [Peering](docs/peering.md))* |
 
 See [Modes](./docs/modes.md) for a complete behavior matrix and [Conflicts](./docs/conflicts.md) for resolution strategies.
 
@@ -71,35 +69,36 @@ See [Modes](./docs/modes.md) for a complete behavior matrix and [Conflicts](./do
 
 Autobahn was inspired by [Mutagen](https://mutagen.io/). I originally set out to optimize RAM use but quickly got carried away squeezing every possible second out of a sync.
 
-<<TODO MAKE SURE THIS IS UP TO DATE>>
-| | autobahn | mutagen | |
-|---|---|---|---|
-| Propagate one edit, Chromium (505k files) | **188 ms** | 7,118 ms | 37.8× |
-| Propagate one edit, 40k files, 10 agents | **52 ms** | 1,854 ms | 35.4× |
-| Peak memory, Chromium | **249 MB** | 2,033 MB | 8.2× |
-| CPU while idle, Chromium | **0.2%** | 50% | 250× |
-| First sync, Chromium | 423 s | 418 s | ~1% |
+Latest recorded Linux results, refreshed through October 1, 2026: **Autobahn 0.4.0 versus mutagen 0.19.0-dev**. The [matrix](docs/benchmark-matrix.md) identifies the measured build for each cell; these are not measurements of every subsequent commit.
+
+| Measurement | Autobahn | mutagen | Ratio |
+|---|---:|---:|---:|
+| Small-file edit, Chromium, 1 editor, p50 | **23.8 ms** | 6,232.2 ms | 261.9× |
+| Small-file edit, 50k subset, 10 editors, p50 | **13.4 ms** | 1,809.8 ms | 135.1× |
+| Peak controller memory, Chromium, 1 editor | **479 MiB** | 2,081 MiB | 4.3× |
+| Idle controller CPU, Chromium | **0.1% of a core** | 49.9% | rounded values |
+| First sync, Chromium | **228.1 s** | 454.8 s | 2.0× |
 
 See [Benchmarks](docs/benchmarks.md), and [Why Mutagen is Slower](docs/mutagen.md) for details.
 
 ## Safety
 
-I have been running this on my on fleet every day: 20 sessions across five hosts. One of them is a 13 GB, 215,000-file tree.
+I have been running this on my own fleet every day: 20 sessions across five hosts. One of them is a 13 GB, 215,000-file tree.
 
 Autobahn has also undergone a battery of tests and benchmarks including a 24-hour soak test and formal verification where suitable.
 
-See [Safety](docs/safety.md) for gurantees and the related invariants in [Correctness](docs/correctness/).
+See [Safety](docs/safety.md) for guarantees and the related invariants in [Correctness](docs/correctness/).
 
 
-## Quality of Life (Beta)
+## User interfaces (experimental)
 
-Autobahn comes with an [App](docs/app.md), an [TUI](docs/shop.md), and a standalone [Tray](TODO). For alerts, you can even set one line in your config to run a script every time an alert fires:
+Autobahn comes with an [App](docs/app.md), a [TUI](docs/shop.md), and a standalone [Tray](docs/macos-app.md). For alerts, you can even set one line in your config to run a script every time an alert fires:
 
 ```toml
 on_alert = "~/.autobahn/on-alert.sh"   # written for you by `autobahn init`
 ```
 
-None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them beta features.
+None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them experimental features.
 
 **Peering** (dangerously experimental) — a beta takes the lead when the alpha is away, and gives it back. It has known security issues that are not fixed in this release; any peer that can lead is trusted with every other peer. Read [Peering](docs/peering.md) before enabling it.
 
@@ -109,7 +108,7 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 
 ## Contributing
 
-- I won't accept PRs. I prefer my slop of your slop, so instead file an issue for a bug report or (small) feature request.
+- I won't accept PRs. I prefer my slop over your slop, so instead file an issue for a bug report or (small) feature request.
 - Bug reports should come with detailed context from a human or LLM.
 - Feature requests should be small with high impact.
 - Have a greater vision? Go fork yourself: Autobahn is considered near complete. If there's something crazy you really want, set up your own repo.
@@ -117,13 +116,13 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 
 ## Documentation
 
-**Using it** — [Configuration](docs/configuration.md) · [Modes](docs/modes.md) · [Ignores](docs/ignores.md) · [Alerts](docs/alerts.md) · [Commands](docs/commands.md) · [Conflicts](docs/conflicts.md) · [TUI](docs/shop.md) · [Menu bar app](docs/macos-app.md) · [Logging](docs/logging.md) · [State](docs/state.md)
+**Using it** — [Installation](INSTALL.md) · [Desktop app](docs/app.md) · [Git checkouts](docs/git.md) · [Configuration](docs/configuration.md) · [Modes](docs/modes.md) · [Ignores](docs/ignores.md) · [Alerts](docs/alerts.md) · [Commands](docs/commands.md) · [Conflicts](docs/conflicts.md) · [TUI](docs/shop.md) · [Menu bar app](docs/macos-app.md) · [Logging](docs/logging.md) · [State](docs/state.md)
 
 **Understanding it** — [Safety](docs/safety.md) · [How it works](docs/how-it-works.md) · [Overlapping and nested roots](docs/nesting.md) · [Scope and support boundaries](docs/support-boundaries.md)
 
 **Measuring it** — [Benchmarks](docs/benchmarks.md) · [The benchmark matrix](docs/benchmark-matrix.md) · [Why mutagen is slower](docs/mutagen.md)
 
-**Working on it** — [Development](docs/development.md) · [Releases](docs/releases.md) · [Correctness](docs/correctness/)
+**Working on it** — [Review archive](REVIEWS/README.md) · [Development](docs/development.md) · [Releases](docs/releases.md) · [Correctness](docs/correctness/)
 
 ## Limitations
 

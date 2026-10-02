@@ -2,19 +2,21 @@
 
 The companion to [INVARIANTS.md](./INVARIANTS.md): the risks that are deliberately left open. Each entry records what the residual is, why it was retained, what would change that decision, and what the fix would be if the decision changed — so revisiting any of them starts from the reasoning, not from scratch. None of these are forgotten; all of them are chosen.
 
-## 1. Single-huge-file mounts evade the emptied guard
+## 1. Mounts that were never observed mounted
 
-**The residual.** The emptied-tree guard — now the `two-way-paranoid` mode's conflict-and-restore rules; below the root the other modes propagate the emptying, since the guard as a halt fired on `git gc` packing loose refs — triggers on a directory that is empty or absent on exactly one side, with an ancestor recording eight or more entries (two at the root, where the halt remains in every mode). A vanished mount holding one multi-terabyte database image, or a handful of very large media files, stays under the count and its disappearance propagates as deletion, in the paranoid mode too.
+**The residual.** Scans record mount boundaries, and the session retains them. With `ignore_mounts = false` (the default), a recorded mount that disappears or empties where the ancestor held content halts the session, regardless of its entry count. With `ignore_mounts = true`, recorded mount paths are excluded on both sides, including after an unmount.
 
-**Why retained.** The alternative — a byte-magnitude trigger — was examined and rejected in review round five, by both reviewers, because the on-disk signature is identical for the hazard and for routine work: `rm` of the single large file in a one-file directory leaves exactly the same existing-but-empty directory a vanished mount does. A byte threshold halts every legitimate deletion of a big file to catch a rare mount shape. Count errs toward not interrupting ordinary operations; bytes err toward interrupting them constantly.
+A mount that was never observed mounted has no such identity evidence. Below the root its disappearance follows ordinary reconciliation unless `guard_directory_deletes_over` applies. A directory smaller than the configured threshold—including one huge file—does not trigger that additional guard. The whole-root emptying guard has its own threshold of two ancestor entries; a missing alpha root is separately refused.
 
-**What would change the decision.** An observed incident, or telemetry showing the low-entry/high-byte shape is common in real trees. The halt message already logs entry counts; adding byte totals to it costs nothing and builds the evidence base.
+**Why retained.** An unseen mount disappearing and a deliberate deletion have the same tree shape. A byte threshold would also interrupt routine deletion of large files. Mount tracking closed the known-boundary case; it cannot reconstruct a mount that no scan observed.
 
-**The fix if changed.** Not a byte threshold — mount-identity evidence instead: record the root's and major subtrees' device IDs (`st_dev`) at scan time, and halt when a subtree's device changes or vanishes. That distinguishes "the mount went away" from "the user deleted the file" by mechanism rather than by magnitude, which no threshold can.
+**What would change the decision.** Evidence of real losses from mounts appearing and disappearing entirely between scans, or a requirement to declare mount identities before the first scan.
+
+**The fix if changed.** Explicit expected-mount configuration or OS mount-event tracking, with tests for unplugged-at-startup and mounted-between-scans cases. Raising a file-count or byte threshold cannot establish mount identity.
 
 ## 2. Pathname TOCTOU outside Linux creations
 
-**The residual.** Creation on Linux is atomic (`RENAME_NOREPLACE`). Everything else keeps a microsecond check/use window: replacements and removals validate against the scan and then rename or unlink by pathname; an editor's save landing in the window is lost; a directory component swapped for a symlink after verification can redirect an operation outside the root. Non-Linux creations and `EINVAL` fallback paths keep the plain-rename window too.
+**The residual.** Creation uses atomic no-replace rename on Linux (`RENAME_NOREPLACE`) and macOS (`RENAME_EXCL`). Everything else keeps a microsecond check/use window: replacements and removals validate against the scan and then rename or unlink by pathname; an editor's save landing in the window is lost; a directory component swapped for a symlink after verification can redirect an operation outside the root. Creations on other platforms and unsupported-flag fallback paths keep the plain-rename window too.
 
 **Why retained.** Full closure requires descriptor-relative traversal — `openat2`/`openat` with `O_NOFOLLOW`, directory file descriptors held across each operation, and rename/unlink relative to those descriptors. That is a rewrite of the transitioner's spine, not a patch, and it deserves its own design and review rather than riding a fix wave. The editor-save window is real but tiny; the symlink redirect requires a cooperating local process, and in the current single-user threat model an actor who can win that race can already write the tree directly.
 
@@ -34,7 +36,7 @@ The companion to [INVARIANTS.md](./INVARIANTS.md): the risks that are deliberate
 
 ## 4. Cross-process overlapping configurations
 
-**The residual.** Within one configuration, nested writable endpoints are refused and equal shared endpoints warn. Across *processes* — two users, two config files, two machines — only the exactly-identical pair is excluded (the endpoint-pair lock). Two different-but-overlapping configs in separate processes can still write one tree region from independent ancestors.
+**The residual.** Within one configuration, nested writable endpoints are refused and equal shared endpoints warn. Across processes sharing one user's default state root, only the exactly-identical pair is excluded (the endpoint-pair lock), even with different `--state-root` or `--state-dir` overrides. Different machines, users, or `AUTOBAHN_HOME` directories do not share that lock. Two different-but-overlapping configs in separate processes can still write one tree region from independent ancestors.
 
 **Why retained.** The full fix is endpoint read/write locks acquired on the host that owns each endpoint, including agent-side acquisition for remote roots — a protocol change with its own new failure modes (stale-lock recovery, lock ordering across sessions, deadlock between supervisors). Review round five judged the trigger topology — a *writable* overlap spanning processes — an exotic, deliberate configuration, and the mechanism heavier than the exposure.
 

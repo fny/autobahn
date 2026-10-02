@@ -8,6 +8,8 @@ Most of the design here is a direct answer to a way an earlier, ad-hoc version o
 
 ## Quick start
 
+Run these commands from `bench/` (use `cd bench` from the repository root). AWS commands create billable resources; the local smoke test does not.
+
 ```bash
 # Verify the harness itself, locally, in about six minutes. No AWS.
 ./smoke.sh
@@ -117,7 +119,7 @@ For each tool, in an order randomized per job:
 2. **Restore sources.** Every file any workload may edit is restored from a pristine copy baked into the image, so the second tool synchronizes exactly the bytes the first one did.
 3. **Clear destinations.**
 4. **Prepare storage.** Fault the corpus in once per host, then drop the page cache. Both tools then read a hydrated volume from disk. See [Lessons](#lessons-paid-for).
-5. **Cold sync** until the destination's digests match the source's, with both the cheap count match and the digest-verified time recorded.
+5. **Seed or cold sync.** Steady-state cells start from seeded destinations and verify agreement. Dedicated `coldsync-*` cells start empty and record both the cheap count match and digest-verified convergence time.
 6. **Wait for quiescence**, verified by identical digests on both sides across a ten-second gap.
 7. **Idle window** — sample resources with the tool running and nothing to do.
 8. **Verify partitions** on both hosts, before the workload window opens, so this walk does not pollute the workload's resource attribution.
@@ -233,14 +235,19 @@ The general lesson is the one both share: a measurement that silently degrades t
 | `aggregate.py` | JSONL to tables: pooled percentiles with censoring, per-run spread, windowed resources, delivered-vs-planned, taint rules, problems. |
 | `toysync.py` | A deliberately dumb local subject (a copy loop) with known behavior, for the smoke test. |
 | `smoke.sh` | Local end-to-end test of the harness itself. Run after any change. |
-| `report/` | The published report. |
+| `report/` | The historical HTML report for the 0.3.0 comparison. |
+| `../docs/benchmarks.md`, `../docs/benchmark-matrix.md` | The current published summary and tables. |
+| `../benchmarks/2026-10-01.json` | Portable aggregate and provenance for the September–October 2026 matrix. |
 | `results-*/` | Raw JSONL per run, plus the plan and per-pair driver logs. |
 
 ## The local gate: `bench/ab.sh`
 
 The matrix above is the benchmark of record and needs a pair of EC2 hosts. The gate that every hot-path change passes before it ships is smaller, runs on one machine in about ten minutes, and lives here too:
 
-bench/ab.sh target/release/autobahn-before target/release/autobahn-after
+```sh
+# From the repository root:
+bench/ab.sh target/release/autobahn-before target/release/autobahn-after --legs 5
+```
 
 It runs the two binaries in interleaved legs over a generated 40,000-file corpus (`bench/corpus.py`), each leg a cold sync and then a window of simulated editing agents, and reports p50/p90/p99 side by side with a verdict against the run-to-run spread. Interleaving is what makes it honest on a shared machine. The raw reports of every gate run that shaped a decision are in `bench/ab-reports/`.
 

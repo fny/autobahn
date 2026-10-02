@@ -1,5 +1,7 @@
 # Two gates before building the ancestor journal
 
+> Historical measurement record for the setup and build described below. Conclusions and source references belong to that run. See the [current benchmark](../../../docs/benchmarks.md) for the latest published matrix.
+
 Both reviewers asked for these before any work started. Run on one source/destination pair of `c6i.4xlarge`, against the Chromium corpus (504,960 files), with the destination pre-seeded so the session begins converged rather than paying a cold sync.
 
 Script: `bench/verify/gates.sh`.

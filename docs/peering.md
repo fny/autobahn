@@ -9,7 +9,7 @@ Failover for the star. The alpha leads, as it always has. When it is gone for lo
 - The on-disk state under `peering/` may change shape between releases without a migration.
 - Peering trusts every peer that can lead with the folders it syncs, on every member, and — unless [restricted keys](#restricted-keys) are on — with a shell on every other beta. Use it only among machines that already trust each other that far.
 
-The old names, `peering-conflict-experimental`, `peering-alpha-experimental` and `[advanced.peering-experimental]`, are refused with a message pointing here. The rename is deliberate: turning peering on should mean reading this page.
+The old names, `peering-conflict-experimental`, `peering-alpha-experimental` and `[experimental.peering-experimental]`, are refused with a message pointing here. The rename is deliberate: turning peering on should mean reading this page.
 
 ## The configuration
 
@@ -124,7 +124,7 @@ autobahn peering attach                # what the alpha runs over ssh; not for t
 Any beta must be able to take the lead, so each reaches every other over SSH. With ordinary keys that is a shell on every beta from every beta: one compromised beta is all of them. With `manage_keys`, the alpha sets up keys between the betas that can run autobahn and nothing else:
 
 ```toml
-[advanced.peering-dangerously-experimental]
+[experimental.peering-dangerously-experimental]
 manage_keys = true
 ```
 
@@ -161,7 +161,7 @@ These are open.
 - **A beta's sessions with the other betas start without an ancestor.** The alpha's session with each beta is replicated; a session between two betas exists only during a failover and has no history to inherit. If the two betas were in step when the alpha left, they agree; whatever was in flight shows as a handful of conflicts, never as loss.
 - **A peer runs the pushed configuration, or its own — not both.** A machine with a configuration of its own runs that, and is not a peer: a pushed `name` beside it is ignored, with a warning at startup.
 - **The menu bar app and `mi`** show the role only through `status`.
-- **Clocks.** Staleness is judged on the follower's clock against the leader's `renewed_at`. Seconds of skew do not matter; minutes do.
+- **Clocks.** The agent's write fence uses a locally recorded receipt time, so leader/agent clock skew does not extend write permission. Follower takeover still compares its clock with the leader's `renewed_at`; minutes of skew can change failover timing. Keep peer clocks synchronized.
 
 ## Under the hood
 

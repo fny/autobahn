@@ -37,6 +37,18 @@ CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
 
 That is what `apps/tray/build.sh` does. The login service runs `target/release/autobahn`, and a feature build there replaces it.
 
+## Desktop app and shared text
+
+Dash is a separate binary behind `--features dash`, using GPUI Kit and the configuration schema. Its build currently uses Rust 1.98.0, as specified in `apps/dash/build.sh` and `.github/workflows/dash.yml`:
+
+```sh
+cargo +1.98.0 build --release --locked --features dash --bin autobahn-dash --target-dir target/dash
+```
+
+Build the CLI separately and keep it beside `autobahn-dash`, or install it where the app can find it. On macOS, `apps/dash/build.sh` creates an ad-hoc-signed bundle and copies `target/release/autobahn` into it when that command exists. Linux build packages are listed in `.github/workflows/dash.yml`; running it also needs a display server and a Vulkan driver. See [the app guide](./app.md).
+
+The ordinary CI workflow tests the CLI/library and the macOS tray. Dash has its own build workflow; a green ordinary CI run does not establish that Dash builds. Shared interface strings live in `assets/words/en.toml`, read through `src/words.rs`; the catalogue tests check their use across the interfaces. `src/surface.rs` holds the shared UI model and configuration editor.
+
 ## The A/B gate
 
 Every hot-path change is measured before it ships, because analysis estimates of these costs have been wrong every time they were tried:
@@ -53,7 +65,7 @@ It runs two binaries in interleaved legs over one synthetic corpus and reports l
 
 ## Compatibility epochs
 
-A change that breaks the wire protocol, or that makes two versions disagree about a tree — a scan rule, an ignore rule — must bump `COMPATIBILITY_EPOCH` in `src/protocol.rs`. See [State](./state.md#compatibility-epochs) for how it is enforced. After a bump, the agents bundle must be rebuilt before the supervisor is restarted, or the stale bundle is uploaded under the new name and every session fails its handshake.
+A change that breaks the wire protocol, or that makes two versions disagree about a tree — a scan rule, an ignore rule — must bump `COMPATIBILITY_EPOCH` in `src/protocol.rs`. See [State](./state.md#compatibility-epochs) for how it is enforced. After a bump, rebuild the agents bundle before restarting the supervisor. A released bundle with a stale `MANIFEST` is refused before upload; a hand-built bundle without one reaches the version handshake and is refused there.
 
 ## The specification
 

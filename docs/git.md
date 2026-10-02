@@ -23,6 +23,8 @@ ignores = [
 ]
 ```
 
+If you started from `autobahn init`, remove the broad `.git` pattern from `[defaults].ignores` for this setup, or it will still exclude the entire Git directory. Group patterns are appended to defaults; they do not replace them.
+
 That is the whole setup. Everything else in `.git` synchronizes cleanly, because of what it is:
 
 - **Objects and packs** are content-addressed and written once, by rename. Equal names mean equal bytes; a conflict is impossible.

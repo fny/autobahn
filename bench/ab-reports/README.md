@@ -1,6 +1,6 @@
 # A/B reports
 
-The raw output behind the "Currency" section of [docs/benchmarks.md](../../docs/benchmarks.md), and behind the A/B claims in the commit messages of every hot-path change.
+The raw output behind the "Currency" section of [historical 0.3.0 report](../../docs/benchmarks-0.3.md), and behind the A/B claims in the commit messages of every hot-path change.
 
 These are *not* the benchmark. The benchmark measures autobahn against mutagen on matched pairs of AWS instances; these measure autobahn against itself on one machine, to answer a narrower question: did this change move steady-state latency before it shipped? That gate exists because analysis estimates of these costs were wrong every time they were tried, and a ten-minute local harness was not.
 

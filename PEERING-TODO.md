@@ -1,5 +1,7 @@
 # Peering — experimental
 
+> Historical implementation checklist. Peering remains dangerously experimental; [docs/peering.md](docs/peering.md) is the current guide and records later fencing, local-policy, multi-group, and restricted-key changes. Configuration now uses `[experimental.peering-dangerously-experimental]`; phase records below retain their original names and scope.
+
 Failover for the star. The alpha leads; when it is gone for long enough, the first beta that is up takes the lead; when the alpha returns, it gets the lead back after one cycle as a follower. Nothing in reconciliation changes. The design is in `docs/peering.md` (written in phase 6).
 
 One word everywhere: the mode is `peering-*-dangerously-experimental`, the section is `[advanced.peering-dangerously-experimental]`, the state lives in `~/.autobahn/peering/`, the verbs are `autobahn peering …`. "Peer" is prose for one member.

@@ -1,10 +1,12 @@
 # Why mutagen is slower and uses more memory
 
-The [benchmark](./benchmarks.md) measured mutagen at 2,033 MB of peak memory against autobahn's 249 MB on a Chromium checkout. It measured a 7 to 9 second median propagation latency against autobahn's fraction of a second. This document explains where those numbers come from in mutagen's code.
+The [0.3.0 benchmark](./benchmarks-0.3.md) measured mutagen at 2,033 MB of peak memory against autobahn's 249 MB on a Chromium checkout. It measured a 7 to 9 second median propagation latency against autobahn's fraction of a second. This document explains where those numbers come from in mutagen's code.
 
 This is not a criticism of mutagen's engineering. Mutagen is a mature tool. Most of what follows comes from two decisions that buy real things elsewhere: protobuf as the in-memory tree, and scan-based rather than event-based change detection. The benchmark measures what those decisions cost at half a million files on Linux.
 
-Citations are against upstream `master` (`6ccfeaa`, after `v0.18.0`), which is what the benchmarked `0.19.0-dev` binary was built from. Read them with `git show master:<path>`.
+Citations are against upstream `master` (`6ccfeaa`, after `v0.18.0`), which is what the benchmarked `0.19.0-dev` binary was built from. Read them with `git show 6ccfeaa:<path>`.
+
+This is a historical source analysis of that measured revision. The [current benchmark](./benchmarks.md) uses newer Autobahn builds; its figures replace the old headlines without turning this into a review of current mutagen upstream.
 
 ## Memory
 
@@ -113,7 +115,7 @@ Writing the one small file that changed is a rounding error next to rescanning a
 
 - The memory model is built from the list of resident fields and measured with equivalents. It is not a heap profile of mutagen on a real Chromium tree. It agrees with the measurement to 10 to 15%.
 - Stage timings come from different hardware than the benchmark. The relative sizes hold. The absolute milliseconds do not transfer.
-- Upstream has in-flight work on several of these behaviors, including a compact tree and an inline cache timestamp. This document describes the released code that the benchmark measured.
+- This document does not assess subsequent upstream changes. Its source claims apply to `6ccfeaa`, the benchmarked development revision.
 
 ## See also
 

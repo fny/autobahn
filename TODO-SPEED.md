@@ -1,5 +1,7 @@
 # Speed
 
+> Measurements below belong to their named revisions. Since these notes, `0c72865` moved the timed full walk beside foreground scans; the October 1 Chromium patch runs measured the resulting tail improvement. See the [current matrix](docs/benchmark-matrix.md) for those results; older observations below remain historical evidence.
+
 Where the remaining time goes, and what would take it back. Every item names the measurement that would decide it, because the analysis estimate has been wrong every time it was tried; nothing here ships without an A/B (`bench/ab.sh`, now with `--remote HOST` for a destination over ssh, and `tc netem` on a loopback alias for a link with latency).
 
 Numbers are from 2026-09-22 on an 8-core c6i-class box unless a cell name says otherwise. Base is 0.4.0 at `6b67b4a`.

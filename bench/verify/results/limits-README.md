@@ -1,5 +1,7 @@
 # Three limits: cold sync throughput, latency floor, memory
 
+> Historical measurement record for the setup and build described below. Conclusions and source references belong to that run. See the [current benchmark](../../../docs/benchmarks.md) for the latest published matrix.
+
 Minimal investigations into the three numbers nobody had explained. Two needed a real peer and used one source/destination pair; the memory work is entirely local.
 
 ## 1. Cold sync throughput — we are at the destination's filesystem ceiling

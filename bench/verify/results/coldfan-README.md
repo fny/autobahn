@@ -1,5 +1,7 @@
 # Cold sync against fan-out width
 
+> Historical measurement record for the setup and build described below. Conclusions and source references belong to that run. See the [current benchmark](../../../docs/benchmarks.md) for the latest published matrix.
+
 **Question.** When one source feeds N destinations a cold (empty-destination) sync, does the source pay N times, or does the shared observer save work?
 
 **Why this needed real machines.** Two earlier local measurements answered "7.3x" and "6.4x" and both were artifacts. Running ten local destinations puts all ten destinations' own work on the one host doing the measuring, so the curve that came out described the test, not the tool. The only fix is destinations on their own machines.

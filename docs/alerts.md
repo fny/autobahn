@@ -3,8 +3,7 @@
 A supervisor running as a login service is invisible by design, which means a conflict or a permission that stopped working sits there with nobody told. `on_alert` runs a command when that happens:
 
 ```toml
-on_alert = "terminal-notifier -title autobahn -appIcon \"$AUTOBAHN_ICON\" \\
-            -subtitle \"$AUTOBAHN_DETAIL\" -message \"$AUTOBAHN_SUMMARY\""
+on_alert = 'terminal-notifier -title autobahn -appIcon "$AUTOBAHN_ICON" -subtitle "$AUTOBAHN_DETAIL" -message "$AUTOBAHN_SUMMARY"'
 ```
 
 That is the whole of it. It sits at the top level of the config because it is the one thing about alerting anyone should have to write.
@@ -44,7 +43,7 @@ Point at the first one and the escaping problem goes away:
 on_alert = "~/.autobahn/on-alert.sh"
 ```
 
-**Experimental.** What the example notices, which notifier it picks, and what it prints may change between releases. `on_alert` itself and the variables it is handed do not: a hook written against the table below keeps working.
+**Experimental.** What the example notices, which notifier it picks, and what it prints may change between releases. `on_alert` itself and the variables it is handed do not: a hook written against the variable table above keeps working.
 
 Neither script is ever replaced once it exists, not even by `autobahn init --force`, because there is no way to tell one that was edited from one that was not. Delete a script to get a fresh copy.
 
@@ -91,5 +90,6 @@ A configuration written against the old `[alerts]` section is told where each ke
 
 - [Configuration](./configuration.md) — the top-level keys
 - [The shop](./shop.md) — `autobahn mi`, where a notification leads
+- [The desktop app](./app.md) — the window and its optional menu bar
 - [The menu bar app](./macos-app.md) — an icon in the colour of the worst session
 - [The log](./logging.md) — the evidence, for the alerts that clear themselves

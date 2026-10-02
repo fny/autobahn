@@ -1,12 +1,14 @@
 # Mac bench
 
+> Historical macOS test plan and dated results. Build paths and setting names in recorded output describe the tested revision. Current commands are in [Development](docs/development.md) and [the tray guide](docs/macos-app.md); `apps/macos/` is now `apps/tray/`, whose build uses `target/tray` and does not replace the plain CLI.
+
 What can only be checked on a Mac, and how. Everything here was built and tested on Linux. On macOS the watcher is FSEvents rather than inotify, the menu bar app compiles at all, drives live under `/Volumes`, and a laptop sleeps and runs on battery.
 
-Build first, from `main` at or after `dd4f7d3` (compatibility epoch 14):
+For a new run, build the current checkout first and record its commit (the original plan started at `dd4f7d3`, epoch 14):
 
 ```sh
-cargo build --release
-apps/macos/build.sh          # the menu bar app; also replaces target/release/autobahn for the login service
+cargo build --release --locked --bin autobahn
+apps/tray/build.sh           # standalone menu bar app, built in target/tray
 autobahn restart             # if a login service is installed
 ```
 

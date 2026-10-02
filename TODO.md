@@ -1,5 +1,7 @@
 # TODO
 
+> Current behavior is documented under [docs](README.md#documentation). Completed items below preserve the decisions and names used at the time; they are not current configuration examples. The open `fold_transition` investigation remains parked pending a reproduction. `ignore_mounts` now defaults to `false`, timing tables live under `[experimental]`, and agent names use twelve digest hex characters; see [Configuration](docs/configuration.md) and [State](docs/state.md).
+
 Running list, kept in the repository.
 
 Open work is sorted by what a v1 needs. Everything settled is below, with the measurements that produced it.

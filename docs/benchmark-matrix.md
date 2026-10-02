@@ -1,163 +1,212 @@
-# Benchmark matrix: autobahn 0.3.0 vs mutagen 0.19.0-dev
+# Benchmark matrix: September–October 2026
 
-> **Every figure here is autobahn 0.3.0.** At 0.4.0 the latency cells
-> should be read about 6 ms higher (an intent record is synced before
-> each mutating cycle of a remote session) and the first-synchronization
-> cells slightly higher (published content is re-hashed at the moment of
-> publication). The reasoning and the measurements are in
-> [the summary](./benchmarks.md#currency-what-changed-since-these-numbers).
-> Both changes buy correctness properties, and neither changes a
-> conclusion in these tables.
+This is the latest recorded matrix, refreshed through October 1. It is a composite of complete cells from identified builds, not a run of today's HEAD. The [summary](./benchmarks.md) explains the headline results. The committed [aggregate](../benchmarks/2026-10-01.json) contains the figures, sample counts, per-run ranges, exclusions, and problem records used below.
 
-Every cell, every percentile. The summary and the interpretation are in [the benchmark summary](./benchmarks.md). The method is in [bench/README.md](../bench/README.md).
+## Provenance
 
-**Setup.** Matched pairs of `c6i.4xlarge` instances, one AWS availability zone, 200 GB gp3 volumes. Chromium at 504,940 files with symbolic links removed and `.git` and `out` excluded. Fifteen cells, ten repeats each: 150 jobs and 300 tool-runs. Both tools run in every job, back to back on the same pair, in an order randomized per job. mutagen used a 5-second poll interval, better than its 10-second default.
+| Cells | Autobahn build | Run | Date |
+|---|---|---|---|
+| All except the five patch cells below | `e7b3ac0`, 0.4.0+e16, musl `dist` with mimalloc | `bench-1790601586` | 2026-09-28 |
+| `50k-1-patch`, `50k-10-patch` | `98598b8` | `bench-1790773610` | 2026-09-30 |
+| `chromium-10-fan-patch` | `0c72865` | `bench-1790869509` | 2026-10-01 |
+| `chromium-1-patch`, `chromium-10-patch` | `0c72865` | `bench-1790873270` | 2026-10-01 |
 
-**Integrity.** 150 of 150 jobs completed. Zero censored samples. One run excluded, when a destination host became unreachable and the cleanliness check refused to certify it. Harness overhead measured 0.6 ms median across all 150 jobs, against results in the tens to thousands of milliseconds.
+Each replacement carries both tools' measurements from the same follow-up run. Intermediate patch runs (`1790773610`'s Chromium cells and `1790826510`) are superseded here. The base run's Autobahn binary SHA-256 is `5dfaffcf415724c2e1c0440c6610cb482d43d8fdb7c3def68c7552e474f6ce76`; its harness SHA-256 is `a46f791514a2b4a6ce964af6c2e492b138a1a99c36c730a5e7a2a73331055f04`.
+
+The base matrix has 32 cells × 5 repeats: 160 completed jobs, each running Autobahn and mutagen 0.19.0-dev on the same machines in randomized order. There are no excluded tool-runs, censored latency samples, or inconsistent resource series in the published aggregate. Follow-up runs also completed with five repeats per cell and no exclusions or censored samples. Skipped workload ticks remain reported; they are an offered-load shortfall, not a timeout.
+
+The base run used 26 groups on 151 Linux instances in us-east-2: 106 `c6i.4xlarge`, 30 `c6i.2xlarge`, and 15 `c6i.xlarge`. Smaller cells can run on larger groups. The image was `ami-096a78f9bffc18f94`, with Chromium at `87d2dbeceeb6ee28744922bdcf7be799c065627e`. Corpus labels `5k` and `50k` name approximate subsets; they are not the older report's `4k` and `40k` cells. The full checkout is about 505,000 files. Harness floor p50 was 0.7 ms (0.5–0.8 ms across the base run).
+
+Raw JSONL and plans remain in the local `bench/results-bench-<run>/` directories; these directories are normally ignored by Git. The committed aggregate makes the tables available in a clean checkout, but is not a substitute for raw samples when re-running the analysis. See [bench/README.md](../bench/README.md) for the harness.
 
 ## Propagation latency
 
-All figures are milliseconds. `⇄` marks a bidirectional cell, which runs a separate measuring agent in each direction. Ratio is mutagen's median over autobahn's. "Skipped" counts ticks where the measuring agent could not issue an edit, which records an offered-load shortfall.
+All percentiles are pooled milliseconds across five repeats. `ab` is Autobahn, `mu` is mutagen. Samples and skipped ticks are shown as `ab / mu`. `-bidir` measures each direction separately; `-fan` has ten destinations; `-patch` changes ranges within large files instead of replacing small files. The direction labels retain the corpus identity for two-tree cells.
 
-| corpus | agents | direction | ab p50 | ab p90 | ab p99 | mu p50 | mu p90 | mu p99 | ratio | samples | skipped |
-|---|---|---|---|---|---|---|---|---|---|---|---|
-| Chromium | 1 | a-to-b | 188 | 286 | 16,188 | 7,118 | 9,369 | 10,710 | **37.8×** | 1,729 | 3 |
-| Chromium | 10 | a-to-b | 356 | 525 | 2,061 | 8,521 | 12,079 | 18,622 | **23.9×** | 1,741 | 2 |
-| Chromium | 100 | a-to-b | 782 | 2,396 | 4,414 | 7,664 | 11,560 | 25,705 | **9.8×** | 1,732 | 2 |
-| Chromium ⇄ | 1 | a-to-b | 835 | 1,272 | 2,567 | 7,226 | 9,967 | 30,807 | **8.7×** | 1,739 | 0 |
-| Chromium ⇄ | 1 | b-to-a | 854 | 1,276 | 2,839 | 8,756 | 11,631 | 33,942 | **10.3×** | 1,719 | 1 |
-| Chromium ⇄ | 10 | a-to-b | 1,132 | 1,524 | 19,026 | 6,368 | 9,472 | 32,334 | **5.6×** | 1,724 | 31 |
-| Chromium ⇄ | 10 | b-to-a | 1,152 | 1,586 | 18,697 | 6,788 | 9,909 | 25,862 | **5.9×** | 1,732 | 24 |
-| Chromium ⇄ | 100 | a-to-b | 4,984 | 15,064 | 32,483 | 11,067 | 15,310 | 17,937 | **2.2×** | 1,691 | 59 |
-| Chromium ⇄ | 100 | b-to-a | 5,842 | 17,838 | 36,912 | 12,134 | 16,352 | 18,825 | **2.1×** | 1,678 | 75 |
-| 40k | 1 | a-to-b | 52 | 135 | 186 | 286 | 1,064 | 2,786 | **5.5×** | 1,733 | 0 |
-| 40k | 10 | a-to-b | 52 | 81 | 142 | 1,854 | 4,259 | 5,127 | **35.4×** | 1,569 | 0 |
-| 40k | 100 | a-to-b | 128 | 226 | 352 | 1,602 | 3,772 | 5,387 | **12.5×** | 1,743 | 0 |
-| 2×40k | 1 | a-to-b | 55 | 136 | 216 | 303 | 1,036 | 2,586 | **5.5×** | 1,724 | 0 |
-| 2×40k | 1 | a-to-b | 58 | 139 | 223 | 355 | 1,100 | 2,868 | **6.1×** | 1,743 | 0 |
-| 2×40k | 10 | a-to-b | 57 | 89 | 141 | 1,919 | 4,280 | 5,150 | **33.9×** | 1,744 | 0 |
-| 2×40k | 10 | a-to-b | 61 | 97 | 151 | 1,928 | 4,345 | 5,350 | **31.6×** | 1,734 | 0 |
-| 2×40k | 100 | a-to-b | 158 | 270 | 396 | 1,689 | 3,955 | 5,574 | **10.7×** | 1,726 | 0 |
-| 2×40k | 100 | a-to-b | 181 | 304 | 433 | 1,853 | 4,178 | 5,581 | **10.2×** | 1,755 | 0 |
-| 4k | 1 | a-to-b | 41 | 118 | 142 | 62 | 800 | 2,390 | **1.5×** | 1,780 | 0 |
-| 4k | 10 | a-to-b | 40 | 64 | 104 | 1,037 | 3,114 | 4,821 | **25.7×** | 1,747 | 0 |
-| 4k | 100 | a-to-b | 78 | 133 | 4,204 | 2,690 | 4,953 | 5,459 | **34.6×** | 1,737 | 0 |
-
-### Reading the latency table
-
-**autobahn leads every cell**, from 1.5× on the smallest to 37.8× on Chromium with a single writer.
-
-**The two tools scale differently.** autobahn's median moves from 40 ms to 782 ms across the whole matrix, a factor of about 20 spanning a 125× change in tree size and a 100× change in concurrency. mutagen's moves from 62 ms to 11,600 ms, a factor of 187.
-
-**The 99th percentile carries a defect, not a scaling limit.** In several cells autobahn's 99th percentile sits far above its 90th. The cause is a self-inflicted session restart: under churn a file is rewritten between staging and application, the cycle reports missing staged content, and after six such cycles autobahn fails the whole attempt even though each cycle applied dozens of other changes. The supervisor then drops the session, backs off, reconnects and rescans, and nothing propagates meanwhile. Restarts number 30 across `chromium-100-bidir`, 8 across `4k-100`, and 2 in a single `chromium-1` run. Every cell with a multi-second outlier has them, and every cell without them has a clean tail. Details in [the summary](./benchmarks.md#where-autobahn-is-weakest). The defect has since been fixed; the summary says how.
-
-**mutagen's ordering is not monotonic in agent count.** On the 40k corpus it is slower at 10 agents (1,854 ms) than at 100 (1,602 ms). Both are far above its single-agent figure of 286 ms. Under continuous churn its coalescing timers reset rather than expire, so latency tracks writer density in a way that is not simply proportional to it.
+| Cell | Direction | ab p50 | ab p90 | ab p99 | mu p50 | mu p90 | mu p99 | p50 ratio | Samples ab / mu | Skipped ab / mu |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 50k-1-patch | sub50k:a-to-b | 22.7 | 25.2 | 29.7 | 447.4 | 546.5 | 686.3 | 19.7× | 2,748 / 2,729 | 0 / 0 |
+| 50k-1 | sub50k:a-to-b | 13.6 | 14.2 | 44.1 | 426.5 | 533.9 | 1,927.5 | 31.4× | 2,756 / 2,722 | 0 / 0 |
+| 50k-10-fan | sub50k:a-to-b | 17.2 | 29.8 | 89.6 | 4,820.0 | 5,320.0 | 5,602.1 | 280.2× | 2,736 / 2,720 | 0 / 0 |
+| 50k-10-patch | sub50k:a-to-b | 22.7 | 27.5 | 35.5 | 709.1 | 2,065.6 | 3,509.4 | 31.2× | 2,728 / 2,703 | 0 / 1 |
+| 50k-10 | sub50k:a-to-b | 13.4 | 20.4 | 45.9 | 1,809.8 | 4,185.5 | 5,226.2 | 135.1× | 2,738 / 2,757 | 0 / 0 |
+| 50k-100 | sub50k:a-to-b | 28.3 | 54.7 | 80.3 | 2,139.0 | 4,507.1 | 5,706.2 | 75.6× | 2,742 / 2,745 | 0 / 0 |
+| 5k-1 | sub5k:a-to-b | 12.1 | 12.6 | 14.0 | 74.1 | 77.3 | 1,666.3 | 6.1× | 2,750 / 2,754 | 0 / 0 |
+| 5k-10-fan | sub5k:a-to-b | 16.9 | 23.4 | 33.2 | 3,417.1 | 4,885.0 | 5,081.3 | 202.2× | 2,739 / 2,751 | 0 / 0 |
+| 5k-10 | sub5k:a-to-b | 11.6 | 16.6 | 25.2 | 1,235.1 | 3,547.2 | 4,877.5 | 106.5× | 2,765 / 2,773 | 0 / 0 |
+| 5k-100 | sub5k:a-to-b | 18.3 | 31.0 | 41.2 | 2,733.2 | 4,948.1 | 5,495.3 | 149.4× | 2,755 / 2,747 | 0 / 0 |
+| chromium-1-bidir | chromium:a-to-b | 23.5 | 159.4 | 385.4 | 7,299.5 | 9,908.0 | 11,776.6 | 310.6× | 2,720 / 2,741 | 0 / 0 |
+| chromium-1-bidir | chromium:b-to-a | 28.8 | 324.8 | 625.8 | 8,436.9 | 11,144.2 | 13,254.7 | 292.9× | 2,746 / 2,771 | 0 / 0 |
+| chromium-1-patch | chromium:a-to-b | 33.1 | 44.4 | 48.2 | 7,575.9 | 9,442.5 | 10,510.8 | 228.9× | 2,708 / 1,823 | 0 / 980 |
+| chromium-1 | chromium:a-to-b | 23.8 | 293.0 | 355.8 | 6,232.2 | 8,820.4 | 10,293.3 | 261.9× | 2,730 / 2,741 | 0 / 0 |
+| chromium-10-bidir | chromium:a-to-b | 47.1 | 289.9 | 607.8 | 6,062.7 | 8,540.1 | 10,135.9 | 128.7× | 2,738 / 2,753 | 0 / 1 |
+| chromium-10-bidir | chromium:b-to-a | 74.6 | 368.0 | 697.9 | 6,329.2 | 8,826.1 | 10,838.9 | 84.8× | 2,713 / 2,732 | 0 / 0 |
+| chromium-10-fan-patch | chromium:a-to-b | 42.0 | 67.0 | 107.8 | 11,165.1 | 17,103.1 | 25,404.1 | 265.8× | 2,710 / 1,268 | 0 / 1576 |
+| chromium-10-fan | chromium:a-to-b | 43.9 | 441.4 | 822.2 | 10,881.0 | 12,898.8 | 16,194.5 | 247.9× | 2,723 / 2,713 | 0 / 2 |
+| chromium-10-patch | chromium:a-to-b | 34.0 | 44.8 | 58.1 | 7,839.6 | 11,095.3 | 13,304.5 | 230.6× | 2,711 / 1,765 | 0 / 1038 |
+| chromium-10 | chromium:a-to-b | 26.7 | 189.0 | 527.1 | 9,202.4 | 12,160.8 | 13,215.0 | 344.7× | 2,736 / 2,734 | 0 / 0 |
+| chromium-100-bidir | chromium:a-to-b | 232.9 | 480.3 | 1,239.4 | 11,331.3 | 15,413.8 | 17,353.7 | 48.7× | 2,731 / 2,720 | 0 / 3 |
+| chromium-100-bidir | chromium:b-to-a | 299.0 | 609.9 | 1,305.5 | 12,128.8 | 16,205.0 | 17,873.0 | 40.6× | 2,740 / 2,709 | 0 / 3 |
+| chromium-100 | chromium:a-to-b | 80.3 | 339.6 | 681.9 | 8,421.8 | 11,920.3 | 13,463.4 | 104.9× | 2,755 / 2,763 | 0 / 0 |
+| two50k-1 | sub50k-b:a-to-b | 12.9 | 20.6 | 35.8 | 367.0 | 447.1 | 1,827.7 | 28.4× | 2,750 / 2,720 | 0 / 0 |
+| two50k-1 | sub50k:a-to-b | 13.1 | 14.2 | 44.6 | 444.2 | 558.4 | 1,836.3 | 33.9× | 2,723 / 2,707 | 0 / 0 |
+| two50k-10-fan | sub50k-b:a-to-b | 19.3 | 38.7 | 82.7 | 5,128.6 | 5,656.5 | 6,210.2 | 265.7× | 2,733 / 2,730 | 0 / 0 |
+| two50k-10-fan | sub50k:a-to-b | 19.0 | 48.3 | 109.0 | 5,019.8 | 5,615.2 | 6,466.1 | 264.2× | 2,736 / 2,725 | 0 / 0 |
+| two50k-10 | sub50k-b:a-to-b | 13.2 | 23.8 | 36.7 | 2,040.4 | 4,541.5 | 5,429.4 | 154.6× | 2,720 / 2,741 | 0 / 0 |
+| two50k-10 | sub50k:a-to-b | 13.6 | 21.0 | 46.4 | 1,908.8 | 4,375.8 | 5,272.0 | 140.4× | 2,724 / 2,722 | 0 / 0 |
+| two50k-100 | sub50k-b:a-to-b | 39.2 | 67.2 | 94.3 | 2,027.4 | 4,387.0 | 5,712.9 | 51.7× | 2,684 / 2,767 | 0 / 0 |
+| two50k-100 | sub50k:a-to-b | 31.8 | 62.8 | 90.5 | 2,170.7 | 4,628.4 | 5,786.9 | 68.3× | 2,706 / 2,708 | 0 / 0 |
 
 ## Memory and CPU
 
-Peak resident memory and mean CPU, as a percentage of one core, median across repeats. "Source" is the editing host, "dest" the receiving one. Sampling covers each tool's whole process tree, including its remote agent.
+Median of each run's peak resident memory, in MiB (the aggregate's `/proc` KiB divided by 1024), and mean CPU as a percentage of one core. `local` is the controller/source; `remote` is the destination resource series. These cover the tool process trees, including transport children. Fan-out and two-tree cells have different topology and must not be treated as one-pair per-file memory costs.
 
 ### Workload
 
-| corpus, agents | host | autobahn RSS | mutagen RSS | ratio | autobahn CPU | mutagen CPU |
-|---|---|---|---|---|---|---|
-| 4k, 1 | source | 16 MB | 48 MB | **3.1×** | 1.1% | 6.1% |
-| 4k, 1 | dest | 5 MB | 31 MB | **6.1×** | 0.3% | 4.0% |
-| 4k, 10 | source | 17 MB | 48 MB | **2.8×** | 5.8% | 4.1% |
-| 4k, 10 | dest | 5 MB | 32 MB | **6.0×** | 2.1% | 3.5% |
-| 4k, 100 | source | 19 MB | 49 MB | **2.6×** | 17.7% | 13.2% |
-| 4k, 100 | dest | 6 MB | 35 MB | **6.1×** | 10.9% | 8.9% |
-| 40k, 1 | source | 33 MB | 171 MB | **5.2×** | 5.4% | 50.1% |
-| 40k, 1 | dest | 16 MB | 121 MB | **7.5×** | 1.5% | 36.3% |
-| 40k, 10 | source | 39 MB | 168 MB | **4.3×** | 34.6% | 17.1% |
-| 40k, 10 | dest | 17 MB | 128 MB | **7.4×** | 7.4% | 15.6% |
-| 40k, 100 | source | 41 MB | 180 MB | **4.4×** | 35.2% | 38.1% |
-| 40k, 100 | dest | 18 MB | 132 MB | **7.4×** | 22.8% | 40.6% |
-| 2×40k, 1 | source | 55 MB | 328 MB | **6.0×** | 13.0% | 115.2% |
-| 2×40k, 1 | dest | 30 MB | 251 MB | **8.4×** | 3.2% | 75.7% |
-| 2×40k, 10 | source | 65 MB | 303 MB | **4.7×** | 87.7% | 36.5% |
-| 2×40k, 10 | dest | 31 MB | 267 MB | **8.7×** | 20.6% | 39.4% |
-| 2×40k, 100 | source | 71 MB | 330 MB | **4.7×** | 82.2% | 78.5% |
-| 2×40k, 100 | dest | 31 MB | 274 MB | **8.8×** | 48.2% | 80.7% |
-| Chromium, 1 | source | 249 MB | 2,033 MB | **8.2×** | 60.2% | 153.1% |
-| Chromium, 1 | dest | 173 MB | 1,361 MB | **7.9×** | 16.1% | 117.4% |
-| Chromium, 10 | source | 272 MB | 1,964 MB | **7.2×** | 102.9% | 97.2% |
-| Chromium, 10 | dest | 173 MB | 1,448 MB | **8.3×** | 31.8% | 113.9% |
-| Chromium, 100 | source | 321 MB | 1,903 MB | **5.9×** | 79.4% | 103.1% |
-| Chromium, 100 | dest | 180 MB | 1,447 MB | **8.1×** | 35.0% | 124.5% |
-| Chromium ⇄, 1 | source | 449 MB | 2,054 MB | **4.6×** | 88.7% | 150.9% |
-| Chromium ⇄, 1 | dest | 239 MB | 1,375 MB | **5.8×** | 43.4% | 132.8% |
-| Chromium ⇄, 10 | source | 452 MB | 2,083 MB | **4.6×** | 89.2% | 128.0% |
-| Chromium ⇄, 10 | dest | 238 MB | 1,378 MB | **5.8×** | 47.0% | 102.9% |
-| Chromium ⇄, 100 | source | 449 MB | 1,921 MB | **4.3×** | 60.0% | 116.7% |
-| Chromium ⇄, 100 | dest | 239 MB | 1,358 MB | **5.7×** | 44.4% | 87.5% |
+| Cell | Host | ab MiB | mu MiB | ab CPU % | mu CPU % |
+|---|---|---:|---:|---:|---:|
+| 50k-1-patch | local | 73.9 | 269.7 | 2.9 | 91.9 |
+| 50k-1-patch | remote | 49.4 | 184.0 | 1.4 | 62.4 |
+| 50k-1 | local | 76.7 | 273.4 | 2.7 | 84.5 |
+| 50k-1 | remote | 51.4 | 195.6 | 0.8 | 58.3 |
+| 50k-10-fan | local | 565.7 | 2,716.9 | 58.8 | 293.2 |
+| 50k-10-fan | remote | 404.8 | 1,745.1 | 43.3 | 218.0 |
+| 50k-10-patch | local | 75.7 | 273.8 | 11.0 | 56.6 |
+| 50k-10-patch | remote | 35.9 | 199.3 | 5.9 | 48.6 |
+| 50k-10 | local | 89.6 | 266.3 | 11.6 | 27.1 |
+| 50k-10 | remote | 40.9 | 198.6 | 4.1 | 24.9 |
+| 50k-100 | local | 107.1 | 277.2 | 36.8 | 48.2 |
+| 50k-100 | remote | 50.0 | 206.0 | 17.5 | 46.3 |
+| 50k-burst | local | 217.2 | 777.1 | 77.9 | 46.0 |
+| 50k-burst | remote | 131.2 | 581.6 | 97.3 | 84.0 |
+| 5k-1 | local | 28.4 | 52.7 | 0.6 | 9.5 |
+| 5k-1 | remote | 19.7 | 32.3 | 0.2 | 6.9 |
+| 5k-10-fan | local | 172.1 | 377.3 | 27.4 | 61.5 |
+| 5k-10-fan | remote | 162.4 | 319.3 | 19.9 | 46.5 |
+| 5k-10 | local | 27.6 | 54.0 | 3.3 | 5.1 |
+| 5k-10 | remote | 16.5 | 34.5 | 1.3 | 3.8 |
+| 5k-100 | local | 33.2 | 52.7 | 14.2 | 14.4 |
+| 5k-100 | remote | 22.8 | 38.6 | 8.9 | 9.9 |
+| chromium-1-bidir | local | 467.3 | 2,121.8 | 21.3 | 155.8 |
+| chromium-1-bidir | remote | 319.3 | 1,377.3 | 28.7 | 138.9 |
+| chromium-1-patch | local | 351.1 | 2,078.4 | 16.9 | 158.3 |
+| chromium-1-patch | remote | 168.9 | 1,367.9 | 5.5 | 119.8 |
+| chromium-1 | local | 479.0 | 2,081.3 | 20.3 | 162.8 |
+| chromium-1 | remote | 170.4 | 1,380.4 | 4.8 | 124.9 |
+| chromium-10-bidir | local | 509.7 | 2,128.0 | 61.7 | 131.6 |
+| chromium-10-bidir | remote | 370.1 | 1,429.0 | 77.0 | 106.1 |
+| chromium-10-fan-patch | local | 2,085.9 | 22,441.9 | 178.0 | 1289.0 |
+| chromium-10-fan-patch | remote | 1,866.8 | 12,848.0 | 222.2 | 1091.4 |
+| chromium-10-fan | local | 3,449.7 | 22,124.6 | 278.3 | 1275.3 |
+| chromium-10-fan | remote | 1,825.9 | 12,861.5 | 185.3 | 1086.5 |
+| chromium-10-patch | local | 367.3 | 2,111.0 | 50.6 | 110.6 |
+| chromium-10-patch | remote | 153.4 | 1,427.7 | 19.5 | 123.6 |
+| chromium-10 | local | 529.6 | 2,074.4 | 60.2 | 91.8 |
+| chromium-10 | remote | 157.9 | 1,472.1 | 19.3 | 112.4 |
+| chromium-100-bidir | local | 564.6 | 2,034.5 | 95.4 | 113.8 |
+| chromium-100-bidir | remote | 379.9 | 1,398.2 | 71.7 | 87.8 |
+| chromium-100 | local | 544.4 | 2,014.3 | 94.2 | 105.2 |
+| chromium-100 | remote | 159.2 | 1,451.8 | 37.9 | 123.9 |
+| chromium-burst | local | 385.3 | 1,914.6 | 11.5 | 113.2 |
+| chromium-burst | remote | 216.3 | 1,316.8 | 12.2 | 93.1 |
+| two50k-1 | local | 119.6 | 448.9 | 4.8 | 159.8 |
+| two50k-1 | remote | 66.0 | 320.8 | 1.4 | 106.5 |
+| two50k-10-fan | local | 838.1 | 4,830.9 | 134.7 | 550.0 |
+| two50k-10-fan | remote | 662.4 | 3,140.0 | 81.9 | 386.8 |
+| two50k-10 | local | 145.2 | 405.2 | 22.7 | 46.0 |
+| two50k-10 | remote | 77.2 | 352.2 | 8.8 | 48.7 |
+| two50k-100 | local | 187.0 | 446.6 | 86.9 | 91.5 |
+| two50k-100 | remote | 86.1 | 362.0 | 37.4 | 91.5 |
 
 ### Idle
 
-| corpus, agents | host | autobahn RSS | mutagen RSS | ratio | autobahn CPU | mutagen CPU |
-|---|---|---|---|---|---|---|
-| 4k, 1 | source | 15 MB | 46 MB | **3.2×** | 0.1% | 0.4% |
-| 4k, 1 | dest | 6 MB | 28 MB | **5.1×** | 0.0% | 0.4% |
-| 4k, 10 | source | 15 MB | 46 MB | **3.1×** | 0.1% | 0.4% |
-| 4k, 10 | dest | 6 MB | 28 MB | **5.1×** | 0.0% | 0.4% |
-| 4k, 100 | source | 14 MB | 46 MB | **3.2×** | 0.1% | 0.4% |
-| 4k, 100 | dest | 6 MB | 28 MB | **5.1×** | 0.0% | 0.4% |
-| 40k, 1 | source | 29 MB | 162 MB | **5.7×** | 0.1% | 3.6% |
-| 40k, 1 | dest | 19 MB | 113 MB | **5.8×** | 0.0% | 3.9% |
-| 40k, 10 | source | 29 MB | 163 MB | **5.7×** | 0.1% | 3.7% |
-| 40k, 10 | dest | 20 MB | 110 MB | **5.6×** | 0.0% | 3.6% |
-| 40k, 100 | source | 29 MB | 161 MB | **5.6×** | 0.1% | 3.5% |
-| 40k, 100 | dest | 20 MB | 116 MB | **5.9×** | 0.0% | 3.6% |
-| 2×40k, 1 | source | 47 MB | 289 MB | **6.2×** | 0.2% | 8.1% |
-| 2×40k, 1 | dest | 38 MB | 245 MB | **6.4×** | 0.1% | 7.8% |
-| 2×40k, 10 | source | 47 MB | 292 MB | **6.3×** | 0.2% | 7.8% |
-| 2×40k, 10 | dest | 38 MB | 240 MB | **6.3×** | 0.1% | 8.1% |
-| 2×40k, 100 | source | 47 MB | 292 MB | **6.3×** | 0.2% | 8.1% |
-| 2×40k, 100 | dest | 38 MB | 244 MB | **6.4×** | 0.1% | 7.8% |
-| Chromium, 1 | source | 193 MB | 1,712 MB | **8.9×** | 0.2% | 49.9% |
-| Chromium, 1 | dest | 200 MB | 1,358 MB | **6.8×** | 3.0% | 51.5% |
-| Chromium, 10 | source | 192 MB | 1,791 MB | **9.3×** | 0.2% | 50.0% |
-| Chromium, 10 | dest | 200 MB | 1,327 MB | **6.6×** | 3.0% | 51.0% |
-| Chromium, 100 | source | 194 MB | 1,777 MB | **9.2×** | 0.2% | 50.0% |
-| Chromium, 100 | dest | 200 MB | 1,287 MB | **6.4×** | 3.0% | 52.3% |
-| Chromium ⇄, 1 | source | 192 MB | 1,803 MB | **9.4×** | 0.2% | 50.9% |
-| Chromium ⇄, 1 | dest | 200 MB | 1,331 MB | **6.7×** | 3.0% | 53.0% |
-| Chromium ⇄, 10 | source | 194 MB | 1,768 MB | **9.1×** | 0.2% | 50.4% |
-| Chromium ⇄, 10 | dest | 200 MB | 1,303 MB | **6.5×** | 3.0% | 52.8% |
-| Chromium ⇄, 100 | source | 194 MB | 1,749 MB | **9.0×** | 0.2% | 49.7% |
-| Chromium ⇄, 100 | dest | 200 MB | 1,354 MB | **6.8×** | 3.0% | 52.5% |
-
-### Reading the resource tables
-
-**Memory scales with the tree, not with the agent count.** autobahn holds Chromium in 249 MB with one agent and 321 MB with a hundred. The ratio against mutagen grows with file count — 3.1× at 4,000 files, 8.2× at 505,000 — which is the signature of a per-file cost rather than fixed overhead.
-
-**Idle CPU is the starkest single number.** With the tree synchronized and nothing happening, mutagen uses half a core on Chromium. autobahn uses two tenths of one percent.
-
-**The receiving host is not idle for mutagen.** In one-direction cells it does no editing, yet mutagen sustains more than a core there. It rescans and reserializes the whole tree on every cycle.
-
-An implementation account of all three findings is in [Why mutagen is slower](./mutagen.md).
+| Cell | Host | ab MiB | mu MiB | ab CPU % | mu CPU % |
+|---|---|---:|---:|---:|---:|
+| 50k-1-patch | local | 67.9 | 220.3 | 0.1 | 5.7 |
+| 50k-1-patch | remote | 43.0 | 160.2 | 0.0 | 5.8 |
+| 50k-1 | local | 67.1 | 214.8 | 0.1 | 5.8 |
+| 50k-1 | remote | 43.3 | 163.7 | 0.0 | 5.6 |
+| 50k-10-fan | local | 516.2 | 1,824.4 | 0.7 | 56.2 |
+| 50k-10-fan | remote | 398.5 | 1,591.0 | 0.2 | 59.0 |
+| 50k-10-patch | local | 68.8 | 223.1 | 0.1 | 5.5 |
+| 50k-10-patch | remote | 42.9 | 160.8 | 0.0 | 6.0 |
+| 50k-10 | local | 67.5 | 219.5 | 0.1 | 5.8 |
+| 50k-10 | remote | 42.7 | 156.2 | 0.0 | 5.6 |
+| 50k-100 | local | 68.2 | 216.3 | 0.1 | 5.7 |
+| 50k-100 | remote | 42.7 | 160.4 | 0.0 | 5.8 |
+| 50k-burst | local | 67.8 | 211.4 | 0.1 | 5.6 |
+| 50k-burst | remote | 42.8 | 163.6 | 0.0 | 5.9 |
+| 5k-1 | local | 23.1 | 47.8 | 0.1 | 0.6 |
+| 5k-1 | remote | 11.5 | 29.7 | 0.0 | 0.6 |
+| 5k-10-fan | local | 164.8 | 289.8 | 0.8 | 5.6 |
+| 5k-10-fan | remote | 114.8 | 287.2 | 0.3 | 6.7 |
+| 5k-10 | local | 23.4 | 47.5 | 0.1 | 0.6 |
+| 5k-10 | remote | 11.6 | 29.4 | 0.0 | 0.5 |
+| 5k-100 | local | 22.9 | 47.2 | 0.1 | 0.6 |
+| 5k-100 | remote | 11.4 | 29.6 | 0.0 | 0.5 |
+| chromium-1-bidir | local | 387.1 | 1,692.5 | 0.1 | 48.8 |
+| chromium-1-bidir | remote | 169.7 | 1,276.2 | 0.0 | 51.4 |
+| chromium-1-patch | local | 386.6 | 1,793.5 | 0.1 | 49.2 |
+| chromium-1-patch | remote | 168.9 | 1,285.2 | 0.0 | 49.3 |
+| chromium-1 | local | 386.5 | 1,713.3 | 0.1 | 49.9 |
+| chromium-1 | remote | 170.4 | 1,268.8 | 0.0 | 51.1 |
+| chromium-10-bidir | local | 386.7 | 1,728.7 | 0.1 | 50.0 |
+| chromium-10-bidir | remote | 170.5 | 1,231.3 | 0.0 | 50.3 |
+| chromium-10-fan-patch | local | 3,037.0 | 15,094.6 | 0.8 | 565.0 |
+| chromium-10-fan-patch | remote | 1,923.8 | 12,428.9 | 0.3 | 521.2 |
+| chromium-10-fan | local | 3,055.3 | 15,149.4 | 0.8 | 611.8 |
+| chromium-10-fan | remote | 1,891.4 | 12,560.3 | 0.3 | 515.6 |
+| chromium-10-patch | local | 387.3 | 1,654.1 | 0.1 | 49.1 |
+| chromium-10-patch | remote | 170.9 | 1,241.7 | 0.0 | 49.5 |
+| chromium-10 | local | 386.7 | 1,714.2 | 0.1 | 48.0 |
+| chromium-10 | remote | 170.8 | 1,271.1 | 0.0 | 50.8 |
+| chromium-100-bidir | local | 387.0 | 1,730.7 | 0.1 | 47.5 |
+| chromium-100-bidir | remote | 170.6 | 1,278.0 | 0.0 | 50.4 |
+| chromium-100 | local | 386.0 | 1,718.3 | 0.1 | 48.1 |
+| chromium-100 | remote | 170.2 | 1,261.1 | 0.0 | 50.5 |
+| chromium-burst | local | 386.3 | 1,751.2 | 0.1 | 48.7 |
+| chromium-burst | remote | 170.2 | 1,277.3 | 0.0 | 49.8 |
+| coldsync-50k-fan | local | 500.0 | 1,834.5 | 0.7 | 57.2 |
+| coldsync-50k-fan | remote | 859.6 | 1,681.5 | 0.2 | 58.0 |
+| coldsync-50k | local | 71.3 | 237.8 | 0.1 | 5.7 |
+| coldsync-50k | remote | 87.8 | 172.0 | 0.0 | 5.9 |
+| coldsync-5k-fan | local | 209.0 | 304.3 | 0.8 | 5.5 |
+| coldsync-5k-fan | remote | 305.6 | 317.3 | 0.2 | 6.4 |
+| coldsync-5k | local | 29.2 | 49.7 | 0.1 | 0.6 |
+| coldsync-5k | remote | 36.6 | 31.9 | 0.0 | 0.6 |
+| coldsync-chromium-fan | local | 1,210.8 | 15,190.6 | 0.7 | 563.6 |
+| coldsync-chromium-fan | remote | 2,704.0 | 12,758.1 | 46.9 | 511.8 |
+| coldsync-chromium | local | 210.2 | 1,812.1 | 0.1 | 48.9 |
+| coldsync-chromium | remote | 271.4 | 1,345.9 | 5.0 | 50.3 |
+| two50k-1 | local | 116.4 | 354.2 | 0.2 | 9.9 |
+| two50k-1 | remote | 64.4 | 291.5 | 0.0 | 9.9 |
+| two50k-10-fan | local | 867.6 | 3,240.5 | 1.4 | 112.0 |
+| two50k-10-fan | remote | 671.0 | 2,956.3 | 0.5 | 105.1 |
+| two50k-10 | local | 115.0 | 343.9 | 0.2 | 9.9 |
+| two50k-10 | remote | 70.8 | 284.5 | 0.0 | 10.6 |
+| two50k-100 | local | 115.4 | 349.7 | 0.2 | 10.0 |
+| two50k-100 | remote | 64.4 | 288.6 | 0.0 | 10.2 |
 
 ## First synchronization
 
-Time to first digest-verified convergence, with the corpus faulted into the volume and the page cache dropped beforehand.
+Dedicated unseeded cells, median digest-verified seconds across five repeats. Ordinary latency cells are pre-seeded and do not measure first-sync throughput. Verification and completion polling are included.
 
-| corpus | autobahn | mutagen |
-|---|---|---|
-| Chromium (505k files) | 423.3 s | 418.0 s |
-| 40k files | 34.0 s | 31.8 s |
-| 2 × 40k files | 35.5 s / 38.5 s | 30.0 s / 38.1 s |
-| 4k files | 8.4 s | 5.8 s |
+| Cell | Autobahn seconds | mutagen seconds |
+|---|---:|---:|
+| coldsync-50k-fan | 23.9 | 57.8 |
+| coldsync-50k | 21.9 | 52.1 |
+| coldsync-5k-fan | 7.7 | 23.0 |
+| coldsync-5k | 4.9 | 7.3 |
+| coldsync-chromium-fan | 221.3 | 505.4 |
+| coldsync-chromium | 228.1 | 454.8 |
 
-The two land within about one percent on Chromium. Half a million small files is bound by device IOPS rather than by either tool, so this measurement has little power to separate them. mutagen is modestly ahead on the smaller trees.
+## Bursts
 
-Without the storage controls these numbers are meaningless: an uncontrolled run charged the first tool 434 s and the second 125 s for identical work, purely from snapshot block loading. See [bench/README.md](../bench/README.md#lessons-paid-for).
+Median wall seconds for repeated module copies, as reported by the aggregate. These are convergence measurements, including the harness's verification work; Autobahn's internal cycle timing is a different metric and is retained in the aggregate.
 
----
+| Cell | Autobahn seconds | mutagen seconds |
+|---|---:|---:|
+| 50k-burst | 3.5 | 7.5 |
+| chromium-burst | 4.5 | 6.9 |
 
-Raw JSONL for all 150 jobs, the plan, and per-pair driver logs are in `bench/results-bench-1787811723/`.
-
-## See also
-
-- [Benchmarks](./benchmarks.md) — the summary, and what has changed since
-- [Why mutagen is slower](./mutagen.md) — the implementation account
-- [bench/README.md](../bench/README.md) — the method
+The [0.3.0 matrix](./benchmark-matrix-0.3.md) is retained separately. Its corpus, build, and method differ; compare tools within a run rather than attributing every difference between reports to a code change.

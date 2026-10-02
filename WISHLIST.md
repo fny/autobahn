@@ -37,7 +37,9 @@ Things we would like autobahn to do, thought through but not built or not suppor
 
 ## A full walk that costs what the tree can afford
 
-**The problem.** Every session re-reads its whole tree every 120 seconds, whether or not anything changed (`FULL_SCAN_INTERVAL`, `src/endpoint/observer.rs`). Everyday syncing doesn't depend on it: an edit arrives because the watcher reports it. The walk is the backstop for changes the watcher never reports, and its interval is the longest such a change can go unnoticed. But its cost grows with the tree, and on a Mac it is not small.
+**Current status (2026-10-02).** `power_saver_experimental` already selects a fixed ten-minute full-walk interval on battery, with two minutes on AC (`src/power.rs`). Timed audits run beside foreground scans (`RootObserver::begin_audit`). The cost-based interval and wake-triggered walk proposed below remain unimplemented; `[power_saver]` below is a design sketch, not accepted configuration.
+
+**The original problem.** A watched root is audited every 120 seconds by default, whether or not anything changed. Everyday syncing doesn't depend on it: an edit arrives because the watcher reports it. The walk is the backstop for changes the watcher never reports, and its interval is the longest such a change can go unnoticed. But its cost grows with the tree, and on a Mac it is not small.
 
 Measured on 2026-09-24: macOS 26.5.1, Apple M4, on battery, a 160,000-file corpus with both sides local, 30 one-minute `powermetrics` samples with nothing else running:
 
@@ -152,7 +154,7 @@ walk_ceiling = "15m"
 
 ## A supported Linux tray
 
-**The problem.** The tray code is shared with macOS and compiles behind the `tray` feature, but on Linux nothing builds it. No release includes it and CI never compiles it. `docs/macos-app.md` has an unverified build-it-yourself section, and nobody has confirmed that section's steps work.
+**The problem.** The standalone tray compiles behind the `tray` feature, but ordinary CI and tagged releases cover it only on macOS. The separate Dash workflow now builds the shared menu bar code on Linux and publishes experimental Dash archives; standalone Linux tray coverage and desktop validation remain open. `docs/macos-app.md` has an unverified build-it-yourself section, and nobody has confirmed that section's steps work.
 
 **What it would take.**
 
@@ -166,7 +168,7 @@ walk_ceiling = "15m"
 
 **Where it falls short.**
 
-- **The dependencies.** It adds about 170 crates, mostly GTK 3 bindings, which are no longer maintained. `glib 0.18` has a soundness advisory. Supporting it means accepting those until the tray libraries move to GTK 4 or away from GTK.
+- **The dependencies.** It adds GTK 3 dependencies. The pinned dependency and advisory policy is in `Cargo.lock` and `deny.toml`; supporting the interface means maintaining that optional desktop dependency stack.
 - **Tray support varies by desktop.** GNOME shows no tray icons without an extension, so it cannot work the same everywhere.
 - **Testing stops at the build.** CI can compile and unit-test it, but cannot check that an icon appears on a real desktop.
 

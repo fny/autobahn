@@ -56,11 +56,11 @@ The useful half. `ret` opens any order — where it syncs from and to, its mode,
 
 Each of `o`, `t` and `b` asks before it acts, because resolution overwrites a file someone edited on every destination in the group. It then runs the same `resolve` you would type, on whichever paths the selected level covers — or on every marked level at once, as a single command. That is also the faster way round: resolution reads each losing side once per invocation, so twenty paths settled together cost one scan and twenty settled one by one cost twenty. Marking a folder and a file inside it is safe; the file is named once. The marks are forgotten once the settlement runs, and when you leave the counter. Blocked paths autobahn cannot clear itself, since the commands are `sudo` over ssh and a password prompt has nowhere to appear — so `c` copies the fix instead.
 
-Under the counter, the last few lines the supervisor wrote — the only view of the log there is.
+Under the counter, the last few lines the supervisor wrote — a view of the same log available in [Dash](./app.md) and `service.log`.
 
 ## From a notification
 
-A notification holds one line. `autobahn mi` is the rest of it, so a hook that can run something on click — `terminal-notifier -execute`, a tray item — is given that command. The shop is a terminal program, so on macOS the command must open a terminal around it, which is why autobahn no longer writes one: what that terminal is differs per reader.
+A notification holds one line. `autobahn mi` is the rest of it, so a hook that can run something on click — `terminal-notifier -execute`, a tray item — is given that command. The shop is a terminal program, so on macOS the command must open a terminal around it, which is what the example `open-status` script does for `autobahn status`. Edit that script to open `autobahn mi` instead if you prefer the shop; see [Alerts](./alerts.md#the-example-hook-experimental).
 
 ## See also
 

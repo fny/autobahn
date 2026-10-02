@@ -15,23 +15,19 @@ A **mode** defines two things:
 | `two-way-alpha` | Alpha ↔ Beta | Alpha wins | Active editing on both sides, but Alpha is the primary authority. |
 | `two-way-alpha-strict` | Alpha ↔ Beta | Alpha wins (strict) | Alpha is authoritative, and Alpha's deletions must override Beta's edits. |
 | `one-way-conflict` | Alpha → Beta | Beta changes pause | Deployments where Beta generates local files (logs, caches) that Alpha must not touch. |
-| `one-way-alpha`<br>
-
-<br>*(alias: `mirror`)* | Alpha → Beta | Alpha mirrors strictly | Backups and releases where Beta must be an exact, identical replica of Alpha. |
+| `one-way-alpha` *(alias: `mirror`)* | Alpha → Beta | Alpha mirrors strictly | Backups and releases where Beta must be an exact, identical replica of Alpha. |
 | `peering-*-dangerously-experimental` | Failover mesh | Conflict or Alpha | Multi-node failover when Alpha goes offline. *(See [Peering](./peering.md))* |
 
 
 ## Behavior Matrix
 
-The modes behave identically for standard actions: unchanged files remain untouched, new files on Alpha propagate to Beta, and renames apply across sides. They differ in only seven specific collision and deletion scenarios:
+The modes behave identically for standard actions: unchanged files remain untouched, new files on Alpha propagate to Beta, and renames apply across sides. The table covers regular files within the synchronized scope. Root and mount safeguards, excluded content, and an optional directory-deletion guard can prevent a transition:
 
 | Event | `two-way-conflict` | `two-way-alpha` | `two-way-alpha-strict` | `one-way-conflict` | `one-way-alpha` (`mirror`) |
 | --- | --- | --- | --- | --- | --- |
 | **Alpha edits a file** | Copied to Beta | Copied to Beta | Copied to Beta | Copied to Beta | Copied to Beta |
 | **Beta edits a file** | Copied to Alpha | Copied to Alpha | Copied to Alpha | Stays on Beta; **reported as conflict** | **Overwritten** from Alpha |
-| **Both edit the same file** | **Conflict reported**;<br>
-<br>both versions kept | Alpha wins silently | Alpha wins silently | **Conflict reported**;<br>
-<br>both versions kept | Alpha wins silently |
+| **Both edit the same file** | **Conflict reported**; both versions kept | Alpha wins silently | Alpha wins silently | **Conflict reported**; both versions kept | Alpha wins silently |
 | **Alpha deletes a file** | Deleted on Beta | Deleted on Beta | Deleted on Beta | Deleted on Beta | Deleted on Beta |
 | **Alpha deletes, but Beta edited** | Beta's edit wins and copies back to Alpha | Beta's edit wins and copies back to Alpha | **Deleted on Beta** (Alpha's deletion wins) | Stays on Beta untracked (treated as a new Beta file) | **Deleted on Beta** |
 | **Beta creates a new file** | Kept & copied to Alpha | Kept & copied to Alpha | Kept & copied to Alpha | Kept locally on Beta | **Deleted** on Beta |
@@ -44,7 +40,7 @@ The modes behave identically for standard actions: unchanged files remain untouc
 ### 1. `one-way-conflict` vs. `one-way-alpha`
 
 * **`one-way-conflict` protects Beta from data loss:** It pushes updates from Alpha to Beta, but if Beta modifies a file locally, the engine refuses to overwrite it and flags a conflict. New local files on Beta are ignored and preserved.
-* **`one-way-alpha` enforces parity:** Beta is forced to match Alpha byte-for-byte. Any untracked file on Beta—including runtime logs, caches, and build artifacts—is immediately **deleted**.
+* **`one-way-alpha` enforces parity:** Beta is made to match Alpha within the synchronized scope. Beta-only files—including runtime logs, caches, and build artifacts—are **deleted** unless they are excluded by policy. Ignored entries are not mirrored individually, but deleting their parent can remove them; see [Ignores](./ignores.md#ignores-and-deletion).
 
 ### 2. Deletions vs. Edits: Standard vs. Strict
 
@@ -67,9 +63,9 @@ guard_directory_deletes_over = 8
 Set it, and a directory the ancestor recorded with that many entries or more — **counted recursively**, so one subfolder of seven files reaches eight — is no longer trusted when it disappears from exactly one side:
 
 * **Directory emptied on one side:** Flags a **directory conflict** at that path and moves nothing beneath it. Resolve with `resolve --keep <full-side>` to restore the files, or `resolve --keep <empty-side>` to approve deleting the entire tree.
-* **Directory missing entirely on one side:** If the remaining side matches the last-known synchronized state, the directory is **restored**, not deleted. To intentionally delete it, remove it on both sides simultaneously or empty it first and resolve the conflict.
+* **Directory missing entirely on one side, in a two-way mode:** If the remaining side matches the last-known synchronized state, the directory is **restored**, not deleted. To intentionally delete it, remove it on both sides or empty it first and resolve the conflict. In a one-way mode, the ordinary directional rules still apply to a missing directory: this setting does not restore alpha from beta.
 
-Unset — the default — every disappearance propagates, whatever its size.
+Unset—the default—this extra directory guard is off. The independent safeguards for a missing alpha, an emptied root with at least two ancestor entries, and a previously recorded mount still apply; see [Safety](./safety.md).
 
 ---
 
@@ -77,10 +73,12 @@ Unset — the default — every disappearance propagates, whatever its size.
 
 When an Alpha syncs concurrently to multiple Betas, each pair runs an independent session. The chosen mode determines how concurrent edits from different Betas are handled:
 
-* **Under `two-way-conflict`:** Whichever Beta syncs first updates Alpha. When the second Beta syncs, Alpha detects a collision and flags a conflict. Both edits are preserved until manually reviewed.
-* **Under `two-way-alpha`:** Whichever Beta syncs last wins. Because "Alpha always wins," Beta B's update to Alpha will silently overwrite Beta A's previous sync across the entire cluster. Use this mode only for central broadcast setups, not multi-node collaborative editing.
+* **Under `two-way-conflict`:** If Beta A's edit reaches Alpha before the session with a differently edited Beta B reconciles, that session reports a conflict against its old ancestor. Both edits are preserved until manually reviewed.
+* **Under `two-way-alpha`:** Once Beta A's edit reaches Alpha, a competing Beta B edit against the old ancestor loses to the version now on Alpha. A beta edit still travels to Alpha when Alpha is unchanged against that pair's ancestor. This is per-session three-way reconciliation, not a last-writer-wins policy; transition validation refuses writes based on stale scans. Use `two-way-conflict` when competing edits need review.
 
 ---
+
+The legacy spellings `two-way-safe`, `two-way-resolved`, `one-way-safe`, and `one-way-replica` remain aliases of their corresponding core modes. `two-way-paranoid` has been removed; migrate it to `two-way-conflict` with `guard_directory_deletes_over = 8`.
 
 ## See Also
 

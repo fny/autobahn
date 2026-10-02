@@ -38,7 +38,7 @@ pub enum ControlRequest {
     /// Report what every supervised session is doing right now. The one
     /// request that reads rather than writes.
     Progress,
-    /// Peering: hand the lead to the named peer — `alpha`, or a beta's
+    /// P2P: hand the lead to the named peer — `alpha`, or a beta's
     /// spec — at the next term, and step down.
     Yield {
         /// Who leads next.
@@ -469,7 +469,7 @@ pub(crate) struct Entry {
     pub published: Arc<std::sync::Mutex<Option<super::SessionStatus>>>,
 }
 
-/// Peering: what the control socket calls to hand the lead on.
+/// P2P: what the control socket calls to hand the lead on.
 pub type YieldHandle = Arc<dyn Fn(&str) -> anyhow::Result<()> + Send + Sync>;
 
 /// The registry mapping sessions to their control flags, shared between the
@@ -478,7 +478,7 @@ pub(crate) struct Registry {
     /// One entry per supervised session, replaced as an edit to the
     /// configuration changes which sessions run.
     pub entries: RwLock<Vec<Entry>>,
-    /// Peering: how to hand the lead on, when this supervisor leads.
+    /// P2P: how to hand the lead on, when this supervisor leads.
     pub yield_to: Option<YieldHandle>,
     /// The configuration the sessions were planned from, replaced with
     /// the entries.
@@ -506,7 +506,7 @@ impl Registry {
         if let ControlRequest::Yield { to } = request {
             let Some(yield_to) = &self.yield_to else {
                 return ControlResponse::Error(
-                    "this supervisor is not leading a peering group".into(),
+                    "this supervisor is not leading a p2p group".into(),
                 );
             };
             return match yield_to(to) {
@@ -530,7 +530,7 @@ impl Registry {
                     supervisor: crate::protocol::version(),
                 };
             }
-            return match bincode::deserialize::<ControlRequest>(request) {
+            return match crate::wire::decode_capped::<ControlRequest>(request) {
                 // Nested once, never twice: the inner request is a verb.
                 Ok(ControlRequest::Versioned { .. }) => {
                     ControlResponse::Error("a versioned request inside another".into())
@@ -1095,7 +1095,7 @@ fn send_within(
     let mut writer = stream;
     let versioned = ControlRequest::Versioned {
         version: crate::protocol::version(),
-        request: bincode::serialize(request).context("unable to encode the control request")?,
+        request: crate::wire::encode(request).context("unable to encode the control request")?,
     };
     if let Err(error) = crate::transport::send_control_frame(&mut writer, &versioned) {
         return Err(match timed_out(&error) {
@@ -1163,7 +1163,7 @@ fn probe_within(state_root: &Path, timeout: Duration) -> Probe {
         return Probe::Absent;
     };
     let mut writer = stream;
-    let Ok(request) = bincode::serialize(&ControlRequest::Progress) else {
+    let Ok(request) = crate::wire::encode(&ControlRequest::Progress) else {
         return Probe::Absent;
     };
     let versioned = ControlRequest::Versioned {
@@ -1194,7 +1194,7 @@ pub fn inventory(state_root: &Path) -> Option<Inventory> {
     let mut writer = stream;
     let versioned = ControlRequest::Versioned {
         version: crate::protocol::version(),
-        request: bincode::serialize(&ControlRequest::Sessions).ok()?,
+        request: crate::wire::encode(&ControlRequest::Sessions).ok()?,
     };
     crate::transport::send_control_frame(&mut writer, &versioned).ok()?;
     match crate::transport::receive_control_frame(&mut reader) {
@@ -1221,7 +1221,7 @@ mod tests {
         Entry {
             session: SessionKey::new(format!("{group}-{host}")),
             display: format!("{group}@{host}"),
-            mode: "two-way-safe".into(),
+            mode: "two-way-conflict".into(),
             published: Arc::default(),
             group: group.into(),
             host: host.into(),
@@ -1551,7 +1551,7 @@ mod tests {
     fn versioned(version: &str, request: &ControlRequest) -> ControlRequest {
         ControlRequest::Versioned {
             version: version.into(),
-            request: bincode::serialize(request).expect("encodes"),
+            request: crate::wire::encode(request).expect("encodes"),
         }
     }
 
@@ -1587,17 +1587,17 @@ mod tests {
         // Variant order is the wire: a later build adding a request must
         // add it after these, or an older supervisor misreads the envelope
         // as something else and a newer one cannot say "restart".
-        let envelope = bincode::serialize(&versioned("x", &ControlRequest::Progress)).unwrap();
+        let envelope = crate::wire::encode(&versioned("x", &ControlRequest::Progress)).unwrap();
         assert_eq!(envelope[..4], 7u32.to_le_bytes());
-        let mismatch = bincode::serialize(&ControlResponse::Mismatch {
+        let mismatch = crate::wire::encode(&ControlResponse::Mismatch {
             supervisor: "x".into(),
         })
         .unwrap();
         assert_eq!(mismatch[..4], 3u32.to_le_bytes());
         // Later requests come after them.
-        let sessions = bincode::serialize(&ControlRequest::Sessions).unwrap();
+        let sessions = crate::wire::encode(&ControlRequest::Sessions).unwrap();
         assert_eq!(sessions[..4], 8u32.to_le_bytes());
-        let inventory = bincode::serialize(&ControlResponse::Sessions(Inventory {
+        let inventory = crate::wire::encode(&ControlResponse::Sessions(Inventory {
             sessions: Vec::new(),
             configuration: None,
             notice: None,

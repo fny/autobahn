@@ -4,7 +4,7 @@
 autobahn mi
 ```
 
-An easter egg that turned useful. Every session is an order, an order fills as its transfer does, and the shop is open when a supervisor answers and shuttered when none does. Every number on it is real — it reads the same `status --json` document as everything else.
+A useful easter egg. The Autobahn Mi shop preseents you your sessions as orders managed by the supervisor.
 
 ```
   ◉ OPEN   🥖 AUTOBÁNH MÌ   15 customers · 12,480 files · 3.4 GB · 1 filling · 2.1 MB/s
@@ -14,15 +14,12 @@ An easter egg that turned useful. Every session is an order, an order fills as i
     voltai   → boite   🥖[▓░░░░░░░░░░░]  disputed  checking the pantry · 14s · 1 waiting
 ```
 
-An order is always *something* — served, disputed, delivery blocked — and sometimes also *doing* something. The first has the coloured word and never gives it up. The second has a column of its own, filled only once the work has gone on long enough to be worth mentioning: the same rule `status` applies, so a routine scan is never announced and one that drags names itself without displacing the outcome.
 
-Press `?` for a page that explains every word on the screen.
+Each row shows the last cycle’s outcome separately from current work. The phase column appears only after the work passes the same duration threshold as `status`.
 
-A line under the sign reading `⚠ configuration refused …` means the supervisor read an edit to `config.toml` it would not start from. The orders below it are still being filled, under the last configuration that loaded; the line goes when the file loads again. See [Editing it while it runs](./configuration.md#editing-it-while-it-runs).
+Press `?` for definitions of the interface labels.
 
-## The counter
-
-The useful half. `ret` opens any order — where it syncs from and to, its mode, how many cycles it has run and how much it has carried — and then its issues as a tree: cause, then place, then path. Every level of that tree can be acted on, so one keypress settles a whole directory or a single file. `spc` marks a level; mark as many as you like and one keypress settles all of them together.
+A `⚠ configuration refused …` line means the supervisor rejected a configuration edit. Sessions continue under the last valid configuration. The notice clears after a valid reload. See [Live reload](./configuration.md#editing-it-while-it-runs).
 
 ```
   ┌──────────────────────────────────────────────────────────────┐
@@ -54,16 +51,8 @@ The useful half. `ret` opens any order — where it syncs from and to, its mode,
 | `?` | help |
 | `q` | close the shop |
 
-Each of `o`, `t` and `b` asks before it acts, because resolution overwrites a file someone edited on every destination in the group. It then runs the same `resolve` you would type, on whichever paths the selected level covers — or on every marked level at once, as a single command. That is also the faster way round: resolution reads each losing side once per invocation, so twenty paths settled together cost one scan and twenty settled one by one cost twenty. Marking a folder and a file inside it is safe; the file is named once. The marks are forgotten once the settlement runs, and when you leave the counter. Blocked paths autobahn cannot clear itself, since the commands are `sudo` over ssh and a password prompt has nowhere to appear — so `c` copies the fix instead.
+Resolution actions ask for confirmation. They can replace edited files across every destination in the group.
 
-Under the counter, the last few lines the supervisor wrote — a view of the same log available in [Dash](./app.md) and `service.log`.
+Each action runs the normal `resolve` command for the selected paths or all marked paths together. One invocation scans each losing side once. Resolving twenty paths together avoids nineteen additional scans.
 
-## From a notification
-
-A notification holds one line. `autobahn mi` is the rest of it, so a hook that can run something on click — `terminal-notifier -execute`, a tray item — is given that command. The shop is a terminal program, so on macOS the command must open a terminal around it, which is what the example `open-status` script does for `autobahn status`. Edit that script to open `autobahn mi` instead if you prefer the shop; see [Alerts](./alerts.md#the-example-hook-experimental).
-
-## See also
-
-- [Conflicts](./conflicts.md) — the `resolve` the shop runs
-- [Alerts](./alerts.md) — the hook a notification comes from
-- [Commands](./commands.md) — `status --json`, which the shop reads
+Overlapping selections are deduplicated. Marks clear after resolution and after leaving the counter. Blocked-path repairs can require interactive `sudo` over SSH. The interface copies these commands instead of running them.

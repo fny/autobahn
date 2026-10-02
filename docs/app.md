@@ -29,7 +29,7 @@ Conflict actions use the same CLI operations described in [Conflicts](./conflict
 
 Edits remain in the form until **Save**. The editor validates through Autobahn's configuration loader and reports errors at the affected fields; invalid configuration is not saved. **Reload** reads the file again and discards pending form changes. Optional switches preserve the distinction between inheriting a value and explicitly setting it.
 
-Advanced fields fold away. Experimental controls become visible after five clicks on the Autobahn wordmark; their meanings and limits remain those in [Configuration](./configuration.md), [Alerts](./alerts.md), and [Peering](./peering.md).
+Advanced fields fold away. Experimental controls become visible after five clicks on the Autobahn wordmark; their meanings and limits remain those in [Configuration](./configuration.md), [Alerts](./alerts.md), and [P2P](./p2p.md).
 
 A running supervisor picks up a saved configuration through [live reload](./configuration.md#editing-it-while-it-runs). If live reload is disabled, restart it to apply the file.
 

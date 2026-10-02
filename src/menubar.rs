@@ -1092,7 +1092,7 @@ pub(crate) fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
 }
 
 /// How a group is named in the menu: its root, its name, and — when it is
-/// peering — which side is doing the work. A group that is not peering
+/// p2p — which side is doing the work. A group that is not p2p
 /// says nothing about roles, which is every group until someone asks for
 /// one.
 pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {

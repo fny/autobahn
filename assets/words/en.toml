@@ -188,7 +188,7 @@ settings = "settings"
 defaults = "defaults"
 advanced = "experimental"
 advanced_alerts = "alerts"
-advanced_peering = "peering · dangerously experimental"
+advanced_p2p = "p2p · dangerously experimental"
 
 # Adding, renaming and removing a group.
 [group]

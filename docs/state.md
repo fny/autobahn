@@ -18,12 +18,12 @@ Autobahn keeps configuration and session state under `~/.autobahn` by default, o
 | `agents/` | the agent bundle — binaries for platforms other than this one |
 | `bin/autobahn-<version>-<digest>` | on a *remote* host: the agent this controller streamed there, named by its version and its content |
 | `ignores/` | ignore files, named from the config — see [Ignores](./ignores.md) |
-| `peering/` | experimental: the lease, this host's name in the star, the pushed configuration, and the ancestor copies a leader keeps here — see [Peering](./peering.md). `clean` leaves it alone |
+| `p2p/` | experimental: the lease, this host's name in the star, the pushed configuration, and the ancestor copies a leader keeps here — see [P2P](./p2p.md). `clean` leaves it alone |
 | `service.log` | the supervisor's log — see [The log](./logging.md) |
 | `control.sock` | the running supervisor's control socket, through which `flush`, `reset`, `verify` and `pause` reach live sessions |
 | `config-notice.json` | present while the running supervisor is refusing an edit to `config.toml` — what `status`, `mi` and the menu bar app show for it; removed when the file loads again, or a supervisor starts — see [Editing it while it runs](./configuration.md#editing-it-while-it-runs) |
 | `icon.png` | autobahn's icon, for notifiers |
-| `on-alert.sh`, `open-status` | the example alert hook `init` writes, and what a click on its notification opens — see [Alerts](./alerts.md). Yours to edit; never replaced |
+| `on-alert.sh` | the example alert hook `init` writes — see [Alerts](./alerts.md). Yours to edit; never replaced |
 
 ## Sessions outlive the config
 

@@ -1,0 +1,64 @@
+# Carry a repository's history, and leave out only what cannot cross.
+#
+# Name this *after* Essential.gitignore, which excludes `.git` whole:
+#
+#   [defaults]
+#   ignores = ["file:Essential.gitignore", "file:Git.gitignore"]
+#
+# The order is the point. A file's patterns land where its entry sits, so
+# the first line below undoes Essential's `.git` and the rest then say
+# what, inside it, still cannot travel.
+#
+# Two rules worth knowing before editing this file:
+#
+# A comment goes on its own line. These files have no trailing comments,
+# so a `#` after a pattern becomes part of the pattern, and a pattern
+# with a `#` in it matches nothing and says nothing about it.
+#
+# A bare name matches at any depth; a path does not. `.git` finds every
+# repository under the root, but `.git/index` finds only the one at the
+# very top — a slash inside a pattern anchors it. That is why every
+# multi-part line below starts with `**/` and the single name does not.
+
+# Undo the wholesale exclusion. Objects, refs, HEAD and config cross from
+# here on, which is what keeps every machine on the same commits.
+!.git
+
+# Rewritten by every `git status`, so two sides editing it is a conflict
+# on a file nobody touched.
+**/.git/index
+
+# index.lock, config.lock, packed-refs.lock, and the rest.
+**/.git/*.lock
+**/.git/**/*.lock
+
+# The reflog is this machine's account of what this machine did.
+**/.git/logs/**
+
+# Housekeeping, true here and nowhere else.
+**/.git/gc.pid
+**/.git/gc.log
+**/.git/FETCH_HEAD
+**/.git/ORIG_HEAD
+**/.git/COMMIT_EDITMSG
+
+# Scratch files that appear and vanish inside one cycle, faster than
+# staging can catch them.
+**/.git/objects/pack/tmp_*
+**/.git/objects/**/tmp_obj_*
+**/.git/lfs/tmp/**
+
+# Worktree links hold absolute paths to the machine that made them.
+# Delete this line if you have set `git config worktree.useRelativePaths
+# true`, which makes them portable.
+**/.git/worktrees/**
+
+# A half-finished merge, rebase, cherry-pick or bisect. Carried to
+# another machine it is an operation you cannot finish there.
+**/.git/MERGE_HEAD
+**/.git/MERGE_MSG
+**/.git/CHERRY_PICK_HEAD
+**/.git/REVERT_HEAD
+**/.git/BISECT_*
+**/.git/rebase-merge/**
+**/.git/rebase-apply/**

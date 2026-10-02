@@ -34,8 +34,8 @@ fn main() {
 
     // What a restart produces: the ancestor is decoded from its file, so
     // every allocation is new even though the content is identical.
-    let encoded = bincode::serialize(&settled.root).expect("ancestor encodes");
-    let reloaded: Option<Node> = bincode::deserialize(&encoded).expect("ancestor decodes");
+    let encoded = autobahn::wire::encode(&settled.root).expect("ancestor encodes");
+    let reloaded: Option<Node> = autobahn::wire::decode(&encoded).expect("ancestor decodes");
 
     // One file changes, and is put back the moment the rescan has seen it.
     // The guard runs on a panic too, which matters because the root worth

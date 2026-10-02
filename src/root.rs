@@ -2,7 +2,7 @@
 //!
 //! Autobahn is a single-user tool: its state, its configuration and the
 //! commands that configuration runs all belong to one user, and the races
-//! it accepts (RETAINED §2) are harmless only because nobody with more
+//! it accepts (accepted-risks §2) are harmless only because nobody with more
 //! rights than that user acts on what it scans. Root breaks both halves.
 //! Under `sudo` on macOS `$HOME` stays the calling user's, so a root run
 //! leaves root-owned state in their `~/.autobahn` that breaks every later

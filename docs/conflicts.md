@@ -1,53 +1,69 @@
-# Conflicts
+# Conflict Resolution
 
-When two sides disagree about a file, `status` names it and these commands settle it:
+When concurrent, competing modifications occur across endpoints in a bidirectional synchronization session, Autobahn halts propagation on the affected paths, flags a conflict, and preserves both versions until resolved.
+
+## Conflict Inspection Commands
+
+Inspect outstanding issues, compare competing file contents, and isolate affected subdirectories:
 
 ```sh
-autobahn issues                     # everything that needs you, grouped by cause
-autobahn issues voltai autobahn     # ...under one folder
-autobahn conflicts                  # every conflict, with what each side holds
-autobahn conflicts ~/project        # ...for whatever group syncs that folder
-autobahn conflicts voltai autobahn  # ...to one folder inside the group
-autobahn conflicts --depth 1        # roll up: which top-level folders, and how many
-autobahn conflicts --filter vulns   # only paths containing "vulns"
-autobahn conflicts --filter '*.ts'  # ...or matching a glob, at any depth
-autobahn diff ./src/main.rs         # the two sides of a file, as a unified diff
-autobahn diff project src/main.rs   # same file, by group and root-relative path
+# List all operational issues and conflicts across all groups
+autobahn issues
 
-autobahn resolve ./src/main.rs --keep alpha       # my version wins, everywhere
-autobahn resolve project src/main.rs --keep boite # boite's version wins, everywhere
-autobahn resolve project src/main.rs --keep both  # keep alpha's; the loser is
-                                                  # renamed aside as main.rs.boite
-autobahn resolve voltai autobahn --keep alpha     # every conflict under one folder
-autobahn resolve project a.rs b.rs c.rs --keep alpha  # several at once, one pass
-autobahn resolve ~/project --all --keep boite     # every conflict in the group
+# Enumerate conflicts for a specific group or directory
+autobahn conflicts ~/Workspace/project
+autobahn conflicts mygroup src/subfolder
+
+# Aggregate conflicts by directory depth (useful for mass conflicts)
+autobahn conflicts --depth 1
+
+# Filter conflicts by filename or pattern
+autobahn conflicts --filter vulns
+autobahn conflicts --filter '*.ts'
+
+# View unified diff between conflicting file versions
+autobahn diff ./src/main.rs
+autobahn diff mygroup src/main.rs
 ```
 
-`conflicts` is an alias of `issues`; it also reports blocked paths and halted sessions. Conflicts can concern executable bits, symbolic links, or file/directory differences, so equal content hashes do not always mean there is nothing to resolve.
+> [!NOTE]
+> `autobahn conflicts` is an alias of `autobahn issues`. In addition to content discrepancies, the command reports mode/permission conflicts, symbolic link targets, and filesystem type mismatches (e.g., file vs. directory).
 
-## Naming a winner
+## Resolving Conflicts (`autobahn resolve`)
 
-A winner is named as `status` names it: `alpha`, or a destination's host (or path). Its version reaches alpha and every other destination, so one command settles a conflict across a whole fan-out — including destinations whose own conflict was with a *third* version.
+To resolve a conflict, specify which endpoint's version should prevail using `--keep`:
 
-It asks before it acts, unless you pass `--yes` (`-y`).
+```sh
+# Promote Alpha's version as authoritative
+autobahn resolve ./src/main.rs --keep alpha
 
-## How `resolve` works
+# Promote a specific remote host's version
+autobahn resolve mygroup src/main.rs --keep remotehost
 
-What it does is retire the *losing* version, not copy the winning one: the losing side's copy is removed, or moved aside for `--keep both`, and the ancestor forgets that path. The next cycle treats the retained winner as a creation and carries it across, even when its content matches the old ancestor. That is why it settles a conflict between a file and a whole directory, which no amount of copying bytes can do — reconciliation already propagates one side's content over the other's deletion, for a file, a symbolic link, or a tree alike.
+# Retain Alpha's version, renaming the remote copy aside (e.g., main.rs.remotehost)
+autobahn resolve mygroup src/main.rs --keep both
 
-Two things follow. The removal goes through the same transition path a cycle uses, so an entry that changed since the command started is refused and reported rather than destroyed; run the command again to settle it. And the winner arrives on the next cycle, so the command flushes the supervisor before returning. Without a supervisor running, run `autobahn sync` once. Only the settled paths are forgotten; unrelated ancestor history is kept. With a live supervisor, settlement runs through its control socket under the session's ownership; otherwise the command takes the session locks itself.
+# Batch resolve all conflicts within a subtree
+autobahn resolve mygroup src/subfolder --keep alpha
 
-## Reading a long list
+# Resolve all conflicts across an entire group without interactive confirmation
+autobahn resolve ~/Workspace/project --all --keep alpha --yes
+```
 
-`--depth` turns a long list into a map of where the trouble is — seven hundred paths under one folder are one fact about that folder — and each level tells you how to look inside the next. `--filter` takes a plain word (matched anywhere in the path, ignoring case) or a glob: without a slash it matches at any depth, with one it is anchored to the root.
+## Resolution Mechanics
 
-## Blocked paths
+1. **Retiring the Non-Authoritative Copy:**
+   `autobahn resolve` does not perform a direct byte transfer immediately. Instead, it retires the non-winning replica on the opposing endpoint (or moves it to an adjacent backup name if `--keep both` is specified) and removes the path entry from the session ancestor database.
+2. **Re-propagation:**
+   Upon the subsequent synchronization cycle, the winning file is detected as a fresh creation and cleanly propagated across all endpoints in the group.
+3. **Atomic Verification:**
+   Removal transitions validate the path state against the latest scan. If a file changed after the `resolve` command was initiated, the deletion is rejected to protect against race conditions.
+4. **Immediate Flush:**
+   If a background supervisor is active, `resolve` automatically issues a flush over the supervisor control socket so the winning state propagates immediately. If no supervisor is active, execute `autobahn sync <group>` to complete propagation.
 
-A blocked path is one the endpoint could not read or write — usually permissions, sometimes a name the destination filesystem refuses. autobahn cannot clear those itself, since the fix is typically `sudo` over ssh and a password prompt has nowhere to appear. `issues` prints the command that would clear each one, and [the shop](./shop.md) copies it to the clipboard.
 
-## See also
+## Blocked Paths
 
-- [Modes](./modes.md) — which disagreements become conflicts in the first place
-- [The shop](./shop.md) — the same `resolve`, from a tree you can act on
-- [The menu bar app](./macos-app.md) — the same `resolve`, from a menu
-- [Commands](./commands.md) — what the state words mean
+A **blocked path** occurs when an endpoint cannot read or write an entry due to filesystem permissions, missing directory structures, or unsupported filename characters:
+- `autobahn issues` prints the root cause and suggested remediation commands (e.g., `chmod` or `chown`).
+- Once filesystem permissions or paths are corrected, the subsequent sync cycle clears the blocked status automatically.

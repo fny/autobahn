@@ -236,9 +236,9 @@ impl Shop {
             .collect()
     }
 
-    /// The peering role of the group an order belongs to, as the rail says
+    /// The p2p role of the group an order belongs to, as the rail says
     /// it: who is doing the synchronizing right now. Empty for a group that
-    /// is not peering, which is every group until someone asks for one.
+    /// is not p2p, which is every group until someone asks for one.
     fn role(&self, group: &str) -> &'static str {
         match self
             .report
@@ -1418,7 +1418,7 @@ fn help_page() -> Vec<String> {
         (
             "another branch",
             "\x1b[2m",
-            "peering: another host holds the lead and is doing the work",
+            "p2p: another host holds the lead and is doing the work",
         ),
     ];
     for (word, colour, what) in pairs {
@@ -2007,10 +2007,10 @@ mod tests {
         assert_eq!(activity_column(None), "");
     }
 
-    /// Peering: which host is doing the work belongs on the rail, not only
-    /// in `status`. A group that is not peering says nothing about roles.
+    /// P2P: which host is doing the work belongs on the rail, not only
+    /// in `status`. A group that is not p2p says nothing about roles.
     #[test]
-    fn a_peering_group_says_which_side_holds_the_lead() {
+    fn a_p2p_group_says_which_side_holds_the_lead() {
         use autobahn::supervisor::{GroupReport, SessionReport, StatusReport};
 
         let session = SessionReport {
@@ -2018,7 +2018,7 @@ mod tests {
             host: "fny".into(),
             destination: String::new(),
             beta: "ubuntu@fny:~/w".into(),
-            mode: "peering-alpha-dangerously-experimental".into(),
+            mode: "p2p-alpha-dangerously-experimental".into(),
             state: "synchronized".into(),
             cycles: 3,
             age_seconds: Some(1),

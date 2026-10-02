@@ -34,11 +34,14 @@ pub mod invocation;
 pub mod logging;
 pub mod ownership;
 pub mod paths;
-pub mod peering;
+pub mod p2p;
 pub mod peerkeys;
 pub mod persist;
 pub mod power;
 pub mod progress;
+/// Encoding, in one place: the format and the decode limits. Public
+/// so the examples measure what the transport actually does.
+pub mod wire;
 pub mod protocol;
 pub mod root;
 pub mod rsync;

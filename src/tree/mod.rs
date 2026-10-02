@@ -128,14 +128,14 @@ pub struct Policy {
     /// Counted recursively, so one subfolder of seven files reaches
     /// eight. `None` propagates every disappearance, whatever its size,
     /// which is what every mode did before this was a setting.
-    pub guard_directory_deletes_over: Option<usize>,
+    pub guard_dir_deletes_over: Option<usize>,
 }
 
 impl From<SyncMode> for Policy {
     fn from(mode: SyncMode) -> Policy {
         Policy {
             mode,
-            guard_directory_deletes_over: None,
+            guard_dir_deletes_over: None,
         }
     }
 }
@@ -628,7 +628,7 @@ impl TreeDigester {
             root: None,
             ..snapshot.clone()
         };
-        hasher.update(&bincode::serialize(&head).unwrap_or_default());
+        hasher.update(&crate::wire::encode(&head).unwrap_or_default());
         match &snapshot.root {
             Some(root) => {
                 hasher.update(&[1]);

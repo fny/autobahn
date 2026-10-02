@@ -94,7 +94,7 @@ fn main() {
         let started = Instant::now();
         let encoded: Vec<Vec<u8>> = batches
             .iter()
-            .map(|batch| bincode::serialize(batch).expect("frames should encode"))
+            .map(|batch| autobahn::wire::encode(batch).expect("frames should encode"))
             .collect();
         let encode = started.elapsed().as_secs_f64();
 
@@ -108,7 +108,7 @@ fn main() {
         let mut scratch: Vec<u8> = Vec::with_capacity(16 * 1024 * 1024);
         for batch in &batches {
             scratch.clear();
-            bincode::serialize_into(&mut scratch, batch).expect("frames should encode");
+            autobahn::wire::encode_into(batch, &mut scratch).expect("frames should encode");
         }
         let encode_reused = started.elapsed().as_secs_f64();
 
@@ -170,7 +170,7 @@ fn main() {
     let second = collect(&mut endpoint, needs.clone());
     let identical = first.len() == second.len()
         && first.iter().zip(second.iter()).all(|(a, b)| {
-            bincode::serialize(a).expect("encodes") == bincode::serialize(b).expect("encodes")
+            autobahn::wire::encode(a).expect("encodes") == autobahn::wire::encode(b).expect("encodes")
         });
     println!(
         "\nbatch determinism: {} batches, identical across two supply streams: {}",

@@ -231,7 +231,7 @@ fn open_window(
                             "defaults" => Section::Defaults,
                             "experimental" => Section::Advanced,
                             "alerts" => Section::Alerts,
-                            "peering" => Section::Peering,
+                            "p2p" => Section::P2P,
                             "settings" => Section::Settings,
                             name => Section::Group(name.to_owned()),
                         };
@@ -243,7 +243,7 @@ fn open_window(
                     // one gets taken without a hand on the mouse.
                     dash.unlocked = matches!(
                         dash.section,
-                        Section::Advanced | Section::Alerts | Section::Peering
+                        Section::Advanced | Section::Alerts | Section::P2P
                     ) || std::env::var("AUTOBAHN_DESK_EXPERIMENTAL").is_ok();
                     dash.settle(dash.pane, window, cx);
                 }
@@ -3484,7 +3484,7 @@ impl Dash {
             Section::Alerts => self.shape["$defs"]["AlertsAdvanced"]
                 .get("properties")
                 .cloned(),
-            Section::Peering => self.shape["$defs"]["PeeringAdvanced"]
+            Section::P2P => self.shape["$defs"]["P2pAdvanced"]
                 .get("properties")
                 .cloned(),
             Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),

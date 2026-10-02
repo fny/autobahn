@@ -18,29 +18,31 @@ Point your coding agent at [INSTALL.md](INSTALL.md) for interactive setup, or se
 
 ## Why Autobahn
 
-- **Fast as hell.** The September 2026 Linux benchmark measured 13.4 ms median for a small-file edit on the 50k subset with ten editors, and 23.8 ms on a half-million-file Chromium checkout with one editor.
-- **Lightweight.** That benchmark measured 479 MiB of peak controller memory on the Chromium single-editor workload, versus 2,081 MiB for mutagen, and 0.1% of a core while idle.
+- **Fast as hell.** Delivers sub-30ms propagation times for small-file updates across trees containing hundreds of thousands of files.
+- **Lightweight.** Employs immutable shared-tree structures in memory, requiring significantly less RAM and idle CPU than conventional sync daemons.
 - **Safe.** Choose a sync policy per group, backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
-- **Reviewed.** Security findings and fixes are recorded in [REVIEWS](REVIEWS/README.md); [known residual risks](docs/correctness/RETAINED.md) remain.
+- **Reviewed.** Security findings and fixes are recorded in [REVIEWS](REVIEWS/README.md); [accepted risks](docs/correctness/accepted-risks.md) remain.
 - **Privacy first.** No cloud service, no account, no third party.
 
-## Start here
+## Quick Start
 
 After you [install Autobahn](INSTALL.md) you need to set up your configuration. By default, the configuration is written to `~/.autobahn/config.toml`. You can edit it by hand or use [the app](docs/app.md).
+
+Each group connects one root, called alpha, to one or more destinations, called betas. Sync can be one-way, bidirectional, or P2P (experimental.)
 
 ```toml
 # ~/.autobahn/config.toml
 
-[defaults]                  # inherited by every group; settings can be overridden
+[defaults]
 mode = "two-way-conflict"   # sync modes explained below
 ignores = [".git", "node_modules"]
 
 [groups.project]
-alpha = "~/project"         # the source root you edit
+alpha = "~/project"
 betas = [                   # sync targets
   "user@audi.de:/srv/car",  #  - fully specified
-  "mercedes-benz.de",       #  - inherits the alpha path
-  "/mnt/backup/project",    # local paths work too
+  "mercedes-benz.de",       #  - inherits alpha path
+  "/mnt/backup/project",    #  - local paths work too
 ]
 ignores = ["target"]        # appended to the defaults' ignores
 ```
@@ -52,24 +54,27 @@ autobahn install            # or install as a login service
 
 ## Sync Modes
 
-Autobahn has five core modes. Start with `two-way-conflict`: it propagates changes in either direction and reports competing edits for you to resolve.
+Autobahn has several sync modes with different resolution strsategies.
 
-| Mode | Policy | Best For... |
-| --- | --- | --- |
-| `two-way-conflict` | Report conflicts | Editing on both sides without risking data loss. |
-| `two-way-alpha` | Alpha wins | Active editing on both sides, but Alpha is the primary authority. |
-| `two-way-alpha-strict` | Alpha wins (strict) | Alpha is authoritative, and Alpha's deletions must override Beta's edits. |
-| `one-way-conflict` | Beta changes pause | Deployments where Beta generates local files (logs, caches) that Alpha must not touch. |
-| `one-way-alpha`<br>*(alias: `mirror`)* | Alpha mirrors strictly | Backups and releases where Beta must be an exact, identical replica of Alpha. |
-| `peering-*-dangerously-experimental` | Conflict or Alpha | Multi-node failover when Alpha goes offline. *(See [Peering](docs/peering.md))* |
+Start with `two-way-conflict` for editing on both sides. It propagates changes in either direction and reports competing edits for you to resolve.
 
-See [Modes](./docs/modes.md) for a complete behavior matrix and [Conflicts](./docs/conflicts.md) for resolution strategies.
+| Mode | Behavior |
+| --- | --- |
+| `two-way-conflict` | Bidirectional sync with conflict reports |
+| `two-way-alpha` | Favors alpha in conflicts with deletion safeguards |
+| `two-way-alpha-strict` | Favors alpha, including alpha deletions |
+| `one-way-conflict` | Reports beta changes that prevent a safe copy |
+| `one-way-alpha` (alias: `mirror`) | Makes beta match alpha |
+| `p2p-*-dangerously-experimental` | Lets a beta lead while alpha is offline |
+
+For mode details, see [Modes](docs/modes.md) and [Conflict Resolution](docs/conflicts.md).
+
+Read [P2P](docs/p2p.md) before P2P use.
+
 
 ## Benchmarks
 
-Autobahn was inspired by [Mutagen](https://mutagen.io/). I originally set out to optimize RAM use but quickly got carried away squeezing every possible second out of a sync.
-
-Latest recorded Linux results, refreshed through October 1, 2026: **Autobahn 0.4.0 versus mutagen 0.19.0-dev**. The [matrix](docs/benchmark-matrix.md) identifies the measured build for each cell; these are not measurements of every subsequent commit.
+Autobahn began as an effort to reduce the memory use of [Mutagen](https://mutagen.io/) which offers similar sync features, and then I got carried away.
 
 | Measurement | Autobahn | mutagen | Ratio |
 |---|---:|---:|---:|
@@ -79,28 +84,38 @@ Latest recorded Linux results, refreshed through October 1, 2026: **Autobahn 0.4
 | Idle controller CPU, Chromium | **0.1% of a core** | 49.9% | rounded values |
 | First sync, Chromium | **228.1 s** | 454.8 s | 2.0× |
 
-See [Benchmarks](docs/benchmarks.md), and [Why Mutagen is Slower](docs/mutagen.md) for details.
+See [Benchmarks](docs/benchmarks.md) for details.
 
 ## Safety
 
-I have been running this on my own fleet every day: 20 sessions across five hosts. One of them is a 13 GB, 215,000-file tree.
+### Empirically
 
-Autobahn has also undergone a battery of tests and benchmarks including a 24-hour soak test and formal verification where suitable.
+I have been running this on my own fleet every day: 20 sessions across five hosts. One of them is a 13 GB, 215,000-file tree. Autobahn has also undergone a battery of tests and benchmarks including a 24-hour soak test.
+
+### Formally
+
+Autobahn prevents data loss through strict operational invariants:
+
+- **Three-Way Reconciliation:** Tracks a shared ancestor to accurately distinguish deletions, modifications, and concurrent edits.
+- **Atomic File Transitions:** All file writes stage content to temporary paths and swap into place using atomic filesystem operations.
+- **Fail-Closed Guarantees:** Any ambiguous state, communication failure, or unexpected filesystem mutation results in a pause rather than accidental overwrites.
 
 See [Safety](docs/safety.md) for guarantees and the related invariants in [Correctness](docs/correctness/).
 
 
-## User interfaces (experimental)
+## UI Goodness
 
-Autobahn comes with an [App](docs/app.md), a [TUI](docs/shop.md), and a standalone [Tray](docs/macos-app.md). For alerts, you can even set one line in your config to run a script every time an alert fires:
+In addition to the standard CLI, several user interfaces are available:
+- **[Autobahn Dash](docs/app.md):** Experimental graphical management application.
+- **[Terminal UI](docs/shop.md):** Interactive curses-based console monitor (`autobahn shop`).
+- **[Menu Bar App](docs/macos-app.md):** Lightweight status monitor for macOS.
+- **[Alert Hooks](docs/alerts.md):** Event notification script support (`on_alert`).
 
 ```toml
 on_alert = "~/.autobahn/on-alert.sh"   # written for you by `autobahn init`
 ```
 
-None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them experimental features.
-
-**Peering** (dangerously experimental) — a beta takes the lead when the alpha is away, and gives it back. It has known security issues that are not fixed in this release; any peer that can lead is trusted with every other peer. Read [Peering](docs/peering.md) before enabling it.
+None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them in beta.
 
 ## AI Disclaimer
 
@@ -111,21 +126,40 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 - I won't accept PRs. I prefer my slop over your slop, so instead file an issue for a bug report or (small) feature request.
 - Bug reports should come with detailed context from a human or LLM.
 - Feature requests should be small with high impact.
-- Have a greater vision? Go fork yourself: Autobahn is considered near complete. If there's something crazy you really want, set up your own repo.
-
+- Have a greater request? Go fork yourself. ;D
 
 ## Documentation
 
-**Using it** — [Installation](INSTALL.md) · [Desktop app](docs/app.md) · [Git checkouts](docs/git.md) · [Configuration](docs/configuration.md) · [Modes](docs/modes.md) · [Ignores](docs/ignores.md) · [Alerts](docs/alerts.md) · [Commands](docs/commands.md) · [Conflicts](docs/conflicts.md) · [TUI](docs/shop.md) · [Menu bar app](docs/macos-app.md) · [Logging](docs/logging.md) · [State](docs/state.md)
+### Operations & Configuration
 
-**Understanding it** — [Safety](docs/safety.md) · [How it works](docs/how-it-works.md) · [Overlapping and nested roots](docs/nesting.md) · [Scope and support boundaries](docs/support-boundaries.md)
+- [Installation Guide](INSTALL.md)
+- [Configuration Reference](docs/configuration.md)
+- [Command-Line Reference](docs/commands.md)
+- [Sync Modes](docs/modes.md)
+- [Ignore Rules](docs/ignores.md)
+- [Conflict Resolution](docs/conflicts.md)
+- [Git Repository Best Practices](docs/git.md)
+- [Logging & Diagnostics](docs/logging.md)
+- [State Directory Layout](docs/state.md)
 
-**Measuring it** — [Benchmarks](docs/benchmarks.md) · [The benchmark matrix](docs/benchmark-matrix.md) · [Why mutagen is slower](docs/mutagen.md)
+### Architecture & Design
 
-**Working on it** — [Review archive](REVIEWS/README.md) · [Development](docs/development.md) · [Releases](docs/releases.md) · [Correctness](docs/correctness/)
+- [System Architecture & Internals](docs/how-it-works.md)
+- [Safety Guarantees](docs/safety.md)
+- [Limitations](docs/limitations.md)
+- [Failover P2P (Experimental)](docs/p2p.md)
 
-## Limitations
+### Verification & Performance
+- [Benchmark Results](docs/benchmarks.md)
+- [Full Benchmark Matrix](docs/benchmark-matrix.md)
+- [Invariants](docs/correctness/invariants.md)
+- [Accepted risks](docs/correctness/accepted-risks.md)
+- [Development Guide](docs/development.md)
+- [Release Process](docs/releases.md)
 
-Unix only: Linux (x86-64 and arm64) and macOS (Apple Silicon), with macOS a first-class target rather than a build target. Transport is SSH. Roots must live on local filesystems: network mounts are best-effort. The full list of what is and is not covered is in [Scope and support boundaries](docs/support-boundaries.md).
 
-**One difference on macOS.** Some programs save a file by writing a temporary copy and renaming it over the original; vim and JetBrains IDEs do. On Linux, Autobahn waits for the program to finish writing before it syncs the file, so it copies only the finished file. macOS does not say when a program has finished writing a file, so there a save like this of a large file can cost an extra round of work before it syncs: a fraction of a second, not an error. Details in [How it works](docs/how-it-works.md#the-settle-as-an-illustration).
+## System Requirements & Limitations
+
+- **Supported Platforms:** Linux (`x86_64`, `aarch64`) and macOS (`Apple Silicon`).
+- **Filesystems:** Requires local POSIX filesystems. Network filesystems (NFS, SMB, CIFS) receive best-effort support only.
+- **Editor Saves on macOS:** On macOS, atomic save operations (write-temporary and rename) lack immediate completion events from the kernel, occasionally requiring an extra polling cycle compared to Linux. Details are available in [How Autobahn Works](docs/how-it-works.md).

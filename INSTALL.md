@@ -1,26 +1,34 @@
-# Set up Autobahn with an LLM
+# Setting up Autobahn
 
 Give this file to your coding agent and ask it to set up Autobahn. The instructions below are for the agent.
 
-Your goal is one working sync group. Inspect what you can, ask one short question at a time for missing information, and run the commands yourself when you have terminal access. Use answers already given. Explain each meaningful choice briefly; don't walk the user through every setting.
+Your goal is to set up Autobahn and have one sync group working.
 
-## 1. Find out what to sync
+For details see [the repository](https://github.com/fny/autobahn).
 
-Check the OS, architecture, whether `autobahn` is installed, and whether it already has a configuration or running supervisor. Preserve existing groups and session state. The default configuration is `~/.autobahn/config.toml`; respect an existing `AUTOBAHN_HOME` or custom service configuration.
+## 1. Install Autobahhn
 
-Ask: **“Which folder should sync, and to which machine and folder?”** A destination can also be another local folder. Get real paths and an SSH host or alias; don't use the example values below literally. Check whether either folder already contains files.
-
-Recommend `two-way-conflict` for editing on both sides. Explain that changes, including deletions, travel both ways, while conflicting edits require a choice. If the user wants a one-way copy, consult [Modes](docs/modes.md) before choosing: a strict mirror can delete destination-only files.
-
-## 2. Install and check access
-
-Release binaries support Linux x86-64/arm64 and macOS Intel/Apple Silicon. Run as the ordinary user, without `sudo`. If Autobahn is missing:
+Check if `autobahn` is already in the path if not run the install script. Release binaries support Linux x86-64/arm64 and macOS Intel/Apple Silicon. Run as the ordinary user, without `sudo`. Install script:
 
 ```sh
 curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
-The installer puts the CLI in `~/.local/bin`, the agent bundle in `~/.autobahn/agents`, and creates a configuration template if needed. Follow its PATH guidance, then check `autobahn --version`. It does not start syncing or register a service. See [Development](docs/development.md) only if a source build is needed.
+If `autobahn` does exist check to see if there's an update and ask the user if they want to install it.
+
+When Autobahn installs, it creates a config file in `~/.autobahn/config.toml`. Brieflt familiarize yourself with it. Respect an existing `AUTOBAHN_HOME`.
+
+## 2. Managing Syncing
+
+First ask the user which folder they want to sync. Once you have that, move on to determining which hosts the sync should target as betas.
+
+Syncing leverages hosts in `~/.ssh/config`. Make sure there's something that can be a sync target there. If not guide the user to add a host.
+
+If hosts already exist, present them to the user and ask which hosts to sync the folder two and what the target directories are.
+
+For sync mode, recommend `two-way-conflict` for editing on both sides. Explain that changes, including deletions, travel both ways, while conflicting edits require a choice. If the user wants a one-way copy, consult [Modes](docs/modes.md) before choosing: a strict mirror can delete destination-only files.
+
+## 3. Check access
 
 For a remote destination, test key-based SSH using the chosen host:
 
@@ -28,25 +36,7 @@ For a remote destination, test key-based SSH using the chosen host:
 ssh -o BatchMode=yes -o ConnectTimeout=10 user@build.example.com true
 ```
 
-If access fails, help the user fix authentication or verify the host key before continuing. Don't bypass host-key checks. Autobahn installs its matching remote agent automatically; no separate remote CLI installation is needed.
-
-## 3. Write a small configuration
-
-If there is no configuration, `autobahn init` creates a template. Edit the existing file without `--force`. Add a uniquely named group using the agreed paths, mode, and exclusions:
-
-```toml
-[groups.project]
-alpha = "~/project"
-betas = ["user@build.example.com:/srv/project"]
-mode = "two-way-conflict"
-ignores = [".git", ".DS_Store", "node_modules", "target"]
-```
-
-Make sure the alpha folder exists. For a local destination, use an absolute path or one beginning with `~/` or `./`.
-
-Tailor the exclusions to the project. Ask whether Git history should sync if relevant; `.git` is excluded in the generated defaults. Group ignores **append** to defaults, and `.gitignore` is not read automatically. See [Configuration](docs/configuration.md) or [Git checkouts](docs/git.md) only as needed.
-
-Before saving, state the selected roots, direction, and exclusions. A running supervisor normally applies configuration edits automatically, so saving can start the new group immediately.
+If access fails, help the user fix authentication or verify the host key before continuing. Autobahn installs its matching remote agent automatically; no separate remote CLI installation is needed.
 
 ## 4. Verify the first sync
 
@@ -69,6 +59,6 @@ Ask: **“Should Autobahn keep syncing automatically at login, or only when you 
 - **In a terminal:** `autobahn watch` keeps syncing until Ctrl-C. Run it in the user's terminal or a persistent session.
 - **On demand:** use `autobahn sync` for each pass.
 
-Stop any foreground watcher before starting the service. Check `autobahn status` afterward. Offer [Autobahn Dash](docs/app.md) or the [macOS tray](docs/macos-app.md) only if the user wants a desktop interface.
+Stop any foreground watcher before starting the service. Check `autobahn status` afterward. Again offer [Autobahn Dash](docs/app.md) or the [macOS tray](docs/macos-app.md) only if the user wants a desktop interface.
 
 Finish with a short handoff: the configuration path, synced folders, mode, verification result, and whether syncing is running. For a service, mention `autobahn stop` to stop it and `autobahn start` to resume.

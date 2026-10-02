@@ -1,6 +1,6 @@
 # Commands
 
-Writing a configuration to start from:
+## Create a Configuration
 
 ```sh
 autobahn init                     # write ~/.autobahn/config.toml
@@ -8,9 +8,13 @@ autobahn init --config ./try.toml # ...or somewhere else
 autobahn init --force             # replace one, keeping the old beside it
 ```
 
-It writes the defaults, every mode explained in a comment, and one example group that is commented out — so a fresh install describes nothing and starts nothing until you have edited it and meant it. It refuses to replace a configuration that already exists unless you pass `--force`, which keeps the previous file as `config.toml.bak`. Whatever it writes, it reads back before it reports success.
+`init` writes the defaults, comments that explain each mode, and a commented example group. No sessions start until you edit the file.
 
-Asking a running supervisor things, whether it is `watch` or the login service:
+An existing configuration requires `--force` to replace it. The command keeps the previous file as `config.toml.bak` and reads the new file back before reporting success.
+
+## Inspect and Control Sessions
+
+These commands work with a foreground `watch` supervisor or the login service:
 
 ```sh
 autobahn status            # what every session is doing, or last did
@@ -37,9 +41,13 @@ autobahn mi                # the shop: watch it work, and clear the queue
                            # (? explains every word on the screen)
 ```
 
-`reset` requires the group name. A reset is deliberate, never a default. Run `doctor` first: it scans both sides and says whether they already match — in which case a reset is free — and if not, exactly what it would copy where, which is what a reset brings back. It changes neither folder nor the baseline, and runs beside a supervisor. `clean` is described in [State](./state.md); the conflict commands in [Conflicts](./conflicts.md).
+`reset` requires a group name and discards its baseline. The next cycle merges both sides additively, which can restore deleted files.
 
-Turning things off and on, without opening the file:
+Before a reset, run `doctor`. It scans both sides and reports whether they match and what a reset will copy. It changes neither the folders nor the baseline and can run beside the supervisor. If both sides match, a reset requires no copies.
+
+See [State](./state.md) for `clean` and [Conflicts](./conflicts.md) for conflict commands.
+
+## Disable and Enable Synchronization
 
 ```sh
 autobahn disable --host boite    # off everywhere it appears
@@ -48,9 +56,11 @@ autobahn disable --group vibe    # the whole group, sessions and all
 autobahn enable  --group vibe
 ```
 
-`disable` edits `~/.autobahn/config.toml` in place, keeping every comment: a host goes in and out of the top-level `disabled_hosts` list, a group gets `disabled = true` and loses it again. A name no group mentions is refused with the list of names that would work, so a typo cannot become a line that reads as done and does nothing. Nothing is deleted either way — session state stays, so enabling resumes rather than starts over — and the running supervisor picks the edit up within a few seconds, like any other (see [Editing it while it runs](./configuration.md#editing-it-while-it-runs)).
+These commands edit `~/.autobahn/config.toml` and preserve comments. A host enters or leaves `disabled_hosts`. A group gains or loses `disabled = true`.
 
-Running it as a service, and keeping it current:
+An unknown name produces an error with valid names. Disabling preserves session state, so enabling resumes the session. The supervisor normally applies the edit within a few seconds. See [Live reload](./configuration.md#editing-it-while-it-runs).
+
+## Manage the Service and Updates
 
 ```sh
 autobahn install           # register the supervisor as a login service
@@ -60,7 +70,9 @@ autobahn restart
 autobahn uninstall         # stop it and unregister it
 ```
 
-`start` and `restart` read the configuration first and refuse one the supervisor would refuse — a key it does not know, a mode it does not have, a group with no sessions — with the same message, and the service left as it was. Without that check the service manager reports the restart done, and the supervisor exits into `~/.autobahn/service.log` a moment later, unseen. A running supervisor makes the same checks on every edit to the file, so a `restart` is for an upgrade, not an edit: see [Editing it while it runs](./configuration.md#editing-it-while-it-runs).
+`start` and `restart` validate the configuration before changing the service. They reject unknown keys, unsupported modes, and groups without sessions. If validation fails, the service remains unchanged.
+
+A running supervisor performs the same checks on configuration edits. With live reload enabled, edits require no restart. An upgrade requires a restart.
 
 ```sh
 
@@ -68,11 +80,11 @@ autobahn update            # install the latest release over this one
 autobahn update --dry-run  # ...or just say what it would install
 ```
 
-`install` is in [Configuration](./configuration.md); `update`, and what a release contains, in [Releases](./releases.md).
+See [Configuration](./configuration.md) for service installation and [Releases](./releases.md) for updates.
 
 ## What `status` shows
 
-When a session has been working long enough that its silence would look like death — a cold sync, a first scan, an unreachable host — `status` says what it is doing, how long it has been at it, and, where the numbers allow an honest one, an estimate:
+After a session works for five seconds, `status` shows its phase, elapsed time, and available progress:
 
 ```
 ~/Workspace/Voltai voltai
@@ -83,50 +95,73 @@ When a session has been working long enough that its silence would look like dea
     mode: two-way-conflict
 ```
 
-Routine cycles say nothing. They finish in well under a second, and a line that flickered into "scanning" every few seconds would report nothing while hiding what the reader came for — so a phase earns the line only after the session has been working for five seconds, counted across the whole run rather than restarted at each step.
+The five-second threshold covers the whole run, across phases. Brief routine cycles do not display a phase line.
 
-The estimate is withheld unless the phase has been running long enough to have a rate and has a total to measure against — a first scan of a tree nothing has ever counted reports its progress and its elapsed time, and no estimate. A remote scan happens inside one request on the far side; once it has run half a second it reports its count every half second, so a long one shows entries as they are found — with no estimate, since the far side's total is not known here.
+An estimate requires a known total and enough elapsed time to measure a rate. A first scan without a known total shows counts and elapsed time only.
 
-A session between cycles is described by how its last cycle ended; so is a paused one, and one backing off from an error, both of which the recorded status names.
+After half a second, a remote scan reports its entry count every half second. It provides no estimate because the controller does not know its total.
 
-Every command that talks to the running supervisor — `status`, `flush`, `mi`, the menu bar app — sends its own build with the request, and a supervisor of another build refuses it rather than guess. After installing a new build by hand, before the service is restarted, `status` says so — *the running supervisor is 0.4.0+e16 and this is 0.4.1+e16; `autobahn restart` to run this build* — and shows what the supervisor last recorded. `autobahn update` restarts the service itself, so it never shows there.
+Between cycles, status describes the last cycle’s outcome. It also identifies paused sessions and sessions in error backoff.
 
-A group with nothing to say is one line — every destination synchronized, nothing waiting on anyone, nothing going on long enough to earn a line:
+Commands that contact the supervisor send their build identity. A supervisor with a different build rejects the request. Status then explains the mismatch and shows the last recorded state. After a manual upgrade, run `autobahn restart`. `autobahn update` restarts the service itself.
+
+A group with all destinations synchronized and no outstanding work appears on one line:
 
 ```
 ~/Workspace/notes notes  ✓ 2 synchronized · last cycle 4s ago
 ```
 
-Anything else — a conflict, a blocked path, a halt, an unreachable host, a pause, a long scan — shows the group in full, so what needs you is never folded away. `status <group>` shows that group in full regardless, and `status --all` shows everything. `--json` is unaffected.
+Conflicts, blocked paths, halts, unreachable hosts, pauses, and long scans expand the group. `status <group>` always expands the selected group. `status --all` expands every group. This compact display does not affect `--json`.
 
 ## `--live`
 
-To watch it happen rather than sample it, `autobahn status --live` repaints twice a second and shows every phase however brief. It is a read-only window onto whatever supervisor is already running — the login service, or a `watch` in another terminal. (`watch` is the same display, but it also does the synchronizing.)
+`autobahn status --live` refreshes twice a second and shows every phase, including brief ones. It reads an existing supervisor. `watch` uses the same display and also runs synchronization.
 
-Both scroll, with the keys a pager has trained everyone to try: arrows and `j`/`k` by the line, PgUp/PgDn and space/`b` by the screen, `g`/`G` or Home/End for the ends, `q` to leave. A footer says where you are in the list. The content keeps refreshing underneath while you move around in it, and leaving — by `q` or Ctrl-C — gives the terminal back with the scrollback intact.
+Both displays support these controls:
 
-## What a session's state means
+| Keys | Action |
+| --- | --- |
+| Arrows or `j`/`k` | Move one line |
+| PgUp/PgDn or space/`b` | Move one screen |
+| `g`/`G` or Home/End | Move to the beginning or end |
+| `q` or Ctrl-C | Leave |
 
-Two questions, not one word list. **Did the cycle run?** If it did not:
+A footer shows the current position. The display continues to refresh during scrolling. Exiting preserves terminal scrollback.
 
-- `unreachable` — the host is not answering. Usually clears itself.
-- `halted` — a safety refusal: the session stopped rather than carry out something that looks like an accident. Most clear only when you act, as the message says; a missing alpha folder (an unplugged drive, a dropped share, a mistyped path) clears on its own once the folder is back. See the [safety rules](./safety.md).
-- `errored` — it failed for some other reason; the message is the evidence, and [the log](./logging.md) has the rest.
+## Session States
 
-If it did run, the tree is in sync except for what the cycle could not carry:
+If a cycle cannot run, status reports:
 
-- `conflicts` — both sides changed a path. You pick a winner.
-- `blocked` — a path could not be read or written. You fix the filesystem.
+| State | Meaning |
+| --- | --- |
+| `unreachable` | The host does not answer. This usually clears without intervention. |
+| `halted` | A safety check stopped the session. Follow the reported instruction. A missing alpha folder clears automatically when the folder returns. |
+| `errored` | Another error stopped the cycle. Read the message and [log](./logging.md). |
 
-Conflicts and blocked paths co-occur, so both counts are reported rather than one hiding the other.
+If the cycle runs but cannot synchronize every path, status reports:
+
+| State | Meaning |
+| --- | --- |
+| `conflicts` | Both sides changed a path. Choose a resolution. |
+| `blocked` | A path cannot be read or written. Correct the filesystem problem. |
+
+Conflicts and blocked paths can occur together. Status reports both counts. See [Safety](./safety.md) for halt conditions.
 
 ## `--json`
 
-`autobahn status --json` and `autobahn conflicts --json` print everything as one versioned document, for scripts and user interfaces. The `version` is 4. Version 3 added `config_notice`, present only while the running supervisor is refusing an edit to the configuration (see [Editing it while it runs](./configuration.md#editing-it-while-it-runs)); version 4 added `supervisor_mismatch`, present only while the running supervisor is another build. Each session carries a `progress` object while a supervisor is running. `--filter` applies to the JSON too, while `--depth`, being a way of reading a list, does not. The alert hook receives this same document for session alerts; a configuration-refusal event instead carries the notice object described in [Alerts](./alerts.md). [The shop](./shop.md), [Dash](./app.md), and [the menu bar app](./macos-app.md) use this status data.
+`autobahn status --json` and `autobahn conflicts --json` produce one versioned document for scripts and interfaces. The current `version` is 4.
 
-## One-off syncs and scripting
+Version 3 added `config_notice`, present while the supervisor rejects a configuration edit. Version 4 added `supervisor_mismatch`, present while the supervisor uses another build. Each session has a `progress` object while a supervisor runs.
 
-Underneath the supervisor sits a single-session command, useful for trying a pairing before committing it to the config, and for scripts that need a sync that converges and *exits* with a status code. A one-off pass registers no filesystem watchers on either side, local or remote — it never waits for anything — so on a large tree it starts in a fraction of the time a `watch` does (a 160,000-file pair, already in sync: 0.7 s locally, 1.4 s over SSH):
+`--filter` applies to JSON. `--depth` affects the list display only.
+
+Session alerts receive this same document. Configuration-refusal alerts receive the notice object described in [Alerts](./alerts.md). The [terminal interface](./shop.md), [Dash](./app.md), and [menu bar app](./macos-app.md) use status data.
+
+## One-off Syncs and Scripting
+
+`sync` runs a pairing once and exits, or runs every configured session when no roots are supplied. Without `--watch`, it registers no local or remote filesystem watchers.
+
+For an already synchronized 160,000-file pair, a recorded one-off run took 0.7 s locally and 1.4 s over SSH.
 
 ```sh
 # One bidirectional pass, then exit:
@@ -146,7 +181,7 @@ autobahn sync ~/project host:/srv/project \
     --watch --mode one-way-alpha --ignore target --ignore '*.log'
 ```
 
-A `sync` that finishes — of two roots, or of every configured session when it is given none — exits with a code a script can act on. With several sessions, the worst one decides: `1` beats `2`, which beats `0`.
+A completed command returns one of these exit codes. Across multiple sessions, `1` takes precedence over `2`, which takes precedence over `0`.
 
 | Code | Meaning |
 |---|---|
@@ -154,12 +189,12 @@ A `sync` that finishes — of two roots, or of every configured session when it 
 | `1` | An error stopped a session: unreachable, halted, a bad configuration. |
 | `2` | Every session finished its pass, but conflicts or blocked paths remain. |
 
-One-shots share session state with the supervisor (same roots → same session), so deletions propagate correctly across runs, conflicts are detected across runs, and interrupted transfers resume. A `sync` and a supervisor can never race the same pairing: each session's state is exclusively locked while it runs.
+One-off runs share session state with the supervisor for the same roots. Deletions and conflicts propagate across runs, and interrupted transfers resume. An exclusive session-state lock prevents a one-off command and supervisor from operating on the same pair concurrently.
 
-## See also
+## Related Documentation
 
-- [Conflicts](./conflicts.md) — `issues`, `conflicts`, `diff`, `resolve`
-- [The shop](./shop.md) — `autobahn mi`
-- [State](./state.md) — `clean`, and what lives in `~/.autobahn`
-- [Alerts](./alerts.md) — being told without watching
-- [Releases](./releases.md) — `update`, and what ships with a release
+- [Conflicts](./conflicts.md): `issues`, `conflicts`, `diff`, and `resolve`
+- [Terminal interface](./shop.md): `autobahn mi`
+- [State](./state.md): `clean` and the contents of `~/.autobahn`
+- [Alerts](./alerts.md): notifications
+- [Releases](./releases.md): updates and release contents.

@@ -5,7 +5,7 @@
 #   spec/check.sh strict       one mode
 #   spec/check.sh quick        the star at three edits, half a minute: CI's check
 #   spec/check.sh strict_n3    three betas under symmetry: invariants only
-#   spec/check.sh peering_conflict_safety   the failover protocol (Peering.tla)
+#   spec/check.sh p2p_conflict_safety   the failover protocol (P2P.tla)
 #   spec/check.sh --traces DIR validate replay traces (see tests/spec_replay.rs)
 #
 # Needs Java 11+ and the tla2tools.jar that spec/tla2tools.version pins.
@@ -73,7 +73,7 @@ if [ "${1:-}" = "--traces" ]; then
     for t in "$dir"/Trace*.tla; do
         [ -f "$t" ] || continue
         count=$((count + 1))
-        cp "$HERE/Autobahn.tla" "$HERE/Reconcile.tla" "$HERE/Peering.tla" "$dir/"
+        cp "$HERE/Autobahn.tla" "$HERE/Reconcile.tla" "$HERE/P2P.tla" "$dir/"
         log="${t%.tla}.log"
         (cd "$dir" && tlc -config "$(basename "${t%.tla}").cfg" "$(basename "$t")") > "$log" 2>&1
         if ! judge "$log" $? > /dev/null; then
@@ -92,7 +92,7 @@ status=0
 for mode in $modes; do
     echo "== $mode"
     case "$mode" in
-        peering_*) cfg="Peering_${mode#peering_}.cfg"; module=MCPeering.tla ;;
+        p2p_*) cfg="P2P_${mode#p2p_}.cfg"; module=MCP2P.tla ;;
         *) cfg="Autobahn_$mode.cfg"; module=MC.tla ;;
     esac
     (cd "$HERE" && tlc -config "$cfg" "$module") > "$log" 2>&1

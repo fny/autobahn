@@ -347,7 +347,7 @@ impl<'m> Reconciler<'m> {
             // Every other mode propagates it. This was once a halt in all
             // of them, and it stopped whole sessions for exactly the tool
             // cleanups above.
-            if self.policy.guard_directory_deletes_over.is_some() && !path.is_empty() {
+            if self.policy.guard_dir_deletes_over.is_some() && !path.is_empty() {
                 // Empty means nothing synchronizable: a directory emptied
                 // down to one ignored entry is the same shape.
                 let empty = |node: Option<&Node>| {
@@ -356,7 +356,7 @@ impl<'m> Reconciler<'m> {
                             && !node.holds_synchronizable())
                 };
                 if empty(alpha) != empty(beta)
-                    && large_in_ancestor(ancestor, self.policy.guard_directory_deletes_over)
+                    && large_in_ancestor(ancestor, self.policy.guard_dir_deletes_over)
                 {
                     let change = |side: Option<&Node>| Change {
                         path: path.to_owned(),
@@ -520,7 +520,7 @@ impl<'m> Reconciler<'m> {
         // not this shape, so the emptying side can still win: retiring the
         // full copy leaves two pure deletions, and the fuller one carries.
         if !path.is_empty()
-            && large_in_ancestor(ancestor, self.policy.guard_directory_deletes_over)
+            && large_in_ancestor(ancestor, self.policy.guard_dir_deletes_over)
             && alpha.is_none() != beta.is_none()
         {
             let alpha_gone = alpha.is_none();
@@ -787,7 +787,7 @@ impl<'m> Reconciler<'m> {
         // Beta has non-deletion changes. If alpha is nil or untracked, and
         // it's not the case that both the ancestor and beta are directories,
         // then nil out the ancestor and leave beta's content in place (the
-        // core of one-way-safe semantics: beta-side creations and
+        // core of one-way-conflict semantics: beta-side creations and
         // modifications survive).
         let ancestor_is_directory =
             matches!(ancestor, Some(node) if matches!(node.content, Content::Directory(_)));
@@ -934,7 +934,7 @@ mod tests {
     fn guarding(over: usize) -> Policy {
         Policy {
             mode: SyncMode::TwoWaySafe,
-            guard_directory_deletes_over: Some(over),
+            guard_dir_deletes_over: Some(over),
         }
     }
 

@@ -54,12 +54,12 @@ BUILDER_TYPE = "c6i.2xlarge"
 VOLUME_GB = 200
 
 CELLS = [
-    # name, corpora, agents, bidirectional, betas, seed, mode
+    # name, corpora, agents, bidirectional, replicas, seed, mode
     #
-    # `betas` is how many destinations one source feeds. Everything is a
-    # pair at 1. At 10 it is a fan-out: one alpha, ten betas, which asks a
+    # `replicas` is how many destinations one source feeds. Everything is a
+    # pair at 1. At 10 it is a fan-out: one primary, ten replicas, which asks a
     # different question — autobahn fans a config group into one session
-    # per beta, so ten betas means ten sessions scanning the same source.
+    # per replica, so ten replicas means ten sessions scanning the same source.
     #
     # `seed` fills the destinations from the copy already in the image
     # rather than timing a first synchronization.
@@ -93,7 +93,7 @@ CELLS = [
     ("5k-1", ["sub5k"], 1, False, 1, True),
     ("5k-10", ["sub5k"], 10, False, 1, True),
     ("5k-100", ["sub5k"], 100, False, 1, True),
-    # Fan-out: one alpha, ten betas, at a fixed agent count so that width
+    # Fan-out: one primary, ten replicas, at a fixed agent count so that width
     # is the only variable.
     ("5k-10-fan", ["sub5k"], 10, False, 10, True),
     ("50k-10-fan", ["sub50k"], 10, False, 10, True),
@@ -922,14 +922,14 @@ def _dispatch_body(options):
     jobs = []
     for repeat in range(options.repeats):
         for cell in selected:
-            name, corpora, agents, bidirectional, betas, seed = cell[:6]
+            name, corpora, agents, bidirectional, replicas, seed = cell[:6]
             mode = cell[6] if len(cell) > 6 else "replace"
             tools = ["autobahn", "mutagen"]
             rng.shuffle(tools)
             jobs.append({
                 "run": run_id, "repeat": repeat, "job": f"{name}-r{repeat}",
                 "cell": {"name": name, "corpora": corpora, "agents": agents,
-                         "bidirectional": bidirectional, "betas": betas,
+                         "bidirectional": bidirectional, "replicas": replicas,
                          "mode": mode,
                          "pre_seeded": seed},
                 "tools": tools,

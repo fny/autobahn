@@ -1,17 +1,17 @@
 #!/bin/bash
-# alpha-bench — what does one source cost when it feeds N destinations?
+# primary-bench — what does one source cost when it feeds N destinations?
 #
-# autobahn fans a config group into one session per beta, and each session
-# builds its own endpoint over the same alpha. So ten destinations may mean
+# autobahn fans a config group into one session per replica, and each session
+# builds its own endpoint over the same primary. So ten destinations may mean
 # ten scans of one tree, ten copies of it in memory, ten inotify watches per
 # directory, and ten scan caches on disk — or the page cache and the
 # operating system may absorb most of that. This measures which.
 #
-# It runs locally and costs nothing. The betas are local directories: a
-# remote beta would add an agent per destination, but the duplication being
-# measured is on the ALPHA side, and that is identical either way.
+# It runs locally and costs nothing. The replicas are local directories: a
+# remote replica would add an agent per destination, but the duplication being
+# measured is on the PRIMARY side, and that is identical either way.
 #
-# Usage: alpha-bench.sh [widths...]      (default: 1 2 5 10)
+# Usage: primary-bench.sh [widths...]      (default: 1 2 5 10)
 set -u
 
 AB=${AB:-/home/ubuntu/Workspace/autobahn/target/release/autobahn}
@@ -40,7 +40,7 @@ echo "corpus: $actual_files files, $actual_dirs directories"
 echo
 
 printf '%6s %10s %10s %10s %10s %10s %12s\n' \
-  betas rss_mb watches fds caches cache_mb cpu_pct
+  replicas rss_mb watches fds caches cache_mb cpu_pct
 printf '%6s %10s %10s %10s %10s %10s %12s\n' \
   ------ ---------- ---------- ---------- ---------- ---------- ------------
 
@@ -48,13 +48,13 @@ for width in $WIDTHS; do
   pkill -x autobahn 2>/dev/null; sleep 1
   rm -rf "$WORK/state" "$WORK/dst"*; mkdir -p "$WORK/state"
 
-  # One group, `width` betas — exactly the shape a fan-out configuration has.
+  # One group, `width` replicas — exactly the shape a fan-out configuration has.
   {
     echo "[groups.fan]"
-    echo "alpha = \"$WORK/src\""
+    echo "primary = \"$WORK/src\""
     echo 'mode = "two-way-conflict"'
     echo "interval = 5"
-    printf 'betas = ['
+    printf 'replicas = ['
     for b in $(seq 1 "$width"); do
       mkdir -p "$WORK/dst$b"
       printf '"%s/dst%s"' "$WORK" "$b"
@@ -95,7 +95,7 @@ for width in $WIDTHS; do
 done
 
 echo
-echo "Reading it: a cost that shares across sessions stays flat as betas"
+echo "Reading it: a cost that shares across sessions stays flat as replicas"
 echo "grow; a cost paid per session rises with them. Watches and scan"
 echo "caches are the sharpest signals — they are countable rather than"
 echo "sampled, and neither is absorbed by the page cache."

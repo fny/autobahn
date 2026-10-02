@@ -99,13 +99,13 @@ After an increment, rebuild the agent bundle before restarting the supervisor. A
 
 ## The specification
 
-TLA+ models in `spec/` cover reconciliation across one alpha and multiple betas, plus p2p. TLC explores bounded configurations.
+TLA+ models in `spec/` cover reconciliation across one primary and multiple replicas, plus p2p. TLC explores bounded configurations.
 
 CI’s `spec` job runs `spec/check.sh quick` with the version pinned in `spec/tla2tools.version`. It then runs `AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_p2p_replay -- --include-ignored`.
 
 Replay tests drive real `reconcile()` and lease code through TLC traces and compare results with `Match`. Without TLC, these tests remain `#[ignore]`d.
 
-`spec/check.sh` without arguments includes liveness and three-beta models. The manual `spec-full.yml` workflow does the same. P2P liveness can take hours and requires a large machine.
+`spec/check.sh` without arguments includes liveness and three-replica models. The manual `spec-full.yml` workflow does the same. P2P liveness can take hours and requires a large machine.
 
 See [Specification guide](../spec/README.md) for modes, bounds, and modeling lessons.
 

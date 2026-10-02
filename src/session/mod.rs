@@ -41,13 +41,13 @@ pub enum SafetyHalt {
     /// one side.
     #[error("halted: one side's synchronization root was emptied; propagate the deletion manually or restore the content, then run again")]
     RootEmptied,
-    /// The alpha root is not there at all. Nothing is synchronized, so the
+    /// The primary root is not there at all. Nothing is synchronized, so the
     /// destination is not emptied to match a source that only looks empty
     /// — an unplugged drive, a dropped share, a mistyped path. Unlike the
     /// others this clears on its own: the next attempt finds the folder
     /// back and carries on.
-    #[error("halted: the alpha folder {0} is missing, so nothing was synchronized rather than emptying the other side to match; reconnect the drive or correct the path, and syncing resumes on its own")]
-    AlphaRootMissing(String),
+    #[error("halted: the primary folder {0} is missing, so nothing was synchronized rather than emptying the other side to match; reconnect the drive or correct the path, and syncing resumes on its own")]
+    PrimaryRootMissing(String),
     /// The session's ancestor cannot be read, and the two sides differ, so
     /// there is no safe way to tell a deletion from a creation or an edit
     /// from a stale copy. When they match it is rebuilt instead.
@@ -68,11 +68,11 @@ pub enum SafetyHalt {
 
 impl SafetyHalt {
     /// How long this halt must stand before it is worth waking someone,
-    /// when that differs from a halt's usual "at once". A missing alpha is
+    /// when that differs from a halt's usual "at once". A missing primary is
     /// often a drive that comes back with the laptop's wake.
     pub fn alert_after(&self) -> Option<std::time::Duration> {
         match self {
-            SafetyHalt::AlphaRootMissing(_) => Some(std::time::Duration::from_secs(120)),
+            SafetyHalt::PrimaryRootMissing(_) => Some(std::time::Duration::from_secs(120)),
             SafetyHalt::RootDeletion
             | SafetyHalt::RootEmptied
             | SafetyHalt::AncestorUnreadable(_)
@@ -85,21 +85,21 @@ impl SafetyHalt {
 /// A report of one synchronization cycle.
 #[derive(Debug, Default)]
 pub struct CycleReport {
-    /// The number of transitions applied to alpha.
-    pub alpha_transitions: usize,
-    /// The number of transitions applied to beta.
-    pub beta_transitions: usize,
+    /// The number of transitions applied to primary.
+    pub primary_transitions: usize,
+    /// The number of transitions applied to replica.
+    pub replica_transitions: usize,
     /// Conflicts identified during reconciliation (left unresolved in safe
     /// modes).
     pub conflicts: Vec<Conflict>,
-    /// Scan problems from alpha.
-    pub alpha_scan_problems: Vec<Problem>,
-    /// Scan problems from beta.
-    pub beta_scan_problems: Vec<Problem>,
-    /// Transition problems from alpha.
-    pub alpha_transition_problems: Vec<Problem>,
-    /// Transition problems from beta.
-    pub beta_transition_problems: Vec<Problem>,
+    /// Scan problems from primary.
+    pub primary_scan_problems: Vec<Problem>,
+    /// Scan problems from replica.
+    pub replica_scan_problems: Vec<Problem>,
+    /// Transition problems from primary.
+    pub primary_transition_problems: Vec<Problem>,
+    /// Transition problems from replica.
+    pub replica_transition_problems: Vec<Problem>,
     /// Whether or not either endpoint reported missing staged content
     /// (warranting an immediate follow-up cycle).
     pub missing_staged_files: bool,
@@ -107,17 +107,17 @@ pub struct CycleReport {
     /// and digest, across both endpoints. A follow-up that reports the same
     /// pair again is not looking at a changing file.
     pub missing_staged: Vec<crate::endpoint::FileRequest>,
-    /// Whether alpha's scan was skipped on the strength of a standing
+    /// Whether primary's scan was skipped on the strength of a standing
     /// watch, its last snapshot standing in.
-    pub alpha_scan_skipped: bool,
-    /// Whether beta's scan was skipped, in the same way.
-    pub beta_scan_skipped: bool,
+    pub primary_scan_skipped: bool,
+    /// Whether replica's scan was skipped, in the same way.
+    pub replica_scan_skipped: bool,
 }
 
 impl CycleReport {
     /// Indicates whether or not the cycle applied any transitions.
     pub fn changed(&self) -> bool {
-        self.alpha_transitions > 0 || self.beta_transitions > 0
+        self.primary_transitions > 0 || self.replica_transitions > 0
     }
 
     /// Indicates that the cycle left nothing outstanding: nothing applied,
@@ -128,10 +128,10 @@ impl CycleReport {
         !self.changed()
             && self.conflicts.is_empty()
             && !self.missing_staged_files
-            && self.alpha_scan_problems.is_empty()
-            && self.beta_scan_problems.is_empty()
-            && self.alpha_transition_problems.is_empty()
-            && self.beta_transition_problems.is_empty()
+            && self.primary_scan_problems.is_empty()
+            && self.replica_scan_problems.is_empty()
+            && self.primary_transition_problems.is_empty()
+            && self.replica_transition_problems.is_empty()
     }
 }
 
@@ -145,14 +145,14 @@ impl CycleReport {
 pub enum CyclePoint {
     /// Both scans are in hand; nothing has been reconciled or moved.
     AfterScans,
-    /// Beta's content is staged; its transition is about to be sent.
-    BeforeBetaTransition,
-    /// Beta's transition has answered.
-    AfterBetaTransition,
-    /// Alpha's content is staged; its transition is about to be sent.
-    BeforeAlphaTransition,
-    /// Alpha's transition has answered.
-    AfterAlphaTransition,
+    /// Replica's content is staged; its transition is about to be sent.
+    BeforeReplicaTransition,
+    /// Replica's transition has answered.
+    AfterReplicaTransition,
+    /// Primary's content is staged; its transition is about to be sent.
+    BeforePrimaryTransition,
+    /// Primary's transition has answered.
+    AfterPrimaryTransition,
     /// Every transition has answered; the ancestor is about to be recorded.
     BeforeRecord,
 }
@@ -163,8 +163,8 @@ pub type CycleHook = Box<dyn FnMut(CyclePoint) + Send>;
 /// One of a session's two sides.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Side {
-    Alpha,
-    Beta,
+    Primary,
+    Replica,
 }
 
 /// What resolution does with one losing copy.
@@ -225,10 +225,10 @@ pub struct SettlementOutcome {
 
 /// A synchronization session between two endpoints.
 pub struct Session {
-    /// The alpha endpoint.
-    alpha: Box<dyn Endpoint + Send>,
-    /// The beta endpoint.
-    beta: Box<dyn Endpoint + Send>,
+    /// The primary endpoint.
+    primary: Box<dyn Endpoint + Send>,
+    /// The replica endpoint.
+    replica: Box<dyn Endpoint + Send>,
     /// The synchronization mode.
     mode: SyncMode,
     /// The persisted ancestor path.
@@ -258,25 +258,25 @@ pub struct Session {
     hook: Option<CycleHook>,
     /// Whether the last cycle finished with the two sides synchronized and
     /// nothing outstanding — the precondition for skipping a cycle whose
-    /// scans reproduce [`settled_alpha`](Self::settled_alpha) and
-    /// [`settled_beta`](Self::settled_beta).
+    /// scans reproduce [`settled_primary`](Self::settled_primary) and
+    /// [`settled_replica`](Self::settled_replica).
     quiesced: bool,
-    /// Alpha's hierarchy as of the last quiesced cycle.
-    settled_alpha: Option<Node>,
-    /// Beta's hierarchy as of the last quiesced cycle.
-    settled_beta: Option<Node>,
+    /// Primary's hierarchy as of the last quiesced cycle.
+    settled_primary: Option<Node>,
+    /// Replica's hierarchy as of the last quiesced cycle.
+    settled_replica: Option<Node>,
     /// P2P: what this session presents to its peer when its
     /// supervisor leads. `None` for a plain mode, and for a follower.
     leadership: Option<crate::p2p::Leadership>,
     /// When `present_lease` last had the lease accepted, for renewing it
     /// while the session waits between cycles.
     lease_presented_at: Option<std::time::Instant>,
-    /// P2P: which side the peer is. The beta, except for the session
-    /// a beta that leads runs against the attached alpha.
+    /// P2P: which side the peer is. The replica, except for the session
+    /// a replica that leads runs against the attached primary.
     peer_side: crate::p2p::PeerSide,
-    /// P2P: whether the beta's ancestor copy has been compared with
+    /// P2P: whether the replica's ancestor copy has been compared with
     /// this session's ancestor since the session connected. Done once,
-    /// after the first accepted lease, so a beta that has no copy — or
+    /// after the first accepted lease, so a replica that has no copy — or
     /// one from before a restart — gets a checkpoint even when the cycle
     /// itself changes nothing.
     copy_checked: bool,
@@ -315,8 +315,8 @@ pub struct Session {
 /// The mount points last seen on each side, root-relative.
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct MountRecord {
-    alpha: Vec<String>,
-    beta: Vec<String>,
+    primary: Vec<String>,
+    replica: Vec<String>,
 }
 
 /// The error raised when a session's state directory is locked by another
@@ -336,11 +336,11 @@ pub struct SessionLockHeld {
 
 /// Computes a stable session identifier from the two endpoint
 /// specifications, used to isolate persisted state.
-pub fn session_identifier(alpha_spec: &str, beta_spec: &str) -> String {
+pub fn session_identifier(primary_spec: &str, replica_spec: &str) -> String {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(alpha_spec.as_bytes());
+    hasher.update(primary_spec.as_bytes());
     hasher.update(&[0]);
-    hasher.update(beta_spec.as_bytes());
+    hasher.update(replica_spec.as_bytes());
     let digest = hasher.finalize();
     let bytes = digest.as_bytes();
     let mut identifier = String::with_capacity(32);
@@ -355,12 +355,17 @@ impl Session {
     /// directory's exclusive lock and loading any persisted ancestor (the
     /// directory is created if needed).
     pub fn new(
-        alpha: Box<dyn Endpoint + Send>,
-        beta: Box<dyn Endpoint + Send>,
+        primary: Box<dyn Endpoint + Send>,
+        replica: Box<dyn Endpoint + Send>,
         mode: SyncMode,
         state_directory: PathBuf,
     ) -> Result<Session> {
-        Session::with_lock(alpha, beta, mode, SessionLock::acquire(state_directory)?)
+        Session::with_lock(
+            primary,
+            replica,
+            mode,
+            SessionLock::acquire(state_directory)?,
+        )
     }
 
     /// Holds an exclusivity lock for this session's lifetime.
@@ -429,11 +434,11 @@ impl Session {
             .forget(self.ancestor.as_ref(), &settlement.forget)?;
         // Both sides are about to change under the last settled cycle.
         self.quiesced = false;
-        self.settled_alpha = None;
-        self.settled_beta = None;
+        self.settled_primary = None;
+        self.settled_replica = None;
 
         let mut outcome = SettlementOutcome::default();
-        for side in [Side::Alpha, Side::Beta] {
+        for side in [Side::Primary, Side::Replica] {
             let retire: Vec<&(Side, String, Retirement)> = settlement
                 .retire
                 .iter()
@@ -443,8 +448,8 @@ impl Session {
                 continue;
             }
             let endpoint = match side {
-                Side::Alpha => &mut self.alpha,
-                Side::Beta => &mut self.beta,
+                Side::Primary => &mut self.primary,
+                Side::Replica => &mut self.replica,
             };
             let mut removals = Vec::new();
             for (_, path, retirement) in retire {
@@ -499,8 +504,8 @@ impl Session {
     /// acquire the lock *first* and discover a conflicting session before
     /// incurring any of that work or its remote side effects.
     pub fn with_lock(
-        alpha: Box<dyn Endpoint + Send>,
-        beta: Box<dyn Endpoint + Send>,
+        primary: Box<dyn Endpoint + Send>,
+        replica: Box<dyn Endpoint + Send>,
         mode: SyncMode,
         lock: SessionLock,
     ) -> Result<Session> {
@@ -570,7 +575,7 @@ impl Session {
                 ancestor = tainted;
             }
         }
-        let remote_involved = alpha.is_remote() || beta.is_remote();
+        let remote_involved = primary.is_remote() || replica.is_remote();
         let mounts = std::fs::read(lock.state_directory().join("mounts"))
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok())
@@ -581,8 +586,8 @@ impl Session {
             fail_before_record: false,
             verify_next: false,
             remote_involved,
-            alpha,
-            beta,
+            primary,
+            replica,
             mode,
             ancestor_store,
             ancestor,
@@ -590,11 +595,11 @@ impl Session {
             wake: Arc::default(),
             hook: None,
             quiesced: false,
-            settled_alpha: None,
-            settled_beta: None,
+            settled_primary: None,
+            settled_replica: None,
             leadership: None,
             lease_presented_at: None,
-            peer_side: crate::p2p::PeerSide::Beta,
+            peer_side: crate::p2p::PeerSide::Replica,
             copy_checked: false,
             _lock: lock,
             mounts,
@@ -624,10 +629,10 @@ impl Session {
     /// on it.
     fn account_for_mounts(
         &mut self,
-        alpha_root: Option<Node>,
-        beta_root: Option<Node>,
-        alpha_found: &[String],
-        beta_found: &[String],
+        primary_root: Option<Node>,
+        replica_root: Option<Node>,
+        primary_found: &[String],
+        replica_found: &[String],
     ) -> Result<(Option<Node>, Option<Node>)> {
         let hollow = |root: Option<&Node>, path: &str| match crate::tree::node_at(root, path) {
             None => true,
@@ -638,18 +643,18 @@ impl Session {
         let mut record = MountRecord::default();
         for (side, found, root, remembered, kept) in [
             (
-                "alpha",
-                alpha_found,
-                alpha_root.as_ref(),
-                &self.mounts.alpha,
-                &mut record.alpha,
+                "primary",
+                primary_found,
+                primary_root.as_ref(),
+                &self.mounts.primary,
+                &mut record.primary,
             ),
             (
-                "beta",
-                beta_found,
-                beta_root.as_ref(),
-                &self.mounts.beta,
-                &mut record.beta,
+                "replica",
+                replica_found,
+                replica_root.as_ref(),
+                &self.mounts.replica,
+                &mut record.replica,
             ),
         ] {
             kept.extend(found.iter().cloned());
@@ -681,10 +686,14 @@ impl Session {
             self.mounts = record;
         }
         if !self.ignore_mounts {
-            return Ok((alpha_root, beta_root));
+            return Ok((primary_root, replica_root));
         }
-        let mut excluded: Vec<&String> =
-            self.mounts.alpha.iter().chain(&self.mounts.beta).collect();
+        let mut excluded: Vec<&String> = self
+            .mounts
+            .primary
+            .iter()
+            .chain(&self.mounts.replica)
+            .collect();
         excluded.sort();
         excluded.dedup();
         let leave_out = |root: Option<Node>| -> Result<Option<Node>> {
@@ -708,7 +717,7 @@ impl Session {
             apply(root.as_ref(), &changes)
                 .map_err(|message| anyhow::anyhow!("unable to leave mount points out: {message}"))
         };
-        Ok((leave_out(alpha_root)?, leave_out(beta_root)?))
+        Ok((leave_out(primary_root)?, leave_out(replica_root)?))
     }
 
     /// Answers an ancestor that could not be read, with both sides scanned.
@@ -727,13 +736,13 @@ impl Session {
         &mut self,
         problem: String,
         format: bool,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
+        primary: Option<&Node>,
+        replica: Option<&Node>,
     ) -> Result<()> {
-        let untouched = reconcile(None, alpha, beta, self.policy());
+        let untouched = reconcile(None, primary, replica, self.policy());
         let matching = untouched.conflicts.is_empty()
-            && untouched.alpha_transitions.is_empty()
-            && untouched.beta_transitions.is_empty();
+            && untouched.primary_transitions.is_empty()
+            && untouched.replica_transitions.is_empty();
         let marker = self.ancestor_path.with_file_name("ancestor.rebuilt");
         if !matching {
             self.unreadable = Some((problem.clone(), format));
@@ -762,7 +771,7 @@ impl Session {
     }
 
     /// P2P: adopts (or drops) the leadership this session presents to
-    /// its beta. Set by a leading supervisor before every attempt, so a
+    /// its replica. Set by a leading supervisor before every attempt, so a
     /// change of term reaches the next cycle.
     pub fn set_leadership(
         &mut self,
@@ -779,8 +788,8 @@ impl Session {
     /// P2P: the endpoint on the peer's side.
     fn peer(&mut self) -> &mut Box<dyn Endpoint + Send> {
         match self.peer_side {
-            crate::p2p::PeerSide::Alpha => &mut self.alpha,
-            crate::p2p::PeerSide::Beta => &mut self.beta,
+            crate::p2p::PeerSide::Primary => &mut self.primary,
+            crate::p2p::PeerSide::Replica => &mut self.replica,
         }
     }
 
@@ -790,13 +799,13 @@ impl Session {
         self.peer().p2p_keys()
     }
 
-    /// P2P, with `manage_keys`: installs the other betas' keys on the
+    /// P2P, with `manage_keys`: installs the other replicas' keys on the
     /// peer host.
     pub fn install_peers(&mut self, authorized: &[String], known_hosts: &[String]) -> Result<()> {
         self.peer().install_peers(authorized, known_hosts)
     }
 
-    /// P2P: writes the files a follower needs onto the beta's host.
+    /// P2P: writes the files a follower needs onto the replica's host.
     pub fn push_p2p_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
         for (name, bytes) in files {
             self.peer()
@@ -806,9 +815,9 @@ impl Session {
         Ok(())
     }
 
-    /// P2P, at the start of a cycle: presents the lease to the beta and
+    /// P2P, at the start of a cycle: presents the lease to the replica and
     /// stops the cycle if the host refused it. Then, once per session,
-    /// makes sure the beta's ancestor copy matches this session's.
+    /// makes sure the replica's ancestor copy matches this session's.
     pub fn present_lease(&mut self) -> Result<()> {
         let Some(leadership) = self.leadership.clone() else {
             return Ok(());
@@ -878,7 +887,7 @@ impl Session {
         Ok(())
     }
 
-    /// P2P, after the ancestor advanced: sends the record to the beta,
+    /// P2P, after the ancestor advanced: sends the record to the replica,
     /// and a checkpoint if the copy could not apply it. Best effort — the
     /// ancestor is already recorded here, and a copy that misses a record
     /// asks for a checkpoint on the next one, so a failure costs a
@@ -898,7 +907,7 @@ impl Session {
             Err(error) => Err(error),
         };
         if let Err(error) = outcome {
-            crate::complain!("unable to replicate the ancestor to the beta: {error:#}");
+            crate::complain!("unable to replicate the ancestor to the replica: {error:#}");
         }
     }
 
@@ -924,8 +933,8 @@ impl Session {
     /// is doing is visible while it does it. Each endpoint gets the handle
     /// for its own side.
     pub fn set_progress(&mut self, progress: Arc<crate::progress::Progress>) {
-        self.alpha.set_scan_progress(progress.alpha.clone());
-        self.beta.set_scan_progress(progress.beta.clone());
+        self.primary.set_scan_progress(progress.primary.clone());
+        self.replica.set_scan_progress(progress.replica.clone());
         self.progress = progress;
     }
 
@@ -955,13 +964,17 @@ impl Session {
             if remaining.is_zero() {
                 return Ok(false);
             }
-            self.alpha.watch_begin(remaining, Arc::clone(&self.wake))?;
-            self.beta.watch_begin(remaining, Arc::clone(&self.wake))?;
-            if self.alpha.watch_poll()? == Some(true) || self.beta.watch_poll()? == Some(true) {
+            self.primary
+                .watch_begin(remaining, Arc::clone(&self.wake))?;
+            self.replica
+                .watch_begin(remaining, Arc::clone(&self.wake))?;
+            if self.primary.watch_poll()? == Some(true) || self.replica.watch_poll()? == Some(true)
+            {
                 return Ok(true);
             }
             self.wake.wait(remaining.min(SLICE));
-            if self.alpha.watch_poll()? == Some(true) || self.beta.watch_poll()? == Some(true) {
+            if self.primary.watch_poll()? == Some(true) || self.replica.watch_poll()? == Some(true)
+            {
                 return Ok(true);
             }
         }
@@ -1003,8 +1016,8 @@ impl Session {
         let writing_deadline = started + crate::endpoint::WRITE_GRACE.max(maximum);
         let sample = |session: &mut Self| {
             (
-                session.alpha.change_activity(),
-                session.beta.change_activity(),
+                session.primary.change_activity(),
+                session.replica.change_activity(),
             )
         };
         let writing = |sampled: &(Option<ChangeActivity>, Option<ChangeActivity>)| {
@@ -1056,35 +1069,35 @@ impl Session {
         // scan is never skipped; that is its point.
         self.progress.enter(crate::progress::Phase::Scanning);
         let verify = std::mem::take(&mut self.verify_next);
-        let alpha_cached = (!verify && self.alpha.unchanged_since_scan())
-            .then(|| self.alpha.cached_snapshot())
+        let primary_cached = (!verify && self.primary.unchanged_since_scan())
+            .then(|| self.primary.cached_snapshot())
             .flatten();
-        let beta_cached = (!verify && self.beta.unchanged_since_scan())
-            .then(|| self.beta.cached_snapshot())
+        let replica_cached = (!verify && self.replica.unchanged_since_scan())
+            .then(|| self.replica.cached_snapshot())
             .flatten();
-        report.alpha_scan_skipped = alpha_cached.is_some();
-        report.beta_scan_skipped = beta_cached.is_some();
-        let (alpha_snapshot, beta_snapshot) = {
-            let alpha = &mut self.alpha;
-            let beta = &mut self.beta;
+        report.primary_scan_skipped = primary_cached.is_some();
+        report.replica_scan_skipped = replica_cached.is_some();
+        let (primary_snapshot, replica_snapshot) = {
+            let primary = &mut self.primary;
+            let replica = &mut self.replica;
             std::thread::scope(|scope| {
-                let alpha_scan =
-                    crate::threads::spawn_deep_scoped(scope, move || match alpha_cached {
+                let primary_scan =
+                    crate::threads::spawn_deep_scoped(scope, move || match primary_cached {
                         Some(snapshot) => Ok(snapshot),
-                        None if verify => alpha.scan_verified(),
-                        None => alpha.scan(),
+                        None if verify => primary.scan_verified(),
+                        None => primary.scan(),
                     });
-                let beta_result = match beta_cached {
+                let replica_result = match replica_cached {
                     Some(snapshot) => Ok(snapshot),
-                    None if verify => beta.scan_verified(),
-                    None => beta.scan(),
+                    None if verify => replica.scan_verified(),
+                    None => replica.scan(),
                 };
-                let alpha_result = alpha_scan.join().expect("scan thread panicked");
-                (alpha_result, beta_result)
+                let primary_result = primary_scan.join().expect("scan thread panicked");
+                (primary_result, replica_result)
             })
         };
-        let alpha_snapshot = alpha_snapshot.context("alpha scan failed")?;
-        let beta_snapshot = beta_snapshot.context("beta scan failed")?;
+        let primary_snapshot = primary_snapshot.context("primary scan failed")?;
+        let replica_snapshot = replica_snapshot.context("replica scan failed")?;
 
         // If both sides produced the very same hierarchies as the last cycle
         // — the same storage, not merely equal content — then nothing can
@@ -1095,12 +1108,12 @@ impl Session {
         // so "the same as last time" means "still synchronized".
         if self.quiesced
             && crate::tree::nodes_share_storage(
-                self.settled_alpha.as_ref(),
-                alpha_snapshot.root.as_ref(),
+                self.settled_primary.as_ref(),
+                primary_snapshot.root.as_ref(),
             )
             && crate::tree::nodes_share_storage(
-                self.settled_beta.as_ref(),
-                beta_snapshot.root.as_ref(),
+                self.settled_replica.as_ref(),
+                replica_snapshot.root.as_ref(),
             )
         {
             return Ok(report);
@@ -1109,8 +1122,8 @@ impl Session {
         self.at(CyclePoint::AfterScans);
 
         for (side, root, problems) in [
-            (0, &alpha_snapshot.root, &mut report.alpha_scan_problems),
-            (1, &beta_snapshot.root, &mut report.beta_scan_problems),
+            (0, &primary_snapshot.root, &mut report.primary_scan_problems),
+            (1, &replica_snapshot.root, &mut report.replica_scan_problems),
         ] {
             let Some(root) = root else {
                 self.scan_problems[side] = None;
@@ -1129,34 +1142,39 @@ impl Session {
         // other side (when it preserves bits) for byte-identical files, and
         // the ancestor otherwise — so reconciliation sees only real content
         // changes rather than phantom permission churn.
-        let alpha_root = if alpha_snapshot.preserves_executability {
-            alpha_snapshot.root.clone()
+        let primary_root = if primary_snapshot.preserves_executability {
+            primary_snapshot.root.clone()
         } else {
-            let peer = beta_snapshot
+            let peer = replica_snapshot
                 .preserves_executability
-                .then_some(beta_snapshot.root.as_ref())
+                .then_some(replica_snapshot.root.as_ref())
                 .flatten();
-            propagate_executability(self.ancestor.as_ref(), peer, alpha_snapshot.root.as_ref())
+            propagate_executability(self.ancestor.as_ref(), peer, primary_snapshot.root.as_ref())
         };
-        let beta_root = if beta_snapshot.preserves_executability {
-            beta_snapshot.root.clone()
+        let replica_root = if replica_snapshot.preserves_executability {
+            replica_snapshot.root.clone()
         } else {
-            let peer = alpha_snapshot
+            let peer = primary_snapshot
                 .preserves_executability
-                .then_some(alpha_snapshot.root.as_ref())
+                .then_some(primary_snapshot.root.as_ref())
                 .flatten();
-            propagate_executability(self.ancestor.as_ref(), peer, beta_snapshot.root.as_ref())
+            propagate_executability(self.ancestor.as_ref(), peer, replica_snapshot.root.as_ref())
         };
 
-        let (alpha_root, beta_root) = self.account_for_mounts(
-            alpha_root,
-            beta_root,
-            &alpha_snapshot.mount_points,
-            &beta_snapshot.mount_points,
+        let (primary_root, replica_root) = self.account_for_mounts(
+            primary_root,
+            replica_root,
+            &primary_snapshot.mount_points,
+            &replica_snapshot.mount_points,
         )?;
 
         if let Some((problem, format)) = self.unreadable.take() {
-            self.rebuild_or_halt(problem, format, alpha_root.as_ref(), beta_root.as_ref())?;
+            self.rebuild_or_halt(
+                problem,
+                format,
+                primary_root.as_ref(),
+                replica_root.as_ref(),
+            )?;
         }
 
         // Safety: if the ancestor root was a directory with non-trivial
@@ -1166,8 +1184,8 @@ impl Session {
         // intentional mass deletion.
         if one_side_emptied_root(
             self.ancestor.as_ref(),
-            alpha_root.as_ref(),
-            beta_root.as_ref(),
+            primary_root.as_ref(),
+            replica_root.as_ref(),
         ) {
             bail!(SafetyHalt::RootEmptied);
         }
@@ -1178,24 +1196,24 @@ impl Session {
         // since is walked: see `ReconcileMemo`.
         let reconciliation = crate::tree::reconcile_since(
             self.ancestor.as_ref(),
-            alpha_root.as_ref(),
-            beta_root.as_ref(),
+            primary_root.as_ref(),
+            replica_root.as_ref(),
             self.policy(),
             self.reconcile_memo.as_ref(),
         );
         self.reconcile_memo = Some(crate::tree::ReconcileMemo::of(
             self.ancestor.as_ref(),
-            alpha_root.as_ref(),
-            beta_root.as_ref(),
+            primary_root.as_ref(),
+            replica_root.as_ref(),
             &reconciliation,
         ));
         report.conflicts = reconciliation.conflicts;
 
         // Safety: refuse to propagate a root deletion.
         let contains_root_deletion = reconciliation
-            .alpha_transitions
+            .primary_transitions
             .iter()
-            .chain(reconciliation.beta_transitions.iter())
+            .chain(reconciliation.replica_transitions.iter())
             .any(Change::is_root_deletion);
         if contains_root_deletion {
             bail!(SafetyHalt::RootDeletion);
@@ -1211,25 +1229,25 @@ impl Session {
         // window: it mutates neither tree, it is the longest phase of a
         // large cycle, and a crash there must recover as the clean
         // propagation it still is rather than as conflict noise. When both
-        // sides have transitions, alpha's staging runs after beta's
+        // sides have transitions, primary's staging runs after replica's
         // transition, and so inside the window.
         let intended: Vec<String> = reconciliation
-            .alpha_transitions
+            .primary_transitions
             .iter()
-            .chain(reconciliation.beta_transitions.iter())
+            .chain(reconciliation.replica_transitions.iter())
             .map(|change| change.path.clone())
             .collect();
         let mut intent_recorded = false;
 
-        // Stage and transition each side. Content flowing to beta is
-        // supplied by alpha and vice versa.
-        let beta_outcome = if reconciliation.beta_transitions.is_empty() {
+        // Stage and transition each side. Content flowing to replica is
+        // supplied by primary and vice versa.
+        let replica_outcome = if reconciliation.replica_transitions.is_empty() {
             None
         } else {
             stage(
-                self.alpha.as_mut(),
-                self.beta.as_mut(),
-                &reconciliation.beta_transitions,
+                self.primary.as_mut(),
+                self.replica.as_mut(),
+                &reconciliation.replica_transitions,
                 &self.progress,
             )?;
             if !intent_recorded {
@@ -1238,24 +1256,24 @@ impl Session {
                 intent_recorded = true;
             }
             self.progress
-                .begin_applying(reconciliation.beta_transitions.len() as u64);
-            self.at(CyclePoint::BeforeBetaTransition);
+                .begin_applying(reconciliation.replica_transitions.len() as u64);
+            self.at(CyclePoint::BeforeReplicaTransition);
             let outcome = self
-                .beta
-                .transition(reconciliation.beta_transitions.clone())
-                .context("beta transition failed")?;
-            self.at(CyclePoint::AfterBetaTransition);
+                .replica
+                .transition(reconciliation.replica_transitions.clone())
+                .context("replica transition failed")?;
+            self.at(CyclePoint::AfterReplicaTransition);
             self.progress
-                .applied_reached(reconciliation.beta_transitions.len() as u64);
+                .applied_reached(reconciliation.replica_transitions.len() as u64);
             Some(outcome)
         };
-        let alpha_outcome = if reconciliation.alpha_transitions.is_empty() {
+        let primary_outcome = if reconciliation.primary_transitions.is_empty() {
             None
         } else {
             stage(
-                self.beta.as_mut(),
-                self.alpha.as_mut(),
-                &reconciliation.alpha_transitions,
+                self.replica.as_mut(),
+                self.primary.as_mut(),
+                &reconciliation.primary_transitions,
                 &self.progress,
             )?;
             if !intent_recorded {
@@ -1263,15 +1281,15 @@ impl Session {
                     .intend(&intended, self.remote_involved)?;
             }
             self.progress
-                .begin_applying(reconciliation.alpha_transitions.len() as u64);
-            self.at(CyclePoint::BeforeAlphaTransition);
+                .begin_applying(reconciliation.primary_transitions.len() as u64);
+            self.at(CyclePoint::BeforePrimaryTransition);
             let outcome = self
-                .alpha
-                .transition(reconciliation.alpha_transitions.clone())
-                .context("alpha transition failed")?;
-            self.at(CyclePoint::AfterAlphaTransition);
+                .primary
+                .transition(reconciliation.primary_transitions.clone())
+                .context("primary transition failed")?;
+            self.at(CyclePoint::AfterPrimaryTransition);
             self.progress
-                .applied_reached(reconciliation.alpha_transitions.len() as u64);
+                .applied_reached(reconciliation.primary_transitions.len() as u64);
             Some(outcome)
         };
         self.at(CyclePoint::BeforeRecord);
@@ -1288,19 +1306,21 @@ impl Session {
             ancestor_changes.extend(crate::endpoint::achieved_changes(transitions, outcome)?);
             Ok(())
         };
-        if let Some(outcome) = &beta_outcome {
-            fold(&reconciliation.beta_transitions, outcome).context("beta transition failed")?;
-            report.beta_transitions = reconciliation.beta_transitions.len();
-            report.beta_transition_problems = outcome.problems.clone();
+        if let Some(outcome) = &replica_outcome {
+            fold(&reconciliation.replica_transitions, outcome)
+                .context("replica transition failed")?;
+            report.replica_transitions = reconciliation.replica_transitions.len();
+            report.replica_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
             report
                 .missing_staged
                 .extend(outcome.missing_staged.iter().cloned());
         }
-        if let Some(outcome) = &alpha_outcome {
-            fold(&reconciliation.alpha_transitions, outcome).context("alpha transition failed")?;
-            report.alpha_transitions = reconciliation.alpha_transitions.len();
-            report.alpha_transition_problems = outcome.problems.clone();
+        if let Some(outcome) = &primary_outcome {
+            fold(&reconciliation.primary_transitions, outcome)
+                .context("primary transition failed")?;
+            report.primary_transitions = reconciliation.primary_transitions.len();
+            report.primary_transition_problems = outcome.problems.clone();
             report.missing_staged_files |= outcome.missing_staged_files;
             report
                 .missing_staged
@@ -1340,7 +1360,7 @@ impl Session {
             self.ancestor_store
                 .record(&ancestor_changes, new_ancestor.as_ref())?;
             self.ancestor = new_ancestor;
-            // P2P: the beta's copy follows, after this side's record
+            // P2P: the replica's copy follows, after this side's record
             // is durable — a copy ahead of the truth is the one order
             // that can mislead a leader later.
             self.replicate_ancestor(&ancestor_changes);
@@ -1352,11 +1372,11 @@ impl Session {
         // without walking either tree.
         self.quiesced = report.settled();
         if self.quiesced {
-            self.settled_alpha = alpha_snapshot.root.clone();
-            self.settled_beta = beta_snapshot.root.clone();
+            self.settled_primary = primary_snapshot.root.clone();
+            self.settled_replica = replica_snapshot.root.clone();
         } else {
-            self.settled_alpha = None;
-            self.settled_beta = None;
+            self.settled_primary = None;
+            self.settled_replica = None;
         }
 
         Ok(report)
@@ -1624,8 +1644,8 @@ fn pump(
 /// trigger fires.
 fn one_side_emptied_root(
     ancestor: Option<&Node>,
-    alpha: Option<&Node>,
-    beta: Option<&Node>,
+    primary: Option<&Node>,
+    replica: Option<&Node>,
 ) -> bool {
     let ancestor = match ancestor {
         Some(node) if matches!(node.content, Content::Directory(_)) => node,
@@ -1635,7 +1655,7 @@ fn one_side_emptied_root(
         None => true,
         Some(node) => !node.holds_synchronizable(),
     };
-    if gone(alpha) == gone(beta) {
+    if gone(primary) == gone(replica) {
         return false;
     }
     fn entries_below(node: &Node) -> usize {
@@ -1657,8 +1677,8 @@ fn one_side_emptied_root(
 /// provenance, and content silently swaps sides before one of the versions
 /// is lost. This lock keys on what is actually being synchronized rather
 /// than on where its state lives. The pair is unordered, so the same two
-/// trees in opposite directions conflict as well; a fan-out (one alpha,
-/// many betas) and a relay (one's beta, another's alpha) key differently
+/// trees in opposite directions conflict as well; a fan-out (one primary,
+/// many replicas) and a relay (one's replica, another's primary) key differently
 /// and stay legal.
 pub struct EndpointPairLock {
     _lock: SessionLock,
@@ -1666,22 +1686,22 @@ pub struct EndpointPairLock {
 
 impl EndpointPairLock {
     /// Acquires the pair lock for two endpoint identities.
-    pub fn acquire(alpha_identity: &str, beta_identity: &str) -> Result<EndpointPairLock> {
+    pub fn acquire(primary_identity: &str, replica_identity: &str) -> Result<EndpointPairLock> {
         // The *default* state root, deliberately — this directory must not
         // move with the overrides whose divergence it exists to catch.
         let root = crate::paths::default_state_root()?.join("endpoint-locks");
-        EndpointPairLock::acquire_in(&root, alpha_identity, beta_identity)
+        EndpointPairLock::acquire_in(&root, primary_identity, replica_identity)
     }
 
     /// The lock directory name for a pair of endpoint identities, in either
     /// order. Exposed so `clean` can tell which lock directories belong to a
     /// configured pair and which are left over from pairs that no longer
     /// exist.
-    pub fn key(alpha_identity: &str, beta_identity: &str) -> String {
-        let (first, second) = if alpha_identity <= beta_identity {
-            (alpha_identity, beta_identity)
+    pub fn key(primary_identity: &str, replica_identity: &str) -> String {
+        let (first, second) = if primary_identity <= replica_identity {
+            (primary_identity, replica_identity)
         } else {
-            (beta_identity, alpha_identity)
+            (replica_identity, primary_identity)
         };
         let mut hasher = blake3::Hasher::new();
         hasher.update(first.as_bytes());
@@ -1700,15 +1720,15 @@ impl EndpointPairLock {
     /// real home directory).
     fn acquire_in(
         root: &Path,
-        alpha_identity: &str,
-        beta_identity: &str,
+        primary_identity: &str,
+        replica_identity: &str,
     ) -> Result<EndpointPairLock> {
-        let (first, second) = if alpha_identity <= beta_identity {
-            (alpha_identity, beta_identity)
+        let (first, second) = if primary_identity <= replica_identity {
+            (primary_identity, replica_identity)
         } else {
-            (beta_identity, alpha_identity)
+            (replica_identity, primary_identity)
         };
-        let directory = root.join(EndpointPairLock::key(alpha_identity, beta_identity));
+        let directory = root.join(EndpointPairLock::key(primary_identity, replica_identity));
         let lock = SessionLock::acquire(directory).map_err(|error| {
             anyhow::anyhow!(
                 "another session is already synchronizing these roots \
@@ -1908,7 +1928,7 @@ mod tests {
             Some(&ancestor)
         ));
         // A root holding everything under one directory is exactly the
-        // shape the original guard missed: reproduced deleting beta's
+        // shape the original guard missed: reproduced deleting replica's
         // whole copy before the guard counted recursive entries.
         let single = Node::directory(
             "",
@@ -1962,10 +1982,10 @@ mod tests {
         ));
     }
 
-    /// Reproduced before the fix: an ancestor of twenty files, alpha down
-    /// to one untracked `.DS_Store`, beta untouched. The halt did not fire,
-    /// because alpha's root had a child, and reconciliation deleted all
-    /// twenty files from beta — in every mode, the paranoid one included.
+    /// Reproduced before the fix: an ancestor of twenty files, primary down
+    /// to one untracked `.DS_Store`, replica untouched. The halt did not fire,
+    /// because primary's root had a child, and reconciliation deleted all
+    /// twenty files from replica — in every mode, the paranoid one included.
     #[test]
     fn a_root_emptied_down_to_an_ignored_entry_halts_in_every_mode() {
         let full = || Node::directory("", (1..=20).map(|i| file(&format!("f{i}"), i)).collect());
@@ -1983,18 +2003,18 @@ mod tests {
             SyncMode::TwoWayResolved,
             SyncMode::TwoWayStrict,
             SyncMode::OneWaySafe,
-            SyncMode::OneWayReplica,
+            SyncMode::OneWayMirror,
         ] {
             let state = tempfile::tempdir().unwrap();
             let transitions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            let alpha = ScriptedEndpoint::new(vec![scripted(full()), scripted(emptied())]);
-            let beta = CountingEndpoint {
+            let primary = ScriptedEndpoint::new(vec![scripted(full()), scripted(emptied())]);
+            let replica = CountingEndpoint {
                 inner: ScriptedEndpoint::new(vec![scripted(full())]),
                 transitions: std::sync::Arc::clone(&transitions),
             };
             let mut session = Session::new(
-                Box::new(alpha),
-                Box::new(beta),
+                Box::new(primary),
+                Box::new(replica),
                 mode,
                 state.path().to_path_buf(),
             )
@@ -2014,7 +2034,7 @@ mod tests {
             assert_eq!(
                 transitions.load(std::sync::atomic::Ordering::SeqCst),
                 settled,
-                "{mode:?}: beta must not be transitioned"
+                "{mode:?}: replica must not be transitioned"
             );
         }
     }
@@ -2274,11 +2294,11 @@ mod tests {
 
         session.set_leadership(
             Some(crate::p2p::Leadership {
-                leader: crate::p2p::ALPHA.into(),
+                leader: crate::p2p::PRIMARY.into(),
                 term: 1,
                 ttl: std::time::Duration::from_secs(30),
             }),
-            crate::p2p::PeerSide::Beta,
+            crate::p2p::PeerSide::Replica,
         );
         copy.lock().unwrap().reports = generation;
         session.level_the_copy().expect("already level");
@@ -2339,11 +2359,11 @@ mod tests {
         std::fs::create_dir_all(&state).unwrap();
         let base = || Node::directory("", vec![file("x", 1)]);
         let grown = || Node::directory("", vec![file("a", 2), file("b", 3), file("x", 1)]);
-        let alpha = ScriptedEndpoint::new(vec![scripted(base()), scripted(grown())]);
-        let beta = ShortOfResults(ScriptedEndpoint::new(vec![scripted(base())]));
+        let primary = ScriptedEndpoint::new(vec![scripted(base()), scripted(grown())]);
+        let replica = ShortOfResults(ScriptedEndpoint::new(vec![scripted(base())]));
         let mut session = Session::new(
-            Box::new(alpha),
-            Box::new(beta),
+            Box::new(primary),
+            Box::new(replica),
             SyncMode::TwoWaySafe,
             state.clone(),
         )
@@ -2353,8 +2373,8 @@ mod tests {
         let error = match session.run_cycle() {
             Ok(report) => panic!(
                 "two transitions and one result must fail the cycle, not record {} \
-                 beta transitions",
-                report.beta_transitions
+                 replica transitions",
+                report.replica_transitions
             ),
             Err(error) => error,
         };
@@ -2386,14 +2406,14 @@ mod tests {
         let new_content = || Node::directory("", vec![file("target", 2)]);
 
         // Cycle one converges on the old content; cycle two propagates the
-        // new content to beta and then "crashes" at the seam.
+        // new content to replica and then "crashes" at the seam.
         {
-            let alpha =
+            let primary =
                 ScriptedEndpoint::new(vec![scripted(old_content()), scripted(new_content())]);
-            let beta = ScriptedEndpoint::new(vec![scripted(old_content())]);
+            let replica = ScriptedEndpoint::new(vec![scripted(old_content())]);
             let mut session = Session::new(
-                Box::new(alpha),
-                Box::new(beta),
+                Box::new(primary),
+                Box::new(replica),
                 SyncMode::TwoWaySafe,
                 state.clone(),
             )
@@ -2404,16 +2424,21 @@ mod tests {
             assert!(format!("{error:#}").contains("test seam"), "{error:#}");
         }
 
-        // While the tool was down, the user deliberately reverted alpha.
-        // Beta holds the propagated new content (the transition landed).
+        // While the tool was down, the user deliberately reverted primary.
+        // Replica holds the propagated new content (the transition landed).
         let transitions = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let alpha = CountingEndpoint {
+        let primary = CountingEndpoint {
             inner: ScriptedEndpoint::new(vec![scripted(old_content())]),
             transitions: std::sync::Arc::clone(&transitions),
         };
-        let beta = ScriptedEndpoint::new(vec![scripted(new_content())]);
-        let mut session =
-            Session::new(Box::new(alpha), Box::new(beta), SyncMode::TwoWaySafe, state).unwrap();
+        let replica = ScriptedEndpoint::new(vec![scripted(new_content())]);
+        let mut session = Session::new(
+            Box::new(primary),
+            Box::new(replica),
+            SyncMode::TwoWaySafe,
+            state,
+        )
+        .unwrap();
         let report = session.run_cycle().expect("the recovery cycle runs");
         assert!(
             !report.conflicts.is_empty(),
@@ -2423,7 +2448,7 @@ mod tests {
             transitions.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "the revert must not be overwritten: without the intent record, \
-             the stale ancestor read alpha as unchanged and beta as modified \
+             the stale ancestor read primary as unchanged and replica as modified \
              and pushed the new content back over the revert"
         );
     }
@@ -2438,13 +2463,13 @@ mod tests {
         }
     }
 
-    fn settling(alpha_activity: Vec<ChangeActivity>) -> (Session, tempfile::TempDir) {
+    fn settling(primary_activity: Vec<ChangeActivity>) -> (Session, tempfile::TempDir) {
         let root = || scripted(Node::directory("", vec![file("shared", 1)]));
-        let mut alpha = ScriptedEndpoint::new(vec![root()]);
-        alpha.activity = alpha_activity.into();
+        let mut primary = ScriptedEndpoint::new(vec![root()]);
+        primary.activity = primary_activity.into();
         let state = tempfile::tempdir().unwrap();
         let session = Session::new(
-            Box::new(alpha),
+            Box::new(primary),
             Box::new(ScriptedEndpoint::new(vec![root()])),
             SyncMode::TwoWaySafe,
             state.path().to_path_buf(),
@@ -2513,17 +2538,17 @@ mod tests {
 
     #[test]
     fn an_unchanged_pair_skips_reconciliation_only_after_a_settled_cycle() {
-        let alpha_root = Node::directory("", vec![file("shared", 1)]);
-        let beta_root = Node::directory("", vec![file("shared", 1)]);
+        let primary_root = Node::directory("", vec![file("shared", 1)]);
+        let replica_root = Node::directory("", vec![file("shared", 1)]);
         // Every scan reproduces the same storage, as an unchanged rescan
         // does. The first cycle must still reconcile — nothing has settled
         // yet — and later ones may skip.
-        let alpha = ScriptedEndpoint::new(vec![scripted(alpha_root)]);
-        let beta = ScriptedEndpoint::new(vec![scripted(beta_root)]);
+        let primary = ScriptedEndpoint::new(vec![scripted(primary_root)]);
+        let replica = ScriptedEndpoint::new(vec![scripted(replica_root)]);
         let state = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            Box::new(alpha),
-            Box::new(beta),
+            Box::new(primary),
+            Box::new(replica),
             SyncMode::TwoWaySafe,
             state.path().to_path_buf(),
         )
@@ -2543,21 +2568,21 @@ mod tests {
         let settled = Node::directory("", vec![file("shared", 1)]);
         let edited = Node::directory("", vec![file("shared", 2)]);
         // Two identical scans settle the session; the third carries a real
-        // change on alpha, which must not be skipped.
-        let alpha = ScriptedEndpoint::new(vec![
+        // change on primary, which must not be skipped.
+        let primary = ScriptedEndpoint::new(vec![
             scripted(settled.clone()),
             scripted(settled.clone()),
             scripted(edited),
         ]);
         let applied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let beta = CountingEndpoint {
+        let replica = CountingEndpoint {
             inner: ScriptedEndpoint::new(vec![scripted(settled.clone()), scripted(settled)]),
             transitions: std::sync::Arc::clone(&applied),
         };
         let state = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            Box::new(alpha),
-            Box::new(beta),
+            Box::new(primary),
+            Box::new(replica),
             SyncMode::TwoWaySafe,
             state.path().to_path_buf(),
         )
@@ -2567,10 +2592,10 @@ mod tests {
         assert!(!session.run_cycle().expect("cycle should succeed").changed());
         assert!(session.quiesced, "two identical cycles should settle");
 
-        // Alpha's edit arrives on a settled session: the shortcut must not
-        // fire, because alpha's storage no longer matches what settled.
+        // Primary's edit arrives on a settled session: the shortcut must not
+        // fire, because primary's storage no longer matches what settled.
         let report = session.run_cycle().expect("cycle should succeed");
-        assert_eq!(report.beta_transitions, 1, "the edit was not propagated");
+        assert_eq!(report.replica_transitions, 1, "the edit was not propagated");
         assert_eq!(applied.load(std::sync::atomic::Ordering::Relaxed), 1);
         assert!(
             !session.quiesced,
@@ -2593,12 +2618,12 @@ mod tests {
                 },
             }],
         );
-        let alpha = ScriptedEndpoint::new(vec![scripted(problematic.clone())]);
-        let beta = ScriptedEndpoint::new(vec![scripted(problematic)]);
+        let primary = ScriptedEndpoint::new(vec![scripted(problematic.clone())]);
+        let replica = ScriptedEndpoint::new(vec![scripted(problematic)]);
         let state = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            Box::new(alpha),
-            Box::new(beta),
+            Box::new(primary),
+            Box::new(replica),
             SyncMode::TwoWaySafe,
             state.path().to_path_buf(),
         )
@@ -2607,7 +2632,7 @@ mod tests {
         for cycle in 0..3 {
             let report = session.run_cycle().expect("cycle should succeed");
             assert_eq!(
-                report.alpha_scan_problems.len(),
+                report.primary_scan_problems.len(),
                 1,
                 "cycle {cycle} stopped reporting the problem"
             );
@@ -2633,16 +2658,16 @@ mod tests {
             ..Snapshot::default()
         };
 
-        // Alpha preserves executability; beta doesn't, and after the first
+        // Primary preserves executability; replica doesn't, and after the first
         // cycle its scans report the file spuriously executable (the classic
-        // FAT-style noise). The third alpha scan carries a *real*
+        // FAT-style noise). The third primary scan carries a *real*
         // executability change.
-        let alpha = ScriptedEndpoint::new(vec![
+        let primary = ScriptedEndpoint::new(vec![
             snapshot(Node::directory("", vec![tool(false)]), true),
             snapshot(Node::directory("", vec![tool(false)]), true),
             snapshot(Node::directory("", vec![tool(true)]), true),
         ]);
-        let beta = ScriptedEndpoint::new(vec![
+        let replica = ScriptedEndpoint::new(vec![
             snapshot(Node::directory("", vec![]), false),
             snapshot(Node::directory("", vec![tool(true)]), false),
             snapshot(Node::directory("", vec![tool(true)]), false),
@@ -2650,24 +2675,24 @@ mod tests {
 
         let state = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            Box::new(alpha),
-            Box::new(beta),
+            Box::new(primary),
+            Box::new(replica),
             SyncMode::TwoWaySafe,
             state.path().join("session"),
         )
         .expect("the session should construct");
 
-        // Cycle 1 creates the file on beta and establishes the ancestor.
+        // Cycle 1 creates the file on replica and establishes the ancestor.
         let report = session.run_cycle().expect("cycle 1");
-        assert_eq!(report.beta_transitions, 1);
+        assert_eq!(report.replica_transitions, 1);
 
-        // Cycle 2: beta's spurious bit is grafted away; nothing propagates
-        // (without propagation this would emit a transition to alpha).
+        // Cycle 2: replica's spurious bit is grafted away; nothing propagates
+        // (without propagation this would emit a transition to primary).
         let report = session.run_cycle().expect("cycle 2");
         assert!(!report.changed(), "{report:?}");
         assert!(report.conflicts.is_empty());
 
-        // Cycle 3: alpha makes a *real* executability change. Beta's copy
+        // Cycle 3: primary makes a *real* executability change. Replica's copy
         // holds the same bytes, so the preserving peer vouches for the new
         // bit directly — the sides agree immediately, with no transition
         // and no conflict (the case a purely ancestor-based graft would
@@ -2698,26 +2723,26 @@ mod tests {
                     .unwrap(),
                 )
             };
-            for name in ["alpha", "beta"] {
+            for name in ["primary", "replica"] {
                 fs::create_dir_all(keep.path().join(name)).unwrap();
             }
-            fs::write(keep.path().join("alpha/keep.txt"), "original").unwrap();
-            fs::write(keep.path().join("alpha/other.txt"), "other").unwrap();
+            fs::write(keep.path().join("primary/keep.txt"), "original").unwrap();
+            fs::write(keep.path().join("primary/other.txt"), "other").unwrap();
             let mut session = Session::new(
-                endpoint("alpha"),
-                endpoint("beta"),
+                endpoint("primary"),
+                endpoint("replica"),
                 SyncMode::TwoWaySafe,
                 keep.path().join("state"),
             )
             .unwrap();
             cycle_to_quiescence(&mut session);
-            fs::write(keep.path().join("beta/keep.txt"), "beta's edit").unwrap();
+            fs::write(keep.path().join("replica/keep.txt"), "replica's edit").unwrap();
             // Long enough for the session's watch to hear of it, as it has
             // long since when someone resolves a conflict they can see.
             std::thread::sleep(std::time::Duration::from_millis(200));
 
-            // Beta's copy as resolve would read it.
-            let mut reader = endpoint("beta");
+            // Replica's copy as resolve would read it.
+            let mut reader = endpoint("replica");
             let scanned = reader.scan().unwrap().root;
             let expectation = crate::tree::node_at(scanned.as_ref(), "keep.txt")
                 .and_then(Node::synchronizable_subtree)
@@ -2729,7 +2754,7 @@ mod tests {
                         false => Vec::new(),
                     },
                     retire: vec![(
-                        Side::Beta,
+                        Side::Replica,
                         "keep.txt".into(),
                         Retirement::Remove(expectation),
                     )],
@@ -2741,10 +2766,10 @@ mod tests {
             }
             let read = |side: &str| fs::read_to_string(keep.path().join(side).join("keep.txt"));
             if forget {
-                assert_eq!(read("alpha").unwrap(), "original");
-                assert_eq!(read("beta").unwrap(), "original");
+                assert_eq!(read("primary").unwrap(), "original");
+                assert_eq!(read("replica").unwrap(), "original");
             } else {
-                assert!(read("alpha").is_err() && read("beta").is_err());
+                assert!(read("primary").is_err() && read("replica").is_err());
             }
         }
     }
@@ -2767,32 +2792,36 @@ mod tests {
                 .unwrap(),
             )
         };
-        for name in ["alpha", "beta"] {
+        for name in ["primary", "replica"] {
             fs::create_dir_all(keep.path().join(name)).unwrap();
         }
-        fs::write(keep.path().join("alpha/keep.txt"), "original").unwrap();
-        fs::write(keep.path().join("alpha/other.txt"), "other").unwrap();
+        fs::write(keep.path().join("primary/keep.txt"), "original").unwrap();
+        fs::write(keep.path().join("primary/other.txt"), "other").unwrap();
         let mut session = Session::new(
-            endpoint("alpha"),
-            endpoint("beta"),
+            endpoint("primary"),
+            endpoint("replica"),
             SyncMode::TwoWaySafe,
             keep.path().join("state"),
         )
         .unwrap();
         cycle_to_quiescence(&mut session);
-        fs::write(keep.path().join("beta/keep.txt"), "beta's edit").unwrap();
-        let mut reader = endpoint("beta");
+        fs::write(keep.path().join("replica/keep.txt"), "replica's edit").unwrap();
+        let mut reader = endpoint("replica");
         let scanned = reader.scan().unwrap().root;
         let expectation = crate::tree::node_at(scanned.as_ref(), "keep.txt")
             .and_then(Node::synchronizable_subtree)
             .unwrap();
-        fs::write(keep.path().join("beta/keep.txt"), "beta's later edit!").unwrap();
+        fs::write(
+            keep.path().join("replica/keep.txt"),
+            "replica's later edit!",
+        )
+        .unwrap();
 
         let outcome = session
             .apply_settlement(&Settlement {
                 forget: vec!["keep.txt".into()],
                 retire: vec![(
-                    Side::Beta,
+                    Side::Replica,
                     "keep.txt".into(),
                     Retirement::Remove(expectation),
                 )],
@@ -2803,8 +2832,8 @@ mod tests {
         let report = session.run_cycle().unwrap();
         assert_eq!(report.conflicts.len(), 1, "{report:?}");
         assert_eq!(
-            fs::read_to_string(keep.path().join("beta/keep.txt")).unwrap(),
-            "beta's later edit!"
+            fs::read_to_string(keep.path().join("replica/keep.txt")).unwrap(),
+            "replica's later edit!"
         );
     }
 
@@ -3022,8 +3051,8 @@ mod tests {
         let mut last = None;
         for _ in 0..6 {
             let report = session.run_cycle().expect("recovery cycles run");
-            let settled = report.alpha_transitions == 0
-                && report.beta_transitions == 0
+            let settled = report.primary_transitions == 0
+                && report.replica_transitions == 0
                 && !report.missing_staged_files;
             last = Some(report);
             if settled {
@@ -3035,15 +3064,15 @@ mod tests {
 
     /// The full lifecycle: converge, diverge, crash at the armed boundary,
     /// verify nothing is torn, recover, verify the recovered state.
-    fn a_crash_at(alpha_fault: Option<Fault>, beta_fault: Option<Fault>) {
+    fn a_crash_at(primary_fault: Option<Fault>, replica_fault: Option<Fault>) {
         let keep = tempfile::tempdir().unwrap();
-        let alpha_root = keep.path().join("alpha");
-        let beta_root = keep.path().join("beta");
-        let alpha_staging = keep.path().join("staging-alpha");
-        let beta_staging = keep.path().join("staging-beta");
+        let primary_root = keep.path().join("primary");
+        let replica_root = keep.path().join("replica");
+        let primary_staging = keep.path().join("staging-primary");
+        let replica_staging = keep.path().join("staging-replica");
         let state = keep.path().join("state");
-        std::fs::create_dir_all(&alpha_root).unwrap();
-        std::fs::create_dir_all(&beta_root).unwrap();
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::create_dir_all(&replica_root).unwrap();
         std::fs::create_dir_all(&state).unwrap();
 
         let old_modify = bytes(1, 96 * 1024);
@@ -3053,13 +3082,13 @@ mod tests {
         let own = bytes(5, 24 * 1024);
 
         // Converge on the initial content.
-        std::fs::write(alpha_root.join("modify.txt"), &old_modify).unwrap();
-        std::fs::write(alpha_root.join("delete.txt"), &old_delete).unwrap();
-        std::fs::write(alpha_root.join("keep.txt"), b"keep").unwrap();
+        std::fs::write(primary_root.join("modify.txt"), &old_modify).unwrap();
+        std::fs::write(primary_root.join("delete.txt"), &old_delete).unwrap();
+        std::fs::write(primary_root.join("keep.txt"), b"keep").unwrap();
         {
             let mut session = Session::new(
-                lifecycle_endpoint(&alpha_root, &alpha_staging, None),
-                lifecycle_endpoint(&beta_root, &beta_staging, None),
+                lifecycle_endpoint(&primary_root, &primary_staging, None),
+                lifecycle_endpoint(&replica_root, &replica_staging, None),
                 SyncMode::TwoWaySafe,
                 state.clone(),
             )
@@ -3068,21 +3097,21 @@ mod tests {
             assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         }
         assert_eq!(
-            read_or_absent(&beta_root, "keep.txt").as_deref(),
+            read_or_absent(&replica_root, "keep.txt").as_deref(),
             Some(&b"keep"[..])
         );
 
         // The divergence the crashed cycle will be propagating.
-        std::fs::write(alpha_root.join("modify.txt"), &new_modify).unwrap();
-        std::fs::write(alpha_root.join("created.bin"), &created).unwrap();
-        std::fs::remove_file(alpha_root.join("delete.txt")).unwrap();
-        std::fs::write(beta_root.join("beta_own.txt"), &own).unwrap();
+        std::fs::write(primary_root.join("modify.txt"), &new_modify).unwrap();
+        std::fs::write(primary_root.join("created.bin"), &created).unwrap();
+        std::fs::remove_file(primary_root.join("delete.txt")).unwrap();
+        std::fs::write(replica_root.join("replica_own.txt"), &own).unwrap();
 
         // The crash.
         {
             let mut session = Session::new(
-                lifecycle_endpoint(&alpha_root, &alpha_staging, alpha_fault),
-                lifecycle_endpoint(&beta_root, &beta_staging, beta_fault),
+                lifecycle_endpoint(&primary_root, &primary_staging, primary_fault),
+                lifecycle_endpoint(&replica_root, &replica_staging, replica_fault),
                 SyncMode::TwoWaySafe,
                 state.clone(),
             )
@@ -3101,16 +3130,16 @@ mod tests {
             assert_untorn(root, "created.bin", &[None, Some(created.clone())]);
             assert_untorn(root, "delete.txt", &[None, Some(old_delete.clone())]);
             assert_untorn(root, "keep.txt", &[Some(b"keep".to_vec())]);
-            assert_untorn(root, "beta_own.txt", &[None, Some(own.clone())]);
+            assert_untorn(root, "replica_own.txt", &[None, Some(own.clone())]);
         };
-        untorn(&alpha_root);
-        untorn(&beta_root);
+        untorn(&primary_root);
+        untorn(&replica_root);
 
         // Recovery: a fresh session over the same state, no faults.
         let report = {
             let mut session = Session::new(
-                lifecycle_endpoint(&alpha_root, &alpha_staging, None),
-                lifecycle_endpoint(&beta_root, &beta_staging, None),
+                lifecycle_endpoint(&primary_root, &primary_staging, None),
+                lifecycle_endpoint(&replica_root, &replica_staging, None),
                 SyncMode::TwoWaySafe,
                 state,
             )
@@ -3120,8 +3149,8 @@ mod tests {
 
         // Still nothing torn, crash noise stays on the crashed cycle's own
         // paths, and every unconflicted path agrees between the sides.
-        untorn(&alpha_root);
-        untorn(&beta_root);
+        untorn(&primary_root);
+        untorn(&replica_root);
         let conflicted: Vec<&str> = report
             .conflicts
             .iter()
@@ -3129,7 +3158,7 @@ mod tests {
             .collect();
         for path in &conflicted {
             assert!(
-                ["modify.txt", "created.bin", "delete.txt", "beta_own.txt"].contains(path),
+                ["modify.txt", "created.bin", "delete.txt", "replica_own.txt"].contains(path),
                 "a conflict appeared off the crashed cycle's paths: {path}"
             );
         }
@@ -3138,34 +3167,37 @@ mod tests {
             "created.bin",
             "delete.txt",
             "keep.txt",
-            "beta_own.txt",
+            "replica_own.txt",
         ] {
             if !conflicted.contains(&path) {
                 assert_eq!(
-                    read_or_absent(&alpha_root, path),
-                    read_or_absent(&beta_root, path),
+                    read_or_absent(&primary_root, path),
+                    read_or_absent(&replica_root, path),
                     "{path} is unconflicted but the sides disagree"
                 );
             }
         }
-        // The edit made on beta while the crash was in flight is never lost.
-        assert_eq!(read_or_absent(&beta_root, "beta_own.txt"), Some(own));
+        // The edit made on replica while the crash was in flight is never lost.
+        assert_eq!(read_or_absent(&replica_root, "replica_own.txt"), Some(own));
 
         // Faults during staging precede the intent record, so recovery owes
         // full convergence with no conflict noise at all.
         let staging_fault = matches!(
-            alpha_fault.or(beta_fault),
+            primary_fault.or(replica_fault),
             Some(Fault::StageBegin | Fault::StagePushTruncate | Fault::SupplyPull)
         );
         if staging_fault {
             assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
             assert_eq!(
-                read_or_absent(&alpha_root, "modify.txt"),
+                read_or_absent(&primary_root, "modify.txt"),
                 Some(new_modify.clone())
             );
-            assert_eq!(read_or_absent(&beta_root, "modify.txt"), Some(new_modify));
-            assert_eq!(read_or_absent(&beta_root, "created.bin"), Some(created));
-            assert_eq!(read_or_absent(&beta_root, "delete.txt"), None);
+            assert_eq!(
+                read_or_absent(&replica_root, "modify.txt"),
+                Some(new_modify)
+            );
+            assert_eq!(read_or_absent(&replica_root, "created.bin"), Some(created));
+            assert_eq!(read_or_absent(&replica_root, "delete.txt"), None);
         }
     }
 
@@ -3205,20 +3237,20 @@ mod tests {
     #[test]
     fn corrupted_frames_are_discarded_never_published() {
         let keep = tempfile::tempdir().unwrap();
-        let alpha_root = keep.path().join("alpha");
-        let beta_root = keep.path().join("beta");
+        let primary_root = keep.path().join("primary");
+        let replica_root = keep.path().join("replica");
         let state = keep.path().join("state");
-        std::fs::create_dir_all(&alpha_root).unwrap();
-        std::fs::create_dir_all(&beta_root).unwrap();
+        std::fs::create_dir_all(&primary_root).unwrap();
+        std::fs::create_dir_all(&replica_root).unwrap();
         std::fs::create_dir_all(&state).unwrap();
         let content = bytes(9, 200 * 1024);
-        std::fs::write(alpha_root.join("payload.bin"), &content).unwrap();
+        std::fs::write(primary_root.join("payload.bin"), &content).unwrap();
 
         let mut session = Session::new(
-            lifecycle_endpoint(&alpha_root, &keep.path().join("staging-alpha"), None),
+            lifecycle_endpoint(&primary_root, &keep.path().join("staging-primary"), None),
             lifecycle_endpoint(
-                &beta_root,
-                &keep.path().join("staging-beta"),
+                &replica_root,
+                &keep.path().join("staging-replica"),
                 Some(Fault::CorruptFrames),
             ),
             SyncMode::TwoWaySafe,
@@ -3227,12 +3259,12 @@ mod tests {
         .unwrap();
 
         // The corrupted cycle: staging discards the mismatched content, so
-        // the transition reports it missing and nothing lands on beta —
+        // the transition reports it missing and nothing lands on replica —
         // wrong bytes above all.
         let report = session.run_cycle().expect("a corrupted cycle still runs");
-        assert_untorn(&beta_root, "payload.bin", &[None, Some(content.clone())]);
+        assert_untorn(&replica_root, "payload.bin", &[None, Some(content.clone())]);
         assert!(
-            report.missing_staged_files || read_or_absent(&beta_root, "payload.bin").is_some(),
+            report.missing_staged_files || read_or_absent(&replica_root, "payload.bin").is_some(),
             "the corrupted transfer neither landed nor was reported missing"
         );
 
@@ -3240,15 +3272,15 @@ mod tests {
         // the endpoint), and the next session converges on correct bytes.
         drop(session);
         let mut session = Session::new(
-            lifecycle_endpoint(&alpha_root, &keep.path().join("staging-alpha"), None),
-            lifecycle_endpoint(&beta_root, &keep.path().join("staging-beta"), None),
+            lifecycle_endpoint(&primary_root, &keep.path().join("staging-primary"), None),
+            lifecycle_endpoint(&replica_root, &keep.path().join("staging-replica"), None),
             SyncMode::TwoWaySafe,
             keep.path().join("state"),
         )
         .unwrap();
         let report = cycle_to_quiescence(&mut session);
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
-        assert_eq!(read_or_absent(&beta_root, "payload.bin"), Some(content));
+        assert_eq!(read_or_absent(&replica_root, "payload.bin"), Some(content));
     }
 
     /// A session with a remote endpoint asks for durable intents: the
@@ -3292,8 +3324,8 @@ mod tests {
             let state = keep.path().join("state");
             std::fs::create_dir_all(&state).unwrap();
             let content = || Node::directory("", vec![file("target", 1)]);
-            let alpha = ScriptedEndpoint::new(vec![scripted(content())]);
-            let beta: Box<dyn Endpoint + Send> = if remote {
+            let primary = ScriptedEndpoint::new(vec![scripted(content())]);
+            let replica: Box<dyn Endpoint + Send> = if remote {
                 Box::new(RemoteFlagged(ScriptedEndpoint::new(vec![scripted(
                     Node::directory("", vec![]),
                 )])))
@@ -3304,7 +3336,7 @@ mod tests {
                 ))]))
             };
             let mut session =
-                Session::new(Box::new(alpha), beta, SyncMode::TwoWaySafe, state).unwrap();
+                Session::new(Box::new(primary), replica, SyncMode::TwoWaySafe, state).unwrap();
             session.run_cycle().expect("the cycle runs");
             session.ancestor_store.append_syncs
         };
@@ -3329,27 +3361,30 @@ mod tests {
 
     #[test]
     fn a_mount_is_left_alone_on_both_sides_and_unplugging_it_moves_nothing() {
-        // Alpha has something mounted at `mnt`, which its scan left out;
-        // beta has a real directory there with its own file in it.
-        let alpha_first = mounted(
+        // Primary has something mounted at `mnt`, which its scan left out;
+        // replica has a real directory there with its own file in it.
+        let primary_first = mounted(
             Node::directory("", vec![file("a", 1), untracked("mnt")]),
             &["mnt"],
         );
         // Unplugged: the mount point is an empty directory again.
-        let alpha_unplugged = scripted(Node::directory(
+        let primary_unplugged = scripted(Node::directory(
             "",
             vec![file("a", 1), Node::directory("mnt", Vec::new())],
         ));
-        let beta = scripted(Node::directory(
+        let replica = scripted(Node::directory(
             "",
             vec![file("a", 1), Node::directory("mnt", vec![file("own", 2)])],
         ));
         let applied = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let state = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            Box::new(ScriptedEndpoint::new(vec![alpha_first, alpha_unplugged])),
+            Box::new(ScriptedEndpoint::new(vec![
+                primary_first,
+                primary_unplugged,
+            ])),
             Box::new(CountingEndpoint {
-                inner: ScriptedEndpoint::new(vec![beta]),
+                inner: ScriptedEndpoint::new(vec![replica]),
                 transitions: std::sync::Arc::clone(&applied),
             }),
             SyncMode::TwoWaySafe,
@@ -3359,14 +3394,14 @@ mod tests {
         let report = session.run_cycle().expect("mounted");
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         assert_eq!(
-            report.alpha_transitions + report.beta_transitions,
+            report.primary_transitions + report.replica_transitions,
             0,
             "{report:?}"
         );
         let report = session.run_cycle().expect("unplugged");
         assert!(report.conflicts.is_empty(), "{:?}", report.conflicts);
         assert_eq!(
-            report.alpha_transitions + report.beta_transitions,
+            report.primary_transitions + report.replica_transitions,
             0,
             "an unplugged mount copies nothing into its empty mount point: {report:?}"
         );
@@ -3379,16 +3414,16 @@ mod tests {
     #[test]
     fn a_followed_mount_that_vanishes_halts_instead_of_deleting_its_content() {
         let full = Node::directory("mnt", vec![file("data", 3)]);
-        let alpha_mounted = mounted(Node::directory("", vec![full.clone()]), &["mnt"]);
-        let alpha_gone = scripted(Node::directory(
+        let primary_mounted = mounted(Node::directory("", vec![full.clone()]), &["mnt"]);
+        let primary_gone = scripted(Node::directory(
             "",
             vec![Node::directory("mnt", Vec::new())],
         ));
-        let beta = scripted(Node::directory("", vec![full]));
+        let replica = scripted(Node::directory("", vec![full]));
         let state = tempfile::tempdir().unwrap();
         let mut session = Session::new(
-            Box::new(ScriptedEndpoint::new(vec![alpha_mounted, alpha_gone])),
-            Box::new(ScriptedEndpoint::new(vec![beta])),
+            Box::new(ScriptedEndpoint::new(vec![primary_mounted, primary_gone])),
+            Box::new(ScriptedEndpoint::new(vec![replica])),
             SyncMode::TwoWaySafe,
             state.path().to_path_buf(),
         )
@@ -3401,7 +3436,7 @@ mod tests {
         assert!(
             matches!(
                 error.downcast_ref::<SafetyHalt>(),
-                Some(SafetyHalt::MountVanished("alpha", path)) if path == "mnt"
+                Some(SafetyHalt::MountVanished("primary", path)) if path == "mnt"
             ),
             "{error:#}"
         );

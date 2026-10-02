@@ -865,8 +865,8 @@ pub struct AgentPool {
     /// [`POOL_WAIT_TIMEOUT`].
     wait_timeout: Option<std::time::Duration>,
     /// P2P: connections that dialed *in*, by the peer's name. The
-    /// configured alpha attaches to a beta that leads this way, since the
-    /// alpha is never dialed; each of its sessions opens its own channels
+    /// configured primary attaches to a replica that leads this way, since the
+    /// primary is never dialed; each of its sessions opens its own channels
     /// on the one connection, as sessions share a pooled one.
     attachments: Mutex<HashMap<String, AgentConnection>>,
 }
@@ -1138,7 +1138,7 @@ mod tests {
             symlink_mode: SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
-            side: "beta".into(),
+            side: "replica".into(),
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
@@ -1197,7 +1197,7 @@ mod tests {
         // endpoint lives, so it is waited for before the channel closes.
         let cache = state
             .join("staging")
-            .join(format!("{session}-beta.scancache"));
+            .join(format!("{session}-replica.scancache"));
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !cache.is_file() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(20));

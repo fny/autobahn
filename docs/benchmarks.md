@@ -34,7 +34,7 @@ Cells cover replacements, large-file patches, bidirectional edits, ten-destinati
 
 ## Tails and Latency
 
-On Chromium with 100 editors per side, base-build alpha-to-beta p50 was 232.9 ms and beta-to-alpha p50 was 299.0 ms. Their p99 values were 1,239.4 ms and 1,305.5 ms. This cell has no later audit-build rerun.
+On Chromium with 100 editors per side, base-build primary-to-replica p50 was 232.9 ms and replica-to-primary p50 was 299.0 ms. Their p99 values were 1,239.4 ms and 1,305.5 ms. This cell has no later audit-build rerun.
 
 The October 1 Chromium patch runs measured later fixes:
 

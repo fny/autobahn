@@ -7,10 +7,10 @@ Autobahn formally models its synchronization invariants and failover peering pro
 ## Specification Models
 
 ### 1. Three-Way Reconciliation (`Autobahn.tla`, `Reconcile.tla`)
-Models state transitions over hierarchical filesystem paths across one Alpha and multiple Betas:
+Models state transitions over hierarchical filesystem paths across one Primary and multiple Replicas:
 - Preserves well-formed trees under all concurrent operations.
 - Validates non-destructive reconciliation under `two-way-conflict`.
-- Proves Alpha precedence under `two-way-alpha` and `two-way-alpha-strict`.
+- Proves Primary precedence under `two-way-primary` and `two-way-primary-strict`.
 - Verifies system convergence once external modifications cease.
 
 ### 2. Peering & Automated Failover (`Peering.tla`)
@@ -31,11 +31,11 @@ spec/check.sh
 
 # Run model checks for specific modes
 spec/check.sh strict
-spec/check.sh strict_n3 alpha_n3 conflict_n3
+spec/check.sh strict_n3 primary_n3 conflict_n3
 
 # Verify failover peering safety and liveness
-spec/check.sh peering_conflict_safety peering_alpha_safety
-spec/check.sh peering_conflict_liveness peering_alpha_liveness
+spec/check.sh peering_conflict_safety peering_primary_safety
+spec/check.sh peering_conflict_liveness peering_primary_liveness
 ```
 
 ---

@@ -1203,7 +1203,7 @@ mod tests {
             symlink_mode: SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
-            side: "beta".into(),
+            side: "replica".into(),
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,

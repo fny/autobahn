@@ -1,21 +1,21 @@
-//! P2P keys: SSH keys between the betas that can only run autobahn.
+//! P2P keys: SSH keys between the replicas that can only run autobahn.
 //!
-//! Any beta must be able to take the lead, so each reaches every other.
-//! With `manage_keys` on, the alpha sets that up itself over the logins it
-//! already has (its sessions with each beta):
+//! Any replica must be able to take the lead, so each reaches every other.
+//! With `manage_keys` on, the primary sets that up itself over the logins it
+//! already has (its sessions with each replica):
 //!
-//! 1. each beta makes a key pair of its own under its p2p directory and
+//! 1. each replica makes a key pair of its own under its p2p directory and
 //!    hands back the public half, with its SSH host keys
 //!    ([`ensure_key`]); private keys never leave the host that made them;
-//! 2. each beta is given every *other* beta's public key, in a marked block
+//! 2. each replica is given every *other* replica's public key, in a marked block
 //!    of its `~/.ssh/authorized_keys` that autobahn owns, each line forced
 //!    through the gate ([`crate::gate`]); a p2p `known_hosts` holding
-//!    the other betas' host keys; and the gate itself ([`install_peers`]);
-//! 3. a beta leading dials the others with its p2p key and that
+//!    the other replicas' host keys; and the gate itself ([`install_peers`]);
+//! 3. a replica leading dials the others with its p2p key and that
 //!    `known_hosts` ([`ssh_options`]).
 //!
 //! A gated agent refuses both requests, so a p2p key never widens its
-//! own access: only the alpha, over the user's own login, manages keys.
+//! own access: only the primary, over the user's own login, manages keys.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 
 /// The key pair's file, under the p2p directory.
 pub const KEY_FILE: &str = "id_ed25519";
-/// The other betas' host keys, under the p2p directory.
+/// The other replicas' host keys, under the p2p directory.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// The gate, under `~/.autobahn/bin`.
 pub const GATE_BINARY: &str = "autobahn-gate";
@@ -121,11 +121,11 @@ fn hostname() -> String {
         .unwrap_or_else(|| "host".to_owned())
 }
 
-/// Installs what the alpha sends a beta: `authorized`, the other betas'
+/// Installs what the primary sends a replica: `authorized`, the other replicas'
 /// keys, as the marked block of `~/.ssh/authorized_keys` under `home`,
 /// replacing the block there and nothing else; `known_hosts`, the other
-/// betas' host keys, as the p2p directory's `known_hosts`; and the gate,
-/// as a copy of this executable. Every line is checked to be what the alpha
+/// replicas' host keys, as the p2p directory's `known_hosts`; and the gate,
+/// as a copy of this executable. Every line is checked to be what the primary
 /// makes — a key forced through the gate, a host and its key — so nothing
 /// else can be written there this way.
 pub fn install_peers(
@@ -247,7 +247,7 @@ fn install_gate(bin: &Path) -> Result<()> {
         .with_context(|| format!("unable to install {}", target.display()))
 }
 
-/// The line authorizing `public`, a beta's p2p key, through the gate.
+/// The line authorizing `public`, a replica's p2p key, through the gate.
 pub fn authorized_line(public: &str, host: &str) -> String {
     let mut words = public.split_whitespace();
     let kind = words.next().unwrap_or_default();
@@ -255,9 +255,9 @@ pub fn authorized_line(public: &str, host: &str) -> String {
     format!("{FORCED} {kind} {key} autobahn-p2p:{host}")
 }
 
-/// What one beta is given: every other beta's p2p key, forced through
-/// the gate, and every other beta's host keys, by its host name. `keys` is
-/// every beta's, by host; the beta's own are left out.
+/// What one replica is given: every other replica's p2p key, forced through
+/// the gate, and every other replica's host keys, by its host name. `keys` is
+/// every replica's, by host; the replica's own are left out.
 pub fn block_for(host: &str, keys: &BTreeMap<String, HostKeys>) -> (Vec<String>, Vec<String>) {
     let mut authorized = Vec::new();
     let mut known_hosts = Vec::new();
@@ -276,7 +276,7 @@ pub fn block_for(host: &str, keys: &BTreeMap<String, HostKeys>) -> (Vec<String>,
     (authorized, known_hosts)
 }
 
-/// The ssh options a beta leading from here dials the others with: its
+/// The ssh options a replica leading from here dials the others with: its
 /// p2p key, tried first, and the p2p `known_hosts` beside the
 /// user's own. None when this host has no p2p key.
 pub fn ssh_options(p2p_directory: &Path) -> Option<Vec<String>> {
@@ -333,10 +333,10 @@ mod tests {
         }
     }
 
-    /// A beta is given every other beta's key, forced through the gate, and
+    /// A replica is given every other replica's key, forced through the gate, and
     /// their host keys by host name — never its own.
     #[test]
-    fn a_beta_is_given_every_other_betas_key_through_the_gate() {
+    fn a_replica_is_given_every_other_replicas_key_through_the_gate() {
         let mut known = BTreeMap::new();
         known.insert("u@one".to_owned(), keys(KEY));
         known.insert("two".to_owned(), keys(&KEY.replace("Jl", "Jm")));
@@ -402,7 +402,7 @@ mod tests {
         );
     }
 
-    /// A host makes its p2p key once and keeps it; the options a beta
+    /// A host makes its p2p key once and keeps it; the options a replica
     /// leading from here dials with name it, once there is one.
     #[test]
     fn a_host_makes_its_key_once() {

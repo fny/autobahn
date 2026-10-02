@@ -21,8 +21,8 @@ pub(crate) struct Conflict {
     /// Where each side of this path lives. A conflict over a file that
     /// is not text has no diff to read, so the two files themselves are
     /// what the window has to show — and it needs to know where they are.
-    pub(crate) alpha_root: String,
-    pub(crate) beta_root: String,
+    pub(crate) primary_root: String,
+    pub(crate) replica_root: String,
 }
 
 /// Which part of the file the form is showing.
@@ -101,7 +101,7 @@ pub(crate) struct Spot {
 /// hashes a file every sixtieth of a second is a window that stops.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct Side {
-    /// `alpha` or `beta`, the words every other surface uses.
+    /// `primary` or `replica`, the words every other surface uses.
     pub(crate) name: &'static str,
     /// The directory this side of the pair lives in.
     pub(crate) root: String,
@@ -146,16 +146,16 @@ pub(crate) enum Agreement {
 }
 
 /// The verdict, when both sides hashed and hashed the same.
-pub(crate) fn agreement(alpha: &Side, beta: &Side) -> Option<Agreement> {
-    if alpha.digest.is_none() || alpha.digest != beta.digest {
+pub(crate) fn agreement(primary: &Side, replica: &Side) -> Option<Agreement> {
+    if primary.digest.is_none() || primary.digest != replica.digest {
         return None;
     }
-    match (alpha.executable, beta.executable) {
+    match (primary.executable, replica.executable) {
         (true, false) => Some(Agreement::OnlyTheMode {
-            executable: alpha.name,
+            executable: primary.name,
         }),
         (false, true) => Some(Agreement::OnlyTheMode {
-            executable: beta.name,
+            executable: replica.name,
         }),
         _ => Some(Agreement::Settled),
     }
@@ -796,16 +796,16 @@ pub(crate) fn describe(progress: &crate::progress::ProgressSnapshot) -> String {
         progress.phase.label(),
         format_age(progress.seconds)
     );
-    let side = &progress.alpha;
+    let side = &progress.primary;
     match (side.entries, side.expected) {
         // A tree nothing has counted yet reports what it has walked and
         // no estimate, which is the honest answer on a first scan.
         (walked, Some(expected)) if walked > 0 && expected > 0 => line.push_str(&format!(
-            " · alpha {} of ~{}",
+            " · primary {} of ~{}",
             thousands(walked),
             thousands(expected)
         )),
-        (walked, None) if walked > 0 => line.push_str(&format!(" · alpha {}", thousands(walked))),
+        (walked, None) if walked > 0 => line.push_str(&format!(" · primary {}", thousands(walked))),
         _ => {}
     }
     if let Some(left) = progress.remaining_seconds.filter(|left| *left > 0) {
@@ -852,13 +852,13 @@ pub(crate) fn tail(path: &str, keep: usize) -> String {
     format!("…/{}", parts[parts.len() - keep..].join("/"))
 }
 
-/// The short name of a beta: the host it is on, or the last part of the
+/// The short name of a replica: the host it is on, or the last part of the
 /// path when it is a directory on this machine. Long enough to tell two
 /// apart, short enough to sit on a button.
-pub(crate) fn short_name(beta: &str) -> String {
-    match beta.split_once(':') {
+pub(crate) fn short_name(replica: &str) -> String {
+    match replica.split_once(':') {
         Some((host, _)) if !host.starts_with('/') && !host.starts_with('~') => host.to_owned(),
-        _ => beta.rsplit('/').next().unwrap_or(beta).to_owned(),
+        _ => replica.rsplit('/').next().unwrap_or(replica).to_owned(),
     }
 }
 
@@ -1396,7 +1396,7 @@ impl Sheet {
 
     /// Makes a group, with the two keys without which it cannot load.
     ///
-    /// A group needs an alpha and at least one beta, so it is written
+    /// A group needs a primary and at least one replica, so it is written
     /// with both, empty. That is refused by the loader — which is the
     /// point: the form opens on a section whose two required fields are
     /// red and say what they want, rather than on a table that quietly
@@ -1417,8 +1417,8 @@ impl Sheet {
         let Some(table) = table_for(&mut document, &Section::Group(name.to_owned())) else {
             return Some(fill("config.missing_section", &[("section", name)]));
         };
-        table.insert("alpha", toml_edit::value(""));
-        table.insert("betas", toml_edit::value(toml_edit::Array::new()));
+        table.insert("primary", toml_edit::value(""));
+        table.insert("replicas", toml_edit::value(toml_edit::Array::new()));
         self.hold(document);
         None
     }
@@ -1705,29 +1705,34 @@ mod tests {
 
         // Same bytes, same mode: recorded earlier, settled since.
         let both = agreement(
-            &side("alpha", Some("aa"), false),
-            &side("beta", Some("aa"), false),
+            &side("primary", Some("aa"), false),
+            &side("replica", Some("aa"), false),
         );
         assert!(matches!(both, Some(Agreement::Settled)));
 
         // Same bytes, and the mode is the whole disagreement. The side
         // that is executable is named, because the choice decides it.
         let mode = agreement(
-            &side("alpha", Some("aa"), false),
-            &side("beta", Some("aa"), true),
+            &side("primary", Some("aa"), false),
+            &side("replica", Some("aa"), true),
         );
         assert!(
-            matches!(mode, Some(Agreement::OnlyTheMode { executable: "beta" })),
+            matches!(
+                mode,
+                Some(Agreement::OnlyTheMode {
+                    executable: "replica"
+                })
+            ),
             "the executable side is the one named"
         );
 
         // Different bytes, or a file too large to hash, says nothing.
         assert!(agreement(
-            &side("alpha", Some("aa"), false),
-            &side("beta", Some("bb"), false)
+            &side("primary", Some("aa"), false),
+            &side("replica", Some("bb"), false)
         )
         .is_none());
-        assert!(agreement(&side("alpha", None, false), &side("beta", None, false)).is_none());
+        assert!(agreement(&side("primary", None, false), &side("replica", None, false)).is_none());
     }
 
     /// A complaint that names its key belongs under that key, and the
@@ -1753,7 +1758,7 @@ mod tests {
 
         // A complaint that is a sentence, not a key, belongs nowhere in
         // particular and must not be forced under a field.
-        assert!(fault_at("group 'aws': a p2p mode needs a local alpha").is_none());
+        assert!(fault_at("group 'aws': a p2p mode needs a local primary").is_none());
         assert!(fault_at("sessions 'a' and 'b': endpoint nested").is_none());
     }
 
@@ -1791,7 +1796,7 @@ mod tests {
     #[test]
     fn a_group_can_be_made_renamed_and_taken_out() {
         let text = "[defaults]\nmode = \"two-way-conflict\"\n\n\
-                    [groups.notes]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
+                    [groups.notes]\nprimary = \"/tmp/a\"\nreplicas = [\"/tmp/b\"]\n";
         let mut sheet = Sheet {
             path: std::path::PathBuf::from("config.toml"),
             text: text.to_owned(),
@@ -1809,9 +1814,9 @@ mod tests {
         assert_eq!(sheet.make_group("work"), None);
         assert!(sheet.groups().contains(&"work".to_owned()));
         assert!(sheet
-            .held(&Section::Group("work".to_owned()), "alpha")
+            .held(&Section::Group("work".to_owned()), "primary")
             .is_some());
-        assert!(sheet.refused().is_some(), "an empty alpha is refused");
+        assert!(sheet.refused().is_some(), "an empty primary is refused");
 
         // A name that is taken, or that a command would read as an
         // option, is refused before anything is written.
@@ -1824,7 +1829,7 @@ mod tests {
         assert_eq!(sheet.rename_group("notes", "reading"), None);
         assert_eq!(
             sheet
-                .held(&Section::Group("reading".to_owned()), "alpha")
+                .held(&Section::Group("reading".to_owned()), "primary")
                 .map(|held| held.to_string().trim().to_owned()),
             Some("\"/tmp/a\"".to_owned())
         );
@@ -1922,17 +1927,17 @@ mod tests {
                     mode = \"two-way-conflict\"  # both ways\n\
                     \n\
                     [groups.notes]\n\
-                    alpha = \"/tmp/a\"\n\
-                    betas = [\"/tmp/b\"]\n";
+                    primary = \"/tmp/a\"\n\
+                    replicas = [\"/tmp/b\"]\n";
         let mut document: toml_edit::DocumentMut = text.parse().expect("the file parses");
 
         let table = table_for(&mut document, &Section::Group("notes".to_owned()))
             .expect("the group is in the file");
-        table.insert("mode", toml_edit::value("one-way-alpha"));
+        table.insert("mode", toml_edit::value("one-way-primary"));
         let written = document.to_string();
         assert!(written.contains("# the fleet"), "{written}");
         assert!(written.contains("# both ways"), "{written}");
-        assert!(written.contains("mode = \"one-way-alpha\""), "{written}");
+        assert!(written.contains("mode = \"one-way-primary\""), "{written}");
         crate::config::Config::parse(path, &written).expect("the parser takes it");
 
         // A key the parser does not know is refused, and the form is not
@@ -1949,7 +1954,7 @@ mod tests {
     fn the_gate_is_what_the_supervisor_would_load() {
         let path = std::path::Path::new("config.toml");
         let text = "[defaults]\nmode = \"two-way-conflict\"\n\n\
-                    [groups.a]\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n";
+                    [groups.a]\nprimary = \"/tmp/a\"\nreplicas = [\"/tmp/b\"]\n";
         assert_eq!(refusal(path, text), Ok(Vec::new()));
 
         let mut document: toml_edit::DocumentMut = text.parse().unwrap();
@@ -1969,7 +1974,7 @@ mod tests {
     #[test]
     fn a_missing_section_is_made_only_when_it_is_written_to() {
         let mut document: toml_edit::DocumentMut =
-            "[groups.a]\nalpha = \"/tmp/a\"\n".parse().unwrap();
+            "[groups.a]\nprimary = \"/tmp/a\"\n".parse().unwrap();
         assert!(!document.to_string().contains("[defaults]"));
         let table = table_for(&mut document, &Section::Defaults).expect("a table is made");
         table.insert("interval", toml_edit::value(30));

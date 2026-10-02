@@ -3,8 +3,8 @@
 //! This is a faithful port of Mutagen's reconciliation semantics (which this
 //! project derives from): a recursive three-way merge between an ancestor
 //! (the last synchronized state, containing only synchronizable content) and
-//! the current alpha and beta states, producing ancestor updates, alpha
-//! transitions, beta transitions, and conflicts. See the extensive reasoning
+//! the current primary and replica states, producing ancestor updates, primary
+//! transitions, replica transitions, and conflicts. See the extensive reasoning
 //! in Mutagen's `reconcile.go` for the derivation of each rule; comments
 //! here summarize rather than re-derive.
 
@@ -16,11 +16,11 @@ pub struct Reconciliation {
     /// Changes to apply to the ancestor (beyond those implied by successful
     /// transitions).
     pub ancestor_changes: Vec<Change>,
-    /// Transitions to perform on alpha.
-    pub alpha_transitions: Vec<Change>,
-    /// Transitions to perform on beta.
-    pub beta_transitions: Vec<Change>,
-    /// Conflicts between alpha and beta.
+    /// Transitions to perform on primary.
+    pub primary_transitions: Vec<Change>,
+    /// Transitions to perform on replica.
+    pub replica_transitions: Vec<Change>,
+    /// Conflicts between primary and replica.
     pub conflicts: Vec<Conflict>,
 }
 
@@ -48,8 +48,8 @@ struct Reconciler<'m> {
 #[derive(Clone, Debug, Default)]
 pub struct ReconcileMemo {
     ancestor: Option<Node>,
-    alpha: Option<Node>,
-    beta: Option<Node>,
+    primary: Option<Node>,
+    replica: Option<Node>,
     /// Every path the reconciliation produced a change, transition or
     /// conflict at, sorted.
     produced: Vec<String>,
@@ -59,15 +59,15 @@ impl ReconcileMemo {
     /// Remembers a reconciliation of these inputs, for the next.
     pub fn of(
         ancestor: Option<&Node>,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
+        primary: Option<&Node>,
+        replica: Option<&Node>,
         result: &Reconciliation,
     ) -> ReconcileMemo {
         let mut produced: Vec<String> = result
             .ancestor_changes
             .iter()
-            .chain(&result.alpha_transitions)
-            .chain(&result.beta_transitions)
+            .chain(&result.primary_transitions)
+            .chain(&result.replica_transitions)
             .map(|change| change.path.clone())
             .chain(
                 result
@@ -80,8 +80,8 @@ impl ReconcileMemo {
         produced.dedup();
         ReconcileMemo {
             ancestor: ancestor.cloned(),
-            alpha: alpha.cloned(),
-            beta: beta.cloned(),
+            primary: primary.cloned(),
+            replica: replica.cloned(),
             produced,
         }
     }
@@ -267,16 +267,18 @@ impl<'m> Reconciler<'m> {
         &mut self,
         path: &str,
         ancestor: Option<&Node>,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
+        primary: Option<&Node>,
+        replica: Option<&Node>,
         previous: Previous<'m>,
     ) {
         // The same three inputs as last time, where last time produced
         // nothing: nothing again. See [`ReconcileMemo`].
-        if let (Some((then_ancestor, then_alpha, then_beta)), Some(memo)) = (previous, self.memo) {
+        if let (Some((then_ancestor, then_primary, then_replica)), Some(memo)) =
+            (previous, self.memo)
+        {
             if identical(ancestor, then_ancestor)
-                && identical(alpha, then_alpha)
-                && identical(beta, then_beta)
+                && identical(primary, then_primary)
+                && identical(replica, then_replica)
                 && !memo.produced_within(path)
             {
                 return;
@@ -286,7 +288,7 @@ impl<'m> Reconciler<'m> {
         // If either side is purely problematic at this path, then there's
         // nothing safe to do here: the problem is already surfaced as a scan
         // problem.
-        if problematic(alpha) || problematic(beta) {
+        if problematic(primary) || problematic(replica) {
             return;
         }
 
@@ -299,7 +301,7 @@ impl<'m> Reconciler<'m> {
         // side during that window, was resurrected from the other side
         // when the ignore was lifted, because without the ancestor the
         // survivor read as a brand-new creation.
-        if alpha.is_none() && beta.is_none() {
+        if primary.is_none() && replica.is_none() {
             if ancestor.is_some() {
                 self.result.ancestor_changes.push(Change {
                     path: path.to_owned(),
@@ -309,7 +311,7 @@ impl<'m> Reconciler<'m> {
             }
             return;
         }
-        if nil_or_untracked(alpha) && nil_or_untracked(beta) {
+        if nil_or_untracked(primary) && nil_or_untracked(replica) {
             // At least one side is untracked (both-none returned above).
             // Nothing to synchronize while policy excludes it; whatever
             // the ancestor holds stays, so re-inclusion resumes as an
@@ -327,12 +329,12 @@ impl<'m> Reconciler<'m> {
         // (Without an ancestor, the existing disagreement handling already
         // surfaces such content as a conflict rather than propagating.)
         let untracked = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Untracked));
-        if (untracked(alpha) || untracked(beta)) && ancestor.is_some() {
+        if (untracked(primary) || untracked(replica)) && ancestor.is_some() {
             return;
         }
 
-        // If alpha and beta agree (shallowly) at this path, then recurse.
-        if shallow_equal(alpha, beta) {
+        // If primary and replica agree (shallowly) at this path, then recurse.
+        if shallow_equal(primary, replica) {
             // The paranoid mode's emptied-directory guard: both sides hold
             // a directory here, exactly one of them is empty, and the
             // ancestor says it was substantial. Plain three-way merging
@@ -355,7 +357,7 @@ impl<'m> Reconciler<'m> {
                         if matches!(node.content, Content::Directory(_))
                             && !node.holds_synchronizable())
                 };
-                if empty(alpha) != empty(beta)
+                if empty(primary) != empty(replica)
                     && large_in_ancestor(ancestor, self.policy.guard_dir_deletes_over)
                 {
                     let change = |side: Option<&Node>| Change {
@@ -365,8 +367,8 @@ impl<'m> Reconciler<'m> {
                     };
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
-                        alpha_changes: vec![change(alpha)],
-                        beta_changes: vec![change(beta)],
+                        primary_changes: vec![change(primary)],
+                        replica_changes: vec![change(replica)],
                     });
                     return;
                 }
@@ -375,8 +377,8 @@ impl<'m> Reconciler<'m> {
             // this path (enabling "both modified same" reconciliation) and
             // don't let the old ancestor contents drive recursion.
             let mut ancestor_children: &[Node] = ancestor.map(Node::children).unwrap_or(&[]);
-            if !shallow_equal(ancestor, alpha) {
-                let slim = alpha.map(|node| Node {
+            if !shallow_equal(ancestor, primary) {
+                let slim = primary.map(|node| Node {
                     name: node.name.clone(),
                     content: match &node.content {
                         Content::Directory(_) => Content::Directory(Default::default()),
@@ -393,17 +395,19 @@ impl<'m> Reconciler<'m> {
 
             // Recurse over the union of child names with a three-way linear
             // merge (all child lists are name-sorted).
-            let alpha_children = alpha.map(Node::children).unwrap_or(&[]);
-            let beta_children = beta.map(Node::children).unwrap_or(&[]);
+            let primary_children = primary.map(Node::children).unwrap_or(&[]);
+            let replica_children = replica.map(Node::children).unwrap_or(&[]);
             let (mut i, mut j, mut k) = (0, 0, 0);
-            while i < ancestor_children.len() || j < alpha_children.len() || k < beta_children.len()
+            while i < ancestor_children.len()
+                || j < primary_children.len()
+                || k < replica_children.len()
             {
                 // Determine the smallest name among the remaining children.
                 let mut name: Option<&str> = None;
                 for candidate in [
                     ancestor_children.get(i).map(|n| n.name.as_str()),
-                    alpha_children.get(j).map(|n| n.name.as_str()),
-                    beta_children.get(k).map(|n| n.name.as_str()),
+                    primary_children.get(j).map(|n| n.name.as_str()),
+                    replica_children.get(k).map(|n| n.name.as_str()),
                 ]
                 .into_iter()
                 .flatten()
@@ -423,14 +427,14 @@ impl<'m> Reconciler<'m> {
                     }
                     _ => None,
                 };
-                let alpha_child = match alpha_children.get(j) {
+                let primary_child = match primary_children.get(j) {
                     Some(child) if child.name == name => {
                         j += 1;
                         Some(child)
                     }
                     _ => None,
                 };
-                let beta_child = match beta_children.get(k) {
+                let replica_child = match replica_children.get(k) {
                     Some(child) if child.name == name => {
                         k += 1;
                         Some(child)
@@ -466,24 +470,24 @@ impl<'m> Reconciler<'m> {
                 self.reconcile(
                     &child_path,
                     ancestor_child,
-                    alpha_child,
-                    beta_child,
+                    primary_child,
+                    replica_child,
                     child_previous,
                 );
             }
             return;
         }
 
-        // Alpha and beta disagree at this path; dispatch by mode.
+        // Primary and replica disagree at this path; dispatch by mode.
         match self.policy.mode {
             SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
-                self.handle_disagreement_bidirectional(path, ancestor, alpha, beta)
+                self.handle_disagreement_bidirectional(path, ancestor, primary, replica)
             }
             SyncMode::OneWaySafe => {
-                self.handle_disagreement_one_way_safe(path, ancestor, alpha, beta)
+                self.handle_disagreement_one_way_safe(path, ancestor, primary, replica)
             }
-            SyncMode::OneWayReplica => {
-                self.handle_disagreement_one_way_replica(path, ancestor, alpha, beta)
+            SyncMode::OneWayMirror => {
+                self.handle_disagreement_one_way_mirror(path, ancestor, primary, replica)
             }
         }
     }
@@ -492,18 +496,18 @@ impl<'m> Reconciler<'m> {
         &mut self,
         path: &str,
         ancestor: Option<&Node>,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
+        primary: Option<&Node>,
+        replica: Option<&Node>,
     ) {
         // Extract the synchronizable portion of each side.
-        let alpha_sync = synchronized(alpha);
-        let beta_sync = synchronized(beta);
+        let primary_sync = synchronized(primary);
+        let replica_sync = synchronized(replica);
 
         // Classic three-way merge: if one side is unmodified, propagate the
         // other side's synchronizable content (unless the unmodified side
         // carries unsynchronizable content, which indicates a conflict).
-        let alpha_diff = diff_at(path, ancestor, alpha_sync.as_ref());
-        let beta_diff = diff_at(path, ancestor, beta_sync.as_ref());
+        let primary_diff = diff_at(path, ancestor, primary_sync.as_ref());
+        let replica_diff = diff_at(path, ancestor, replica_sync.as_ref());
 
         // The paranoid mode's other rule: a large directory that is gone
         // on one side while the other still holds exactly what the
@@ -519,13 +523,13 @@ impl<'m> Reconciler<'m> {
         // full copy leaves two pure deletions, and the fuller one carries.
         if !path.is_empty()
             && large_in_ancestor(ancestor, self.policy.guard_dir_deletes_over)
-            && alpha.is_none() != beta.is_none()
+            && primary.is_none() != replica.is_none()
         {
-            let alpha_gone = alpha.is_none();
-            let (kept, kept_diff) = if alpha_gone {
-                (beta_sync.clone(), &beta_diff)
+            let primary_gone = primary.is_none();
+            let (kept, kept_diff) = if primary_gone {
+                (replica_sync.clone(), &replica_diff)
             } else {
-                (alpha_sync.clone(), &alpha_diff)
+                (primary_sync.clone(), &primary_diff)
             };
             if kept_diff.is_empty() {
                 let restore = Change {
@@ -533,54 +537,54 @@ impl<'m> Reconciler<'m> {
                     old: None,
                     new: kept,
                 };
-                if alpha_gone {
-                    self.result.alpha_transitions.push(restore);
+                if primary_gone {
+                    self.result.primary_transitions.push(restore);
                 } else {
-                    self.result.beta_transitions.push(restore);
+                    self.result.replica_transitions.push(restore);
                 }
                 return;
             }
         }
 
-        if beta_diff.is_empty() {
-            let beta_unsynchronizable = blocking(
+        if replica_diff.is_empty() {
+            let replica_unsynchronizable = blocking(
                 path,
                 ancestor,
-                alpha_sync.as_ref(),
-                diff_at(path, beta_sync.as_ref(), beta),
+                primary_sync.as_ref(),
+                diff_at(path, replica_sync.as_ref(), replica),
             );
-            if !beta_unsynchronizable.is_empty() {
+            if !replica_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
-                    alpha_changes: alpha_diff,
-                    beta_changes: beta_unsynchronizable,
+                    primary_changes: primary_diff,
+                    replica_changes: replica_unsynchronizable,
                 });
             } else {
-                self.result.beta_transitions.push(Change {
+                self.result.replica_transitions.push(Change {
                     path: path.to_owned(),
                     old: ancestor.cloned(),
-                    new: alpha_sync,
+                    new: primary_sync,
                 });
             }
             return;
-        } else if alpha_diff.is_empty() {
-            let alpha_unsynchronizable = blocking(
+        } else if primary_diff.is_empty() {
+            let primary_unsynchronizable = blocking(
                 path,
                 ancestor,
-                beta_sync.as_ref(),
-                diff_at(path, alpha_sync.as_ref(), alpha),
+                replica_sync.as_ref(),
+                diff_at(path, primary_sync.as_ref(), primary),
             );
-            if !alpha_unsynchronizable.is_empty() {
+            if !primary_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
-                    alpha_changes: alpha_unsynchronizable,
-                    beta_changes: beta_diff,
+                    primary_changes: primary_unsynchronizable,
+                    replica_changes: replica_diff,
                 });
             } else {
-                self.result.alpha_transitions.push(Change {
+                self.result.primary_transitions.push(Change {
                     path: path.to_owned(),
                     old: ancestor.cloned(),
-                    new: beta_sync,
+                    new: replica_sync,
                 });
             }
             return;
@@ -588,49 +592,49 @@ impl<'m> Reconciler<'m> {
 
         // Both sides are modified. Pure-deletion changes can be safely
         // overwritten, so classify each side.
-        let alpha_non_deletion = non_deletion_changes(&alpha_diff);
-        let beta_non_deletion = non_deletion_changes(&beta_diff);
+        let primary_non_deletion = non_deletion_changes(&primary_diff);
+        let replica_non_deletion = non_deletion_changes(&replica_diff);
 
         // Both sides purely deletions: propagate the full deletion to the
         // side with the partial deletion.
-        if alpha_non_deletion.is_empty() && beta_non_deletion.is_empty() {
-            if alpha_sync.is_none() {
-                let beta_unsynchronizable = blocking(
+        if primary_non_deletion.is_empty() && replica_non_deletion.is_empty() {
+            if primary_sync.is_none() {
+                let replica_unsynchronizable = blocking(
                     path,
                     ancestor,
                     None,
-                    diff_at(path, beta_sync.as_ref(), beta),
+                    diff_at(path, replica_sync.as_ref(), replica),
                 );
-                if !beta_unsynchronizable.is_empty() {
+                if !replica_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
-                        alpha_changes: alpha_diff,
-                        beta_changes: beta_unsynchronizable,
+                        primary_changes: primary_diff,
+                        replica_changes: replica_unsynchronizable,
                     });
                 } else {
-                    self.result.beta_transitions.push(Change {
+                    self.result.replica_transitions.push(Change {
                         path: path.to_owned(),
-                        old: beta_sync,
+                        old: replica_sync,
                         new: None,
                     });
                 }
             } else {
-                let alpha_unsynchronizable = blocking(
+                let primary_unsynchronizable = blocking(
                     path,
                     ancestor,
                     None,
-                    diff_at(path, alpha_sync.as_ref(), alpha),
+                    diff_at(path, primary_sync.as_ref(), primary),
                 );
-                if !alpha_unsynchronizable.is_empty() {
+                if !primary_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
-                        alpha_changes: alpha_unsynchronizable,
-                        beta_changes: beta_diff,
+                        primary_changes: primary_unsynchronizable,
+                        replica_changes: replica_diff,
                     });
                 } else {
-                    self.result.alpha_transitions.push(Change {
+                    self.result.primary_transitions.push(Change {
                         path: path.to_owned(),
-                        old: alpha_sync,
+                        old: primary_sync,
                         new: None,
                     });
                 }
@@ -641,102 +645,102 @@ impl<'m> Reconciler<'m> {
         // Exactly one side purely deletions: propagate the other side's
         // content over it (this is also what enables manual conflict
         // resolution by deleting the losing side).
-        if beta_non_deletion.is_empty() {
-            let beta_unsynchronizable = blocking(
+        if replica_non_deletion.is_empty() {
+            let replica_unsynchronizable = blocking(
                 path,
                 ancestor,
-                alpha_sync.as_ref(),
-                diff_at(path, beta_sync.as_ref(), beta),
+                primary_sync.as_ref(),
+                diff_at(path, replica_sync.as_ref(), replica),
             );
-            if !beta_unsynchronizable.is_empty() {
+            if !replica_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
-                    alpha_changes: alpha_non_deletion,
-                    beta_changes: beta_unsynchronizable,
+                    primary_changes: primary_non_deletion,
+                    replica_changes: replica_unsynchronizable,
                 });
             } else {
-                self.result.beta_transitions.push(Change {
+                self.result.replica_transitions.push(Change {
                     path: path.to_owned(),
-                    old: beta_sync,
-                    new: alpha_sync,
+                    old: replica_sync,
+                    new: primary_sync,
                 });
             }
             return;
-        } else if alpha_non_deletion.is_empty() {
-            // Alpha only deleted here, and beta edited or added. The edit
+        } else if primary_non_deletion.is_empty() {
+            // Primary only deleted here, and replica edited or added. The edit
             // wins: a deletion carries nothing to weigh against it, and
             // letting it win would destroy the only copy. In the strict
-            // mode alpha's deletion is final, and beta is made to match.
+            // mode primary's deletion is final, and replica is made to match.
             if self.policy.mode == SyncMode::TwoWayStrict {
-                let beta_unsynchronizable = blocking(
+                let replica_unsynchronizable = blocking(
                     path,
                     ancestor,
-                    alpha_sync.as_ref(),
-                    diff_at(path, beta_sync.as_ref(), beta),
+                    primary_sync.as_ref(),
+                    diff_at(path, replica_sync.as_ref(), replica),
                 );
-                if !beta_unsynchronizable.is_empty() {
+                if !replica_unsynchronizable.is_empty() {
                     self.result.conflicts.push(Conflict {
                         root: path.to_owned(),
-                        alpha_changes: alpha_diff,
-                        beta_changes: beta_unsynchronizable,
+                        primary_changes: primary_diff,
+                        replica_changes: replica_unsynchronizable,
                     });
                 } else {
-                    self.result.beta_transitions.push(Change {
+                    self.result.replica_transitions.push(Change {
                         path: path.to_owned(),
-                        old: beta_sync,
-                        new: alpha_sync,
+                        old: replica_sync,
+                        new: primary_sync,
                     });
                 }
                 return;
             }
-            let alpha_unsynchronizable = blocking(
+            let primary_unsynchronizable = blocking(
                 path,
                 ancestor,
-                beta_sync.as_ref(),
-                diff_at(path, alpha_sync.as_ref(), alpha),
+                replica_sync.as_ref(),
+                diff_at(path, primary_sync.as_ref(), primary),
             );
-            if !alpha_unsynchronizable.is_empty() {
+            if !primary_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
-                    alpha_changes: alpha_unsynchronizable,
-                    beta_changes: beta_non_deletion,
+                    primary_changes: primary_unsynchronizable,
+                    replica_changes: replica_non_deletion,
                 });
             } else {
-                self.result.alpha_transitions.push(Change {
+                self.result.primary_transitions.push(Change {
                     path: path.to_owned(),
-                    old: alpha_sync,
-                    new: beta_sync,
+                    old: primary_sync,
+                    new: replica_sync,
                 });
             }
             return;
         }
 
         // Both sides have non-deletion changes: conflict, or forced
-        // resolution in alpha's favor in resolved mode.
+        // resolution in primary's favor in resolved mode.
         if self.policy.mode == SyncMode::TwoWaySafe {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
-                alpha_changes: alpha_non_deletion,
-                beta_changes: beta_non_deletion,
+                primary_changes: primary_non_deletion,
+                replica_changes: replica_non_deletion,
             });
         } else {
-            let beta_unsynchronizable = blocking(
+            let replica_unsynchronizable = blocking(
                 path,
                 ancestor,
-                alpha_sync.as_ref(),
-                diff_at(path, beta_sync.as_ref(), beta),
+                primary_sync.as_ref(),
+                diff_at(path, replica_sync.as_ref(), replica),
             );
-            if !beta_unsynchronizable.is_empty() {
+            if !replica_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
-                    alpha_changes: alpha_non_deletion,
-                    beta_changes: beta_unsynchronizable,
+                    primary_changes: primary_non_deletion,
+                    replica_changes: replica_unsynchronizable,
                 });
             } else {
-                self.result.beta_transitions.push(Change {
+                self.result.replica_transitions.push(Change {
                     path: path.to_owned(),
-                    old: beta_sync,
-                    new: alpha_sync,
+                    old: replica_sync,
+                    new: primary_sync,
                 });
             }
         }
@@ -746,54 +750,55 @@ impl<'m> Reconciler<'m> {
         &mut self,
         path: &str,
         ancestor: Option<&Node>,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
+        primary: Option<&Node>,
+        replica: Option<&Node>,
     ) {
-        // If beta's synchronizable portion is unmodified or purely deleted,
-        // overwrite it with alpha's content (unless beta carries
+        // If replica's synchronizable portion is unmodified or purely deleted,
+        // overwrite it with primary's content (unless replica carries
         // unsynchronizable content, which indicates a conflict, reported
-        // with a synthetic alpha change).
-        let beta_sync = synchronized(beta);
-        let beta_non_deletion = non_deletion_changes(&diff_at(path, ancestor, beta_sync.as_ref()));
-        if beta_non_deletion.is_empty() {
-            let beta_unsynchronizable = blocking(
+        // with a synthetic primary change).
+        let replica_sync = synchronized(replica);
+        let replica_non_deletion =
+            non_deletion_changes(&diff_at(path, ancestor, replica_sync.as_ref()));
+        if replica_non_deletion.is_empty() {
+            let replica_unsynchronizable = blocking(
                 path,
                 ancestor,
-                alpha,
-                diff_at(path, beta_sync.as_ref(), beta),
+                primary,
+                diff_at(path, replica_sync.as_ref(), replica),
             );
-            if !beta_unsynchronizable.is_empty() {
+            if !replica_unsynchronizable.is_empty() {
                 self.result.conflicts.push(Conflict {
                     root: path.to_owned(),
-                    alpha_changes: vec![Change {
+                    primary_changes: vec![Change {
                         path: path.to_owned(),
                         old: ancestor.cloned(),
-                        new: alpha.cloned(),
+                        new: primary.cloned(),
                     }],
-                    beta_changes: beta_unsynchronizable,
+                    replica_changes: replica_unsynchronizable,
                 });
             } else {
-                self.result.beta_transitions.push(Change {
+                self.result.replica_transitions.push(Change {
                     path: path.to_owned(),
-                    old: beta_sync,
-                    new: synchronized(alpha),
+                    old: replica_sync,
+                    new: synchronized(primary),
                 });
             }
             return;
         }
 
-        // Beta has non-deletion changes. If alpha is nil or untracked, and
-        // it's not the case that both the ancestor and beta are directories,
-        // then nil out the ancestor and leave beta's content in place (the
-        // core of one-way-conflict semantics: beta-side creations and
+        // Replica has non-deletion changes. If primary is nil or untracked, and
+        // it's not the case that both the ancestor and replica are directories,
+        // then nil out the ancestor and leave replica's content in place (the
+        // core of one-way-conflict semantics: replica-side creations and
         // modifications survive).
         let ancestor_is_directory =
             matches!(ancestor, Some(node) if matches!(node.content, Content::Directory(_)));
-        let beta_is_directory =
-            matches!(beta, Some(node) if matches!(node.content, Content::Directory(_)));
-        let untrack_beta_content =
-            nil_or_untracked(alpha) && !(ancestor_is_directory && beta_is_directory);
-        if untrack_beta_content {
+        let replica_is_directory =
+            matches!(replica, Some(node) if matches!(node.content, Content::Directory(_)));
+        let untrack_replica_content =
+            nil_or_untracked(primary) && !(ancestor_is_directory && replica_is_directory);
+        if untrack_replica_content {
             if ancestor.is_some() {
                 self.result.ancestor_changes.push(Change {
                     path: path.to_owned(),
@@ -804,89 +809,89 @@ impl<'m> Reconciler<'m> {
             return;
         }
 
-        // Otherwise indicate a conflict (with a synthetic alpha change).
+        // Otherwise indicate a conflict (with a synthetic primary change).
         self.result.conflicts.push(Conflict {
             root: path.to_owned(),
-            alpha_changes: vec![Change {
+            primary_changes: vec![Change {
                 path: path.to_owned(),
                 old: ancestor.cloned(),
-                new: alpha.cloned(),
+                new: primary.cloned(),
             }],
-            beta_changes: beta_non_deletion,
+            replica_changes: replica_non_deletion,
         });
     }
 
-    fn handle_disagreement_one_way_replica(
+    fn handle_disagreement_one_way_mirror(
         &mut self,
         path: &str,
         ancestor: Option<&Node>,
-        alpha: Option<&Node>,
-        beta: Option<&Node>,
+        primary: Option<&Node>,
+        replica: Option<&Node>,
     ) {
-        // Alpha carrying untracked content cannot be mirrored — and must
-        // not read as "nothing", which would delete beta's copy of content
+        // Primary carrying untracked content cannot be mirrored — and must
+        // not read as "nothing", which would delete replica's copy of content
         // that synchronization merely excludes (an oversized file, say).
-        // It surfaces as a conflict, matching the treatment of beta-side
+        // It surfaces as a conflict, matching the treatment of replica-side
         // content that mirroring can't remove.
-        let alpha_untracked =
-            matches!(alpha, Some(node) if matches!(node.content, Content::Untracked));
-        if alpha_untracked {
+        let primary_untracked =
+            matches!(primary, Some(node) if matches!(node.content, Content::Untracked));
+        if primary_untracked {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
-                alpha_changes: vec![Change {
+                primary_changes: vec![Change {
                     path: path.to_owned(),
                     old: ancestor.cloned(),
-                    new: alpha.cloned(),
+                    new: primary.cloned(),
                 }],
-                beta_changes: vec![Change {
+                replica_changes: vec![Change {
                     path: path.to_owned(),
                     old: ancestor.cloned(),
-                    new: beta.cloned(),
+                    new: replica.cloned(),
                 }],
             });
             return;
         }
 
-        // Exact mirroring: overwrite beta with alpha's synchronizable
-        // content, unless beta carries unsynchronizable content (which can't
+        // Exact mirroring: overwrite replica with primary's synchronizable
+        // content, unless replica carries unsynchronizable content (which can't
         // be removed), in which case indicate a conflict.
-        let beta_sync = synchronized(beta);
-        let beta_unsynchronizable = blocking(
+        let replica_sync = synchronized(replica);
+        let replica_unsynchronizable = blocking(
             path,
             ancestor,
-            alpha,
-            diff_at(path, beta_sync.as_ref(), beta),
+            primary,
+            diff_at(path, replica_sync.as_ref(), replica),
         );
-        if !beta_unsynchronizable.is_empty() {
+        if !replica_unsynchronizable.is_empty() {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
-                alpha_changes: vec![Change {
+                primary_changes: vec![Change {
                     path: path.to_owned(),
                     old: ancestor.cloned(),
-                    new: alpha.cloned(),
+                    new: primary.cloned(),
                 }],
-                beta_changes: beta_unsynchronizable,
+                replica_changes: replica_unsynchronizable,
             });
         } else {
-            self.result.beta_transitions.push(Change {
+            self.result.replica_transitions.push(Change {
                 path: path.to_owned(),
-                old: beta_sync,
-                new: synchronized(alpha),
+                old: replica_sync,
+                new: synchronized(primary),
             });
         }
     }
 }
 
-/// Performs three-way reconciliation between the ancestor, alpha, and beta
+/// Performs three-way reconciliation between the ancestor, primary, and replica
 /// hierarchies under the specified synchronization mode. The ancestor must
 /// contain only synchronizable content.
 pub fn reconcile(
     ancestor: Option<&Node>,
-    alpha: Option<&Node>,
-    beta: Option<&Node>,
+    primary: Option<&Node>,
+    replica: Option<&Node>,
     policy: impl Into<Policy>,
 ) -> Reconciliation {
-    reconcile_since(ancestor, alpha, beta, policy, None)
+    reconcile_since(ancestor, primary, replica, policy, None)
 }
 
 /// [`reconcile`], skipping every subtree whose three inputs are the very
@@ -895,8 +900,8 @@ pub fn reconcile(
 /// previous reconciliation, in the same mode.
 pub fn reconcile_since(
     ancestor: Option<&Node>,
-    alpha: Option<&Node>,
-    beta: Option<&Node>,
+    primary: Option<&Node>,
+    replica: Option<&Node>,
     policy: impl Into<Policy>,
     memo: Option<&ReconcileMemo>,
 ) -> Reconciliation {
@@ -908,11 +913,11 @@ pub fn reconcile_since(
     let previous = memo.map(|memo| {
         (
             memo.ancestor.as_ref(),
-            memo.alpha.as_ref(),
-            memo.beta.as_ref(),
+            memo.primary.as_ref(),
+            memo.replica.as_ref(),
         )
     });
-    reconciler.reconcile("", ancestor, alpha, beta, previous);
+    reconciler.reconcile("", ancestor, primary, replica, previous);
     reconciler.result
 }
 
@@ -938,7 +943,7 @@ mod tests {
 
     /// Provenance must survive mutual exclusion. Reproduced before the
     /// fix: a file ignored on both sides had its ancestor entry cleared,
-    /// so a deletion made during the exclusion read as "beta holds a new
+    /// so a deletion made during the exclusion read as "replica holds a new
     /// creation" when the ignore was lifted, and the deliberately deleted
     /// content came back.
     #[test]
@@ -962,7 +967,7 @@ mod tests {
             "exclusion must not clear provenance: {:?}",
             result.ancestor_changes
         );
-        assert!(result.alpha_transitions.is_empty() && result.beta_transitions.is_empty());
+        assert!(result.primary_transitions.is_empty() && result.replica_transitions.is_empty());
 
         // Genuinely gone on both sides is different: the entry goes.
         let empty = Node::directory("", vec![]);
@@ -977,18 +982,18 @@ mod tests {
 
         // And the payoff: after the exclusion lifts, the preserved
         // ancestor lets the deletion made while excluded propagate.
-        let alpha_deleted = Node::directory("", vec![]);
-        let beta_kept = Node::directory("", vec![file("secret", 1, false)]);
+        let primary_deleted = Node::directory("", vec![]);
+        let replica_kept = Node::directory("", vec![file("secret", 1, false)]);
         let result = reconcile(
             Some(&ancestor),
-            Some(&alpha_deleted),
-            Some(&beta_kept),
+            Some(&primary_deleted),
+            Some(&replica_kept),
             SyncMode::TwoWaySafe,
         );
-        assert_eq!(result.beta_transitions.len(), 1, "{result:?}");
+        assert_eq!(result.replica_transitions.len(), 1, "{result:?}");
         assert!(
-            result.beta_transitions[0].new.is_none(),
-            "the deletion must propagate to beta, not resurrect"
+            result.replica_transitions[0].new.is_none(),
+            "the deletion must propagate to replica, not resurrect"
         );
     }
 
@@ -1022,10 +1027,10 @@ mod tests {
         // Both sides are described at the directory, so the report can
         // show a directory on each side rather than an absence.
         let node = |changes: &[Change]| changes[0].new.clone().expect("present");
-        assert!(node(&conflict.alpha_changes).children().is_empty());
-        assert_eq!(node(&conflict.beta_changes).children().len(), 9);
+        assert!(node(&conflict.primary_changes).children().is_empty());
+        assert_eq!(node(&conflict.replica_changes).children().len(), 9);
         assert!(
-            result.alpha_transitions.is_empty() && result.beta_transitions.is_empty(),
+            result.primary_transitions.is_empty() && result.replica_transitions.is_empty(),
             "nothing beneath moves while the conflict stands: {result:?}"
         );
 
@@ -1046,12 +1051,12 @@ mod tests {
             SyncMode::TwoWaySafe,
             SyncMode::TwoWayResolved,
             SyncMode::OneWaySafe,
-            SyncMode::OneWayReplica,
+            SyncMode::OneWayMirror,
         ] {
             let result = reconcile(Some(&ancestor), Some(&emptied), Some(&ancestor), mode);
             assert!(result.conflicts.is_empty(), "{mode:?}: {result:?}");
-            assert_eq!(result.beta_transitions.len(), 9, "{mode:?}: {result:?}");
-            assert!(result.beta_transitions.iter().all(|c| c.new.is_none()));
+            assert_eq!(result.replica_transitions.len(), 9, "{mode:?}: {result:?}");
+            assert!(result.replica_transitions.iter().all(|c| c.new.is_none()));
         }
     }
 
@@ -1074,12 +1079,12 @@ mod tests {
                 ),
             ],
         );
-        for (alpha, beta) in [(&emptied, &ancestor), (&ancestor, &emptied)] {
-            let result = reconcile(Some(&ancestor), Some(alpha), Some(beta), guarding(8));
+        for (primary, replica) in [(&emptied, &ancestor), (&ancestor, &emptied)] {
+            let result = reconcile(Some(&ancestor), Some(primary), Some(replica), guarding(8));
             assert_eq!(result.conflicts.len(), 1, "{result:?}");
             assert_eq!(result.conflicts[0].root, "data");
             assert!(
-                result.alpha_transitions.is_empty() && result.beta_transitions.is_empty(),
+                result.primary_transitions.is_empty() && result.replica_transitions.is_empty(),
                 "nothing beneath moves while the conflict stands: {result:?}"
             );
         }
@@ -1097,7 +1102,7 @@ mod tests {
             guarding(8),
         );
         assert!(result.conflicts.is_empty(), "{result:?}");
-        assert_eq!(result.beta_transitions.len(), 3);
+        assert_eq!(result.replica_transitions.len(), 3);
     }
 
     /// A large directory gone on one side while the other holds exactly
@@ -1112,17 +1117,17 @@ mod tests {
 
         let result = reconcile(Some(&ancestor), Some(&gone), Some(&ancestor), guarding(8));
         assert!(result.conflicts.is_empty(), "{result:?}");
-        assert!(result.beta_transitions.is_empty(), "{result:?}");
-        assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
-        let restore = &result.alpha_transitions[0];
+        assert!(result.replica_transitions.is_empty(), "{result:?}");
+        assert_eq!(result.primary_transitions.len(), 1, "{result:?}");
+        let restore = &result.primary_transitions[0];
         assert_eq!(restore.path, "data");
         assert!(restore.old.is_none());
         assert_eq!(restore.new.as_ref().expect("restored").children().len(), 9);
 
         // Symmetric.
         let result = reconcile(Some(&ancestor), Some(&ancestor), Some(&gone), guarding(8));
-        assert_eq!(result.beta_transitions.len(), 1);
-        assert!(result.beta_transitions[0].new.is_some());
+        assert_eq!(result.replica_transitions.len(), 1);
+        assert!(result.replica_transitions[0].new.is_some());
 
         // Elsewhere the deletion is honoured.
         let result = reconcile(
@@ -1131,15 +1136,15 @@ mod tests {
             Some(&ancestor),
             SyncMode::TwoWaySafe,
         );
-        assert_eq!(result.beta_transitions.len(), 1);
-        assert!(result.beta_transitions[0].new.is_none());
+        assert_eq!(result.replica_transitions.len(), 1);
+        assert!(result.replica_transitions[0].new.is_none());
 
         // A small directory is deleted in the paranoid mode too.
         let ancestor = dir("", vec![file("readme", 9, false), large(3)]);
         let result = reconcile(Some(&ancestor), Some(&gone), Some(&ancestor), guarding(8));
-        assert!(result.alpha_transitions.is_empty());
-        assert_eq!(result.beta_transitions.len(), 1);
-        assert!(result.beta_transitions[0].new.is_none());
+        assert!(result.primary_transitions.is_empty());
+        assert_eq!(result.replica_transitions.len(), 1);
+        assert!(result.replica_transitions[0].new.is_none());
     }
 
     /// The other resolution: the emptying side wins. `resolve` retires the
@@ -1153,10 +1158,10 @@ mod tests {
         let emptied = dir("", vec![file("readme", 9, false), dir("data", vec![])]);
         let result = reconcile(Some(&ancestor), Some(&gone), Some(&emptied), guarding(8));
         assert!(result.conflicts.is_empty(), "{result:?}");
-        assert!(result.alpha_transitions.is_empty(), "{result:?}");
-        assert_eq!(result.beta_transitions.len(), 1, "{result:?}");
-        assert_eq!(result.beta_transitions[0].path, "data");
-        assert!(result.beta_transitions[0].new.is_none());
+        assert!(result.primary_transitions.is_empty(), "{result:?}");
+        assert_eq!(result.replica_transitions.len(), 1, "{result:?}");
+        assert_eq!(result.replica_transitions[0].path, "data");
+        assert!(result.replica_transitions[0].new.is_none());
     }
 
     /// The restore rule needs the kept side untouched. A deletion against
@@ -1172,10 +1177,10 @@ mod tests {
         let edited = dir("", vec![dir("data", edited_children)]);
         let result = reconcile(Some(&ancestor), Some(&gone), Some(&edited), guarding(8));
         assert!(result.conflicts.is_empty(), "{result:?}");
-        assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
-        assert_eq!(result.alpha_transitions[0].path, "data");
+        assert_eq!(result.primary_transitions.len(), 1, "{result:?}");
+        assert_eq!(result.primary_transitions[0].path, "data");
         assert_eq!(
-            result.alpha_transitions[0]
+            result.primary_transitions[0]
                 .new
                 .as_ref()
                 .expect("edit wins")
@@ -1204,7 +1209,7 @@ mod tests {
             SyncMode::TwoWaySafe,
             SyncMode::TwoWayResolved,
             SyncMode::OneWaySafe,
-            SyncMode::OneWayReplica,
+            SyncMode::OneWayMirror,
         ] {
             let result = reconcile(
                 Some(&ancestor),
@@ -1212,26 +1217,26 @@ mod tests {
                 Some(&ancestor),
                 mode,
             );
-            assert!(result.alpha_transitions.is_empty(), "{mode:?}");
-            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+            assert!(result.primary_transitions.is_empty(), "{mode:?}");
+            assert!(result.replica_transitions.is_empty(), "{mode:?}");
             assert!(result.ancestor_changes.is_empty(), "{mode:?}");
-            // The reverse orientation (beta untracked) must hold too.
+            // The reverse orientation (replica untracked) must hold too.
             let result = reconcile(
                 Some(&ancestor),
                 Some(&ancestor),
                 Some(&with_untracked),
                 mode,
             );
-            assert!(result.alpha_transitions.is_empty(), "{mode:?}");
-            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+            assert!(result.primary_transitions.is_empty(), "{mode:?}");
+            assert!(result.replica_transitions.is_empty(), "{mode:?}");
             assert!(result.ancestor_changes.is_empty(), "{mode:?}");
 
             // The ancestor-less case (the ancestor was cleared while both
             // sides were untracked, then one re-entered tracked scope) must
             // not delete either: at most it surfaces a conflict.
             let result = reconcile(None, Some(&with_untracked), Some(&ancestor), mode);
-            assert!(result.alpha_transitions.is_empty(), "{mode:?}");
-            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+            assert!(result.primary_transitions.is_empty(), "{mode:?}");
+            assert!(result.replica_transitions.is_empty(), "{mode:?}");
         }
     }
 
@@ -1245,48 +1250,48 @@ mod tests {
             SyncMode::TwoWaySafe,
         );
         assert!(result.ancestor_changes.is_empty());
-        assert!(result.alpha_transitions.is_empty());
-        assert!(result.beta_transitions.is_empty());
+        assert!(result.primary_transitions.is_empty());
+        assert!(result.replica_transitions.is_empty());
         assert!(result.conflicts.is_empty());
     }
 
     #[test]
-    fn alpha_modification_propagates_to_beta() {
+    fn primary_modification_propagates_to_replica() {
         let ancestor = dir("", vec![file("a", 1, false)]);
-        let alpha = dir("", vec![file("a", 2, false)]);
+        let primary = dir("", vec![file("a", 2, false)]);
         let result = reconcile(
             Some(&ancestor),
-            Some(&alpha),
+            Some(&primary),
             Some(&ancestor),
             SyncMode::TwoWaySafe,
         );
-        assert_eq!(result.beta_transitions.len(), 1);
-        assert!(result.alpha_transitions.is_empty());
+        assert_eq!(result.replica_transitions.len(), 1);
+        assert!(result.primary_transitions.is_empty());
         assert!(result.conflicts.is_empty());
-        assert_eq!(result.beta_transitions[0].path, "a");
+        assert_eq!(result.replica_transitions[0].path, "a");
     }
 
     #[test]
-    fn beta_modification_propagates_to_alpha_bidirectionally_only() {
+    fn replica_modification_propagates_to_primary_bidirectionally_only() {
         let ancestor = dir("", vec![file("a", 1, false)]);
-        let beta = dir("", vec![file("a", 2, false)]);
+        let replica = dir("", vec![file("a", 2, false)]);
         let bidirectional = reconcile(
             Some(&ancestor),
             Some(&ancestor),
-            Some(&beta),
+            Some(&replica),
             SyncMode::TwoWaySafe,
         );
-        assert_eq!(bidirectional.alpha_transitions.len(), 1);
-        let replica = reconcile(
+        assert_eq!(bidirectional.primary_transitions.len(), 1);
+        let mirror = reconcile(
             Some(&ancestor),
             Some(&ancestor),
-            Some(&beta),
-            SyncMode::OneWayReplica,
+            Some(&replica),
+            SyncMode::OneWayMirror,
         );
-        assert!(replica.alpha_transitions.is_empty());
-        assert_eq!(replica.beta_transitions.len(), 1);
-        // Replica overwrites the beta modification with alpha content.
-        assert!(replica.beta_transitions[0]
+        assert!(mirror.primary_transitions.is_empty());
+        assert_eq!(mirror.replica_transitions.len(), 1);
+        // The mirror overwrites the replica modification with primary content.
+        assert!(mirror.replica_transitions[0]
             .new
             .as_ref()
             .unwrap()
@@ -1294,18 +1299,18 @@ mod tests {
     }
 
     #[test]
-    fn one_way_safe_preserves_beta_creations() {
+    fn one_way_safe_preserves_replica_creations() {
         let ancestor = dir("", vec![file("a", 1, false)]);
-        let beta = dir("", vec![file("a", 1, false), file("b", 2, false)]);
+        let replica = dir("", vec![file("a", 1, false), file("b", 2, false)]);
         let result = reconcile(
             Some(&ancestor),
             Some(&ancestor),
-            Some(&beta),
+            Some(&replica),
             SyncMode::OneWaySafe,
         );
-        assert!(result.beta_transitions.is_empty());
+        assert!(result.replica_transitions.is_empty());
         assert!(result.conflicts.is_empty());
-        // The beta creation is untracked by niling the (absent) ancestor:
+        // The replica creation is untracked by niling the (absent) ancestor:
         // no ancestor change needed since the ancestor lacks "b".
         assert!(result.ancestor_changes.is_empty());
     }
@@ -1313,134 +1318,134 @@ mod tests {
     #[test]
     fn concurrent_divergent_edits_conflict_in_safe_mode_and_resolve_in_resolved_mode() {
         let ancestor = dir("", vec![file("a", 1, false)]);
-        let alpha = dir("", vec![file("a", 2, false)]);
-        let beta = dir("", vec![file("a", 3, false)]);
+        let primary = dir("", vec![file("a", 2, false)]);
+        let replica = dir("", vec![file("a", 3, false)]);
         let safe = reconcile(
             Some(&ancestor),
-            Some(&alpha),
-            Some(&beta),
+            Some(&primary),
+            Some(&replica),
             SyncMode::TwoWaySafe,
         );
         assert_eq!(safe.conflicts.len(), 1);
-        assert!(safe.alpha_transitions.is_empty() && safe.beta_transitions.is_empty());
+        assert!(safe.primary_transitions.is_empty() && safe.replica_transitions.is_empty());
         let resolved = reconcile(
             Some(&ancestor),
-            Some(&alpha),
-            Some(&beta),
+            Some(&primary),
+            Some(&replica),
             SyncMode::TwoWayResolved,
         );
         assert!(resolved.conflicts.is_empty());
-        assert_eq!(resolved.beta_transitions.len(), 1);
-        assert!(resolved.beta_transitions[0]
+        assert_eq!(resolved.replica_transitions.len(), 1);
+        assert!(resolved.replica_transitions[0]
             .new
             .as_ref()
             .unwrap()
-            .content_equal(alpha.child("a").unwrap(), true));
+            .content_equal(primary.child("a").unwrap(), true));
     }
 
     #[test]
-    fn strict_lets_an_alpha_deletion_beat_a_beta_edit() {
+    fn strict_lets_an_primary_deletion_beat_a_replica_edit() {
         let ancestor = dir("", vec![file("a", 1, false), file("b", 1, false)]);
-        let alpha = dir("", vec![file("b", 1, false)]);
-        let beta = dir("", vec![file("a", 2, false), file("b", 1, false)]);
-        // Every other two-way mode brings the edit back to alpha.
+        let primary = dir("", vec![file("b", 1, false)]);
+        let replica = dir("", vec![file("a", 2, false), file("b", 1, false)]);
+        // Every other two-way mode brings the edit back to primary.
         for mode in [SyncMode::TwoWaySafe, SyncMode::TwoWayResolved] {
-            let result = reconcile(Some(&ancestor), Some(&alpha), Some(&beta), mode);
+            let result = reconcile(Some(&ancestor), Some(&primary), Some(&replica), mode);
             assert!(result.conflicts.is_empty(), "{mode:?}");
-            assert_eq!(result.alpha_transitions.len(), 1, "{mode:?}");
-            assert!(result.beta_transitions.is_empty(), "{mode:?}");
+            assert_eq!(result.primary_transitions.len(), 1, "{mode:?}");
+            assert!(result.replica_transitions.is_empty(), "{mode:?}");
         }
-        // Strict removes it from beta.
+        // Strict removes it from replica.
         let result = reconcile(
             Some(&ancestor),
-            Some(&alpha),
-            Some(&beta),
+            Some(&primary),
+            Some(&replica),
             SyncMode::TwoWayStrict,
         );
         assert!(result.conflicts.is_empty());
-        assert!(result.alpha_transitions.is_empty());
-        assert_eq!(result.beta_transitions.len(), 1);
-        assert_eq!(result.beta_transitions[0].path, "a");
-        assert!(result.beta_transitions[0].new.is_none());
-        // And still carries a beta addition to alpha, as any two-way mode.
-        let beta = dir("", vec![file("b", 1, false), file("c", 5, false)]);
+        assert!(result.primary_transitions.is_empty());
+        assert_eq!(result.replica_transitions.len(), 1);
+        assert_eq!(result.replica_transitions[0].path, "a");
+        assert!(result.replica_transitions[0].new.is_none());
+        // And still carries a replica addition to primary, as any two-way mode.
+        let replica = dir("", vec![file("b", 1, false), file("c", 5, false)]);
         let result = reconcile(
             Some(&ancestor),
-            Some(&alpha),
-            Some(&beta),
+            Some(&primary),
+            Some(&replica),
             SyncMode::TwoWayStrict,
         );
-        assert_eq!(result.alpha_transitions.len(), 1);
-        assert_eq!(result.alpha_transitions[0].path, "c");
+        assert_eq!(result.primary_transitions.len(), 1);
+        assert_eq!(result.primary_transitions[0].path, "c");
     }
 
-    /// The row of `docs/modes.md`'s table for "alpha deletes a file beta
+    /// The row of `docs/modes.md`'s table for "primary deletes a file replica
     /// edited", one assertion per cell. The one-way modes never write to
-    /// alpha, so in `one-way-conflict` beta's edit stays on beta and
-    /// synchronization forgets the file, as if beta had created it; it is
-    /// not reported, since there is nothing of alpha's to overwrite it.
+    /// primary, so in `one-way-conflict` replica's edit stays on replica and
+    /// synchronization forgets the file, as if replica had created it; it is
+    /// not reported, since there is nothing of primary's to overwrite it.
     #[test]
-    fn alpha_deleting_a_file_beta_edited_matches_the_modes_table() {
+    fn primary_deleting_a_file_replica_edited_matches_the_modes_table() {
         let ancestor = dir("", vec![file("a", 1, false), file("b", 1, false)]);
-        let alpha = dir("", vec![file("b", 1, false)]);
-        let beta = dir("", vec![file("a", 2, false), file("b", 1, false)]);
-        let run = |mode| reconcile(Some(&ancestor), Some(&alpha), Some(&beta), mode);
-        let restores_to_alpha = |result: &Reconciliation| {
+        let primary = dir("", vec![file("b", 1, false)]);
+        let replica = dir("", vec![file("a", 2, false), file("b", 1, false)]);
+        let run = |mode| reconcile(Some(&ancestor), Some(&primary), Some(&replica), mode);
+        let restores_to_primary = |result: &Reconciliation| {
             result.conflicts.is_empty()
-                && result.beta_transitions.is_empty()
-                && result.alpha_transitions.len() == 1
-                && result.alpha_transitions[0].path == "a"
-                && result.alpha_transitions[0]
+                && result.replica_transitions.is_empty()
+                && result.primary_transitions.len() == 1
+                && result.primary_transitions[0].path == "a"
+                && result.primary_transitions[0]
                     .new
                     .as_ref()
-                    .is_some_and(|n| n.content_equal(beta.child("a").unwrap(), true))
+                    .is_some_and(|n| n.content_equal(replica.child("a").unwrap(), true))
         };
-        let deletes_on_beta = |result: &Reconciliation| {
+        let deletes_on_replica = |result: &Reconciliation| {
             result.conflicts.is_empty()
-                && result.alpha_transitions.is_empty()
-                && result.beta_transitions.len() == 1
-                && result.beta_transitions[0].path == "a"
-                && result.beta_transitions[0].new.is_none()
+                && result.primary_transitions.is_empty()
+                && result.replica_transitions.len() == 1
+                && result.replica_transitions[0].path == "a"
+                && result.replica_transitions[0].new.is_none()
         };
 
-        // two-way-conflict: beta's edit comes back to alpha.
+        // two-way-conflict: replica's edit comes back to primary.
         let result = run(SyncMode::TwoWaySafe);
-        assert!(restores_to_alpha(&result), "{result:?}");
-        // two-way-alpha: beta's edit comes back to alpha.
+        assert!(restores_to_primary(&result), "{result:?}");
+        // two-way-primary: replica's edit comes back to primary.
         let result = run(SyncMode::TwoWayResolved);
-        assert!(restores_to_alpha(&result), "{result:?}");
-        // two-way-alpha-strict: deleted on beta too.
+        assert!(restores_to_primary(&result), "{result:?}");
+        // two-way-primary-strict: deleted on replica too.
         let result = run(SyncMode::TwoWayStrict);
-        assert!(deletes_on_beta(&result), "{result:?}");
-        // one-way-conflict: beta's edit stays on beta, unreported, and the
+        assert!(deletes_on_replica(&result), "{result:?}");
+        // one-way-conflict: replica's edit stays on replica, unreported, and the
         // ancestor forgets the file.
         let result = run(SyncMode::OneWaySafe);
         assert!(result.conflicts.is_empty(), "{result:?}");
-        assert!(result.alpha_transitions.is_empty(), "{result:?}");
-        assert!(result.beta_transitions.is_empty(), "{result:?}");
+        assert!(result.primary_transitions.is_empty(), "{result:?}");
+        assert!(result.replica_transitions.is_empty(), "{result:?}");
         assert_eq!(result.ancestor_changes.len(), 1, "{result:?}");
         assert_eq!(result.ancestor_changes[0].path, "a");
         assert!(result.ancestor_changes[0].new.is_none());
-        // one-way-alpha: deleted on beta too.
-        let result = run(SyncMode::OneWayReplica);
-        assert!(deletes_on_beta(&result), "{result:?}");
+        // one-way-primary: deleted on replica too.
+        let result = run(SyncMode::OneWayMirror);
+        assert!(deletes_on_replica(&result), "{result:?}");
     }
 
     #[test]
     fn deletion_versus_modification_repropagates_content() {
-        // Alpha deleted a file; beta modified it: the modification wins on
+        // Primary deleted a file; replica modified it: the modification wins on
         // both sides (deletion is the losing side of the conflict).
         let ancestor = dir("", vec![file("a", 1, false)]);
-        let alpha = dir("", vec![]);
-        let beta = dir("", vec![file("a", 2, false)]);
+        let primary = dir("", vec![]);
+        let replica = dir("", vec![file("a", 2, false)]);
         let result = reconcile(
             Some(&ancestor),
-            Some(&alpha),
-            Some(&beta),
+            Some(&primary),
+            Some(&replica),
             SyncMode::TwoWaySafe,
         );
-        assert_eq!(result.alpha_transitions.len(), 1);
-        assert!(result.alpha_transitions[0].new.is_some());
+        assert_eq!(result.primary_transitions.len(), 1);
+        assert!(result.primary_transitions[0].new.is_some());
         assert!(result.conflicts.is_empty());
     }
 
@@ -1454,8 +1459,8 @@ mod tests {
             Some(&both),
             SyncMode::TwoWaySafe,
         );
-        assert!(result.alpha_transitions.is_empty());
-        assert!(result.beta_transitions.is_empty());
+        assert!(result.primary_transitions.is_empty());
+        assert!(result.replica_transitions.is_empty());
         assert!(result.conflicts.is_empty());
         assert!(!result.ancestor_changes.is_empty());
         // Applying the ancestor changes must produce the agreed state.
@@ -1469,8 +1474,8 @@ mod tests {
     /// grown past `max_file_size`, turned into a FIFO, a symlink under the
     /// `ignore` mode — is a change reconciliation cannot see, and it
     /// blocks the deletion of the directory around it. Reproduced before
-    /// the fix in `two-way-conflict`: alpha grew `d/a` past the limit, beta
-    /// deleted `d`, and the "both purely deletions" branch deleted alpha's
+    /// the fix in `two-way-conflict`: primary grew `d/a` past the limit, replica
+    /// deleted `d`, and the "both purely deletions" branch deleted primary's
     /// edited file.
     #[test]
     fn an_entry_excluded_since_the_ancestor_blocks_the_deletion_around_it() {
@@ -1495,22 +1500,25 @@ mod tests {
         let removes_d =
             |changes: &[Change]| changes.iter().any(|c| c.path == "d" && c.new.is_none());
 
-        // Beta excluded `a`, alpha deleted `d`: a conflict in every mode.
+        // Replica excluded `a`, primary deleted `d`: a conflict in every mode.
         for mode in MODES {
             let result = reconcile(Some(&ancestor), Some(&deleted), Some(&excluded), mode);
             assert_eq!(result.conflicts.len(), 1, "{mode:?}: {result:?}");
             assert_eq!(result.conflicts[0].root, "d", "{mode:?}");
-            assert!(!removes_d(&result.beta_transitions), "{mode:?}: {result:?}");
+            assert!(
+                !removes_d(&result.replica_transitions),
+                "{mode:?}: {result:?}"
+            );
         }
-        // Alpha excluded `a`, beta deleted `d`: a conflict in the two-way
-        // modes, and alpha is never touched.
+        // Primary excluded `a`, replica deleted `d`: a conflict in the two-way
+        // modes, and primary is never touched.
         for mode in MODES {
             let result = reconcile(Some(&ancestor), Some(&excluded), Some(&deleted), mode);
             assert!(
-                !removes_d(&result.alpha_transitions),
+                !removes_d(&result.primary_transitions),
                 "{mode:?}: {result:?}"
             );
-            if !matches!(mode, SyncMode::OneWaySafe | SyncMode::OneWayReplica) {
+            if !matches!(mode, SyncMode::OneWaySafe | SyncMode::OneWayMirror) {
                 assert_eq!(result.conflicts.len(), 1, "{mode:?}: {result:?}");
             }
         }
@@ -1534,15 +1542,18 @@ mod tests {
         for mode in MODES {
             let result = reconcile(Some(&ancestor), Some(&deleted), Some(&with_git), mode);
             assert!(result.conflicts.is_empty(), "{mode:?}: {result:?}");
-            assert!(removes_d(&result.beta_transitions), "{mode:?}: {result:?}");
+            assert!(
+                removes_d(&result.replica_transitions),
+                "{mode:?}: {result:?}"
+            );
         }
     }
 
     #[test]
-    fn untracked_beta_content_blocks_replica_with_conflict() {
+    fn untracked_replica_content_blocks_mirror_with_conflict() {
         let ancestor = dir("", vec![]);
-        let alpha = dir("", vec![file("a", 1, false)]);
-        let beta = dir(
+        let primary = dir("", vec![file("a", 1, false)]);
+        let replica = dir(
             "",
             vec![Node {
                 name: "a".into(),
@@ -1551,12 +1562,12 @@ mod tests {
         );
         let result = reconcile(
             Some(&ancestor),
-            Some(&alpha),
-            Some(&beta),
-            SyncMode::OneWayReplica,
+            Some(&primary),
+            Some(&replica),
+            SyncMode::OneWayMirror,
         );
         assert_eq!(result.conflicts.len(), 1);
-        assert!(result.beta_transitions.is_empty());
+        assert!(result.replica_transitions.is_empty());
     }
 
     // ── property-based reconciliation ────────────────────────────────
@@ -1589,7 +1600,7 @@ mod tests {
         SyncMode::TwoWayResolved,
         SyncMode::TwoWayStrict,
         SyncMode::OneWaySafe,
-        SyncMode::OneWayReplica,
+        SyncMode::OneWayMirror,
     ];
 
     fn untracked_node(name: &str) -> Node {
@@ -1669,13 +1680,13 @@ mod tests {
         }
     }
 
-    /// An ancestor, and alpha and beta each derived from it by their own
+    /// An ancestor, and primary and replica each derived from it by their own
     /// local activity. The ancestor holds only synchronizable content, as
     /// a real one does; the sides hold untracked entries when permitted.
     fn generated(
         ancestor: &[u8],
-        alpha: &[u8],
-        beta: &[u8],
+        primary: &[u8],
+        replica: &[u8],
         untracked: bool,
     ) -> (Option<Node>, Option<Node>, Option<Node>) {
         let mut input = Instructions {
@@ -1697,8 +1708,8 @@ mod tests {
             let mut input = Instructions { bytes, next: 0 };
             mutated(ancestor.as_ref(), "", 0, &mut input, untracked)
         };
-        let (alpha, beta) = (side(alpha), side(beta));
-        (ancestor, alpha, beta)
+        let (primary, replica) = (side(primary), side(replica));
+        (ancestor, primary, replica)
     }
 
     fn trees_equal(left: Option<&Node>, right: Option<&Node>) -> bool {
@@ -1758,34 +1769,34 @@ mod tests {
     /// Whatever a side holds that the ancestor does not vouch for — an
     /// edit, a creation, an entry turned untracked — survives on that side
     /// or stands under a conflict. The exceptions are the modes' own
-    /// policy: alpha overwrites beta's synchronizable content in the
-    /// alpha-wins modes, and an ignored entry the ancestor never held goes
+    /// policy: primary overwrites replica's synchronizable content in the
+    /// primary-wins modes, and an ignored entry the ancestor never held goes
     /// with a directory deleted around it (`docs/ignores.md`; which of
     /// those the endpoint may really remove is its own decision).
     ///
     /// And every synchronizable change a side made reaches the other side
     /// or stands under a conflict, unless the other side holds untracked
     /// content there (which neither offers nor receives changes) or the
-    /// change is beta's in a one-way mode, where beta's changes stay put.
+    /// change is replica's in a one-way mode, where replica's changes stay put.
     fn silent_losses(
         mode: SyncMode,
         ancestor: Option<&Node>,
-        (alpha, beta): (Option<&Node>, Option<&Node>),
-        (alpha_after, beta_after): (Option<&Node>, Option<&Node>),
+        (primary, replica): (Option<&Node>, Option<&Node>),
+        (primary_after, replica_after): (Option<&Node>, Option<&Node>),
         conflicts: &[Conflict],
     ) -> Vec<String> {
-        let one_way = matches!(mode, SyncMode::OneWaySafe | SyncMode::OneWayReplica);
-        let alpha_wins = matches!(
+        let one_way = matches!(mode, SyncMode::OneWaySafe | SyncMode::OneWayMirror);
+        let primary_wins = matches!(
             mode,
-            SyncMode::TwoWayResolved | SyncMode::TwoWayStrict | SyncMode::OneWayReplica
+            SyncMode::TwoWayResolved | SyncMode::TwoWayStrict | SyncMode::OneWayMirror
         );
         let conflicted = |path: &str| conflicts.iter().any(|c| covers(&c.root, path));
         let mut losses = Vec::new();
-        for (is_beta, before, after, other_before, other_after) in [
-            (false, alpha, alpha_after, beta, beta_after),
-            (true, beta, beta_after, alpha, alpha_after),
+        for (is_replica, before, after, other_before, other_after) in [
+            (false, primary, primary_after, replica, replica_after),
+            (true, replica, replica_after, primary, primary_after),
         ] {
-            let side = if is_beta { "beta" } else { "alpha" };
+            let side = if is_replica { "replica" } else { "primary" };
             let mut held = Vec::new();
             if let Some(root) = before {
                 entries(String::new(), root, &mut held);
@@ -1800,7 +1811,7 @@ mod tests {
                     continue;
                 }
                 let untracked = matches!(node.content, Content::Untracked);
-                if is_beta && alpha_wins && !untracked {
+                if is_replica && primary_wins && !untracked {
                     continue;
                 }
                 if untracked && recorded.is_none() && now.is_none() {
@@ -1809,7 +1820,7 @@ mod tests {
                 losses.push(format!("{side} lost '{path}'"));
             }
 
-            if is_beta && one_way {
+            if is_replica && one_way {
                 continue;
             }
             let own = before.and_then(Node::synchronizable_subtree);
@@ -1888,40 +1899,40 @@ mod tests {
         #[test]
         fn conflict_free_reconciliation_converges(
             ancestor_spec in instructions(),
-            alpha_spec in instructions(),
-            beta_spec in instructions(),
+            primary_spec in instructions(),
+            replica_spec in instructions(),
         ) {
-            let (ancestor, alpha, beta) =
-                generated(&ancestor_spec, &alpha_spec, &beta_spec, false);
+            let (ancestor, primary, replica) =
+                generated(&ancestor_spec, &primary_spec, &replica_spec, false);
             let result = reconcile(
                 ancestor.as_ref(),
-                alpha.as_ref(),
-                beta.as_ref(),
+                primary.as_ref(),
+                replica.as_ref(),
                 SyncMode::TwoWaySafe,
             );
             if result.conflicts.is_empty() {
-                let alpha_after = apply(alpha.as_ref(), &result.alpha_transitions)
-                    .expect("alpha transitions apply");
-                let beta_after = apply(beta.as_ref(), &result.beta_transitions)
-                    .expect("beta transitions apply");
+                let primary_after = apply(primary.as_ref(), &result.primary_transitions)
+                    .expect("primary transitions apply");
+                let replica_after = apply(replica.as_ref(), &result.replica_transitions)
+                    .expect("replica transitions apply");
                 proptest::prop_assert!(
-                    trees_equal(alpha_after.as_ref(), beta_after.as_ref()),
+                    trees_equal(primary_after.as_ref(), replica_after.as_ref()),
                     "conflict-free reconciliation did not converge:\n\
-                     alpha {alpha_after:?}\nbeta {beta_after:?}"
+                     primary {primary_after:?}\nreplica {replica_after:?}"
                 );
             }
             apply(ancestor.as_ref(), &result.ancestor_changes)
                 .expect("ancestor changes apply");
         }
 
-        /// Three-way agreement is inert: when ancestor, alpha, and beta all
+        /// Three-way agreement is inert: when ancestor, primary, and replica all
         /// hold the same content, reconciliation has nothing to say.
         #[test]
         fn agreement_emits_nothing(spec in instructions(), mode_index in 0usize..5) {
             let (tree, _, _) = generated(&spec, &[], &[], false);
             let result = reconcile(tree.as_ref(), tree.as_ref(), tree.as_ref(), MODES[mode_index]);
-            proptest::prop_assert!(result.alpha_transitions.is_empty());
-            proptest::prop_assert!(result.beta_transitions.is_empty());
+            proptest::prop_assert!(result.primary_transitions.is_empty());
+            proptest::prop_assert!(result.replica_transitions.is_empty());
             proptest::prop_assert!(result.ancestor_changes.is_empty());
             proptest::prop_assert!(result.conflicts.is_empty());
         }
@@ -1932,18 +1943,18 @@ mod tests {
         #[test]
         fn unsynchronizable_content_never_travels(
             ancestor_spec in instructions(),
-            alpha_spec in instructions(),
-            beta_spec in instructions(),
+            primary_spec in instructions(),
+            replica_spec in instructions(),
             mode_index in 0usize..5,
         ) {
             let mode = MODES[mode_index];
-            let (ancestor, alpha, beta) =
-                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
-            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            let (ancestor, primary, replica) =
+                generated(&ancestor_spec, &primary_spec, &replica_spec, true);
+            let result = reconcile(ancestor.as_ref(), primary.as_ref(), replica.as_ref(), mode);
             for change in result
-                .alpha_transitions
+                .primary_transitions
                 .iter()
-                .chain(result.beta_transitions.iter())
+                .chain(result.replica_transitions.iter())
                 .chain(result.ancestor_changes.iter())
             {
                 if let Some(new) = &change.new {
@@ -1964,34 +1975,34 @@ mod tests {
         #[test]
         fn no_change_is_lost_silently(
             ancestor_spec in instructions(),
-            alpha_spec in instructions(),
-            beta_spec in instructions(),
+            primary_spec in instructions(),
+            replica_spec in instructions(),
             mode_index in 0usize..5,
         ) {
             let mode = MODES[mode_index];
-            let (ancestor, alpha, beta) =
-                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
-            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
-            let alpha_after = apply(alpha.as_ref(), &result.alpha_transitions)
-                .expect("alpha transitions apply");
-            let beta_after = apply(beta.as_ref(), &result.beta_transitions)
-                .expect("beta transitions apply");
+            let (ancestor, primary, replica) =
+                generated(&ancestor_spec, &primary_spec, &replica_spec, true);
+            let result = reconcile(ancestor.as_ref(), primary.as_ref(), replica.as_ref(), mode);
+            let primary_after = apply(primary.as_ref(), &result.primary_transitions)
+                .expect("primary transitions apply");
+            let replica_after = apply(replica.as_ref(), &result.replica_transitions)
+                .expect("replica transitions apply");
             let losses = silent_losses(
                 mode,
                 ancestor.as_ref(),
-                (alpha.as_ref(), beta.as_ref()),
-                (alpha_after.as_ref(), beta_after.as_ref()),
+                (primary.as_ref(), replica.as_ref()),
+                (primary_after.as_ref(), replica_after.as_ref()),
                 &result.conflicts,
             );
             proptest::prop_assert!(
                 losses.is_empty(),
-                "{mode:?}: {losses:?}\nancestor {}\nalpha {}\nbeta {}\n\
-                 alpha transitions {}\nbeta transitions {}\nconflicts at {:?}",
+                "{mode:?}: {losses:?}\nancestor {}\nprimary {}\nreplica {}\n\
+                 primary transitions {}\nreplica transitions {}\nconflicts at {:?}",
                 show(ancestor.as_ref()),
-                show(alpha.as_ref()),
-                show(beta.as_ref()),
-                show_changes(&result.alpha_transitions),
-                show_changes(&result.beta_transitions),
+                show(primary.as_ref()),
+                show(replica.as_ref()),
+                show_changes(&result.primary_transitions),
+                show_changes(&result.replica_transitions),
                 result.conflicts.iter().map(|c| c.root.as_str()).collect::<Vec<_>>(),
             );
         }
@@ -2004,17 +2015,17 @@ mod tests {
         #[test]
         fn a_transition_expects_what_its_side_synchronizes(
             ancestor_spec in instructions(),
-            alpha_spec in instructions(),
-            beta_spec in instructions(),
+            primary_spec in instructions(),
+            replica_spec in instructions(),
             mode_index in 0usize..5,
         ) {
             let mode = MODES[mode_index];
-            let (ancestor, alpha, beta) =
-                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
-            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            let (ancestor, primary, replica) =
+                generated(&ancestor_spec, &primary_spec, &replica_spec, true);
+            let result = reconcile(ancestor.as_ref(), primary.as_ref(), replica.as_ref(), mode);
             for (side, root, transitions) in [
-                ("alpha", alpha.as_ref(), &result.alpha_transitions),
-                ("beta", beta.as_ref(), &result.beta_transitions),
+                ("primary", primary.as_ref(), &result.primary_transitions),
+                ("replica", replica.as_ref(), &result.replica_transitions),
             ] {
                 for change in transitions {
                     let held = crate::tree::node_at(root, &change.path)
@@ -2030,26 +2041,26 @@ mod tests {
             }
         }
 
-        /// The one-way modes never write to alpha, whatever they see.
+        /// The one-way modes never write to primary, whatever they see.
         #[test]
-        fn one_way_modes_never_touch_alpha(
+        fn one_way_modes_never_touch_primary(
             ancestor_spec in instructions(),
-            alpha_spec in instructions(),
-            beta_spec in instructions(),
-            replica in proptest::bool::ANY,
+            primary_spec in instructions(),
+            replica_spec in instructions(),
+            mirror in proptest::bool::ANY,
         ) {
-            let mode = if replica {
-                SyncMode::OneWayReplica
+            let mode = if mirror {
+                SyncMode::OneWayMirror
             } else {
                 SyncMode::OneWaySafe
             };
-            let (ancestor, alpha, beta) =
-                generated(&ancestor_spec, &alpha_spec, &beta_spec, true);
-            let result = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), mode);
+            let (ancestor, primary, replica) =
+                generated(&ancestor_spec, &primary_spec, &replica_spec, true);
+            let result = reconcile(ancestor.as_ref(), primary.as_ref(), replica.as_ref(), mode);
             proptest::prop_assert!(
-                result.alpha_transitions.is_empty(),
-                "a one-way mode emitted alpha transitions: {:?}",
-                result.alpha_transitions
+                result.primary_transitions.is_empty(),
+                "a one-way mode emitted primary transitions: {:?}",
+                result.primary_transitions
             );
         }
     }
@@ -2094,7 +2105,7 @@ mod tests {
             SyncMode::TwoWayResolved,
             SyncMode::TwoWayStrict,
             SyncMode::OneWaySafe,
-            SyncMode::OneWayReplica,
+            SyncMode::OneWayMirror,
         ];
         for (trial, mode) in modes.iter().cycle().take(18).enumerate() {
             // A shared starting tree: most of it agrees on all three sides,
@@ -2119,7 +2130,7 @@ mod tests {
                     })
                     .collect(),
             );
-            let (mut ancestor, mut alpha, mut beta) =
+            let (mut ancestor, mut primary, mut replica) =
                 (Some(base.clone()), Some(base.clone()), Some(base));
             let mut memo: Option<ReconcileMemo> = None;
             for round in 0..120 {
@@ -2146,18 +2157,18 @@ mod tests {
                     };
                     let target = match next() % 3 {
                         0 => &mut ancestor,
-                        1 => &mut alpha,
-                        _ => &mut beta,
+                        1 => &mut primary,
+                        _ => &mut replica,
                     };
                     if let Ok(changed) = apply(target.as_ref(), std::slice::from_ref(&change)) {
                         *target = changed;
                     }
                 }
-                let fresh = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), *mode);
+                let fresh = reconcile(ancestor.as_ref(), primary.as_ref(), replica.as_ref(), *mode);
                 let skipping = reconcile_since(
                     ancestor.as_ref(),
-                    alpha.as_ref(),
-                    beta.as_ref(),
+                    primary.as_ref(),
+                    replica.as_ref(),
                     *mode,
                     memo.as_ref(),
                 );
@@ -2168,8 +2179,8 @@ mod tests {
                 );
                 memo = Some(ReconcileMemo::of(
                     ancestor.as_ref(),
-                    alpha.as_ref(),
-                    beta.as_ref(),
+                    primary.as_ref(),
+                    replica.as_ref(),
                     &fresh,
                 ));
                 // Sometimes the cycle lands: its record reaches the

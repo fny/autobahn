@@ -34,26 +34,26 @@ autobahn diff mygroup src/main.rs
 To resolve a conflict, specify which endpoint's version should prevail using `--keep`:
 
 ```sh
-# Promote Alpha's version as authoritative
-autobahn resolve ./src/main.rs --keep alpha
+# Promote Primary's version as authoritative
+autobahn resolve ./src/main.rs --keep primary
 
 # Promote a specific remote host's version
 autobahn resolve mygroup src/main.rs --keep remotehost
 
-# Retain Alpha's version, renaming the remote copy aside (e.g., main.rs.remotehost)
+# Retain Primary's version, renaming the remote copy aside (e.g., main.rs.remotehost)
 autobahn resolve mygroup src/main.rs --keep both
 
 # Batch resolve all conflicts within a subtree
-autobahn resolve mygroup src/subfolder --keep alpha
+autobahn resolve mygroup src/subfolder --keep primary
 
 # Resolve all conflicts across an entire group without interactive confirmation
-autobahn resolve ~/Workspace/project --all --keep alpha --yes
+autobahn resolve ~/Workspace/project --all --keep primary --yes
 ```
 
 ## Resolution Mechanics
 
 1. **Retiring the Non-Authoritative Copy:**
-   `autobahn resolve` does not perform a direct byte transfer immediately. Instead, it retires the non-winning replica on the opposing endpoint (or moves it to an adjacent backup name if `--keep both` is specified) and removes the path entry from the session ancestor database.
+   `autobahn resolve` does not perform a direct byte transfer immediately. Instead, it retires the non-winning copy on the opposing endpoint (or moves it to an adjacent backup name if `--keep both` is specified) and removes the path entry from the session ancestor database.
 2. **Re-propagation:**
    Upon the subsequent synchronization cycle, the winning file is detected as a fresh creation and cleanly propagated across all endpoints in the group.
 3. **Atomic Verification:**

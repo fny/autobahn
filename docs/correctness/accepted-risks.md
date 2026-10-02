@@ -8,7 +8,7 @@ This document records unresolved risks associated with [the invariants](./invari
 
 An unobserved mount has no recorded identity. Below the root, its disappearance follows ordinary reconciliation unless `guard_dir_deletes_over` applies. Content below the count threshold, including one large file, receives no additional guard.
 
-The whole-root emptying guard requires two ancestor entries. A missing alpha has a separate refusal.
+The whole-root emptying guard requires two ancestor entries. A missing primary has a separate refusal.
 
 **Reason retained.** An unseen unmount and deliberate deletion have the same tree shape. Byte thresholds also interrupt intentional large-file deletion and cannot establish mount identity.
 
@@ -56,7 +56,7 @@ Review round five judged writable overlap across processes an uncommon, delibera
 
 **Reason to revisit.** Broader agent-protocol changes or evidence of common multi-machine synchronization into shared storage.
 
-**Possible fix.** Add advisory locks keyed by resolved endpoint identity under the endpoint host’s default state root. Use shared locks for read-only one-way alphas and exclusive locks for writable endpoints. Retain the existing pair lock.
+**Possible fix.** Add advisory locks keyed by resolved endpoint identity under the endpoint host’s default state root. Use shared locks for read-only one-way primaries and exclusive locks for writable endpoints. Retain the existing pair lock.
 
 ## 5. Forged timestamps beyond the verify verb
 

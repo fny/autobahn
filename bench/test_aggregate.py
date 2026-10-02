@@ -35,8 +35,8 @@ def report_for(records, plan=None):
         return json.loads(out.getvalue())
 
 
-def job_records(name, destinations, betas, cold_s):
-    spec = {"job": name, "cell": {"name": "cell-1", "betas": betas}, "tools": ["autobahn"]}
+def job_records(name, destinations, replicas, cold_s):
+    spec = {"job": name, "cell": {"name": "cell-1", "replicas": replicas}, "tools": ["autobahn"]}
     return [
         {"measurement": "job_start", "job": name, "cell": "cell-1", "spec": spec,
          "destinations": [f"dest{i}" for i in range(1, destinations + 1)]},
@@ -49,7 +49,7 @@ def job_records(name, destinations, betas, cold_s):
 
 class NothingLanded(unittest.TestCase):
     def test_a_window_where_nothing_landed_is_left_out_and_listed(self):
-        spec = {"job": "cell-r0", "cell": {"name": "cell-1", "betas": 1},
+        spec = {"job": "cell-r0", "cell": {"name": "cell-1", "replicas": 1},
                 "tools": ["autobahn"]}
         def window(job, samples, attempts, censored):
             return {"measurement": "workload", "job": job, "cell": "cell-1",
@@ -76,7 +76,7 @@ class NothingLanded(unittest.TestCase):
 
 class InconsistentSeries(unittest.TestCase):
     def test_interleaved_samplers_give_no_resource_figures(self):
-        spec = {"job": "fan-r0", "cell": {"name": "fan", "betas": 2}, "tools": ["autobahn"]}
+        spec = {"job": "fan-r0", "cell": {"name": "fan", "replicas": 2}, "tools": ["autobahn"]}
         clean = [[t, 1000, 100 + t, 1] for t in range(0, 30)]
         # Two samplers in one log: time and cumulative CPU both jump back.
         mixed = [[t, 1000, 100 + t, 1] for t in range(0, 30)] + [[5, 9000, 50, 3]]

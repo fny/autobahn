@@ -147,23 +147,23 @@ pub enum SyncMode {
     /// Bidirectional synchronization that surfaces conflicts without
     /// resolving them.
     TwoWaySafe,
-    /// Bidirectional synchronization that resolves conflicts in alpha's
+    /// Bidirectional synchronization that resolves conflicts in primary's
     /// favor.
     TwoWayResolved,
-    /// `TwoWayResolved` without its one exception: alpha wins every
-    /// collision, including one where alpha's side of it is a deletion.
+    /// `TwoWayResolved` without its one exception: primary wins every
+    /// collision, including one where primary's side of it is a deletion.
     /// In `TwoWayResolved` a deletion never beats an edit, since it
-    /// carries no content to weigh against one; here alpha's word is
-    /// final, and what beta edited under a name alpha removed is removed
-    /// on beta too. Beta's own additions still flow to alpha, which is
+    /// carries no content to weigh against one; here primary's word is
+    /// final, and what replica edited under a name primary removed is removed
+    /// on replica too. Replica's own additions still flow to primary, which is
     /// what keeps this two-way.
     TwoWayStrict,
-    /// Unidirectional (alpha to beta) synchronization that refuses to
-    /// overwrite or reverse-propagate beta-side changes.
+    /// Unidirectional (primary to replica) synchronization that refuses to
+    /// overwrite or reverse-propagate replica-side changes.
     OneWaySafe,
-    /// Unidirectional (alpha to beta) synchronization that maintains beta as
-    /// an exact mirror of alpha.
-    OneWayReplica,
+    /// Unidirectional (primary to replica) synchronization that maintains replica as
+    /// an exact mirror of primary.
+    OneWayMirror,
 }
 
 /// A content change: a transition from one content state to another at a
@@ -186,15 +186,15 @@ impl Change {
     }
 }
 
-/// A conflict between changes made on alpha and beta.
+/// A conflict between changes made on primary and replica.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Conflict {
     /// The root path of the conflict.
     pub root: String,
-    /// The relevant changes on alpha.
-    pub alpha_changes: Vec<Change>,
-    /// The relevant changes on beta.
-    pub beta_changes: Vec<Change>,
+    /// The relevant changes on primary.
+    pub primary_changes: Vec<Change>,
+    /// The relevant changes on replica.
+    pub replica_changes: Vec<Change>,
 }
 
 /// A non-fatal problem encountered at a particular path.

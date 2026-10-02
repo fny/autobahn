@@ -114,14 +114,14 @@ struct Cli {
 #[derive(Subcommand)]
 enum P2pVerb {
     /// Bridge standard input and output to the leading supervisor's attach
-    /// socket. The alpha runs this over SSH on a beta that leads; it is
+    /// socket. The primary runs this over SSH on a replica that leads; it is
     /// not for typing.
     Attach {
         /// The attach socket (default: the p2p directory's).
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Hand the lead to a peer: `alpha`, or a beta's spec.
+    /// Hand the lead to a peer: `primary`, or a replica's spec.
     Yield {
         /// Who leads next.
         #[arg(long)]
@@ -139,21 +139,21 @@ enum ModeArgument {
     /// reported and left alone.
     #[value(name = "two-way-conflict")]
     TwoWaySafe,
-    /// Both directions; a file changed on both sides takes alpha's
+    /// Both directions; a file changed on both sides takes primary's
     /// version, silently.
-    #[value(name = "two-way-alpha")]
+    #[value(name = "two-way-primary")]
     TwoWayResolved,
-    /// two-way-alpha, and alpha's deletion of a file beta edited wins too.
-    #[value(name = "two-way-alpha-strict")]
+    /// two-way-primary, and primary's deletion of a file replica edited wins too.
+    #[value(name = "two-way-primary-strict")]
     TwoWayStrict,
-    /// Alpha to beta; a change beta made itself is kept and reported as a
+    /// Primary to replica; a change replica made itself is kept and reported as a
     /// conflict.
     #[value(name = "one-way-conflict")]
     OneWaySafe,
-    /// Alpha to beta; beta becomes an exact copy, its own changes
+    /// Primary to replica; replica becomes an exact copy, its own changes
     /// discarded.
-    #[value(name = "one-way-alpha", alias = "mirror")]
-    OneWayReplica,
+    #[value(name = "one-way-primary", alias = "mirror")]
+    OneWayMirror,
 }
 
 impl From<ModeArgument> for SyncMode {
@@ -163,7 +163,7 @@ impl From<ModeArgument> for SyncMode {
             ModeArgument::TwoWayResolved => SyncMode::TwoWayResolved,
             ModeArgument::TwoWayStrict => SyncMode::TwoWayStrict,
             ModeArgument::OneWaySafe => SyncMode::OneWaySafe,
-            ModeArgument::OneWayReplica => SyncMode::OneWayReplica,
+            ModeArgument::OneWayMirror => SyncMode::OneWayMirror,
         }
     }
 }
@@ -206,7 +206,7 @@ enum Command {
         /// inside a synchronized root selects the group that covers it,
         /// so `autobahn status .` answers "what syncs where I am?".
         group: Option<String>,
-        /// Filter to a destination host (or local beta path) within the
+        /// Filter to a destination host (or local replica path) within the
         /// group.
         host: Option<String>,
         /// List every conflicting path rather than a count and an example.
@@ -315,8 +315,8 @@ enum Command {
     },
     /// Resolve conflicts by choosing which side's version wins.
     ///
-    /// The winner is named by what `status` calls it: `alpha`, or a
-    /// destination's host (or local path). Its content is put on alpha and
+    /// The winner is named by what `status` calls it: `primary`, or a
+    /// destination's host (or local path). Its content is put on primary and
     /// every other destination, so one command settles a conflict across
     /// a whole fan-out. `both` keeps the winner in place and renames the
     /// other side's version aside as `<name>.<side>` before propagating.
@@ -332,7 +332,7 @@ enum Command {
         /// folder. Several may be given; each losing side is then read once
         /// for all of them rather than once per path.
         paths: Vec<String>,
-        /// Whose version wins: `alpha`, a destination host or path, or
+        /// Whose version wins: `primary`, a destination host or path, or
         /// `both`.
         #[arg(long)]
         keep: String,
@@ -516,12 +516,12 @@ enum Command {
     /// ([user@]host:path), which connects over SSH (installing the matching
     /// agent on the remote host on first contact).
     Sync {
-        /// The alpha synchronization root (a local path or [user@]host:path).
+        /// The primary synchronization root (a local path or [user@]host:path).
         /// With no roots at all, every session in the configuration is
         /// synchronized once instead.
-        alpha: Option<String>,
-        /// The beta synchronization root (a local path or [user@]host:path).
-        beta: Option<String>,
+        primary: Option<String>,
+        /// The replica synchronization root (a local path or [user@]host:path).
+        replica: Option<String>,
         /// The configuration file, for the no-roots form (defaults to
         /// ~/.autobahn/config.toml).
         #[arg(long)]
@@ -555,16 +555,16 @@ enum Command {
         /// ~/.autobahn/sessions/<session-id>).
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Advanced: connect beta through this agent command (whitespace
-        /// split into argv) instead of SSH, treating BETA as the remote
+        /// Advanced: connect replica through this agent command (whitespace
+        /// split into argv) instead of SSH, treating REPLICA as the remote
         /// root path. Used for testing and custom transports.
         #[arg(long)]
-        beta_agent: Option<String>,
-        /// Advanced: connect alpha through this agent command (whitespace
-        /// split into argv) instead of SSH, treating ALPHA as the remote
+        replica_agent: Option<String>,
+        /// Advanced: connect primary through this agent command (whitespace
+        /// split into argv) instead of SSH, treating PRIMARY as the remote
         /// root path. Used for testing and custom transports.
         #[arg(long)]
-        alpha_agent: Option<String>,
+        primary_agent: Option<String>,
     },
     /// Install the latest release over this one: the command, and the
     /// agent bundle the controller streams to remote hosts.
@@ -613,8 +613,8 @@ enum Command {
     /// interrupted. On a terminal the display is a live `autobahn status`;
     /// when the output is a file or a pipe, one line is logged per event.
     ///
-    /// The configuration fans groups of one local alpha directory out to
-    /// any number of local or remote betas; see the documentation for the
+    /// The configuration fans groups of one local primary directory out to
+    /// any number of local or remote replicas; see the documentation for the
     /// format. Sessions run in parallel, and a session whose destination is
     /// unreachable backs off and heals automatically — it never blocks the
     /// others. To keep this running when no terminal is, see `install`.
@@ -867,20 +867,20 @@ fn main() {
             yes,
         ),
         Command::Sync {
-            alpha: None,
-            beta: None,
+            primary: None,
+            replica: None,
             config,
             state_root,
             ..
         } => run_sync_config(config, state_root),
-        Command::Sync { alpha: None, .. } | Command::Sync { beta: None, .. } => {
+        Command::Sync { primary: None, .. } | Command::Sync { replica: None, .. } => {
             Err(anyhow::anyhow!(
                 "sync takes two roots, or none to synchronize every configured session once"
             ))
         }
         Command::Sync {
-            alpha: Some(alpha),
-            beta: Some(beta),
+            primary: Some(primary),
+            replica: Some(replica),
             config: _,
             state_root: _,
             mode,
@@ -891,22 +891,22 @@ fn main() {
             watch,
             interval,
             state_dir,
-            beta_agent,
-            alpha_agent,
+            replica_agent,
+            primary_agent,
         } => parse_policy(symlink_mode, file_mode, directory_mode).and_then(|policy| {
             // On a thread with room for a deep tree, not the main thread.
             autobahn::threads::run_deep(move || {
                 run_sync(
-                    alpha,
-                    beta,
+                    primary,
+                    replica,
                     mode,
                     ignores,
                     policy,
                     watch,
                     interval,
                     state_dir,
-                    beta_agent,
-                    alpha_agent,
+                    replica_agent,
+                    primary_agent,
                 )
             })
         }),
@@ -958,17 +958,17 @@ fn refuse_root(command: &Command, allow_root: bool) -> Result<()> {
     autobahn::root::check_controller(identity, allowed)
 }
 
-/// Parses an scp-style beta specification into (host, path) if it denotes a
+/// Parses an scp-style replica specification into (host, path) if it denotes a
 /// remote root. A specification is remote when it contains a colon before
 /// any slash (so relative and absolute local paths are never misparsed).
-fn parse_remote(beta: &str) -> Option<(&str, &str)> {
-    let colon = beta.find(':')?;
-    if let Some(slash) = beta.find('/') {
+fn parse_remote(replica: &str) -> Option<(&str, &str)> {
+    let colon = replica.find(':')?;
+    if let Some(slash) = replica.find('/') {
         if slash < colon {
             return None;
         }
     }
-    Some((&beta[..colon], &beta[colon + 1..]))
+    Some((&replica[..colon], &replica[colon + 1..]))
 }
 
 /// The endpoint policy assembled from command-line arguments.
@@ -1004,16 +1004,16 @@ fn parse_policy(
 
 #[allow(clippy::too_many_arguments)]
 fn run_sync(
-    alpha: String,
-    beta: String,
+    primary: String,
+    replica: String,
     mode: ModeArgument,
     ignores: Vec<String>,
     policy: Policy,
     watch: bool,
     interval: u64,
     state_dir: Option<PathBuf>,
-    beta_agent: Option<String>,
-    alpha_agent: Option<String>,
+    replica_agent: Option<String>,
+    primary_agent: Option<String>,
 ) -> Result<()> {
     // Compute the session identity and state directory. Local paths are
     // resolved to their physical identity, so a session created here shares
@@ -1038,30 +1038,30 @@ fn run_sync(
             )?)))
         }
     };
-    let alpha_frozen = frozen_of(&alpha, &alpha_agent)?;
-    let beta_frozen = frozen_of(&beta, &beta_agent)?;
+    let primary_frozen = frozen_of(&primary, &primary_agent)?;
+    let replica_frozen = frozen_of(&replica, &replica_agent)?;
     let identity_from = |spec: &str, frozen: &Option<PathBuf>| -> String {
         match frozen {
             Some(path) => path.to_string_lossy().into_owned(),
             None => spec.to_owned(),
         }
     };
-    let alpha_identity = identity_from(&alpha, &alpha_frozen);
-    let beta_identity = identity_from(&beta, &beta_frozen);
-    let identifier = session_identifier(&alpha_identity, &beta_identity);
+    let primary_identity = identity_from(&primary, &primary_frozen);
+    let replica_identity = identity_from(&replica, &replica_frozen);
+    let identifier = session_identifier(&primary_identity, &replica_identity);
     // The topology a configured session is held to, before anything opens.
     let target = |spec: &str, agent: &Option<String>, frozen: &Option<PathBuf>| {
         autobahn::config::EndpointTarget::manual(spec, agent.as_deref(), frozen.as_deref())
     };
-    let alpha_target = target(&alpha, &alpha_agent, &alpha_frozen);
-    let beta_target = target(&beta, &beta_agent, &beta_frozen);
+    let primary_target = target(&primary, &primary_agent, &primary_frozen);
+    let replica_target = target(&replica, &replica_agent, &replica_frozen);
     autobahn::config::check_session_topology(
-        &alpha_target,
-        &beta_target,
-        &alpha_identity,
-        &beta_identity,
+        &primary_target,
+        &replica_target,
+        &primary_identity,
+        &replica_identity,
     )
-    .map_err(|problem| anyhow::anyhow!("{alpha} and {beta}: {problem}"))?;
+    .map_err(|problem| anyhow::anyhow!("{primary} and {replica}: {problem}"))?;
     let state_directory = match state_dir {
         Some(directory) => directory,
         None => {
@@ -1072,15 +1072,15 @@ fn run_sync(
     };
     autobahn::config::OwnState::new(&state_directory, None)
         .check_session(
-            (&alpha_target, &alpha_identity),
-            (&beta_target, &beta_identity),
+            (&primary_target, &primary_identity),
+            (&replica_target, &replica_identity),
             &ignores,
         )
         .map_err(|problem| anyhow::anyhow!(problem))?;
     // Credentials are synchronized as asked, and said so first.
     for (target, identity) in [
-        (&alpha_target, &alpha_identity),
-        (&beta_target, &beta_identity),
+        (&primary_target, &primary_identity),
+        (&replica_target, &replica_identity),
     ] {
         if let (autobahn::config::EndpointTarget::Local(_), Some(warning)) = (
             target,
@@ -1157,15 +1157,15 @@ fn run_sync(
         // The frozen resolution computed for the session identity above —
         // never a second canonicalization of the original spelling, and
         // never the raw lexical path, either of which would reopen the
-        // retarget window the freeze closes. A missing *beta* root is a
+        // retarget window the freeze closes. A missing *replica* root is a
         // legitimate state (the transition creates it, under the frozen
-        // resolved parent); a missing alpha stays an error, since a
+        // resolved parent); a missing primary stays an error, since a
         // mistyped source combined with a mirroring mode would otherwise
         // empty the destination.
         let root = frozen
             .expect("local endpoints carry a frozen resolution")
             .clone();
-        if side == "alpha" && std::fs::symlink_metadata(&root).is_err() {
+        if side == "primary" && std::fs::symlink_metadata(&root).is_err() {
             bail!("unable to resolve {side} root {spec}");
         }
         Ok(Box::new(LocalEndpoint::new(
@@ -1174,17 +1174,22 @@ fn run_sync(
             options()?,
         )?))
     };
-    let alpha_endpoint = endpoint(&alpha, alpha_agent, alpha_frozen.as_ref(), "alpha")?;
-    let beta_endpoint = endpoint(&beta, beta_agent, beta_frozen.as_ref(), "beta")?;
+    let primary_endpoint = endpoint(&primary, primary_agent, primary_frozen.as_ref(), "primary")?;
+    let replica_endpoint = endpoint(&replica, replica_agent, replica_frozen.as_ref(), "replica")?;
 
     // Create the session and run.
-    let mut session = Session::new(alpha_endpoint, beta_endpoint, mode.into(), state_directory)?;
+    let mut session = Session::new(
+        primary_endpoint,
+        replica_endpoint,
+        mode.into(),
+        state_directory,
+    )?;
     // Exclusivity over the *trees*, not just the chosen state directory: a
     // manual sync with --state-dir must not run beside a supervisor that
     // owns the same pair under different state.
     session.hold(autobahn::session::EndpointPairLock::acquire(
-        &alpha_identity,
-        &beta_identity,
+        &primary_identity,
+        &replica_identity,
     )?);
     let mut follow_ups = 0u32;
     loop {
@@ -1212,10 +1217,10 @@ fn run_sync(
         }
         if !watch {
             let conflicts = report.conflicts.len();
-            let blocked = report.alpha_scan_problems.len()
-                + report.beta_scan_problems.len()
-                + report.alpha_transition_problems.len()
-                + report.beta_transition_problems.len();
+            let blocked = report.primary_scan_problems.len()
+                + report.replica_scan_problems.len()
+                + report.primary_transition_problems.len()
+                + report.replica_transition_problems.len();
             if conflicts > 0 || blocked > 0 {
                 return Err(Unsettled(format!(
                     "{conflicts} conflict(s) and {blocked} blocked path(s) remain"
@@ -1266,19 +1271,19 @@ fn run_doctor(
     for plan in selection.plans {
         say!(
             "\x1b[1m{}\x1b[0m → {}  \x1b[2m{} · {}\x1b[0m",
-            plan.alpha_spec,
-            plan.beta_spec(),
+            plan.primary_spec,
+            plan.replica_spec(),
             plan.group,
             plan.mode_name()
         );
         let scanned = (|| -> Result<_> {
-            let (mut alpha, mut beta) =
+            let (mut primary, mut replica) =
                 autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
-            let alpha = alpha.scan().context("unable to scan alpha")?;
-            let beta = beta.scan().context("unable to scan beta")?;
-            Ok((alpha, beta))
+            let primary = primary.scan().context("unable to scan primary")?;
+            let replica = replica.scan().context("unable to scan replica")?;
+            Ok((primary, replica))
         })();
-        let (alpha, beta) = match scanned {
+        let (primary, replica) = match scanned {
             Ok(scanned) => scanned,
             Err(error) => {
                 say!(
@@ -1289,7 +1294,7 @@ fn run_doctor(
                 continue;
             }
         };
-        for (side, snapshot) in [("alpha", &alpha), ("beta", &beta)] {
+        for (side, snapshot) in [("primary", &primary), ("replica", &replica)] {
             match &snapshot.root {
                 None => say!("  {side}: \x1b[33mmissing\x1b[0m"),
                 Some(_) => {
@@ -1331,14 +1336,14 @@ fn run_doctor(
         let describe = |reconciliation: &autobahn::tree::Reconciliation| -> Vec<String> {
             let mut lines = Vec::new();
             for (change, direction) in reconciliation
-                .alpha_transitions
+                .primary_transitions
                 .iter()
-                .map(|change| (change, "to alpha"))
+                .map(|change| (change, "to primary"))
                 .chain(
                     reconciliation
-                        .beta_transitions
+                        .replica_transitions
                         .iter()
-                        .map(|change| (change, "to beta")),
+                        .map(|change| (change, "to replica")),
                 )
             {
                 let verb = match (&change.old, &change.new) {
@@ -1379,8 +1384,8 @@ fn run_doctor(
         if let Ok((baseline, _)) = &ancestor {
             let next = describe(&reconcile(
                 baseline.as_ref(),
-                alpha.root.as_ref(),
-                beta.root.as_ref(),
+                primary.root.as_ref(),
+                replica.root.as_ref(),
                 mode,
             ));
             if next.is_empty() {
@@ -1393,8 +1398,8 @@ fn run_doctor(
         // What a reset would do: the same, with no history at all.
         let reset = describe(&reconcile(
             None,
-            alpha.root.as_ref(),
-            beta.root.as_ref(),
+            primary.root.as_ref(),
+            replica.root.as_ref(),
             mode,
         ));
         if reset.is_empty() {
@@ -1413,7 +1418,12 @@ fn run_doctor(
         // Folders populated on one side and empty or gone on the other: the
         // shape of a vanished mount, and of an emptied tree.
         let mut lopsided = Vec::new();
-        lopsided_folders(alpha.root.as_ref(), beta.root.as_ref(), "", &mut lopsided);
+        lopsided_folders(
+            primary.root.as_ref(),
+            replica.root.as_ref(),
+            "",
+            &mut lopsided,
+        );
         if lopsided.is_empty() {
             say!("  folders full on one side and empty on the other: none");
         } else {
@@ -1433,8 +1443,8 @@ fn run_doctor(
 /// Walks two trees together, collecting the folders that hold eight or
 /// more entries on one side and are empty or absent on the other.
 fn lopsided_folders(
-    alpha: Option<&autobahn::tree::Node>,
-    beta: Option<&autobahn::tree::Node>,
+    primary: Option<&autobahn::tree::Node>,
+    replica: Option<&autobahn::tree::Node>,
     path: &str,
     found: &mut Vec<String>,
 ) {
@@ -1445,11 +1455,11 @@ fn lopsided_folders(
     let directory = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Directory(_)));
     let empty =
         |node: Option<&Node>| !directory(node) || node.is_some_and(|n| n.children().is_empty());
-    if !path.is_empty() && empty(alpha) != empty(beta) {
-        let (populated, side) = if empty(alpha) {
-            (beta, "beta")
+    if !path.is_empty() && empty(primary) != empty(replica) {
+        let (populated, side) = if empty(primary) {
+            (replica, "replica")
         } else {
-            (alpha, "alpha")
+            (primary, "primary")
         };
         let count = populated.map(below).unwrap_or(0);
         if count >= 8 {
@@ -1460,11 +1470,11 @@ fn lopsided_folders(
             return;
         }
     }
-    if !directory(alpha) || !directory(beta) {
+    if !directory(primary) || !directory(replica) {
         return;
     }
-    let left = alpha.map(Node::children).unwrap_or(&[]);
-    let right = beta.map(Node::children).unwrap_or(&[]);
+    let left = primary.map(Node::children).unwrap_or(&[]);
+    let right = replica.map(Node::children).unwrap_or(&[]);
     let mut names: Vec<&str> = left
         .iter()
         .chain(right.iter())
@@ -1479,8 +1489,8 @@ fn lopsided_folders(
             format!("{path}/{name}")
         };
         lopsided_folders(
-            alpha.and_then(|node| node.child(name)),
-            beta.and_then(|node| node.child(name)),
+            primary.and_then(|node| node.child(name)),
+            replica.and_then(|node| node.child(name)),
             &child_path,
             found,
         );
@@ -1567,7 +1577,7 @@ fn run_p2p(verb: P2pVerb) -> Result<()> {
             let mut writer = stream.try_clone().context("unable to clone the socket")?;
             std::io::Write::write_all(
                 &mut writer,
-                format!("{}\n", autobahn::p2p::ALPHA).as_bytes(),
+                format!("{}\n", autobahn::p2p::PRIMARY).as_bytes(),
             )
             .context("unable to greet the supervisor")?;
             let mut reader = stream;
@@ -1701,8 +1711,8 @@ fn run_sync_config(config: Option<PathBuf>, state_root: Option<PathBuf>) -> Resu
         match &outcome.result {
             Ok(digest) => {
                 let mut summary = format!(
-                    "{} change(s) to alpha, {} change(s) to beta",
-                    digest.alpha_transitions, digest.beta_transitions
+                    "{} change(s) to primary, {} change(s) to replica",
+                    digest.primary_transitions, digest.replica_transitions
                 );
                 if digest.conflicts > 0 {
                     summary.push_str(&format!(", {} conflict(s)", digest.conflicts));
@@ -1830,12 +1840,12 @@ fn run_watch(
             let stop = std::sync::atomic::AtomicBool::new(false);
             loop {
                 // P2P, when any group asks for it. This machine is the
-                // configured alpha of every such group (the configuration
+                // configured primary of every such group (the configuration
                 // says so), so it leads — unless its own lease file says a
-                // beta led while it was away.
+                // replica led while it was away.
                 let p2p = loaded.plans.iter().any(|plan| plan.p2p.is_some());
                 if p2p {
-                    autobahn::supervisor::peer::run_alpha(
+                    autobahn::supervisor::peer::run_primary(
                         &config_path,
                         &autobahn::p2p::directory()?,
                         &loaded.plans,
@@ -1978,12 +1988,12 @@ fn run_live_display(
 struct Selection<'a> {
     plans: Vec<&'a autobahn::config::SessionPlan>,
     /// Per plan, in the order of `plans`: the path's remainder below that
-    /// plan's alpha root, when the selector was a path deeper than the
+    /// plan's primary root, when the selector was a path deeper than the
     /// root itself. `Some("")` never occurs; the root itself yields `None`.
     /// Nested groups have different roots, so each keeps its own.
     relatives: Vec<Option<String>>,
     /// The remainder every selected plan agrees on — always, within one
-    /// group, which has one alpha. Plans in nested groups disagree, and
+    /// group, which has one primary. Plans in nested groups disagree, and
     /// then this is `None` rather than any one of them.
     relative: Option<String>,
 }
@@ -1992,7 +2002,7 @@ struct Selection<'a> {
 ///
 /// A selector that looks like a path — starting with `.`, `/`, or `~`, or
 /// naming something that exists — is resolved to its physical identity and
-/// matched against each group's alpha by *containment*, so a folder or
+/// matched against each group's primary by *containment*, so a folder or
 /// file inside a synchronized root selects the group covering it. That is
 /// what lets every command that takes a selector answer from wherever the
 /// caller happens to be standing, and what lets `diff` and `resolve` be
@@ -2021,10 +2031,10 @@ fn select<'a>(
         .iter()
         .filter_map(|plan| match (&folder, selector) {
             (Some(folder), _) => {
-                let alpha = std::path::Path::new(&plan.alpha_identity);
-                if folder == alpha {
+                let primary = std::path::Path::new(&plan.primary_identity);
+                if folder == primary {
                     Some((plan, None))
-                } else if let Ok(rest) = folder.strip_prefix(alpha) {
+                } else if let Ok(rest) = folder.strip_prefix(primary) {
                     Some((plan, Some(rest.to_string_lossy().into_owned())))
                 } else {
                     None
@@ -2036,7 +2046,7 @@ fn select<'a>(
         .collect();
     let before_host = selected.len();
     // A destination is named as status prints it: a host name, or for a
-    // local beta its path — which may be spelled with ~ or relatively, so
+    // local replica its path — which may be spelled with ~ or relatively, so
     // a path-looking name is compared by identity rather than text.
     let host_identity = host.and_then(|host| {
         let looks_like_path =
@@ -2057,8 +2067,8 @@ fn select<'a>(
             .filter(|(plan, _)| {
                 host.is_none_or(|host| {
                     plan.host == host
-                        || plan.beta_spec() == host
-                        || host_identity.as_deref() == Some(plan.beta_identity.as_str())
+                        || plan.replica_spec() == host
+                        || host_identity.as_deref() == Some(plan.replica_identity.as_str())
                 })
             })
             .unzip();
@@ -2228,14 +2238,14 @@ fn blocked_fix(
         // a command at all, since no quoting makes a newline safe to
         // paste.
         let (remote, root) = match side {
-            "beta" => {
-                let spec = plan.beta_spec();
+            "replica" => {
+                let spec = plan.replica_spec();
                 match spec.split_once(':') {
                     Some((destination, root)) => (Some(destination.to_owned()), root.to_owned()),
                     None => (None, spec),
                 }
             }
-            _ => (None, plan.alpha_spec.clone()),
+            _ => (None, plan.primary_spec.clone()),
         };
         let path = format!("{root}/{where_}");
         if path.chars().any(char::is_control) {
@@ -2279,8 +2289,8 @@ fn blocked_fix(
         // filesystem files as a single entry. Diffing was the old
         // suggestion and it is useless: the two copies are usually the
         // same bytes, and one of them is often a PDF.
-        let elsewhere = if side == "beta" {
-            "alpha".to_owned()
+        let elsewhere = if side == "replica" {
+            "primary".to_owned()
         } else {
             plan.host.clone()
         };
@@ -2433,11 +2443,11 @@ fn run_issues(
             current_group = Some(plan.group.as_str());
             say!(
                 "\x1b[1m{}\x1b[0m \x1b[2m{}\x1b[0m",
-                plan.alpha_spec,
+                plan.primary_spec,
                 plan.group
             );
         }
-        say!("  {}", plan.beta_spec());
+        say!("  {}", plan.replica_spec());
         total += selected.len() + blocked.len();
 
         if failed {
@@ -2507,15 +2517,15 @@ fn run_issues(
                         kind => kind.to_owned(),
                     }
                 };
-                say!("        alpha  {}", describe(&detail.alpha));
-                say!("        {:<6} {}", plan.host, describe(&detail.beta));
+                say!("        primary  {}", describe(&detail.primary));
+                say!("        {:<6} {}", plan.host, describe(&detail.replica));
                 // Why it is a conflict at all. Two sides that merely
                 // differ are reconciled; a side holding content that was
                 // never scanned is not overwritten, and that refusal is
                 // what the reader is actually looking at. Without it the
                 // listing shows a difference and no reason for the
                 // stalemate.
-                for (side, name) in [(&detail.alpha, "alpha"), (&detail.beta, &plan.host)] {
+                for (side, name) in [(&detail.primary, "primary"), (&detail.replica, &plan.host)] {
                     let Some(blocking) = &side.unsynchronizable else {
                         continue;
                     };
@@ -2544,7 +2554,7 @@ fn run_issues(
                 None => "<path>".to_owned(),
             };
             say!(
-                "      fix: autobahn resolve {} {where_} --keep alpha|{}|both",
+                "      fix: autobahn resolve {} {where_} --keep primary|{}|both",
                 pasteable(&plan.group),
                 plan.host
             );
@@ -2707,7 +2717,7 @@ fn confirmed(
         None => println!("about to resolve {what}:"),
     }
 
-    // The two sides by their roots. Naming them "alpha" and
+    // The two sides by their roots. Naming them "primary" and
     // "group@destination" told the reader neither which machine nor which
     // folder, and the second reads like an ssh target, which it is not.
     println!();
@@ -2732,7 +2742,7 @@ fn confirmed(
         }
     } else {
         for (plan, paths) in targets {
-            println!("  {}", plan.beta_spec());
+            println!("  {}", plan.replica_spec());
             for path in paths {
                 println!("    {}", display_safe(path));
             }
@@ -2769,11 +2779,12 @@ fn run_diff(
 
     for (index, plan) in selection.plans.iter().enumerate() {
         let path = relative_in(&selection, index, path.clone())?;
-        let (mut alpha, mut beta) = autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
-        let a = alpha.read_file(&path)?;
-        let b = beta.read_file(&path)?;
+        let (mut primary, mut replica) =
+            autobahn::supervisor::open_endpoints(plan, &state_root, &pool)?;
+        let a = primary.read_file(&path)?;
+        let b = replica.read_file(&path)?;
         if a == b {
-            println!("{}: identical on alpha and {}", path, plan.host);
+            println!("{}: identical on primary and {}", path, plan.host);
             continue;
         }
         // Both sides go into a private directory of their own under the
@@ -2789,12 +2800,12 @@ fn run_diff(
                 .with_context(|| format!("unable to write {}", file.display()))?;
             Ok(file)
         };
-        let left = write("alpha", &a)?;
+        let left = write("primary", &a)?;
         // Named by side, not by host: a host is not a file name.
-        let right = write("beta", &b)?;
+        let right = write("replica", &b)?;
         // The labels name the sides, not the scratch files.
         let status = std::process::Command::new("diff")
-            .args(["-u", "--label", &format!("alpha/{path}"), "--label"])
+            .args(["-u", "--label", &format!("primary/{path}"), "--label"])
             .arg(format!("{}/{path}", plan.host))
             .arg(&left)
             .arg(&right)
@@ -2809,7 +2820,7 @@ fn run_diff(
             println!(
                 "({} on {})",
                 if a.is_none() { "absent" } else { "present" },
-                if a.is_none() { "alpha" } else { &plan.host }
+                if a.is_none() { "primary" } else { &plan.host }
             );
         }
     }
@@ -2991,16 +3002,16 @@ fn run_resolve(
         bail!("resolve works within one group; the selector matched several");
     }
 
-    // The winner: alpha, both, or one of this group's destinations by the
+    // The winner: primary, both, or one of this group's destinations by the
     // name status prints for it.
     #[derive(Clone, Copy, PartialEq)]
     enum Winner {
-        Alpha,
+        Primary,
         Both,
-        Beta(usize),
+        Replica(usize),
     }
     let winner = match keep.as_str() {
-        "alpha" => Winner::Alpha,
+        "primary" => Winner::Primary,
         "both" => Winner::Both,
         other => {
             let all_in_group: Vec<&autobahn::config::SessionPlan> =
@@ -3008,14 +3019,14 @@ fn run_resolve(
             let matches: Vec<usize> = all_in_group
                 .iter()
                 .enumerate()
-                .filter(|(_, plan)| plan.host == other || plan.beta_spec() == other)
+                .filter(|(_, plan)| plan.host == other || plan.replica_spec() == other)
                 .map(|(index, _)| index)
                 .collect();
             match matches.as_slice() {
-                [index] => Winner::Beta(*index),
+                [index] => Winner::Replica(*index),
                 [] => bail!(
                     "--keep {other:?} names no destination of group '{group}'; expected \
-                     alpha, both, or one of: {}",
+                     primary, both, or one of: {}",
                     all_in_group
                         .iter()
                         .map(|plan| plan.host.as_str())
@@ -3117,15 +3128,15 @@ fn run_resolve(
     // Modes that cannot carry the kept version where it has to go. These
     // are refused before anything is read, since no path could succeed.
     match winner {
-        Winner::Beta(index)
+        Winner::Replica(index)
             if matches!(
                 group_plans[index].mode,
-                autobahn::tree::SyncMode::OneWaySafe | autobahn::tree::SyncMode::OneWayReplica
+                autobahn::tree::SyncMode::OneWaySafe | autobahn::tree::SyncMode::OneWayMirror
             ) =>
         {
             bail!(
                 "--keep {keep} cannot work in {mode}: that mode never carries {host}'s \
-                 content to alpha, so removing alpha's copy would not make it win. \
+                 content to primary, so removing primary's copy would not make it win. \
                  Nothing was changed",
                 mode = group_plans[index].mode_name(),
                 host = group_plans[index].host,
@@ -3134,10 +3145,10 @@ fn run_resolve(
         Winner::Both => {
             if let Some((plan, _)) = targets
                 .iter()
-                .find(|(plan, _)| plan.mode == autobahn::tree::SyncMode::OneWayReplica)
+                .find(|(plan, _)| plan.mode == autobahn::tree::SyncMode::OneWayMirror)
             {
                 bail!(
-                    "--keep both cannot work in {mode}: {host} is made identical to alpha, \
+                    "--keep both cannot work in {mode}: {host} is made identical to primary, \
                      so the copy moved aside there would be deleted. Nothing was changed",
                     mode = plan.mode_name(),
                     host = plan.host,
@@ -3148,35 +3159,35 @@ fn run_resolve(
     }
 
     // Who keeps their version, and who gets overwritten — named by their
-    // actual roots. "alpha" is the word `--keep` takes, and on its own it
+    // actual roots. "primary" is the word `--keep` takes, and on its own it
     // says nothing about which machine or folder that is.
-    let alpha_spec = group_plans
+    let primary_spec = group_plans
         .first()
-        .map(|plan| plan.alpha_spec.clone())
+        .map(|plan| plan.primary_spec.clone())
         .unwrap_or_default();
     let (kept, mut overwritten) = match winner {
-        Winner::Alpha | Winner::Both => (
-            format!("{alpha_spec}  (alpha)"),
+        Winner::Primary | Winner::Both => (
+            format!("{primary_spec}  (primary)"),
             targets
                 .iter()
-                .map(|(plan, _)| plan.beta_spec())
+                .map(|(plan, _)| plan.replica_spec())
                 .collect::<Vec<_>>(),
         ),
         // A destination's version reaches every other destination through
-        // alpha, so every one of them is overwritten where it differs.
-        Winner::Beta(index) => (
+        // primary, so every one of them is overwritten where it differs.
+        Winner::Replica(index) => (
             format!(
                 "{}  ({})",
-                group_plans[index].beta_spec(),
+                group_plans[index].replica_spec(),
                 group_plans[index].host
             ),
-            std::iter::once(format!("{alpha_spec}  (alpha)"))
+            std::iter::once(format!("{primary_spec}  (primary)"))
                 .chain(
                     group_plans
                         .iter()
                         .enumerate()
                         .filter(|(other, _)| *other != index)
-                        .map(|(_, plan)| plan.beta_spec()),
+                        .map(|(_, plan)| plan.replica_spec()),
                 )
                 .collect(),
         ),
@@ -3255,22 +3266,22 @@ fn run_resolve(
 
     // Which side of each session loses. The winner keeps its version
     // untouched; every other copy in the group is retired, including
-    // alpha's when a destination wins, since alpha is how the winning
+    // primary's when a destination wins, since primary is how the winning
     // content reaches the group's other destinations.
     //
-    // Alpha wins (or both sides are kept, in which case alpha's copy stays
-    // put and beta's moves aside): only each beta loses. A destination
-    // wins, so alpha loses — and alpha is retired *there*, on the winning
+    // Primary wins (or both sides are kept, in which case primary's copy stays
+    // put and replica's moves aside): only each replica loses. A destination
+    // wins, so primary loses — and primary is retired *there*, on the winning
     // session, for two reasons. Every session opens its own handle on
-    // alpha, so the retirement has to happen through exactly one of them;
+    // primary, so the retirement has to happen through exactly one of them;
     // and that is the session that will carry the winning content back to
-    // alpha, from which the group's other destinations then take it. Every
-    // other destination loses too: its copy and alpha's both go, the pair
+    // primary, from which the group's other destinations then take it. Every
+    // other destination loses too: its copy and primary's both go, the pair
     // reads as a deletion on both sides, which clears the ancestor entry,
     // and the winner's content then arrives as ordinary new content.
     struct Loser {
         index: usize,
-        alpha: bool,
+        primary: bool,
         side: String,
         root: Option<autobahn::tree::Node>,
         actions: Vec<(String, Action)>,
@@ -3301,20 +3312,20 @@ fn run_resolve(
     let mut losers: Vec<Loser> = Vec::new();
     let mut here_of: Vec<Vec<String>> = Vec::new();
     for (index, plan) in group_plans.iter().enumerate() {
-        let (alpha, side) = match winner {
-            Winner::Beta(w) if w == index => (true, "alpha".to_owned()),
+        let (primary, side) = match winner {
+            Winner::Replica(w) if w == index => (true, "primary".to_owned()),
             _ => (false, plan.host.clone()),
         };
-        // When alpha's version or both are kept, only paths that conflict
+        // When primary's version or both are kept, only paths that conflict
         // on this session are touched. When a destination's is, every side
-        // of the group is: alpha's copy must go for the winning content to
+        // of the group is: primary's copy must go for the winning content to
         // reach it, and every other destination's ancestor forgets the
         // path, so whatever it holds there that differs goes too, or the
         // winner would arrive there as a conflict.
         let here: Vec<String> = paths
             .iter()
             .filter(|path| {
-                matches!(winner, Winner::Beta(_))
+                matches!(winner, Winner::Replica(_))
                     || targets.iter().any(|(target, paths)| {
                         target.identifier() == plan.identifier() && paths.contains(*path)
                     })
@@ -3324,14 +3335,14 @@ fn run_resolve(
         if here.is_empty() {
             continue;
         }
-        let endpoint = match alpha {
+        let endpoint = match primary {
             true => &mut endpoints[index].0,
             false => &mut endpoints[index].1,
         };
         let root = scan(endpoint, &side)?;
         losers.push(Loser {
             index,
-            alpha,
+            primary,
             side,
             root,
             actions: Vec::new(),
@@ -3346,8 +3357,10 @@ fn run_resolve(
     // The winner is read too: what it holds is what the losers are
     // compared against, and what the next cycle must be seen to keep.
     let (winner_name, winner_root) = match winner {
-        Winner::Alpha | Winner::Both => ("alpha".to_owned(), scan(&mut endpoints[0].0, "alpha")?),
-        Winner::Beta(w) => {
+        Winner::Primary | Winner::Both => {
+            ("primary".to_owned(), scan(&mut endpoints[0].0, "primary")?)
+        }
+        Winner::Replica(w) => {
             let host = group_plans[w].host.clone();
             let root = scan(&mut endpoints[w].1, &host)?;
             (host, root)
@@ -3436,13 +3449,13 @@ fn run_resolve(
     }
 
     // The paths each session's ancestor forgets, as the retirements stand:
-    // every one a loser is retired at on that session's sides — alpha's
+    // every one a loser is retired at on that session's sides — primary's
     // copy is on every session's — with the name a copy is moved aside to.
     let forgets_of = |losers: &[Loser], index: usize| -> Vec<String> {
         let mut forget = std::collections::BTreeSet::new();
         for loser in losers
             .iter()
-            .filter(|loser| loser.alpha || loser.index == index)
+            .filter(|loser| loser.primary || loser.index == index)
         {
             for (path, action) in &loser.actions {
                 forget.insert(path.clone());
@@ -3490,15 +3503,15 @@ fn run_resolve(
             }
             changes
         };
-        let alpha_loser = losers.iter().find(|loser| loser.alpha);
+        let primary_loser = losers.iter().find(|loser| loser.primary);
         for (index, plan) in group_plans.iter().enumerate() {
-            let beta_loser = losers
+            let replica_loser = losers
                 .iter()
-                .find(|loser| loser.index == index && !loser.alpha);
+                .find(|loser| loser.index == index && !loser.primary);
             // Which paths this session's cycle decides.
             let decided: Vec<&String> = match winner {
-                Winner::Beta(_) => acted.iter().collect(),
-                _ => match beta_loser {
+                Winner::Replica(_) => acted.iter().collect(),
+                _ => match replica_loser {
                     Some(loser) => loser.actions.iter().map(|(path, _)| path).collect(),
                     None => continue,
                 },
@@ -3542,33 +3555,34 @@ fn run_resolve(
             };
 
             // Both sides as the retirement leaves them. When a destination
-            // wins, alpha's copy is gone on the winning session; on every
+            // wins, primary's copy is gone on the winning session; on every
             // other session the worst order is assumed, the one in which
-            // alpha already holds the winner's version when that session
+            // primary already holds the winner's version when that session
             // next runs.
-            let scanned = match (winner, beta_loser) {
-                (Winner::Beta(w), None) if w != index => {
+            let scanned = match (winner, replica_loser) {
+                (Winner::Replica(w), None) if w != index => {
                     Some(scan(&mut endpoints[index].1, &plan.host)?)
                 }
                 _ => None,
             };
             let simulated = (|| -> std::result::Result<_, String> {
-                let (alpha_after, beta_after) = match winner {
-                    Winner::Alpha | Winner::Both => {
-                        let loser = beta_loser.expect("an acting session has a losing beta");
+                let (primary_after, replica_after) = match winner {
+                    Winner::Primary | Winner::Both => {
+                        let loser = replica_loser.expect("an acting session has a losing replica");
                         (
                             winner_root.clone(),
                             apply(loser.root.as_ref(), &removals_of(loser))?,
                         )
                     }
-                    Winner::Beta(w) => {
-                        let alpha_loser = alpha_loser.expect("the winning session retires alpha");
-                        let alpha_after = if w == index {
-                            apply(alpha_loser.root.as_ref(), &removals_of(alpha_loser))?
+                    Winner::Replica(w) => {
+                        let primary_loser =
+                            primary_loser.expect("the winning session retires primary");
+                        let primary_after = if w == index {
+                            apply(primary_loser.root.as_ref(), &removals_of(primary_loser))?
                         } else {
-                            // Alpha as the winning session leaves it: holding
+                            // Primary as the winning session leaves it: holding
                             // the winner's version at every path decided,
-                            // whether or not alpha had a copy to retire.
+                            // whether or not primary had a copy to retire.
                             let replaced: Vec<Change> = decided
                                 .iter()
                                 .map(|path| Change {
@@ -3577,32 +3591,32 @@ fn run_resolve(
                                     new: node_at(winner_root.as_ref(), path).cloned(),
                                 })
                                 .collect();
-                            apply(alpha_loser.root.as_ref(), &replaced)?
+                            apply(primary_loser.root.as_ref(), &replaced)?
                         };
-                        let beta_after = if w == index {
+                        let replica_after = if w == index {
                             winner_root.clone()
-                        } else if let Some(loser) = beta_loser {
+                        } else if let Some(loser) = replica_loser {
                             apply(loser.root.as_ref(), &removals_of(loser))?
                         } else {
                             scanned.clone().flatten()
                         };
-                        (alpha_after, beta_after)
+                        (primary_after, replica_after)
                     }
                 };
                 let outcome = reconcile(
                     ancestor.as_ref(),
-                    alpha_after.as_ref(),
-                    beta_after.as_ref(),
+                    primary_after.as_ref(),
+                    replica_after.as_ref(),
                     plan.mode,
                 );
                 Ok((
-                    apply(alpha_after.as_ref(), &outcome.alpha_transitions)?,
-                    apply(beta_after.as_ref(), &outcome.beta_transitions)?,
+                    apply(primary_after.as_ref(), &outcome.primary_transitions)?,
+                    apply(replica_after.as_ref(), &outcome.replica_transitions)?,
                 ))
             })();
             // A tree the changes do not fit — a parent that is not there —
             // refuses the paths rather than guessing at them.
-            let (alpha_final, beta_final) = match simulated {
+            let (primary_final, replica_final) = match simulated {
                 Ok(trees) => trees,
                 Err(message) => {
                     for path in decided {
@@ -3619,19 +3633,19 @@ fn run_resolve(
 
             for path in decided {
                 let kept = node_at(winner_root.as_ref(), path);
-                let on_alpha = same(node_at(alpha_final.as_ref(), path), kept);
-                let on_beta = same(node_at(beta_final.as_ref(), path), kept);
+                let on_primary = same(node_at(primary_final.as_ref(), path), kept);
+                let on_replica = same(node_at(replica_final.as_ref(), path), kept);
                 // Where a destination wins, a session other than the
-                // winner's needs only to leave alpha's new version alone;
+                // winner's needs only to leave primary's new version alone;
                 // it reaches that destination on a later cycle.
                 let survives = match winner {
-                    Winner::Beta(w) if w != index => on_alpha,
-                    _ => on_alpha && on_beta,
+                    Winner::Replica(w) if w != index => on_primary,
+                    _ => on_primary && on_replica,
                 };
-                let aside_lost = beta_loser.and_then(|loser| {
+                let aside_lost = replica_loser.and_then(|loser| {
                     loser.actions.iter().find_map(|(at, action)| match action {
                         Action::Aside(aside, node) if at == path => {
-                            (!same(node_at(beta_final.as_ref(), aside), Some(node)))
+                            (!same(node_at(replica_final.as_ref(), aside), Some(node)))
                                 .then(|| aside.clone())
                         }
                         _ => None,
@@ -3686,7 +3700,7 @@ fn run_resolve(
     // the engine here rather than call `remove_dir_all`.
     //
     // One part per session: what its ancestor forgets, and which losing
-    // copies on its sides go. The part that retires alpha's copy goes last
+    // copies on its sides go. The part that retires primary's copy goes last
     // (see `ResolutionPart::last`).
     use autobahn::session::{Retirement, Settlement, Side};
     use autobahn::supervisor::control::PartState;
@@ -3703,11 +3717,11 @@ fn run_resolve(
         let mut retire = Vec::new();
         let mut last = false;
         for loser in losers.iter().filter(|loser| loser.index == index) {
-            let side = match loser.alpha {
-                true => Side::Alpha,
-                false => Side::Beta,
+            let side = match loser.primary {
+                true => Side::Primary,
+                false => Side::Replica,
             };
-            last |= loser.alpha && !loser.actions.is_empty();
+            last |= loser.primary && !loser.actions.is_empty();
             for (path, action) in &loser.actions {
                 let retirement = match action {
                     Action::Retire(expectation) => Retirement::Remove(expectation.clone()),
@@ -3748,11 +3762,15 @@ fn run_resolve(
                 }
                 settlement.spare(&refused_paths);
             }
-            let (alpha, beta) = endpoints[index].take().expect("one part per session");
+            let (primary, replica) = endpoints[index].take().expect("one part per session");
             let lock = locks[index].take().expect("one part per session");
-            let applied =
-                autobahn::session::Session::with_lock(alpha, beta, group_plans[index].mode, lock)
-                    .and_then(|mut session| session.apply_settlement(&settlement));
+            let applied = autobahn::session::Session::with_lock(
+                primary,
+                replica,
+                group_plans[index].mode,
+                lock,
+            )
+            .and_then(|mut session| session.apply_settlement(&settlement));
             let state = match applied {
                 Ok(outcome) => {
                     refused_paths.extend(outcome.refused.iter().map(|(path, _)| path.clone()));
@@ -3864,9 +3882,9 @@ fn run_resolve(
     // it once the parts are in.
     //
     // Only the sessions touched are flushed. One that agreed already has
-    // nothing to carry; and where alpha was retired, the winning session
-    // is among the touched, and its cycle's write to alpha wakes every
-    // other session over that alpha as any change there does.
+    // nothing to carry; and where primary was retired, the winning session
+    // is among the touched, and its cycle's write to primary wakes every
+    // other session over that primary as any change there does.
     let flushes: Vec<ControlRequest> = touched
         .iter()
         .map(|&index| {
@@ -4069,7 +4087,7 @@ fn run_availability(
         let led = configuration.groups_led_by(host);
         if !led.is_empty() {
             println!(
-                "  note: it is the alpha of {}, so {} group(s) {} with it",
+                "  note: it is the primary of {}, so {} group(s) {} with it",
                 led.join(", "),
                 led.len(),
                 match enable {
@@ -4211,7 +4229,7 @@ fn run_clean(
     let live_sessions: HashSet<String> = kept_plans.iter().map(|plan| plan.identifier()).collect();
     let live_locks: HashSet<String> = kept_plans
         .iter()
-        .map(|plan| EndpointPairLock::key(&plan.alpha_identity, &plan.beta_identity))
+        .map(|plan| EndpointPairLock::key(&plan.primary_identity, &plan.replica_identity))
         .collect();
     // A disabled group whose settings no longer validate cannot say which
     // sessions were its own, so nothing that might be is removed.
@@ -4422,7 +4440,7 @@ fn run_clean(
         use autobahn::config::EndpointTarget;
         let mut destinations: Vec<String> = plans
             .iter()
-            .flat_map(|plan| [&plan.alpha, &plan.beta])
+            .flat_map(|plan| [&plan.primary, &plan.replica])
             .filter_map(|target| match target {
                 // A session driven through a custom agent command does not
                 // use the installed-agent path at all, so there is nothing
@@ -4606,7 +4624,7 @@ fn show_recorded(state_root: &Path, error: &anyhow::Error) -> Result<()> {
     }
     for status in &statuses {
         let state = autobahn::supervisor::classify_state(status);
-        // Betas of one group on one host are told apart by their paths,
+        // Replicas of one group on one host are told apart by their paths,
         // as the configuration would label them.
         let shared = statuses
             .iter()
@@ -4614,7 +4632,7 @@ fn show_recorded(state_root: &Path, error: &anyhow::Error) -> Result<()> {
             .count()
             > 1;
         let display = match shared {
-            true => format!("{}@{} ({})", status.group, status.host, status.beta),
+            true => format!("{}@{} ({})", status.group, status.host, status.replica),
             false => format!("{}@{}", status.group, status.host),
         };
         match &status.error {
@@ -4893,7 +4911,7 @@ fn render_probed_status(
                 let _ = writeln!(
                     out,
                     "\x1b[1m{}\x1b[0m \x1b[2m{}{role}\x1b[0m  {line}",
-                    plan.alpha_spec, plan.group
+                    plan.primary_spec, plan.group
                 );
                 index = end;
                 continue;
@@ -4902,7 +4920,7 @@ fn render_probed_status(
         let _ = writeln!(
             out,
             "\x1b[1m{}\x1b[0m \x1b[2m{}{role}\x1b[0m",
-            plan.alpha_spec, plan.group
+            plan.primary_spec, plan.group
         );
 
         for (plan, status) in block {
@@ -4910,7 +4928,7 @@ fn render_probed_status(
                 .as_deref()
                 .and_then(|sessions| progress_of(sessions, &SessionKey::of(plan)));
             render_status_entry(
-                &plan.beta_spec(),
+                &plan.replica_spec(),
                 plan.mode_name(),
                 status.as_ref(),
                 progress,
@@ -5150,7 +5168,10 @@ fn render_working(progress: &ProgressSnapshot, out: &mut String) {
 
     match progress.phase {
         Phase::Scanning => {
-            for (name, side) in [("alpha", &progress.alpha), ("beta", &progress.beta)] {
+            for (name, side) in [
+                ("primary", &progress.primary),
+                ("replica", &progress.replica),
+            ] {
                 if !side.active {
                     continue;
                 }
@@ -5302,26 +5323,26 @@ fn format_age(updated_at: u64) -> String {
 fn print_report(report: &CycleReport) {
     if report.changed() {
         println!(
-            "synchronized: {} change(s) to alpha, {} change(s) to beta",
-            report.alpha_transitions, report.beta_transitions
+            "synchronized: {} change(s) to primary, {} change(s) to replica",
+            report.primary_transitions, report.replica_transitions
         );
     }
     for conflict in &report.conflicts {
         eprintln!("conflict at {:?} (left unresolved)", conflict.root);
     }
     for problem in report
-        .alpha_scan_problems
+        .primary_scan_problems
         .iter()
-        .chain(&report.alpha_transition_problems)
+        .chain(&report.primary_transition_problems)
     {
-        eprintln!("{}", problem_line("alpha", problem));
+        eprintln!("{}", problem_line("primary", problem));
     }
     for problem in report
-        .beta_scan_problems
+        .replica_scan_problems
         .iter()
-        .chain(&report.beta_transition_problems)
+        .chain(&report.replica_transition_problems)
     {
-        eprintln!("{}", problem_line("beta", problem));
+        eprintln!("{}", problem_line("replica", problem));
     }
 }
 
@@ -5393,12 +5414,16 @@ mod tests {
     #[test]
     fn resolve_flushes_only_the_sessions_it_touched() {
         let keep = tempfile::tempdir().expect("tempdir");
-        let (alpha, differs, agrees) = (
-            keep.path().join("alpha"),
+        let (primary, differs, agrees) = (
+            keep.path().join("primary"),
             keep.path().join("differs"),
             keep.path().join("agrees"),
         );
-        for (root, content) in [(&alpha, "alpha"), (&differs, "beta"), (&agrees, "alpha")] {
+        for (root, content) in [
+            (&primary, "primary"),
+            (&differs, "replica"),
+            (&agrees, "primary"),
+        ] {
             std::fs::create_dir_all(root).unwrap();
             std::fs::write(root.join("file.txt"), content).unwrap();
         }
@@ -5406,8 +5431,8 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
-                alpha.display(),
+                "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\", \"{}\"]\n",
+                primary.display(),
                 differs.display(),
                 agrees.display()
             ),
@@ -5419,7 +5444,7 @@ mod tests {
             .unwrap();
         let touched = plans
             .iter()
-            .find(|plan| plan.beta_spec() == differs.display().to_string())
+            .find(|plan| plan.replica_spec() == differs.display().to_string())
             .expect("the differing destination's plan");
 
         super::RESOLVE_FLUSHES.with(|sent| sent.borrow_mut().clear());
@@ -5428,7 +5453,7 @@ mod tests {
             Some(keep.path().join("state")),
             "g".into(),
             vec!["file.txt".into()],
-            "alpha".into(),
+            "primary".into(),
             false,
             true,
             None,
@@ -5436,7 +5461,7 @@ mod tests {
         .expect("resolves");
         assert_eq!(
             std::fs::read_to_string(agrees.join("file.txt")).unwrap(),
-            "alpha",
+            "primary",
             "the agreeing destination was left alone"
         );
         assert!(
@@ -5472,8 +5497,8 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "[groups.outer]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
-                 [groups.inner]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                "[groups.outer]\nmode = \"one-way-primary\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n\n\
+                 [groups.inner]\nmode = \"one-way-primary\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
                 outer.display(),
                 keep.path().join("b1").display(),
                 inner.display(),
@@ -5508,7 +5533,7 @@ mod tests {
         let good = keep.path().join("good.toml");
         std::fs::write(
             &good,
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\nbetas = [\"/tmp/b\"]\n",
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"/tmp/a\"\nreplicas = [\"/tmp/b\"]\n",
         )
         .unwrap();
         assert!(super::check_startable(Some(good)).is_ok());
@@ -5516,7 +5541,7 @@ mod tests {
         let bad = keep.path().join("bad.toml");
         std::fs::write(
             &bad,
-            "[groups.g]\nmode = \"sideways\"\nalpha = \"/tmp/a\"\n",
+            "[groups.g]\nmode = \"sideways\"\nprimary = \"/tmp/a\"\n",
         )
         .unwrap();
         let error = super::check_startable(Some(bad)).expect_err("a bad configuration is refused");
@@ -5625,8 +5650,8 @@ mod tests {
             phase,
             seconds,
             working_seconds: seconds,
-            alpha: side(),
-            beta: side(),
+            primary: side(),
+            replica: side(),
             staged: 0,
             staged_total: 0,
             staged_bytes: 0,
@@ -5640,7 +5665,7 @@ mod tests {
         let shows = |progress: &ProgressSnapshot, live: bool| {
             let mut out = String::new();
             render_status_entry(
-                "beta",
+                "replica",
                 "two-way-conflict",
                 None,
                 Some(progress),
@@ -5664,11 +5689,11 @@ mod tests {
         assert!(!shows(&snapshot(Phase::Waiting, 600), true));
     }
 
-    /// Two betas on one host in one group share a group and a host, so
+    /// Two replicas on one host in one group share a group and a host, so
     /// progress keyed by those showed each the other's. Keyed by the
     /// session, each shows its own.
     #[test]
-    fn two_betas_on_one_host_show_their_own_progress() {
+    fn two_replicas_on_one_host_show_their_own_progress() {
         use autobahn::progress::{Phase, ProgressSnapshot};
         use autobahn::supervisor::control::{progress_of, SessionKey, SessionProgress};
 
@@ -5676,8 +5701,8 @@ mod tests {
         let config = keep.path().join("config.toml");
         std::fs::write(
             &config,
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\n\
-             betas = [\"host:/tree\", \"host:/other\"]\n",
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"/tmp/a\"\n\
+             replicas = [\"host:/tree\", \"host:/other\"]\n",
         )
         .unwrap();
         let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
@@ -5688,8 +5713,8 @@ mod tests {
             phase,
             seconds: 0,
             working_seconds: 0,
-            alpha: side(),
-            beta: side(),
+            primary: side(),
+            replica: side(),
             staged: 0,
             staged_total: 0,
             staged_bytes: 0,
@@ -5719,19 +5744,19 @@ mod tests {
         assert_eq!(phase(1), Phase::Paused);
     }
 
-    /// Two betas on one host in one group are two lines in `status`, and
+    /// Two replicas on one host in one group are two lines in `status`, and
     /// two sessions in its report: each keyed apart, and each named by its
     /// path where the host alone would name both.
     #[test]
-    fn two_betas_on_one_host_show_their_own_status_lines() {
+    fn two_replicas_on_one_host_show_their_own_status_lines() {
         use autobahn::supervisor::control::SessionKey;
 
         let keep = tempfile::tempdir().expect("tempdir");
         let config = keep.path().join("config.toml");
         std::fs::write(
             &config,
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\n\
-             betas = [\"host:/tree\", \"host:/other\"]\n",
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"/tmp/a\"\n\
+             replicas = [\"host:/tree\", \"host:/other\"]\n",
         )
         .unwrap();
         let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
@@ -5767,8 +5792,8 @@ mod tests {
         let config = keep.path().join("config.toml");
         std::fs::write(
             &config,
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"/tmp/a\"\n\
-             betas = [\"host:/tree\"]\n",
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"/tmp/a\"\n\
+             replicas = [\"host:/tree\"]\n",
         )
         .unwrap();
         let plans = super::load_config(Some(config)).unwrap().plans().unwrap();
@@ -5800,8 +5825,8 @@ mod tests {
             message: "unable to open evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jname".into(),
             disagreement: false,
         };
-        let line = super::problem_line("beta", &problem);
-        assert!(line.starts_with("beta problem at \"a\": unable to open evil"));
+        let line = super::problem_line("replica", &problem);
+        assert!(line.starts_with("replica problem at \"a\": unable to open evil"));
         assert!(!line.chars().any(char::is_control), "{line:?}");
     }
 
@@ -5922,19 +5947,19 @@ mod tests {
     /// they share, and that is what turns twenty lines into one.
     #[test]
     fn blocked_entries_are_read_back_into_side_path_and_cause() {
-        let entry = "beta azure/backend/.ruff_cache/0.9.10/104972: unable to read file: \
+        let entry = "replica azure/backend/.ruff_cache/0.9.10/104972: unable to read file: \
                      unable to open /home/ubuntu/Workspace/azure/backend/.ruff_cache/0.9.10/104972: \
                      Permission denied (os error 13)";
         let (side, path, cause) = autobahn::blocked::parts(entry);
-        assert_eq!(side, "beta");
+        assert_eq!(side, "replica");
         assert_eq!(path, "azure/backend/.ruff_cache/0.9.10/104972");
         assert_eq!(cause, "Permission denied (os error 13)");
         assert_eq!(autobahn::blocked::path(entry), Some(path));
 
         // A message with no wrapping context is its own cause.
         let (side, path, cause) =
-            autobahn::blocked::parts("alpha notes.txt: refusing to create over existing content");
-        assert_eq!((side, path), ("alpha", "notes.txt"));
+            autobahn::blocked::parts("primary notes.txt: refusing to create over existing content");
+        assert_eq!((side, path), ("primary", "notes.txt"));
         assert_eq!(cause, "refusing to create over existing content");
     }
 
@@ -5968,10 +5993,10 @@ mod tests {
         );
     }
 
-    /// A plan whose one beta is `beta`, for the fix-command tests.
-    fn fix_plan(beta: &str) -> autobahn::config::SessionPlan {
+    /// A plan whose one replica is `replica`, for the fix-command tests.
+    fn fix_plan(replica: &str) -> autobahn::config::SessionPlan {
         let text = format!(
-            "[groups.g]\nalpha = \"/tmp/a\"\nmode = \"two-way-conflict\"\nbetas = [\"{beta}\"]\n"
+            "[groups.g]\nprimary = \"/tmp/a\"\nmode = \"two-way-conflict\"\nreplicas = [\"{replica}\"]\n"
         );
         toml::from_str::<autobahn::config::Config>(&text)
             .expect("parses")
@@ -6028,9 +6053,9 @@ mod tests {
     #[test]
     fn a_fix_command_quotes_every_name_it_holds() {
         let prefix = "a dir/it's;$(touch pwned)/`touch pwned`";
-        for beta in ["u@h:/tmp/b", "/tmp/b"] {
-            let plan = fix_plan(beta);
-            for side in ["alpha", "beta"] {
+        for replica in ["u@h:/tmp/b", "/tmp/b"] {
+            let plan = fix_plan(replica);
+            for side in ["primary", "replica"] {
                 let fixes = blocked_fix(side, "Permission denied (os error 13)", prefix, &plan);
                 let command = &fixes[0];
                 let parsed = std::process::Command::new("sh")
@@ -6041,8 +6066,8 @@ mod tests {
 
                 let dir = tempfile::tempdir().unwrap();
                 let args = run_stubbed(dir.path(), command);
-                let root = match (side, beta) {
-                    ("beta", _) => "/tmp/b",
+                let root = match (side, replica) {
+                    ("replica", _) => "/tmp/b",
                     _ => "/tmp/a",
                 };
                 assert_eq!(
@@ -6061,7 +6086,7 @@ mod tests {
     #[test]
     fn a_remote_fix_names_the_remote_user_not_the_host() {
         let fixes = blocked_fix(
-            "beta",
+            "replica",
             "Permission denied (os error 13)",
             "x",
             &fix_plan("h:/tmp/b"),
@@ -6085,12 +6110,12 @@ mod tests {
     /// paste at all: it is shown escaped, with a word to do it by hand.
     #[test]
     fn a_strange_name_gets_a_manual_fix_not_a_command() {
-        for beta in ["u@h:/tmp/b", "/tmp/b"] {
+        for replica in ["u@h:/tmp/b", "/tmp/b"] {
             let fixes = blocked_fix(
-                "beta",
+                "replica",
                 "Permission denied (os error 13)",
                 "evil\nrm -rf ~\x1b[2J",
-                &fix_plan(beta),
+                &fix_plan(replica),
             );
             assert!(fixes[0].starts_with("fix permissions on "), "{fixes:?}");
             assert!(fixes[0].ends_with(" by hand"), "{fixes:?}");
@@ -6107,7 +6132,7 @@ mod tests {
     #[test]
     fn a_fix_for_a_home_relative_root_expands_the_home() {
         let fixes = blocked_fix(
-            "beta",
+            "replica",
             "Permission denied (os error 13)",
             "x",
             &fix_plan("u@h:~/mirror"),
@@ -6133,7 +6158,7 @@ mod tests {
             "--all".to_owned(),
             "-k".to_owned(),
             "-y".to_owned(),
-            "--keep=alpha".to_owned(),
+            "--keep=primary".to_owned(),
         ];
         let command = autobahn::invocation::resolve_command("-g", "b1", &paths);
         let command = autobahn::invocation::with_options(
@@ -6186,7 +6211,7 @@ mod tests {
     fn an_ignore_is_suggested_only_for_a_generated_directory() {
         let plan = |group: &str| -> autobahn::config::SessionPlan {
             let text = format!(
-                "[groups.{group}]\nalpha = \"/tmp/a\"\nmode = \"two-way-conflict\"\nbetas = [\"u@h:/tmp/b\"]\n"
+                "[groups.{group}]\nprimary = \"/tmp/a\"\nmode = \"two-way-conflict\"\nreplicas = [\"u@h:/tmp/b\"]\n"
             );
             toml::from_str::<autobahn::config::Config>(&text)
                 .expect("parses")
@@ -6199,7 +6224,7 @@ mod tests {
         // The last segment is a version. The generated directory is the
         // hidden one above it, and that is what may be ignored.
         let fixes = blocked_fix(
-            "beta",
+            "replica",
             "Permission denied (os error 13)",
             "azure/backend/.ruff_cache/0.9.10",
             &plan,
@@ -6210,7 +6235,7 @@ mod tests {
         // Nothing hidden in the path, so no ignore is offered: ignoring a
         // real folder is worse than fixing its ownership.
         let fixes = blocked_fix(
-            "beta",
+            "replica",
             "Permission denied (os error 13)",
             "arcturus/frontend/static",
             &plan,
@@ -6227,17 +6252,17 @@ mod tests {
     /// way have to group as one problem.
     #[test]
     fn a_name_collision_reads_as_a_collision() {
-        let entry = "alpha recruiting/candidates/Jorge Suárez resume.pdf: \
+        let entry = "primary recruiting/candidates/Jorge Suárez resume.pdf: \
                      \"Jorge Sua\u{301}rez resume.pdf\" is already here under one entry: \
                      unicode collision";
         let (side, path, cause) = autobahn::blocked::parts(entry);
-        assert_eq!(side, "alpha");
+        assert_eq!(side, "primary");
         assert_eq!(path, "recruiting/candidates/Jorge Suárez resume.pdf");
         assert_eq!(cause, "unicode collision", "the heading names the rule");
 
         // Two files colliding the same way group together, however
         // different the names in front of the cause.
-        let other = "alpha recruiting/candidates/Ana Muñoz cv.pdf: \
+        let other = "primary recruiting/candidates/Ana Muñoz cv.pdf: \
                      \"Ana Mun\u{303}oz cv.pdf\" is already here under one entry: \
                      unicode collision";
         assert_eq!(autobahn::blocked::parts(other).2, cause);
@@ -6245,21 +6270,21 @@ mod tests {
         // And the fix names what to do about it rather than offering a
         // diff, which for a PDF is no help at all.
         let plan = toml::from_str::<autobahn::config::Config>(
-            "[groups.g]\nalpha = \"/tmp/a\"\nmode = \"two-way-conflict\"\nbetas = [\"u@h:/tmp/b\"]\n",
+            "[groups.g]\nprimary = \"/tmp/a\"\nmode = \"two-way-conflict\"\nreplicas = [\"u@h:/tmp/b\"]\n",
         )
         .expect("parses")
         .plans()
         .expect("plans")
         .remove(0);
-        let fixes = blocked_fix("alpha", cause, "recruiting/candidates", &plan);
+        let fixes = blocked_fix("primary", cause, "recruiting/candidates", &plan);
         assert_eq!(fixes.len(), 1);
         assert!(fixes[0].contains("holds this name twice"), "{fixes:?}");
         assert!(fixes[0].contains("spelled two ways"), "{fixes:?}");
         assert!(!fixes[0].contains("diff"), "{fixes:?}");
 
         // Casing says casing.
-        let fixes = blocked_fix("beta", "casing collision", "docs", &plan);
-        assert!(fixes[0].starts_with("alpha holds"), "{fixes:?}");
+        let fixes = blocked_fix("replica", "casing collision", "docs", &plan);
+        assert!(fixes[0].starts_with("primary holds"), "{fixes:?}");
         assert!(fixes[0].contains("cased two ways"), "{fixes:?}");
     }
 }

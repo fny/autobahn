@@ -186,13 +186,13 @@ Identical-root sharing relies on generations and lease validation, rather than e
 
 ## I7. Reconciliation never destroys silently
 
-**Statement.** Two-way conflict mode reports competing non-deletion changes and restores an edit against a deletion. One-way conflict mode preserves beta-only changes without copying them to alpha.
+**Statement.** Two-way conflict mode reports competing non-deletion changes and restores an edit against a deletion. One-way conflict mode preserves replica-only changes without copying them to primary.
 
-Alpha-winning policies intentionally discard some competing changes. See [Modes](../modes.md).
+Primary-winning policies intentionally discard some competing changes. See [Modes](../modes.md).
 
 Exactly one empty or absent root causes a halt if the ancestor has at least two entries. Emptiness counts synchronizable content, so excluded entries do not prevent this guard.
 
-A missing alpha and a vanished recorded mount have separate safeguards.
+A missing primary and a vanished recorded mount have separate safeguards.
 
 `guard_dir_deletes_over = N` protects directories with at least N recursive ancestor entries. Emptying creates a conflict. Two-way modes also restore a missing protected directory from an unchanged peer.
 
@@ -208,8 +208,8 @@ One-way modes retain their direction for missing directories. The optional guard
 - `mutual_exclusion_preserves_the_ancestor`
 - `concurrent_divergent_edits_conflict_in_safe_mode_and_resolve_in_resolved_mode`
 - `deletion_versus_modification_repropagates_content`
-- `one_way_safe_preserves_beta_creations`
-- `one_way_modes_never_touch_alpha`
+- `one_way_safe_preserves_replica_creations`
+- `one_way_modes_never_touch_primary`
 - `content_leaving_tracked_scope_never_reads_as_deletion`
 - `emptied_root_detection`
 - `a_root_emptied_down_to_an_ignored_entry_halts_in_every_mode`
@@ -306,7 +306,7 @@ Observer caches and status files have no content checksum against torn-sector co
 
 **Enforcement.** Unless stated otherwise, these checks live in `src/endpoint/local.rs`.
 
-`Initialize::validate` in `src/protocol.rs` requires a 32-character lowercase hex session and side `alpha` or `beta`. It runs before `create_endpoint` in `src/transport/mod.rs` touches the filesystem. `ancestor_copy_path` in `src/p2p.rs` repeats the session check.
+`Initialize::validate` in `src/protocol.rs` requires a 32-character lowercase hex session and side `primary` or `replica`. It runs before `create_endpoint` in `src/transport/mod.rs` touches the filesystem. `ancestor_copy_path` in `src/p2p.rs` repeats the session check.
 
 `validate_path` and `validate_name` reject empty, `.`, `..`, separator, NUL, and reserved temporary-space components.
 
@@ -352,7 +352,7 @@ Observer caches and status files have no content checksum against torn-sector co
 
 Raw symbolic links synchronize as data, including targets outside the root. Autobahn does not follow them during these operations, but other tools can.
 
-P2P followers apply their own `host.toml` restrictions and ignore pushed `agent_command`. Attached alpha serves only its configured sessions. Without restricted keys, peer SSH credentials still provide shell access. See [P2P](../p2p.md).
+P2P followers apply their own `host.toml` restrictions and ignore pushed `agent_command`. Attached primary serves only its configured sessions. Without restricted keys, peer SSH credentials still provide shell access. See [P2P](../p2p.md).
 
 ## The threat-model note
 
@@ -385,4 +385,4 @@ Extend existing harness operation sets where possible.
 
 ## The specification
 
-`spec/Autobahn.tla` models reconciliation across one alpha and multiple betas. TLC checks bounded states, and `tests/spec_replay.rs` compares implementation behavior. See [Specification guide](../../spec/README.md).
+`spec/Autobahn.tla` models reconciliation across one primary and multiple replicas. TLC checks bounded states, and `tests/spec_replay.rs` compares implementation behavior. See [Specification guide](../../spec/README.md).

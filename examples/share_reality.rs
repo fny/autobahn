@@ -2,9 +2,9 @@
 //!
 //! `cycle_cost.rs` reported that 2,499 of 2,501 directories are
 //! pointer-identical after a one-file edit, but it passed one local scan as
-//! both the ancestor and beta. That measures how well an incremental rescan
+//! both the ancestor and replica. That measures how well an incremental rescan
 //! preserves storage against the *previous scan* — the best case — and says
-//! nothing about a session whose ancestor came off disk and whose beta came
+//! nothing about a session whose ancestor came off disk and whose replica came
 //! off the wire, both of which allocate fresh.
 //!
 //! This measures the three relationships a real reconcile compares.
@@ -79,15 +79,15 @@ fn main() {
         SyncMode::TwoWaySafe,
     );
     // The ancestor advances from *achieved* transition results, so a
-    // successful beta transition is what actually reaches it.
-    let next = apply(reloaded.as_ref(), &result.beta_transitions).expect("ancestor applies");
+    // successful replica transition is what actually reaches it.
+    let next = apply(reloaded.as_ref(), &result.replica_transitions).expect("ancestor applies");
     println!();
     report(
         "previous ancestor vs apply()-derived next ancestor",
         reloaded.as_ref(),
         next.as_ref(),
     );
-    println!("  ({} change(s) applied)", result.beta_transitions.len());
+    println!("  ({} change(s) applied)", result.replica_transitions.len());
 
     let _ = std::fs::remove_dir_all(&staging);
 }

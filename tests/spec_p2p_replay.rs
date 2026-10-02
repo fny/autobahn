@@ -1,7 +1,7 @@
 //! The implementation's fence, held to `spec/P2P.tla`.
 //!
 //! The p2p spec's safety rests on one decision — whether a host admits
-//! the lease a controller presents — and on the order betas take over in.
+//! the lease a controller presents — and on the order replicas take over in.
 //! This file plays the spec's leadership game with the real decision: every
 //! host is a directory with a real lease file, presented leases go through
 //! `admit_lease` exactly as the agent's `Request::Lease` handler does,
@@ -26,24 +26,24 @@ const PATHS: [&str; 2] = ["p", "q"];
 const VALUES: [&str; 2] = ["v1", "v2"];
 const TTL: Duration = Duration::from_secs(30);
 
-/// A host of the star: the alpha, or beta number i (0-based).
+/// A host of the star: the primary, or replica number i (0-based).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Host {
-    Alpha,
-    Beta(usize),
+    Primary,
+    Replica(usize),
 }
 
 impl Host {
     fn name(self) -> String {
         match self {
-            Host::Alpha => "alpha".into(),
-            Host::Beta(i) => format!("b{}", i + 1),
+            Host::Primary => "primary".into(),
+            Host::Replica(i) => format!("b{}", i + 1),
         }
     }
     fn tla(self) -> String {
         match self {
-            Host::Alpha => "\"alpha\"".into(),
-            Host::Beta(i) => format!("b{}", i + 1),
+            Host::Primary => "\"primary\"".into(),
+            Host::Replica(i) => format!("b{}", i + 1),
         }
     }
 }
@@ -53,14 +53,14 @@ type Tree = BTreeMap<&'static str, &'static str>;
 /// The game's state: the spec's variables, with every host's lease on disk.
 struct Game {
     mode: SyncMode,
-    betas: usize,
+    replicas: usize,
     dirs: Vec<PathBuf>,
     tree: Vec<Tree>,
     up: Vec<bool>,
     leading: Vec<bool>,
     myterm: Vec<u64>,
-    /// (alpha, b) session ancestors: what each host holds as leader (`own`)
-    /// and as a replica (`copy`), each with a generation.
+    /// (primary, b) session ancestors: what each host holds as leader (`own`)
+    /// and as a copy (`copy`), each with a generation.
     own: Vec<Vec<(Tree, u64)>>,
     copy: Vec<Vec<(Tree, u64)>>,
     /// Whether each host's copy was written after its own store: the spec's
@@ -68,7 +68,7 @@ struct Game {
     later: Vec<Vec<bool>>,
     /// What a host held where a copy it adopted disagreed.
     disputed: BTreeSet<(Host, &'static str, &'static str)>,
-    /// A leading beta's ancestors with the other betas.
+    /// A leading replica's ancestors with the other replicas.
     bb: Vec<Vec<Tree>>,
     conflicts: Vec<Vec<BTreeSet<&'static str>>>,
     writers: Vec<BTreeSet<(String, u64)>>,
@@ -129,8 +129,8 @@ fn from_node(node: Option<&Node>) -> Tree {
 }
 
 impl Game {
-    fn new(mode: SyncMode, betas: usize, keep: &tempfile::TempDir) -> Game {
-        let hosts = betas + 1;
+    fn new(mode: SyncMode, replicas: usize, keep: &tempfile::TempDir) -> Game {
+        let hosts = replicas + 1;
         let dirs: Vec<PathBuf> = (0..hosts)
             .map(|h| {
                 let dir = keep.path().join(format!("host{h}"));
@@ -140,17 +140,17 @@ impl Game {
             .collect();
         let mut game = Game {
             mode,
-            betas,
+            replicas,
             dirs,
             tree: vec![Tree::new(); hosts],
             up: vec![true; hosts],
             leading: (0..hosts).map(|h| h == 0).collect(),
             myterm: (0..hosts).map(|h| if h == 0 { 1 } else { 0 }).collect(),
-            own: vec![vec![(Tree::new(), 0); betas]; hosts],
-            copy: vec![vec![(Tree::new(), 0); betas]; hosts],
-            later: vec![vec![false; betas]; hosts],
+            own: vec![vec![(Tree::new(), 0); replicas]; hosts],
+            copy: vec![vec![(Tree::new(), 0); replicas]; hosts],
+            later: vec![vec![false; replicas]; hosts],
             disputed: BTreeSet::new(),
-            bb: vec![vec![Tree::new(); betas]; betas],
+            bb: vec![vec![Tree::new(); replicas]; replicas],
             conflicts: vec![vec![BTreeSet::new(); hosts]; hosts],
             writers: vec![BTreeSet::new(); hosts],
             written: BTreeSet::new(),
@@ -163,10 +163,10 @@ impl Game {
             trace: Vec::new(),
             steps: Vec::new(),
         };
-        // Every host starts under the alpha's lease at term 1, as the
+        // Every host starts under the primary's lease at term 1, as the
         // leader's first cycles leave it.
         for h in 0..hosts {
-            game.put_lease(h, &game.lease_of(Host::Alpha, 1));
+            game.put_lease(h, &game.lease_of(Host::Primary, 1));
         }
         game.record();
         game
@@ -174,15 +174,15 @@ impl Game {
 
     fn index(host: Host) -> usize {
         match host {
-            Host::Alpha => 0,
-            Host::Beta(i) => i + 1,
+            Host::Primary => 0,
+            Host::Replica(i) => i + 1,
         }
     }
     fn host(index: usize) -> Host {
         if index == 0 {
-            Host::Alpha
+            Host::Primary
         } else {
-            Host::Beta(index - 1)
+            Host::Replica(index - 1)
         }
     }
 
@@ -204,11 +204,11 @@ impl Game {
     }
     fn leader_of(&self, h: usize) -> Host {
         let lease = self.lease(h);
-        if lease.leader == "alpha" {
-            Host::Alpha
+        if lease.leader == "primary" {
+            Host::Primary
         } else {
             let i: usize = lease.leader[1..].parse().unwrap();
-            Host::Beta(i - 1)
+            Host::Replica(i - 1)
         }
     }
 
@@ -283,11 +283,11 @@ impl Game {
     // ---------------------------------------------------------- leadership
 
     /// The spec's `Takeover`, with the real staleness test on a clock the
-    /// game advances: a beta acts when the lease it holds is stale and
-    /// every beta ahead of it in the failover order is down or is the
+    /// game advances: a replica acts when the lease it holds is stale and
+    /// every replica ahead of it in the failover order is down or is the
     /// leader it is replacing.
     fn takeover(&mut self, i: usize) -> bool {
-        let h = Self::index(Host::Beta(i));
+        let h = Self::index(Host::Replica(i));
         if !self.up[h] || self.leading[h] {
             return false;
         }
@@ -297,57 +297,57 @@ impl Game {
         }
         let leader = self.leader_of(h);
         for e in 0..i {
-            let eh = Self::index(Host::Beta(e));
-            if self.up[eh] && Host::Beta(e) != leader {
+            let eh = Self::index(Host::Replica(e));
+            if self.up[eh] && Host::Replica(e) != leader {
                 return false;
             }
         }
         let term = held.term + 1;
         self.myterm[h] = term;
-        let lease = self.lease_of(Host::Beta(i), term);
+        let lease = self.lease_of(Host::Replica(i), term);
         self.put_lease(h, &lease);
         self.leading[h] = true;
         self.adopt(h, i);
-        self.bb[i] = vec![Tree::new(); self.betas];
+        self.bb[i] = vec![Tree::new(); self.replicas];
         self.changes += 1;
         self.steps.push(format!("takeover b{} term {term}", i + 1));
         true
     }
 
-    /// The spec's `Handoff`: the alpha, following a leading beta it is
+    /// The spec's `Handoff`: the primary, following a leading replica it is
     /// level with, takes the lead back at the next term.
     fn handoff(&mut self) -> bool {
         if !self.up[0] || self.leading[0] {
             return false;
         }
         let leader = self.leader_of(0);
-        if !matches!(leader, Host::Beta(_)) {
+        if !matches!(leader, Host::Replica(_)) {
             return false;
         }
         let lh = Self::index(leader);
         if !self.up[lh] || !self.leading[lh] || self.tree[0] != self.tree[lh] {
             return false;
         }
-        // Session::level_the_copy: the handback waits for the alpha's copy
+        // Session::level_the_copy: the handback waits for the primary's copy
         // to be level with the leader's ancestor.
         if self.copy[0][lh - 1] != self.own[lh][lh - 1] {
             return false;
         }
         let term = self.lease(0).term + 1;
         self.myterm[0] = term;
-        let lease = self.lease_of(Host::Alpha, term);
+        let lease = self.lease_of(Host::Primary, term);
         self.put_lease(0, &lease);
         self.leading[0] = true;
-        for b in 0..self.betas {
+        for b in 0..self.replicas {
             self.adopt(0, b);
         }
         self.changes += 1;
-        self.steps.push(format!("handoff to alpha term {term}"));
+        self.steps.push(format!("handoff to primary term {term}"));
         true
     }
 
     /// adopt_newer_copy, as the spec's `Adopted`: host `h` takes up its copy
-    /// of the (alpha, b) ancestor when the copy holds history and was
+    /// of the (primary, b) ancestor when the copy holds history and was
     /// written after its own store, or it has none — less every path where
     /// the copy disagrees with the host's tree, which is set aside for the
     /// next cycle to reconcile as new.
@@ -384,7 +384,7 @@ impl Game {
     // ------------------------------------------------------------ sessions
 
     /// The spec's `Cycle(c, h)`: present the lease; if admitted, reconcile
-    /// with the real reconciler, the alpha side being the configured alpha
+    /// with the real reconciler, the primary side being the configured primary
     /// wherever it is involved.
     fn cycle(&mut self, c: usize, h: usize) -> bool {
         if !self.leading[c] || !self.up[c] || !self.up[h] || c == h {
@@ -400,7 +400,7 @@ impl Game {
             ));
             return true;
         }
-        let (alpha_side, beta_side) = if h == 0 { (0, c) } else { (c, h) };
+        let (primary_side, replica_side) = if h == 0 { (0, c) } else { (c, h) };
         let ancestor = if c == 0 {
             self.own[0][h - 1].0.clone()
         } else if h == 0 {
@@ -409,8 +409,8 @@ impl Game {
             self.bb[c - 1][h - 1].clone()
         };
         let a = to_node(&ancestor);
-        let x = to_node(&self.tree[alpha_side]);
-        let y = to_node(&self.tree[beta_side]);
+        let x = to_node(&self.tree[primary_side]);
+        let y = to_node(&self.tree[replica_side]);
         let r = reconcile(a.as_ref(), x.as_ref(), y.as_ref(), self.mode);
         let achieved = |t: &[Change]| {
             let outcome = TransitionOutcome {
@@ -422,28 +422,28 @@ impl Game {
             achieved_changes(t, &outcome).expect("one result per transition")
         };
         let x2 = from_node(
-            apply(x.as_ref(), &r.alpha_transitions)
-                .expect("alpha applies")
+            apply(x.as_ref(), &r.primary_transitions)
+                .expect("primary applies")
                 .as_ref(),
         );
         let y2 = from_node(
-            apply(y.as_ref(), &r.beta_transitions)
-                .expect("beta applies")
+            apply(y.as_ref(), &r.replica_transitions)
+                .expect("replica applies")
                 .as_ref(),
         );
         let mut anc_changes = r.ancestor_changes.clone();
-        anc_changes.extend(achieved(&r.beta_transitions));
-        anc_changes.extend(achieved(&r.alpha_transitions));
+        anc_changes.extend(achieved(&r.replica_transitions));
+        anc_changes.extend(achieved(&r.primary_transitions));
         let a2 = from_node(
             apply(a.as_ref(), &anc_changes)
                 .expect("ancestor applies")
                 .as_ref(),
         );
 
-        let x_before = self.tree[alpha_side].clone();
-        let y_before = self.tree[beta_side].clone();
-        self.tree[alpha_side] = x2.clone();
-        self.tree[beta_side] = y2.clone();
+        let x_before = self.tree[primary_side].clone();
+        let y_before = self.tree[replica_side].clone();
+        self.tree[primary_side] = x2.clone();
+        self.tree[replica_side] = y2.clone();
         // A store written moves its copy to before it.
         let bump = |store: &mut (Tree, u64), later: &mut bool| {
             if store.0 != a2 {
@@ -466,8 +466,8 @@ impl Game {
         // Lost: a side's own change, gone from both sides of the pair.
         for &p in &PATHS {
             for (side, before, after, other) in [
-                (Self::host(beta_side), &y_before, &y2, &x2),
-                (Self::host(alpha_side), &x_before, &x2, &y2),
+                (Self::host(replica_side), &y_before, &y2, &x2),
+                (Self::host(primary_side), &x_before, &x2, &y2),
             ] {
                 if let Some(v) = before.get(p) {
                     let changed = ancestor.get(p) != Some(v);
@@ -486,7 +486,7 @@ impl Game {
         true
     }
 
-    /// The spec's `Replicate`: the leader of an (alpha, b) session pushes
+    /// The spec's `Replicate`: the leader of a (primary, b) session pushes
     /// its ancestor to the other side.
     fn replicate(&mut self, c: usize, h: usize) -> bool {
         if !self.leading[c] || !self.up[c] || !self.up[h] || c == h || (c != 0 && h != 0) {
@@ -566,8 +566,8 @@ impl Game {
         }
         for d in &self.discarded {
             assert!(
-                d.0 != Host::Alpha,
-                "{context}: alpha lost {} at {}\n{}",
+                d.0 != Host::Primary,
+                "{context}: primary lost {} at {}\n{}",
                 d.2,
                 d.1,
                 self.report()
@@ -613,8 +613,8 @@ impl Game {
         };
         let leases: Vec<Lease> = (0..self.tree.len()).map(|h| self.lease(h)).collect();
         let lease_tla = |l: &Lease| -> String {
-            let leader = if l.leader == "alpha" {
-                "\"alpha\"".to_string()
+            let leader = if l.leader == "primary" {
+                "\"primary\"".to_string()
             } else {
                 l.leader.clone()
             };
@@ -657,14 +657,14 @@ impl Rng {
 fn play(
     seed: u64,
     mode: SyncMode,
-    betas: usize,
+    replicas: usize,
     budgets: (usize, usize, usize),
     steps: usize,
 ) -> Game {
     let keep = tempfile::tempdir().unwrap();
     let mut rng = Rng(seed | 1);
-    let mut game = Game::new(mode, betas, &keep);
-    let hosts = betas + 1;
+    let mut game = Game::new(mode, replicas, &keep);
+    let hosts = replicas + 1;
     let (max_edits, max_failures, max_changes) = budgets;
     for _ in 0..steps {
         let acted = match rng.below(12) {
@@ -684,7 +684,7 @@ fn play(
                 game.tick();
                 false
             }
-            6 if game.changes < max_changes => game.takeover(rng.below(betas)),
+            6 if game.changes < max_changes => game.takeover(rng.below(replicas)),
             7 if game.changes < max_changes => game.handoff(),
             8..=10 => game.cycle(rng.below(hosts), rng.below(hosts)),
             11 => game.replicate(rng.below(hosts), rng.below(hosts)),
@@ -708,8 +708,8 @@ fn random_games_keep_the_fence_and_the_accounting() {
     }
 }
 
-/// The real failover order: a beta's wait grows with its position, so the
-/// first live beta acts first — the ordering the spec's `Takeover` assumes.
+/// The real failover order: a replica's wait grows with its position, so the
+/// first live replica acts first — the ordering the spec's `Takeover` assumes.
 #[test]
 fn takeover_waits_grow_with_position() {
     let timing = autobahn::config::P2pPlan {
@@ -729,14 +729,14 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
     let name = format!("Trace{index}");
     let mode_name = match mode {
         SyncMode::TwoWaySafe => "conflict",
-        SyncMode::TwoWayResolved => "alpha",
+        SyncMode::TwoWayResolved => "primary",
         _ => unreachable!(),
     };
-    let betas: Vec<String> = (1..=game.betas).map(|i| format!("b{i}")).collect();
+    let replicas: Vec<String> = (1..=game.replicas).map(|i| format!("b{i}")).collect();
     let module = [
         format!("---- MODULE {name} ----"),
         "EXTENDS P2P, Sequences, TLC".to_string(),
-        format!("CONSTANTS {}, v1, v2", betas.join(", ")),
+        format!("CONSTANTS {}, v1, v2", replicas.join(", ")),
         format!(
             "TPaths == {{{}}}",
             PATHS
@@ -745,7 +745,7 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
                 .collect::<Vec<_>>()
                 .join(", ")
         ),
-        format!("TOrder == <<{}>>", betas.join(", ")),
+        format!("TOrder == <<{}>>", replicas.join(", ")),
         format!("Trace == <<\n  {}\n>>", game.trace.join(",\n  ")),
         "VARIABLE i".to_string(),
         "Match == /\\ tree' = Trace[i + 1].tree /\\ up' = Trace[i + 1].up".to_string(),
@@ -759,11 +759,11 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
     .join("\n");
     std::fs::write(dir.join(format!("{name}.tla")), module).unwrap();
     let cfg = format!(
-        "SPECIFICATION TSpec\nCONSTANTS\n{}    v1 = v1\n    v2 = v2\n    Betas = {{{}}}\n    Order <- TOrder\n    Paths <- TPaths\n    \
+        "SPECIFICATION TSpec\nCONSTANTS\n{}    v1 = v1\n    v2 = v2\n    Replicas = {{{}}}\n    Order <- TOrder\n    Paths <- TPaths\n    \
          Values = {{v1, v2}}\n    NoFile = NoFile\n    Dir = Dir\n    Mode = \"{mode_name}\"\n    MaxEdits = {}\n    MaxFailures = {}\n    \
          MaxChanges = {}\n    Flaky = TRUE\n    Lies = FALSE\n    MaxLies = 0\nCHECK_DEADLOCK TRUE\n",
-        betas.iter().map(|b| format!("    {b} = {b}\n")).collect::<String>(),
-        betas.join(", "),
+        replicas.iter().map(|b| format!("    {b} = {b}\n")).collect::<String>(),
+        replicas.join(", "),
         game.edits,
         game.failures,
         game.changes

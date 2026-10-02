@@ -171,11 +171,11 @@ fn repeated_one_way_edits_keep_synchronizing_through_a_real_agent() {
     // the controller already models, so it reports itself unchanged — and
     // synchronization must still be exactly correct through many rounds.
     let world = World::new();
-    let alpha = world.directory("source");
-    let beta = world.directory("mirror");
+    let primary = world.directory("source");
+    let replica = world.directory("mirror");
     for index in 0..20 {
         write(
-            &alpha,
+            &primary,
             &format!("dir{}/file{index}.txt", index % 3),
             "initial",
         );
@@ -184,94 +184,94 @@ fn repeated_one_way_edits_keep_synchronizing_through_a_real_agent() {
     let plans = world.plans(&format!(
         r#"
         [groups.churn]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         agent_command = "{agent} agent"
-        betas = ["remote-host:{beta}"]
+        replicas = ["remote-host:{replica}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         agent = agent_binary(),
-        beta = beta.display(),
+        replica = replica.display(),
     ));
 
     assert_all_synchronized(&world.run_once(plans.clone()));
-    assert_eq!(read(&beta, "dir0/file0.txt"), "initial");
+    assert_eq!(read(&replica, "dir0/file0.txt"), "initial");
 
-    // Round after round of one-directional edits: only alpha changes, so
-    // beta's every scan after the first reports itself unchanged.
+    // Round after round of one-directional edits: only primary changes, so
+    // replica's every scan after the first reports itself unchanged.
     // Each round makes exactly one modification and one creation; the
     // created names lie outside the range the fixture already wrote.
     for round in 1..=5 {
-        write(&alpha, "dir0/file0.txt", &format!("round {round}"));
+        write(&primary, "dir0/file0.txt", &format!("round {round}"));
         write(
-            &alpha,
+            &primary,
             &format!("dir1/added{round}.txt"),
             &format!("new {round}"),
         );
         assert_all_synchronized(&world.run_once(plans.clone()));
-        assert_eq!(read(&beta, "dir0/file0.txt"), format!("round {round}"));
+        assert_eq!(read(&replica, "dir0/file0.txt"), format!("round {round}"));
         assert_eq!(
-            read(&beta, &format!("dir1/added{round}.txt")),
+            read(&replica, &format!("dir1/added{round}.txt")),
             format!("new {round}")
         );
     }
 
-    // A deletion and a beta-side edit must still cross correctly.
-    fs::remove_file(alpha.join("dir2/file2.txt")).expect("file should be removable");
-    write(&beta, "beta-only.txt", "from the far side");
+    // A deletion and a replica-side edit must still cross correctly.
+    fs::remove_file(primary.join("dir2/file2.txt")).expect("file should be removable");
+    write(&replica, "replica-only.txt", "from the far side");
     assert_all_synchronized(&world.run_once(plans));
-    assert!(!beta.join("dir2/file2.txt").exists());
-    assert_eq!(read(&alpha, "beta-only.txt"), "from the far side");
+    assert!(!replica.join("dir2/file2.txt").exists());
+    assert_eq!(read(&primary, "replica-only.txt"), "from the far side");
 }
 
 #[test]
-fn a_remote_alpha_synchronizes_through_a_real_agent() {
+fn a_remote_primary_synchronizes_through_a_real_agent() {
     let world = World::new();
-    let remote_alpha = world.directory("remote-src");
-    let local_beta = world.directory("local-dst");
-    write(&remote_alpha, "artifact.bin", "built content");
-    write(&remote_alpha, "nested/report.txt", "report");
-    write(&local_beta, "local-note.txt", "kept");
+    let remote_primary = world.directory("remote-src");
+    let local_replica = world.directory("local-dst");
+    write(&remote_primary, "artifact.bin", "built content");
+    write(&remote_primary, "nested/report.txt", "report");
+    write(&local_replica, "local-note.txt", "kept");
 
-    // The alpha is a *remote* specification reached through a real agent
-    // subprocess; the beta is a plain local directory.
+    // The primary is a *remote* specification reached through a real agent
+    // subprocess; the replica is a plain local directory.
     let plans = world.plans(&format!(
         r#"
         [groups.pull]
-        alpha = "remote-host:{remote_alpha}"
+        primary = "remote-host:{remote_primary}"
         mode = "two-way-conflict"
         agent_command = "{agent} agent"
-        betas = ["{local_beta}"]
+        replicas = ["{local_replica}"]
         "#,
-        remote_alpha = remote_alpha.display(),
+        remote_primary = remote_primary.display(),
         agent = agent_binary(),
-        local_beta = local_beta.display(),
+        local_replica = local_replica.display(),
     ));
     assert_eq!(plans.len(), 1);
 
     let outcomes = world.run_once(plans);
     assert_all_synchronized(&outcomes);
 
-    // Content flowed in both directions across the remote alpha.
-    assert_eq!(read(&local_beta, "artifact.bin"), "built content");
-    assert_eq!(read(&local_beta, "nested/report.txt"), "report");
-    assert_eq!(read(&remote_alpha, "local-note.txt"), "kept");
+    // Content flowed in both directions across the remote primary.
+    assert_eq!(read(&local_replica, "artifact.bin"), "built content");
+    assert_eq!(read(&local_replica, "nested/report.txt"), "report");
+    assert_eq!(read(&remote_primary, "local-note.txt"), "kept");
 }
 
 #[test]
 fn a_configuration_file_drives_multiple_groups_and_hosts() {
     let world = World::new();
-    let alpha_one = world.directory("project");
-    let alpha_two = world.directory("notes");
-    let local_beta = world.directory("mirror");
-    let second_beta = world.path("second-mirror");
-    let agent_beta = world.directory("agent-mirror");
-    write(&alpha_one, "src/main.rs", "fn main() {}");
-    write(&alpha_one, "README.md", "readme");
-    write(&alpha_two, "todo.txt", "everything");
+    let primary_one = world.directory("project");
+    let primary_two = world.directory("notes");
+    let local_replica = world.directory("mirror");
+    let second_replica = world.path("second-mirror");
+    let agent_replica = world.directory("agent-mirror");
+    write(&primary_one, "src/main.rs", "fn main() {}");
+    write(&primary_one, "README.md", "readme");
+    write(&primary_two, "todo.txt", "everything");
 
-    // One group fans out to two local betas (one of which doesn't exist yet
-    // and must be created); the other reaches its beta through a real agent
+    // One group fans out to two local replicas (one of which doesn't exist yet
+    // and must be created); the other reaches its replica through a real agent
     // subprocess.
     let plans = world.plans(&format!(
         r#"
@@ -279,38 +279,38 @@ fn a_configuration_file_drives_multiple_groups_and_hosts() {
         mode = "two-way-conflict"
 
         [groups.project]
-        alpha = "{alpha_one}"
-        betas = ["{local_beta}", "{second_beta}"]
+        primary = "{primary_one}"
+        replicas = ["{local_replica}", "{second_replica}"]
 
         [groups.notes]
-        alpha = "{alpha_two}"
+        primary = "{primary_two}"
         agent_command = "{agent} agent"
-        betas = ["remote-host:{agent_beta}"]
+        replicas = ["remote-host:{agent_replica}"]
         "#,
-        alpha_one = alpha_one.display(),
-        local_beta = local_beta.display(),
-        second_beta = second_beta.display(),
-        alpha_two = alpha_two.display(),
+        primary_one = primary_one.display(),
+        local_replica = local_replica.display(),
+        second_replica = second_replica.display(),
+        primary_two = primary_two.display(),
         agent = agent_binary(),
-        agent_beta = agent_beta.display(),
+        agent_replica = agent_replica.display(),
     ));
     assert_eq!(plans.len(), 3);
 
     let outcomes = world.run_once(plans.clone());
     assert_all_synchronized(&outcomes);
 
-    // Every destination matches its alpha.
-    assert_eq!(read(&local_beta, "src/main.rs"), "fn main() {}");
-    assert_eq!(read(&local_beta, "README.md"), "readme");
-    assert_eq!(read(&second_beta, "src/main.rs"), "fn main() {}");
+    // Every destination matches its primary.
+    assert_eq!(read(&local_replica, "src/main.rs"), "fn main() {}");
+    assert_eq!(read(&local_replica, "README.md"), "readme");
+    assert_eq!(read(&second_replica, "src/main.rs"), "fn main() {}");
     // A root created by the transition takes the configured directory mode
     // (the conservative default), not the umask's.
     use std::os::unix::fs::MetadataExt;
     assert_eq!(
-        fs::symlink_metadata(&second_beta).expect("root").mode() & 0o777,
+        fs::symlink_metadata(&second_replica).expect("root").mode() & 0o777,
         0o700
     );
-    assert_eq!(read(&agent_beta, "todo.txt"), "everything");
+    assert_eq!(read(&agent_replica, "todo.txt"), "everything");
 
     // Every session recorded a synchronized status.
     for plan in &plans {
@@ -327,54 +327,54 @@ fn a_configuration_file_drives_multiple_groups_and_hosts() {
     assert_all_synchronized(&outcomes);
     for outcome in &outcomes {
         let digest = outcome.result.as_ref().expect("the pass should succeed");
-        assert_eq!(digest.alpha_transitions + digest.beta_transitions, 0);
+        assert_eq!(digest.primary_transitions + digest.replica_transitions, 0);
     }
 }
 
 #[test]
 fn per_group_modes_are_respected() {
     let world = World::new();
-    let safe_alpha = world.directory("safe-alpha");
-    let safe_beta = world.directory("safe-beta");
-    let replica_alpha = world.directory("replica-alpha");
-    let replica_beta = world.directory("replica-beta");
-    write(&safe_alpha, "shared.txt", "original");
-    write(&replica_alpha, "kept.txt", "kept");
-    write(&replica_beta, "extra.txt", "beta only");
+    let safe_primary = world.directory("safe-primary");
+    let safe_replica = world.directory("safe-replica");
+    let mirror_primary = world.directory("mirror-primary");
+    let mirror_replica = world.directory("mirror-replica");
+    write(&safe_primary, "shared.txt", "original");
+    write(&mirror_primary, "kept.txt", "kept");
+    write(&mirror_replica, "extra.txt", "replica only");
 
     let configuration = format!(
         r#"
         [groups.careful]
-        alpha = "{safe_alpha}"
+        primary = "{safe_primary}"
         mode = "two-way-conflict"
-        betas = ["{safe_beta}"]
+        replicas = ["{safe_replica}"]
 
         [groups.mirror]
-        alpha = "{replica_alpha}"
-        mode = "one-way-alpha"
-        betas = ["{replica_beta}"]
+        primary = "{mirror_primary}"
+        mode = "one-way-primary"
+        replicas = ["{mirror_replica}"]
         "#,
-        safe_alpha = safe_alpha.display(),
-        safe_beta = safe_beta.display(),
-        replica_alpha = replica_alpha.display(),
-        replica_beta = replica_beta.display(),
+        safe_primary = safe_primary.display(),
+        safe_replica = safe_replica.display(),
+        mirror_primary = mirror_primary.display(),
+        mirror_replica = mirror_replica.display(),
     );
     let plans = world.plans(&configuration);
     assert_all_synchronized(&world.run_once(plans.clone()));
 
-    // The replica beta mirrors its alpha exactly: the beta-only file is gone.
-    assert_eq!(read(&replica_beta, "kept.txt"), "kept");
-    assert!(!replica_beta.join("extra.txt").exists());
+    // The mirrored replica matches its primary exactly: the replica-only file is gone.
+    assert_eq!(read(&mirror_replica, "kept.txt"), "kept");
+    assert!(!mirror_replica.join("extra.txt").exists());
 
     // Now diverge the safe group's file on both sides.
-    write(&safe_alpha, "shared.txt", "alpha edit");
-    write(&safe_beta, "shared.txt", "beta edit");
+    write(&safe_primary, "shared.txt", "primary edit");
+    write(&safe_replica, "shared.txt", "replica edit");
     let outcomes = world.run_once(plans.clone());
     assert_all_synchronized(&outcomes);
 
     // The conflict is reported, not resolved: both edits survive.
-    assert_eq!(read(&safe_alpha, "shared.txt"), "alpha edit");
-    assert_eq!(read(&safe_beta, "shared.txt"), "beta edit");
+    assert_eq!(read(&safe_primary, "shared.txt"), "primary edit");
+    assert_eq!(read(&safe_replica, "shared.txt"), "replica edit");
     let careful = plans
         .iter()
         .find(|plan| plan.group == "careful")
@@ -383,25 +383,25 @@ fn per_group_modes_are_respected() {
     assert_eq!(status.state, "conflicts");
     assert_eq!(status.conflicts, vec!["shared.txt".to_owned()]);
 
-    // The same divergence under two-way-alpha resolves in alpha's favor
+    // The same divergence under two-way-primary resolves in primary's favor
     // (a fresh state root gives the mode change a clean baseline).
     let resolved_world = World::new();
-    let plans = resolved_world.plans(&configuration.replace("two-way-conflict", "two-way-alpha"));
+    let plans = resolved_world.plans(&configuration.replace("two-way-conflict", "two-way-primary"));
     assert_all_synchronized(&resolved_world.run_once(plans.clone()));
-    write(&safe_alpha, "shared.txt", "alpha wins");
-    write(&safe_beta, "shared.txt", "beta loses");
+    write(&safe_primary, "shared.txt", "primary wins");
+    write(&safe_replica, "shared.txt", "replica loses");
     assert_all_synchronized(&resolved_world.run_once(plans));
-    assert_eq!(read(&safe_beta, "shared.txt"), "alpha wins");
+    assert_eq!(read(&safe_replica, "shared.txt"), "primary wins");
 }
 
 #[test]
 fn defaults_and_group_ignores_combine() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, ".git/HEAD", "ref: refs/heads/main");
-    write(&alpha, "scratch.tmp", "temporary");
-    write(&alpha, "real.txt", "real");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, ".git/HEAD", "ref: refs/heads/main");
+    write(&primary, "scratch.tmp", "temporary");
+    write(&primary, "real.txt", "real");
 
     let plans = world.plans(&format!(
         r#"
@@ -410,19 +410,22 @@ fn defaults_and_group_ignores_combine() {
         ignores = [".git"]
 
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         ignores = ["*.tmp"]
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     assert_all_synchronized(&world.run_once(plans));
 
-    assert_eq!(read(&beta, "real.txt"), "real");
-    assert!(!beta.join(".git").exists(), "default ignore should apply");
+    assert_eq!(read(&replica, "real.txt"), "real");
     assert!(
-        !beta.join("scratch.tmp").exists(),
+        !replica.join(".git").exists(),
+        "default ignore should apply"
+    );
+    assert!(
+        !replica.join("scratch.tmp").exists(),
         "group ignore should apply"
     );
 }
@@ -430,60 +433,60 @@ fn defaults_and_group_ignores_combine() {
 #[test]
 fn disabled_hosts_are_excluded_from_supervision() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let enabled_beta = world.directory("enabled-beta");
-    let disabled_beta = world.directory("disabled-beta");
-    write(&alpha, "file.txt", "content");
+    let primary = world.directory("primary");
+    let enabled_replica = world.directory("enabled-replica");
+    let disabled_replica = world.directory("disabled-replica");
+    write(&primary, "file.txt", "content");
 
     let plans = world.plans(&format!(
         r#"
         disabled_hosts = ["down-host"]
 
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         agent_command = "{agent} agent"
-        betas = ["up-host:{enabled_beta}", "down-host:{disabled_beta}"]
+        replicas = ["up-host:{enabled_replica}", "down-host:{disabled_replica}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         agent = agent_binary(),
-        enabled_beta = enabled_beta.display(),
-        disabled_beta = disabled_beta.display(),
+        enabled_replica = enabled_replica.display(),
+        disabled_replica = disabled_replica.display(),
     ));
     // The disabled host never becomes a plan at all.
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].host, "up-host");
 
     assert_all_synchronized(&world.run_once(plans));
-    assert_eq!(read(&enabled_beta, "file.txt"), "content");
-    assert!(!disabled_beta.join("file.txt").exists());
+    assert_eq!(read(&enabled_replica, "file.txt"), "content");
+    assert!(!disabled_replica.join("file.txt").exists());
 }
 
 #[test]
 fn an_unreachable_destination_does_not_block_other_sessions() {
     let world = World::new();
-    let healthy_alpha = world.directory("healthy-alpha");
-    let healthy_beta = world.directory("healthy-beta");
-    let doomed_alpha = world.directory("doomed-alpha");
-    write(&healthy_alpha, "file.txt", "content");
-    write(&doomed_alpha, "file.txt", "content");
+    let healthy_primary = world.directory("healthy-primary");
+    let healthy_replica = world.directory("healthy-replica");
+    let doomed_primary = world.directory("doomed-primary");
+    write(&healthy_primary, "file.txt", "content");
+    write(&doomed_primary, "file.txt", "content");
 
     let plans = world.plans(&format!(
         r#"
         [groups.healthy]
-        alpha = "{healthy_alpha}"
+        primary = "{healthy_primary}"
         mode = "two-way-conflict"
-        betas = ["{healthy_beta}"]
+        replicas = ["{healthy_replica}"]
 
         [groups.doomed]
-        alpha = "{doomed_alpha}"
+        primary = "{doomed_primary}"
         mode = "two-way-conflict"
         agent_command = "/nonexistent/agent-binary agent"
-        betas = ["unreachable-host:/anywhere"]
+        replicas = ["unreachable-host:/anywhere"]
         "#,
-        healthy_alpha = healthy_alpha.display(),
-        healthy_beta = healthy_beta.display(),
-        doomed_alpha = doomed_alpha.display(),
+        healthy_primary = healthy_primary.display(),
+        healthy_replica = healthy_replica.display(),
+        doomed_primary = doomed_primary.display(),
     ));
     let outcomes = world.run_once(plans.clone());
 
@@ -493,7 +496,7 @@ fn an_unreachable_destination_does_not_block_other_sessions() {
         .find(|outcome| outcome.display.starts_with("healthy@"))
         .expect("the healthy outcome should exist");
     assert!(healthy.result.is_ok(), "{:?}", healthy.result);
-    assert_eq!(read(&healthy_beta, "file.txt"), "content");
+    assert_eq!(read(&healthy_replica, "file.txt"), "content");
 
     // The doomed session failed, and both the outcome and its status file
     // say so.
@@ -522,19 +525,19 @@ fn an_unreachable_destination_does_not_block_other_sessions() {
 #[test]
 fn a_status_recording_failure_fails_the_run() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "content");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "content");
 
     let plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
 
     // Make status recording impossible: a regular file squats on the status
@@ -550,15 +553,15 @@ fn a_status_recording_failure_fails_the_run() {
         .expect_err("an unrecordable attempt must not report success");
     assert!(error.contains("unable to record status"), "{error}");
     // The synchronization itself did happen — only its recording failed.
-    assert_eq!(read(&beta, "file.txt"), "content");
+    assert_eq!(read(&replica, "file.txt"), "content");
 }
 
 #[test]
 fn concurrent_sessions_over_the_same_state_are_refused() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "content");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "content");
 
     // Duplicate plans can't come from one configuration (plans() rejects
     // them), so simulate two supervisor processes: two Supervisors over the
@@ -566,12 +569,12 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
     let plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     let mut watch_plans = plans.clone();
     watch_plans[0].interval = Duration::from_millis(30);
@@ -583,7 +586,9 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
         let watcher = scope.spawn(move || supervisor.run_watch(stop));
         let _guard = StopGuard(stop);
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("file.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("file.txt")
+                .exists()),
             "the watcher should be running and synchronized"
         );
 
@@ -617,19 +622,19 @@ fn concurrent_sessions_over_the_same_state_are_refused() {
 #[test]
 fn a_second_supervisor_over_the_same_state_root_is_refused() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "content");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "content");
 
     let mut plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     plans[0].interval = Duration::from_millis(30);
 
@@ -640,7 +645,9 @@ fn a_second_supervisor_over_the_same_state_root_is_refused() {
         let watcher = scope.spawn(move || supervisor.run_watch(stop_ref));
         let _guard = StopGuard(stop_ref);
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("file.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("file.txt")
+                .exists()),
             "the first supervisor should be running"
         );
 
@@ -669,18 +676,18 @@ fn a_second_supervisor_over_the_same_state_root_is_refused() {
 }
 
 #[test]
-fn a_missing_alpha_is_a_session_error_not_a_crash() {
+fn a_missing_primary_is_a_session_error_not_a_crash() {
     let world = World::new();
-    let beta = world.directory("beta");
+    let replica = world.directory("replica");
     let plans = world.plans(&format!(
         r#"
         [groups.ghost]
-        alpha = "{missing}"
+        primary = "{missing}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
         missing = world.path("never-created").display(),
-        beta = beta.display(),
+        replica = replica.display(),
     ));
     let outcomes = world.run_once(plans.clone());
     let error = outcomes[0]
@@ -688,7 +695,7 @@ fn a_missing_alpha_is_a_session_error_not_a_crash() {
         .as_ref()
         .expect_err("the session should fail");
     assert!(
-        error.contains("halted") && error.contains("alpha folder") && error.contains("missing"),
+        error.contains("halted") && error.contains("primary folder") && error.contains("missing"),
         "{error}"
     );
     // Recorded as the safety stop it is, with the patience of one that
@@ -711,7 +718,7 @@ fn a_retargeted_root_is_refused_rather_than_bound_to_stale_state() {
     let world = World::new();
     let tree_a = world.directory("tree-a");
     let tree_b = world.directory("tree-b");
-    let beta = world.directory("beta");
+    let replica = world.directory("replica");
     write(&tree_a, "file.txt", "a's content");
     write(&tree_b, "file.txt", "b's content");
     let link = world.path("entry");
@@ -720,12 +727,12 @@ fn a_retargeted_root_is_refused_rather_than_bound_to_stale_state() {
     let plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{link}"
+        primary = "{link}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
         link = link.display(),
-        beta = beta.display(),
+        replica = replica.display(),
     ));
 
     // The retarget lands between planning and connecting.
@@ -742,7 +749,7 @@ fn a_retargeted_root_is_refused_rather_than_bound_to_stale_state() {
         "expected the retarget refusal, got: {error}"
     );
     assert!(
-        !beta.join("file.txt").exists(),
+        !replica.join("file.txt").exists(),
         "nothing may be synchronized from the wrong tree"
     );
 }
@@ -750,51 +757,51 @@ fn a_retargeted_root_is_refused_rather_than_bound_to_stale_state() {
 #[test]
 fn state_persists_across_supervisor_runs() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "keep.txt", "keep");
-    write(&alpha, "remove.txt", "remove");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "keep.txt", "keep");
+    write(&primary, "remove.txt", "remove");
 
     let configuration = format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     );
     let plans = world.plans(&configuration);
     assert_all_synchronized(&world.run_once(plans.clone()));
-    assert_eq!(read(&beta, "remove.txt"), "remove");
+    assert_eq!(read(&replica, "remove.txt"), "remove");
 
-    // Delete on alpha, then run a *fresh* supervisor over the same state
+    // Delete on primary, then run a *fresh* supervisor over the same state
     // root: only a persisted ancestor lets it see a deletion rather than a
     // one-sided file (which two-way-conflict would copy back).
-    fs::remove_file(alpha.join("remove.txt")).expect("file should be removable");
+    fs::remove_file(primary.join("remove.txt")).expect("file should be removable");
     assert_all_synchronized(&world.run_once(plans));
-    assert!(!beta.join("remove.txt").exists());
-    assert!(alpha.join("keep.txt").exists());
-    assert_eq!(read(&beta, "keep.txt"), "keep");
+    assert!(!replica.join("remove.txt").exists());
+    assert!(primary.join("keep.txt").exists());
+    assert_eq!(read(&replica, "keep.txt"), "keep");
 }
 
 #[test]
 fn watch_mode_synchronizes_continuously_until_stopped() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "first.txt", "first");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "first.txt", "first");
 
     let mut plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     // The configuration expresses intervals in whole seconds; drive the
     // watch loop faster for the test.
@@ -810,15 +817,17 @@ fn watch_mode_synchronizes_continuously_until_stopped() {
 
         // The initial content propagates...
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("first.txt")
+                .exists()),
             "initial content should propagate"
         );
         // ...changes made while watching propagate in both directions...
-        write(&alpha, "second.txt", "second");
-        write(&beta, "from-beta.txt", "reverse");
+        write(&primary, "second.txt", "second");
+        write(&replica, "from-replica.txt", "reverse");
         assert!(
             wait_until(Duration::from_secs(15), || {
-                beta.join("second.txt").exists() && alpha.join("from-beta.txt").exists()
+                replica.join("second.txt").exists() && primary.join("from-replica.txt").exists()
             }),
             "ongoing changes should propagate both ways"
         );
@@ -920,11 +929,11 @@ fn cycles(world: &World, plan: &SessionPlan) -> u64 {
 fn an_edited_configuration_is_applied_without_a_restart() {
     use autobahn::supervisor::reload::read_notice;
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let notes = world.directory("notes");
     let notes_mirror = world.path("notes-mirror");
-    write(&alpha, "first.txt", "first");
+    write(&primary, "first.txt", "first");
     write(&notes, "todo.txt", "everything");
     let (script, counter) = counting_agent(&world, "agent");
 
@@ -932,14 +941,14 @@ fn an_edited_configuration_is_applied_without_a_restart() {
     let one_group = format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         interval = 1
         agent_command = "{script}"
-        betas = ["host:{beta}"]
+        replicas = ["host:{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
         script = script.display(),
     );
     let plans = world.plans(&one_group);
@@ -947,7 +956,9 @@ fn an_edited_configuration_is_applied_without_a_restart() {
 
     supervise_with_reload(&world, &path, || {
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("first.txt")
+                .exists()),
             "the first configuration synchronizes"
         );
         // A broken edit is refused and recorded; the session runs on.
@@ -959,9 +970,11 @@ fn an_edited_configuration_is_applied_without_a_restart() {
             }),
             "the refusal is recorded"
         );
-        write(&alpha, "second.txt", "second");
+        write(&primary, "second.txt", "second");
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("second.txt")
+                .exists()),
             "the session runs on under the refused edit"
         );
         // A good one adds a group, which starts while the first runs on:
@@ -972,7 +985,7 @@ fn an_edited_configuration_is_applied_without_a_restart() {
         fs::write(
             &path,
             format!(
-                "{one_group}\n[groups.notes]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                "{one_group}\n[groups.notes]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
                 notes.display(),
                 notes_mirror.display()
             ),
@@ -984,9 +997,11 @@ fn an_edited_configuration_is_applied_without_a_restart() {
             }),
             "the added group synchronizes"
         );
-        write(&alpha, "third.txt", "third");
+        write(&primary, "third.txt", "third");
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("third.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("third.txt")
+                .exists()),
             "the kept group runs on"
         );
         assert!(
@@ -1017,23 +1032,23 @@ fn an_edit_whose_root_holds_the_state_root_is_not_applied() {
     // The work group's trees are outside the world's directory, which the
     // edit adds a root for.
     let elsewhere = TempDir::new().expect("temporary directory should be creatable");
-    let alpha = elsewhere.path().join("alpha");
-    let beta = elsewhere.path().join("beta");
-    fs::create_dir_all(&alpha).expect("directory should be creatable");
-    fs::create_dir_all(&beta).expect("directory should be creatable");
+    let primary = elsewhere.path().join("primary");
+    let replica = elsewhere.path().join("replica");
+    fs::create_dir_all(&primary).expect("directory should be creatable");
+    fs::create_dir_all(&replica).expect("directory should be creatable");
     let mirror = elsewhere.path().join("mirror");
-    write(&alpha, "first.txt", "first");
+    write(&primary, "first.txt", "first");
     let path = world.path("config.toml");
     let one_group = format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         interval = 1
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     );
     let plans = world.plans(&one_group);
     let reloader = Arc::new(Reloader::new(path.clone()).with_interval(Duration::from_millis(20)));
@@ -1048,28 +1063,32 @@ fn an_edit_whose_root_holds_the_state_root_is_not_applied() {
         let _guard = StopGuard(&stop);
         let watcher = scope.spawn(|| supervisor.run_watch(&stop));
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("first.txt")
+                .exists()),
             "the first configuration synchronizes"
         );
         // The world's directory holds the state root and the configuration.
         fs::write(
             &path,
             format!(
-                "{one_group}\n[groups.everything]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                "{one_group}\n[groups.everything]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
                 world.path("").display(),
                 mirror.display()
             ),
         )
         .expect("configuration should be writable");
         std::thread::sleep(Duration::from_millis(500));
-        write(&alpha, "second.txt", "second");
+        write(&primary, "second.txt", "second");
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("second.txt")
+                .exists()),
             "the running session carries on"
         );
         assert_eq!(
             supervised(&world),
-            Some(vec![format!("work@{}", beta.display())]),
+            Some(vec![format!("work@{}", replica.display())]),
             "the edit was not applied"
         );
         assert!(!mirror.exists(), "nothing ran over the state root");
@@ -1085,10 +1104,10 @@ fn an_edit_whose_root_holds_the_state_root_is_not_applied() {
 #[test]
 fn an_edit_to_one_groups_ignores_restarts_only_that_session() {
     let world = World::new();
-    let alpha_one = world.directory("alpha-one");
-    let alpha_two = world.directory("alpha-two");
-    let beta_one = world.directory("beta-one");
-    let beta_two = world.directory("beta-two");
+    let primary_one = world.directory("primary-one");
+    let primary_two = world.directory("primary-two");
+    let replica_one = world.directory("replica-one");
+    let replica_two = world.directory("replica-two");
     let (script, counter) = counting_agent(&world, "agent");
     let path = world.path("config.toml");
     let configuration = |ignores: &str| {
@@ -1099,39 +1118,39 @@ fn an_edit_to_one_groups_ignores_restarts_only_that_session() {
             interval = 1
 
             [groups.one]
-            alpha = "{alpha_one}"
+            primary = "{primary_one}"
             agent_command = "{script}"
-            betas = ["shared-host:{beta_one}"]
+            replicas = ["shared-host:{replica_one}"]
 
             [groups.two]
-            alpha = "{alpha_two}"
+            primary = "{primary_two}"
             agent_command = "{script}"
             ignores = [{ignores}]
-            betas = ["shared-host:{beta_two}"]
+            replicas = ["shared-host:{replica_two}"]
             "#,
             script = script.display(),
-            alpha_one = alpha_one.display(),
-            alpha_two = alpha_two.display(),
-            beta_one = beta_one.display(),
-            beta_two = beta_two.display(),
+            primary_one = primary_one.display(),
+            primary_two = primary_two.display(),
+            replica_one = replica_one.display(),
+            replica_two = replica_two.display(),
         )
     };
     let plans = world.plans(&configuration(""));
     let (one, two) = (plans[0].clone(), plans[1].clone());
-    write(&alpha_one, "one.txt", "one");
-    write(&alpha_two, "two.txt", "two");
+    write(&primary_one, "one.txt", "one");
+    write(&primary_two, "two.txt", "two");
 
     supervise_with_reload(&world, &path, || {
         assert!(wait_until(Duration::from_secs(15), || {
-            beta_one.join("one.txt").exists() && beta_two.join("two.txt").exists()
+            replica_one.join("one.txt").exists() && replica_two.join("two.txt").exists()
         }));
         // Run the session to be changed through more cycles than one
         // attempt can hold, so its restart shows as a count that went back.
         let limit = autobahn::supervisor::MAXIMUM_FOLLOW_UP_CYCLES as u64 + 1;
         for index in 0..=limit {
             let name = format!("warm-{index}.txt");
-            write(&alpha_two, &name, "warm");
-            assert!(wait_until(Duration::from_secs(15), || beta_two
+            write(&primary_two, &name, "warm");
+            assert!(wait_until(Duration::from_secs(15), || replica_two
                 .join(&name)
                 .exists()));
         }
@@ -1147,16 +1166,16 @@ fn an_edit_to_one_groups_ignores_restarts_only_that_session() {
             "the changed session starts over ({} after {two_before})",
             cycles(&world, &two)
         );
-        write(&alpha_two, "scratch.tmp", "scratch");
-        write(&alpha_two, "kept.txt", "kept");
+        write(&primary_two, "scratch.tmp", "scratch");
+        write(&primary_two, "kept.txt", "kept");
         assert!(
-            wait_until(Duration::from_secs(15), || beta_two
+            wait_until(Duration::from_secs(15), || replica_two
                 .join("kept.txt")
                 .exists()),
             "the changed session runs under its new plan"
         );
         assert!(
-            !beta_two.join("scratch.tmp").exists(),
+            !replica_two.join("scratch.tmp").exists(),
             "the new ignores apply"
         );
         assert!(
@@ -1175,10 +1194,10 @@ fn an_edit_to_one_groups_ignores_restarts_only_that_session() {
 #[test]
 fn disabling_one_group_leaves_the_others_connected_and_closes_its_host() {
     let world = World::new();
-    let alpha_one = world.directory("alpha-one");
-    let alpha_two = world.directory("alpha-two");
-    let beta_one = world.directory("beta-one");
-    let beta_two = world.directory("beta-two");
+    let primary_one = world.directory("primary-one");
+    let primary_two = world.directory("primary-two");
+    let replica_one = world.directory("replica-one");
+    let replica_two = world.directory("replica-two");
     let (script_one, counter_one) = counting_agent(&world, "agent-one");
     let (script_two, counter_two) = counting_agent(&world, "agent-two");
     let path = world.path("config.toml");
@@ -1189,29 +1208,29 @@ fn disabling_one_group_leaves_the_others_connected_and_closes_its_host() {
         interval = 1
 
         [groups.one]
-        alpha = "{alpha_one}"
+        primary = "{primary_one}"
         agent_command = "{script_one}"
-        betas = ["host-one:{beta_one}"]
+        replicas = ["host-one:{replica_one}"]
 
         [groups.two]
-        alpha = "{alpha_two}"
+        primary = "{primary_two}"
         agent_command = "{script_two}"
-        betas = ["host-two:{beta_two}"]
+        replicas = ["host-two:{replica_two}"]
         "#,
         script_one = script_one.display(),
         script_two = script_two.display(),
-        alpha_one = alpha_one.display(),
-        alpha_two = alpha_two.display(),
-        beta_one = beta_one.display(),
-        beta_two = beta_two.display(),
+        primary_one = primary_one.display(),
+        primary_two = primary_two.display(),
+        replica_one = replica_one.display(),
+        replica_two = replica_two.display(),
     );
     world.plans(&text);
-    write(&alpha_one, "one.txt", "one");
-    write(&alpha_two, "two.txt", "two");
+    write(&primary_one, "one.txt", "one");
+    write(&primary_two, "two.txt", "two");
 
     supervise_with_reload(&world, &path, || {
         assert!(wait_until(Duration::from_secs(15), || {
-            beta_one.join("one.txt").exists() && beta_two.join("two.txt").exists()
+            replica_one.join("one.txt").exists() && replica_two.join("two.txt").exists()
         }));
         let (disabled, _) =
             autobahn::config::set_group_disabled(&text, "two", true).expect("the edit applies");
@@ -1229,8 +1248,8 @@ fn disabling_one_group_leaves_the_others_connected_and_closes_its_host() {
                 == 1),
             "the disabled group's host is not kept connected"
         );
-        write(&alpha_one, "more.txt", "more");
-        assert!(wait_until(Duration::from_secs(15), || beta_one
+        write(&primary_one, "more.txt", "more");
+        assert!(wait_until(Duration::from_secs(15), || replica_one
             .join("more.txt")
             .exists()));
         assert_eq!(
@@ -1248,29 +1267,29 @@ fn disabling_one_group_leaves_the_others_connected_and_closes_its_host() {
 /// where a session that had lost its ancestor would bring the file back.
 fn turning_the_only_group_off_and_on(edit: impl Fn(&str) -> String) {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let path = world.path("config.toml");
     let text = format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         interval = 1
         agent_command = "{agent} agent"
-        betas = ["only-host:{beta}"]
+        replicas = ["only-host:{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
         agent = agent_binary(),
     );
     world.plans(&text);
-    write(&alpha, "kept.txt", "kept");
-    write(&alpha, "doomed.txt", "doomed");
+    write(&primary, "kept.txt", "kept");
+    write(&primary, "doomed.txt", "doomed");
 
     supervise_with_reload(&world, &path, || {
         assert!(wait_until(Duration::from_secs(15), || {
-            beta.join("kept.txt").exists() && beta.join("doomed.txt").exists()
+            replica.join("kept.txt").exists() && replica.join("doomed.txt").exists()
         }));
         fs::write(&path, edit(&text)).expect("configuration should be writable");
         assert!(
@@ -1282,30 +1301,30 @@ fn turning_the_only_group_off_and_on(edit: impl Fn(&str) -> String) {
         let (succeeded, shown) = cli(&world, &path, &["status"]);
         assert!(succeeded, "{shown}");
         assert!(shown.contains("no active sessions"), "{shown}");
-        write(&alpha, "while-off.txt", "while off");
-        fs::remove_file(alpha.join("doomed.txt")).expect("removable");
+        write(&primary, "while-off.txt", "while off");
+        fs::remove_file(primary.join("doomed.txt")).expect("removable");
         std::thread::sleep(Duration::from_millis(2500));
         assert!(
-            !beta.join("while-off.txt").exists(),
+            !replica.join("while-off.txt").exists(),
             "nothing propagates while off"
         );
-        assert!(beta.join("doomed.txt").exists());
+        assert!(replica.join("doomed.txt").exists());
 
         fs::write(&path, &text).expect("configuration should be writable");
         assert!(
-            wait_until(Duration::from_secs(15), || beta
+            wait_until(Duration::from_secs(15), || replica
                 .join("while-off.txt")
                 .exists()),
             "syncing resumes"
         );
         assert!(
-            wait_until(Duration::from_secs(15), || !beta
+            wait_until(Duration::from_secs(15), || !replica
                 .join("doomed.txt")
                 .exists()),
             "the deletion propagates: the ancestor is intact"
         );
-        assert!(!alpha.join("doomed.txt").exists());
-        assert_eq!(read(&beta, "kept.txt"), "kept");
+        assert!(!primary.join("doomed.txt").exists());
+        assert_eq!(read(&replica, "kept.txt"), "kept");
     });
 }
 
@@ -1335,9 +1354,9 @@ fn removing_the_last_group_stops_it_and_restoring_resumes_it() {
 #[test]
 fn watch_mode_heals_after_a_destination_recovers() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "content");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "content");
 
     // The agent command is a script that initially fails, standing in for an
     // unreachable host; rewriting it to exec the real agent stands in for
@@ -1353,14 +1372,14 @@ fn watch_mode_heals_after_a_destination_recovers() {
     let mut plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         agent_command = "{script}"
-        betas = ["flaky-host:{beta}"]
+        replicas = ["flaky-host:{replica}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         script = script.display(),
-        beta = beta.display(),
+        replica = replica.display(),
     ));
     plans[0].interval = Duration::from_millis(30);
     let plan = plans[0].clone();
@@ -1381,7 +1400,7 @@ fn watch_mode_heals_after_a_destination_recovers() {
             }),
             "the failure should be recorded"
         );
-        assert!(!beta.join("file.txt").exists());
+        assert!(!replica.join("file.txt").exists());
 
         // The destination recovers; the session heals without intervention.
         fs::write(
@@ -1390,7 +1409,9 @@ fn watch_mode_heals_after_a_destination_recovers() {
         )
         .expect("script should be rewritable");
         assert!(
-            wait_until(Duration::from_secs(20), || beta.join("file.txt").exists()),
+            wait_until(Duration::from_secs(20), || replica
+                .join("file.txt")
+                .exists()),
             "the session should heal and synchronize"
         );
         assert!(
@@ -1415,20 +1436,20 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
     use autobahn::supervisor::control::{self, ControlRequest, ControlResponse, Selector};
 
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "first.txt", "first");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "first.txt", "first");
 
     let mut plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         interval = 3600
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     // The interval is effectively disabled: everything below must happen
     // through change notifications and control requests.
@@ -1445,12 +1466,16 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
         // Startup synchronizes, and file changes propagate purely through
         // watching (no heartbeat is coming for an hour).
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("first.txt")
+                .exists()),
             "initial content should synchronize"
         );
-        write(&alpha, "second.txt", "second");
+        write(&primary, "second.txt", "second");
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join("second.txt").exists()),
+            wait_until(Duration::from_secs(15), || replica
+                .join("second.txt")
+                .exists()),
             "a watched change should propagate without a heartbeat"
         );
 
@@ -1470,16 +1495,16 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
             }),
             "the pause should be recorded"
         );
-        // Delete a synchronized file on alpha while paused; nothing moves.
-        fs::remove_file(alpha.join("second.txt")).expect("file should be removable");
+        // Delete a synchronized file on primary while paused; nothing moves.
+        fs::remove_file(primary.join("second.txt")).expect("file should be removable");
         std::thread::sleep(Duration::from_millis(500));
         assert!(
-            beta.join("second.txt").exists(),
+            replica.join("second.txt").exists(),
             "paused sessions must not sync"
         );
 
         // Reset while paused, then resume: with the ancestor discarded, the
-        // deletion is forgotten and beta's copy flows back to alpha.
+        // deletion is forgotten and replica's copy flows back to primary.
         let response = control::send(&world.state_root(), &ControlRequest::Reset(selector()))
             .expect("reset should send");
         assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
@@ -1487,7 +1512,7 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
             .expect("resume should send");
         assert!(matches!(response, ControlResponse::Applied { sessions: 1 }));
         assert!(
-            wait_until(Duration::from_secs(15), || alpha
+            wait_until(Duration::from_secs(15), || primary
                 .join("second.txt")
                 .exists()),
             "after a reset, the deletion is forgotten and content merges back"
@@ -1515,19 +1540,19 @@ fn control_socket_pauses_resumes_and_resets_sessions() {
 #[test]
 fn watch_mode_observes_remote_changes_through_the_agent() {
     let world = World::new();
-    let alpha = world.directory("alpha");
+    let primary = world.directory("primary");
     let remote = world.directory("remote-mirror");
-    write(&alpha, "seed.txt", "seed");
+    write(&primary, "seed.txt", "seed");
 
     let mut plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         agent_command = "{agent} agent"
-        betas = ["fake-host:{remote}"]
+        replicas = ["fake-host:{remote}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         agent = agent_binary(),
         remote = remote.display(),
     ));
@@ -1550,7 +1575,7 @@ fn watch_mode_observes_remote_changes_through_the_agent() {
         write(&remote, "from-remote.txt", "remote change");
         assert!(
             wait_until(Duration::from_secs(15), || {
-                alpha.join("from-remote.txt").exists()
+                primary.join("from-remote.txt").exists()
             }),
             "remote changes should be observed through the agent"
         );
@@ -1566,10 +1591,10 @@ fn watch_mode_observes_remote_changes_through_the_agent() {
 #[test]
 fn agents_install_automatically_over_ssh() {
     let world = World::new();
-    let alpha = world.directory("alpha");
+    let primary = world.directory("primary");
     let remote_home = world.directory("remote-home");
     let remote_mirror = world.directory("remote-mirror");
-    write(&alpha, "file.txt", "content");
+    write(&primary, "file.txt", "content");
 
     // A fake `ssh` that runs the remote command locally under the fake
     // remote home — auth-free SSH semantics, faithful enough for the
@@ -1621,11 +1646,11 @@ fn agents_install_automatically_over_ssh() {
         format!(
             r#"
             [groups.work]
-            alpha = "{alpha}"
+            primary = "{primary}"
             mode = "two-way-conflict"
-            betas = ["fake-host:{remote_mirror}"]
+            replicas = ["fake-host:{remote_mirror}"]
             "#,
-            alpha = alpha.display(),
+            primary = primary.display(),
             remote_mirror = remote_mirror.display(),
         ),
     )
@@ -1672,12 +1697,12 @@ fn agents_install_automatically_over_ssh() {
 #[test]
 fn sessions_on_one_host_share_one_agent_connection() {
     let world = World::new();
-    let alpha_one = world.directory("alpha-one");
-    let alpha_two = world.directory("alpha-two");
-    let beta_one = world.directory("beta-one");
-    let beta_two = world.directory("beta-two");
-    write(&alpha_one, "one.txt", "one");
-    write(&alpha_two, "two.txt", "two");
+    let primary_one = world.directory("primary-one");
+    let primary_two = world.directory("primary-two");
+    let replica_one = world.directory("replica-one");
+    let replica_two = world.directory("replica-two");
+    write(&primary_one, "one.txt", "one");
+    write(&primary_two, "two.txt", "two");
 
     // The wrapper counts agent launches: two sessions with the same spawn
     // command must share one pooled connection, and therefore one process.
@@ -1702,27 +1727,27 @@ fn sessions_on_one_host_share_one_agent_connection() {
         mode = "two-way-conflict"
 
         [groups.one]
-        alpha = "{alpha_one}"
+        primary = "{primary_one}"
         agent_command = "{script}"
-        betas = ["shared-host:{beta_one}"]
+        replicas = ["shared-host:{replica_one}"]
 
         [groups.two]
-        alpha = "{alpha_two}"
+        primary = "{primary_two}"
         agent_command = "{script}"
-        betas = ["shared-host:{beta_two}"]
+        replicas = ["shared-host:{replica_two}"]
         "#,
         script = script.display(),
-        alpha_one = alpha_one.display(),
-        alpha_two = alpha_two.display(),
-        beta_one = beta_one.display(),
-        beta_two = beta_two.display(),
+        primary_one = primary_one.display(),
+        primary_two = primary_two.display(),
+        replica_one = replica_one.display(),
+        replica_two = replica_two.display(),
     ));
     let outcomes = world.run_once(plans);
     assert_all_synchronized(&outcomes);
 
     // Both sessions synchronized...
-    assert_eq!(read(&beta_one, "one.txt"), "one");
-    assert_eq!(read(&beta_two, "two.txt"), "two");
+    assert_eq!(read(&replica_one, "one.txt"), "one");
+    assert_eq!(read(&replica_two, "two.txt"), "two");
     // ...through exactly one agent process.
     let launches = fs::read_to_string(&counter).expect("the counter should exist");
     assert_eq!(launches.lines().count(), 1, "{launches:?}");
@@ -1731,48 +1756,48 @@ fn sessions_on_one_host_share_one_agent_connection() {
 #[test]
 fn policy_flows_through_the_agent_protocol() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    fs::write(alpha.join("file.txt"), "content").expect("file should be writable");
-    std::os::unix::fs::symlink("file.txt", alpha.join("link")).expect("symlink");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    fs::write(primary.join("file.txt"), "content").expect("file should be writable");
+    std::os::unix::fs::symlink("file.txt", primary.join("link")).expect("symlink");
 
     // The group's policy — ignored symlinks and 0644 files — must govern the
     // *agent-side* endpoint, proving Initialize carries it across the wire.
     let plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         symlink_mode = "ignore"
         file_mode = "0644"
         directory_mode = "0755"
         agent_command = "{agent} agent"
-        betas = ["remote-host:{beta}"]
+        replicas = ["remote-host:{replica}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         agent = agent_binary(),
-        beta = beta.display(),
+        replica = replica.display(),
     ));
     let outcomes = world.run_once(plans);
     assert_all_synchronized(&outcomes);
 
-    assert_eq!(read(&beta, "file.txt"), "content");
+    assert_eq!(read(&replica, "file.txt"), "content");
     use std::os::unix::fs::MetadataExt;
-    let mode = fs::symlink_metadata(beta.join("file.txt"))
+    let mode = fs::symlink_metadata(replica.join("file.txt"))
         .expect("file should exist")
         .mode()
         & 0o777;
     assert_eq!(mode, 0o644);
     // The symlink was invisible on both sides.
-    assert!(!beta.join("link").exists());
+    assert!(!replica.join("link").exists());
 }
 
 #[test]
 fn remote_home_relative_roots_resolve_against_the_agent_home() {
     let world = World::new();
-    let alpha = world.directory("alpha");
+    let primary = world.directory("primary");
     let remote_home = world.directory("remote-home");
-    write(&alpha, "file.txt", "content");
+    write(&primary, "file.txt", "content");
 
     // The wrapper gives the agent its own home directory, standing in for a
     // remote host whose home differs from the local one.
@@ -1795,12 +1820,12 @@ fn remote_home_relative_roots_resolve_against_the_agent_home() {
     let plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         agent_command = "{script}"
-        betas = ["remote-host:~/mirror"]
+        replicas = ["remote-host:~/mirror"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         script = script.display(),
     ));
     assert_all_synchronized(&world.run_once(plans));
@@ -1830,14 +1855,14 @@ fn cli_code(world: &World, config: &Path, args: &[&str]) -> (Option<i32>, String
 }
 
 /// Writes a configuration of one two-way-conflict group per `(name,
-/// alpha, beta)`, with an extra line of settings for each.
+/// primary, replica)`, with an extra line of settings for each.
 fn exit_code_config(world: &World, groups: &[(&str, &Path, &str, &str)]) -> PathBuf {
     let config = world.path("config.toml");
     let mut text = String::new();
-    for (name, alpha, beta, extra) in groups {
+    for (name, primary, replica, extra) in groups {
         text.push_str(&format!(
-            "[groups.{name}]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{beta}\"]\n{extra}\n",
-            alpha.display()
+            "[groups.{name}]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{replica}\"]\n{extra}\n",
+            primary.display()
         ));
     }
     fs::write(&config, text).unwrap();
@@ -1847,27 +1872,27 @@ fn exit_code_config(world: &World, groups: &[(&str, &Path, &str, &str)]) -> Path
 #[test]
 fn sync_exits_zero_when_every_session_converged() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "content");
-    let beta_spec = beta.to_string_lossy().to_string();
-    let config = exit_code_config(&world, &[("g", &alpha, &beta_spec, "")]);
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "content");
+    let replica_spec = replica.to_string_lossy().to_string();
+    let config = exit_code_config(&world, &[("g", &primary, &replica_spec, "")]);
     let (code, text) = cli_code(&world, &config, &["sync"]);
     assert_eq!(code, Some(0), "{text}");
-    assert_eq!(read(&beta, "file.txt"), "content");
+    assert_eq!(read(&replica, "file.txt"), "content");
 }
 
 #[test]
 fn sync_exits_two_when_a_conflict_remains() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "original");
-    let beta_spec = beta.to_string_lossy().to_string();
-    let config = exit_code_config(&world, &[("g", &alpha, &beta_spec, "")]);
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "original");
+    let replica_spec = replica.to_string_lossy().to_string();
+    let config = exit_code_config(&world, &[("g", &primary, &replica_spec, "")]);
     assert_eq!(cli_code(&world, &config, &["sync"]).0, Some(0));
-    write(&alpha, "file.txt", "v-alpha");
-    write(&beta, "file.txt", "v-beta");
+    write(&primary, "file.txt", "v-primary");
+    write(&replica, "file.txt", "v-replica");
     let (code, text) = cli_code(&world, &config, &["sync"]);
     assert_eq!(code, Some(2), "{text}");
     assert!(text.contains("conflict"), "{text}");
@@ -1876,13 +1901,13 @@ fn sync_exits_two_when_a_conflict_remains() {
 #[test]
 fn sync_exits_one_when_a_destination_is_unreachable() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    write(&alpha, "file.txt", "content");
+    let primary = world.directory("primary");
+    write(&primary, "file.txt", "content");
     let config = exit_code_config(
         &world,
         &[(
             "g",
-            &alpha,
+            &primary,
             "unreachable-host:/anywhere",
             "agent_command = \"/nonexistent/agent-binary agent\"",
         )],
@@ -1896,20 +1921,20 @@ fn sync_exits_one_when_a_destination_is_unreachable() {
 #[test]
 fn sync_exits_with_the_worst_session_an_error_beating_a_conflict() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let doomed = world.directory("doomed");
-    write(&alpha, "file.txt", "original");
+    write(&primary, "file.txt", "original");
     write(&doomed, "file.txt", "content");
-    let beta_spec = beta.to_string_lossy().to_string();
-    let only_conflicted = exit_code_config(&world, &[("g", &alpha, &beta_spec, "")]);
+    let replica_spec = replica.to_string_lossy().to_string();
+    let only_conflicted = exit_code_config(&world, &[("g", &primary, &replica_spec, "")]);
     assert_eq!(cli_code(&world, &only_conflicted, &["sync"]).0, Some(0));
-    write(&alpha, "file.txt", "v-alpha");
-    write(&beta, "file.txt", "v-beta");
+    write(&primary, "file.txt", "v-primary");
+    write(&replica, "file.txt", "v-replica");
     let config = exit_code_config(
         &world,
         &[
-            ("g", &alpha, &beta_spec, ""),
+            ("g", &primary, &replica_spec, ""),
             (
                 "doomed",
                 &doomed,
@@ -1928,15 +1953,15 @@ fn sync_exits_with_the_worst_session_an_error_beating_a_conflict() {
 #[test]
 fn a_manual_sync_exits_two_when_a_conflict_remains() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "original");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "original");
     let state = world.path("manual-state");
     let run = || {
         let output = std::process::Command::new(agent_binary())
             .arg("sync")
-            .arg(&alpha)
-            .arg(&beta)
+            .arg(&primary)
+            .arg(&replica)
             .arg("--mode")
             .arg("two-way-conflict")
             .arg("--state-dir")
@@ -1950,8 +1975,8 @@ fn a_manual_sync_exits_two_when_a_conflict_remains() {
     };
     let (code, text) = run();
     assert_eq!(code, Some(0), "{text}");
-    write(&alpha, "file.txt", "v-alpha");
-    write(&beta, "file.txt", "v-beta");
+    write(&primary, "file.txt", "v-primary");
+    write(&replica, "file.txt", "v-replica");
     let (code, text) = run();
     assert_eq!(code, Some(2), "{text}");
 }
@@ -1983,17 +2008,17 @@ fn a_manual_sync_expands_a_quoted_tilde() {
 #[test]
 fn a_wildcard_negation_under_an_ignored_directory_is_warned_about() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "vendor/fix.patch", "patch");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "vendor/fix.patch", "patch");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n\
              ignores = [\"vendor\", \"!vendor/*.patch\"]\n",
-            alpha.display(),
-            beta.display()
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();
@@ -2003,7 +2028,7 @@ fn a_wildcard_negation_under_an_ignored_directory_is_warned_about() {
         text.contains("warning: group 'g': !vendor/*.patch has no effect"),
         "{text}"
     );
-    assert!(!beta.join("vendor").exists(), "{text}");
+    assert!(!replica.join("vendor").exists(), "{text}");
 }
 
 /// `diff` on a file inside two nested groups reads it under each group's
@@ -2020,8 +2045,8 @@ fn diff_of_a_path_in_nested_groups_reads_it_under_each_root() {
     fs::write(
         &config,
         format!(
-            "[groups.outer]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
-             [groups.inner]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "[groups.outer]\nmode = \"one-way-primary\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n\n\
+             [groups.inner]\nmode = \"one-way-primary\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
             outer.display(),
             b1.display(),
             inner.display(),
@@ -2059,36 +2084,36 @@ fn set_group_enabled(config: &Path, group: &str, enabled: bool) {
 /// A group whose session has state, with a second, active group beside it
 /// so the configuration still describes a session once the first is off.
 fn two_groups(world: &World, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    let other_alpha = world.directory("other-alpha");
-    let other_beta = world.directory("other-beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    let other_primary = world.directory("other-primary");
+    let other_replica = world.directory("other-replica");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
-            "[groups.g]\nmode = \"{mode}\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
-             [groups.other]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display(),
-            other_alpha.display(),
-            other_beta.display()
+            "[groups.g]\nmode = \"{mode}\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n\n\
+             [groups.other]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display(),
+            other_primary.display(),
+            other_replica.display()
         ),
     )
     .unwrap();
-    (config, alpha, beta)
+    (config, primary, replica)
 }
 
 #[test]
 fn clean_keeps_a_disabled_sessions_state_so_enabling_resumes() {
     let world = World::new();
-    let (config, alpha, beta) = two_groups(&world, "two-way-conflict");
-    write(&alpha, "gone.txt", "content");
+    let (config, primary, replica) = two_groups(&world, "two-way-conflict");
+    write(&primary, "gone.txt", "content");
     assert!(cli(&world, &config, &["sync"]).0);
-    assert_eq!(read(&beta, "gone.txt"), "content");
+    assert_eq!(read(&replica, "gone.txt"), "content");
 
     // Deleted, then turned off before the deletion was carried.
-    fs::remove_file(alpha.join("gone.txt")).unwrap();
+    fs::remove_file(primary.join("gone.txt")).unwrap();
     set_group_enabled(&config, "g", false);
     let (ok, text) = cli(&world, &config, &["clean"]);
     assert!(ok, "{text}");
@@ -2098,15 +2123,15 @@ fn clean_keeps_a_disabled_sessions_state_so_enabling_resumes() {
     let (ok, text) = cli(&world, &config, &["sync"]);
     assert!(ok, "{text}");
     // The ancestor survived, so the deletion is carried, not undone.
-    assert!(!alpha.join("gone.txt").exists(), "{text}");
-    assert!(!beta.join("gone.txt").exists(), "{text}");
+    assert!(!primary.join("gone.txt").exists(), "{text}");
+    assert!(!replica.join("gone.txt").exists(), "{text}");
 }
 
 #[test]
 fn clean_include_disabled_lists_the_disabled_session_and_plain_clean_does_not() {
     let world = World::new();
-    let (config, alpha, _) = two_groups(&world, "two-way-conflict");
-    write(&alpha, "file.txt", "content");
+    let (config, primary, _) = two_groups(&world, "two-way-conflict");
+    write(&primary, "file.txt", "content");
     assert!(cli(&world, &config, &["sync"]).0);
     set_group_enabled(&config, "g", false);
 
@@ -2137,8 +2162,8 @@ fn clean_include_disabled_lists_the_disabled_session_and_plain_clean_does_not() 
 #[test]
 fn clean_keeps_state_it_cannot_attribute_to_a_broken_disabled_group() {
     let world = World::new();
-    let (config, alpha, _) = two_groups(&world, "two-way-conflict");
-    write(&alpha, "file.txt", "content");
+    let (config, primary, _) = two_groups(&world, "two-way-conflict");
+    write(&primary, "file.txt", "content");
     assert!(cli(&world, &config, &["sync"]).0);
     let text = fs::read_to_string(&config).unwrap().replacen(
         "mode = \"two-way-conflict\"",
@@ -2218,30 +2243,30 @@ fn cli(world: &World, config: &Path, args: &[&str]) -> (bool, String) {
     (output.status.success(), text)
 }
 
-/// A fan-out in conflict three ways: one file edited differently on alpha
+/// A fan-out in conflict three ways: one file edited differently on primary
 /// and on each of two destinations.
 fn three_way_conflict(world: &World) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
-    let alpha = world.directory("alpha");
+    let primary = world.directory("primary");
     let b1 = world.directory("b1");
     let b2 = world.directory("b2");
-    write(&alpha, "notes.txt", "original");
+    write(&primary, "notes.txt", "original");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
-            "[groups.r]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
-            alpha.display(),
+            "[groups.r]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\", \"{}\"]\n",
+            primary.display(),
             b1.display(),
             b2.display()
         ),
     )
     .unwrap();
     assert!(cli(world, &config, &["sync"]).0, "the first sync converges");
-    write(&alpha, "notes.txt", "v-alpha");
+    write(&primary, "notes.txt", "v-primary");
     write(&b1, "notes.txt", "v-b1");
     write(&b2, "notes.txt", "v-b2");
     cli(world, &config, &["sync"]);
-    (config, alpha, b1, b2)
+    (config, primary, b1, b2)
 }
 
 #[test]
@@ -2255,14 +2280,14 @@ fn conflicts_lists_every_side_with_what_it_holds() {
     assert!(text.contains(&b2.to_string_lossy().to_string()), "{text}");
     // Both sides are described — the size is the proof the details
     // recorded at conflict time reached the listing.
-    assert!(text.contains("alpha  7 B"), "{text}");
-    assert!(text.contains("--keep alpha|"), "{text}");
+    assert!(text.contains("primary  9 B"), "{text}");
+    assert!(text.contains("--keep primary|"), "{text}");
 }
 
 #[test]
 fn diff_shows_the_two_sides_by_group_or_by_file_path() {
     let world = World::new();
-    let (config, alpha, _, b2) = three_way_conflict(&world);
+    let (config, primary, _, b2) = three_way_conflict(&world);
     let b2_spec = b2.to_string_lossy().to_string();
 
     let (_, by_group) = cli(
@@ -2271,15 +2296,15 @@ fn diff_shows_the_two_sides_by_group_or_by_file_path() {
         &["diff", "r", "notes.txt", "--host", &b2_spec],
     );
     assert!(
-        by_group.contains("-v-alpha") && by_group.contains("+v-b2"),
+        by_group.contains("-v-primary") && by_group.contains("+v-b2"),
         "{by_group}"
     );
 
     // Addressed by the file itself, from anywhere.
-    let file = alpha.join("notes.txt").to_string_lossy().to_string();
+    let file = primary.join("notes.txt").to_string_lossy().to_string();
     let (_, by_path) = cli(&world, &config, &["diff", &file, "--host", &b2_spec]);
     assert!(
-        by_path.contains("-v-alpha") && by_path.contains("+v-b2"),
+        by_path.contains("-v-primary") && by_path.contains("+v-b2"),
         "{by_path}"
     );
 }
@@ -2287,11 +2312,11 @@ fn diff_shows_the_two_sides_by_group_or_by_file_path() {
 #[test]
 fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
     let world = World::new();
-    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    let (config, primary, b1, b2) = three_way_conflict(&world);
     let b1_spec = b1.to_string_lossy().to_string();
     // Addressed by a path inside the root, and keeping b1's version: it
-    // must reach alpha *and* b2, whose own conflict is settled by it.
-    let file = alpha.join("notes.txt").to_string_lossy().to_string();
+    // must reach primary *and* b2, whose own conflict is settled by it.
+    let file = primary.join("notes.txt").to_string_lossy().to_string();
     let (ok, text) = cli(
         &world,
         &config,
@@ -2299,10 +2324,10 @@ fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
     );
     assert!(ok, "{text}");
     // Resolution retires the losing versions; the cycle carries the winner.
-    // Two cycles, because b2's copy reaches it through alpha.
+    // Two cycles, because b2's copy reaches it through primary.
     cli(&world, &config, &["sync"]);
     cli(&world, &config, &["sync"]);
-    for root in [&alpha, &b1, &b2] {
+    for root in [&primary, &b1, &b2] {
         assert_eq!(read(root, "notes.txt"), "v-b1");
     }
     let (_, after) = cli(&world, &config, &["conflicts"]);
@@ -2312,7 +2337,7 @@ fn resolve_keeping_one_destination_settles_the_whole_fan_out() {
 #[test]
 fn resolve_keeping_both_renames_the_loser_aside() {
     let world = World::new();
-    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    let (config, primary, b1, b2) = three_way_conflict(&world);
     let (ok, text) = cli(
         &world,
         &config,
@@ -2323,12 +2348,12 @@ fn resolve_keeping_both_renames_the_loser_aside() {
     // the losing side and nothing has to be moved to preserve it.
     assert_eq!(read(&b1, "notes.txt.b1"), "v-b1");
     assert_eq!(read(&b2, "notes.txt.b2"), "v-b2");
-    // Everything else is ordinary propagation: alpha's version fills the
+    // Everything else is ordinary propagation: primary's version fills the
     // names the renames vacated, and each aside reaches the other roots.
     cli(&world, &config, &["sync"]);
     cli(&world, &config, &["sync"]);
-    for root in [&alpha, &b1, &b2] {
-        assert_eq!(read(root, "notes.txt"), "v-alpha");
+    for root in [&primary, &b1, &b2] {
+        assert_eq!(read(root, "notes.txt"), "v-primary");
         assert_eq!(read(root, "notes.txt.b1"), "v-b1");
         assert_eq!(read(root, "notes.txt.b2"), "v-b2");
     }
@@ -2340,16 +2365,16 @@ fn resolve_keeping_both_renames_the_loser_aside() {
 /// winner is exercised, because each retires a different side.
 #[test]
 fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
-    for keep in ["alpha", "b1", "both"] {
+    for keep in ["primary", "b1", "both"] {
         let world = World::new();
-        let (config, alpha, b1, _) = three_way_conflict(&world);
+        let (config, primary, b1, _) = three_way_conflict(&world);
         // `tree` is a populated directory on one side and a file on the
         // other, both created since the ancestor: neither change is a
         // deletion, so it is a genuine conflict rather than a propagation.
         // Large enough that a mistake would trip the emptied-subtree halt.
         let (directory, file) = match keep {
-            "b1" => (&alpha, &b1),
-            _ => (&b1, &alpha),
+            "b1" => (&primary, &b1),
+            _ => (&b1, &primary),
         };
         fs::create_dir_all(directory.join("tree/inner")).unwrap();
         for n in 0..9 {
@@ -2380,7 +2405,7 @@ fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
         assert!(!after.contains("tree"), "keeping {keep}: {after}");
         match keep {
             // The file wins: the tree is gone from every root.
-            "alpha" | "b1" => {
+            "primary" | "b1" => {
                 assert_eq!(read(file, "tree"), "the file version");
                 assert_eq!(read(directory, "tree"), "the file version");
                 assert!(!directory.join("tree/inner").exists(), "the tree is gone");
@@ -2388,8 +2413,8 @@ fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
             // Both are kept: the loser's whole tree survives under a free
             // name, which is the thing a rename can do and a copy cannot.
             _ => {
-                assert_eq!(read(&alpha, "tree"), "the file version");
-                assert_eq!(read(&alpha, "tree.b1/inner/f0"), "held");
+                assert_eq!(read(&primary, "tree"), "the file version");
+                assert_eq!(read(&primary, "tree.b1/inner/f0"), "held");
                 assert_eq!(read(&b1, "tree.b1/inner/f8"), "held");
             }
         }
@@ -2404,30 +2429,33 @@ fn resolve_settles_a_conflict_between_a_directory_and_a_file() {
 #[test]
 fn deleting_a_project_propagates_even_though_it_holds_ignored_content() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("b1");
-    write(&alpha, "seed", "seed");
+    let primary = world.directory("primary");
+    let replica = world.directory("b1");
+    write(&primary, "seed", "seed");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
             "[defaults]\nmode = \"two-way-conflict\"\nignores = [\".git\", \"node_modules\"]\n\
-             [groups.r]\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+             [groups.r]\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();
     assert!(cli(&world, &config, &["sync"]).0);
 
-    write(&beta, "project/.git/HEAD", "ref");
-    write(&beta, "project/node_modules/dep.js", "dep");
-    write(&beta, "project/src/main.rs", "fn main() {}");
+    write(&replica, "project/.git/HEAD", "ref");
+    write(&replica, "project/node_modules/dep.js", "dep");
+    write(&replica, "project/src/main.rs", "fn main() {}");
     cli(&world, &config, &["sync"]);
-    assert_eq!(read(&alpha, "project/src/main.rs"), "fn main() {}");
-    assert!(!alpha.join("project/.git").exists(), "ignored, so not sent");
+    assert_eq!(read(&primary, "project/src/main.rs"), "fn main() {}");
+    assert!(
+        !primary.join("project/.git").exists(),
+        "ignored, so not sent"
+    );
 
-    fs::remove_dir_all(alpha.join("project")).unwrap();
+    fs::remove_dir_all(primary.join("project")).unwrap();
     let (_, first) = cli(&world, &config, &["sync"]);
 
     // The whole tree goes, ignored content included. An ignore says which
@@ -2437,7 +2465,7 @@ fn deleting_a_project_propagates_even_though_it_holds_ignored_content() {
     // neither reading — the tree is not deleted, and what stays is litter
     // synchronization can never clear.
     assert!(
-        !beta.join("project").exists(),
+        !replica.join("project").exists(),
         "the tree evaporated: {first}"
     );
 
@@ -2446,8 +2474,8 @@ fn deleting_a_project_propagates_even_though_it_holds_ignored_content() {
 
     for _ in 0..3 {
         let (_, text) = cli(&world, &config, &["sync"]);
-        assert!(text.contains("0 change(s) to alpha"), "quiet: {text}");
-        assert!(text.contains("0 change(s) to beta"), "quiet: {text}");
+        assert!(text.contains("0 change(s) to primary"), "quiet: {text}");
+        assert!(text.contains("0 change(s) to replica"), "quiet: {text}");
     }
     let (_, issues) = cli(&world, &config, &["conflicts"]);
     assert!(issues.contains("nothing needs you"), "{issues}");
@@ -2464,18 +2492,18 @@ fn deleting_a_project_propagates_even_though_it_holds_ignored_content() {
 #[test]
 fn a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted() {
     let world = World::new();
-    let outer_alpha = world.directory("outer-alpha");
-    let outer_beta = world.directory("outer-beta");
-    let inner_beta = world.directory("inner-beta");
+    let outer_primary = world.directory("outer-primary");
+    let outer_replica = world.directory("outer-replica");
+    let inner_replica = world.directory("inner-replica");
 
     let outer = world.path("outer.toml");
     fs::write(
         &outer,
         format!(
             "[groups.outer]\nmode = \"two-way-conflict\"\nignores = [\"nested\"]\n\
-             alpha = \"{}\"\nbetas = [\"{}\"]\n",
-            outer_alpha.display(),
-            outer_beta.display()
+             primary = \"{}\"\nreplicas = [\"{}\"]\n",
+            outer_primary.display(),
+            outer_replica.display()
         ),
     )
     .unwrap();
@@ -2485,27 +2513,27 @@ fn a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted() {
     fs::write(
         &inner,
         format!(
-            "[groups.inner]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            outer_beta.join("proj/nested").display(),
-            inner_beta.display()
+            "[groups.inner]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            outer_replica.join("proj/nested").display(),
+            inner_replica.display()
         ),
     )
     .unwrap();
 
     // A sibling, so deleting `proj` is not also emptying the root — that
     // trips a different guard and would prove nothing about this one.
-    write(&outer_alpha, "other.txt", "keep");
-    write(&outer_alpha, "proj/src/main.rs", "code");
+    write(&outer_primary, "other.txt", "keep");
+    write(&outer_primary, "proj/src/main.rs", "code");
     assert!(cli(&world, &outer, &["sync"]).0);
-    write(&outer_beta, "proj/nested/data.txt", "precious");
+    write(&outer_replica, "proj/nested/data.txt", "precious");
     assert!(cli(&world, &inner, &["sync"]).0);
-    assert_eq!(read(&inner_beta, "data.txt"), "precious");
+    assert_eq!(read(&inner_replica, "data.txt"), "precious");
 
-    fs::remove_dir_all(outer_alpha.join("proj")).unwrap();
+    fs::remove_dir_all(outer_primary.join("proj")).unwrap();
     let (ok, text) = cli(&world, &outer, &["sync"]);
     assert!(ok, "{text}");
     // The tree went whole, the nested root with it.
-    assert!(!outer_beta.join("proj").exists(), "{text}");
+    assert!(!outer_replica.join("proj").exists(), "{text}");
 
     // The nested session refuses to carry that loss any further.
     let (ok, text) = cli(&world, &inner, &["sync"]);
@@ -2514,7 +2542,7 @@ fn a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted() {
         text.contains("halted") && text.contains("is missing"),
         "{text}"
     );
-    assert_eq!(read(&inner_beta, "data.txt"), "precious");
+    assert_eq!(read(&inner_replica, "data.txt"), "precious");
 }
 
 /// A conflict whose losing side holds ignored content settles like any
@@ -2525,17 +2553,17 @@ fn a_nested_session_halts_when_an_ignored_path_holding_its_root_is_deleted() {
 #[test]
 fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("b1");
-    write(&alpha, "seed", "seed");
+    let primary = world.directory("primary");
+    let replica = world.directory("b1");
+    write(&primary, "seed", "seed");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
             "[defaults]\nmode = \"two-way-conflict\"\nignores = [\".git\"]\n\
-             [groups.r]\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+             [groups.r]\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();
@@ -2543,9 +2571,9 @@ fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
 
     // A genuine disagreement, not a deletion: a file on one side and a
     // project directory on the other, both new since the ancestor.
-    write(&alpha, "project", "alpha's file");
-    write(&beta, "project/.git/HEAD", "ref");
-    write(&beta, "project/src/main.rs", "fn main() {}");
+    write(&primary, "project", "primary's file");
+    write(&replica, "project/.git/HEAD", "ref");
+    write(&replica, "project/src/main.rs", "fn main() {}");
     cli(&world, &config, &["sync"]);
     let (_, listed) = cli(&world, &config, &["conflicts"]);
     assert!(listed.contains("project"), "a conflict: {listed}");
@@ -2553,7 +2581,7 @@ fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "project", "--keep", "alpha", "--yes"],
+        &["resolve", "r", "project", "--keep", "primary", "--yes"],
     );
     assert!(ok, "{text}");
     assert!(text.contains("settled 1 of 1"), "{text}");
@@ -2561,57 +2589,57 @@ fn resolve_settles_a_conflict_whose_loser_holds_ignored_content() {
         cli(&world, &config, &["sync"]);
     }
 
-    // Alpha's version won everywhere, and the loser's tree went whole —
+    // Primary's version won everywhere, and the loser's tree went whole —
     // resolution follows the same rule the cycle does, so a `.git` inside
     // the losing version is no more of an obstacle here than there.
-    assert_eq!(read(&alpha, "project"), "alpha's file");
-    assert_eq!(read(&beta, "project"), "alpha's file");
+    assert_eq!(read(&primary, "project"), "primary's file");
+    assert_eq!(read(&replica, "project"), "primary's file");
     let (_, after) = cli(&world, &config, &["conflicts"]);
     assert!(after.contains("nothing needs you"), "{after}");
 }
 
-/// A group of one alpha and one beta in `mode`, holding `keep.txt` and a
+/// A group of one primary and one replica in `mode`, holding `keep.txt` and a
 /// sibling (so no guard about emptied roots is in play), synchronized once.
 fn one_pair(world: &World, mode: &str) -> (PathBuf, PathBuf, PathBuf) {
-    let alpha = world.directory("alpha");
-    let beta = world.directory("b1");
-    write(&alpha, "keep.txt", "original");
-    write(&alpha, "other.txt", "other");
+    let primary = world.directory("primary");
+    let replica = world.directory("b1");
+    write(&primary, "keep.txt", "original");
+    write(&primary, "other.txt", "other");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
-            "[groups.r]\nmode = \"{mode}\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.r]\nmode = \"{mode}\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();
     assert!(cli(world, &config, &["sync"]).0, "the first sync converges");
-    assert_eq!(read(&beta, "keep.txt"), "original");
-    (config, alpha, beta)
+    assert_eq!(read(&replica, "keep.txt"), "original");
+    (config, primary, replica)
 }
 
 /// Resolving a path both sides already agree on retires nothing. Before
-/// the guard it retired beta's copy, and the next cycle read that as a
-/// deletion against an unchanged alpha and took the file from both sides.
+/// the guard it retired replica's copy, and the next cycle read that as a
+/// deletion against an unchanged primary and took the file from both sides.
 #[test]
 fn resolving_an_in_sync_path_twice_keeps_it_everywhere() {
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
+    let (config, primary, replica) = one_pair(&world, "two-way-conflict");
     for _ in 0..2 {
         let (ok, text) = cli(
             &world,
             &config,
-            &["resolve", "r", "keep.txt", "--keep", "alpha", "--yes"],
+            &["resolve", "r", "keep.txt", "--keep", "primary", "--yes"],
         );
         assert!(ok, "{text}");
         assert!(text.contains("already the same on every side"), "{text}");
         cli(&world, &config, &["sync"]);
     }
     cli(&world, &config, &["sync"]);
-    assert_eq!(read(&alpha, "keep.txt"), "original");
-    assert_eq!(read(&beta, "keep.txt"), "original");
+    assert_eq!(read(&primary, "keep.txt"), "original");
+    assert_eq!(read(&replica, "keep.txt"), "original");
 }
 
 /// The root is never a path to resolve: retiring it would retire the
@@ -2619,20 +2647,20 @@ fn resolving_an_in_sync_path_twice_keeps_it_everywhere() {
 #[test]
 fn resolving_the_root_is_refused() {
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
-    write(&beta, "keep.txt", "beta's edit");
+    let (config, primary, replica) = one_pair(&world, "two-way-conflict");
+    write(&replica, "keep.txt", "replica's edit");
     for root in ["./", ".", ""] {
         let (ok, text) = cli(
             &world,
             &config,
-            &["resolve", "r", root, "--keep", "alpha", "--yes"],
+            &["resolve", "r", root, "--keep", "primary", "--yes"],
         );
         assert!(!ok, "resolving {root:?} must fail: {text}");
         assert!(text.contains("not the root"), "{text}");
     }
-    assert_eq!(read(&alpha, "keep.txt"), "original");
-    assert_eq!(read(&beta, "keep.txt"), "beta's edit");
-    assert_eq!(read(&beta, "other.txt"), "other");
+    assert_eq!(read(&primary, "keep.txt"), "original");
+    assert_eq!(read(&replica, "keep.txt"), "replica's edit");
+    assert_eq!(read(&replica, "other.txt"), "other");
 }
 
 /// Keeping a side that has not changed since the last sync makes every
@@ -2642,25 +2670,25 @@ fn resolving_the_root_is_refused() {
 #[test]
 fn keeping_an_unchanged_side_makes_every_side_match_it() {
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
-    write(&beta, "keep.txt", "beta's edit");
+    let (config, primary, replica) = one_pair(&world, "two-way-conflict");
+    write(&replica, "keep.txt", "replica's edit");
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "keep.txt", "--keep", "alpha", "--yes"],
+        &["resolve", "r", "keep.txt", "--keep", "primary", "--yes"],
     );
     assert!(ok, "{text}");
     assert!(text.contains("settled 1 of 1"), "{text}");
     for _ in 0..3 {
         assert!(cli(&world, &config, &["sync"]).0);
-        assert_eq!(read(&alpha, "keep.txt"), "original");
-        assert_eq!(read(&beta, "keep.txt"), "original");
+        assert_eq!(read(&primary, "keep.txt"), "original");
+        assert_eq!(read(&replica, "keep.txt"), "original");
     }
 
     // `--keep both` keeps the unchanged name, and the copy moved aside.
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
-    write(&beta, "keep.txt", "beta's edit");
+    let (config, primary, replica) = one_pair(&world, "two-way-conflict");
+    write(&replica, "keep.txt", "replica's edit");
     let (ok, text) = cli(
         &world,
         &config,
@@ -2669,52 +2697,52 @@ fn keeping_an_unchanged_side_makes_every_side_match_it() {
     assert!(ok, "{text}");
     for _ in 0..3 {
         assert!(cli(&world, &config, &["sync"]).0);
-        for root in [&alpha, &beta] {
+        for root in [&primary, &replica] {
             assert_eq!(read(root, "keep.txt"), "original");
-            assert_eq!(read(root, "keep.txt.b1"), "beta's edit");
+            assert_eq!(read(root, "keep.txt.b1"), "replica's edit");
         }
     }
 }
 
-/// A one-way mode never carries beta's content to alpha, so retiring
-/// alpha's copy cannot make beta's version win.
+/// A one-way mode never carries replica's content to primary, so retiring
+/// primary's copy cannot make replica's version win.
 #[test]
-fn keeping_beta_in_a_one_way_mode_is_refused() {
+fn keeping_replica_in_a_one_way_mode_is_refused() {
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "one-way-alpha");
-    write(&alpha, "keep.txt", "alpha's edit");
-    let beta_spec = beta.to_string_lossy().to_string();
+    let (config, primary, replica) = one_pair(&world, "one-way-primary");
+    write(&primary, "keep.txt", "primary's edit");
+    let replica_spec = replica.to_string_lossy().to_string();
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "keep.txt", "--keep", &beta_spec, "--yes"],
+        &["resolve", "r", "keep.txt", "--keep", &replica_spec, "--yes"],
     );
     assert!(!ok, "{text}");
-    assert!(text.contains("one-way-alpha"), "{text}");
-    assert_eq!(read(&alpha, "keep.txt"), "alpha's edit");
-    assert_eq!(read(&beta, "keep.txt"), "original");
+    assert!(text.contains("one-way-primary"), "{text}");
+    assert_eq!(read(&primary, "keep.txt"), "primary's edit");
+    assert_eq!(read(&replica, "keep.txt"), "original");
 }
 
-/// In two-way-alpha-strict alpha's deletion beats beta's edit, so stage 1
-/// refused to keep beta there. With the path forgotten, beta's version is
-/// a creation, which flows to alpha in that mode like any other.
+/// In two-way-primary-strict primary's deletion beats replica's edit, so stage 1
+/// refused to keep replica there. With the path forgotten, replica's version is
+/// a creation, which flows to primary in that mode like any other.
 #[test]
-fn keeping_beta_in_the_strict_mode_wins() {
+fn keeping_replica_in_the_strict_mode_wins() {
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "two-way-alpha-strict");
-    write(&alpha, "keep.txt", "alpha's edit");
-    let beta_spec = beta.to_string_lossy().to_string();
+    let (config, primary, replica) = one_pair(&world, "two-way-primary-strict");
+    write(&primary, "keep.txt", "primary's edit");
+    let replica_spec = replica.to_string_lossy().to_string();
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "keep.txt", "--keep", &beta_spec, "--yes"],
+        &["resolve", "r", "keep.txt", "--keep", &replica_spec, "--yes"],
     );
     assert!(ok, "{text}");
     assert!(text.contains("settled 1 of 1"), "{text}");
     for _ in 0..3 {
         assert!(cli(&world, &config, &["sync"]).0);
-        assert_eq!(read(&alpha, "keep.txt"), "original");
-        assert_eq!(read(&beta, "keep.txt"), "original");
+        assert_eq!(read(&primary, "keep.txt"), "original");
+        assert_eq!(read(&replica, "keep.txt"), "original");
     }
 }
 
@@ -2732,26 +2760,26 @@ enum Shape {
     Directory,
 }
 
-/// Resolves `shape` in `mode`, keeping `keep` (`alpha`, `beta` or `both`),
+/// Resolves `shape` in `mode`, keeping `keep` (`primary`, `replica` or `both`),
 /// and checks the outcome over three more cycles.
 fn resolve_in(mode: &str, keep: &str, shape: Shape) {
     let label = format!("{mode}, keeping {keep}, {shape:?}");
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, mode);
+    let (config, primary, replica) = one_pair(&world, mode);
     let path = match shape {
         Shape::Directory => {
             for n in 0..9 {
-                write(&alpha, &format!("tree/f{n}"), "original");
+                write(&primary, &format!("tree/f{n}"), "original");
             }
             assert!(cli(&world, &config, &["sync"]).0, "{label}");
-            assert_eq!(read(&beta, "tree/f8"), "original", "{label}");
+            assert_eq!(read(&replica, "tree/f8"), "original", "{label}");
             "tree"
         }
         _ => "keep.txt",
     };
     let (winner, loser) = match keep {
-        "beta" => (&beta, &alpha),
-        _ => (&alpha, &beta),
+        "replica" => (&replica, &primary),
+        _ => (&primary, &replica),
     };
     match shape {
         Shape::Agreed => {}
@@ -2767,9 +2795,9 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
         }
     }
 
-    let beta_spec = beta.to_string_lossy().to_string();
+    let replica_spec = replica.to_string_lossy().to_string();
     let argument = match keep {
-        "beta" => beta_spec.as_str(),
+        "replica" => replica_spec.as_str(),
         other => other,
     };
     let (ok, text) = cli(
@@ -2778,7 +2806,7 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
         &["resolve", "r", path, "--keep", argument, "--yes"],
     );
     let one_way = mode.starts_with("one-way");
-    if (one_way && keep == "beta") || (mode == "one-way-alpha" && keep == "both") {
+    if (one_way && keep == "replica") || (mode == "one-way-primary" && keep == "both") {
         assert!(!ok, "{label}: {text}");
         assert!(text.contains(mode), "{label}: {text}");
         assert!(text.contains("Nothing was changed"), "{label}: {text}");
@@ -2790,17 +2818,17 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
         _ => assert!(text.contains("settled 1 of 1"), "{label}: {text}"),
     }
 
-    // The loser's version, kept aside, reaches alpha too — except in the
-    // one mode that never carries beta's additions.
+    // The loser's version, kept aside, reaches primary too — except in the
+    // one mode that never carries replica's additions.
     let aside_roots: Vec<&PathBuf> = match mode {
-        "one-way-conflict" => vec![&beta],
-        _ => vec![&alpha, &beta],
+        "one-way-conflict" => vec![&replica],
+        _ => vec![&primary, &replica],
     };
     for cycle in 1..=3 {
         let (ok, synced) = cli(&world, &config, &["sync"]);
         assert!(ok, "{label}, cycle {cycle}: {synced}");
         let context = format!("{label}, cycle {cycle}");
-        for root in [&alpha, &beta] {
+        for root in [&primary, &replica] {
             assert_eq!(read(root, "other.txt"), "other", "{context}");
             match shape {
                 Shape::Agreed | Shape::LoserEdited => {
@@ -2819,7 +2847,7 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
         if keep != "both" {
             continue;
         }
-        for root in [&alpha, &beta] {
+        for root in [&primary, &replica] {
             let expected = aside_roots.contains(&root);
             let (aside, content) = match shape {
                 Shape::Agreed => {
@@ -2841,12 +2869,12 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
 fn resolve_in_every_mode(shape: Shape) {
     for mode in [
         "two-way-conflict",
-        "two-way-alpha",
-        "two-way-alpha-strict",
+        "two-way-primary",
+        "two-way-primary-strict",
         "one-way-conflict",
-        "one-way-alpha",
+        "one-way-primary",
     ] {
-        for keep in ["alpha", "beta", "both"] {
+        for keep in ["primary", "replica", "both"] {
             resolve_in(mode, keep, shape);
         }
     }
@@ -2873,29 +2901,29 @@ fn resolving_a_directory_works_in_every_mode() {
 }
 
 /// Keeping a destination that has not changed since the last sync, named
-/// alone, while alpha and the other destination edited: every side ends
+/// alone, while primary and the other destination edited: every side ends
 /// with the winner's version, the unnamed destination included.
 #[test]
 fn keeping_an_unchanged_destination_reaches_every_other_one() {
     let world = World::new();
-    let alpha = world.directory("alpha");
+    let primary = world.directory("primary");
     let b1 = world.directory("b1");
     let b2 = world.directory("b2");
-    write(&alpha, "notes.txt", "original");
-    write(&alpha, "other.txt", "other");
+    write(&primary, "notes.txt", "original");
+    write(&primary, "other.txt", "other");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
-            "[groups.r]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
-            alpha.display(),
+            "[groups.r]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\", \"{}\"]\n",
+            primary.display(),
             b1.display(),
             b2.display()
         ),
     )
     .unwrap();
     assert!(cli(&world, &config, &["sync"]).0);
-    write(&alpha, "notes.txt", "v-alpha");
+    write(&primary, "notes.txt", "v-primary");
     write(&b2, "notes.txt", "v-b2");
     let b1_spec = b1.to_string_lossy().to_string();
     let (ok, text) = cli(
@@ -2914,11 +2942,11 @@ fn keeping_an_unchanged_destination_reaches_every_other_one() {
     );
     assert!(ok, "{text}");
     assert!(text.contains("settled 1 of 1"), "{text}");
-    // Two cycles to reach b2 through alpha, then one more to be sure.
+    // Two cycles to reach b2 through primary, then one more to be sure.
     for _ in 0..3 {
         assert!(cli(&world, &config, &["sync"]).0);
     }
-    for root in [&alpha, &b1, &b2] {
+    for root in [&primary, &b1, &b2] {
         assert_eq!(read(root, "notes.txt"), "original");
         assert_eq!(read(root, "other.txt"), "other");
     }
@@ -2933,7 +2961,7 @@ fn keeping_an_unchanged_destination_reaches_every_other_one() {
 #[test]
 fn a_running_supervisor_applies_a_resolution_across_the_fan_out() {
     let world = World::new();
-    let (config, alpha, b1, b2) = three_way_conflict(&world);
+    let (config, primary, b1, b2) = three_way_conflict(&world);
     let text = fs::read_to_string(&config).unwrap();
     let plans = world.plans(&text);
     fs::write(&config, &text).unwrap();
@@ -2961,7 +2989,7 @@ fn a_running_supervisor_applies_a_resolution_across_the_fan_out() {
         assert!(text.contains("copying the kept version across"), "{text}");
         assert!(
             wait_until(Duration::from_secs(20), || {
-                [&alpha, &b1, &b2].iter().all(|root| {
+                [&primary, &b1, &b2].iter().all(|root| {
                     fs::read_to_string(root.join("notes.txt")).ok().as_deref() == Some("v-b1")
                 })
             }),
@@ -2985,14 +3013,14 @@ fn a_running_supervisor_applies_a_resolution_across_the_fan_out() {
 #[test]
 fn settling_a_file_named_like_a_flag_settles_only_that_file() {
     let world = World::new();
-    let (config, alpha, b1, _) = three_way_conflict(&world);
-    write(&alpha, "--all", "a");
+    let (config, primary, b1, _) = three_way_conflict(&world);
+    write(&primary, "--all", "a");
     write(&b1, "--all", "b");
     cli(&world, &config, &["sync"]);
     let (_, listed) = cli(&world, &config, &["conflicts"]);
     assert!(listed.contains("--all"), "{listed}");
 
-    let command = autobahn::invocation::resolve_command("r", "alpha", &["--all".to_owned()]);
+    let command = autobahn::invocation::resolve_command("r", "primary", &["--all".to_owned()]);
     let command = autobahn::invocation::with_options(
         &command,
         &[
@@ -3045,23 +3073,23 @@ fn without_colour(text: &str) -> String {
 #[test]
 fn a_name_with_control_characters_is_printed_escaped() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("b1");
-    write(&alpha, "seed", "seed");
+    let primary = world.directory("primary");
+    let replica = world.directory("b1");
+    write(&primary, "seed", "seed");
     let config = world.path("config.toml");
     fs::write(
         &config,
         format!(
-            "[groups.r]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.r]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();
     assert!(cli(&world, &config, &["sync"]).0);
     let name = "evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jsettled.txt";
-    write(&alpha, name, "a");
-    write(&beta, name, "b");
+    write(&primary, name, "a");
+    write(&replica, name, "b");
     cli(&world, &config, &["sync"]);
 
     for args in [&["status", "--all", "--conflicts"][..], &["conflicts"][..]] {
@@ -3151,17 +3179,17 @@ fn no_color_on_a_terminal_takes_the_colour_away() {
     assert!(plain.contains("\x1b[1m"), "{plain:?}");
 }
 
-/// Keeping one destination's version where alpha has no copy at all:
-/// alpha's side has nothing to retire, and the other destination must
-/// still be checked as though alpha already holds the winner's version,
+/// Keeping one destination's version where primary has no copy at all:
+/// primary's side has nothing to retire, and the other destination must
+/// still be checked as though primary already holds the winner's version,
 /// which is what it will hold once the winning session has run.
 #[test]
-fn keeping_a_destination_where_alpha_has_no_copy_settles_the_fan_out() {
+fn keeping_a_destination_where_primary_has_no_copy_settles_the_fan_out() {
     let world = World::new();
-    let (config, alpha, b1, b2) = three_way_conflict(&world);
-    write(&alpha, "fresh.txt", "seed");
+    let (config, primary, b1, b2) = three_way_conflict(&world);
+    write(&primary, "fresh.txt", "seed");
     cli(&world, &config, &["sync"]);
-    fs::remove_file(alpha.join("fresh.txt")).unwrap();
+    fs::remove_file(primary.join("fresh.txt")).unwrap();
     write(&b1, "fresh.txt", "v-b1");
     write(&b2, "fresh.txt", "v-b2");
     let b1_spec = b1.to_string_lossy().to_string();
@@ -3175,7 +3203,7 @@ fn keeping_a_destination_where_alpha_has_no_copy_settles_the_fan_out() {
     for _ in 0..3 {
         cli(&world, &config, &["sync"]);
     }
-    for root in [&alpha, &b1, &b2] {
+    for root in [&primary, &b1, &b2] {
         assert_eq!(read(root, "fresh.txt"), "v-b1");
     }
 }
@@ -3184,27 +3212,27 @@ fn keeping_a_destination_where_alpha_has_no_copy_settles_the_fan_out() {
 #[test]
 fn naming_a_folder_and_a_path_inside_it_settles_the_folder_once() {
     let world = World::new();
-    let (config, alpha, beta) = one_pair(&world, "two-way-conflict");
-    write(&alpha, "d/f", "alpha");
-    write(&beta, "d/f", "beta");
+    let (config, primary, replica) = one_pair(&world, "two-way-conflict");
+    write(&primary, "d/f", "primary");
+    write(&replica, "d/f", "replica");
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "d", "d/f", "--keep", "alpha", "--yes"],
+        &["resolve", "r", "d", "d/f", "--keep", "primary", "--yes"],
     );
     assert!(ok, "{text}");
     assert!(text.contains("settled 1 of 1"), "{text}");
     for _ in 0..2 {
         cli(&world, &config, &["sync"]);
     }
-    assert_eq!(read(&beta, "d/f"), "alpha");
+    assert_eq!(read(&replica, "d/f"), "primary");
 }
 
 #[test]
 fn resolve_all_requires_a_winner_and_asks_first() {
     let world = World::new();
-    let (config, alpha, b1, _) = three_way_conflict(&world);
-    write(&alpha, "more.txt", "a");
+    let (config, primary, b1, _) = three_way_conflict(&world);
+    write(&primary, "more.txt", "a");
     write(&b1, "more.txt", "b");
     cli(&world, &config, &["sync"]);
     let (ok, text) = cli(
@@ -3219,19 +3247,19 @@ fn resolve_all_requires_a_winner_and_asks_first() {
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "--all", "--keep", "alpha"],
+        &["resolve", "r", "--all", "--keep", "primary"],
     );
     assert!(!ok && text.contains("pass --yes"), "{text}");
     assert_eq!(read(&b1, "more.txt"), "b");
     let (ok, text) = cli(
         &world,
         &config,
-        &["resolve", "r", "--all", "--keep", "alpha", "--yes"],
+        &["resolve", "r", "--all", "--keep", "primary", "--yes"],
     );
     assert!(ok, "{text}");
     cli(&world, &config, &["sync"]);
     assert_eq!(read(&b1, "more.txt"), "a");
-    assert_eq!(read(&b1, "notes.txt"), "v-alpha");
+    assert_eq!(read(&b1, "notes.txt"), "v-primary");
 }
 
 #[test]
@@ -3266,22 +3294,22 @@ fn a_supervised_session_reports_what_it_is_doing() {
     use autobahn::supervisor::control;
 
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     for index in 0..64 {
-        write(&alpha, &format!("file{index:02}.txt"), "content");
+        write(&primary, &format!("file{index:02}.txt"), "content");
     }
 
     let plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         interval = 1
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     let plan = plans[0].clone();
 
@@ -3293,7 +3321,9 @@ fn a_supervised_session_reports_what_it_is_doing() {
         let _guard = StopGuard(stop_ref);
 
         assert!(
-            wait_until(Duration::from_secs(20), || beta.join("file00.txt").exists()),
+            wait_until(Duration::from_secs(20), || replica
+                .join("file00.txt")
+                .exists()),
             "the initial content should synchronize"
         );
 
@@ -3324,39 +3354,39 @@ fn a_supervised_session_reports_what_it_is_doing() {
         // These are what a later scan is measured against; without them
         // there is no honest estimate, only elapsed time. Waited for, not
         // read at once: the session can be caught waiting right after the
-        // cycle that filled beta, before any scan of beta since — its total
+        // cycle that filled replica, before any scan of replica since — its total
         // is then the empty root it first saw, until the next cycle (a
         // heartbeat, at most a second here) scans it again.
         let totals = || {
             control::query_progress(&world.state_root()).and_then(|live| {
                 Some((
-                    live[0].progress.alpha.expected?,
-                    live[0].progress.beta.expected?,
+                    live[0].progress.primary.expected?,
+                    live[0].progress.replica.expected?,
                 ))
             })
         };
         assert!(
             wait_until(Duration::from_secs(20), || {
-                totals().is_some_and(|(alpha, beta)| alpha == beta)
+                totals().is_some_and(|(primary, replica)| primary == replica)
             }),
             "both sides leave a total: {:?}",
             totals()
         );
-        let (alpha_entries, beta_entries) = totals().expect("both sides have totals");
+        let (primary_entries, replica_entries) = totals().expect("both sides have totals");
         assert!(
-            alpha_entries >= 65,
-            "the total counts the tree: {alpha_entries}"
+            primary_entries >= 65,
+            "the total counts the tree: {primary_entries}"
         );
         assert_eq!(
-            alpha_entries, beta_entries,
+            primary_entries, replica_entries,
             "synchronized trees hold the same number of entries"
         );
 
         // The totals are recorded alongside the status, so the next run's
         // first scan starts with a yardstick rather than without one.
         let status = world.status(&plan).expect("a status is recorded");
-        assert_eq!(status.alpha_entries, alpha_entries);
-        assert_eq!(status.beta_entries, beta_entries);
+        assert_eq!(status.primary_entries, primary_entries);
+        assert_eq!(status.replica_entries, replica_entries);
 
         stop.store(true, Ordering::Relaxed);
         watcher
@@ -3376,8 +3406,8 @@ fn a_supervised_session_reports_what_it_is_doing() {
 #[test]
 fn a_session_needing_attention_runs_the_configured_hook() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let evidence = world.directory("evidence");
     let fired = evidence.join("fired");
 
@@ -3386,10 +3416,10 @@ fn a_session_needing_attention_runs_the_configured_hook() {
         on_alert = "cat > {fired}.stdin; printf '%s' \"$AUTOBAHN_SUMMARY|$AUTOBAHN_STATES|$AUTOBAHN_EVENT\" > {fired}"
 
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
         interval = 1
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
 
         # Deliberately the old spelling of the section: the supervisor
         # still reads a file written before `[experimental]` was named,
@@ -3401,8 +3431,8 @@ fn a_session_needing_attention_runs_the_configured_hook() {
         # minute and the case would be timing out on the wrong rule.
         coalesce_after = "0s"
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
         fired = fired.display(),
     );
     let plans = world.plans(&configuration);
@@ -3420,9 +3450,11 @@ fn a_session_needing_attention_runs_the_configured_hook() {
 
         // Healthy: the hook must not run. Silence is the normal state, and
         // a tool that announces its own good health is one people mute.
-        write(&alpha, "shared.txt", "from alpha");
+        write(&primary, "shared.txt", "from primary");
         assert!(
-            wait_until(Duration::from_secs(20), || beta.join("shared.txt").exists()),
+            wait_until(Duration::from_secs(20), || replica
+                .join("shared.txt")
+                .exists()),
             "the initial content should synchronize"
         );
         std::thread::sleep(Duration::from_secs(3));
@@ -3432,8 +3464,8 @@ fn a_session_needing_attention_runs_the_configured_hook() {
         );
 
         // Now make the two sides disagree about the same file.
-        write(&alpha, "shared.txt", "alpha's version");
-        write(&beta, "shared.txt", "beta's version");
+        write(&primary, "shared.txt", "primary's version");
+        write(&replica, "shared.txt", "replica's version");
 
         assert!(
             wait_until(Duration::from_secs(30), || fired.exists()),
@@ -3492,35 +3524,35 @@ fn p2p_agent_script(world: &World, agent_home: &Path) -> PathBuf {
 }
 
 /// P2P, phase 3: a leading supervisor presents its lease, pushes the
-/// follower's files, and keeps the beta's ancestor copy level — all of it
-/// visible on the beta's host afterwards.
+/// follower's files, and keeps the replica's ancestor copy level — all of it
+/// visible on the replica's host afterwards.
 #[test]
-fn a_p2p_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
+fn a_p2p_leader_pushes_its_lease_files_and_ancestor_to_the_replica() {
     use autobahn::supervisor::P2pContext;
 
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let agent_home = world.directory("agent-home");
-    write(&alpha, "hello.txt", "hello");
+    write(&primary, "hello.txt", "hello");
     let script = p2p_agent_script(&world, &agent_home);
     let configuration = format!(
         r#"
         [groups.g]
         mode = "p2p-conflict-dangerously-experimental"
-        alpha = "{alpha}"
+        primary = "{primary}"
         agent_command = "{script}"
-        betas = ["peer:{beta}"]
+        replicas = ["peer:{replica}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         script = script.display(),
-        beta = beta.display(),
+        replica = replica.display(),
     );
     let plans = world.plans(&configuration);
     let plan = plans[0].clone();
     let leader_directory = world.path("leader-p2p");
     let context = || {
-        P2pContext::for_alpha(
+        P2pContext::for_primary(
             world.path("config.toml"),
             leader_directory.clone(),
             autobahn::config::DEFAULT_P2P_TTL,
@@ -3532,17 +3564,17 @@ fn a_p2p_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
         .with_p2p(context())
         .run_once();
     assert_all_synchronized(&outcomes);
-    assert_eq!(read(&beta, "hello.txt"), "hello");
+    assert_eq!(read(&replica, "hello.txt"), "hello");
 
-    // The beta's host now holds everything a follower needs.
+    // The replica's host now holds everything a follower needs.
     let p2p = agent_home.join(".autobahn").join("p2p");
     let lease = autobahn::p2p::read_lease(&p2p)
         .expect("lease readable")
         .expect("a lease was written");
-    assert_eq!((lease.leader.as_str(), lease.term), ("alpha", 1));
+    assert_eq!((lease.leader.as_str(), lease.term), ("primary", 1));
     assert_eq!(
         fs::read_to_string(p2p.join("name")).expect("name"),
-        plan.beta_spec()
+        plan.replica_spec()
     );
     assert_eq!(
         fs::read_to_string(p2p.join("config.toml")).expect("config"),
@@ -3560,19 +3592,19 @@ fn a_p2p_leader_pushes_its_lease_files_and_ancestor_to_the_beta() {
     let own = autobahn::p2p::read_lease(&leader_directory)
         .expect("lease readable")
         .expect("the leader's own lease");
-    assert_eq!((own.leader.as_str(), own.term), ("alpha", 1));
+    assert_eq!((own.leader.as_str(), own.term), ("primary", 1));
     let status = world.status(&plan).expect("a status");
     assert_eq!((status.role.as_str(), status.term), ("leader", 1));
     assert_eq!(status.state, "synchronized");
 
-    // A change on the alpha reaches the beta, and the copy follows the
+    // A change on the primary reaches the replica, and the copy follows the
     // ancestor: it stands at the same generation the leader does.
-    write(&alpha, "more.txt", "more");
+    write(&primary, "more.txt", "more");
     let outcomes = Supervisor::new(plans, world.state_root(), false)
         .with_p2p(context())
         .run_once();
     assert_all_synchronized(&outcomes);
-    assert_eq!(read(&beta, "more.txt"), "more");
+    assert_eq!(read(&replica, "more.txt"), "more");
     let lease = autobahn::p2p::read_lease(&p2p)
         .expect("lease readable")
         .expect("renewed");
@@ -3589,36 +3621,36 @@ fn a_fenced_p2p_leader_steps_down_and_stays_down() {
     use std::time::Duration;
 
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let agent_home = world.directory("agent-home");
-    write(&alpha, "hello.txt", "hello");
+    write(&primary, "hello.txt", "hello");
     let script = p2p_agent_script(&world, &agent_home);
     let plans = world.plans(&format!(
         r#"
         [groups.g]
         mode = "p2p-conflict-dangerously-experimental"
-        alpha = "{alpha}"
+        primary = "{primary}"
         agent_command = "{script}"
-        betas = ["peer:{beta}"]
+        replicas = ["peer:{replica}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         script = script.display(),
-        beta = beta.display(),
+        replica = replica.display(),
     ));
     let plan = plans[0].clone();
-    // The beta led at term 9 while the alpha was away.
+    // The replica led at term 9 while the primary was away.
     let p2p = agent_home.join(".autobahn").join("p2p");
     write_lease(
         &p2p,
-        &Lease::new(&plan.beta_spec(), 9, Duration::from_secs(30)),
+        &Lease::new(&plan.replica_spec(), 9, Duration::from_secs(30)),
     )
-    .expect("the beta's lease");
+    .expect("the replica's lease");
 
     let leader_directory = world.path("leader-p2p");
     let outcomes = Supervisor::new(plans.clone(), world.state_root(), false)
         .with_p2p(
-            P2pContext::for_alpha(
+            P2pContext::for_primary(
                 world.path("config.toml"),
                 leader_directory.clone(),
                 autobahn::config::DEFAULT_P2P_TTL,
@@ -3628,19 +3660,19 @@ fn a_fenced_p2p_leader_steps_down_and_stays_down() {
         .run_once();
     assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
     assert!(
-        !beta.join("hello.txt").exists(),
+        !replica.join("hello.txt").exists(),
         "a fenced leader writes nothing"
     );
     let status = world.status(&plan).expect("a status");
     assert_eq!(status.state, "following", "{status:?}");
     assert_eq!((status.role.as_str(), status.term), ("follower", 9));
-    // The beta's lease is untouched, and the alpha recorded it as its own.
+    // The replica's lease is untouched, and the primary recorded it as its own.
     let held = autobahn::p2p::read_lease(&p2p)
         .expect("readable")
         .expect("held");
     assert_eq!(
         (held.leader.as_str(), held.term),
-        (plan.beta_spec().as_str(), 9)
+        (plan.replica_spec().as_str(), 9)
     );
     let own = autobahn::p2p::read_lease(&leader_directory)
         .expect("readable")
@@ -3648,8 +3680,8 @@ fn a_fenced_p2p_leader_steps_down_and_stays_down() {
     assert_eq!(own.term, 9);
 
     // A restart reads its own lease and comes back as a follower: it does
-    // not connect, and the beta is still untouched.
-    let context = P2pContext::for_alpha(
+    // not connect, and the replica is still untouched.
+    let context = P2pContext::for_primary(
         world.path("config.toml"),
         leader_directory,
         autobahn::config::DEFAULT_P2P_TTL,
@@ -3663,21 +3695,21 @@ fn a_fenced_p2p_leader_steps_down_and_stays_down() {
         .with_p2p(context)
         .run_once();
     assert!(outcomes[0].result.is_err());
-    assert!(!beta.join("hello.txt").exists());
+    assert!(!replica.join("hello.txt").exists());
     assert_eq!(world.status(&plan).expect("a status").state, "following");
 }
 
-/// With `manage_keys`, the alpha sets up the betas' keys to one another
-/// over the logins it already has: each beta makes a key of its own, and is
-/// given every other beta's, forced through the gate, inside autobahn's
+/// With `manage_keys`, the primary sets up the replicas' keys to one another
+/// over the logins it already has: each replica makes a key of its own, and is
+/// given every other replica's, forced through the gate, inside autobahn's
 /// block of its `authorized_keys` — with the gate itself, and the others'
 /// host keys. Never its own.
 #[test]
-fn the_alpha_gives_each_beta_the_others_keys_through_the_gate() {
+fn the_primary_gives_each_replica_the_others_keys_through_the_gate() {
     use autobahn::supervisor::P2pContext;
 
     let world = World::new();
-    let alpha = world.directory("alpha");
+    let primary = world.directory("primary");
     let homes = [world.directory("one-home"), world.directory("two-home")];
     let roots = [world.directory("one"), world.directory("two")];
     let scripts = [p2p_agent_script(&world, &homes[0]), {
@@ -3703,33 +3735,33 @@ fn the_alpha_gives_each_beta_the_others_keys_through_the_gate() {
 
         [groups.g1]
         mode = "p2p-conflict-dangerously-experimental"
-        alpha = "{alpha}/g1"
+        primary = "{primary}/g1"
         agent_command = "{one_script}"
-        betas = ["one:{one}"]
+        replicas = ["one:{one}"]
 
         [groups.g2]
         mode = "p2p-conflict-dangerously-experimental"
-        alpha = "{alpha}/g2"
+        primary = "{primary}/g2"
         agent_command = "{two_script}"
-        betas = ["two:{two}"]
+        replicas = ["two:{two}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         one_script = scripts[0].display(),
         two_script = scripts[1].display(),
         one = roots[0].display(),
         two = roots[1].display(),
     ));
-    fs::create_dir_all(alpha.join("g1")).unwrap();
-    fs::create_dir_all(alpha.join("g2")).unwrap();
+    fs::create_dir_all(primary.join("g1")).unwrap();
+    fs::create_dir_all(primary.join("g2")).unwrap();
     let supervisor = Supervisor::new(plans, world.state_root(), false).with_p2p(
-        P2pContext::for_alpha(
+        P2pContext::for_primary(
             world.path("config.toml"),
-            world.path("alpha-p2p"),
+            world.path("primary-p2p"),
             autobahn::config::DEFAULT_P2P_TTL,
         )
         .expect("a p2p context"),
     );
-    // Twice: the first pass learns each beta's key, and whichever beta was
+    // Twice: the first pass learns each replica's key, and whichever replica was
     // given its block first is given it again with the other's in it.
     assert_all_synchronized(&supervisor.run_once());
     assert_all_synchronized(&supervisor.run_once());
@@ -3760,41 +3792,41 @@ fn the_alpha_gives_each_beta_the_others_keys_through_the_gate() {
     }
 }
 
-/// While the alpha follows, its plain groups keep running: they are the
-/// alpha's alone, whoever leads the star. Only its p2p sessions wait
+/// While the primary follows, its plain groups keep running: they are the
+/// primary's alone, whoever leads the star. Only its p2p sessions wait
 /// for the lead to come back.
 #[test]
-fn plain_groups_keep_running_while_the_alpha_follows() {
+fn plain_groups_keep_running_while_the_primary_follows() {
     use autobahn::p2p::{self, write_lease, Lease};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let plain = world.directory("plain");
     let mirror = world.directory("plain-mirror");
     let agent_home = world.directory("agent-home");
-    write(&alpha, "hello.txt", "hello");
+    write(&primary, "hello.txt", "hello");
     let script = p2p_agent_script(&world, &agent_home);
     let plans = world.plans(&format!(
         r#"
         [groups.g]
         mode = "p2p-conflict-dangerously-experimental"
         interval = 1
-        alpha = "{alpha}"
+        primary = "{primary}"
         agent_command = "{script}"
-        betas = ["peer:{beta}"]
+        replicas = ["peer:{replica}"]
 
         [groups.plain]
         mode = "two-way-conflict"
         interval = 1
-        alpha = "{plain}"
-        betas = ["{mirror}"]
+        primary = "{plain}"
+        replicas = ["{mirror}"]
         "#,
-        alpha = alpha.display(),
+        primary = primary.display(),
         script = script.display(),
-        beta = beta.display(),
+        replica = replica.display(),
         plain = plain.display(),
         mirror = mirror.display(),
     ));
@@ -3803,24 +3835,24 @@ fn plain_groups_keep_running_while_the_alpha_follows() {
         .find(|plan| plan.group == "g")
         .expect("the p2p group")
         .clone();
-    // The beta led at term 9 while the alpha was away.
+    // The replica led at term 9 while the primary was away.
     write_lease(
         &agent_home.join(".autobahn").join("p2p"),
-        &Lease::new(&p2p_plan.beta_spec(), 9, Duration::from_secs(30)),
+        &Lease::new(&p2p_plan.replica_spec(), 9, Duration::from_secs(30)),
     )
-    .expect("the beta's lease");
+    .expect("the replica's lease");
     // There is no leader to attach to here: attaching fails at once.
     let _attach = EnvironmentGuard::set(p2p::ATTACH_COMMAND_VARIABLE, "false");
 
     let stop = AtomicBool::new(false);
     let alerts = autobahn::alerts::AlertPlan::default();
-    let directory = world.path("alpha-p2p");
+    let directory = world.path("primary-p2p");
     let state_root = world.state_root();
     let config_path = world.path("config.toml");
     std::thread::scope(|scope| {
         let _guard = StopGuard(&stop);
         let run = scope.spawn(|| {
-            autobahn::supervisor::peer::run_alpha(
+            autobahn::supervisor::peer::run_primary(
                 &config_path,
                 &directory,
                 &plans,
@@ -3835,29 +3867,29 @@ fn plain_groups_keep_running_while_the_alpha_follows() {
             wait_until(Duration::from_secs(20), || world
                 .status(&p2p_plan)
                 .is_some_and(|status| status.state == "following")),
-            "the alpha should be fenced and follow"
+            "the primary should be fenced and follow"
         );
         write(&plain, "while-following.txt", "plain");
         assert!(
             wait_until(Duration::from_secs(20), || mirror
                 .join("while-following.txt")
                 .exists()),
-            "the plain group should keep running while the alpha follows"
+            "the plain group should keep running while the primary follows"
         );
         assert!(
-            !beta.join("hello.txt").exists(),
+            !replica.join("hello.txt").exists(),
             "the p2p group writes nothing while it follows"
         );
         stop.store(true, Ordering::Relaxed);
         run.join()
-            .expect("the alpha thread")
-            .expect("the alpha ran");
+            .expect("the primary thread")
+            .expect("the primary ran");
     });
 }
 
 /// P2P, phase 4: a peer whose lease has been stale for its wait takes
 /// the lead at the next term, runs the leader's star turned around, and
-/// reaches the other beta; the old leader, back at its old term, is fenced.
+/// reaches the other replica; the old leader, back at its old term, is fenced.
 #[test]
 fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     use autobahn::p2p::{self, Lease};
@@ -3866,8 +3898,8 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     use std::time::Duration;
 
     let world = World::new();
-    // Three machines: the alpha (never dialed here), this peer, and one
-    // other beta. Each beta has its own home, so its agent's p2p
+    // Three machines: the primary (never dialed here), this peer, and one
+    // other replica. Each replica has its own home, so its agent's p2p
     // directory is its own.
     let peer_root = world.directory("peer-root");
     let peer_home = world.directory("peer-home");
@@ -3888,7 +3920,7 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
     fs::set_permissions(&other_script, permissions).expect("executable");
 
-    // What the alpha pushed to this peer: its own star, with a lease
+    // What the primary pushed to this peer: its own star, with a lease
     // lifetime and a wait short enough for a test.
     let pushed = format!(
         r#"
@@ -3899,9 +3931,9 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         [groups.g]
         mode = "p2p-conflict-dangerously-experimental"
         interval = 1
-        alpha = "/nonexistent/alpha"
+        primary = "/nonexistent/primary"
         agent_command = "{script}"
-        betas = ["peer:{peer_root}", "other:{other_root}"]
+        replicas = ["peer:{peer_root}", "other:{other_root}"]
         "#,
         script = other_script.display(),
         peer_root = peer_root.display(),
@@ -3911,16 +3943,16 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     let p2p_directory = peer_home.join(".autobahn").join("p2p");
     p2p::write_pushed_file(&p2p_directory, "config.toml", pushed.as_bytes()).unwrap();
     // The pushed agent_command is never run: how this peer reaches the
-    // other beta is its own to say.
+    // other replica is its own to say.
     fs::write(
         peer_home.join(".autobahn").join("host.toml"),
         format!("agent_command = {:?}\n", other_script.display().to_string()),
     )
     .unwrap();
     p2p::write_pushed_file(&p2p_directory, "name", name.as_bytes()).unwrap();
-    // The alpha's lease, last renewed a while ago.
+    // The primary's lease, last renewed a while ago.
     let stale = Lease {
-        leader: p2p::ALPHA.to_owned(),
+        leader: p2p::PRIMARY.to_owned(),
         term: 3,
         renewed_at: p2p::now_seconds().saturating_sub(120),
         ttl_seconds: 1,
@@ -3933,12 +3965,12 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         let _guard = StopGuard(&stop);
         let peer = scope
             .spawn(|| autobahn::supervisor::peer::run(&p2p_directory, &state_root, false, &stop));
-        // The peer takes the lead and its file reaches the other beta.
+        // The peer takes the lead and its file reaches the other replica.
         assert!(
             wait_until(Duration::from_secs(20), || other_root
                 .join("from-peer.txt")
                 .exists()),
-            "the peer's file should reach the other beta"
+            "the peer's file should reach the other replica"
         );
         let own = p2p::read_lease(&p2p_directory)
             .expect("readable")
@@ -3952,7 +3984,7 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
                     .flatten()
                     .is_some_and(|lease| lease.term == 4 && lease.leader == name)
             }),
-            "the other beta holds the peer's lease"
+            "the other replica holds the peer's lease"
         );
         assert_eq!(
             fs::read_to_string(theirs.join("name")).expect("name pushed on"),
@@ -3964,40 +3996,40 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
         );
 
         // The old leader comes back at its old term and is fenced on the
-        // other beta: it steps down, writes nothing.
-        let old_alpha = world.directory("alpha-root");
-        write(&old_alpha, "from-alpha.txt", "late");
+        // other replica: it steps down, writes nothing.
+        let old_primary = world.directory("primary-root");
+        write(&old_primary, "from-primary.txt", "late");
         let plans = world.plans(&format!(
             r#"
             [groups.g]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "{alpha}"
+            primary = "{primary}"
             agent_command = "{script}"
-            betas = ["other:{other_root}"]
+            replicas = ["other:{other_root}"]
             "#,
-            alpha = old_alpha.display(),
+            primary = old_primary.display(),
             script = other_script.display(),
             other_root = other_root.display(),
         ));
-        let alpha_directory = world.path("alpha-p2p");
+        let primary_directory = world.path("primary-p2p");
         p2p::write_lease(
-            &alpha_directory,
-            &Lease::new(p2p::ALPHA, 3, Duration::from_secs(30)),
+            &primary_directory,
+            &Lease::new(p2p::PRIMARY, 3, Duration::from_secs(30)),
         )
         .unwrap();
-        let outcomes = Supervisor::new(plans.clone(), world.path("alpha-state"), false)
+        let outcomes = Supervisor::new(plans.clone(), world.path("primary-state"), false)
             .with_p2p(
-                P2pContext::for_alpha(
+                P2pContext::for_primary(
                     world.path("config.toml"),
-                    alpha_directory.clone(),
+                    primary_directory.clone(),
                     autobahn::config::DEFAULT_P2P_TTL,
                 )
                 .expect("context"),
             )
             .run_once();
         assert!(outcomes[0].result.is_err(), "{:?}", outcomes[0].result);
-        assert!(!other_root.join("from-alpha.txt").exists());
-        let recorded = p2p::read_lease(&alpha_directory)
+        assert!(!other_root.join("from-primary.txt").exists());
+        let recorded = p2p::read_lease(&primary_directory)
             .expect("readable")
             .expect("recorded");
         assert_eq!(
@@ -4010,27 +4042,27 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     });
 }
 
-/// P2P, phase 5, the whole loop from the alpha's side. A beta leads;
-/// the alpha comes back and dials the beta as it always did, is fenced,
-/// and steps down; it then dials in and attaches as an agent; the beta
+/// P2P, phase 5, the whole loop from the primary's side. A replica leads;
+/// the primary comes back and dials the replica as it always did, is fenced,
+/// and steps down; it then dials in and attaches as an agent; the replica
 /// runs their session over the attachment and, once it settles, hands
-/// the lead back; the alpha leads again and dials the beta as before.
+/// the lead back; the primary leads again and dials the replica as before.
 #[test]
-fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
+fn the_primary_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     use autobahn::p2p::{self, Lease};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     let world = World::new();
-    let alpha_root = world.directory("alpha-root");
+    let primary_root = world.directory("primary-root");
     let peer_root = world.directory("peer-root");
     let peer_home = world.directory("peer-home");
-    write(&alpha_root, "from-alpha.txt", "from the alpha");
+    write(&primary_root, "from-primary.txt", "from the primary");
     write(&peer_root, "from-peer.txt", "from the peer");
     let peer_script = p2p_agent_script(&world, &peer_home);
 
-    // What the alpha pushed to the peer before it went away: a star of
-    // one beta, its own root as the alpha, and the session's identifier.
+    // What the primary pushed to the peer before it went away: a star of
+    // one replica, its own root as the primary, and the session's identifier.
     let configuration = format!(
         r#"
         [experimental.p2p-dangerously-experimental]
@@ -4040,11 +4072,11 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
         [groups.g]
         mode = "p2p-conflict-dangerously-experimental"
         interval = 1
-        alpha = "{alpha_root}"
+        primary = "{primary_root}"
         agent_command = "{script}"
-        betas = ["peer:{peer_root}"]
+        replicas = ["peer:{peer_root}"]
         "#,
-        alpha_root = alpha_root.display(),
+        primary_root = primary_root.display(),
         script = peer_script.display(),
         peer_root = peer_root.display(),
     );
@@ -4062,20 +4094,20 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     p2p::write_lease(
         &p2p_directory,
         &Lease {
-            leader: p2p::ALPHA.to_owned(),
+            leader: p2p::PRIMARY.to_owned(),
             term: 3,
             renewed_at: p2p::now_seconds().saturating_sub(120),
             ttl_seconds: 2,
         },
     )
     .unwrap();
-    // The alpha remembers leading at term 3, and reaches the peer's attach
-    // socket directly rather than over ssh. The alpha runs in this process,
+    // The primary remembers leading at term 3, and reaches the peer's attach
+    // socket directly rather than over ssh. The primary runs in this process,
     // so the variable is set process-wide, under the guard that restores it.
-    let alpha_directory = p2p::directory().expect("the alpha's p2p directory");
+    let primary_directory = p2p::directory().expect("the primary's p2p directory");
     p2p::write_lease(
-        &alpha_directory,
-        &Lease::new(p2p::ALPHA, 3, Duration::from_secs(30)),
+        &primary_directory,
+        &Lease::new(p2p::PRIMARY, 3, Duration::from_secs(30)),
     )
     .unwrap();
     let socket = p2p_directory.join(p2p::ATTACH_SOCKET);
@@ -4090,7 +4122,7 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
 
     let stop = AtomicBool::new(false);
     let peer_state = world.state_root();
-    let alpha_state = world.path("alpha-state");
+    let primary_state = world.path("primary-state");
     let alerts = autobahn::alerts::AlertPlan::default();
     std::thread::scope(|scope| {
         let _guard = StopGuard(&stop);
@@ -4098,17 +4130,17 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
             .spawn(|| autobahn::supervisor::peer::run(&p2p_directory, &peer_state, true, &stop));
         assert!(
             wait_until(Duration::from_secs(20), || socket.exists()),
-            "the peer should lead and listen for the alpha"
+            "the peer should lead and listen for the primary"
         );
 
-        // The alpha comes back.
-        let alpha = scope.spawn(|| {
-            autobahn::supervisor::peer::run_alpha(
+        // The primary comes back.
+        let primary = scope.spawn(|| {
+            autobahn::supervisor::peer::run_primary(
                 &world.path("config.toml"),
-                &alpha_directory,
+                &primary_directory,
                 &plans,
                 &alerts,
-                &alpha_state,
+                &primary_state,
                 true,
                 &stop,
                 None,
@@ -4118,39 +4150,39 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
         // Fenced, attached, synchronized both ways over the attachment.
         assert!(
             wait_until(Duration::from_secs(30), || peer_root
-                .join("from-alpha.txt")
+                .join("from-primary.txt")
                 .exists()
-                && alpha_root.join("from-peer.txt").exists()),
+                && primary_root.join("from-peer.txt").exists()),
             "the attached session should carry both roots' files"
         );
-        // The lead comes back to the alpha at the next term, on both hosts.
+        // The lead comes back to the primary at the next term, on both hosts.
         assert!(
             wait_until(Duration::from_secs(30), || {
                 let theirs = p2p::read_lease(&p2p_directory).ok().flatten();
-                let mine = p2p::read_lease(&alpha_directory).ok().flatten();
-                theirs.is_some_and(|l| l.leader == p2p::ALPHA && l.term == 5)
-                    && mine.is_some_and(|l| l.leader == p2p::ALPHA && l.term == 5)
+                let mine = p2p::read_lease(&primary_directory).ok().flatten();
+                theirs.is_some_and(|l| l.leader == p2p::PRIMARY && l.term == 5)
+                    && mine.is_some_and(|l| l.leader == p2p::PRIMARY && l.term == 5)
             }),
-            "the lead should come back to the alpha at term 5"
+            "the lead should come back to the primary at term 5"
         );
-        // The alpha leads again the ordinary way: it dials the peer's
+        // The primary leads again the ordinary way: it dials the peer's
         // agent, and a new file crosses; the peer's lease stays fresh
-        // because the alpha renews it every cycle.
-        write(&alpha_root, "after.txt", "after the handback");
+        // because the primary renews it every cycle.
+        write(&primary_root, "after.txt", "after the handback");
         assert!(
             wait_until(Duration::from_secs(30), || peer_root
                 .join("after.txt")
                 .exists()),
-            "the alpha should lead again and reach the peer"
+            "the primary should lead again and reach the peer"
         );
         std::thread::sleep(Duration::from_secs(3));
         let theirs = p2p::read_lease(&p2p_directory)
             .expect("readable")
             .expect("held");
-        assert_eq!((theirs.leader.as_str(), theirs.term), (p2p::ALPHA, 5));
+        assert_eq!((theirs.leader.as_str(), theirs.term), (p2p::PRIMARY, 5));
         assert!(
             !theirs.is_stale_at(p2p::now_seconds()),
-            "the alpha keeps the peer's lease fresh: {theirs:?}"
+            "the primary keeps the peer's lease fresh: {theirs:?}"
         );
         let status = autobahn::supervisor::peer::read_status(&p2p_directory)
             .expect("readable")
@@ -4159,25 +4191,25 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
 
         stop.store(true, Ordering::Relaxed);
         peer.join().expect("the peer thread").expect("the peer ran");
-        alpha
+        primary
             .join()
-            .expect("the alpha thread")
-            .expect("the alpha ran");
+            .expect("the primary thread")
+            .expect("the primary ran");
     });
 }
 
-/// The alpha dials in to a leading beta once, and every p2p group it
-/// shares with that beta syncs over the one connection, each session on
+/// The primary dials in to a leading replica once, and every p2p group it
+/// shares with that replica syncs over the one connection, each session on
 /// channels of its own. Taken whole by the first session, the connection
-/// left the alpha's other groups unsynced until the lead came back.
+/// left the primary's other groups unsynced until the lead came back.
 #[test]
-fn every_group_syncs_over_the_alphas_one_attachment() {
+fn every_group_syncs_over_the_primaries_one_attachment() {
     use autobahn::p2p::{self, Lease};
     use std::sync::atomic::AtomicBool;
     use std::time::Duration;
 
     let world = World::new();
-    let alphas = [world.directory("alpha1"), world.directory("alpha2")];
+    let primaries = [world.directory("primary1"), world.directory("primary2")];
     let peers = [world.directory("peer1"), world.directory("peer2")];
     let peer_home = world.directory("peer-home");
     write(&peers[0], "from-peer1.txt", "p1");
@@ -4192,19 +4224,19 @@ fn every_group_syncs_over_the_alphas_one_attachment() {
         [groups.g1]
         mode = "p2p-conflict-dangerously-experimental"
         interval = 1
-        alpha = "{a1}"
+        primary = "{a1}"
         agent_command = "{script}"
-        betas = ["peer:{p1}"]
+        replicas = ["peer:{p1}"]
 
         [groups.g2]
         mode = "p2p-conflict-dangerously-experimental"
         interval = 1
-        alpha = "{a2}"
+        primary = "{a2}"
         agent_command = "{script}"
-        betas = ["peer:{p2}"]
+        replicas = ["peer:{p2}"]
         "#,
-        a1 = alphas[0].display(),
-        a2 = alphas[1].display(),
+        a1 = primaries[0].display(),
+        a2 = primaries[1].display(),
         script = peer_script.display(),
         p1 = peers[0].display(),
         p2 = peers[1].display(),
@@ -4233,17 +4265,17 @@ fn every_group_syncs_over_the_alphas_one_attachment() {
     p2p::write_lease(
         &directory,
         &Lease {
-            leader: p2p::ALPHA.to_owned(),
+            leader: p2p::PRIMARY.to_owned(),
             term: 3,
             renewed_at: p2p::now_seconds().saturating_sub(120),
             ttl_seconds: 2,
         },
     )
     .unwrap();
-    let alpha_directory = p2p::directory().expect("the alpha's p2p directory");
+    let primary_directory = p2p::directory().expect("the primary's p2p directory");
     p2p::write_lease(
-        &alpha_directory,
-        &Lease::new(p2p::ALPHA, 3, Duration::from_secs(30)),
+        &primary_directory,
+        &Lease::new(p2p::PRIMARY, 3, Duration::from_secs(30)),
     )
     .unwrap();
     let socket = directory.join(p2p::ATTACH_SOCKET);
@@ -4258,30 +4290,30 @@ fn every_group_syncs_over_the_alphas_one_attachment() {
 
     let stop = AtomicBool::new(false);
     let peer_state = world.state_root();
-    let alpha_state = world.path("alpha-state");
+    let primary_state = world.path("primary-state");
     let alerts = autobahn::alerts::AlertPlan::default();
     std::thread::scope(|scope| {
         let _guard = StopGuard(&stop);
         let peer =
             scope.spawn(|| autobahn::supervisor::peer::run(&directory, &peer_state, false, &stop));
         assert!(wait_until(Duration::from_secs(20), || socket.exists()));
-        let alpha = scope.spawn(|| {
-            autobahn::supervisor::peer::run_alpha(
+        let primary = scope.spawn(|| {
+            autobahn::supervisor::peer::run_primary(
                 &world.path("config.toml"),
-                &alpha_directory,
+                &primary_directory,
                 &plans,
                 &alerts,
-                &alpha_state,
+                &primary_state,
                 false,
                 &stop,
                 None,
             )
         });
-        // Each group's copy of its ancestor on the alpha is written by the
-        // leading beta's session with the attached alpha, after a cycle
+        // Each group's copy of its ancestor on the primary is written by the
+        // leading replica's session with the attached primary, after a cycle
         // over the attachment: both, for both groups.
         let written_by_the_peer = |group: &str| {
-            p2p::copy_writer(&alpha_directory, &plan(group).identifier())
+            p2p::copy_writer(&primary_directory, &plan(group).identifier())
                 .ok()
                 .flatten()
                 .is_some_and(|writer| writer.starts_with("peer:"))
@@ -4289,20 +4321,20 @@ fn every_group_syncs_over_the_alphas_one_attachment() {
         assert!(
             wait_until(Duration::from_secs(30), || written_by_the_peer("g1")
                 && written_by_the_peer("g2")),
-            "both groups should sync with the alpha while the beta leads: g1 {}, g2 {}",
+            "both groups should sync with the primary while the replica leads: g1 {}, g2 {}",
             written_by_the_peer("g1"),
             written_by_the_peer("g2")
         );
-        assert!(wait_until(Duration::from_secs(30), || alphas[0]
+        assert!(wait_until(Duration::from_secs(30), || primaries[0]
             .join("from-peer1.txt")
             .exists()
-            && alphas[1].join("from-peer2.txt").exists()));
+            && primaries[1].join("from-peer2.txt").exists()));
         stop.store(true, Ordering::Relaxed);
         peer.join().expect("the peer thread").expect("the peer ran");
-        alpha
+        primary
             .join()
-            .expect("the alpha thread")
-            .expect("the alpha ran");
+            .expect("the primary thread")
+            .expect("the primary ran");
     });
 }
 
@@ -4322,12 +4354,12 @@ fn a_healthy_group_is_one_line_in_status_and_trouble_is_shown_in_full() {
         mode = "two-way-conflict"
 
         [groups.quiet]
-        alpha = "{quiet}"
-        betas = ["{quiet_mirror}"]
+        primary = "{quiet}"
+        replicas = ["{quiet_mirror}"]
 
         [groups.noisy]
-        alpha = "{noisy}"
-        betas = ["{noisy_mirror}"]
+        primary = "{noisy}"
+        replicas = ["{noisy_mirror}"]
         "#,
         quiet = quiet.display(),
         quiet_mirror = quiet_mirror.display(),
@@ -4336,8 +4368,8 @@ fn a_healthy_group_is_one_line_in_status_and_trouble_is_shown_in_full() {
     ));
     assert_all_synchronized(&world.run_once(plans.clone()));
     // A conflict in one group only.
-    write(&noisy, "b.txt", "alpha's");
-    write(&noisy_mirror, "b.txt", "beta's");
+    write(&noisy, "b.txt", "primary's");
+    write(&noisy_mirror, "b.txt", "replica's");
     world.run_once(plans);
 
     let (ok, text) = cli(&world, &config, &["status"]);
@@ -4365,20 +4397,20 @@ fn a_healthy_group_is_one_line_in_status_and_trouble_is_shown_in_full() {
 #[test]
 fn doctor_says_whether_a_reset_is_free_and_writes_nothing() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "keep.txt", "keep");
-    write(&alpha, "gone.txt", "gone");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "keep.txt", "keep");
+    write(&primary, "gone.txt", "gone");
     let config = world.path("config.toml");
     let plans = world.plans(&format!(
         r#"
         [groups.work]
         mode = "two-way-conflict"
-        alpha = "{alpha}"
-        betas = ["{beta}"]
+        primary = "{primary}"
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     assert_all_synchronized(&world.run_once(plans));
 
@@ -4392,17 +4424,17 @@ fn doctor_says_whether_a_reset_is_free_and_writes_nothing() {
     );
 
     // A deletion the baseline knows about, not yet carried across.
-    fs::remove_file(alpha.join("gone.txt")).unwrap();
+    fs::remove_file(primary.join("gone.txt")).unwrap();
     let sessions = world.state_root().join("sessions");
     let before: Vec<(PathBuf, std::time::SystemTime)> = walk_files(&sessions);
     let (ok, text) = cli(&world, &config, &["doctor", "work"]);
     assert!(ok, "{text}");
     assert!(
-        text.contains("delete gone.txt to beta"),
+        text.contains("delete gone.txt to replica"),
         "the next cycle: {text}"
     );
     assert!(
-        text.contains("copy gone.txt to alpha"),
+        text.contains("copy gone.txt to primary"),
         "what a reset would bring back: {text}"
     );
     // The baseline is untouched. (A scan refreshes its scan cache, as any
@@ -4437,29 +4469,29 @@ fn walk_files(root: &Path) -> Vec<(PathBuf, std::time::SystemTime)> {
     found
 }
 
-/// An atomic deploy swap on the alpha, seen by the watcher as three
+/// An atomic deploy swap on the primary, seen by the watcher as three
 /// renamed names and nothing inside them. Reproduced before the fix: the
-/// beta kept the old `live/` contents, duplicated them into `old/`, and
+/// replica kept the old `live/` contents, duplicated them into `old/`, and
 /// deleted `staging/`, until a full walk minutes later.
 #[test]
-fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
+fn a_swapped_directory_reaches_the_replica_with_its_new_contents() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "live/f1", "old content");
-    write(&alpha, "live/sub/f2", "old deeper");
-    write(&alpha, "staging/f1", "new content");
-    write(&alpha, "staging/sub/f2", "new deeper");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "live/f1", "old content");
+    write(&primary, "live/sub/f2", "old deeper");
+    write(&primary, "staging/f1", "new content");
+    write(&primary, "staging/sub/f2", "new deeper");
 
     let mut plans = world.plans(&format!(
         r#"
         [groups.work]
-        alpha = "{alpha}"
+        primary = "{primary}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
-        alpha = alpha.display(),
-        beta = beta.display(),
+        primary = primary.display(),
+        replica = replica.display(),
     ));
     plans[0].interval = Duration::from_millis(30);
 
@@ -4472,7 +4504,7 @@ fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
 
         assert!(
             wait_until(Duration::from_secs(15), || {
-                beta.join("staging/sub/f2").exists() && beta.join("live/sub/f2").exists()
+                replica.join("staging/sub/f2").exists() && replica.join("live/sub/f2").exists()
             }),
             "initial content should propagate"
         );
@@ -4480,23 +4512,29 @@ fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
         // incremental scan against a baseline that holds both trees.
         std::thread::sleep(Duration::from_millis(500));
 
-        fs::rename(alpha.join("live"), alpha.join("old")).expect("rename");
-        fs::rename(alpha.join("staging"), alpha.join("live")).expect("rename");
+        fs::rename(primary.join("live"), primary.join("old")).expect("rename");
+        fs::rename(primary.join("staging"), primary.join("live")).expect("rename");
 
         let settled = || {
-            !beta.join("staging").exists()
-                && fs::read_to_string(beta.join("live/f1")).ok().as_deref() == Some("new content")
-                && fs::read_to_string(beta.join("live/sub/f2")).ok().as_deref()
+            !replica.join("staging").exists()
+                && fs::read_to_string(replica.join("live/f1")).ok().as_deref()
+                    == Some("new content")
+                && fs::read_to_string(replica.join("live/sub/f2"))
+                    .ok()
+                    .as_deref()
                     == Some("new deeper")
-                && fs::read_to_string(beta.join("old/f1")).ok().as_deref() == Some("old content")
-                && fs::read_to_string(beta.join("old/sub/f2")).ok().as_deref() == Some("old deeper")
+                && fs::read_to_string(replica.join("old/f1")).ok().as_deref() == Some("old content")
+                && fs::read_to_string(replica.join("old/sub/f2"))
+                    .ok()
+                    .as_deref()
+                    == Some("old deeper")
         };
         assert!(
             wait_until(Duration::from_secs(15), settled),
-            "the beta should hold the swapped tree: live/f1 = {:?}, old/f1 = {:?}, staging = {}",
-            fs::read_to_string(beta.join("live/f1")).ok(),
-            fs::read_to_string(beta.join("old/f1")).ok(),
-            beta.join("staging").exists(),
+            "the replica should hold the swapped tree: live/f1 = {:?}, old/f1 = {:?}, staging = {}",
+            fs::read_to_string(replica.join("live/f1")).ok(),
+            fs::read_to_string(replica.join("old/f1")).ok(),
+            replica.join("staging").exists(),
         );
 
         stop.store(true, Ordering::Relaxed);
@@ -4515,9 +4553,9 @@ fn a_swapped_directory_reaches_the_beta_with_its_new_contents() {
 #[test]
 fn a_stray_peer_name_beside_a_configuration_is_ignored_with_a_warning() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "first.txt", "first");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "first.txt", "first");
     let home = world.directory("home");
     let state = home.join(".autobahn");
     fs::create_dir_all(state.join("p2p")).expect("the p2p directory");
@@ -4525,9 +4563,9 @@ fn a_stray_peer_name_beside_a_configuration_is_ignored_with_a_warning() {
     fs::write(
         state.join("config.toml"),
         format!(
-            "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 1\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.work]\nprimary = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 1\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .expect("configuration should be writable");
@@ -4550,7 +4588,9 @@ fn a_stray_peer_name_beside_a_configuration_is_ignored_with_a_warning() {
     }
     let mut child = Kill(child);
     assert!(
-        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+        wait_until(Duration::from_secs(15), || replica
+            .join("first.txt")
+            .exists()),
         "its own configuration runs: {}",
         fs::read_to_string(&log).unwrap_or_default()
     );
@@ -4568,16 +4608,16 @@ fn watch_keeps_synchronizing_after_its_standard_output_closes() {
     // `autobahn watch | head -1`: the reader goes away, and every later
     // log line meets a closed pipe. That costs the lines, not the sessions.
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "first.txt", "first");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "first.txt", "first");
     let path = world.path("config.toml");
     fs::write(
         &path,
         format!(
-            "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 1\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.work]\nprimary = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 1\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .expect("configuration should be writable");
@@ -4601,14 +4641,16 @@ fn watch_keeps_synchronizing_after_its_standard_output_closes() {
     }
     let mut child = Kill(child);
     assert!(
-        wait_until(Duration::from_secs(15), || beta.join("first.txt").exists()),
+        wait_until(Duration::from_secs(15), || replica
+            .join("first.txt")
+            .exists()),
         "the first file synchronizes"
     );
     for index in 0..3 {
         let name = format!("later-{index}.txt");
-        write(&alpha, &name, "later");
+        write(&primary, &name, "later");
         assert!(
-            wait_until(Duration::from_secs(15), || beta.join(&name).exists()),
+            wait_until(Duration::from_secs(15), || replica.join(&name).exists()),
             "{name} synchronizes with nobody reading the log"
         );
     }
@@ -4621,17 +4663,17 @@ fn watch_keeps_synchronizing_after_its_standard_output_closes() {
 #[test]
 fn status_shows_the_running_sessions_and_the_refusal_when_the_file_breaks() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
     let notes = world.directory("notes");
     let notes_mirror = world.path("notes-mirror");
-    write(&alpha, "file.txt", "file");
+    write(&primary, "file.txt", "file");
     write(&notes, "todo.txt", "todo");
     let path = world.path("config.toml");
     let one = format!(
-        "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 1\nbetas = [\"{}\"]\n",
-        alpha.display(),
-        beta.display()
+        "[groups.work]\nprimary = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 1\nreplicas = [\"{}\"]\n",
+        primary.display(),
+        replica.display()
     );
     world.plans(&one);
     let shown_groups = || -> Vec<String> {
@@ -4641,7 +4683,7 @@ fn status_shows_the_running_sessions_and_the_refusal_when_the_file_breaks() {
     };
 
     supervise_with_reload(&world, &path, || {
-        assert!(wait_until(Duration::from_secs(15), || beta
+        assert!(wait_until(Duration::from_secs(15), || replica
             .join("file.txt")
             .exists()));
         fs::write(&path, format!("{one}[groups.notes]\nmdoe = 1\n"))
@@ -4664,7 +4706,7 @@ fn status_shows_the_running_sessions_and_the_refusal_when_the_file_breaks() {
         fs::write(
             &path,
             format!(
-                "{one}[groups.notes]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                "{one}[groups.notes]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
                 notes.display(),
                 notes_mirror.display()
             ),
@@ -4681,14 +4723,14 @@ fn status_shows_the_running_sessions_and_the_refusal_when_the_file_breaks() {
 #[test]
 fn status_with_nothing_running_and_a_broken_file_shows_what_was_recorded() {
     let world = World::new();
-    let alpha = world.directory("alpha");
-    let beta = world.directory("beta");
-    write(&alpha, "file.txt", "file");
+    let primary = world.directory("primary");
+    let replica = world.directory("replica");
+    write(&primary, "file.txt", "file");
     let path = world.path("config.toml");
     let plans = world.plans(&format!(
-        "[groups.work]\nalpha = \"{}\"\nmode = \"two-way-conflict\"\nbetas = [\"{}\"]\n",
-        alpha.display(),
-        beta.display()
+        "[groups.work]\nprimary = \"{}\"\nmode = \"two-way-conflict\"\nreplicas = [\"{}\"]\n",
+        primary.display(),
+        replica.display()
     ));
     assert_all_synchronized(&world.run_once(plans));
     fs::write(&path, "[groups.work]\nmdoe = 1\n").expect("configuration should be writable");

@@ -41,7 +41,7 @@ To avoid false alarms from transient network interruptions or brief locks, condi
 
 | State | Default Hold Duration | Rationale |
 | :--- | :---: | :--- |
-| `halted` | `0s` *(immediate)* | Safety halts (damaged ancestor, conflicting roots) are non-transient. Exception: a missing alpha root waits 2m to accommodate drive remounts. |
+| `halted` | `0s` *(immediate)* | Safety halts (damaged ancestor, conflicting roots) are non-transient. Exception: a missing primary root waits 2m to accommodate drive remounts. |
 | `conflicts`, `blocked` | `30s` | Requires human intervention, but allows brief window for automated tooling or manual resolution. |
 | `errored` | `2m` | Allows transient filesystem or connection errors to heal automatically. |
 | `unreachable` | `5m` | Accommodates routine laptop sleep or brief network re-connections. |

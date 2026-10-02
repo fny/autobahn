@@ -76,10 +76,10 @@ for width in $(seq 1 "$MAX"); do
 
     {
       echo "[groups.fan]"
-      echo "alpha = \"$HOME/corpus/$CORPUS\""
+      echo "primary = \"$HOME/corpus/$CORPUS\""
       echo 'mode = "two-way-conflict"'
       echo "interval = 5"
-      printf 'betas = ['
+      printf 'replicas = ['
       for b in $(seq 1 "$width"); do
         printf '"dest%s:%s/dest/%s"' "$b" "$HOME" "$CORPUS"
         if [ "$b" -lt "$width" ]; then printf ', '; fi

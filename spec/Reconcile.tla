@@ -13,9 +13,9 @@ CONSTANTS
     Values,     \* file contents
     NoFile,     \* the content of a path that does not exist
     Dir,        \* the content of a directory
-    Mode        \* "conflict" | "alpha" | "strict"
+    Mode        \* "conflict" | "primary" | "strict"
 
-ASSUME Mode \in {"conflict", "alpha", "strict"}
+ASSUME Mode \in {"conflict", "primary", "strict"}
 ASSUME NoFile \notin Values /\ Dir \notin Values /\ NoFile # Dir
 ASSUME \A p \in Paths : Len(p) >= 1
 ASSUME \A p \in Paths : Len(p) > 1 => SubSeq(p, 1, Len(p) - 1) \in Paths
@@ -55,31 +55,31 @@ Changed(a, t, q) == {r \in Subtree(q) : t[r] # a[r]}
 Removed(a, t, q) == {r \in Changed(a, t, q) : t[r] = NoFile}
 Kept(a, t, q) == Changed(a, t, q) \ Removed(a, t, q)
 
-\* Whose version of a unit the pair ends up with: "alpha", "beta", or
+\* Whose version of a unit the pair ends up with: "primary", "replica", or
 \* "conflict" for neither. The reconciler's handle_disagreement, for the
 \* two-way modes.
 Decide(a, x, y, q) ==
-    IF Changed(a, y, q) = {} THEN "alpha"          \* beta untouched: alpha's
-    ELSE IF Changed(a, x, q) = {} THEN "beta"      \* alpha untouched: beta's
+    IF Changed(a, y, q) = {} THEN "primary"          \* replica untouched: primary's
+    ELSE IF Changed(a, x, q) = {} THEN "replica"      \* primary untouched: replica's
     ELSE IF Kept(a, x, q) = {} /\ Kept(a, y, q) = {} THEN
         \* both only removed: the union of the removals — whichever side
         \* is gone at the top of the unit is what the other side becomes
-        IF x[q] = NoFile THEN "alpha" ELSE "beta"
-    ELSE IF Kept(a, y, q) = {} THEN "alpha"        \* beta only removed
-    ELSE IF Kept(a, x, q) = {} THEN                \* alpha only removed
-        IF Mode = "strict" THEN "alpha" ELSE "beta"
-    ELSE IF Mode = "conflict" THEN "conflict" ELSE "alpha"
+        IF x[q] = NoFile THEN "primary" ELSE "replica"
+    ELSE IF Kept(a, y, q) = {} THEN "primary"        \* replica only removed
+    ELSE IF Kept(a, x, q) = {} THEN                \* primary only removed
+        IF Mode = "strict" THEN "primary" ELSE "replica"
+    ELSE IF Mode = "conflict" THEN "conflict" ELSE "primary"
 
 \* The outcome at one path of a cycle over trees (a, x, y).
 Outcome(a, x, y, p) ==
     LET q == UnitOf(x, y, p) IN
     IF q = <<>> THEN                                     \* level here
-        [alpha |-> x[p], beta |-> y[p], anc |-> x[p], conflict |-> FALSE]
+        [primary |-> x[p], replica |-> y[p], anc |-> x[p], conflict |-> FALSE]
     ELSE
         LET d == Decide(a, x, y, q) IN
-        IF d = "alpha" THEN [alpha |-> x[p], beta |-> x[p], anc |-> x[p], conflict |-> FALSE]
-        ELSE IF d = "beta" THEN [alpha |-> y[p], beta |-> y[p], anc |-> y[p], conflict |-> FALSE]
-        ELSE [alpha |-> x[p], beta |-> y[p], anc |-> a[p], conflict |-> (p = q)]
+        IF d = "primary" THEN [primary |-> x[p], replica |-> x[p], anc |-> x[p], conflict |-> FALSE]
+        ELSE IF d = "replica" THEN [primary |-> y[p], replica |-> y[p], anc |-> y[p], conflict |-> FALSE]
+        ELSE [primary |-> x[p], replica |-> y[p], anc |-> a[p], conflict |-> (p = q)]
 
 \* What a cycle took from a tree and carried nowhere: a value that was
 \* this side's own change, and after the cycle is on neither side of the

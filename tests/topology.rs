@@ -91,10 +91,10 @@ fn path(path: &Path) -> &str {
     path.to_str().expect("a UTF-8 path")
 }
 
-/// `autobahn sync ALPHA BETA` over a tree and itself, or a tree nested
+/// `autobahn sync PRIMARY REPLICA` over a tree and itself, or a tree nested
 /// either way around, is refused before anything opens — as a configured
-/// session over the same shape is. In replica mode the nested shape used
-/// to delete the alpha root through the beta path.
+/// session over the same shape is. In mirror mode the nested shape used
+/// to delete the primary root through the replica path.
 #[test]
 fn a_manual_sync_refuses_a_tree_and_itself() {
     let world = World::new();
@@ -105,26 +105,32 @@ fn a_manual_sync_refuses_a_tree_and_itself() {
     let alias = world.keep.path().join("alias");
     std::os::unix::fs::symlink(&source, &alias).expect("symlink should be creatable");
 
-    for (alpha, beta, how) in [
+    for (primary, replica, how) in [
         (&source, &source, "the same tree"),
-        (&tree, &source, "inside the alpha"),
-        (&source, &tree, "containing the alpha"),
+        (&tree, &source, "inside the primary"),
+        (&source, &tree, "containing the primary"),
         // Identities are physical paths, so an alias is the same tree.
         (&source, &alias, "the same tree"),
     ] {
         let before = listing(world.keep.path());
-        let (ok, text) = world.cli(&["sync", path(alpha), path(beta), "--mode", "one-way-alpha"]);
-        assert!(!ok, "{alpha:?} vs {beta:?} should be refused: {text}");
-        assert!(text.contains(how), "{alpha:?} vs {beta:?}: {text}");
+        let (ok, text) = world.cli(&[
+            "sync",
+            path(primary),
+            path(replica),
+            "--mode",
+            "one-way-primary",
+        ]);
+        assert!(!ok, "{primary:?} vs {replica:?} should be refused: {text}");
+        assert!(text.contains(how), "{primary:?} vs {replica:?}: {text}");
         let after = listing(world.keep.path());
-        assert_eq!(before, after, "{alpha:?} vs {beta:?} wrote something");
+        assert_eq!(before, after, "{primary:?} vs {replica:?} wrote something");
         assert!(
             !world.home().join(".autobahn").exists(),
-            "{alpha:?} vs {beta:?} made state"
+            "{primary:?} vs {replica:?} made state"
         );
     }
     assert_eq!(
-        fs::read_to_string(source.join("keep.txt")).expect("the alpha survives"),
+        fs::read_to_string(source.join("keep.txt")).expect("the primary survives"),
         "precious"
     );
 
@@ -135,11 +141,11 @@ fn a_manual_sync_refuses_a_tree_and_itself() {
         path(&source),
         path(&sibling),
         "--mode",
-        "one-way-alpha",
+        "one-way-primary",
     ]);
     assert!(ok, "{text}");
     assert_eq!(
-        fs::read_to_string(sibling.join("keep.txt")).expect("the beta is written"),
+        fs::read_to_string(sibling.join("keep.txt")).expect("the replica is written"),
         "precious"
     );
 }
@@ -160,17 +166,17 @@ fn a_home_root_holding_the_state_root_is_refused_unless_ignored() {
     let world = World::new();
     let home = world.home();
     write(&home, "notes.txt", "mine");
-    let beta = world.keep.path().join("beta");
+    let replica = world.keep.path().join("replica");
     let config = |ignores: &str| {
         format!(
             r#"
             [groups.home]
-            alpha = "~"
+            primary = "~"
             mode = "two-way-conflict"
-            betas = ["{beta}"]
+            replicas = ["{replica}"]
             {ignores}
             "#,
-            beta = beta.display()
+            replica = replica.display()
         )
     };
 
@@ -187,7 +193,7 @@ fn a_home_root_holding_the_state_root_is_refused_unless_ignored() {
         )),
         "{text}"
     );
-    assert!(!beta.exists(), "a refused sync wrote the beta");
+    assert!(!replica.exists(), "a refused sync wrote the replica");
 
     // The same refusal from `watch`, at startup rather than never.
     let mut child = Command::new(env!("CARGO_BIN_EXE_autobahn"))
@@ -216,14 +222,17 @@ fn a_home_root_holding_the_state_root_is_refused_unless_ignored() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!beta.exists(), "a refused watch wrote the beta");
+    assert!(!replica.exists(), "a refused watch wrote the replica");
 
     // Ignored, the home directory synchronizes without its state.
     default_config(&world, &config(r#"ignores = [".autobahn"]"#));
     let (ok, text) = world.cli(&["sync"]);
     assert!(ok, "{text}");
-    assert_eq!(fs::read_to_string(beta.join("notes.txt")).unwrap(), "mine");
-    assert!(!beta.join(".autobahn").exists());
+    assert_eq!(
+        fs::read_to_string(replica.join("notes.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!replica.join(".autobahn").exists());
 }
 
 /// A state root moved with `--state-root` is refused inside a root just
@@ -233,16 +242,16 @@ fn a_root_holding_a_custom_state_root_or_the_configuration_is_refused() {
     let world = World::new();
     let tree = world.directory("tree");
     write(&tree, "file.txt", "content");
-    let beta = world.keep.path().join("beta");
+    let replica = world.keep.path().join("replica");
     let text = format!(
         r#"
         [groups.tree]
-        alpha = "{tree}"
+        primary = "{tree}"
         mode = "two-way-conflict"
-        betas = ["{beta}"]
+        replicas = ["{replica}"]
         "#,
         tree = tree.display(),
-        beta = beta.display()
+        replica = replica.display()
     );
     let outside = world.keep.path().join("config.toml");
     fs::write(&outside, &text).unwrap();
@@ -257,7 +266,7 @@ fn a_root_holding_a_custom_state_root_or_the_configuration_is_refused() {
     assert!(!ok, "{output}");
     assert!(output.contains("contains autobahn's own state"), "{output}");
     assert!(
-        !beta.exists() && !state.exists(),
+        !replica.exists() && !state.exists(),
         "a refused sync wrote something"
     );
 
@@ -277,12 +286,12 @@ fn a_root_holding_a_custom_state_root_or_the_configuration_is_refused() {
         "{output}"
     );
     assert!(
-        !beta.exists() && !elsewhere.exists(),
+        !replica.exists() && !elsewhere.exists(),
         "a refused sync wrote something"
     );
 }
 
-/// `autobahn sync ALPHA BETA` is held to the same rule, with `--ignore`
+/// `autobahn sync PRIMARY REPLICA` is held to the same rule, with `--ignore`
 /// as the way through.
 #[test]
 fn a_manual_sync_of_the_home_directory_needs_the_state_root_ignored() {
@@ -290,16 +299,19 @@ fn a_manual_sync_of_the_home_directory_needs_the_state_root_ignored() {
     let home = world.home();
     write(&home, "notes.txt", "mine");
     write(&home, ".autobahn/config.toml", "");
-    let beta = world.keep.path().join("beta");
-    let (ok, text) = world.cli(&["sync", path(&home), path(&beta)]);
+    let replica = world.keep.path().join("replica");
+    let (ok, text) = world.cli(&["sync", path(&home), path(&replica)]);
     assert!(!ok, "{text}");
     assert!(text.contains("contains autobahn's own state"), "{text}");
-    assert!(!beta.exists());
+    assert!(!replica.exists());
 
-    let (ok, text) = world.cli(&["sync", path(&home), path(&beta), "--ignore", ".autobahn"]);
+    let (ok, text) = world.cli(&["sync", path(&home), path(&replica), "--ignore", ".autobahn"]);
     assert!(ok, "{text}");
-    assert_eq!(fs::read_to_string(beta.join("notes.txt")).unwrap(), "mine");
-    assert!(!beta.join(".autobahn").exists());
+    assert_eq!(
+        fs::read_to_string(replica.join("notes.txt")).unwrap(),
+        "mine"
+    );
+    assert!(!replica.join(".autobahn").exists());
 }
 
 /// A root holding credentials is synchronized as asked, and said so,
@@ -309,19 +321,19 @@ fn a_root_holding_credentials_is_warned_about_at_startup() {
     let world = World::new();
     let tree = world.directory("tree");
     write(&tree, ".aws/credentials", "secret");
-    let beta = world.keep.path().join("beta");
+    let replica = world.keep.path().join("replica");
     let config = world.keep.path().join("config.toml");
     let text = |extra: &str| {
         format!(
             r#"
             [groups.tree]
-            alpha = "{tree}"
+            primary = "{tree}"
             mode = "two-way-conflict"
-            betas = ["{beta}"]
+            replicas = ["{replica}"]
             {extra}
             "#,
             tree = tree.display(),
-            beta = beta.display()
+            replica = replica.display()
         )
     };
     let state = world.keep.path().join("state");

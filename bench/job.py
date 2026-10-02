@@ -133,8 +133,8 @@ def destinations():
     orchestrator exports every alias in the group once, for the whole
     pair script. Narrow cells therefore have to trim: `BENCH_DESTINATIONS`
     says what the machine offers, `WIDTH` says what this cell asked for.
-    Without the trim a 1-beta cell landing on a fan-out-wide group
-    silently became a 10-beta fan-out — same cycle count, ten times the
+    Without the trim a 1-replica cell landing on a fan-out-wide group
+    silently became a 10-replica fan-out — same cycle count, ten times the
     changes, and a p90 inflated 6-15x. That is what produced the six
     anomalous jobs in bench-1789947877.
     """
@@ -187,7 +187,7 @@ def peer_ips():
     The orchestrator writes one per line for every machine in the group.
 
     Trimmed to the cell's width, as `destinations` is: a group is sized
-    for its widest cell, and a 1-beta cell on a fan-out group that
+    for its widest cell, and a 1-replica cell on a fan-out group that
     watched every address waited for each edit to land on ten machines
     while one was synchronized. None ever did, so every attempt of the
     window was censored, for both tools alike — seven jobs of
@@ -649,11 +649,11 @@ def start_tool(tool, corpora):
         for corpus in corpora:
             lines += [
                 f"[groups.{corpus}]",
-                f'alpha = "{CORPUS}/{corpus}"',
+                f'primary = "{CORPUS}/{corpus}"',
                 'mode = "two-way-conflict"',
                 "interval = 5",
                 'ignores = ["/.git", "/out"]',
-                "betas = [" + ", ".join(
+                "replicas = [" + ", ".join(
                     f'"{host}:{DEST}/{corpus}"' for host in destinations()) + "]",
                 "",
             ]
@@ -1053,7 +1053,7 @@ def main():
     # width is in force for the whole job and lands in the record below.
     global JOB_LABEL, WIDTH
     JOB_LABEL = spec["job"]
-    WIDTH = spec["cell"].get("betas")
+    WIDTH = spec["cell"].get("replicas")
 
     identity = {key: spec[key] for key in ("run", "pair", "job", "repeat")}
     identity["cell"] = spec["cell"]["name"]

@@ -53,7 +53,7 @@ pub struct Initialize {
     /// The permission bits for created directories (`None` for the agent's
     /// default).
     pub directory_mode: Option<u32>,
-    /// Which side of the session this endpoint is ("alpha" or "beta") —
+    /// Which side of the session this endpoint is ("primary" or "replica") —
     /// part of the agent's staging namespace, so the two sides of one
     /// session never share staging space even on one host.
     pub side: String,
@@ -99,7 +99,7 @@ impl Initialize {
             self.session
         );
         anyhow::ensure!(
-            matches!(self.side.as_str(), "alpha" | "beta"),
+            matches!(self.side.as_str(), "primary" | "replica"),
             "refusing side {:?}",
             self.side
         );
@@ -186,7 +186,7 @@ pub enum Request {
     /// P2P, with `manage_keys`: the host's p2p key, made if it has
     /// none, and its SSH host keys.
     P2pKeys,
-    /// P2P, with `manage_keys`: the other betas' keys for the host's
+    /// P2P, with `manage_keys`: the other replicas' keys for the host's
     /// `authorized_keys`, each forced through the gate, and their host keys
     /// for its p2p `known_hosts`. A gated agent refuses this and
     /// `P2pKeys`.
@@ -384,7 +384,7 @@ pub enum MuxResponse {
 /// diagnostic all enforce it with no protocol change at all: a mismatched
 /// agent fails the handshake, and the installer places the new agent at a
 /// path the old one never occupied.
-pub const COMPATIBILITY_EPOCH: u32 = 17;
+pub const COMPATIBILITY_EPOCH: u32 = 18;
 
 /// Returns the version string used for handshake validation and agent
 /// installation: the package version qualified by the compatibility epoch.
@@ -437,10 +437,10 @@ mod tests {
     fn a_genuine_identifier_is_accepted() {
         let session = crate::session::session_identifier("a", "b");
         assert!(is_session_identifier(&session));
-        initialize(&session, "beta")
+        initialize(&session, "replica")
             .validate()
             .expect("a genuine session and side are accepted");
-        initialize(&session, "alpha")
+        initialize(&session, "primary")
             .validate()
             .expect("a genuine session and side are accepted");
     }
@@ -462,7 +462,7 @@ mod tests {
             &format!("{}/", &hex[..31]),
         ] {
             assert!(!is_session_identifier(session), "{session:?}");
-            let error = initialize(session, "beta")
+            let error = initialize(session, "replica")
                 .validate()
                 .expect_err("the session must be refused");
             assert!(
@@ -478,13 +478,13 @@ mod tests {
     fn an_uppercase_session_is_refused() {
         let session = crate::session::session_identifier("a", "b").to_uppercase();
         assert!(!is_session_identifier(&session));
-        assert!(initialize(&session, "beta").validate().is_err());
+        assert!(initialize(&session, "replica").validate().is_err());
     }
 
     #[test]
     fn an_unknown_side_is_refused() {
         let session = crate::session::session_identifier("a", "b");
-        for side in ["gamma", "../alpha", "", "Beta"] {
+        for side in ["gamma", "../primary", "", "Replica"] {
             let error = initialize(&session, side)
                 .validate()
                 .expect_err("the side must be refused");

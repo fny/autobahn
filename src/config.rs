@@ -1,7 +1,7 @@
 //! The groups configuration: a declarative description of synchronization
-//! sessions, organized as groups that fan one root (the alpha — a local
+//! sessions, organized as groups that fan one root (the primary — a local
 //! directory or a remote `host:path`) out to any number of destinations
-//! (the betas).
+//! (the replicas).
 //!
 //! The configuration is the source of truth: the supervisor derives its
 //! session list from it on every start, so what is running is always what
@@ -18,20 +18,20 @@
 //! interval = 5
 //!
 //! [groups.project]
-//! alpha = "~/project"
-//! betas = ["build.example.com", "user@lab.example.com:/srv/project"]
+//! primary = "~/project"
+//! replicas = ["build.example.com", "user@lab.example.com:/srv/project"]
 //!
 //! [groups.dotfiles]
-//! alpha = "~/.config/shell"
-//! mode = "one-way-alpha"
-//! betas = ["build.example.com", "/mnt/backup/shell"]
+//! primary = "~/.config/shell"
+//! mode = "one-way-primary"
+//! replicas = ["build.example.com", "/mnt/backup/shell"]
 //! ```
 //!
-//! A beta is **remote** unless it visibly denotes a local path: an entry
+//! A replica is **remote** unless it visibly denotes a local path: an entry
 //! containing a `/` before any `:`, or beginning with `.`, `/`, or `~`, is a
-//! local path; anything else is `[user@]host[:path]`. A remote beta without
-//! an explicit path inherits the group's alpha path *as written* (so a
-//! home-relative alpha resolves against each remote host's own home).
+//! local path; anything else is `[user@]host[:path]`. A remote replica without
+//! an explicit path inherits the group's primary path *as written* (so a
+//! home-relative primary resolves against each remote host's own home).
 
 /// A starting configuration, written by `autobahn init`.
 ///
@@ -69,17 +69,17 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 # file. There is no default: direction is never guessed.
 #
 #   two-way-conflict   both ways; a clash is reported and nothing is touched
-#   two-way-alpha      both ways; alpha's version wins a clash, silently
-#   two-way-alpha-strict  as above, and alpha's deletion of a file beta
-#                      edited wins too (in two-way-alpha the edit survives)
-#   one-way-conflict   alpha to beta; an edit on beta is reported, not overwritten
-#   one-way-alpha      alpha to beta; beta is made identical (also spelled "mirror")
+#   two-way-primary      both ways; primary's version wins a clash, silently
+#   two-way-primary-strict  as above, and primary's deletion of a file replica
+#                      edited wins too (in two-way-primary the edit survives)
+#   one-way-conflict   primary to replica; an edit on replica is reported, not overwritten
+#   one-way-primary      primary to replica; replica is made identical (also spelled "mirror")
 #
-# Dangerously experimental: as the two-way modes, and a beta takes the lead
-# while the alpha is away. Known security and collision issues are open;
-# read docs/p2p.md first. The alpha must be this machine.
+# Dangerously experimental: as the two-way modes, and a replica takes the lead
+# while the primary is away. Known security and collision issues are open;
+# read docs/p2p.md first. The primary must be this machine.
 #   p2p-conflict-dangerously-experimental
-#   p2p-alpha-dangerously-experimental
+#   p2p-primary-dangerously-experimental
 mode = "two-way-conflict"
 
 # Applied everywhere, in gitignore syntax: a bare name matches at any
@@ -104,17 +104,17 @@ ignores = [
 # so this is the fallback, not how fast a change travels.
 interval = 5
 
-# A group sends one source folder (the alpha) to any number of
-# destinations (the betas). Each pair is its own session, and one failing
+# A group sends one source folder (the primary) to any number of
+# destinations (the replicas). Each pair is its own session, and one failing
 # never stops the others.
 #
 # This example is commented out, so a fresh install starts nothing. Edit
 # the paths, uncomment it, and run `autobahn watch`.
 #
 # [groups.project]
-# alpha = "~/project"
-# betas = [
-#   "build.example.com",                 # uses the alpha's path on that host
+# primary = "~/project"
+# replicas = [
+#   "build.example.com",                 # uses the primary's path on that host
 #   "user@lab.example.com:/srv/project", # or name a path
 #   "/mnt/backup/project",               # a local path works too
 # ]
@@ -295,8 +295,8 @@ pub struct Config {
     /// not be: `on_alert` is a valid key nowhere else, so one written after
     /// a `[groups.x]` header is refused rather than silently absorbed.
     pub on_alert: Option<String>,
-    /// Hosts excluded from every group. A disabled beta host drops that
-    /// beta; a disabled alpha host drops the whole group.
+    /// Hosts excluded from every group. A disabled replica host drops that
+    /// replica; a disabled primary host drops the whole group.
     ///
     /// Named for what it holds, because a group has a `disabled` of its
     /// own that is a flag, not a list, and one word cannot be both.
@@ -373,7 +373,7 @@ pub struct P2pAdvanced {
     /// How long a candidate waits after the lease went stale before it
     /// takes the lead. This is the blip window.
     pub failover_after: Option<DurationSpec>,
-    /// Whether the alpha sets up the betas' keys to one another itself:
+    /// Whether the primary sets up the replicas' keys to one another itself:
     /// each a key of its own, forced through the gate on every other.
     pub manage_keys: Option<bool>,
 }
@@ -385,7 +385,7 @@ pub struct P2pPlan {
     pub ttl: Duration,
     /// How long a candidate waits past a stale lease before it leads.
     pub failover_after: Duration,
-    /// Whether the alpha sets up the betas' keys to one another.
+    /// Whether the primary sets up the replicas' keys to one another.
     pub manage_keys: bool,
 }
 
@@ -527,18 +527,18 @@ pub enum SizeSpec {
     Text(String),
 }
 
-/// One synchronization group: a local alpha directory fanned out to one or
-/// more beta destinations.
+/// One synchronization group: a local primary directory fanned out to one or
+/// more replica destinations.
 #[derive(Clone, Debug, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Group {
-    /// The alpha synchronization root: a local path (`~` is expanded) or a
+    /// The primary synchronization root: a local path (`~` is expanded) or a
     /// remote `[user@]host:path` specification.
-    pub alpha: String,
-    /// The beta destinations (remote `[user@]host[:path]` or local paths).
+    pub primary: String,
+    /// The replica destinations (remote `[user@]host[:path]` or local paths).
     #[serde(default)]
-    pub betas: Vec<String>,
+    pub replicas: Vec<String>,
     /// The synchronization mode.
     pub mode: Option<String>,
     /// Ignore patterns, appended to the defaults' patterns.
@@ -596,29 +596,29 @@ pub struct Group {
     pub agent_command: Option<String>,
 }
 
-/// One planned session: a fully resolved (group, beta) pair, ready for the
+/// One planned session: a fully resolved (group, replica) pair, ready for the
 /// supervisor to run.
 #[derive(Clone, Debug)]
 pub struct SessionPlan {
     /// The name of the group the session belongs to.
     pub group: String,
-    /// The destination label: the remote host, or the local beta path.
+    /// The destination label: the remote host, or the local replica path.
     pub host: String,
-    /// The alpha endpoint (a tilde-expanded local path, or a remote root).
-    pub alpha: EndpointTarget,
-    /// The alpha root as written in the configuration (used for display
+    /// The primary endpoint (a tilde-expanded local path, or a remote root).
+    pub primary: EndpointTarget,
+    /// The primary root as written in the configuration (used for display
     /// and for remote path inheritance).
-    pub alpha_spec: String,
-    /// The beta destination.
-    pub beta: EndpointTarget,
-    /// The alpha endpoint's resolved identity, frozen at plan time. The
+    pub primary_spec: String,
+    /// The replica destination.
+    pub replica: EndpointTarget,
+    /// The primary endpoint's resolved identity, frozen at plan time. The
     /// worker that later connects re-resolves the live path and refuses to
     /// proceed if the two disagree: between planning and connecting a
     /// symlink can be retargeted, and a session that resolved one tree at
     /// plan time must not bind another tree to the first one's ancestor.
-    pub alpha_identity: String,
-    /// The beta endpoint's resolved identity, frozen at plan time.
-    pub beta_identity: String,
+    pub primary_identity: String,
+    /// The replica endpoint's resolved identity, frozen at plan time.
+    pub replica_identity: String,
     /// The synchronization mode.
     pub mode: SyncMode,
     /// The combined ignore patterns (defaults first, then the group's).
@@ -652,8 +652,8 @@ pub struct SessionPlan {
     pub default_owner: Option<String>,
     /// The group for created entries (`None` to leave ownership alone).
     pub default_group: Option<String>,
-    /// P2P, when the mode asks for it: the betas can take the lead
-    /// while the alpha is away, with this timing. `None` for the plain
+    /// P2P, when the mode asks for it: the replicas can take the lead
+    /// while the primary is away, with this timing. `None` for the plain
     /// modes. Reconciliation never looks at this; `mode` says all it needs.
     pub p2p: Option<P2pPlan>,
     /// The stable identifier isolating this session's state, derived from
@@ -666,7 +666,7 @@ pub struct SessionPlan {
     /// Whether the group said it means to synchronize credentials, which
     /// silences [`secret_warnings`] for its roots.
     pub acknowledge_secrets: bool,
-    /// The beta path, shown in the label when another plan of the group
+    /// The replica path, shown in the label when another plan of the group
     /// shares this one's host: `group@host` alone would name both.
     shown_path: Option<String>,
 }
@@ -689,7 +689,7 @@ pub enum EndpointTarget {
 }
 
 impl EndpointTarget {
-    /// The target `autobahn sync ALPHA BETA` builds for one side: the
+    /// The target `autobahn sync PRIMARY REPLICA` builds for one side: the
     /// frozen resolution of a local root, or the remote root an agent
     /// command or SSH reaches. What the topology checks compare.
     pub fn manual(spec: &str, agent: Option<&str>, frozen: Option<&Path>) -> EndpointTarget {
@@ -711,7 +711,7 @@ impl EndpointTarget {
 
 impl SessionPlan {
     /// Returns the display name of the session: `group@host`, or
-    /// `group@host:path` when another beta of the group is on the same
+    /// `group@host:path` when another replica of the group is on the same
     /// host. For people to read; sessions are told apart by
     /// [`identifier`](Self::identifier).
     pub fn display(&self) -> String {
@@ -721,9 +721,9 @@ impl SessionPlan {
         }
     }
 
-    /// Returns the beta specification string used for session identity.
-    pub fn beta_spec(&self) -> String {
-        match &self.beta {
+    /// Returns the replica specification string used for session identity.
+    pub fn replica_spec(&self) -> String {
+        match &self.replica {
             EndpointTarget::Local(path) => path.to_string_lossy().into_owned(),
             EndpointTarget::Remote {
                 destination, path, ..
@@ -736,14 +736,14 @@ impl SessionPlan {
         self.identifier.clone()
     }
 
-    /// P2P: the session between the configured alpha and this host,
-    /// as a beta that leads runs it — the alpha reached by attachment and
-    /// still the alpha of the pair, this host's own root (the alpha of
-    /// `self`) as the beta, under the identifier the leader pushed so it
+    /// P2P: the session between the configured primary and this host,
+    /// as a replica that leads runs it — the primary reached by attachment and
+    /// still the primary of the pair, this host's own root (the primary of
+    /// `self`) as the replica, under the identifier the leader pushed so it
     /// is the same session the leader ran.
-    pub(crate) fn attached_alpha(
+    pub(crate) fn attached_primary(
         &self,
-        alpha_path: &str,
+        primary_path: &str,
         identifier: String,
     ) -> anyhow::Result<SessionPlan> {
         // The identifier names the session's directory under the state
@@ -754,23 +754,23 @@ impl SessionPlan {
             "the session identifier {identifier:?} for group {} is not one a leader makes",
             self.group
         );
-        let own = match &self.alpha {
+        let own = match &self.primary {
             EndpointTarget::Local(path) => path.clone(),
             EndpointTarget::Remote { path, .. } => PathBuf::from(path),
         };
-        let alpha = EndpointTarget::Remote {
-            destination: crate::p2p::attached_destination(crate::p2p::ALPHA),
-            path: alpha_path.to_owned(),
+        let primary = EndpointTarget::Remote {
+            destination: crate::p2p::attached_destination(crate::p2p::PRIMARY),
+            path: primary_path.to_owned(),
             agent_command: None,
         };
-        let beta = EndpointTarget::Local(own);
+        let replica = EndpointTarget::Local(own);
         Ok(SessionPlan {
-            host: crate::p2p::ALPHA.to_owned(),
-            alpha_identity: target_identity(&alpha),
-            beta_identity: target_identity(&beta),
-            alpha_spec: alpha_path.to_owned(),
-            alpha,
-            beta,
+            host: crate::p2p::PRIMARY.to_owned(),
+            primary_identity: target_identity(&primary),
+            replica_identity: target_identity(&replica),
+            primary_spec: primary_path.to_owned(),
+            primary,
+            replica,
             identifier,
             shown_path: None,
             ..self.clone()
@@ -782,7 +782,7 @@ impl SessionPlan {
     /// shows, so a reader sees the word they wrote.
     pub fn mode_name(&self) -> &'static str {
         match (self.p2p, self.mode) {
-            (Some(_), SyncMode::TwoWayResolved) => "p2p-alpha-dangerously-experimental",
+            (Some(_), SyncMode::TwoWayResolved) => "p2p-primary-dangerously-experimental",
             (Some(_), _) => "p2p-conflict-dangerously-experimental",
             (None, mode) => mode_name(mode),
         }
@@ -860,34 +860,34 @@ impl Place {
 
 /// Refuses a session whose two sides are one tree, or one inside the
 /// other: the session would consume its own output. Reconciliation sees
-/// the copy as divergence and, in replica mode, deletes the alpha root
-/// through the beta path. This was reproduced, not hypothesized, first
-/// from a configuration and then from `autobahn sync ALPHA BETA`, so every
+/// the copy as divergence and, in mirror mode, deletes the primary root
+/// through the replica path. This was reproduced, not hypothesized, first
+/// from a configuration and then from `autobahn sync PRIMARY REPLICA`, so every
 /// way of building a session asks this before any endpoint opens.
 ///
 /// The identities are the resolved ones the session is identified by, so
 /// a symlink alias or a trailing `/.` is the same tree. Relays, where one
-/// session's beta feeds another's alpha, are a different question and
+/// session's replica feeds another's primary, are a different question and
 /// stay legal: only overlap within a single session is self-referential.
 pub fn check_session_topology(
-    alpha: &EndpointTarget,
-    beta: &EndpointTarget,
-    alpha_identity: &str,
-    beta_identity: &str,
+    primary: &EndpointTarget,
+    replica: &EndpointTarget,
+    primary_identity: &str,
+    replica_identity: &str,
 ) -> Result<(), String> {
-    let alpha = Place::of(alpha, alpha_identity);
-    let beta = Place::of(beta, beta_identity);
-    let how = if alpha == beta {
+    let primary = Place::of(primary, primary_identity);
+    let replica = Place::of(replica, replica_identity);
+    let how = if primary == replica {
         "the same tree"
-    } else if alpha.contains(&beta).is_some() {
-        "a tree inside the alpha"
-    } else if beta.contains(&alpha).is_some() {
-        "a tree containing the alpha"
+    } else if primary.contains(&replica).is_some() {
+        "a tree inside the primary"
+    } else if replica.contains(&primary).is_some() {
+        "a tree containing the primary"
     } else {
         return Ok(());
     };
     Err(format!(
-        "the beta is {how}; a session cannot synchronize a tree with itself or \
+        "the replica is {how}; a session cannot synchronize a tree with itself or \
          with a tree that contains it"
     ))
 }
@@ -983,12 +983,12 @@ impl OwnState {
     /// Checks both sides of a session.
     pub fn check_session(
         &self,
-        (alpha, alpha_identity): (&EndpointTarget, &str),
-        (beta, beta_identity): (&EndpointTarget, &str),
+        (primary, primary_identity): (&EndpointTarget, &str),
+        (replica, replica_identity): (&EndpointTarget, &str),
         ignores: &[String],
     ) -> Result<(), String> {
-        self.check(alpha, alpha_identity, ignores)?;
-        self.check(beta, beta_identity, ignores)
+        self.check(primary, primary_identity, ignores)?;
+        self.check(replica, replica_identity, ignores)
     }
 
     /// Checks every planned session, reporting each offending root once.
@@ -996,8 +996,8 @@ impl OwnState {
         let mut problems: Vec<String> = Vec::new();
         for plan in plans {
             if let Err(problem) = self.check_session(
-                (&plan.alpha, &plan.alpha_identity),
-                (&plan.beta, &plan.beta_identity),
+                (&plan.primary, &plan.primary_identity),
+                (&plan.replica, &plan.replica_identity),
                 &plan.ignores,
             ) {
                 let problem = format!("group '{}': {problem}", plan.group);
@@ -1013,13 +1013,13 @@ impl OwnState {
     }
 }
 
-/// Whether a mode writes its alpha. A `match` with no wildcard arm, so
+/// Whether a mode writes its primary. A `match` with no wildcard arm, so
 /// a mode added later is classified by whoever adds it: counted read-only
 /// by default, it would escape the cross-session nesting check.
-fn alpha_is_written(mode: SyncMode) -> bool {
+fn primary_is_written(mode: SyncMode) -> bool {
     match mode {
         SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => true,
-        SyncMode::OneWaySafe | SyncMode::OneWayReplica => false,
+        SyncMode::OneWaySafe | SyncMode::OneWayMirror => false,
     }
 }
 
@@ -1073,8 +1073,8 @@ pub fn secret_warnings(plans: &[SessionPlan]) -> Vec<String> {
     let mut warnings = Vec::new();
     for plan in plans.iter().filter(|plan| !plan.acknowledge_secrets) {
         for (target, identity) in [
-            (&plan.alpha, &plan.alpha_identity),
-            (&plan.beta, &plan.beta_identity),
+            (&plan.primary, &plan.primary_identity),
+            (&plan.replica, &plan.replica_identity),
         ] {
             if !matches!(target, EndpointTarget::Local(_)) || seen.contains(&identity.as_str()) {
                 continue;
@@ -1129,13 +1129,13 @@ impl Config {
     }
 
     /// Every host this configuration names, in configuration order: each
-    /// group's alpha when it is remote, and every remote beta. What `disable`
+    /// group's primary when it is remote, and every remote replica. What `disable`
     /// checks a name against, so a typo is refused rather than written into
     /// the file and quietly ignored.
     pub fn known_hosts(&self) -> Vec<String> {
         let mut hosts: Vec<String> = Vec::new();
         for group in self.groups.values() {
-            for spec in std::iter::once(&group.alpha).chain(group.betas.iter()) {
+            for spec in std::iter::once(&group.primary).chain(group.replicas.iter()) {
                 let destination = spec.split(':').next().unwrap_or(spec);
                 if destination.starts_with('/') || destination.starts_with('~') {
                     continue;
@@ -1149,13 +1149,13 @@ impl Config {
         hosts
     }
 
-    /// The groups whose alpha is this host. Disabling one of these takes the
+    /// The groups whose primary is this host. Disabling one of these takes the
     /// whole group with it, which is worth saying out loud before it happens.
     pub fn groups_led_by(&self, host: &str) -> Vec<String> {
         self.groups
             .iter()
             .filter(|(_, group)| {
-                let destination = group.alpha.split(':').next().unwrap_or(&group.alpha);
+                let destination = group.primary.split(':').next().unwrap_or(&group.primary);
                 !destination.starts_with('/')
                     && !destination.starts_with('~')
                     && host_of(destination) == host
@@ -1411,11 +1411,13 @@ impl Config {
                     false
                 }
             };
-            if group.alpha.is_empty() {
-                errors.push(format!("group '{name}': alpha: cannot be empty"));
+            if group.primary.is_empty() {
+                errors.push(format!("group '{name}': primary: cannot be empty"));
             }
-            if group.betas.is_empty() {
-                errors.push(format!("group '{name}': betas: a group needs at least one"));
+            if group.replicas.is_empty() {
+                errors.push(format!(
+                    "group '{name}': replicas: a group needs at least one"
+                ));
             }
             let agent_command = match &group.agent_command {
                 None => None,
@@ -1430,38 +1432,38 @@ impl Config {
                 }
             };
 
-            // The alpha side accepts the same specifications as a beta,
-            // except that a remote alpha must carry an explicit path (there
+            // The primary side accepts the same specifications as a replica,
+            // except that a remote primary must carry an explicit path (there
             // is nothing for it to inherit one from).
-            let alpha = if group.alpha.is_empty() {
+            let primary = if group.primary.is_empty() {
                 None
             } else {
-                match parse_endpoint(&group.alpha, None, agent_command.clone()) {
+                match parse_endpoint(&group.primary, None, agent_command.clone()) {
                     Ok(EndpointTarget::Local(path)) if !path.is_absolute() => {
-                        // A relative alpha would resolve against whatever
+                        // A relative primary would resolve against whatever
                         // working directory the supervisor happened to start
                         // in — a different tree under a service than in a
                         // shell.
                         errors.push(format!(
-                            "group '{name}': alpha: '{}' must be an absolute (or ~-relative) \
+                            "group '{name}': primary: '{}' must be an absolute (or ~-relative) \
                              path",
-                            group.alpha
+                            group.primary
                         ));
                         None
                     }
                     Ok(target) => Some(target),
                     Err(message) => {
                         errors.push(format!(
-                            "group '{name}': alpha: '{}': {message}",
-                            group.alpha
+                            "group '{name}': primary: '{}': {message}",
+                            group.primary
                         ));
                         None
                     }
                 }
             };
-            // A disabled alpha host takes the whole group with it: every
+            // A disabled primary host takes the whole group with it: every
             // session of the group flows through that endpoint.
-            if let Some(EndpointTarget::Remote { destination, .. }) = &alpha {
+            if let Some(EndpointTarget::Remote { destination, .. }) = &primary {
                 if self
                     .disabled_hosts
                     .iter()
@@ -1470,26 +1472,26 @@ impl Config {
                     continue;
                 }
             }
-            // P2P assumes the alpha is the machine this configuration
+            // P2P assumes the primary is the machine this configuration
             // runs on: it is the one member that is never dialed, so it
-            // has to be the one doing the dialing. A remote alpha would
+            // has to be the one doing the dialing. A remote primary would
             // mean a supervisor on a third machine, which the lease and
             // the handoff do not model.
             if p2p.is_some() {
-                if let Some(EndpointTarget::Remote { .. }) = &alpha {
+                if let Some(EndpointTarget::Remote { .. }) = &primary {
                     errors.push(format!(
-                        "group '{name}': mode: a p2p mode needs a local alpha; '{}' is \
+                        "group '{name}': mode: a p2p mode needs a local primary; '{}' is \
                          remote",
-                        group.alpha
+                        group.primary
                     ));
                     continue;
                 }
             }
-            // The path a remote beta inherits when it names none: the
-            // alpha's path portion, as written.
-            let inherited_path = match &alpha {
+            // The path a remote replica inherits when it names none: the
+            // primary's path portion, as written.
+            let inherited_path = match &primary {
                 Some(EndpointTarget::Remote { path, .. }) => path.clone(),
-                _ => group.alpha.clone(),
+                _ => group.primary.clone(),
             };
 
             // The defaults, then the group, each read straight down: the
@@ -1664,35 +1666,36 @@ impl Config {
                 "default_group",
             );
 
-            for beta in &group.betas {
-                if beta.is_empty() {
-                    errors.push(format!("group '{name}': betas: one of them is empty"));
+            for replica in &group.replicas {
+                if replica.is_empty() {
+                    errors.push(format!("group '{name}': replicas: one of them is empty"));
                     continue;
                 }
                 let target =
-                    match parse_endpoint(beta, Some(&inherited_path), agent_command.clone()) {
+                    match parse_endpoint(replica, Some(&inherited_path), agent_command.clone()) {
                         Ok(target) => target,
                         Err(message) => {
-                            errors.push(format!("group '{name}': betas: '{beta}': {message}"));
+                            errors
+                                .push(format!("group '{name}': replicas: '{replica}': {message}"));
                             continue;
                         }
                     };
                 if let EndpointTarget::Local(path) = &target {
                     // A peer is a machine that can take the lead. A local
                     // path is this machine again, and this machine is the
-                    // alpha already.
+                    // primary already.
                     if p2p.is_some() {
                         errors.push(format!(
-                            "group '{name}': betas: '{beta}': a p2p mode needs every beta on \
+                            "group '{name}': replicas: '{replica}': a p2p mode needs every replica on \
                              another host"
                         ));
                         continue;
                     }
-                    // The same working-directory hazard as a relative alpha,
+                    // The same working-directory hazard as a relative primary,
                     // and the trap that catches unexpanded `~user` forms.
                     if !path.is_absolute() {
                         errors.push(format!(
-                            "group '{name}': betas: '{beta}' must be an absolute (or ~-relative) \
+                            "group '{name}': replicas: '{replica}' must be an absolute (or ~-relative) \
                              local path"
                         ));
                         continue;
@@ -1707,20 +1710,20 @@ impl Config {
                         continue;
                     }
                 }
-                let (Some(mode), Some(alpha)) = (mode, alpha.clone()) else {
+                let (Some(mode), Some(primary)) = (mode, primary.clone()) else {
                     continue;
                 };
-                let alpha_identity = target_identity(&alpha);
-                let beta_identity = target_identity(&target);
-                let identifier = session_identifier(&alpha_identity, &beta_identity);
+                let primary_identity = target_identity(&primary);
+                let replica_identity = target_identity(&target);
+                let identifier = session_identifier(&primary_identity, &replica_identity);
                 let plan = SessionPlan {
                     group: name.clone(),
                     host,
-                    alpha,
-                    alpha_spec: group.alpha.clone(),
-                    beta: target,
-                    alpha_identity: alpha_identity.clone(),
-                    beta_identity: beta_identity.clone(),
+                    primary,
+                    primary_spec: group.primary.clone(),
+                    replica: target,
+                    primary_identity: primary_identity.clone(),
+                    replica_identity: replica_identity.clone(),
                     mode,
                     ignores: ignores.clone(),
                     interval,
@@ -1740,17 +1743,20 @@ impl Config {
                     acknowledge_secrets: group.acknowledge_secrets,
                     shown_path: None,
                 };
-                if let Err(problem) =
-                    check_session_topology(&plan.alpha, &plan.beta, &alpha_identity, &beta_identity)
-                {
+                if let Err(problem) = check_session_topology(
+                    &plan.primary,
+                    &plan.replica,
+                    &primary_identity,
+                    &replica_identity,
+                ) {
                     errors.push(format!("session '{}': {problem}", plan.display()));
                     continue;
                 }
                 if let Some(previous) =
-                    identities.insert((alpha_identity, beta_identity), plan.display())
+                    identities.insert((primary_identity, replica_identity), plan.display())
                 {
                     errors.push(format!(
-                        "sessions '{previous}' and '{}' describe the same alpha and beta; \
+                        "sessions '{previous}' and '{}' describe the same primary and replica; \
                          they would synchronize the same trees concurrently",
                         plan.display()
                     ));
@@ -1760,7 +1766,7 @@ impl Config {
             }
         }
 
-        // Two betas of one group on one host would read alike, in status,
+        // Two replicas of one group on one host would read alike, in status,
         // in the logs and in the messages below; they show their paths.
         let shared: Vec<usize> = (0..plans.len())
             .filter(|&index| {
@@ -1772,7 +1778,7 @@ impl Config {
             })
             .collect();
         for index in shared {
-            if let EndpointTarget::Remote { path, .. } = &plans[index].beta {
+            if let EndpointTarget::Remote { path, .. } = &plans[index].replica {
                 plans[index].shown_path = Some(path.clone());
             }
         }
@@ -1789,20 +1795,21 @@ impl Config {
         // configurations in separate processes are outside what this can
         // see; the endpoint-pair lock covers the identical pair there, and
         // anything else is documented as unsupported.
-        // A beta is always written; an alpha is written by the two-way
+        // A replica is always written; a primary is written by the two-way
         // modes.
-        let writable = |plan: &SessionPlan, alpha: bool| !alpha || alpha_is_written(plan.mode);
+        let writable =
+            |plan: &SessionPlan, primary: bool| !primary || primary_is_written(plan.mode);
         let mut endpoints: Vec<(String, Place, bool, String)> = Vec::new();
         for plan in &plans {
             endpoints.push((
-                plan.alpha_identity.clone(),
-                Place::of(&plan.alpha, &plan.alpha_identity),
+                plan.primary_identity.clone(),
+                Place::of(&plan.primary, &plan.primary_identity),
                 writable(plan, true),
                 plan.display(),
             ));
             endpoints.push((
-                plan.beta_identity.clone(),
-                Place::of(&plan.beta, &plan.beta_identity),
+                plan.replica_identity.clone(),
+                Place::of(&plan.replica, &plan.replica_identity),
                 writable(plan, false),
                 plan.display(),
             ));
@@ -1811,9 +1818,9 @@ impl Config {
             for (offset, (other_identity, other_place, other_writes, other_owner)) in
                 endpoints.iter().enumerate().skip(index + 1)
             {
-                // Endpoints are pushed two per plan, alpha then beta, so an
+                // Endpoints are pushed two per plan, primary then replica, so an
                 // endpoint at index i belongs to plan i / 2. Plans, not
-                // labels: two betas of one group on one host share a label
+                // labels: two replicas of one group on one host share a label
                 // and are still two sessions.
                 if index / 2 == offset / 2 {
                     continue; // within-session overlap is checked above
@@ -2022,64 +2029,57 @@ pub const MODES: &[ModeName] = &[
         about: "Both ways. A file both sides changed is reported, never chosen between.",
     },
     ModeName {
-        name: "two-way-alpha",
+        name: "two-way-primary",
         also: &[],
         mode: SyncMode::TwoWayResolved,
         p2p: false,
-        about: "Both ways, and alpha wins a collision — except that a deletion never beats an edit.",
+        about: "Both ways, and primary wins a collision — except that a deletion never beats an edit.",
     },
     ModeName {
-        name: "two-way-alpha-strict",
+        name: "two-way-primary-strict",
         also: &[],
         mode: SyncMode::TwoWayStrict,
         p2p: false,
-        about: "As two-way-alpha with that exception removed: alpha's deletion beats beta's edit.",
+        about: "As two-way-primary with that exception removed: primary's deletion beats replica's edit.",
     },
     ModeName {
         name: "one-way-conflict",
         also: &[],
         mode: SyncMode::OneWaySafe,
         p2p: false,
-        about: "Alpha to beta only. A file changed on beta is reported rather than overwritten.",
+        about: "Primary to replica only. A file changed on replica is reported rather than overwritten.",
     },
     ModeName {
-        name: "one-way-alpha",
+        name: "one-way-primary",
         also: &["mirror"],
-        mode: SyncMode::OneWayReplica,
+        mode: SyncMode::OneWayMirror,
         p2p: false,
-        about: "Alpha to beta only, and beta is made to match — what rsync --delete does.",
+        about: "Primary to replica only, and replica is made to match — what rsync --delete does.",
     },
     ModeName {
         name: "p2p-conflict-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWaySafe,
         p2p: true,
-        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/p2p.md first.",
+        about: "two-way-conflict, and a replica may take the lead while primary is away. Known security and collision issues: read docs/p2p.md first.",
     },
     ModeName {
-        name: "p2p-alpha-dangerously-experimental",
+        name: "p2p-primary-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWayResolved,
         p2p: true,
-        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/p2p.md first.",
+        about: "two-way-primary, and a replica may take the lead while primary is away. Known security and collision issues: read docs/p2p.md first.",
     },
 ];
 
 /// Names that were renamed, and what they were renamed to. A
 /// configuration that uses one is told why rather than merely told the
 /// name is unknown.
-pub const RENAMED_MODES: &[(&str, &str, &str)] = &[
-    (
-        "p2p-conflict-experimental",
-        "p2p-conflict-dangerously-experimental",
-        "p2p has known security and collision issues. Read docs/p2p.md before enabling it",
-    ),
-    (
-        "p2p-alpha-experimental",
-        "p2p-alpha-dangerously-experimental",
-        "p2p has known security and collision issues. Read docs/p2p.md before enabling it",
-    ),
-];
+pub const RENAMED_MODES: &[(&str, &str, &str)] = &[(
+    "p2p-conflict-experimental",
+    "p2p-conflict-dangerously-experimental",
+    "p2p has known security and collision issues. Read docs/p2p.md before enabling it",
+)];
 
 /// One row of [`MODES`].
 #[derive(Debug)]
@@ -2215,7 +2215,7 @@ pub fn parse_word<'a>(words: &'a [Word], what: &str, given: &str) -> Result<&'a 
 /// The order the keys of a section are worth reading in.
 ///
 /// A schema is a map, so a form built straight from one is alphabetical,
-/// which puts `acknowledge_secrets` above `alpha` and `disabled` nowhere
+/// which puts `acknowledge_secrets` above `primary` and `disabled` nowhere
 /// near the mode it qualifies. This is the reading order; anything not
 /// named here follows, alphabetically.
 /// What marks an `ignores` entry as naming a file of patterns rather
@@ -2233,8 +2233,8 @@ pub const ORDER: &[&str] = &[
     "disabled_hosts",
     "power_saver_experimental",
     // A group, and the defaults that stand behind one.
-    "alpha",
-    "betas",
+    "primary",
+    "replicas",
     "mode",
     "disabled",
     "ignores",
@@ -2286,8 +2286,8 @@ pub fn unit(key: &str) -> Option<&'static str> {
         "file_mode" | "directory_mode" => "octal permissions: 0600 · 0644 · 0755",
         "ttl" | "timeout" => "a length of time: 30s · 5m · 2h",
         key if key.ends_with("_after") => "a length of time: 30s · 5m · 2h",
-        "alpha" => "a path, or user@host:path",
-        "betas" | "disabled_hosts" => "one to a line",
+        "primary" => "a path, or user@host:path",
+        "replicas" | "disabled_hosts" => "one to a line",
         "ignores" => "one to a line; file:Rust.gitignore reads a file of them",
         "on_alert" | "agent_command" => "a shell command",
         _ => return None,
@@ -2330,8 +2330,8 @@ pub fn fallback(key: &str) -> Option<String> {
 /// for a form, keyed by the key as it is written.
 pub fn widget(key: &str) -> Option<&'static str> {
     Some(match key {
-        "alpha" => "endpoint",
-        "betas" => "endpoints",
+        "primary" => "endpoint",
+        "replicas" => "endpoints",
         "ignores" => "patterns",
         "disabled_hosts" => "hosts",
         "on_alert" => "command",
@@ -2441,10 +2441,9 @@ pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
 /// whether the name asks for p2p.
 pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
     // The names are a grid: direction, then what happens when the two
-    // sides disagree about a file — it is reported as a conflict, or alpha
-    // wins. The older names (safe, resolved, replica) described the same
-    // four modes without exposing that structure; they stay accepted so
-    // existing configurations keep working.
+    // sides disagree about a file — it is reported as a conflict, or primary
+    // wins. The names taken from mutagen described the same four modes
+    // without exposing that structure, and are no longer read.
     if let Some(row) = MODES
         .iter()
         .find(|row| row.name == mode || row.also.contains(&mode))
@@ -2489,8 +2488,8 @@ fn is_local(spec: &str) -> bool {
 }
 
 /// Parses one endpoint entry. A remote entry naming no path inherits
-/// `inherit_path` when one is given (the beta case), and is an error
-/// otherwise (the alpha case, which has nothing to inherit from).
+/// `inherit_path` when one is given (the replica case), and is an error
+/// otherwise (the primary case, which has nothing to inherit from).
 fn parse_endpoint(
     spec: &str,
     inherit_path: Option<&str>,
@@ -2510,7 +2509,7 @@ fn parse_endpoint(
         }
         None => match inherit_path {
             Some(inherited) => (spec, inherited.to_owned()),
-            None => return Err("a remote alpha must include a path (host:path)".into()),
+            None => return Err("a remote primary must include a path (host:path)".into()),
         },
     };
     if destination.is_empty() || host_of(destination).is_empty() {
@@ -2686,8 +2685,8 @@ mod tests {
             println!("{key}: {}", document["properties"][key]);
         }
         println!(
-            "betas: {}",
-            document["$defs"]["Group"]["properties"]["betas"]
+            "replicas: {}",
+            document["$defs"]["Group"]["properties"]["replicas"]
         );
         println!(
             "ignores: {}",
@@ -2755,7 +2754,7 @@ mod tests {
         let path = std::path::Path::new("config.toml");
         let error = Config::parse(
             path,
-            "[groups.\"-rf\"]\nmode = \"two-way-conflict\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
+            "[groups.\"-rf\"]\nmode = \"two-way-conflict\"\nprimary = \"/a\"\nreplicas = [\"/b\"]\n",
         )
         .expect_err("a dash-led group name is refused");
         let message = format!("{error:#}");
@@ -2765,7 +2764,7 @@ mod tests {
         // A dash elsewhere in the name is fine.
         Config::parse(
             path,
-            "[groups.my-group]\nmode = \"two-way-conflict\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
+            "[groups.my-group]\nmode = \"two-way-conflict\"\nprimary = \"/a\"\nreplicas = [\"/b\"]\n",
         )
         .expect("a dash inside a name is accepted");
     }
@@ -2822,7 +2821,7 @@ mod tests {
     /// the reason, not as an unknown mode or field.
     #[test]
     fn the_old_p2p_names_are_answered_with_the_rename() {
-        for old in ["p2p-conflict-experimental", "p2p-alpha-experimental"] {
+        for old in ["p2p-conflict-experimental"] {
             let error = parse_mode_spec(old).expect_err("the old mode name is refused");
             let new = old.replace("-experimental", "-dangerously-experimental");
             assert!(error.contains(&new), "{error}");
@@ -2836,8 +2835,8 @@ mod tests {
                 ttl = "30s"
 
                 [groups.g]
-                alpha = "/tmp/a"
-                betas = ["u@h:/tmp/b"]
+                primary = "/tmp/a"
+                replicas = ["u@h:/tmp/b"]
                 "#,
             )
             .plans()
@@ -2921,8 +2920,8 @@ mod tests {
             ignores = ["*.log", "file:Rust.gitignore", "!keep.log"]
 
             [groups.g]
-            alpha = "/tmp/a"
-            betas = ["/tmp/b"]
+            primary = "/tmp/a"
+            replicas = ["/tmp/b"]
             "#,
         );
         config.ignore_directory = Some(ignores);
@@ -2950,8 +2949,8 @@ mod tests {
             ignores = ["file:Nope.gitignore"]
 
             [groups.g]
-            alpha = "/tmp/a"
-            betas = ["/tmp/b"]
+            primary = "/tmp/a"
+            replicas = ["/tmp/b"]
             "#,
         );
         config.ignore_directory = Some(ignores);
@@ -2976,16 +2975,16 @@ mod tests {
                 max_file_size = "asdf"
 
                 [groups.a]
-                alpha = "/tmp/a"
-                betas = ["/tmp/b"]
+                primary = "/tmp/a"
+                replicas = ["/tmp/b"]
 
                 [groups.b]
-                alpha = "/tmp/c"
-                betas = ["/tmp/d"]
+                primary = "/tmp/c"
+                replicas = ["/tmp/d"]
 
                 [groups.c]
-                alpha = "/tmp/e"
-                betas = ["/tmp/f"]
+                primary = "/tmp/e"
+                replicas = ["/tmp/f"]
                 "#,
             )
             .plans()
@@ -3025,12 +3024,12 @@ mod tests {
                 symlink_mode = "sideways"
 
                 [groups.a]
-                alpha = "/tmp/a"
-                betas = ["/tmp/b"]
+                primary = "/tmp/a"
+                replicas = ["/tmp/b"]
 
                 [groups.b]
-                alpha = "/tmp/c"
-                betas = ["/tmp/d"]
+                primary = "/tmp/c"
+                replicas = ["/tmp/d"]
                 "#,
             )
             .plans()
@@ -3049,8 +3048,8 @@ mod tests {
                 mode = "two-way-conflict"
 
                 [groups.a]
-                alpha = "/tmp/a"
-                betas = ["/tmp/b"]
+                primary = "/tmp/a"
+                replicas = ["/tmp/b"]
                 symlink_mode = "sideways"
                 "#,
             )
@@ -3098,28 +3097,28 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_alpha_fans_out_and_shares_its_path_with_bare_betas() {
+    fn a_remote_primary_fans_out_and_shares_its_path_with_bare_replicas() {
         let config = parse(
             r#"
             [groups.pull]
-            alpha = "build.example.com:/srv/artifacts"
+            primary = "build.example.com:/srv/artifacts"
             mode = "one-way-conflict"
-            betas = ["/data/artifacts", "mirror.example.com"]
+            replicas = ["/data/artifacts", "mirror.example.com"]
             "#,
         );
         let plans = config.plans().expect("plans should derive");
         assert_eq!(plans.len(), 2);
         assert_eq!(
-            plans[0].alpha,
+            plans[0].primary,
             EndpointTarget::Remote {
                 destination: "build.example.com".into(),
                 path: "/srv/artifacts".into(),
                 agent_command: None,
             }
         );
-        // A bare remote beta inherits the remote alpha's *path*.
+        // A bare remote replica inherits the remote primary's *path*.
         assert_eq!(
-            plans[1].beta,
+            plans[1].replica,
             EndpointTarget::Remote {
                 destination: "mirror.example.com".into(),
                 path: "/srv/artifacts".into(),
@@ -3129,13 +3128,13 @@ mod tests {
     }
 
     #[test]
-    fn a_remote_alpha_requires_an_explicit_path() {
+    fn a_remote_primary_requires_an_explicit_path() {
         let config = parse(
             r#"
             [groups.pull]
-            alpha = "build.example.com"
+            primary = "build.example.com"
             mode = "two-way-conflict"
-            betas = ["/data"]
+            replicas = ["/data"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans must fail"));
@@ -3143,15 +3142,15 @@ mod tests {
     }
 
     #[test]
-    fn a_disabled_alpha_host_drops_the_whole_group() {
+    fn a_disabled_primary_host_drops_the_whole_group() {
         let config = parse(
             r#"
             disabled_hosts = ["build.example.com"]
 
             [groups.pull]
-            alpha = "build.example.com:/srv/artifacts"
+            primary = "build.example.com:/srv/artifacts"
             mode = "two-way-conflict"
-            betas = ["/data/artifacts", "mirror.example.com:/srv/artifacts"]
+            replicas = ["/data/artifacts", "mirror.example.com:/srv/artifacts"]
             "#,
         );
         assert!(config.plans().expect("plans should derive").is_empty());
@@ -3169,8 +3168,8 @@ mod tests {
             default_owner = "www-data"
 
             [groups.data]
-            alpha = "/data"
-            betas = ["host.example.com:/data"]
+            primary = "/data"
+            replicas = ["host.example.com:/data"]
             max_file_size = "2GiB"
             staging = "beside-root"
             default_group = "id:33"
@@ -3227,19 +3226,19 @@ mod tests {
             interval = 30
 
             [groups.project]
-            alpha = "~/project"
+            primary = "~/project"
             ignores = ["*.tmp"]
-            betas = [
+            replicas = [
                 "build.example.com",
                 "user@lab.example.com:/srv/project",
                 "down.example.com",
             ]
 
             [groups.backup]
-            alpha = "/data"
-            mode = "one-way-alpha"
+            primary = "/data"
+            mode = "one-way-primary"
             interval = 300
-            betas = ["/mnt/backup/data"]
+            replicas = ["/mnt/backup/data"]
             "#,
         );
         let plans = config.plans().expect("plans should derive");
@@ -3247,10 +3246,10 @@ mod tests {
 
         // Groups iterate in name order (backup before project).
         assert_eq!(plans[0].display(), "backup@/mnt/backup/data");
-        assert_eq!(plans[0].mode, SyncMode::OneWayReplica);
+        assert_eq!(plans[0].mode, SyncMode::OneWayMirror);
         assert_eq!(plans[0].interval, Duration::from_secs(300));
         assert_eq!(
-            plans[0].beta,
+            plans[0].replica,
             EndpointTarget::Local(PathBuf::from("/mnt/backup/data"))
         );
         // The defaults' ignores apply even where the group adds none.
@@ -3263,10 +3262,10 @@ mod tests {
             plans[1].ignores,
             vec![".git".to_owned(), "*.tmp".to_owned()]
         );
-        // A remote beta without a path inherits the alpha as written, so it
+        // A remote replica without a path inherits the primary as written, so it
         // resolves against the remote home.
         assert_eq!(
-            plans[1].beta,
+            plans[1].replica,
             EndpointTarget::Remote {
                 destination: "build.example.com".into(),
                 path: "~/project".into(),
@@ -3276,7 +3275,7 @@ mod tests {
 
         assert_eq!(plans[2].display(), "project@lab.example.com");
         assert_eq!(
-            plans[2].beta,
+            plans[2].replica,
             EndpointTarget::Remote {
                 destination: "user@lab.example.com".into(),
                 path: "/srv/project".into(),
@@ -3289,10 +3288,10 @@ mod tests {
     }
 
     #[test]
-    fn beta_entries_are_classified_as_local_or_remote() {
-        let local = |beta: &str| {
+    fn replica_entries_are_classified_as_local_or_remote() {
+        let local = |replica: &str| {
             matches!(
-                parse_endpoint(beta, Some("~/x"), None).expect("should parse"),
+                parse_endpoint(replica, Some("~/x"), None).expect("should parse"),
                 EndpointTarget::Local(_)
             )
         };
@@ -3308,7 +3307,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_beta_entries_are_rejected() {
+    fn malformed_replica_entries_are_rejected() {
         assert!(parse_endpoint("host:", Some("~/x"), None).is_err());
         assert!(parse_endpoint(":path", Some("~/x"), None).is_err());
         assert!(parse_endpoint("user@:path", Some("~/x"), None).is_err());
@@ -3322,9 +3321,9 @@ mod tests {
         let config = parse(
             r#"
             [groups.a]
-            alpha = "~/x"
+            primary = "~/x"
             mode = "two-way-conflict"
-            betas = ["host1", "host2"]
+            replicas = ["host1", "host2"]
             "#,
         );
         let plans = config.plans().expect("plans should derive");
@@ -3337,24 +3336,24 @@ mod tests {
         let config = parse(
             r#"
             [groups.first]
-            alpha = "~/x"
+            primary = "~/x"
             mode = "sideways"
-            betas = []
+            replicas = []
 
             [groups.second]
-            alpha = ""
-            betas = ["host"]
+            primary = ""
+            replicas = ["host"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(error.contains("unknown mode 'sideways'"), "{error}");
         assert!(error.contains("expected one of"), "{error}");
         assert!(
-            error.contains("'first': betas: a group needs at least one"),
+            error.contains("'first': replicas: a group needs at least one"),
             "{error}"
         );
         assert!(
-            error.contains("'second': alpha: cannot be empty"),
+            error.contains("'second': primary: cannot be empty"),
             "{error}"
         );
         assert!(
@@ -3365,20 +3364,20 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_rejected_with_suggestions() {
-        // A misspelled group key ('beta' for 'betas') fails to parse, and
+        // A misspelled group key ('replica' for 'replicas') fails to parse, and
         // serde's diagnostic names the valid fields.
         let error = toml::from_str::<Config>(
             r#"
             [groups.x]
-            alpha = "~/x"
+            primary = "~/x"
             mode = "two-way-conflict"
-            beta = ["host"]
+            replica = ["host"]
             "#,
         )
         .expect_err("parsing should fail")
         .to_string();
-        assert!(error.contains("beta"), "{error}");
-        assert!(error.contains("betas"), "{error}");
+        assert!(error.contains("replica"), "{error}");
+        assert!(error.contains("replicas"), "{error}");
 
         // Unknown top-level keys fail as well.
         assert!(toml::from_str::<Config>("disable = [\"host\"]").is_err());
@@ -3419,8 +3418,8 @@ mode = "two-way-conflict"
 
 # the work group
 [groups.work]
-alpha = "/tmp/alpha"        # the source
-betas = ["build.example.com:/tmp/beta"]
+primary = "/tmp/primary"        # the source
+replicas = ["build.example.com:/tmp/replica"]
 "#;
         let (text, changed) =
             set_host_disabled(original, "build.example.com", true).expect("the edit applies");
@@ -3447,7 +3446,8 @@ betas = ["build.example.com:/tmp/beta"]
     /// header — the only place TOML allows a bare key.
     #[test]
     fn disabling_a_host_writes_the_list_when_it_is_missing() {
-        let original = "[groups.work]\nalpha = \"/tmp/alpha\"\nbetas = [\"host:/tmp/beta\"]\n";
+        let original =
+            "[groups.work]\nprimary = \"/tmp/primary\"\nreplicas = [\"host:/tmp/replica\"]\n";
         let (text, changed) = set_host_disabled(original, "host", true).expect("the edit applies");
         assert!(changed);
         let parsed = parse(&text);
@@ -3463,7 +3463,7 @@ betas = ["build.example.com:/tmp/beta"]
     /// reads.
     #[test]
     fn enabling_a_group_removes_the_key_it_added() {
-        let original = "[defaults]\nmode = \"two-way-conflict\"\n\n[groups.work]\nalpha = \"/tmp/alpha\"\nbetas = [\"host:/tmp/beta\"]\n";
+        let original = "[defaults]\nmode = \"two-way-conflict\"\n\n[groups.work]\nprimary = \"/tmp/primary\"\nreplicas = [\"host:/tmp/replica\"]\n";
         let (off, changed) = set_group_disabled(original, "work", true).expect("the edit applies");
         assert!(changed);
         assert!(off.contains("disabled = true"), "{off}");
@@ -3479,7 +3479,8 @@ betas = ["build.example.com:/tmp/beta"]
     /// than written into the file as a line that does nothing.
     #[test]
     fn disabling_an_unknown_group_is_refused() {
-        let original = "[groups.work]\nalpha = \"/tmp/alpha\"\nbetas = [\"host:/tmp/beta\"]\n";
+        let original =
+            "[groups.work]\nprimary = \"/tmp/primary\"\nreplicas = [\"host:/tmp/replica\"]\n";
         assert!(set_group_disabled(original, "nope", true).is_err());
     }
 
@@ -3493,12 +3494,12 @@ betas = ["build.example.com:/tmp/beta"]
             mode = "two-way-conflict"
 
             [groups.work]
-            alpha = "/tmp/alpha"
-            betas = ["build.example.com:/tmp/beta", "/mnt/backup", "user@lab.example.com"]
+            primary = "/tmp/primary"
+            replicas = ["build.example.com:/tmp/replica", "/mnt/backup", "user@lab.example.com"]
 
             [groups.remote]
-            alpha = "ubuntu@lead.example.com:/srv/tree"
-            betas = ["build.example.com:/srv/tree"]
+            primary = "ubuntu@lead.example.com:/srv/tree"
+            replicas = ["build.example.com:/srv/tree"]
             "#,
         );
         assert_eq!(
@@ -3531,12 +3532,12 @@ betas = ["build.example.com:/tmp/beta"]
 
             [groups.off]
             disabled = true
-            alpha = "/tmp/alpha"
-            betas = ["gone.example.com:/tmp/beta"]
+            primary = "/tmp/primary"
+            replicas = ["gone.example.com:/tmp/replica"]
 
             [groups.on]
-            alpha = "/tmp/other"
-            betas = ["host.example.com:/tmp/beta"]
+            primary = "/tmp/other"
+            replicas = ["host.example.com:/tmp/replica"]
             "#,
         );
         let plans = config.plans().expect("the configuration should be valid");
@@ -3555,8 +3556,8 @@ betas = ["build.example.com:/tmp/beta"]
 
             [groups.off]
             disabled = true
-            alpha = "relative/path"
-            betas = []
+            primary = "relative/path"
+            replicas = []
             "#,
         );
         assert!(config.plans().expect("no errors").is_empty());
@@ -3567,9 +3568,9 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.x]
-            alpha = "/a"
+            primary = "/a"
             mode = "two-way-conflict"
-            betas = ["host"]
+            replicas = ["host"]
             "#,
         );
         let plans = config.plans().expect("plans should derive");
@@ -3581,84 +3582,84 @@ betas = ["build.example.com:/tmp/beta"]
     }
 
     #[test]
-    fn agent_command_applies_to_remote_betas() {
+    fn agent_command_applies_to_remote_replicas() {
         let config = parse(
             r#"
             [groups.x]
-            alpha = "/a"
+            primary = "/a"
             mode = "two-way-conflict"
             agent_command = "custom-agent --flag"
-            betas = ["host", "/local"]
+            replicas = ["host", "/local"]
             "#,
         );
         let plans = config.plans().expect("plans should derive");
         assert_eq!(
-            plans[0].beta,
+            plans[0].replica,
             EndpointTarget::Remote {
                 destination: "host".into(),
                 path: "/a".into(),
                 agent_command: Some(vec!["custom-agent".into(), "--flag".into()]),
             }
         );
-        // Local betas never involve an agent.
+        // Local replicas never involve an agent.
         assert_eq!(
-            plans[1].beta,
+            plans[1].replica,
             EndpointTarget::Local(PathBuf::from("/local"))
         );
     }
 
     #[test]
     fn overlapping_roots_within_a_session_are_rejected() {
-        // Reproduced before it was fixed: with beta containing alpha, replica
-        // mode read its own output as beta-side divergence and recursively
-        // deleted the alpha root through the beta path.
-        for (alpha, beta, how) in [
-            ("/srv/tree/project", "/srv/tree", "containing the alpha"),
-            ("/srv/tree", "/srv/tree/project", "inside the alpha"),
+        // Reproduced before it was fixed: with replica containing primary, mirror
+        // mode read its own output as replica-side divergence and recursively
+        // deleted the primary root through the replica path.
+        for (primary, replica, how) in [
+            ("/srv/tree/project", "/srv/tree", "containing the primary"),
+            ("/srv/tree", "/srv/tree/project", "inside the primary"),
             ("/srv/tree", "/srv/tree", "the same tree"),
             // Remote pairs on one destination are comparable textually.
             (
                 "host:/srv/tree/project",
                 "host:/srv/tree",
-                "containing the alpha",
+                "containing the primary",
             ),
         ] {
             let config = parse(&format!(
                 r#"
                 [groups.bad]
-                alpha = "{alpha}"
-                mode = "one-way-alpha"
-                betas = ["{beta}"]
+                primary = "{primary}"
+                mode = "one-way-primary"
+                replicas = ["{replica}"]
                 "#
             ));
             let error = format!("{:#}", config.plans().expect_err("plans should fail"));
-            assert!(error.contains(how), "{alpha} vs {beta}: {error}");
+            assert!(error.contains(how), "{primary} vs {replica}: {error}");
         }
 
         // A prefix that is not a component boundary is a different tree.
         let config = parse(
             r#"
             [groups.fine]
-            alpha = "/srv/tree"
+            primary = "/srv/tree"
             mode = "two-way-conflict"
-            betas = ["/srv/tree-backup"]
+            replicas = ["/srv/tree-backup"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 1);
 
-        // Relays — one session's beta feeding another's alpha — stay legal:
+        // Relays — one session's replica feeding another's primary — stay legal:
         // only overlap within a single session is self-referential.
         let config = parse(
             r#"
             [groups.first]
-            alpha = "/srv/a"
+            primary = "/srv/a"
             mode = "one-way-conflict"
-            betas = ["/srv/hub"]
+            replicas = ["/srv/hub"]
 
             [groups.second]
-            alpha = "/srv/hub"
+            primary = "/srv/hub"
             mode = "one-way-conflict"
-            betas = ["/srv/final"]
+            replicas = ["/srv/final"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);
@@ -3676,22 +3677,22 @@ betas = ["build.example.com:/tmp/beta"]
             path: path.to_owned(),
             agent_command: None,
         };
-        let check = |alpha: &EndpointTarget, beta: &EndpointTarget| {
+        let check = |primary: &EndpointTarget, replica: &EndpointTarget| {
             let identity = |target: &EndpointTarget| match target {
                 EndpointTarget::Local(path) => path.to_string_lossy().into_owned(),
                 EndpointTarget::Remote {
                     destination, path, ..
                 } => format!("{destination}:{path}"),
             };
-            check_session_topology(alpha, beta, &identity(alpha), &identity(beta))
+            check_session_topology(primary, replica, &identity(primary), &identity(replica))
         };
-        for (alpha, beta, how) in [
-            (local("/"), local("/srv/project"), "inside the alpha"),
-            (local("/srv/"), local("/srv/project"), "inside the alpha"),
+        for (primary, replica, how) in [
+            (local("/"), local("/srv/project"), "inside the primary"),
+            (local("/srv/"), local("/srv/project"), "inside the primary"),
             (
                 local("/srv/project"),
                 local("/srv/"),
-                "containing the alpha",
+                "containing the primary",
             ),
             (
                 local("/srv/project/"),
@@ -3701,7 +3702,7 @@ betas = ["build.example.com:/tmp/beta"]
             (
                 remote("host", "/tree/"),
                 remote("host", "/tree/nested"),
-                "inside the alpha",
+                "inside the primary",
             ),
             (
                 remote("host", "/tree/./nested//"),
@@ -3711,13 +3712,16 @@ betas = ["build.example.com:/tmp/beta"]
             (
                 remote("host", "/"),
                 remote("host", "/tree"),
-                "inside the alpha",
+                "inside the primary",
             ),
         ] {
-            let problem = check(&alpha, &beta).expect_err("an overlap");
-            assert!(problem.contains(how), "{alpha:?} vs {beta:?}: {problem}");
+            let problem = check(&primary, &replica).expect_err("an overlap");
+            assert!(
+                problem.contains(how),
+                "{primary:?} vs {replica:?}: {problem}"
+            );
         }
-        for (alpha, beta) in [
+        for (primary, replica) in [
             (local("/srv/pro"), local("/srv/project")),
             (local("/srv/project"), local("/srv/pro")),
             (remote("host", "/tree"), remote("other", "/tree/nested")),
@@ -3727,7 +3731,10 @@ betas = ["build.example.com:/tmp/beta"]
             (local("/tree"), remote("host", "/tree/nested")),
             (remote("host", "/tree/.."), remote("host", "/other")),
         ] {
-            assert!(check(&alpha, &beta).is_ok(), "{alpha:?} vs {beta:?}");
+            assert!(
+                check(&primary, &replica).is_ok(),
+                "{primary:?} vs {replica:?}"
+            );
         }
     }
 
@@ -3738,14 +3745,14 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.everything]
-            alpha = "/"
+            primary = "/"
             mode = "one-way-conflict"
-            betas = ["host:/backup"]
+            replicas = ["host:/backup"]
 
             [groups.project]
-            alpha = "/srv/project"
+            primary = "/srv/project"
             mode = "two-way-conflict"
-            betas = ["/laptop/project"]
+            replicas = ["/laptop/project"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
@@ -3819,9 +3826,9 @@ betas = ["build.example.com:/tmp/beta"]
             let config = parse(&format!(
                 r#"
                 [groups.dots]
-                alpha = "{root}"
+                primary = "{root}"
                 mode = "two-way-conflict"
-                betas = ["host:/dots", "other:/dots"]
+                replicas = ["host:/dots", "other:/dots"]
                 {extra}
                 "#,
                 root = root.display()
@@ -3854,9 +3861,9 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(&format!(
             r#"
             [groups.dots]
-            alpha = "{root}"
+            primary = "{root}"
             mode = "two-way-conflict"
-            betas = ["host:/dots", "other:/dots"]
+            replicas = ["host:/dots", "other:/dots"]
             ignores = ["vendor", "!vendor/*.patch"]
             "#,
             root = root.display()
@@ -3902,15 +3909,15 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.project]
-            alpha = "/srv/project"
+            primary = "/srv/project"
             mode = "two-way-conflict"
             ignores = ["dist"]
-            betas = ["/backup/project"]
+            replicas = ["/backup/project"]
 
             [groups.dist]
-            alpha = "/srv/project/dist"
-            mode = "one-way-alpha"
-            betas = ["/web/dist"]
+            primary = "/srv/project/dist"
+            mode = "one-way-primary"
+            replicas = ["/web/dist"]
             "#,
         );
         let plans = config
@@ -3923,14 +3930,14 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.project]
-            alpha = "/srv/project"
+            primary = "/srv/project"
             mode = "two-way-conflict"
-            betas = ["/backup/project"]
+            replicas = ["/backup/project"]
 
             [groups.dist]
-            alpha = "/srv/project/dist"
-            mode = "one-way-alpha"
-            betas = ["/web/dist"]
+            primary = "/srv/project/dist"
+            mode = "one-way-primary"
+            replicas = ["/web/dist"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
@@ -3949,14 +3956,14 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.whole]
-            alpha = "/srv/project"
+            primary = "/srv/project"
             mode = "two-way-conflict"
-            betas = ["/backup/project"]
+            replicas = ["/backup/project"]
 
             [groups.part]
-            alpha = "/srv/project/docs"
+            primary = "/srv/project/docs"
             mode = "two-way-conflict"
-            betas = ["/laptop/docs"]
+            replicas = ["/laptop/docs"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
@@ -3967,14 +3974,14 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.whole]
-            alpha = "/srv/project"
+            primary = "/srv/project"
             mode = "one-way-conflict"
-            betas = ["/backup/project"]
+            replicas = ["/backup/project"]
 
             [groups.part]
-            alpha = "/srv/project/docs"
+            primary = "/srv/project/docs"
             mode = "one-way-conflict"
-            betas = ["/laptop/docs"]
+            replicas = ["/laptop/docs"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);
@@ -3984,34 +3991,34 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.star-one]
-            alpha = "/hub"
+            primary = "/hub"
             mode = "two-way-conflict"
-            betas = ["/spoke-one"]
+            replicas = ["/spoke-one"]
 
             [groups.star-two]
-            alpha = "/hub"
+            primary = "/hub"
             mode = "two-way-conflict"
-            betas = ["/spoke-two"]
+            replicas = ["/spoke-two"]
             "#,
         );
         assert_eq!(config.plans().expect("plans should build").len(), 2);
     }
 
-    /// Two betas of one group on one host are two sessions, with two
+    /// Two replicas of one group on one host are two sessions, with two
     /// ancestors, even though both are `group@host`: one written inside
     /// the other is refused like any other cross-session nesting. The
     /// check once told sessions apart by that label and skipped the pair.
     #[test]
-    fn nested_betas_on_one_host_in_one_group_are_rejected() {
-        // Every beta is written, whatever the mode, so the one-way form
+    fn nested_replicas_on_one_host_in_one_group_are_rejected() {
+        // Every replica is written, whatever the mode, so the one-way form
         // follows the same rule.
-        for mode in ["two-way-conflict", "one-way-alpha"] {
+        for mode in ["two-way-conflict", "one-way-primary"] {
             let config = parse(&format!(
                 r#"
                 [groups.tree]
-                alpha = "/srv/tree"
+                primary = "/srv/tree"
                 mode = "{mode}"
-                betas = ["host:/tree", "host:/tree/nested"]
+                replicas = ["host:/tree", "host:/tree/nested"]
                 "#
             ));
             let error = format!("{:#}", config.plans().expect_err("plans should fail"));
@@ -4022,16 +4029,16 @@ betas = ["build.example.com:/tmp/beta"]
         }
     }
 
-    /// Two betas of one group on one host are told apart by their paths
-    /// in every label; a beta alone on its host keeps the short label.
+    /// Two replicas of one group on one host are told apart by their paths
+    /// in every label; a replica alone on its host keeps the short label.
     #[test]
-    fn betas_sharing_a_host_are_labelled_with_their_paths() {
+    fn replicas_sharing_a_host_are_labelled_with_their_paths() {
         let config = parse(
             r#"
             [groups.tree]
-            alpha = "/srv/tree"
+            primary = "/srv/tree"
             mode = "two-way-conflict"
-            betas = ["host:/tree", "host:/other", "elsewhere:/tree", "/local/tree"]
+            replicas = ["host:/tree", "host:/other", "elsewhere:/tree", "/local/tree"]
             "#,
         );
         let labels: Vec<String> = config
@@ -4051,10 +4058,10 @@ betas = ["build.example.com:/tmp/beta"]
         );
     }
 
-    /// Every mode the parser accepts is classified as writing its alpha
+    /// Every mode the parser accepts is classified as writing its primary
     /// or not, and the two-way modes are the ones that do.
     #[test]
-    fn every_mode_says_whether_it_writes_the_alpha() {
+    fn every_mode_says_whether_it_writes_the_primary() {
         let advertised = parse_mode("not-a-mode").expect_err("an unknown mode is refused");
         let names: Vec<&str> = advertised
             .split(['(', ')', ':', ',', ' ', '\'', '\n'])
@@ -4071,7 +4078,7 @@ betas = ["build.example.com:/tmp/beta"]
         for name in names {
             let mode = parse_mode(name).expect("an advertised mode parses");
             assert_eq!(
-                alpha_is_written(mode),
+                primary_is_written(mode),
                 name.starts_with("two-way-"),
                 "{name}"
             );
@@ -4083,19 +4090,19 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.one]
-            alpha = "/data"
+            primary = "/data"
             mode = "two-way-conflict"
-            betas = ["host:/mirror"]
+            replicas = ["host:/mirror"]
 
             [groups.two]
-            alpha = "/data"
-            mode = "one-way-alpha"
-            betas = ["host:/mirror"]
+            primary = "/data"
+            mode = "one-way-primary"
+            replicas = ["host:/mirror"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(
-            error.contains("describe the same alpha and beta"),
+            error.contains("describe the same primary and replica"),
             "{error}"
         );
         assert!(
@@ -4103,13 +4110,13 @@ betas = ["build.example.com:/tmp/beta"]
             "{error}"
         );
 
-        // The same beta listed twice within one group is caught as well.
+        // The same replica listed twice within one group is caught as well.
         let config = parse(
             r#"
             [groups.one]
-            alpha = "/data"
+            primary = "/data"
             mode = "two-way-conflict"
-            betas = ["host", "host"]
+            replicas = ["host", "host"]
             "#,
         );
         assert!(config.plans().is_err());
@@ -4128,35 +4135,35 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(&format!(
             r#"
             [groups.direct]
-            alpha = "{data}"
+            primary = "{data}"
             mode = "two-way-conflict"
-            betas = ["host:/mirror"]
+            replicas = ["host:/mirror"]
 
             [groups.dotted]
-            alpha = "{data}/."
-            mode = "one-way-alpha"
-            betas = ["host:/mirror"]
+            primary = "{data}/."
+            mode = "one-way-primary"
+            replicas = ["host:/mirror"]
 
             [groups.linked]
-            alpha = "{alias}"
-            mode = "one-way-alpha"
-            betas = ["host:/mirror"]
+            primary = "{alias}"
+            mode = "one-way-primary"
+            replicas = ["host:/mirror"]
             "#,
             data = data.display(),
             alias = alias.display(),
         ));
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(
-            error.contains("describe the same alpha and beta"),
+            error.contains("describe the same primary and replica"),
             "{error}"
         );
         assert!(error.contains("dotted@host"), "{error}");
         assert!(error.contains("linked@host"), "{error}");
 
-        // Betas that don't exist yet still alias when their *ancestors* do:
+        // Replicas that don't exist yet still alias when their *ancestors* do:
         // a missing mirror under a symlinked parent would be created at the
-        // same physical location as its direct spelling. (The betas live
-        // outside the alphas: overlap within a session is refused outright
+        // same physical location as its direct spelling. (The replicas live
+        // outside the primaries: overlap within a session is refused outright
         // before duplicate detection would see it.)
         let out = keep.path().join("out");
         std::fs::create_dir_all(&out).expect("directory should be creatable");
@@ -4165,14 +4172,14 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(&format!(
             r#"
             [groups.one]
-            alpha = "{data}"
+            primary = "{data}"
             mode = "two-way-conflict"
-            betas = ["{out}/mirror/new"]
+            replicas = ["{out}/mirror/new"]
 
             [groups.two]
-            alpha = "{alias}"
-            mode = "one-way-alpha"
-            betas = ["{out_alias}/mirror/new"]
+            primary = "{alias}"
+            mode = "one-way-primary"
+            replicas = ["{out_alias}/mirror/new"]
             "#,
             data = data.display(),
             alias = alias.display(),
@@ -4181,7 +4188,7 @@ betas = ["build.example.com:/tmp/beta"]
         ));
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(
-            error.contains("describe the same alpha and beta"),
+            error.contains("describe the same primary and replica"),
             "{error}"
         );
     }
@@ -4191,27 +4198,27 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.x]
-            alpha = "relative/alpha"
+            primary = "relative/primary"
             mode = "two-way-conflict"
-            betas = ["./relative-beta", "~user/beta", "/absolute/beta"]
+            replicas = ["./relative-replica", "~user/replica", "/absolute/replica"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(
-            error.contains("alpha: 'relative/alpha' must be an absolute"),
+            error.contains("primary: 'relative/primary' must be an absolute"),
             "{error}"
         );
         assert!(
-            error.contains("'./relative-beta' must be an absolute"),
+            error.contains("'./relative-replica' must be an absolute"),
             "{error}"
         );
         // The unexpanded ~user form is relative, so it's caught by the same
         // check instead of silently becoming a working-directory child.
         assert!(
-            error.contains("'~user/beta' must be an absolute"),
+            error.contains("'~user/replica' must be an absolute"),
             "{error}"
         );
-        assert!(!error.contains("/absolute/beta"), "{error}");
+        assert!(!error.contains("/absolute/replica"), "{error}");
     }
 
     #[test]
@@ -4222,9 +4229,9 @@ betas = ["build.example.com:/tmp/beta"]
             ignores = ["[unclosed"]
 
             [groups.x]
-            alpha = "/data"
+            primary = "/data"
             mode = "sideways"
-            betas = ["host"]
+            replicas = ["host"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
@@ -4243,14 +4250,14 @@ betas = ["build.example.com:/tmp/beta"]
             directory_mode = "0755"
 
             [groups.inherits]
-            alpha = "/a"
-            betas = ["host"]
+            primary = "/a"
+            replicas = ["host"]
 
             [groups.overrides]
-            alpha = "/b"
+            primary = "/b"
             symlink_mode = "ignore"
             file_mode = "600"
-            betas = ["host"]
+            replicas = ["host"]
             "#,
         );
         let plans = config.plans().expect("plans should derive");
@@ -4265,12 +4272,12 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.x]
-            alpha = "/a"
+            primary = "/a"
             mode = "two-way-conflict"
             symlink_mode = "follow"
             file_mode = "0444"
             directory_mode = "banana"
-            betas = ["host"]
+            replicas = ["host"]
             "#,
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
@@ -4300,7 +4307,7 @@ betas = ["build.example.com:/tmp/beta"]
             SyncMode::TwoWaySafe,
             SyncMode::TwoWayResolved,
             SyncMode::OneWaySafe,
-            SyncMode::OneWayReplica,
+            SyncMode::OneWayMirror,
         ] {
             assert_eq!(parse_mode(mode_name(mode)).unwrap(), mode);
         }
@@ -4311,7 +4318,7 @@ betas = ["build.example.com:/tmp/beta"]
             SyncMode::TwoWaySafe
         );
         assert_eq!(
-            parse_mode("two-way-alpha").unwrap(),
+            parse_mode("two-way-primary").unwrap(),
             SyncMode::TwoWayResolved
         );
         assert_eq!(
@@ -4319,10 +4326,10 @@ betas = ["build.example.com:/tmp/beta"]
             SyncMode::OneWaySafe
         );
         assert_eq!(
-            parse_mode("one-way-alpha").unwrap(),
-            SyncMode::OneWayReplica
+            parse_mode("one-way-primary").unwrap(),
+            SyncMode::OneWayMirror
         );
-        assert_eq!(parse_mode("mirror").unwrap(), SyncMode::OneWayReplica);
+        assert_eq!(parse_mode("mirror").unwrap(), SyncMode::OneWayMirror);
         assert!(parse_mode("bidirectional").is_err());
     }
 
@@ -4336,7 +4343,7 @@ betas = ["build.example.com:/tmp/beta"]
             (SyncMode::TwoWaySafe, true)
         );
         assert_eq!(
-            parse_mode_spec("p2p-alpha-dangerously-experimental").unwrap(),
+            parse_mode_spec("p2p-primary-dangerously-experimental").unwrap(),
             (SyncMode::TwoWayResolved, true)
         );
         assert_eq!(
@@ -4347,20 +4354,20 @@ betas = ["build.example.com:/tmp/beta"]
         // also relies on.
         let advertised = parse_mode("nope").unwrap_err();
         assert!(advertised.contains("p2p-conflict-dangerously-experimental"));
-        assert!(advertised.contains("p2p-alpha-dangerously-experimental"));
+        assert!(advertised.contains("p2p-primary-dangerously-experimental"));
 
         let config = parse(
             r#"
             [groups.g]
-            mode = "p2p-alpha-dangerously-experimental"
-            alpha = "/tmp/a"
-            betas = ["u@h:/tmp/b"]
+            mode = "p2p-primary-dangerously-experimental"
+            primary = "/tmp/a"
+            replicas = ["u@h:/tmp/b"]
             "#,
         );
         let plans = config.plans().expect("plans");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].mode, SyncMode::TwoWayResolved);
-        assert_eq!(plans[0].mode_name(), "p2p-alpha-dangerously-experimental");
+        assert_eq!(plans[0].mode_name(), "p2p-primary-dangerously-experimental");
         let p2p = plans[0].p2p.expect("a p2p plan");
         assert_eq!(p2p.ttl, DEFAULT_P2P_TTL);
         assert_eq!(p2p.failover_after, DEFAULT_P2P_FAILOVER_AFTER);
@@ -4368,14 +4375,14 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.g]
-            mode = "two-way-alpha"
-            alpha = "/tmp/a"
-            betas = ["u@h:/tmp/b"]
+            mode = "two-way-primary"
+            primary = "/tmp/a"
+            replicas = ["u@h:/tmp/b"]
             "#,
         );
         let plans = config.plans().expect("plans");
         assert!(plans[0].p2p.is_none());
-        assert_eq!(plans[0].mode_name(), "two-way-alpha");
+        assert_eq!(plans[0].mode_name(), "two-way-primary");
     }
 
     /// The timing section: read, defaulted, and refused when the wait is
@@ -4389,8 +4396,8 @@ betas = ["build.example.com:/tmp/beta"]
             failover_after = 45
             [groups.g]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "/tmp/a"
-            betas = ["u@h:/tmp/b"]
+            primary = "/tmp/a"
+            replicas = ["u@h:/tmp/b"]
             "#,
         );
         let p2p = config.plans().expect("plans")[0].p2p.expect("p2p");
@@ -4404,8 +4411,8 @@ betas = ["build.example.com:/tmp/beta"]
             failover_after = "30s"
             [groups.g]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "/tmp/a"
-            betas = ["u@h:/tmp/b"]
+            primary = "/tmp/a"
+            replicas = ["u@h:/tmp/b"]
             "#,
         );
         let error = config.plans().unwrap_err().to_string();
@@ -4423,30 +4430,30 @@ betas = ["build.example.com:/tmp/beta"]
         assert!(result.is_err(), "unknown keys are refused");
     }
 
-    /// P2P names the machine the configuration runs on as the alpha,
+    /// P2P names the machine the configuration runs on as the primary,
     /// and every peer as another host.
     #[test]
-    fn p2p_needs_a_local_alpha_and_remote_betas() {
+    fn p2p_needs_a_local_primary_and_remote_replicas() {
         let config = parse(
             r#"
             [groups.g]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "u@h:/tmp/a"
-            betas = ["v@k:/tmp/b"]
+            primary = "u@h:/tmp/a"
+            replicas = ["v@k:/tmp/b"]
             "#,
         );
         let error = config.plans().unwrap_err().to_string();
-        assert!(error.contains("needs a local alpha"), "{error}");
+        assert!(error.contains("needs a local primary"), "{error}");
 
         let config = parse(
             r#"
             [groups.g]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "/tmp/a"
-            betas = ["/tmp/b", "u@h:/tmp/c"]
+            primary = "/tmp/a"
+            replicas = ["/tmp/b", "u@h:/tmp/c"]
             "#,
         );
         let error = config.plans().unwrap_err().to_string();
-        assert!(error.contains("every beta on another host"), "{error}");
+        assert!(error.contains("every replica on another host"), "{error}");
     }
 }

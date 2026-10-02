@@ -393,7 +393,7 @@ pub trait Endpoint: Send {
         anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// P2P, with `manage_keys`: installs the other betas' keys on the
+    /// P2P, with `manage_keys`: installs the other replicas' keys on the
     /// host, forced through the gate, and their host keys.
     fn install_peers(&mut self, _authorized: &[String], _known_hosts: &[String]) -> Result<()> {
         anyhow::bail!("this endpoint does not take part in p2p")

@@ -90,8 +90,8 @@ After a session works for five seconds, `status` shows its phase, elapsed time, 
 ~/Workspace/Voltai voltai
   ubuntu@fny.voltai.party:~/Workspace
     status: scanning, 6m20s elapsed
-      alpha: 412,331 of ~1,470,000 entries (28%), about 14m left
-      beta: scanning for 6m20s
+      primary: 412,331 of ~1,470,000 entries (28%), about 14m left
+      replica: scanning for 6m20s
     mode: two-way-conflict
 ```
 
@@ -135,7 +135,7 @@ If a cycle cannot run, status reports:
 | State | Meaning |
 | --- | --- |
 | `unreachable` | The host does not answer. This usually clears without intervention. |
-| `halted` | A safety check stopped the session. Follow the reported instruction. A missing alpha folder clears automatically when the folder returns. |
+| `halted` | A safety check stopped the session. Follow the reported instruction. A missing primary folder clears automatically when the folder returns. |
 | `errored` | Another error stopped the cycle. Read the message and [log](./logging.md). |
 
 If the cycle runs but cannot synchronize every path, status reports:
@@ -178,7 +178,7 @@ autobahn sync ~/project user@host:/srv/project --watch
 
 # Mirror exactly, ignoring build artifacts:
 autobahn sync ~/project host:/srv/project \
-    --watch --mode one-way-alpha --ignore target --ignore '*.log'
+    --watch --mode one-way-primary --ignore target --ignore '*.log'
 ```
 
 A completed command returns one of these exit codes. Across multiple sessions, `1` takes precedence over `2`, which takes precedence over `0`.

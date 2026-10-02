@@ -15,7 +15,7 @@
 //! So a root is observed once. The observer owns the watcher, the scan, the
 //! baseline that makes a scan incremental, and the persisted cache. What it
 //! must never own is **provenance**: the ancestor stays with its session,
-//! because it records the history of one alpha/beta pair and legitimately
+//! because it records the history of one primary/replica pair and legitimately
 //! differs between destinations. Sharing observations is safe; sharing
 //! provenance is the silent-overwrite failure this codebase is built to
 //! avoid.

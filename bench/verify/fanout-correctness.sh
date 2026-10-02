@@ -1,5 +1,5 @@
 #!/bin/bash
-# Correctness under sharing: ten sessions over one alpha must each deliver
+# Correctness under sharing: ten sessions over one primary must each deliver
 # every edit to their own destination. A shared observation that dropped a
 # change for one session, or served a stale scan, shows up here as a
 # destination that does not match the source.
@@ -20,8 +20,8 @@ for d in $(seq 1 40); do
   for f in $(seq 1 25); do printf 'v0-%s-%s' "$d" "$f" > "$W/src/dir$d/f$f.txt"; done
 done
 
-{ echo "[groups.fan]"; echo "alpha = \"$W/src\""; echo 'mode = "two-way-conflict"'
-  echo "interval = 2"; printf 'betas = ['
+{ echo "[groups.fan]"; echo "primary = \"$W/src\""; echo 'mode = "two-way-conflict"'
+  echo "interval = 2"; printf 'replicas = ['
   for b in $(seq 1 10); do mkdir -p "$W/dst$b"; printf '"%s/dst%s"' "$W" "$b"
     if [ "$b" -lt 10 ]; then printf ', '; fi; done; printf ']\n'; } > "$W/ab.toml"
 

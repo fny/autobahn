@@ -51,14 +51,14 @@ fn configuration(scratch: &Path) -> std::path::PathBuf {
     let directory = scratch.join("configured");
     std::fs::create_dir(&directory).unwrap();
     std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let alpha = scratch.join("alpha");
-    std::fs::create_dir(&alpha).unwrap();
+    let primary = scratch.join("primary");
+    std::fs::create_dir(&primary).unwrap();
     let path = directory.join("config.toml");
     std::fs::write(
         &path,
         format!(
-            "[groups.g]\nalpha = \"{}\"\nbetas = [\"h:/srv/b\"]\nmode = \"two-way-conflict\"\n",
-            alpha.display()
+            "[groups.g]\nprimary = \"{}\"\nreplicas = [\"h:/srv/b\"]\nmode = \"two-way-conflict\"\n",
+            primary.display()
         ),
     )
     .unwrap();
@@ -143,15 +143,15 @@ fn a_private_configuration_loads_without_a_warning() {
 fn a_manual_sync_keeps_its_session_state_private() {
     let scratch = tempfile::tempdir().unwrap();
     let home = scratch.path().join(".autobahn");
-    let alpha = scratch.path().join("alpha");
-    let beta = scratch.path().join("beta");
-    std::fs::create_dir(&alpha).unwrap();
-    std::fs::write(alpha.join("file"), b"content").unwrap();
+    let primary = scratch.path().join("primary");
+    let replica = scratch.path().join("replica");
+    std::fs::create_dir(&primary).unwrap();
+    std::fs::write(primary.join("file"), b"content").unwrap();
     succeeded(&autobahn(
         &home,
-        &["sync", alpha.to_str().unwrap(), beta.to_str().unwrap()],
+        &["sync", primary.to_str().unwrap(), replica.to_str().unwrap()],
     ));
-    assert_eq!(std::fs::read(beta.join("file")).unwrap(), b"content");
+    assert_eq!(std::fs::read(replica.join("file")).unwrap(), b"content");
     assert_eq!(mode(&home), 0o700);
     assert_eq!(mode(&home.join("sessions")), 0o700);
     let sessions: Vec<_> = std::fs::read_dir(home.join("sessions"))
@@ -170,19 +170,19 @@ fn a_manual_sync_keeps_its_session_state_private() {
 fn diff_compares_private_copies_outside_the_shared_temporary_directory() {
     let scratch = tempfile::tempdir().unwrap();
     let home = scratch.path().join(".autobahn");
-    let alpha = scratch.path().join("alpha");
-    let beta = scratch.path().join("beta");
-    std::fs::create_dir(&alpha).unwrap();
-    std::fs::create_dir(&beta).unwrap();
-    std::fs::write(alpha.join("f"), b"one\n").unwrap();
-    std::fs::write(beta.join("f"), b"two\n").unwrap();
+    let primary = scratch.path().join("primary");
+    let replica = scratch.path().join("replica");
+    std::fs::create_dir(&primary).unwrap();
+    std::fs::create_dir(&replica).unwrap();
+    std::fs::write(primary.join("f"), b"one\n").unwrap();
+    std::fs::write(replica.join("f"), b"two\n").unwrap();
     let config = scratch.path().join("config.toml");
     std::fs::write(
         &config,
         format!(
-            "[groups.g]\nalpha = \"{}\"\nbetas = [\"{}\"]\nmode = \"two-way-conflict\"\n",
-            alpha.display(),
-            beta.display()
+            "[groups.g]\nprimary = \"{}\"\nreplicas = [\"{}\"]\nmode = \"two-way-conflict\"\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();

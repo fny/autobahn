@@ -11,7 +11,7 @@
 //!   version and binaries out of it, builds the script again, and requires
 //!   the two to match to the byte; then it runs the installed binary itself,
 //!   without a shell, marked as gated.
-//! - **`autobahn p2p attach`**, which the alpha runs on a leader.
+//! - **`autobahn p2p attach`**, which the primary runs on a leader.
 //! - **`autobahn gate install <release> <version>`**: an agent installed
 //!   from autobahn's signed release, downloaded and checked here
 //!   ([`crate::update::install_release_agent`]). A controller behind the

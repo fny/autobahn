@@ -8,7 +8,7 @@ Script: `bench/verify/gates.sh`.
 
 ## Gate 1: waiting for ancestor persistence
 
-The measured cycle updated beta before persisting the ancestor. An isolated edit did not wait for that final write. A later edit could arrive while the worker was still occupied.
+The measured cycle updated replica before persisting the ancestor. An isolated edit did not wait for that final write. A later edit could arrive while the worker was still occupied.
 
 The experiment measured isolated saves and pairs spaced 100 ms apart in the same session:
 
@@ -28,14 +28,14 @@ The consecutive-save penalty exceeded the projected 179 ms because the earlier l
 A probe examined the three input relationships on every reconciliation:
 
 ```
-[sharing] ancestor-alpha 0.0%  ancestor-beta 0.0%  alpha-beta 0.0%
+[sharing] ancestor-primary 0.0%  ancestor-replica 0.0%  primary-replica 0.0%
 ```
 
 All fifty reconciliations reported zero sharing.
 
 The earlier 2,499/2,501 result came from `cycle_cost.rs` passing a local scan as two reconciliation arguments. It measured incremental rescan sharing, not sharing among independent production inputs.
 
-Codex identified the aliasing, and fable predicted the zero-sharing result. At this implementation stage, the ancestor came from disk decoding and beta from wire decoding. Neither shared allocations with other inputs.
+Codex identified the aliasing, and fable predicted the zero-sharing result. At this implementation stage, the ancestor came from disk decoding and replica from wire decoding. Neither shared allocations with other inputs.
 
 The probe was removed after the experiment.
 

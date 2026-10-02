@@ -22,7 +22,7 @@ Pushing a version tag (`v*`) triggers `.github/workflows/release.yml`:
 5. **Publishing:** Publishes binary archives, agent tarballs, signatures, and installation scripts via GitHub Releases.
 
 ### Prerelease Terminology
-Autobahn designates early test builds as **prereleases** (`v0.5.0-dev.1`, `v0.5.0-rc.1`). The terms "alpha" and "beta" are strictly avoided in version naming to prevent ambiguity with synchronization endpoint roles.
+Autobahn designates early test builds as **prereleases** (`v0.5.0-dev.1`, `v0.5.0-rc.1`). The terms "primary" and "replica" are strictly avoided in version naming to prevent ambiguity with synchronization endpoint roles.
 
 
 ## Automated In-Place Upgrades (`autobahn update`)

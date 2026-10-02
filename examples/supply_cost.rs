@@ -57,14 +57,14 @@ fn main() {
 
     // Reconciliation is pure over the three trees, so it measures exactly
     // here. It is per-session work that no observer shares: every
-    // destination reconciles the same alpha tree against its own beta. In a
-    // cold sync beta and the ancestor are both empty.
+    // destination reconciles the same primary tree against its own replica. In a
+    // cold sync replica and the ancestor are both empty.
     let started = Instant::now();
     let reconciliation = reconcile(None, snapshot.root.as_ref(), None, SyncMode::TwoWaySafe);
     let reconcile_time = started.elapsed().as_secs_f64();
     println!(
         "reconcile (per destination, not shared): {reconcile_time:.2}s          -> {} transitions\n",
-        reconciliation.beta_transitions.len()
+        reconciliation.replica_transitions.len()
     );
 
     // Every destination in a cold sync needs every file with no base to

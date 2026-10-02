@@ -91,33 +91,33 @@ stop_supervisor() {
 # The tour runs *inside* the scratch tree and refers to everything
 # relatively, so the commands on screen are the commands a reader would
 # type rather than a wall of temporary-directory noise.
-mkdir -p "$WORK/alpha/lib" "$WORK/beta" "$WORK/state" "$WORK/home"
+mkdir -p "$WORK/primary/lib" "$WORK/replica" "$WORK/state" "$WORK/home"
 cd "$WORK"
 # Commands that take no --state-root (the two-root `sync`) keep their
 # state under ~/.autobahn: that is this scratch HOME, not the reader's.
 export HOME="$WORK/home"
-ALPHA="alpha"
-BETA="beta"
+PRIMARY="primary"
+REPLICA="replica"
 STATE="state"
 CONFIG="autobahn.toml"
 
 # ── the tour ────────────────────────────────────────────────────────
 
 chapter "the tree we start from" \
-        "An ordinary little project on alpha; beta is empty."
-echo "shared notes"          > "$ALPHA/notes.txt"
-echo "# readme"              > "$ALPHA/README.md"
-echo "fn main() {}"          > "$ALPHA/lib/main.rs"
-show find "$ALPHA" -type f
+        "An ordinary little project on primary; replica is empty."
+echo "shared notes"          > "$PRIMARY/notes.txt"
+echo "# readme"              > "$PRIMARY/README.md"
+echo "fn main() {}"          > "$PRIMARY/lib/main.rs"
+show find "$PRIMARY" -type f
 
 chapter "the configuration" \
         "One group, one destination, cycling every two seconds."
 cat > "$CONFIG" <<TOML
 [groups.demo]
-alpha = "$WORK/alpha"
+primary = "$WORK/primary"
 mode = "two-way-conflict"
 interval = 2
-betas = ["$WORK/beta"]
+replicas = ["$WORK/replica"]
 TOML
 show cat "$CONFIG"
 
@@ -129,7 +129,7 @@ pause_briefly 4
 show tail -2 watch.log
 
 chapter "the first sync landed" ""
-show find "$BETA" -type f
+show find "$REPLICA" -type f
 
 chapter "autobahn status" \
         "The recorded state of every session, grouped."
@@ -144,12 +144,12 @@ show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
 chapter "a genuine conflict" \
         "While nothing is running, the same file is edited differently on each side."
-narrate "echo \"alpha's line\" > alpha/notes.txt"
-echo "alpha's line" > "$ALPHA/notes.txt"
-narrate "echo \"beta's different line\" > beta/notes.txt"
-echo "beta's different line" > "$BETA/notes.txt"
-narrate "echo only-on-alpha > alpha/unrelated.txt   # no conflict here"
-echo "only-on-alpha" > "$ALPHA/unrelated.txt"
+narrate "echo \"primary's line\" > primary/notes.txt"
+echo "primary's line" > "$PRIMARY/notes.txt"
+narrate "echo \"replica's different line\" > replica/notes.txt"
+echo "replica's different line" > "$REPLICA/notes.txt"
+narrate "echo only-on-primary > primary/unrelated.txt   # no conflict here"
+echo "only-on-primary" > "$PRIMARY/unrelated.txt"
 
 narrate "autobahn watch --config $CONFIG --state-root $STATE &"
 start_supervisor
@@ -158,11 +158,11 @@ show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
 chapter "neither side was touched" \
         "A conflict is reported, never resolved by guessing."
-narrate "cat alpha/notes.txt beta/notes.txt"
-echo "  alpha: $(cat "$ALPHA/notes.txt")"
-echo "  beta:  $(cat "$BETA/notes.txt")"
+narrate "cat primary/notes.txt replica/notes.txt"
+echo "  primary: $(cat "$PRIMARY/notes.txt")"
+echo "  replica:  $(cat "$REPLICA/notes.txt")"
 narrate "# and the unrelated file propagated anyway:"
-echo "  beta/unrelated.txt: $(cat "$BETA/unrelated.txt" 2>/dev/null || echo '(missing)')"
+echo "  replica/unrelated.txt: $(cat "$REPLICA/unrelated.txt" 2>/dev/null || echo '(missing)')"
 
 chapter "autobahn issues" \
         "Everything that needs you — here, the conflict — with the command that clears it."
@@ -170,21 +170,21 @@ show "$BINARY" issues --config "$CONFIG" --state-root "$STATE"
 
 chapter "autobahn diff" \
         "The two sides of the file — addressed by its path, from anywhere."
-show "$BINARY" diff "$ALPHA/notes.txt" --config "$CONFIG" --state-root "$STATE"
+show "$BINARY" diff "$PRIMARY/notes.txt" --config "$CONFIG" --state-root "$STATE"
 
 chapter "autobahn resolve" \
         "Choose a winner; its version is put on every side, and the next cycle records the agreement."
-show "$BINARY" resolve "$ALPHA/notes.txt" --keep alpha --yes --config "$CONFIG" --state-root "$STATE"
+show "$BINARY" resolve "$PRIMARY/notes.txt" --keep primary --yes --config "$CONFIG" --state-root "$STATE"
 pause_briefly 5
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
 chapter "autobahn flush" \
         "Wakes the sessions now rather than at the next interval."
-narrate "echo 'urgent edit' > alpha/notes.txt"
-echo "urgent edit" > "$ALPHA/notes.txt"
+narrate "echo 'urgent edit' > primary/notes.txt"
+echo "urgent edit" > "$PRIMARY/notes.txt"
 show "$BINARY" flush --state-root "$STATE"
 sleep 1
-echo "  beta/notes.txt: $(cat "$BETA/notes.txt")"
+echo "  replica/notes.txt: $(cat "$REPLICA/notes.txt")"
 
 chapter "autobahn verify" \
         "The next cycle re-reads every byte, so content that changed without its metadata moving becomes visible."
@@ -205,12 +205,12 @@ show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
 
 chapter "the safety halt" \
         "A destination that loses a populated tree is not mirrored away — the session halts and says so."
-narrate "rm -rf beta/*    # as if a mount vanished"
-rm -rf "${BETA:?}"/*
+narrate "rm -rf replica/*    # as if a mount vanished"
+rm -rf "${REPLICA:?}"/*
 pause_briefly 6
 show "$BINARY" status --config "$CONFIG" --state-root "$STATE"
-narrate "# alpha is untouched:"
-show find "$ALPHA" -type f
+narrate "# primary is untouched:"
+show find "$PRIMARY" -type f
 
 stop_supervisor
 
@@ -225,7 +225,7 @@ echo "  once-b/file.txt: $(cat "$ONCE_B/file.txt")"
 chapter "remote roots" \
         "The same command, with a destination on another host. (Shown, not run — it needs a real host.)"
 narrate "autobahn sync ./project user@host:/srv/project"
-narrate "# or, in a configuration: betas = [\"user@host:/srv/project\"]"
+narrate "# or, in a configuration: replicas = [\"user@host:/srv/project\"]"
 echo "  The agent is copied to the host on first use and speaks over ssh."
 
 chapter "the rest of the surface" ""

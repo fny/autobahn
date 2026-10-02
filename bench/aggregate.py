@@ -32,6 +32,13 @@ import sys
 from collections import defaultdict
 
 
+
+def cell_width(record):
+    """How many replicas the job's cell asked for. Results recorded before
+    the roles were renamed call it `betas`, and are still aggregated."""
+    cell = record.get("spec", {}).get("cell", {})
+    return cell.get("replicas", cell.get("betas"))
+
 def load(directory):
     records, plan = [], None
     for name in sorted(os.listdir(directory)):
@@ -110,7 +117,7 @@ def find_tainted(records, plan=None):
             # This is what turned six jobs of bench-1789947877 into 10x
             # anomalies before the record existed to say so; for that run
             # the count comes from the plan's groups.
-            wanted = record.get("spec", {}).get("cell", {}).get("betas")
+            wanted = cell_width(record)
             got = destination_count(record, plan)
             if wanted is not None and got is not None and got != wanted:
                 for tool in record.get("spec", {}).get("tools", []):
@@ -234,13 +241,13 @@ def main():
         if kind in ("tool_error", "hygiene_failure", "abort", "corrupt_line"):
             problems.append(record)
         elif kind == "job_start" and destination_count(record, plan) not in (
-            None, record.get("spec", {}).get("cell", {}).get("betas")
+            None, cell_width(record)
         ):
             problems.append({"measurement": "destination_width_mismatch",
                              "cell": record.get("cell"), "job": record.get("job"),
                              "destinations": record.get("destinations",
                                                         destination_count(record, plan)),
-                             "betas": record.get("spec", {}).get("cell", {}).get("betas")})
+                             "replicas": cell_width(record)})
         elif kind == "workload" and (
             "error" in record or record.get("censored")
             or record.get("background_write_errors")

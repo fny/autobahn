@@ -1,27 +1,33 @@
 {
   "provenance": {
+    "date": "2026-10-02",
     "base_run": "bench-1790601586",
     "base_commit": "e7b3ac0",
     "base_date": "2026-09-28",
     "updates": {
-      "1790773610": [
-        "50k-1-patch",
-        "50k-10-patch"
-      ],
       "1790869509": [
         "chromium-10-fan-patch"
       ],
       "1790873270": [
         "chromium-1-patch",
         "chromium-10-patch"
+      ],
+      "1790941679": [
+        "50k-1-patch",
+        "50k-10-patch"
       ]
     },
     "update_commits": {
-      "1790773610": "98598b8",
       "1790869509": "0c72865",
-      "1790873270": "0c72865"
+      "1790873270": "0c72865",
+      "1790941679": "0c72865"
     },
-    "note": "Composite of complete cells, both tools; job counts and floor describe the base run. See docs/benchmark-matrix.md."
+    "update_dates": {
+      "1790869509": "2026-10-01",
+      "1790873270": "2026-10-01",
+      "1790941679": "2026-10-02"
+    },
+    "note": "One complete set: every cell, both tools. The five patch cells were re-run on 0c72865; the rest are the base run. Aggregated from the merged raw results, which are kept out of the repository. See docs/benchmark-matrix.md."
   },
   "plan": {
     "jobs": 160,
@@ -40,40 +46,6 @@
     "n": 160
   },
   "latency": {
-    "50k-1-patch/autobahn/sub50k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2748,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 22.7,
-      "p90_ms": 25.2,
-      "p99_ms": 29.7,
-      "per_run_p50_spread": {
-        "median": 22.3,
-        "min": 22.1,
-        "max": 23.9,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/sub50k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2729,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 447.4,
-      "p90_ms": 546.5,
-      "p99_ms": 686.3,
-      "per_run_p50_spread": {
-        "median": 443.5,
-        "min": 437.0,
-        "max": 512.7,
-        "n": 5
-      }
-    },
     "50k-1/autobahn/sub50k:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
@@ -105,6 +77,74 @@
         "median": 427.7,
         "min": 418.2,
         "max": 433.8,
+        "n": 5
+      }
+    },
+    "50k-1-patch/autobahn/sub50k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2714,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 22.1,
+      "p90_ms": 24.4,
+      "p99_ms": 27.5,
+      "per_run_p50_spread": {
+        "median": 22.3,
+        "min": 21.6,
+        "max": 22.7,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/sub50k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2711,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 430.8,
+      "p90_ms": 507.2,
+      "p99_ms": 625.4,
+      "per_run_p50_spread": {
+        "median": 430.5,
+        "min": 416.1,
+        "max": 463.4,
+        "n": 5
+      }
+    },
+    "50k-10/autobahn/sub50k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2738,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 13.4,
+      "p90_ms": 20.4,
+      "p99_ms": 45.9,
+      "per_run_p50_spread": {
+        "median": 13.4,
+        "min": 13.2,
+        "max": 13.6,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/sub50k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2757,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 1809.8,
+      "p90_ms": 4185.5,
+      "p99_ms": 5226.2,
+      "per_run_p50_spread": {
+        "median": 1842.6,
+        "min": 1681.0,
+        "max": 1946.9,
         "n": 5
       }
     },
@@ -146,16 +186,16 @@
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
-      "pooled_samples": 2728,
+      "pooled_samples": 2751,
       "censored": 0,
       "skipped_ticks": 0,
-      "p50_ms": 22.7,
-      "p90_ms": 27.5,
-      "p99_ms": 35.5,
+      "p50_ms": 22.2,
+      "p90_ms": 27.0,
+      "p99_ms": 34.6,
       "per_run_p50_spread": {
-        "median": 22.8,
-        "min": 22.1,
-        "max": 23.6,
+        "median": 22.2,
+        "min": 21.2,
+        "max": 22.9,
         "n": 5
       }
     },
@@ -163,50 +203,16 @@
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
-      "pooled_samples": 2703,
+      "pooled_samples": 2718,
       "censored": 0,
       "skipped_ticks": 1,
-      "p50_ms": 709.1,
-      "p90_ms": 2065.6,
-      "p99_ms": 3509.4,
+      "p50_ms": 703.1,
+      "p90_ms": 2090.1,
+      "p99_ms": 3558.5,
       "per_run_p50_spread": {
-        "median": 710.5,
-        "min": 664.6,
-        "max": 759.8,
-        "n": 5
-      }
-    },
-    "50k-10/autobahn/sub50k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2738,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 13.4,
-      "p90_ms": 20.4,
-      "p99_ms": 45.9,
-      "per_run_p50_spread": {
-        "median": 13.4,
-        "min": 13.2,
-        "max": 13.6,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/sub50k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2757,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 1809.8,
-      "p90_ms": 4185.5,
-      "p99_ms": 5226.2,
-      "per_run_p50_spread": {
-        "median": 1842.6,
-        "min": 1681.0,
-        "max": 1946.9,
+        "median": 706.8,
+        "min": 654.1,
+        "max": 746.7,
         "n": 5
       }
     },
@@ -278,40 +284,6 @@
         "n": 5
       }
     },
-    "5k-10-fan/autobahn/sub5k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2739,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 16.9,
-      "p90_ms": 23.4,
-      "p99_ms": 33.2,
-      "per_run_p50_spread": {
-        "median": 17.1,
-        "min": 16.5,
-        "max": 17.1,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/sub5k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2751,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 3417.1,
-      "p90_ms": 4885.0,
-      "p99_ms": 5081.3,
-      "per_run_p50_spread": {
-        "median": 3373.3,
-        "min": 3126.2,
-        "max": 3769.8,
-        "n": 5
-      }
-    },
     "5k-10/autobahn/sub5k:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
@@ -346,6 +318,40 @@
         "n": 5
       }
     },
+    "5k-10-fan/autobahn/sub5k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2739,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 16.9,
+      "p90_ms": 23.4,
+      "p99_ms": 33.2,
+      "per_run_p50_spread": {
+        "median": 17.1,
+        "min": 16.5,
+        "max": 17.1,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/sub5k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2751,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 3417.1,
+      "p90_ms": 4885.0,
+      "p99_ms": 5081.3,
+      "per_run_p50_spread": {
+        "median": 3373.3,
+        "min": 3126.2,
+        "max": 3769.8,
+        "n": 5
+      }
+    },
     "5k-100/autobahn/sub5k:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
@@ -377,6 +383,40 @@
         "median": 2857.6,
         "min": 2222.1,
         "max": 2966.8,
+        "n": 5
+      }
+    },
+    "chromium-1/autobahn/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2730,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 23.8,
+      "p90_ms": 293.0,
+      "p99_ms": 355.8,
+      "per_run_p50_spread": {
+        "median": 23.9,
+        "min": 23.1,
+        "max": 26.0,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2741,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 6232.2,
+      "p90_ms": 8820.4,
+      "p99_ms": 10293.3,
+      "per_run_p50_spread": {
+        "median": 6124.0,
+        "min": 5300.3,
+        "max": 7274.7,
         "n": 5
       }
     },
@@ -448,37 +488,71 @@
         "n": 5
       }
     },
-    "chromium-1/autobahn/chromium:a-to-b": {
+    "chromium-1-patch/autobahn/chromium:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
-      "pooled_samples": 2730,
+      "pooled_samples": 2708,
       "censored": 0,
       "skipped_ticks": 0,
-      "p50_ms": 23.8,
-      "p90_ms": 293.0,
-      "p99_ms": 355.8,
+      "p50_ms": 33.1,
+      "p90_ms": 44.4,
+      "p99_ms": 48.2,
       "per_run_p50_spread": {
-        "median": 23.9,
-        "min": 23.1,
-        "max": 26.0,
+        "median": 33.0,
+        "min": 31.6,
+        "max": 34.3,
         "n": 5
       }
     },
-    "chromium-1/mutagen/chromium:a-to-b": {
+    "chromium-1-patch/mutagen/chromium:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
-      "pooled_samples": 2741,
+      "pooled_samples": 1823,
+      "censored": 0,
+      "skipped_ticks": 980,
+      "p50_ms": 7575.9,
+      "p90_ms": 9442.5,
+      "p99_ms": 10510.8,
+      "per_run_p50_spread": {
+        "median": 7598.0,
+        "min": 7448.3,
+        "max": 7699.2,
+        "n": 5
+      }
+    },
+    "chromium-10/autobahn/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2736,
       "censored": 0,
       "skipped_ticks": 0,
-      "p50_ms": 6232.2,
-      "p90_ms": 8820.4,
-      "p99_ms": 10293.3,
+      "p50_ms": 26.7,
+      "p90_ms": 189.0,
+      "p99_ms": 527.1,
       "per_run_p50_spread": {
-        "median": 6124.0,
-        "min": 5300.3,
-        "max": 7274.7,
+        "median": 26.8,
+        "min": 24.5,
+        "max": 29.4,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2734,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 9202.4,
+      "p90_ms": 12160.8,
+      "p99_ms": 13215.0,
+      "per_run_p50_spread": {
+        "median": 9485.2,
+        "min": 8219.4,
+        "max": 9680.5,
         "n": 5
       }
     },
@@ -584,37 +658,105 @@
         "n": 5
       }
     },
-    "chromium-10/autobahn/chromium:a-to-b": {
+    "chromium-10-fan-patch/autobahn/chromium:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
-      "pooled_samples": 2736,
+      "pooled_samples": 2710,
       "censored": 0,
       "skipped_ticks": 0,
-      "p50_ms": 26.7,
-      "p90_ms": 189.0,
-      "p99_ms": 527.1,
+      "p50_ms": 42.0,
+      "p90_ms": 67.0,
+      "p99_ms": 107.8,
       "per_run_p50_spread": {
-        "median": 26.8,
-        "min": 24.5,
-        "max": 29.4,
+        "median": 40.4,
+        "min": 39.0,
+        "max": 58.6,
         "n": 5
       }
     },
-    "chromium-10/mutagen/chromium:a-to-b": {
+    "chromium-10-fan-patch/mutagen/chromium:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
-      "pooled_samples": 2734,
+      "pooled_samples": 1268,
+      "censored": 0,
+      "skipped_ticks": 1576,
+      "p50_ms": 11165.1,
+      "p90_ms": 17103.1,
+      "p99_ms": 25404.1,
+      "per_run_p50_spread": {
+        "median": 11078.9,
+        "min": 10258.1,
+        "max": 18725.4,
+        "n": 5
+      }
+    },
+    "chromium-10-patch/autobahn/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2711,
       "censored": 0,
       "skipped_ticks": 0,
-      "p50_ms": 9202.4,
-      "p90_ms": 12160.8,
-      "p99_ms": 13215.0,
+      "p50_ms": 34.0,
+      "p90_ms": 44.8,
+      "p99_ms": 58.1,
       "per_run_p50_spread": {
-        "median": 9485.2,
-        "min": 8219.4,
-        "max": 9680.5,
+        "median": 34.0,
+        "min": 33.1,
+        "max": 34.5,
+        "n": 5
+      }
+    },
+    "chromium-10-patch/mutagen/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 1765,
+      "censored": 0,
+      "skipped_ticks": 1038,
+      "p50_ms": 7839.6,
+      "p90_ms": 11095.3,
+      "p99_ms": 13304.5,
+      "per_run_p50_spread": {
+        "median": 7748.6,
+        "min": 7367.3,
+        "max": 8531.3,
+        "n": 5
+      }
+    },
+    "chromium-100/autobahn/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2755,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 80.3,
+      "p90_ms": 339.6,
+      "p99_ms": 681.9,
+      "per_run_p50_spread": {
+        "median": 82.2,
+        "min": 77.4,
+        "max": 83.4,
+        "n": 5
+      }
+    },
+    "chromium-100/mutagen/chromium:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2763,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 8421.8,
+      "p90_ms": 11920.3,
+      "p99_ms": 13463.4,
+      "per_run_p50_spread": {
+        "median": 7885.6,
+        "min": 7043.6,
+        "max": 9806.2,
         "n": 5
       }
     },
@@ -686,64 +828,6 @@
         "n": 5
       }
     },
-    "chromium-100/autobahn/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2755,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 80.3,
-      "p90_ms": 339.6,
-      "p99_ms": 681.9,
-      "per_run_p50_spread": {
-        "median": 82.2,
-        "min": 77.4,
-        "max": 83.4,
-        "n": 5
-      }
-    },
-    "chromium-100/mutagen/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2763,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 8421.8,
-      "p90_ms": 11920.3,
-      "p99_ms": 13463.4,
-      "per_run_p50_spread": {
-        "median": 7885.6,
-        "min": 7043.6,
-        "max": 9806.2,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/autobahn/none": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 0,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": null,
-      "p90_ms": null,
-      "p99_ms": null,
-      "per_run_p50_spread": null
-    },
-    "coldsync-50k-fan/mutagen/none": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 0,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": null,
-      "p90_ms": null,
-      "p99_ms": null,
-      "per_run_p50_spread": null
-    },
     "coldsync-50k/autobahn/none": {
       "runs": 5,
       "tainted_runs_excluded": 0,
@@ -768,7 +852,7 @@
       "p99_ms": null,
       "per_run_p50_spread": null
     },
-    "coldsync-5k-fan/autobahn/none": {
+    "coldsync-50k-fan/autobahn/none": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
@@ -780,7 +864,7 @@
       "p99_ms": null,
       "per_run_p50_spread": null
     },
-    "coldsync-5k-fan/mutagen/none": {
+    "coldsync-50k-fan/mutagen/none": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
@@ -816,7 +900,7 @@
       "p99_ms": null,
       "per_run_p50_spread": null
     },
-    "coldsync-chromium-fan/autobahn/none": {
+    "coldsync-5k-fan/autobahn/none": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
@@ -828,7 +912,7 @@
       "p99_ms": null,
       "per_run_p50_spread": null
     },
-    "coldsync-chromium-fan/mutagen/none": {
+    "coldsync-5k-fan/mutagen/none": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
@@ -853,6 +937,30 @@
       "per_run_p50_spread": null
     },
     "coldsync-chromium/mutagen/none": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 0,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "per_run_p50_spread": null
+    },
+    "coldsync-chromium-fan/autobahn/none": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 0,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": null,
+      "p90_ms": null,
+      "p99_ms": null,
+      "per_run_p50_spread": null
+    },
+    "coldsync-chromium-fan/mutagen/none": {
       "runs": 5,
       "tainted_runs_excluded": 0,
       "excluded": [],
@@ -932,74 +1040,6 @@
         "n": 5
       }
     },
-    "two50k-10-fan/autobahn/sub50k-b:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2733,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 19.3,
-      "p90_ms": 38.7,
-      "p99_ms": 82.7,
-      "per_run_p50_spread": {
-        "median": 19.4,
-        "min": 18.9,
-        "max": 20.1,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/autobahn/sub50k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2736,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 19.0,
-      "p90_ms": 48.3,
-      "p99_ms": 109.0,
-      "per_run_p50_spread": {
-        "median": 18.8,
-        "min": 18.6,
-        "max": 19.5,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/sub50k-b:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2730,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 5128.6,
-      "p90_ms": 5656.5,
-      "p99_ms": 6210.2,
-      "per_run_p50_spread": {
-        "median": 5122.6,
-        "min": 5025.7,
-        "max": 5219.9,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/sub50k:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2725,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 5019.8,
-      "p90_ms": 5615.2,
-      "p99_ms": 6466.1,
-      "per_run_p50_spread": {
-        "median": 5028.4,
-        "min": 4874.4,
-        "max": 5095.9,
-        "n": 5
-      }
-    },
     "two50k-10/autobahn/sub50k-b:a-to-b": {
       "runs": 5,
       "tainted_runs_excluded": 0,
@@ -1065,6 +1105,74 @@
         "median": 1912.1,
         "min": 1828.2,
         "max": 1964.3,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/autobahn/sub50k-b:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2733,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 19.3,
+      "p90_ms": 38.7,
+      "p99_ms": 82.7,
+      "per_run_p50_spread": {
+        "median": 19.4,
+        "min": 18.9,
+        "max": 20.1,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/autobahn/sub50k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2736,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 19.0,
+      "p90_ms": 48.3,
+      "p99_ms": 109.0,
+      "per_run_p50_spread": {
+        "median": 18.8,
+        "min": 18.6,
+        "max": 19.5,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/sub50k-b:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2730,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 5128.6,
+      "p90_ms": 5656.5,
+      "p99_ms": 6210.2,
+      "per_run_p50_spread": {
+        "median": 5122.6,
+        "min": 5025.7,
+        "max": 5219.9,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/sub50k:a-to-b": {
+      "runs": 5,
+      "tainted_runs_excluded": 0,
+      "excluded": [],
+      "pooled_samples": 2725,
+      "censored": 0,
+      "skipped_ticks": 0,
+      "p50_ms": 5019.8,
+      "p90_ms": 5615.2,
+      "p99_ms": 6466.1,
+      "per_run_p50_spread": {
+        "median": 5028.4,
+        "min": 4874.4,
+        "max": 5095.9,
         "n": 5
       }
     },
@@ -1135,141 +1243,9 @@
         "max": 2333.1,
         "n": 5
       }
-    },
-    "chromium-10-fan-patch/autobahn/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2710,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 42.0,
-      "p90_ms": 67.0,
-      "p99_ms": 107.8,
-      "per_run_p50_spread": {
-        "median": 40.4,
-        "min": 39.0,
-        "max": 58.6,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 1268,
-      "censored": 0,
-      "skipped_ticks": 1576,
-      "p50_ms": 11165.1,
-      "p90_ms": 17103.1,
-      "p99_ms": 25404.1,
-      "per_run_p50_spread": {
-        "median": 11078.9,
-        "min": 10258.1,
-        "max": 18725.4,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/autobahn/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2708,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 33.1,
-      "p90_ms": 44.4,
-      "p99_ms": 48.2,
-      "per_run_p50_spread": {
-        "median": 33.0,
-        "min": 31.6,
-        "max": 34.3,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 1823,
-      "censored": 0,
-      "skipped_ticks": 980,
-      "p50_ms": 7575.9,
-      "p90_ms": 9442.5,
-      "p99_ms": 10510.8,
-      "per_run_p50_spread": {
-        "median": 7598.0,
-        "min": 7448.3,
-        "max": 7699.2,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/autobahn/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 2711,
-      "censored": 0,
-      "skipped_ticks": 0,
-      "p50_ms": 34.0,
-      "p90_ms": 44.8,
-      "p99_ms": 58.1,
-      "per_run_p50_spread": {
-        "median": 34.0,
-        "min": 33.1,
-        "max": 34.5,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/chromium:a-to-b": {
-      "runs": 5,
-      "tainted_runs_excluded": 0,
-      "excluded": [],
-      "pooled_samples": 1765,
-      "censored": 0,
-      "skipped_ticks": 1038,
-      "p50_ms": 7839.6,
-      "p90_ms": 11095.3,
-      "p99_ms": 13304.5,
-      "per_run_p50_spread": {
-        "median": 7748.6,
-        "min": 7367.3,
-        "max": 8531.3,
-        "n": 5
-      }
     }
   },
   "cold_sync_s": {
-    "coldsync-50k-fan/autobahn/sub50k": {
-      "digest_verified": {
-        "median": 23.9,
-        "min": 22.4,
-        "max": 24.2,
-        "n": 5
-      },
-      "count_matched": {
-        "median": 20.8,
-        "min": 19.3,
-        "max": 21.2,
-        "n": 5
-      },
-      "excluded": []
-    },
-    "coldsync-50k-fan/mutagen/sub50k": {
-      "digest_verified": {
-        "median": 57.8,
-        "min": 55.9,
-        "max": 64.7,
-        "n": 5
-      },
-      "count_matched": {
-        "median": 54.7,
-        "min": 52.8,
-        "max": 61.6,
-        "n": 5
-      },
-      "excluded": []
-    },
     "coldsync-50k/autobahn/sub50k": {
       "digest_verified": {
         "median": 21.9,
@@ -1300,32 +1276,32 @@
       },
       "excluded": []
     },
-    "coldsync-5k-fan/autobahn/sub5k": {
+    "coldsync-50k-fan/autobahn/sub50k": {
       "digest_verified": {
-        "median": 7.7,
-        "min": 5.1,
-        "max": 10.1,
+        "median": 23.9,
+        "min": 22.4,
+        "max": 24.2,
         "n": 5
       },
       "count_matched": {
-        "median": 6.7,
-        "min": 4.4,
-        "max": 9.2,
+        "median": 20.8,
+        "min": 19.3,
+        "max": 21.2,
         "n": 5
       },
       "excluded": []
     },
-    "coldsync-5k-fan/mutagen/sub5k": {
+    "coldsync-50k-fan/mutagen/sub50k": {
       "digest_verified": {
-        "median": 23.0,
-        "min": 21.4,
-        "max": 23.2,
+        "median": 57.8,
+        "min": 55.9,
+        "max": 64.7,
         "n": 5
       },
       "count_matched": {
-        "median": 22.0,
-        "min": 20.7,
-        "max": 22.1,
+        "median": 54.7,
+        "min": 52.8,
+        "max": 61.6,
         "n": 5
       },
       "excluded": []
@@ -1360,32 +1336,32 @@
       },
       "excluded": []
     },
-    "coldsync-chromium-fan/autobahn/chromium": {
+    "coldsync-5k-fan/autobahn/sub5k": {
       "digest_verified": {
-        "median": 221.3,
-        "min": 215.4,
-        "max": 226.1,
+        "median": 7.7,
+        "min": 5.1,
+        "max": 10.1,
         "n": 5
       },
       "count_matched": {
-        "median": 198.7,
-        "min": 192.9,
-        "max": 203.4,
+        "median": 6.7,
+        "min": 4.4,
+        "max": 9.2,
         "n": 5
       },
       "excluded": []
     },
-    "coldsync-chromium-fan/mutagen/chromium": {
+    "coldsync-5k-fan/mutagen/sub5k": {
       "digest_verified": {
-        "median": 505.4,
-        "min": 502.2,
-        "max": 518.0,
+        "median": 23.0,
+        "min": 21.4,
+        "max": 23.2,
         "n": 5
       },
       "count_matched": {
-        "median": 483.2,
-        "min": 479.4,
-        "max": 493.4,
+        "median": 22.0,
+        "min": 20.7,
+        "max": 22.1,
         "n": 5
       },
       "excluded": []
@@ -1416,6 +1392,36 @@
         "median": 433.2,
         "min": 425.6,
         "max": 434.1,
+        "n": 5
+      },
+      "excluded": []
+    },
+    "coldsync-chromium-fan/autobahn/chromium": {
+      "digest_verified": {
+        "median": 221.3,
+        "min": 215.4,
+        "max": 226.1,
+        "n": 5
+      },
+      "count_matched": {
+        "median": 198.7,
+        "min": 192.9,
+        "max": 203.4,
+        "n": 5
+      },
+      "excluded": []
+    },
+    "coldsync-chromium-fan/mutagen/chromium": {
+      "digest_verified": {
+        "median": 505.4,
+        "min": 502.2,
+        "max": 518.0,
+        "n": 5
+      },
+      "count_matched": {
+        "median": 483.2,
+        "min": 479.4,
+        "max": 493.4,
         "n": 5
       },
       "excluded": []
@@ -1474,146 +1480,6 @@
     }
   },
   "resources": {
-    "50k-1-patch/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 69548,
-        "min": 68712,
-        "max": 72800,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.1,
-        "min": 0.1,
-        "max": 0.1,
-        "n": 5
-      }
-    },
-    "50k-1-patch/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 44052,
-        "min": 43484,
-        "max": 44368,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "50k-1-patch/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 75664,
-        "min": 66044,
-        "max": 80812,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 2.9,
-        "min": 2.8,
-        "max": 3.3,
-        "n": 5
-      }
-    },
-    "50k-1-patch/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 50556,
-        "min": 42972,
-        "max": 52396,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 1.4,
-        "min": 1.4,
-        "max": 1.5,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 27112,
-        "min": 26772,
-        "max": 29116,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 10.0,
-        "min": 6.3,
-        "max": 28.9,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 0,
-        "min": 0,
-        "max": 10912,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 225592,
-        "min": 216560,
-        "max": 272892,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 5.7,
-        "min": 5.6,
-        "max": 7.0,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 164024,
-        "min": 148332,
-        "max": 165712,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 5.8,
-        "min": 5.8,
-        "max": 6.1,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 276212,
-        "min": 266984,
-        "max": 279552,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 91.9,
-        "min": 88.8,
-        "max": 104.3,
-        "n": 5
-      }
-    },
-    "50k-1-patch/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 188412,
-        "min": 180852,
-        "max": 190488,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 62.4,
-        "min": 60.6,
-        "max": 66.3,
-        "n": 5
-      }
-    },
     "50k-1/autobahn/idle/local": {
       "peak_rss_kb": {
         "median": 68744,
@@ -1751,6 +1617,286 @@
         "median": 58.3,
         "min": 52.9,
         "max": 63.8,
+        "n": 5
+      }
+    },
+    "50k-1-patch/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 69488,
+        "min": 68312,
+        "max": 69680,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.1,
+        "min": 0.1,
+        "max": 0.1,
+        "n": 5
+      }
+    },
+    "50k-1-patch/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 44344,
+        "min": 43652,
+        "max": 45104,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "50k-1-patch/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 71032,
+        "min": 63748,
+        "max": 78900,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 2.8,
+        "min": 2.7,
+        "max": 3.0,
+        "n": 5
+      }
+    },
+    "50k-1-patch/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 53328,
+        "min": 49568,
+        "max": 57404,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 1.3,
+        "min": 1.3,
+        "max": 1.4,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 27520,
+        "min": 27456,
+        "max": 29316,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 9.0,
+        "min": 7.3,
+        "max": 22.4,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 9960,
+        "min": 0,
+        "max": 11040,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 234844,
+        "min": 222224,
+        "max": 244948,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 5.7,
+        "min": 5.4,
+        "max": 6.2,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 163352,
+        "min": 146452,
+        "max": 164208,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 5.5,
+        "min": 5.4,
+        "max": 6.1,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 274956,
+        "min": 274200,
+        "max": 298164,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 87.2,
+        "min": 86.2,
+        "max": 97.0,
+        "n": 5
+      }
+    },
+    "50k-1-patch/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 199300,
+        "min": 189060,
+        "max": 202116,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 60.5,
+        "min": 57.9,
+        "max": 62.4,
+        "n": 5
+      }
+    },
+    "50k-10/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 69128,
+        "min": 68552,
+        "max": 73428,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.1,
+        "min": 0.1,
+        "max": 0.1,
+        "n": 5
+      }
+    },
+    "50k-10/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 43676,
+        "min": 43428,
+        "max": 44520,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "50k-10/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 91708,
+        "min": 85520,
+        "max": 94804,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 11.6,
+        "min": 10.4,
+        "max": 12.1,
+        "n": 5
+      }
+    },
+    "50k-10/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 41880,
+        "min": 36516,
+        "max": 59100,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 4.1,
+        "min": 3.7,
+        "max": 5.6,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 26836,
+        "min": 18288,
+        "max": 29060,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 9.6,
+        "min": 5.3,
+        "max": 19.0,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 0,
+        "min": 0,
+        "max": 7476,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 224812,
+        "min": 212852,
+        "max": 242348,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 5.8,
+        "min": 5.7,
+        "max": 6.0,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 159964,
+        "min": 151460,
+        "max": 165848,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 5.6,
+        "min": 5.4,
+        "max": 6.3,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 272716,
+        "min": 260472,
+        "max": 276816,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 27.1,
+        "min": 26.7,
+        "max": 31.1,
+        "n": 5
+      }
+    },
+    "50k-10/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 203360,
+        "min": 202080,
+        "max": 206476,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 24.9,
+        "min": 23.3,
+        "max": 26.4,
         "n": 5
       }
     },
@@ -1896,9 +2042,9 @@
     },
     "50k-10-patch/autobahn/idle/local": {
       "peak_rss_kb": {
-        "median": 70448,
-        "min": 67508,
-        "max": 73500,
+        "median": 69960,
+        "min": 69684,
+        "max": 72804,
         "n": 5
       },
       "cpu_percent_of_core": {
@@ -1910,9 +2056,9 @@
     },
     "50k-10-patch/autobahn/idle/remote": {
       "peak_rss_kb": {
-        "median": 43956,
-        "min": 43604,
-        "max": 44236,
+        "median": 44144,
+        "min": 43616,
+        "max": 44276,
         "n": 5
       },
       "cpu_percent_of_core": {
@@ -1924,43 +2070,43 @@
     },
     "50k-10-patch/autobahn/workload/local": {
       "peak_rss_kb": {
-        "median": 77516,
-        "min": 74384,
-        "max": 84796,
+        "median": 78576,
+        "min": 77616,
+        "max": 91176,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 11.0,
-        "min": 10.0,
-        "max": 12.4,
+        "median": 10.7,
+        "min": 8.7,
+        "max": 11.8,
         "n": 5
       }
     },
     "50k-10-patch/autobahn/workload/remote": {
       "peak_rss_kb": {
-        "median": 36768,
-        "min": 36084,
-        "max": 49316,
+        "median": 49724,
+        "min": 37068,
+        "max": 55148,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 5.9,
-        "min": 5.0,
-        "max": 5.9,
+        "median": 5.0,
+        "min": 3.5,
+        "max": 6.6,
         "n": 5
       }
     },
     "50k-10-patch/mutagen/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 27184,
-        "min": 27012,
-        "max": 27660,
+        "median": 28012,
+        "min": 26688,
+        "max": 29040,
         "n": 5
       },
       "cpu_percent_of_core": {
         "median": 9.6,
-        "min": 9.3,
-        "max": 10.3,
+        "min": 7.3,
+        "max": 16.5,
         "n": 5
       }
     },
@@ -1968,209 +2114,69 @@
       "peak_rss_kb": {
         "median": 0,
         "min": 0,
-        "max": 11040,
+        "max": 10736,
         "n": 5
       },
       "cpu_percent_of_core": {
         "median": 0.0,
         "min": 0.0,
-        "max": 0.3,
+        "max": 0.0,
         "n": 5
       }
     },
     "50k-10-patch/mutagen/idle/local": {
       "peak_rss_kb": {
-        "median": 228404,
-        "min": 217176,
-        "max": 234924,
+        "median": 228312,
+        "min": 210012,
+        "max": 237064,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 5.5,
-        "min": 5.3,
-        "max": 6.4,
+        "median": 5.7,
+        "min": 5.5,
+        "max": 5.9,
         "n": 5
       }
     },
     "50k-10-patch/mutagen/idle/remote": {
       "peak_rss_kb": {
-        "median": 164656,
-        "min": 155448,
-        "max": 172776,
+        "median": 161092,
+        "min": 142576,
+        "max": 171448,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 6.0,
-        "min": 5.7,
-        "max": 6.2,
+        "median": 5.7,
+        "min": 5.5,
+        "max": 6.6,
         "n": 5
       }
     },
     "50k-10-patch/mutagen/workload/local": {
       "peak_rss_kb": {
-        "median": 280416,
-        "min": 273348,
-        "max": 286144,
+        "median": 278256,
+        "min": 270020,
+        "max": 283472,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 56.6,
-        "min": 53.0,
-        "max": 67.0,
+        "median": 55.0,
+        "min": 53.2,
+        "max": 64.2,
         "n": 5
       }
     },
     "50k-10-patch/mutagen/workload/remote": {
       "peak_rss_kb": {
-        "median": 204072,
-        "min": 198540,
-        "max": 208352,
+        "median": 204600,
+        "min": 203208,
+        "max": 208716,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 48.6,
-        "min": 45.6,
-        "max": 50.3,
-        "n": 5
-      }
-    },
-    "50k-10/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 69128,
-        "min": 68552,
-        "max": 73428,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.1,
-        "min": 0.1,
-        "max": 0.1,
-        "n": 5
-      }
-    },
-    "50k-10/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 43676,
-        "min": 43428,
-        "max": 44520,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "50k-10/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 91708,
-        "min": 85520,
-        "max": 94804,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 11.6,
-        "min": 10.4,
-        "max": 12.1,
-        "n": 5
-      }
-    },
-    "50k-10/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 41880,
-        "min": 36516,
-        "max": 59100,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 4.1,
-        "min": 3.7,
-        "max": 5.6,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 26836,
-        "min": 18288,
-        "max": 29060,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 9.6,
-        "min": 5.3,
-        "max": 19.0,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 0,
-        "min": 0,
-        "max": 7476,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 224812,
-        "min": 212852,
-        "max": 242348,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 5.8,
-        "min": 5.7,
-        "max": 6.0,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 159964,
-        "min": 151460,
-        "max": 165848,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 5.6,
-        "min": 5.4,
-        "max": 6.3,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 272716,
-        "min": 260472,
-        "max": 276816,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 27.1,
-        "min": 26.7,
-        "max": 31.1,
-        "n": 5
-      }
-    },
-    "50k-10/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 203360,
-        "min": 202080,
-        "max": 206476,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 24.9,
-        "min": 23.3,
-        "max": 26.4,
+        "median": 45.2,
+        "min": 43.7,
+        "max": 52.5,
         "n": 5
       }
     },
@@ -2594,146 +2600,6 @@
         "n": 5
       }
     },
-    "5k-10-fan/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 168704,
-        "min": 164236,
-        "max": 171584,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.8,
-        "min": 0.7,
-        "max": 0.8,
-        "n": 5
-      }
-    },
-    "5k-10-fan/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 117516,
-        "min": 115940,
-        "max": 118444,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.3,
-        "min": 0.2,
-        "max": 0.3,
-        "n": 5
-      }
-    },
-    "5k-10-fan/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 176276,
-        "min": 173936,
-        "max": 182976,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 27.4,
-        "min": 27.2,
-        "max": 27.6,
-        "n": 5
-      }
-    },
-    "5k-10-fan/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 166328,
-        "min": 163724,
-        "max": 173872,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 19.9,
-        "min": 19.8,
-        "max": 20.0,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 235932,
-        "min": 227392,
-        "max": 242136,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 30.3,
-        "min": 28.9,
-        "max": 32.4,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 210088,
-        "min": 207800,
-        "max": 212736,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 11.0,
-        "min": 10.5,
-        "max": 11.3,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 296772,
-        "min": 294956,
-        "max": 298924,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 5.6,
-        "min": 5.5,
-        "max": 5.7,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 294120,
-        "min": 290296,
-        "max": 295208,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 6.7,
-        "min": 6.5,
-        "max": 6.7,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 386312,
-        "min": 381600,
-        "max": 404180,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 61.5,
-        "min": 60.3,
-        "max": 64.6,
-        "n": 5
-      }
-    },
-    "5k-10-fan/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 326916,
-        "min": 325768,
-        "max": 329552,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 46.5,
-        "min": 45.9,
-        "max": 48.5,
-        "n": 5
-      }
-    },
     "5k-10/autobahn/idle/local": {
       "peak_rss_kb": {
         "median": 23928,
@@ -2871,6 +2737,146 @@
         "median": 3.8,
         "min": 2.9,
         "max": 4.3,
+        "n": 5
+      }
+    },
+    "5k-10-fan/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 168704,
+        "min": 164236,
+        "max": 171584,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.8,
+        "min": 0.7,
+        "max": 0.8,
+        "n": 5
+      }
+    },
+    "5k-10-fan/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 117516,
+        "min": 115940,
+        "max": 118444,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.3,
+        "min": 0.2,
+        "max": 0.3,
+        "n": 5
+      }
+    },
+    "5k-10-fan/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 176276,
+        "min": 173936,
+        "max": 182976,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 27.4,
+        "min": 27.2,
+        "max": 27.6,
+        "n": 5
+      }
+    },
+    "5k-10-fan/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 166328,
+        "min": 163724,
+        "max": 173872,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 19.9,
+        "min": 19.8,
+        "max": 20.0,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 235932,
+        "min": 227392,
+        "max": 242136,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 30.3,
+        "min": 28.9,
+        "max": 32.4,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 210088,
+        "min": 207800,
+        "max": 212736,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 11.0,
+        "min": 10.5,
+        "max": 11.3,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 296772,
+        "min": 294956,
+        "max": 298924,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 5.6,
+        "min": 5.5,
+        "max": 5.7,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 294120,
+        "min": 290296,
+        "max": 295208,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 6.7,
+        "min": 6.5,
+        "max": 6.7,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 386312,
+        "min": 381600,
+        "max": 404180,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 61.5,
+        "min": 60.3,
+        "max": 64.6,
+        "n": 5
+      }
+    },
+    "5k-10-fan/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 326916,
+        "min": 325768,
+        "max": 329552,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 46.5,
+        "min": 45.9,
+        "max": 48.5,
         "n": 5
       }
     },
@@ -3014,6 +3020,146 @@
         "n": 5
       }
     },
+    "chromium-1/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 395748,
+        "min": 392564,
+        "max": 396900,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.1,
+        "min": 0.1,
+        "max": 0.1,
+        "n": 5
+      }
+    },
+    "chromium-1/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 174500,
+        "min": 173268,
+        "max": 176128,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.1,
+        "n": 5
+      }
+    },
+    "chromium-1/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 490516,
+        "min": 470556,
+        "max": 504548,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 20.3,
+        "min": 20.0,
+        "max": 22.3,
+        "n": 5
+      }
+    },
+    "chromium-1/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 174500,
+        "min": 142436,
+        "max": 176256,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 4.8,
+        "min": 4.8,
+        "max": 5.3,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 27856,
+        "min": 26732,
+        "max": 29456,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 11.0,
+        "min": 8.6,
+        "max": 36.4,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 0,
+        "min": 0,
+        "max": 10984,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.3,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 1754416,
+        "min": 1628816,
+        "max": 1836268,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 49.9,
+        "min": 48.3,
+        "max": 54.1,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 1299284,
+        "min": 1207020,
+        "max": 1317800,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 51.1,
+        "min": 48.9,
+        "max": 54.0,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 2131212,
+        "min": 2075248,
+        "max": 2154192,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 162.8,
+        "min": 156.1,
+        "max": 168.3,
+        "n": 5
+      }
+    },
+    "chromium-1/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 1413564,
+        "min": 1384688,
+        "max": 1433908,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 124.9,
+        "min": 114.1,
+        "max": 130.0,
+        "n": 5
+      }
+    },
     "chromium-1-bidir/autobahn/idle/local": {
       "peak_rss_kb": {
         "median": 396424,
@@ -3154,11 +3300,11 @@
         "n": 5
       }
     },
-    "chromium-1/autobahn/idle/local": {
+    "chromium-1-patch/autobahn/idle/local": {
       "peak_rss_kb": {
-        "median": 395748,
-        "min": 392564,
-        "max": 396900,
+        "median": 395924,
+        "min": 394796,
+        "max": 397160,
         "n": 5
       },
       "cpu_percent_of_core": {
@@ -3168,65 +3314,65 @@
         "n": 5
       }
     },
-    "chromium-1/autobahn/idle/remote": {
+    "chromium-1-patch/autobahn/idle/remote": {
       "peak_rss_kb": {
-        "median": 174500,
-        "min": 173268,
-        "max": 176128,
+        "median": 172940,
+        "min": 171704,
+        "max": 173312,
         "n": 5
       },
       "cpu_percent_of_core": {
         "median": 0.0,
         "min": 0.0,
-        "max": 0.1,
+        "max": 0.0,
         "n": 5
       }
     },
-    "chromium-1/autobahn/workload/local": {
+    "chromium-1-patch/autobahn/workload/local": {
       "peak_rss_kb": {
-        "median": 490516,
-        "min": 470556,
-        "max": 504548,
+        "median": 359484,
+        "min": 338948,
+        "max": 440060,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 20.3,
-        "min": 20.0,
-        "max": 22.3,
+        "median": 16.9,
+        "min": 16.5,
+        "max": 17.1,
         "n": 5
       }
     },
-    "chromium-1/autobahn/workload/remote": {
+    "chromium-1-patch/autobahn/workload/remote": {
       "peak_rss_kb": {
-        "median": 174500,
-        "min": 142436,
-        "max": 176256,
+        "median": 172952,
+        "min": 142656,
+        "max": 173312,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 4.8,
-        "min": 4.8,
-        "max": 5.3,
+        "median": 5.5,
+        "min": 5.3,
+        "max": 5.7,
         "n": 5
       }
     },
-    "chromium-1/mutagen/cold_sync/local": {
+    "chromium-1-patch/mutagen/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 27856,
-        "min": 26732,
-        "max": 29456,
+        "median": 27660,
+        "min": 26984,
+        "max": 29776,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 11.0,
-        "min": 8.6,
-        "max": 36.4,
+        "median": 10.3,
+        "min": 7.3,
+        "max": 35.4,
         "n": 5
       }
     },
-    "chromium-1/mutagen/cold_sync/remote": {
+    "chromium-1-patch/mutagen/cold_sync/remote": {
       "peak_rss_kb": {
-        "median": 0,
+        "median": 10728,
         "min": 0,
         "max": 10984,
         "n": 5
@@ -3238,59 +3384,199 @@
         "n": 5
       }
     },
-    "chromium-1/mutagen/idle/local": {
+    "chromium-1-patch/mutagen/idle/local": {
       "peak_rss_kb": {
-        "median": 1754416,
-        "min": 1628816,
-        "max": 1836268,
+        "median": 1836528,
+        "min": 1769612,
+        "max": 1853372,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 49.9,
-        "min": 48.3,
-        "max": 54.1,
+        "median": 49.2,
+        "min": 47.7,
+        "max": 50.2,
         "n": 5
       }
     },
-    "chromium-1/mutagen/idle/remote": {
+    "chromium-1-patch/mutagen/idle/remote": {
       "peak_rss_kb": {
-        "median": 1299284,
-        "min": 1207020,
-        "max": 1317800,
+        "median": 1316008,
+        "min": 1303252,
+        "max": 1357832,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 51.1,
-        "min": 48.9,
-        "max": 54.0,
+        "median": 49.3,
+        "min": 48.0,
+        "max": 52.2,
         "n": 5
       }
     },
-    "chromium-1/mutagen/workload/local": {
+    "chromium-1-patch/mutagen/workload/local": {
       "peak_rss_kb": {
-        "median": 2131212,
-        "min": 2075248,
-        "max": 2154192,
+        "median": 2128260,
+        "min": 2098252,
+        "max": 2186996,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 162.8,
-        "min": 156.1,
-        "max": 168.3,
+        "median": 158.3,
+        "min": 152.4,
+        "max": 160.8,
         "n": 5
       }
     },
-    "chromium-1/mutagen/workload/remote": {
+    "chromium-1-patch/mutagen/workload/remote": {
       "peak_rss_kb": {
-        "median": 1413564,
-        "min": 1384688,
-        "max": 1433908,
+        "median": 1400744,
+        "min": 1359600,
+        "max": 1428908,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 124.9,
-        "min": 114.1,
-        "max": 130.0,
+        "median": 119.8,
+        "min": 111.6,
+        "max": 122.4,
+        "n": 5
+      }
+    },
+    "chromium-10/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 395952,
+        "min": 393272,
+        "max": 397084,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.1,
+        "min": 0.1,
+        "max": 0.1,
+        "n": 5
+      }
+    },
+    "chromium-10/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 174860,
+        "min": 173896,
+        "max": 175576,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "chromium-10/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 542316,
+        "min": 540456,
+        "max": 544576,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 60.2,
+        "min": 58.6,
+        "max": 67.0,
+        "n": 5
+      }
+    },
+    "chromium-10/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 161672,
+        "min": 152860,
+        "max": 173508,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 19.3,
+        "min": 17.3,
+        "max": 21.8,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 27112,
+        "min": 26696,
+        "max": 29444,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 10.3,
+        "min": 8.0,
+        "max": 34.9,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 1755308,
+        "min": 1662940,
+        "max": 1834036,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 48.0,
+        "min": 47.3,
+        "max": 56.8,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 1301576,
+        "min": 1232900,
+        "max": 1306884,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 50.8,
+        "min": 49.1,
+        "max": 54.3,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 2124188,
+        "min": 2064396,
+        "max": 2156640,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 91.8,
+        "min": 91.1,
+        "max": 103.5,
+        "n": 5
+      }
+    },
+    "chromium-10/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 1507432,
+        "min": 1425944,
+        "max": 1522200,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 112.4,
+        "min": 110.7,
+        "max": 118.6,
         "n": 5
       }
     },
@@ -3574,11 +3860,151 @@
         "n": 5
       }
     },
-    "chromium-10/autobahn/idle/local": {
+    "chromium-10-fan-patch/autobahn/idle/local": {
       "peak_rss_kb": {
-        "median": 395952,
-        "min": 393272,
-        "max": 397084,
+        "median": 3109864,
+        "min": 3088904,
+        "max": 3115660,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.8,
+        "min": 0.7,
+        "max": 0.8,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 1969928,
+        "min": 1905248,
+        "max": 2003244,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.3,
+        "min": 0.2,
+        "max": 10.8,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 2135972,
+        "min": 2130944,
+        "max": 3091900,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 178.0,
+        "min": 171.7,
+        "max": 185.5,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 1911568,
+        "min": 1839400,
+        "max": 1940336,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 222.2,
+        "min": 203.4,
+        "max": 231.9,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 1157140,
+        "min": 1082352,
+        "max": 1366536,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 64.3,
+        "min": 60.3,
+        "max": 72.3,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 5280920,
+        "min": 4521456,
+        "max": 5749108,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 372.2,
+        "min": 344.8,
+        "max": 397.0,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 15456832,
+        "min": 15187340,
+        "max": 15681388,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 565.0,
+        "min": 563.3,
+        "max": 618.4,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 12727176,
+        "min": 12498092,
+        "max": 13229568,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 521.2,
+        "min": 511.7,
+        "max": 567.9,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 22980552,
+        "min": 21823604,
+        "max": 23621636,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 1289.0,
+        "min": 1181.1,
+        "max": 1337.6,
+        "n": 5
+      }
+    },
+    "chromium-10-fan-patch/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 13156396,
+        "min": 13100792,
+        "max": 13514072,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 1091.4,
+        "min": 1082.9,
+        "max": 1125.0,
+        "n": 5
+      }
+    },
+    "chromium-10-patch/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 396624,
+        "min": 396264,
+        "max": 397008,
         "n": 5
       },
       "cpu_percent_of_core": {
@@ -3588,11 +4014,11 @@
         "n": 5
       }
     },
-    "chromium-10/autobahn/idle/remote": {
+    "chromium-10-patch/autobahn/idle/remote": {
       "peak_rss_kb": {
-        "median": 174860,
-        "min": 173896,
-        "max": 175576,
+        "median": 174956,
+        "min": 174040,
+        "max": 176440,
         "n": 5
       },
       "cpu_percent_of_core": {
@@ -3602,189 +4028,49 @@
         "n": 5
       }
     },
-    "chromium-10/autobahn/workload/local": {
+    "chromium-10-patch/autobahn/workload/local": {
       "peak_rss_kb": {
-        "median": 542316,
-        "min": 540456,
-        "max": 544576,
+        "median": 376076,
+        "min": 369052,
+        "max": 397232,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 60.2,
-        "min": 58.6,
-        "max": 67.0,
-        "n": 5
-      }
-    },
-    "chromium-10/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 161672,
-        "min": 152860,
-        "max": 173508,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 19.3,
-        "min": 17.3,
-        "max": 21.8,
-        "n": 5
-      }
-    },
-    "chromium-10/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 27112,
-        "min": 26696,
-        "max": 29444,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 10.3,
-        "min": 8.0,
-        "max": 34.9,
-        "n": 5
-      }
-    },
-    "chromium-10/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 0,
-        "min": 0,
-        "max": 0,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "chromium-10/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 1755308,
-        "min": 1662940,
-        "max": 1834036,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 48.0,
+        "median": 50.6,
         "min": 47.3,
-        "max": 56.8,
+        "max": 51.0,
         "n": 5
       }
     },
-    "chromium-10/mutagen/idle/remote": {
+    "chromium-10-patch/autobahn/workload/remote": {
       "peak_rss_kb": {
-        "median": 1301576,
-        "min": 1232900,
-        "max": 1306884,
+        "median": 157072,
+        "min": 151552,
+        "max": 158132,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 50.8,
-        "min": 49.1,
-        "max": 54.3,
+        "median": 19.5,
+        "min": 17.9,
+        "max": 22.7,
         "n": 5
       }
     },
-    "chromium-10/mutagen/workload/local": {
+    "chromium-10-patch/mutagen/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 2124188,
-        "min": 2064396,
-        "max": 2156640,
+        "median": 27164,
+        "min": 26508,
+        "max": 29212,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 91.8,
-        "min": 91.1,
-        "max": 103.5,
-        "n": 5
-      }
-    },
-    "chromium-10/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 1507432,
-        "min": 1425944,
-        "max": 1522200,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 112.4,
-        "min": 110.7,
-        "max": 118.6,
-        "n": 5
-      }
-    },
-    "chromium-100-bidir/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 396288,
-        "min": 395920,
-        "max": 396964,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.1,
-        "min": 0.1,
-        "max": 0.1,
-        "n": 5
-      }
-    },
-    "chromium-100-bidir/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 174652,
-        "min": 173288,
-        "max": 175056,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "chromium-100-bidir/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 578132,
-        "min": 540152,
-        "max": 594212,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 95.4,
-        "min": 95.0,
-        "max": 96.3,
-        "n": 5
-      }
-    },
-    "chromium-100-bidir/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 389056,
-        "min": 387400,
-        "max": 394316,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 71.7,
-        "min": 70.4,
-        "max": 74.8,
-        "n": 5
-      }
-    },
-    "chromium-100-bidir/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 28964,
-        "min": 27244,
-        "max": 29556,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 24.3,
+        "median": 10.0,
         "min": 8.0,
-        "max": 30.9,
+        "max": 27.9,
         "n": 5
       }
     },
-    "chromium-100-bidir/mutagen/cold_sync/remote": {
+    "chromium-10-patch/mutagen/cold_sync/remote": {
       "peak_rss_kb": {
         "median": 0,
         "min": 0,
@@ -3798,59 +4084,59 @@
         "n": 5
       }
     },
-    "chromium-100-bidir/mutagen/idle/local": {
+    "chromium-10-patch/mutagen/idle/local": {
       "peak_rss_kb": {
-        "median": 1772252,
-        "min": 1715740,
-        "max": 1795020,
+        "median": 1693752,
+        "min": 1613740,
+        "max": 1788980,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 47.5,
-        "min": 47.4,
-        "max": 48.4,
+        "median": 49.1,
+        "min": 47.7,
+        "max": 50.8,
         "n": 5
       }
     },
-    "chromium-100-bidir/mutagen/idle/remote": {
+    "chromium-10-patch/mutagen/idle/remote": {
       "peak_rss_kb": {
-        "median": 1308632,
-        "min": 1210360,
-        "max": 1318712,
+        "median": 1271512,
+        "min": 1249004,
+        "max": 1320856,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 50.4,
-        "min": 48.7,
-        "max": 53.3,
+        "median": 49.5,
+        "min": 47.9,
+        "max": 50.1,
         "n": 5
       }
     },
-    "chromium-100-bidir/mutagen/workload/local": {
+    "chromium-10-patch/mutagen/workload/local": {
       "peak_rss_kb": {
-        "median": 2083304,
-        "min": 2040504,
-        "max": 2136468,
+        "median": 2161668,
+        "min": 2068816,
+        "max": 2211288,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 113.8,
-        "min": 112.9,
-        "max": 114.6,
+        "median": 110.6,
+        "min": 101.5,
+        "max": 117.0,
         "n": 5
       }
     },
-    "chromium-100-bidir/mutagen/workload/remote": {
+    "chromium-10-patch/mutagen/workload/remote": {
       "peak_rss_kb": {
-        "median": 1431748,
-        "min": 1427404,
-        "max": 1597652,
+        "median": 1461936,
+        "min": 1410120,
+        "max": 1483236,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 87.8,
-        "min": 82.4,
-        "max": 94.6,
+        "median": 123.6,
+        "min": 120.0,
+        "max": 125.2,
         "n": 5
       }
     },
@@ -3994,6 +4280,146 @@
         "n": 5
       }
     },
+    "chromium-100-bidir/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 396288,
+        "min": 395920,
+        "max": 396964,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.1,
+        "min": 0.1,
+        "max": 0.1,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 174652,
+        "min": 173288,
+        "max": 175056,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 578132,
+        "min": 540152,
+        "max": 594212,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 95.4,
+        "min": 95.0,
+        "max": 96.3,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 389056,
+        "min": 387400,
+        "max": 394316,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 71.7,
+        "min": 70.4,
+        "max": 74.8,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 28964,
+        "min": 27244,
+        "max": 29556,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 24.3,
+        "min": 8.0,
+        "max": 30.9,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 0,
+        "min": 0,
+        "max": 0,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.0,
+        "min": 0.0,
+        "max": 0.0,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 1772252,
+        "min": 1715740,
+        "max": 1795020,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 47.5,
+        "min": 47.4,
+        "max": 48.4,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 1308632,
+        "min": 1210360,
+        "max": 1318712,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 50.4,
+        "min": 48.7,
+        "max": 53.3,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 2083304,
+        "min": 2040504,
+        "max": 2136468,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 113.8,
+        "min": 112.9,
+        "max": 114.6,
+        "n": 5
+      }
+    },
+    "chromium-100-bidir/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 1431748,
+        "min": 1427404,
+        "max": 1597652,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 87.8,
+        "min": 82.4,
+        "max": 94.6,
+        "n": 5
+      }
+    },
     "chromium-burst/autobahn/idle/local": {
       "peak_rss_kb": {
         "median": 395548,
@@ -4134,118 +4560,6 @@
         "n": 5
       }
     },
-    "coldsync-50k-fan/autobahn/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 1248340,
-        "min": 1230736,
-        "max": 1265988,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 170.8,
-        "min": 150.1,
-        "max": 172.9,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/autobahn/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 1008388,
-        "min": 882012,
-        "max": 1049764,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 404.4,
-        "min": 386.8,
-        "max": 431.1,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 512020,
-        "min": 502476,
-        "max": 517208,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.7,
-        "min": 0.7,
-        "max": 0.8,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 880216,
-        "min": 837224,
-        "max": 912300,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.2,
-        "min": 0.2,
-        "max": 0.3,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 1773632,
-        "min": 1717084,
-        "max": 2034932,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 189.9,
-        "min": 187.2,
-        "max": 198.8,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 1310308,
-        "min": 1264936,
-        "max": 1491580,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 128.2,
-        "min": 123.3,
-        "max": 135.3,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 1878516,
-        "min": 1851408,
-        "max": 1919960,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 57.2,
-        "min": 55.7,
-        "max": 63.3,
-        "n": 5
-      }
-    },
-    "coldsync-50k-fan/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 1721832,
-        "min": 1705380,
-        "max": 1791108,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 58.0,
-        "min": 57.7,
-        "max": 61.0,
-        "n": 5
-      }
-    },
     "coldsync-50k/autobahn/cold_sync/local": {
       "peak_rss_kb": {
         "median": 146408,
@@ -4358,53 +4672,53 @@
         "n": 5
       }
     },
-    "coldsync-5k-fan/autobahn/cold_sync/local": {
+    "coldsync-50k-fan/autobahn/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 691776,
-        "min": 540684,
-        "max": 752540,
+        "median": 1248340,
+        "min": 1230736,
+        "max": 1265988,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 126.1,
-        "min": 99.0,
-        "max": 177.7,
+        "median": 170.8,
+        "min": 150.1,
+        "max": 172.9,
         "n": 5
       }
     },
-    "coldsync-5k-fan/autobahn/cold_sync/remote": {
+    "coldsync-50k-fan/autobahn/cold_sync/remote": {
       "peak_rss_kb": {
-        "median": 402296,
-        "min": 373208,
-        "max": 503720,
+        "median": 1008388,
+        "min": 882012,
+        "max": 1049764,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 143.9,
-        "min": 106.2,
-        "max": 233.2,
+        "median": 404.4,
+        "min": 386.8,
+        "max": 431.1,
         "n": 5
       }
     },
-    "coldsync-5k-fan/autobahn/idle/local": {
+    "coldsync-50k-fan/autobahn/idle/local": {
       "peak_rss_kb": {
-        "median": 213984,
-        "min": 209880,
-        "max": 238724,
+        "median": 512020,
+        "min": 502476,
+        "max": 517208,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 0.8,
+        "median": 0.7,
         "min": 0.7,
-        "max": 0.9,
+        "max": 0.8,
         "n": 5
       }
     },
-    "coldsync-5k-fan/autobahn/idle/remote": {
+    "coldsync-50k-fan/autobahn/idle/remote": {
       "peak_rss_kb": {
-        "median": 312904,
-        "min": 290100,
-        "max": 503720,
+        "median": 880216,
+        "min": 837224,
+        "max": 912300,
         "n": 5
       },
       "cpu_percent_of_core": {
@@ -4414,59 +4728,59 @@
         "n": 5
       }
     },
-    "coldsync-5k-fan/mutagen/cold_sync/local": {
+    "coldsync-50k-fan/mutagen/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 268892,
-        "min": 261564,
-        "max": 280096,
+        "median": 1773632,
+        "min": 1717084,
+        "max": 2034932,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 70.8,
-        "min": 68.6,
-        "max": 72.1,
+        "median": 189.9,
+        "min": 187.2,
+        "max": 198.8,
         "n": 5
       }
     },
-    "coldsync-5k-fan/mutagen/cold_sync/remote": {
+    "coldsync-50k-fan/mutagen/cold_sync/remote": {
       "peak_rss_kb": {
-        "median": 284532,
-        "min": 273312,
-        "max": 288196,
+        "median": 1310308,
+        "min": 1264936,
+        "max": 1491580,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 48.3,
-        "min": 47.6,
-        "max": 49.2,
+        "median": 128.2,
+        "min": 123.3,
+        "max": 135.3,
         "n": 5
       }
     },
-    "coldsync-5k-fan/mutagen/idle/local": {
+    "coldsync-50k-fan/mutagen/idle/local": {
       "peak_rss_kb": {
-        "median": 311572,
-        "min": 308768,
-        "max": 316656,
+        "median": 1878516,
+        "min": 1851408,
+        "max": 1919960,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 5.5,
-        "min": 5.5,
-        "max": 5.5,
+        "median": 57.2,
+        "min": 55.7,
+        "max": 63.3,
         "n": 5
       }
     },
-    "coldsync-5k-fan/mutagen/idle/remote": {
+    "coldsync-50k-fan/mutagen/idle/remote": {
       "peak_rss_kb": {
-        "median": 324960,
-        "min": 321060,
-        "max": 326128,
+        "median": 1721832,
+        "min": 1705380,
+        "max": 1791108,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 6.4,
-        "min": 5.6,
-        "max": 6.5,
+        "median": 58.0,
+        "min": 57.7,
+        "max": 61.0,
         "n": 5
       }
     },
@@ -4582,115 +4896,115 @@
         "n": 5
       }
     },
-    "coldsync-chromium-fan/autobahn/cold_sync/local": {
+    "coldsync-5k-fan/autobahn/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 4001820,
-        "min": 3961928,
-        "max": 4292352,
+        "median": 691776,
+        "min": 540684,
+        "max": 752540,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 120.9,
-        "min": 117.8,
-        "max": 128.4,
+        "median": 126.1,
+        "min": 99.0,
+        "max": 177.7,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/autobahn/cold_sync/remote": {
+    "coldsync-5k-fan/autobahn/cold_sync/remote": {
       "peak_rss_kb": {
-        "median": 4405504,
-        "min": 4393364,
-        "max": 4838448,
+        "median": 402296,
+        "min": 373208,
+        "max": 503720,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 341.3,
-        "min": 334.2,
-        "max": 351.8,
+        "median": 143.9,
+        "min": 106.2,
+        "max": 233.2,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/autobahn/idle/local": {
+    "coldsync-5k-fan/autobahn/idle/local": {
       "peak_rss_kb": {
-        "median": 1239872,
-        "min": 1232920,
-        "max": 1270892,
+        "median": 213984,
+        "min": 209880,
+        "max": 238724,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 0.7,
-        "min": 0.6,
-        "max": 0.8,
+        "median": 0.8,
+        "min": 0.7,
+        "max": 0.9,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/autobahn/idle/remote": {
+    "coldsync-5k-fan/autobahn/idle/remote": {
       "peak_rss_kb": {
-        "median": 2768892,
-        "min": 2738492,
-        "max": 2798264,
+        "median": 312904,
+        "min": 290100,
+        "max": 503720,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 46.9,
-        "min": 42.6,
-        "max": 53.3,
+        "median": 0.2,
+        "min": 0.2,
+        "max": 0.3,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/mutagen/cold_sync/local": {
+    "coldsync-5k-fan/mutagen/cold_sync/local": {
       "peak_rss_kb": {
-        "median": 19797980,
-        "min": 19353108,
-        "max": 20443680,
+        "median": 268892,
+        "min": 261564,
+        "max": 280096,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 374.4,
-        "min": 371.6,
-        "max": 431.4,
+        "median": 70.8,
+        "min": 68.6,
+        "max": 72.1,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/mutagen/cold_sync/remote": {
+    "coldsync-5k-fan/mutagen/cold_sync/remote": {
       "peak_rss_kb": {
-        "median": 11826768,
-        "min": 11552384,
-        "max": 12004252,
+        "median": 284532,
+        "min": 273312,
+        "max": 288196,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 171.5,
-        "min": 169.4,
-        "max": 177.9,
+        "median": 48.3,
+        "min": 47.6,
+        "max": 49.2,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/mutagen/idle/local": {
+    "coldsync-5k-fan/mutagen/idle/local": {
       "peak_rss_kb": {
-        "median": 15555144,
-        "min": 15246644,
-        "max": 15933488,
+        "median": 311572,
+        "min": 308768,
+        "max": 316656,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 563.6,
-        "min": 557.9,
-        "max": 651.9,
+        "median": 5.5,
+        "min": 5.5,
+        "max": 5.5,
         "n": 5
       }
     },
-    "coldsync-chromium-fan/mutagen/idle/remote": {
+    "coldsync-5k-fan/mutagen/idle/remote": {
       "peak_rss_kb": {
-        "median": 13064296,
-        "min": 12569384,
-        "max": 13137828,
+        "median": 324960,
+        "min": 321060,
+        "max": 326128,
         "n": 5
       },
       "cpu_percent_of_core": {
-        "median": 511.8,
-        "min": 504.7,
-        "max": 523.5,
+        "median": 6.4,
+        "min": 5.6,
+        "max": 6.5,
         "n": 5
       }
     },
@@ -4803,6 +5117,118 @@
         "median": 50.3,
         "min": 49.4,
         "max": 53.6,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/autobahn/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 4001820,
+        "min": 3961928,
+        "max": 4292352,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 120.9,
+        "min": 117.8,
+        "max": 128.4,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/autobahn/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 4405504,
+        "min": 4393364,
+        "max": 4838448,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 341.3,
+        "min": 334.2,
+        "max": 351.8,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 1239872,
+        "min": 1232920,
+        "max": 1270892,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.7,
+        "min": 0.6,
+        "max": 0.8,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 2768892,
+        "min": 2738492,
+        "max": 2798264,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 46.9,
+        "min": 42.6,
+        "max": 53.3,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 19797980,
+        "min": 19353108,
+        "max": 20443680,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 374.4,
+        "min": 371.6,
+        "max": 431.4,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 11826768,
+        "min": 11552384,
+        "max": 12004252,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 171.5,
+        "min": 169.4,
+        "max": 177.9,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 15555144,
+        "min": 15246644,
+        "max": 15933488,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 563.6,
+        "min": 557.9,
+        "max": 651.9,
+        "n": 5
+      }
+    },
+    "coldsync-chromium-fan/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 13064296,
+        "min": 12569384,
+        "max": 13137828,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 511.8,
+        "min": 504.7,
+        "max": 523.5,
         "n": 5
       }
     },
@@ -4946,146 +5372,6 @@
         "n": 5
       }
     },
-    "two50k-10-fan/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 888388,
-        "min": 877460,
-        "max": 910540,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 1.4,
-        "min": 1.3,
-        "max": 1.4,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 687140,
-        "min": 678316,
-        "max": 702540,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.5,
-        "min": 0.4,
-        "max": 0.6,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 858212,
-        "min": 838296,
-        "max": 892088,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 134.7,
-        "min": 133.5,
-        "max": 135.9,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 678328,
-        "min": 668208,
-        "max": 697832,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 81.9,
-        "min": 80.8,
-        "max": 88.3,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 793768,
-        "min": 712140,
-        "max": 837308,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 71.4,
-        "min": 68.0,
-        "max": 76.0,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 1543680,
-        "min": 1488792,
-        "max": 1733824,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 84.2,
-        "min": 82.6,
-        "max": 94.8,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 3318236,
-        "min": 3287256,
-        "max": 3354668,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 112.0,
-        "min": 108.6,
-        "max": 112.5,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 3027240,
-        "min": 2901116,
-        "max": 3056096,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 105.1,
-        "min": 104.1,
-        "max": 108.3,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 4946868,
-        "min": 4921820,
-        "max": 5052132,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 550.0,
-        "min": 548.9,
-        "max": 567.1,
-        "n": 5
-      }
-    },
-    "two50k-10-fan/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 3215392,
-        "min": 3200760,
-        "max": 3232192,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 386.8,
-        "min": 380.0,
-        "max": 398.5,
-        "n": 5
-      }
-    },
     "two50k-10/autobahn/idle/local": {
       "peak_rss_kb": {
         "median": 117784,
@@ -5223,6 +5509,146 @@
         "median": 48.7,
         "min": 43.8,
         "max": 52.4,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/autobahn/idle/local": {
+      "peak_rss_kb": {
+        "median": 888388,
+        "min": 877460,
+        "max": 910540,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 1.4,
+        "min": 1.3,
+        "max": 1.4,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/autobahn/idle/remote": {
+      "peak_rss_kb": {
+        "median": 687140,
+        "min": 678316,
+        "max": 702540,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 0.5,
+        "min": 0.4,
+        "max": 0.6,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/autobahn/workload/local": {
+      "peak_rss_kb": {
+        "median": 858212,
+        "min": 838296,
+        "max": 892088,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 134.7,
+        "min": 133.5,
+        "max": 135.9,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/autobahn/workload/remote": {
+      "peak_rss_kb": {
+        "median": 678328,
+        "min": 668208,
+        "max": 697832,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 81.9,
+        "min": 80.8,
+        "max": 88.3,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/cold_sync/local": {
+      "peak_rss_kb": {
+        "median": 793768,
+        "min": 712140,
+        "max": 837308,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 71.4,
+        "min": 68.0,
+        "max": 76.0,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/cold_sync/remote": {
+      "peak_rss_kb": {
+        "median": 1543680,
+        "min": 1488792,
+        "max": 1733824,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 84.2,
+        "min": 82.6,
+        "max": 94.8,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/idle/local": {
+      "peak_rss_kb": {
+        "median": 3318236,
+        "min": 3287256,
+        "max": 3354668,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 112.0,
+        "min": 108.6,
+        "max": 112.5,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/idle/remote": {
+      "peak_rss_kb": {
+        "median": 3027240,
+        "min": 2901116,
+        "max": 3056096,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 105.1,
+        "min": 104.1,
+        "max": 108.3,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/workload/local": {
+      "peak_rss_kb": {
+        "median": 4946868,
+        "min": 4921820,
+        "max": 5052132,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 550.0,
+        "min": 548.9,
+        "max": 567.1,
+        "n": 5
+      }
+    },
+    "two50k-10-fan/mutagen/workload/remote": {
+      "peak_rss_kb": {
+        "median": 3215392,
+        "min": 3200760,
+        "max": 3232192,
+        "n": 5
+      },
+      "cpu_percent_of_core": {
+        "median": 386.8,
+        "min": 380.0,
+        "max": 398.5,
         "n": 5
       }
     },
@@ -5365,426 +5791,6 @@
         "max": 94.5,
         "n": 5
       }
-    },
-    "chromium-10-fan-patch/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 3109864,
-        "min": 3088904,
-        "max": 3115660,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.8,
-        "min": 0.7,
-        "max": 0.8,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 1969928,
-        "min": 1905248,
-        "max": 2003244,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.3,
-        "min": 0.2,
-        "max": 10.8,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 2135972,
-        "min": 2130944,
-        "max": 3091900,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 178.0,
-        "min": 171.7,
-        "max": 185.5,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 1911568,
-        "min": 1839400,
-        "max": 1940336,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 222.2,
-        "min": 203.4,
-        "max": 231.9,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 1157140,
-        "min": 1082352,
-        "max": 1366536,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 64.3,
-        "min": 60.3,
-        "max": 72.3,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 5280920,
-        "min": 4521456,
-        "max": 5749108,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 372.2,
-        "min": 344.8,
-        "max": 397.0,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 15456832,
-        "min": 15187340,
-        "max": 15681388,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 565.0,
-        "min": 563.3,
-        "max": 618.4,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 12727176,
-        "min": 12498092,
-        "max": 13229568,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 521.2,
-        "min": 511.7,
-        "max": 567.9,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 22980552,
-        "min": 21823604,
-        "max": 23621636,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 1289.0,
-        "min": 1181.1,
-        "max": 1337.6,
-        "n": 5
-      }
-    },
-    "chromium-10-fan-patch/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 13156396,
-        "min": 13100792,
-        "max": 13514072,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 1091.4,
-        "min": 1082.9,
-        "max": 1125.0,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 395924,
-        "min": 394796,
-        "max": 397160,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.1,
-        "min": 0.1,
-        "max": 0.1,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 172940,
-        "min": 171704,
-        "max": 173312,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 359484,
-        "min": 338948,
-        "max": 440060,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 16.9,
-        "min": 16.5,
-        "max": 17.1,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 172952,
-        "min": 142656,
-        "max": 173312,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 5.5,
-        "min": 5.3,
-        "max": 5.7,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 27660,
-        "min": 26984,
-        "max": 29776,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 10.3,
-        "min": 7.3,
-        "max": 35.4,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 10728,
-        "min": 0,
-        "max": 10984,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.3,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 1836528,
-        "min": 1769612,
-        "max": 1853372,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 49.2,
-        "min": 47.7,
-        "max": 50.2,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 1316008,
-        "min": 1303252,
-        "max": 1357832,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 49.3,
-        "min": 48.0,
-        "max": 52.2,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 2128260,
-        "min": 2098252,
-        "max": 2186996,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 158.3,
-        "min": 152.4,
-        "max": 160.8,
-        "n": 5
-      }
-    },
-    "chromium-1-patch/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 1400744,
-        "min": 1359600,
-        "max": 1428908,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 119.8,
-        "min": 111.6,
-        "max": 122.4,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/autobahn/idle/local": {
-      "peak_rss_kb": {
-        "median": 396624,
-        "min": 396264,
-        "max": 397008,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.1,
-        "min": 0.1,
-        "max": 0.1,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/autobahn/idle/remote": {
-      "peak_rss_kb": {
-        "median": 174956,
-        "min": 174040,
-        "max": 176440,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/autobahn/workload/local": {
-      "peak_rss_kb": {
-        "median": 376076,
-        "min": 369052,
-        "max": 397232,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 50.6,
-        "min": 47.3,
-        "max": 51.0,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/autobahn/workload/remote": {
-      "peak_rss_kb": {
-        "median": 157072,
-        "min": 151552,
-        "max": 158132,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 19.5,
-        "min": 17.9,
-        "max": 22.7,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/cold_sync/local": {
-      "peak_rss_kb": {
-        "median": 27164,
-        "min": 26508,
-        "max": 29212,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 10.0,
-        "min": 8.0,
-        "max": 27.9,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/cold_sync/remote": {
-      "peak_rss_kb": {
-        "median": 0,
-        "min": 0,
-        "max": 0,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 0.0,
-        "min": 0.0,
-        "max": 0.0,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/idle/local": {
-      "peak_rss_kb": {
-        "median": 1693752,
-        "min": 1613740,
-        "max": 1788980,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 49.1,
-        "min": 47.7,
-        "max": 50.8,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/idle/remote": {
-      "peak_rss_kb": {
-        "median": 1271512,
-        "min": 1249004,
-        "max": 1320856,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 49.5,
-        "min": 47.9,
-        "max": 50.1,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/workload/local": {
-      "peak_rss_kb": {
-        "median": 2161668,
-        "min": 2068816,
-        "max": 2211288,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 110.6,
-        "min": 101.5,
-        "max": 117.0,
-        "n": 5
-      }
-    },
-    "chromium-10-patch/mutagen/workload/remote": {
-      "peak_rss_kb": {
-        "median": 1461936,
-        "min": 1410120,
-        "max": 1483236,
-        "n": 5
-      },
-      "cpu_percent_of_core": {
-        "median": 123.6,
-        "min": 120.0,
-        "max": 125.2,
-        "n": 5
-      }
     }
   },
   "inconsistent_resource_series": [],
@@ -5862,19 +5868,6 @@
       "direction": "chromium:b-to-a",
       "repeat": 4,
       "job": "chromium-100-bidir-r4",
-      "censored": 0,
-      "error": null,
-      "background_write_errors": 0,
-      "background_panics": 0,
-      "skipped_ticks": 1
-    },
-    {
-      "measurement": "workload",
-      "cell": "50k-10-patch",
-      "tool": "mutagen",
-      "direction": "sub50k:a-to-b",
-      "repeat": 0,
-      "job": "50k-10-patch-r0",
       "censored": 0,
       "error": null,
       "background_write_errors": 0,
@@ -5961,58 +5954,6 @@
     },
     {
       "measurement": "workload",
-      "cell": "chromium-1-patch",
-      "tool": "mutagen",
-      "direction": "chromium:a-to-b",
-      "repeat": 4,
-      "job": "chromium-1-patch-r4",
-      "censored": 0,
-      "error": null,
-      "background_write_errors": 0,
-      "background_panics": 0,
-      "skipped_ticks": 201
-    },
-    {
-      "measurement": "workload",
-      "cell": "chromium-1-patch",
-      "tool": "mutagen",
-      "direction": "chromium:a-to-b",
-      "repeat": 2,
-      "job": "chromium-1-patch-r2",
-      "censored": 0,
-      "error": null,
-      "background_write_errors": 0,
-      "background_panics": 0,
-      "skipped_ticks": 203
-    },
-    {
-      "measurement": "workload",
-      "cell": "chromium-1-patch",
-      "tool": "mutagen",
-      "direction": "chromium:a-to-b",
-      "repeat": 3,
-      "job": "chromium-1-patch-r3",
-      "censored": 0,
-      "error": null,
-      "background_write_errors": 0,
-      "background_panics": 0,
-      "skipped_ticks": 199
-    },
-    {
-      "measurement": "workload",
-      "cell": "chromium-1-patch",
-      "tool": "mutagen",
-      "direction": "chromium:a-to-b",
-      "repeat": 0,
-      "job": "chromium-1-patch-r0",
-      "censored": 0,
-      "error": null,
-      "background_write_errors": 0,
-      "background_panics": 0,
-      "skipped_ticks": 188
-    },
-    {
-      "measurement": "workload",
       "cell": "chromium-10-patch",
       "tool": "mutagen",
       "direction": "chromium:a-to-b",
@@ -6052,6 +5993,32 @@
     },
     {
       "measurement": "workload",
+      "cell": "chromium-1-patch",
+      "tool": "mutagen",
+      "direction": "chromium:a-to-b",
+      "repeat": 4,
+      "job": "chromium-1-patch-r4",
+      "censored": 0,
+      "error": null,
+      "background_write_errors": 0,
+      "background_panics": 0,
+      "skipped_ticks": 201
+    },
+    {
+      "measurement": "workload",
+      "cell": "chromium-1-patch",
+      "tool": "mutagen",
+      "direction": "chromium:a-to-b",
+      "repeat": 2,
+      "job": "chromium-1-patch-r2",
+      "censored": 0,
+      "error": null,
+      "background_write_errors": 0,
+      "background_panics": 0,
+      "skipped_ticks": 203
+    },
+    {
+      "measurement": "workload",
       "cell": "chromium-10-patch",
       "tool": "mutagen",
       "direction": "chromium:a-to-b",
@@ -6065,6 +6032,32 @@
     },
     {
       "measurement": "workload",
+      "cell": "chromium-1-patch",
+      "tool": "mutagen",
+      "direction": "chromium:a-to-b",
+      "repeat": 3,
+      "job": "chromium-1-patch-r3",
+      "censored": 0,
+      "error": null,
+      "background_write_errors": 0,
+      "background_panics": 0,
+      "skipped_ticks": 199
+    },
+    {
+      "measurement": "workload",
+      "cell": "chromium-1-patch",
+      "tool": "mutagen",
+      "direction": "chromium:a-to-b",
+      "repeat": 0,
+      "job": "chromium-1-patch-r0",
+      "censored": 0,
+      "error": null,
+      "background_write_errors": 0,
+      "background_panics": 0,
+      "skipped_ticks": 188
+    },
+    {
+      "measurement": "workload",
       "cell": "chromium-10-patch",
       "tool": "mutagen",
       "direction": "chromium:a-to-b",
@@ -6075,6 +6068,19 @@
       "background_write_errors": 0,
       "background_panics": 0,
       "skipped_ticks": 188
+    },
+    {
+      "measurement": "workload",
+      "cell": "50k-10-patch",
+      "tool": "mutagen",
+      "direction": "sub50k:a-to-b",
+      "repeat": 3,
+      "job": "50k-10-patch-r3",
+      "censored": 0,
+      "error": null,
+      "background_write_errors": 0,
+      "background_panics": 0,
+      "skipped_ticks": 1
     }
   ]
 }

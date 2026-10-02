@@ -227,10 +227,9 @@ Within-job comparisons are stronger than separate runs. For a code change, stage
 | `aggregate.py` | Percentiles, run spread, phase resources, exclusions, missing jobs, and problems |
 | `toysync.py` | Known copy-loop subject |
 | `smoke.sh` | Local end-to-end harness test |
-| `report/` | Historical 0.3.0 HTML report |
 | `../docs/benchmarks.md`, `../docs/benchmark-matrix.md` | Current summary and tables |
-| `../benchmarks/2026-10-01.json` | Portable aggregate and provenance |
-| `results-*/` | Raw JSONL, plan, and driver logs |
+| `../benchmarks/2026-10-02.json` | The one complete set: aggregate and provenance |
+| `results-*/` | Raw JSONL, plan, and driver logs; not committed |
 
 The compiled harness gives both hosts identical instruments and shared walk rules. Editor threads and 500 µs polling remain in one small native program.
 
@@ -245,7 +244,7 @@ bench/ab.sh target/release/autobahn-before target/release/autobahn-after --legs 
 
 It interleaves legs over a generated 40,000-file corpus from `bench/corpus.py`. Each leg includes cold sync and an editor workload.
 
-Reports compare p50, p90, and p99 against variation between legs. Decision-supporting raw reports live in `bench/ab-reports/`.
+Reports compare p50, p90, and p99 against variation between legs.
 
 `--corpus DIR` uses a supplied corpus as read-only input. Each leg edits a copy inside the script’s work directory. Deletion outside that directory is refused.
 

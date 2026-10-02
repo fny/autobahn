@@ -235,10 +235,9 @@ The general lesson is the one both share: a measurement that silently degrades t
 | `aggregate.py` | JSONL to tables: pooled percentiles with censoring, per-run spread, windowed resources, delivered-vs-planned, taint rules, problems. |
 | `toysync.py` | A deliberately dumb local subject (a copy loop) with known behavior, for the smoke test. |
 | `smoke.sh` | Local end-to-end test of the harness itself. Run after any change. |
-| `report/` | The historical HTML report for the 0.3.0 comparison. |
 | `../docs/benchmarks.md`, `../docs/benchmark-matrix.md` | The current published summary and tables. |
-| `../benchmarks/2026-10-01.json` | Portable aggregate and provenance for the September–October 2026 matrix. |
-| `results-*/` | Raw JSONL per run, plus the plan and per-pair driver logs. |
+| `../benchmarks/2026-10-02.json` | The one complete benchmark set: aggregate and provenance. |
+| `results-*/` | Raw JSONL per run, plus the plan and per-pair driver logs. Kept out of the repository. |
 
 ## The local gate: `bench/ab.sh`
 
@@ -249,7 +248,7 @@ The matrix above is the benchmark of record and needs a pair of EC2 hosts. The g
 bench/ab.sh target/release/autobahn-before target/release/autobahn-after --legs 5
 ```
 
-It runs the two binaries in interleaved legs over a generated 40,000-file corpus (`bench/corpus.py`), each leg a cold sync and then a window of simulated editing agents, and reports p50/p90/p99 side by side with a verdict against the run-to-run spread. Interleaving is what makes it honest on a shared machine. The raw reports of every gate run that shaped a decision are in `bench/ab-reports/`.
+It runs the two binaries in interleaved legs over a generated 40,000-file corpus (`bench/corpus.py`), each leg a cold sync and then a window of simulated editing agents, and reports p50/p90/p99 side by side with a verdict against the run-to-run spread. Interleaving is what makes it honest on a shared machine.
 
 `--corpus DIR` runs the legs over DIR instead of the generated corpus. DIR is only ever read: each leg copies it into a working corpus under the script's own work directory, and that working copy is the one the agents edit and the next leg deletes. The script refuses to delete anything outside its work directory. That work directory is made fresh and private for each run (`mktemp -d`) and removed when the run ends; the generated corpus is cached between runs in `$AB_CACHE` (default `~/.cache/autobahn-ab`), which must belong to you, and each run's reports and logs are kept in a private directory the script names at the end.
 

@@ -118,24 +118,6 @@ class ColdSyncExclusion(unittest.TestCase):
         self.assertEqual(row["digest_verified"]["n"], 1)
         self.assertEqual([e["job"] for e in row["excluded"]], ["wide-r1"])
 
-    def test_the_six_contaminated_jobs_of_bench_1789947877_leave_cold_sync(self):
-        directory = os.path.join(HERE, "results-bench-1789947877")
-        if not os.path.isdir(directory):
-            self.skipTest("results-bench-1789947877 is not in this checkout")
-        out = io.StringIO()
-        saved, sys.argv = sys.argv, ["aggregate.py", directory]
-        try:
-            with contextlib.redirect_stdout(out):
-                aggregate.main()
-        finally:
-            sys.argv = saved
-        report = json.loads(out.getvalue())
-        excluded = {e["job"] for row in report["cold_sync_s"].values() for e in row["excluded"]
-                    if e["reason"].startswith("destination_width_mismatch")}
-        self.assertEqual(excluded, {"chromium-1-patch-r2", "chromium-10-r2",
-                                    "chromium-10-bidir-r1", "chromium-1-bidir-r2",
-                                    "chromium-1-bidir-r4", "50k-10-r0"})
-
 
 class RemoteCpu(unittest.TestCase):
     # Two destinations, each burning a steady half core (50 jiffies a

@@ -462,6 +462,8 @@ pub fn shoot(
     run_with(config, state_root, Some((directory, pane)))
 }
 
+/// A menu bar alone is useful only if its item appeared. Decide that
+/// before opening the window, so a failed bar still leaves a way in.
 fn run_with(
     config: Option<PathBuf>,
     state_root: PathBuf,
@@ -485,30 +487,30 @@ fn run_with(
             true => crate::dock::Presence::Both,
             false => crate::dock::read(&state_root),
         };
-        crate::dock::in_the_dock(presence.opens_a_window());
-        let window = open_window(
-            config.clone(),
-            state_root.clone(),
-            wanted,
-            presence.opens_a_window(),
-            cx,
-        );
-        if shots.is_none() && presence.takes_the_menu_bar() {
+        let wants_bar = shots.is_none() && presence.takes_the_menu_bar();
+        let bar = if wants_bar {
             // The same item in the menu bar the other window puts
             // there, from the same code: one poll, one notifier, and
             // "Open the window" when this one has been closed.
-            match crate::menubar::Bar::start(config.clone(), state_root.clone(), || {}) {
-                Ok(mut bar) => {
-                    bar.window = true;
-                    bar.appear();
-                    cx.set_global(Menubar(bar));
-                    watch_the_bar(config.clone(), state_root.clone(), cx);
+            match start_the_bar(config.clone(), state_root.clone()) {
+                Ok(bar) => Some(bar),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
+                    );
+                    None
                 }
-                Err(error) => eprintln!(
-                    "{}",
-                    fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
-                ),
             }
+        } else {
+            None
+        };
+        let shown = presence.opens_a_window() || (wants_bar && bar.is_none());
+        crate::dock::in_the_dock(shown);
+        let window = open_window(config.clone(), state_root.clone(), wanted, shown, cx);
+        if let Some(bar) = bar {
+            cx.set_global(Menubar(bar));
+            watch_the_bar(config.clone(), state_root.clone(), cx);
         }
         let Some((directory, pane)) = shots.clone() else { return };
         cx.spawn(async move |cx| {
@@ -538,25 +540,18 @@ fn run_with(
     Ok(())
 }
 
-/// Starts the menu bar's item for this process, or says why there is
-/// none.
-///
-/// The menu bar's platform code is not the window's: it reaches for
-/// toolkits and daemons the window never asked for, and a refusal
-/// from any of them is a reason to run without the item, not a reason
-/// for the window not to open. `Bar::start` reports most of that as an
-/// `Err`, but a panic in code neither of us owns — the menu bar's
-/// Linux backends, before GTK had been started (#12) — is not caught
-/// by a `match`, so the whole attempt is fenced here and read back as
-/// the same message. The panic still says its piece on the way past;
-/// this only keeps it from being the last thing the process says.
+/// The window can run without the menu bar, even when a backend panics
+/// instead of returning an error. Keep the whole attempt inside the
+/// fence: `appear` reaches the native toolkit after `start` has returned.
+/// Nothing from a failed attempt is kept for the window to poll, and
+/// the usual panic hook still reports where it failed.
 fn start_the_bar(config: Option<PathBuf>, state_root: PathBuf) -> Result<crate::menubar::Bar> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    std::panic::catch_unwind(|| {
         let mut bar = crate::menubar::Bar::start(config, state_root, || {})?;
         bar.window = true;
-        bar.appear();
+        bar.appear()?;
         Ok(bar)
-    }))
+    })
     .unwrap_or_else(|panic| Err(anyhow::anyhow!(said_by_a_panic(panic))))
 }
 
@@ -569,7 +564,7 @@ fn said_by_a_panic(panic: Box<dyn std::any::Any + Send>) -> String {
         Some(said) => (*said).to_owned(),
         None => match panic.downcast_ref::<String>() {
             Some(said) => said.clone(),
-            None => "the menu bar panicked".to_owned(),
+            None => t("status.menu_bar_panicked").to_owned(),
         },
     }
 }

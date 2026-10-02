@@ -237,33 +237,34 @@ impl Bar {
 
     /// Puts the item in the menu bar, once, and fills it in. macOS
     /// wants this after the application is running, which is why it is
-    /// not part of starting.
-    pub(crate) fn appear(&mut self) {
+    /// not part of starting. A refusal goes back to the surface: the
+    /// dash can still offer its window when there is no item to open it.
+    pub(crate) fn appear(&mut self) -> Result<()> {
         if self.tray.is_some() {
-            return;
+            return Ok(());
         }
-        // GTK first, on Linux: the backends under the item cannot so
-        // much as make a menu before it, and neither surface starts it
-        // on the way up. A machine that cannot start it — no display, a
-        // bare ssh session — is told so and goes without the item
-        // rather than not running at all.
-        if let Err(error) = start_gtk() {
-            eprintln!("unable to put an item in the menu bar: {error}");
-            return;
-        }
+        // Neither GPUI nor winit starts GTK, but muda needs it before
+        // building the item's menu (#12). Both surfaces call here on
+        // their main thread. GTK remembers a successful start on that
+        // thread; without a display it returns an error instead.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        gtk::init()?;
+
         let menu = Menu::new();
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon(Health::Idle, menu_bar_ink(None)))
             .with_tooltip("autobahn")
-            .build();
-        match tray {
-            Ok(tray) => {
-                self.tray = Some(tray);
-                self.refresh();
-            }
-            Err(error) => eprintln!("unable to put an item in the menu bar: {error}"),
-        }
+            .build()?;
+        self.tray = Some(tray);
+        self.refresh();
+        Ok(())
     }
 
     /// What a menu choice does. `true` when it was Quit, which the
@@ -303,8 +304,12 @@ impl Bar {
     }
 
     /// Rebuilds the report, the menu, and the icon; raises notifications
-    /// for transitions.
+    /// for transitions. The tray's timer still ticks after a refused
+    /// start, but there is then no item to refresh.
     pub(crate) fn refresh(&mut self) {
+        if self.tray.is_none() {
+            return;
+        }
         let report = match self.build_report() {
             Ok(report) => report,
             Err(error) => {
@@ -1253,47 +1258,6 @@ pub(crate) fn menu_bar_ink(_tray: Option<&TrayIcon>) -> Ink {
     (142, 142, 147)
 }
 
-/// Starts GTK, which the menu bar's backends on this platform are
-/// written against.
-///
-/// GTK will not so much as make a menu before it has been started, and
-/// neither surface starts it on the way up — the dash draws with GPUI
-/// and the tray with winit — so the first either hears of it is the
-/// item being put in the bar, which used to be a panic that took the
-/// process down before any window opened (#12). Started here instead:
-/// once, because asking twice is an error to GTK; on the thread that
-/// asks, because GTK answers for the thread it was started on and no
-/// other; and the outcome is kept, because a machine that cannot start
-/// it — no display, a bare ssh session — would otherwise be asked
-/// again on every refresh, and the answer does not change.
-#[cfg(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-))]
-fn start_gtk() -> std::result::Result<(), String> {
-    static STARTED: std::sync::OnceLock<std::result::Result<(), String>> =
-        std::sync::OnceLock::new();
-    STARTED
-        .get_or_init(|| gtk::init().map_err(|error| error.to_string()))
-        .clone()
-}
-
-/// Nothing to start elsewhere: macOS and Windows have backends of their
-/// own, which come up with the item.
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "dragonfly",
-    target_os = "freebsd",
-    target_os = "netbsd",
-    target_os = "openbsd"
-)))]
-fn start_gtk() -> std::result::Result<(), String> {
-    Ok(())
-}
-
 /// The Autobahn sign — two lanes to the horizon under a bridge — in the
 /// menu bar's ink, with the health in a dot at the corner, drawn in code
 /// so there is no asset to ship or lose.
@@ -1521,22 +1485,67 @@ mod menu_tests {
 mod bar_tests {
     use super::*;
 
-    /// The menu bar's Linux backends are GTK, and GTK will not so much
-    /// as make a menu before it has been started. The dash draws with
-    /// GPUI and the tray with winit, and neither starts GTK on the way
-    /// up, so nothing has started it by the time the item is put in the
-    /// bar — and the tray backend reaches for a `gtk::Menu` anyway,
-    /// which is a panic that takes the process down before any window
-    /// opens (#12). Appearing has to be survivable: an item in the bar
-    /// when the machine allows one, and none, said on stderr, when it
-    /// does not.
+    /// Appearing must start GTK or return a refusal, never panic (#12).
+    /// Each attempt gets a fresh process: GTK belongs to one thread for
+    /// life, and a previous test's start must not hide this one's bug.
+    /// Exercise a missing display even when the test runner has one.
     #[test]
     fn appearing_starts_gtk_or_does_without_an_item() {
+        const CHILD: &str = "AUTOBAHN_TEST_BAR_DISPLAY";
+        if std::env::var_os(CHILD).is_none() {
+            for display in ["inherited", "headless"] {
+                let mut command = std::process::Command::new(
+                    std::env::current_exe().expect("the test binary"),
+                );
+                command
+                    .args([
+                        "--exact",
+                        "menubar::bar_tests::appearing_starts_gtk_or_does_without_an_item",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, display);
+                if display == "headless" {
+                    command
+                        .env_remove("DISPLAY")
+                        .env_remove("WAYLAND_DISPLAY")
+                        .env("GDK_BACKEND", "x11");
+                }
+                let output = command.output().expect("a fresh process for GTK");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{display}: {stdout}\n{stderr}");
+                assert!(stdout.contains("1 passed"), "the test did not run: {stdout}");
+            }
+            return;
+        }
+
+        assert!(!gtk::is_initialized(), "this process must start without GTK");
         let own = tempfile::tempdir().expect("a temporary state root");
-        let mut bar = Bar::start(None, own.path().to_owned(), || {}).expect("a bar");
-        bar.appear();
-        // The item went in, or the attempt was refused and said so on
-        // stderr; what it may not do is take the process with it.
+        let mut bar = Bar::start(
+            Some(own.path().join("config.toml")),
+            own.path().to_owned(),
+            || {},
+        )
+        .expect("a bar");
+        let appeared = bar.appear();
+        if std::env::var(CHILD).as_deref() == Ok("headless") {
+            assert!(appeared.is_err(), "a missing display must be reported");
+        }
+        match appeared {
+            Ok(()) => {
+                assert!(gtk::is_initialized_main_thread());
+                assert!(bar.tray.is_some(), "success means an item appeared");
+                bar.appear().expect("an existing item needs no second start");
+            }
+            Err(error) => {
+                assert!(!error.to_string().is_empty(), "a refusal must say why");
+                assert!(bar.tray.is_none());
+                // The standalone tray keeps its timer after a refusal.
+                bar.refresh();
+                bar.finished();
+                assert!(bar.model.is_none(), "no menu is built without an item");
+            }
+        }
     }
 }
 

@@ -52,13 +52,8 @@ objc2-user-notifications = { version = "0.3", optional = true, default-features 
 block2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSBundle", "NSString", "NSError", "NSDictionary"] }
 
-# The menu bar's Linux backends — muda and tray-icon — are GTK, and
-# GTK refuses to so much as make a menu before it has been started,
-# which nothing else in this process does: the dash draws with GPUI
-# and the tray with winit, so the menu bar has to start it itself.
-# Already in the tree through muda, so this names it rather than
-# adding it, and it matches the targets muda's own GTK backend builds
-# for.
+# Neither GPUI nor winit starts GTK for the menu bar. Name the version
+# muda already uses, on the same targets, so the bar can start it itself.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
 gtk = { version = "0.18", optional = true }
 

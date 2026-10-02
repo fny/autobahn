@@ -97,10 +97,17 @@ impl winit::application::ApplicationHandler<Wake> for Bar {
         }
     }
 
+    /// A refused item leaves a reason on stderr, while the
+    /// event loop stays alive just as it does for other tray failures.
     fn resumed(&mut self, _: &winit::event_loop::ActiveEventLoop) {
         // The item goes in the bar once the loop runs, which is a macOS
         // requirement, and only once.
-        self.appear();
+        if let Err(error) = self.appear() {
+            eprintln!(
+                "{}",
+                crate::words::fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
+            );
+        }
     }
 
     fn window_event(

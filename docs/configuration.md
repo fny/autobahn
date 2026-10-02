@@ -11,7 +11,7 @@ Each **group** fans one source root (the *alpha*) out to any number of destinati
 ```toml
 # ~/.autobahn/config.toml
 
-on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
+on_alert = "~/.autobahn/on-alert.sh"
 
 [defaults]                  # inherited by every group; any key can be
 mode = "two-way-conflict"       # overridden per group
@@ -30,129 +30,88 @@ ignores = ["target"]        # appended to the defaults' ignores
 
 [groups.dotfiles]
 alpha = "~/.config/shell"
-mode = "one-way-alpha"
 betas = ["build.example.com"]
+mode = "one-way-alpha"
 ```
 
-Remote endpoints use the scp-style `[user@]host:path` syntax, key-based SSH auth, and *either* side of a group may be remote — you can pull from a build server, or relay between two remote hosts through your machine. An endpoint spec is treated as remote unless it visibly looks like a local path (starts with `.`, `/`, or `~`, or has a `/` before any `:`).
+### Endpoint Syntax
 
-Sessions are independent: a host being down means its session retries with backoff and heals the moment the host answers — the others never notice. Sessions targeting the same host share one SSH connection. The keepalives below catch a dead network; an agent that is alive but has stopped answering is caught too. It reports every few seconds on work in progress, and a request that goes 60 seconds with neither an answer nor any progress fails the connection, naming the request. Its sessions then reconnect as they would after a dropped connection. Slow work, such as scanning a huge tree or hashing a huge file, keeps reporting and is never cut off.
+Autobahn uses SSH key-based authentication, s you need to have your target machines in your `~/.ssh/config`.
 
-Your `ssh_config` applies to these connections, except for a few options autobahn always sets, which win over it: `-T` (no terminal on the protocol stream), `ForwardAgent=no`, `ForwardX11=no`, `ClearAllForwardings=yes`, `PermitLocalCommand=no`, `ConnectTimeout=20`, `BatchMode=yes`, `ServerAliveInterval=15`, `ServerAliveCountMax=4` and `Compression=no`. The connections stay open for days, so forwarding your agent or a port for their lifetime is not something to inherit by accident. Host-key checking is left to your configuration: with `BatchMode`, an unknown host is refused. `AUTOBAHN_SSH` replaces the `ssh` program itself.
+- **Local Endpoints:** Paths beginning with `/`, `~`, or `./`.
+- **Remote Endpoints:** Standard SSH syntax (`[user@]host[:path]`). If `:path` is omitted, the endpoint defaults to the same path as `alpha` evaluated within the remote user's home directory.
+- **SSH Transport:** Autobahn runs persistent SSH connections enforcing secure defaults (`ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no`, `PermitLocalCommand=no`, `Compression=no`, `ServerAliveInterval=15`). Custom SSH binaries can be configured using `AUTOBAHN_SSH`.
 
-## Top level
+## Top-Level Settings
 
-The top-level keys and experimental settings are listed below. Unknown keys are refused at startup, not ignored — here and in every section.
+Top-level keys must precede section headers in the TOML document. Unknown keys are rejected on load.
 
-| Key | Type | Default | What it is |
-|---|---|---|---|
-| `on_alert` | string | — | Shell command run when a session needs a person. The only hook. `autobahn init` writes an experimental example at `~/.autobahn/on-alert.sh` to point it at. See [Alerts](./alerts.md). |
-| `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. `autobahn disable --host <host>` edits it for you. |
-| `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
-| `power_saver_experimental` | bool | `false` | On battery, walk each local root in full every 10 minutes instead of every 2. That walk is the backstop for changes the watcher never reported, and on a laptop it is almost all of autobahn's idle cost; the price is that such a change can take up to 10 minutes to be found. The power source is read at most once a minute, and the log says when it changes. A remote beta's agent is unaffected. Experimental: the name will change. |
-| `live_reload` | bool | `true` | Whether the supervisor reloads this file on a change without a restart. See [Editing it while it runs](#editing-it-while-it-runs). |
-| `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
-| `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
-| `[experimental.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
-| `[experimental.peering-dangerously-experimental]` | table | — | Peering timing, `ttl` and `failover_after`, correct as shipped; and `manage_keys`, off unless set, for the alpha to set up the betas' keys to one another, each restricted to autobahn. See [Peering](./peering.md#restricted-keys). |
-| `experimental.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
+| Key | Type | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `on_alert` | string | `""` | Shell command executed when an alert condition persists. See [Alerts](alerts.md). |
+| `disabled_hosts` | list of strings | `[]` | Excludes listed hosts across all groups. Disabling an alpha host suspends its entire group. |
+| `log_level` | string | `"normal"` | Supervisor logging verbosity: `"quiet"`, `"normal"`, or `"debug"`. |
+| `power_saver_experimental` | boolean | `false` | When running on battery power, extends the full-walk audit interval from 2 minutes to 10 minutes. |
+| `live_reload` | boolean | `true` | Automatically detects edits to `config.toml` and reconfigures active workers without restarting the process. |
+| `experimental.allow_root` | boolean | `false` | Allows the supervisor to run under UID 0 (`root`). Requires matching home directory ownership. |
+| `[defaults]` | table | — | Shared configuration inherited by all groups. |
+| `[groups.<name>]` | table | — | Definition of a named synchronization group. |
+| `[experimental.alerts]` | table | — | Tuning parameters for alert confirmation thresholds. |
+| `[experimental.p2p-dangerously-experimental]` | table | — | Timing parameters (`ttl`, `failover_after`) for failover clusters. |
+
+## Session and Group Settings
+
+Settings defined in `[defaults]` are inherited by all groups. Group-level definitions take precedence over defaults, except `ignores`, which appends group rules to defaults.
+
+| Setting | Scope | Default | Description |
+| :--- | :---: | :---: | :--- |
+| `alpha` | Group | *(Required)* | Source root path (local path or `[user@]host:path`). |
+| `betas` | Group | `[]` | List of destination endpoints. |
+| `mode` | Both | *(Required)* | Synchronization policy. See [Sync Modes](modes.md). |
+| `ignores` | Both | `[]` | Gitignore-compatible exclusion patterns. |
+| `interval` | Both | `5` | Fallback polling interval in seconds between idle synchronization checks. Minimum: 1. |
+| `disabled` | Group | `false` | Suspends synchronization for this group while retaining session baselines. |
+| `symlink_mode` | Both | `"raw"` | Symbolic link handling: `"raw"` (verbatim), `"portable"` (enforces intra-root relative targets), or `"ignore"`. |
+| `file_mode` / `directory_mode` | Both | `"600"` / `"700"` | Octal permission strings applied to newly created files and directories. |
+| `max_file_size` | Both | unlimited | Skips files exceeding this size threshold (e.g., `"100MB"`, `"2GiB"`) without deleting them. |
+| `max_entry_count` | Both | unlimited | Halts the cycle if an endpoint scan exceeds this total file count. |
+| `ignore_mounts` | Both | `false` | If `true`, ignores mounted subdirectories (e.g., NFS, external drives, `tmpfs`). If `false`, disappearing mounts trigger safety halts. |
+| `guard_dir_deletes_over` | Both | unset | Converts mass directory deletions (above the threshold count) into conflicts requiring review. |
+| `staging` | Both | `"state"` | In-flight staging directory location: `"state"` (`~/.autobahn/staging`), `"beside-root"` (guarantees same-filesystem atomic renames), or `"inside-root"`. |
+| `default_owner` / `default_group` | Both | — | Explicit user/group ownership for created entries (requires root/elevated permissions). |
+| `durability` | Both | `"process"` | Persistence level: `"process"` (survives application crashes) or `"power"` (syncs intent to disk, surviving power failure). |
+| `acknowledge_secrets` | Group | `false` | Suppresses warnings when synchronizing directories containing sensitive tokens (`.ssh`, `.aws`, `.kube`). |
 
 
-Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log`, `power_saver_experimental` and `live_reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
-## Session settings
+## Validation & Refusal Rules
 
-Session settings live in both `[defaults]` and any group, with the group winning. The table marks settings that exist only on a group; `ignores` combines the two lists instead of replacing the defaults.
+Configurations are validated prior to execution. The supervisor halts or rejects changes under the following conditions:
 
-| Key | Where | Default | What it does |
-|---|---|---|---|
-| `alpha` | group | required | The source root: a local path, or `[user@]host:path`. |
-| `betas` | group | `[]` | Destinations: local paths and/or remote specs. A remote beta with no path inherits the alpha's path. |
-| `disabled` | group | `false` | Turns the group off: no sessions, and its settings are not checked. State is kept, so turning it back on resumes. `autobahn disable --group <name>` sets it. Not to be confused with the top-level `disabled_hosts`. |
-| `mode` | both | required | Synchronization mode. See [Modes](./modes.md). No default — direction is never guessed. |
-| `ignores` | both | `[]` | Gitignore-style patterns. Defaults' patterns apply first, then the group's. See [Ignores](./ignores.md). |
-| `interval` | both | `5` | Seconds between heartbeat cycles. Watching makes this a fallback, not the reaction time. Floored at 1. |
-| `symlink_mode` | both | `"raw"` | `raw` (sync verbatim), `portable` (validate portability), or `ignore`. |
-| `file_mode` / `directory_mode` | both | `600` / `700` | Octal permissions for created files and directories, written as strings: `file_mode = "600"`, `directory_mode = "700"`. |
-| `max_file_size` | both | unlimited | Files larger than this (`"100MB"`, `"2GiB"`) stay on disk but are left out of syncing — never mistaken for deletions. |
-| `max_entry_count` | both | unlimited | If a scan finds more entries than this, the cycle fails — a guard against pointing a session at the wrong directory. |
-| `ignore_mounts` | both | `false` | By default a mount inside a root is walked as part of the tree, and a mount point that is now empty where the ancestor held content halts the session rather than deleting. `true` leaves any mounted directory alone — another disk, a network share, a `tmpfs` — as `rsync -x` and `du -x` do: it is left out on *both* sides, so a real directory at the same path on the other side is neither filled from the mount nor emptied to match it, and when the mount goes away its empty mount point stays left out, so nothing moves. |
-| `guard_directory_deletes_over` | both | unset | Protects directories with at least this many ancestor entries, counted recursively. Emptying one side becomes a directory conflict in every mode; in two-way modes, a missing directory is restored from an unchanged peer. This replaces the removed `two-way-paranoid` mode. Unset, this additional guard is off; root and recorded-mount safeguards still apply. See [Large directories](./modes.md#3-large-directory-protection-guard_directory_deletes_over). |
-| `staging` | both | `"state"` | Where in-flight content lives: `state`, `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
-| `default_owner` / `default_group` | both | — | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights, which in practice means an agent running as root — the one case an agent accepts root. That turns the scanner and transition races in [RETAINED §2](./correctness/RETAINED.md) into privilege escalation, so set it only where root is really meant. |
-| `durability` | both | `"process"` | `process` survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
-| `acknowledge_secrets` | group | `false` | Silences the warning that a local root holds credentials — `.ssh`, `.aws`, `.gnupg`, `.config/gcloud` or `.kube` that its ignores leave in, or any of them when the root is your home directory. `sync` and `watch` print that warning once per root when they start, because every destination would receive those files. Set it on a group that means to synchronize them; otherwise add them to `ignores`. |
-| `agent_command` | group | ssh | Advanced: reach remote endpoints through this command (whitespace-split argv) instead of SSH. Testing and custom transports. |
-
-### What is refused
-
-Beyond keys and values it does not know, a configuration is refused at startup, with the session named, when:
-
-- **a session's two sides are one tree, or one is inside the other.** The session would consume its own output — in a mirroring mode, delete the alpha through the beta path. Roots are compared as resolved, so a symbolic link alias or a trailing `/.` is the same tree. The same check guards `autobahn sync ALPHA BETA`. One session's beta feeding another's alpha (a relay) stays legal; two sessions writing nested roots do not — see [Overlapping and nested roots](./nesting.md).
-- **a local root is, or holds, autobahn's own directories**: the state root (`~/.autobahn`, or `--state-root`), the default state root when another is in use, or the directory the configuration file lives in. Synchronized, they would change under the session using them, and a peer that edits its copy of `config.toml` or `on-alert.sh` would choose what runs here next. A root that holds one is accepted when its ignores keep it out — `ignores = [".autobahn"]` for a root of `~`. `watch` checks each edit the same way and keeps the last configuration if one fails.
-
-A root that holds credentials is warned about, not refused: see `acknowledge_secrets` above.
-
-Separately, `watch`, `sync`, `resolve`, `install` and `start` refuse to run as root, before any session is planned, unless `--allow-root` or `experimental.allow_root` says root is meant; root under someone else's home (`sudo`) is refused regardless.
+1. **Self-Referential or Nested Roots:** A session's source and destination cannot resolve to the same filesystem tree, nor can one contain the other.
+2. **State Directory Collisions:** Synchronized roots cannot encompass Autobahn's internal state directories (`~/.autobahn`), configuration files, or log directories unless explicitly excluded via `ignores = [".autobahn"]`.
+3. **Privilege Escalation:** Running as root via `sudo` where `$HOME` belongs to a non-root user is explicitly rejected.
 
 ### Symbolic links
 
-In the default `raw` mode a symbolic link is synchronized as what it is — a link — with its target copied verbatim, even when the target is absolute or points outside the root. Autobahn treats links as entries and checks for linked parents before reading or writing. These pathname checks still have a local check/use race; see [retained risks](./correctness/RETAINED.md#2-pathname-toctou-outside-linux-creations). Other tools that walk the synchronized tree may follow it, though: a backup, an indexer, or a build on the other machine will see whatever that target names *there*. For trees other tools will walk, set `symlink_mode = "portable"`: a link must then be relative and stay inside the root, and one that is not is reported as a problem and left out rather than copied. `ignore` leaves every link out.
+`raw` copies the link target verbatim, including absolute targets and targets outside the root. Autobahn treats links as entries and checks for linked parents before reads and writes. Local pathname check/use races remain. See [Retained Risks](./correctness/accepted-risks.md#2-pathname-toctou-outside-linux-creations).
 
-## Running it
+Other software can follow these links on the destination machine. For trees used by backups, indexers, or builds, consider `symlink_mode = "portable"`. Portable mode requires relative targets that remain inside the root. It reports and excludes invalid links. `ignore` excludes all links.
 
-```sh
-autobahn watch              # every configured session, here, until Ctrl-C
-```
+## Live Reload Behavior
 
-On a terminal, `watch` is a live `autobahn status` that repaints as sessions report; piped to a file it logs one line per event instead. To keep syncing when no terminal is:
+When `live_reload = true` (default), the supervisor monitors `~/.autobahn/config.toml` continuously:
 
-```sh
-autobahn install            # register a login service, and start it
-autobahn stop               # stop it (it returns at the next login)
-autobahn start
-autobahn restart            # after upgrading
-autobahn uninstall          # stop it, and unregister it
-```
+- **Valid Changes:** The supervisor reconciles differences between the running configuration and the new file. Removed groups stop, newly added groups start, and modified groups reload state without interrupting unaffected sessions.
+- **Syntax / Validation Errors:** The supervisor rejects the update and continues running under the previous valid configuration. The refusal is reported via `autobahn status`, service logs, and an alert event (`AUTOBAHN_STATES=config`).
 
-The service is launchd on macOS and a systemd user unit on Linux — inspect it with `launchctl` or `systemctl --user` like any other — and it logs to `~/.autobahn/service.log`. There is no daemon of autobahn's own and nothing backgrounds itself: `start` with no service installed says so and points at `install` or `watch`.
+## Host-Local Policy (`~/.autobahn/host.toml`)
 
-A restart does not ask the supervisor to stop: the service manager kills it and starts it again. That is safe — writes are staged and published by rename, and the ancestor journal is built to survive a crash at any point (see [Safety](./safety.md)) — but a cycle in flight is abandoned and redone. An upgrade needs one; an edit to the configuration does not.
-
-## Editing it while it runs
-
-The running supervisor reads the file every two seconds and acts on an edit once it has read the same bytes twice, so a file caught half-written is read again rather than refused. The edit is parsed and its session plans are validated before it replaces the running configuration. Unlike a fresh start, a live reload may describe zero active sessions: removing or disabling the last group stops its workers while leaving the supervisor ready for the next edit. One of two things happens:
-
-- **It loads.** Only removed or changed sessions wind down between cycles; added or changed sessions start under the new configuration, in the same process. Unchanged sessions keep their workers and connections, and changed sessions resume from their kept state. `status` and `mi` show the new sessions; `autobahn watch` on a terminal repaints with them.
-- **It is refused.** The sessions keep running under the configuration that last loaded, and the refusal is said everywhere the supervisor speaks: the log, `status` (a line above the sessions), `mi` (a line under the sign), the tray (a line in the menu, and a notification), and `on_alert` (one firing, `AUTOBAHN_STATES=config`, `AUTOBAHN_EVENT=config`). The line stands until the file loads again. The same refused bytes are not retried; synchronization continues under the last valid configuration, and the next edit is judged on its own.
-
-`live_reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
-
-## This machine's own settings
-
-`~/.autobahn/host.toml` holds what a machine allows, whoever asks. It is read by that machine alone: no controller sends it and no leader pushes it, so it holds against both. It is not a configuration — a machine with `config.toml` runs its own sessions, and a peering beta has none — so any machine can have one, controller or server.
+To restrict which local directories remote controllers are allowed to access via Autobahn agents, define an immutable host policy on the target machine:
 
 ```toml
-# The folders an agent on this machine serves, whichever controller connects,
-# and the only ones a peering beta leading from here syncs as its own.
-roots = ["~/Workspace", "/srv/shared"]
+# ~/.autobahn/host.toml (on remote host)
+
+# Whitelist directories the local agent will serve
+roots = ["~/Workspace", "/srv/repositories"]
 ```
-
-`agent_command` is what a peering beta leading from this machine runs to reach the other peers, in place of ssh — a group's `agent_command`, for testing and custom transports. A leader's pushed configuration never sets it: a follower ignores any `agent_command` the leader's configuration carries, since it would otherwise run, at takeover, a command this machine never chose.
-
-Without `roots`, or without the file, an agent serves any folder its user can reach, as it always has. With it, a root is judged where it really is, through every symbolic link on the way, and a root outside every listed folder is refused: the session fails to connect, and says why. A file that does not parse refuses everything, so a typo never lifts a restriction.
-
-## Migrating older configurations
-
-The current names are `live_reload` (formerly `reload`) and `[experimental]` (formerly `[advanced]`). Alert timing belongs under `[experimental.alerts]`, and peering timing under `[experimental.peering-dangerously-experimental]`.
-
-Replace `ignore_files = ["Rust.gitignore"]` with `ignores = ["file:Rust.gitignore"]`, placing file entries in the desired pattern order. Bare file names resolve under the state root's `ignores/`; `ignore_directory` has been removed. Replace `mode = "two-way-paranoid"` with `mode = "two-way-conflict"` and `guard_directory_deletes_over = 8` to keep its two-way policy. Old configuration keys and the removed mode are refused; they are not aliases.
-
-## See also
-
-- [Modes](./modes.md) — which to pick, and what each does case by case
-- [Peering](./peering.md) — the peering modes, dangerously experimental
-- [Ignores](./ignores.md) — pattern semantics, ignore files, and negations
-- [Alerts](./alerts.md) — the one hook, and when it fires
-- [Overlapping and nested roots](./nesting.md) — what is refused and why
-- [Commands](./commands.md) — asking a running supervisor things

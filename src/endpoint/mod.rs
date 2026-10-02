@@ -359,44 +359,44 @@ pub trait Endpoint: Send {
         anyhow::bail!("this endpoint cannot move entries")
     }
 
-    /// Peering: presents the controller's lease on this endpoint's host.
+    /// P2P: presents the controller's lease on this endpoint's host.
     /// Only an agent-backed endpoint can hold one; a local endpoint is the
     /// controller's own machine, which never fences itself.
-    fn lease(&mut self, _lease: &crate::peering::Lease) -> Result<crate::peering::LeaseAnswer> {
-        anyhow::bail!("this endpoint does not take part in peering")
+    fn lease(&mut self, _lease: &crate::p2p::Lease) -> Result<crate::p2p::LeaseAnswer> {
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// Peering: sends the leader's ancestor record for this session, and
+    /// P2P: sends the leader's ancestor record for this session, and
     /// learns the generation the host's copy stands at afterwards.
     fn ancestor_record(&mut self, _generation: u64, _changes: &[Change]) -> Result<u64> {
-        anyhow::bail!("this endpoint does not take part in peering")
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// Peering: replaces the host's ancestor copy for this session.
+    /// P2P: replaces the host's ancestor copy for this session.
     fn ancestor_checkpoint(&mut self, _generation: u64, _ancestor: Option<&Node>) -> Result<u64> {
-        anyhow::bail!("this endpoint does not take part in peering")
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// Peering: writes one of the files a follower needs on the host.
-    fn put_peering_file(&mut self, _name: &str, _bytes: &[u8]) -> Result<()> {
-        anyhow::bail!("this endpoint does not take part in peering")
+    /// P2P: writes one of the files a follower needs on the host.
+    fn put_p2p_file(&mut self, _name: &str, _bytes: &[u8]) -> Result<()> {
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// Peering: what the host holds for this session.
-    fn peering_state(&mut self) -> Result<crate::peering::State> {
-        anyhow::bail!("this endpoint does not take part in peering")
+    /// P2P: what the host holds for this session.
+    fn p2p_state(&mut self) -> Result<crate::p2p::State> {
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// Peering, with `manage_keys`: the host's peering key, made if it has
+    /// P2P, with `manage_keys`: the host's p2p key, made if it has
     /// none, and its SSH host keys.
-    fn peering_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
-        anyhow::bail!("this endpoint does not take part in peering")
+    fn p2p_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
-    /// Peering, with `manage_keys`: installs the other betas' keys on the
+    /// P2P, with `manage_keys`: installs the other betas' keys on the
     /// host, forced through the gate, and their host keys.
     fn install_peers(&mut self, _authorized: &[String], _known_hosts: &[String]) -> Result<()> {
-        anyhow::bail!("this endpoint does not take part in peering")
+        anyhow::bail!("this endpoint does not take part in p2p")
     }
 
     /// A monotone measure of how much change this endpoint has recorded but

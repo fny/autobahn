@@ -60,7 +60,7 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 
 # How much the supervisor writes to its log: quiet, normal, or debug.
 # Every line carries a timestamp whichever you pick.
-# log = "normal"
+# log_level = "normal"
 
 [defaults]
 # Inherited by every group below. Any group can override any of it.
@@ -77,15 +77,28 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 #
 # Dangerously experimental: as the two-way modes, and a beta takes the lead
 # while the alpha is away. Known security and collision issues are open;
-# read docs/peering.md first. The alpha must be this machine.
-#   peering-conflict-dangerously-experimental
-#   peering-alpha-dangerously-experimental
+# read docs/p2p.md first. The alpha must be this machine.
+#   p2p-conflict-dangerously-experimental
+#   p2p-alpha-dangerously-experimental
 mode = "two-way-conflict"
 
 # Applied everywhere, in gitignore syntax: a bare name matches at any
 # depth, a leading "/" anchors to the root of the group, "!" puts something
 # back, and the last pattern that matches decides.
-ignores = [".git", ".DS_Store", "node_modules", "target"]
+#
+# A "file:" entry reads a file of patterns from ~/.autobahn/ignores
+# instead of being one, and its patterns land where the entry sits — so
+# the order you read is the order that applies.
+#
+# Essential.gitignore is files that are unsafe to carry, not merely
+# untidy: a database being written, one file of a set that only means
+# anything together, a lock that is true on one machine. Extended adds
+# build output and dependency trees — safe to carry and rarely worth it.
+# Both were written beside this file; read them and edit them.
+ignores = [
+  "file:Essential.gitignore",
+  # "file:Extended.gitignore",
+]
 
 # Seconds between heartbeat cycles. Both sides also watch the filesystem,
 # so this is the fallback, not how fast a change travels.
@@ -116,6 +129,24 @@ interval = 5
 /// releases. The hook interface it is written against — `on_alert` and the
 /// variables handed to it — does not.
 ///
+/// Patterns for files that are unsafe to synchronize rather than merely
+/// untidy: a database being written, one file of a set that only means
+/// anything together, a lock that is true on one machine only.
+///
+/// Carried in the binary and written by `init`, like the hook beside it,
+/// so it arrives however autobahn did — a release, `cargo install`, a
+/// binary copied onto a server. A list this one belongs in a file rather
+/// than the configuration for the same reason any ignore file does:
+/// ninety lines of patterns next to the hosts and the intervals is a
+/// configuration nobody reads.
+pub const ESSENTIAL_IGNORES: &str = include_str!("../assets/ignores/Essential.gitignore");
+
+/// Patterns for files that are safe to synchronize and usually not worth
+/// it: build output, dependency trees, caches. Nothing here can corrupt
+/// anything — it is all rebuildable from the source beside it — so this
+/// is a menu rather than a rule, and the file says so.
+pub const EXTENDED_IGNORES: &str = include_str!("../assets/ignores/Extended.gitignore");
+
 /// A script rather than a line in the configuration, because a hook is a
 /// shell command inside a TOML string: every quote in it is escaped twice,
 /// and a notifier's arguments are mostly quotes. It also leaves somewhere
@@ -139,11 +170,8 @@ set -eu
 
 case "$(uname -s)" in
 Darwin)
-    # A click needs a terminal opened around the shop, which `open` does.
-    OPEN="open -a Terminal $HOME/.autobahn/open-status"
-
-    # terminal-notifier carries a subtitle and a click. Homebrew puts it
-    # in one of two places depending on the chip.
+    # terminal-notifier carries a subtitle. Homebrew puts it in one of two
+    # places depending on the chip.
     for notifier in \
         /opt/homebrew/bin/terminal-notifier \
         /usr/local/bin/terminal-notifier
@@ -153,8 +181,7 @@ Darwin)
             -title autobahn -group autobahn \
             -appIcon "$AUTOBAHN_ICON" \
             -subtitle "$AUTOBAHN_DETAIL" \
-            -message "$AUTOBAHN_SUMMARY" \
-            -execute "$OPEN"
+            -message "$AUTOBAHN_SUMMARY"
     done
 
     # Built in, and always there. It holds one line and no click. The
@@ -189,18 +216,6 @@ esac
 # No notifier, or a headless host: the log is still the record, and
 # standard error goes to it.
 echo "autobahn: $AUTOBAHN_SUMMARY" >&2
-"##;
-
-/// What the example hook opens on a click: the shop, and then a pause,
-/// because a terminal closes its window as soon as the command exits.
-pub const OPEN_STATUS_EXAMPLE: &str = r##"#!/bin/sh
-# autobahn — opened from a notification. EXPERIMENTAL, like the hook that
-# names it.
-set -eu
-autobahn status || true
-echo
-printf '[any key to close] '
-read -r _
 "##;
 
 use std::collections::{BTreeMap, HashMap};
@@ -287,13 +302,9 @@ pub struct Config {
     /// own that is a flag, not a list, and one word cannot be both.
     #[serde(default)]
     pub disabled_hosts: Vec<String>,
-    /// Retired. Kept only so that a configuration written against the old
-    /// spelling is told what to write instead of "unknown field".
-    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
-    pub disabled: Option<toml::Value>,
     /// How much the supervisor writes to its log: "quiet", "normal" (the
     /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
-    pub log: Option<String>,
+    pub log_level: Option<String>,
     /// On battery, walk each root in full every ten minutes instead of two
     /// (`crate::power`). Experimental: off unless set, and the name will
     /// change when it settles.
@@ -319,10 +330,6 @@ pub struct Config {
     /// file itself.
     #[serde(skip)]
     pub ignore_directory: Option<PathBuf>,
-    /// Retired. Kept only so that a configuration written against the old
-    /// shape gets an answer rather than "unknown field `alerts`".
-    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
-    pub alerts: Option<toml::Value>,
 }
 
 /// The `[experimental]` section: settings whose defaults are the right
@@ -337,22 +344,17 @@ pub struct Advanced {
     /// Alerter timing.
     #[serde(default)]
     pub alerts: AlertsAdvanced,
-    /// Peering timing. The section carries the experiment's suffix as the
+    /// P2P timing. The section carries the experiment's suffix as the
     /// modes do, so a configuration that names it says so on its face.
-    #[serde(default, rename = "peering-dangerously-experimental")]
-    pub peering: PeeringAdvanced,
-    /// Renamed. Kept only so that a configuration written against the old
-    /// name gets an answer rather than "unknown field".
-    #[serde(default, rename = "peering-experimental")]
-    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
-    pub retired_peering: Option<toml::Value>,
+    #[serde(default, rename = "p2p-dangerously-experimental")]
+    pub p2p: P2pAdvanced,
     /// Let the controller run as root (see `autobahn::root`). Read by
     /// `root::config_allows_root`; here so that the key is known.
     #[serde(default)]
     pub allow_root: bool,
 }
 
-/// The `[experimental.peering-dangerously-experimental]` section: how long
+/// The `[experimental.p2p-dangerously-experimental]` section: how long
 /// a lease lives, and how long a peer waits past a dead lease before it
 /// takes the lead.
 ///
@@ -363,7 +365,7 @@ pub struct Advanced {
 #[derive(Debug, Default, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
-pub struct PeeringAdvanced {
+pub struct P2pAdvanced {
     /// How long a lease stays valid after the leader last renewed it. The
     /// leader renews on every cycle, so this is a number of missed cycles
     /// expressed as time.
@@ -376,9 +378,9 @@ pub struct PeeringAdvanced {
     pub manage_keys: Option<bool>,
 }
 
-/// Peering timing, resolved: what the supervisor runs with.
+/// P2P timing, resolved: what the supervisor runs with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PeeringPlan {
+pub struct P2pPlan {
     /// How long a lease stays valid after its last renewal.
     pub ttl: Duration,
     /// How long a candidate waits past a stale lease before it leads.
@@ -388,17 +390,17 @@ pub struct PeeringPlan {
 }
 
 /// The lease lifetime as shipped: six missed five-second cycles.
-pub const DEFAULT_PEERING_TTL: Duration = Duration::from_secs(30);
+pub const DEFAULT_P2P_TTL: Duration = Duration::from_secs(30);
 
 /// The blip window as shipped: long enough for a router restart or a
 /// laptop lid closed for a minute, short enough that a leader that is
 /// really gone is replaced within a few minutes.
-pub const DEFAULT_PEERING_FAILOVER_AFTER: Duration = Duration::from_secs(120);
+pub const DEFAULT_P2P_FAILOVER_AFTER: Duration = Duration::from_secs(120);
 
 impl Config {
     /// The configured log level, if the file names a valid one.
     pub fn log_level(&self) -> Result<Option<crate::logging::Level>> {
-        let Some(name) = &self.log else {
+        let Some(name) = &self.log_level else {
             return Ok(None);
         };
         crate::logging::Level::parse(name).map(Some).ok_or_else(|| {
@@ -497,8 +499,8 @@ pub struct Defaults {
     /// size.
     ///
     /// This was the `two-way-paranoid` mode, which did nothing else and
-    /// so could not be had alongside a one-way or peering direction.
-    pub guard_directory_deletes_over: Option<usize>,
+    /// so could not be had alongside a one-way or p2p direction.
+    pub guard_dir_deletes_over: Option<usize>,
     /// Whether directories mounted inside a root are left alone rather
     /// than synchronized as part of it. Off unless said otherwise: a
     /// mount is walked like any other directory, and one that goes away
@@ -563,7 +565,7 @@ pub struct Group {
     pub max_entry_count: Option<u64>,
     /// Entries in a directory at or above which it disappearing from
     /// exactly one side is disbelieved — see the defaults' own.
-    pub guard_directory_deletes_over: Option<usize>,
+    pub guard_dir_deletes_over: Option<usize>,
     /// Whether mounts inside the roots are left alone. Off unless said
     /// otherwise.
     pub ignore_mounts: Option<bool>,
@@ -643,17 +645,17 @@ pub struct SessionPlan {
     pub ignore_mounts: bool,
     /// The directory size at or above which a one-sided disappearance is
     /// disbelieved, or `None` to propagate every one of them.
-    pub guard_directory_deletes_over: Option<usize>,
+    pub guard_dir_deletes_over: Option<usize>,
     /// The staging placement for both endpoints.
     pub staging: StagingMode,
     /// The owner for created entries (`None` to leave ownership alone).
     pub default_owner: Option<String>,
     /// The group for created entries (`None` to leave ownership alone).
     pub default_group: Option<String>,
-    /// Peering, when the mode asks for it: the betas can take the lead
+    /// P2P, when the mode asks for it: the betas can take the lead
     /// while the alpha is away, with this timing. `None` for the plain
     /// modes. Reconciliation never looks at this; `mode` says all it needs.
-    pub peering: Option<PeeringPlan>,
+    pub p2p: Option<P2pPlan>,
     /// The stable identifier isolating this session's state, derived from
     /// the *resolved* endpoint identities (see
     /// [`resolve_for_identity`]) so that
@@ -734,7 +736,7 @@ impl SessionPlan {
         self.identifier.clone()
     }
 
-    /// Peering: the session between the configured alpha and this host,
+    /// P2P: the session between the configured alpha and this host,
     /// as a beta that leads runs it — the alpha reached by attachment and
     /// still the alpha of the pair, this host's own root (the alpha of
     /// `self`) as the beta, under the identifier the leader pushed so it
@@ -757,13 +759,13 @@ impl SessionPlan {
             EndpointTarget::Remote { path, .. } => PathBuf::from(path),
         };
         let alpha = EndpointTarget::Remote {
-            destination: crate::peering::attached_destination(crate::peering::ALPHA),
+            destination: crate::p2p::attached_destination(crate::p2p::ALPHA),
             path: alpha_path.to_owned(),
             agent_command: None,
         };
         let beta = EndpointTarget::Local(own);
         Ok(SessionPlan {
-            host: crate::peering::ALPHA.to_owned(),
+            host: crate::p2p::ALPHA.to_owned(),
             alpha_identity: target_identity(&alpha),
             beta_identity: target_identity(&beta),
             alpha_spec: alpha_path.to_owned(),
@@ -775,13 +777,13 @@ impl SessionPlan {
         })
     }
 
-    /// The mode as the configuration spells it: the peering spelling for
-    /// a peering plan, the canonical grid name otherwise. What `status`
+    /// The mode as the configuration spells it: the p2p spelling for
+    /// a p2p plan, the canonical grid name otherwise. What `status`
     /// shows, so a reader sees the word they wrote.
     pub fn mode_name(&self) -> &'static str {
-        match (self.peering, self.mode) {
-            (Some(_), SyncMode::TwoWayResolved) => "peering-alpha-dangerously-experimental",
-            (Some(_), _) => "peering-conflict-dangerously-experimental",
+        match (self.p2p, self.mode) {
+            (Some(_), SyncMode::TwoWayResolved) => "p2p-alpha-dangerously-experimental",
+            (Some(_), _) => "p2p-conflict-dangerously-experimental",
             (None, mode) => mode_name(mode),
         }
     }
@@ -1175,18 +1177,6 @@ impl Config {
     pub fn alert_plan(&self) -> Result<crate::alerts::AlertPlan> {
         use crate::alerts::Alert;
 
-        // A configuration written against the old shape is answered, not
-        // merely rejected: the keys moved, and the reader should be told
-        // where to rather than left with "unknown field".
-        if self.alerts.is_some() {
-            bail!(
-                "invalid configuration:\n  [alerts] has moved: put `on_alert` at the top \
-                 level, and anything else that was in [alerts] under [experimental.alerts]. \
-                 The per-state hold times are now built in, so [alerts.after] can usually \
-                 just be deleted."
-            );
-        }
-
         let advanced = &self.experimental.alerts;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
             None => Ok(fallback),
@@ -1244,38 +1234,31 @@ impl Config {
         })
     }
 
-    /// The peering timing, from `[experimental.peering-dangerously-experimental]` and the
+    /// The p2p timing, from `[experimental.p2p-dangerously-experimental]` and the
     /// built-in defaults. Resolved whether or not any group is in a
-    /// peering mode: a bad value is a configuration error either way.
-    pub fn peering_plan(&self) -> Result<PeeringPlan> {
-        if self.experimental.retired_peering.is_some() {
-            bail!(
-                "invalid configuration:\n  [experimental.peering-experimental] was renamed to \
-                 [experimental.peering-dangerously-experimental]: peering has known security \
-                 and collision issues. Read docs/peering.md before enabling it."
-            );
-        }
-        let advanced = &self.experimental.peering;
+    /// p2p mode: a bad value is a configuration error either way.
+    pub fn p2p_plan(&self) -> Result<P2pPlan> {
+        let advanced = &self.experimental.p2p;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| {
             match spec {
             None => Ok(fallback),
             Some(spec) => parse_duration(spec).map_err(|message| {
-                anyhow!("invalid configuration:\n  experimental.peering-dangerously-experimental.{what}: {message}")
+                anyhow!("invalid configuration:\n  experimental.p2p-dangerously-experimental.{what}: {message}")
             }),
         }
         };
-        let ttl = duration(&advanced.ttl, "ttl", DEFAULT_PEERING_TTL)?;
+        let ttl = duration(&advanced.ttl, "ttl", DEFAULT_P2P_TTL)?;
         let failover_after = duration(
             &advanced.failover_after,
             "failover_after",
-            DEFAULT_PEERING_FAILOVER_AFTER,
+            DEFAULT_P2P_FAILOVER_AFTER,
         )?;
         // A lease has to be stale before anyone may act on it; a wait
         // shorter than the lease would mean acting on a lease that is
         // still good.
         if failover_after < ttl {
             bail!(
-                "invalid configuration:\n  experimental.peering-dangerously-experimental.failover_after \
+                "invalid configuration:\n  experimental.p2p-dangerously-experimental.failover_after \
                  ({}s) is shorter than ttl ({}s); a peer must not take the lead while the \
                  lease is still valid",
                 failover_after.as_secs(),
@@ -1283,9 +1266,9 @@ impl Config {
             );
         }
         if ttl.is_zero() {
-            bail!("invalid configuration:\n  experimental.peering-dangerously-experimental.ttl must not be zero");
+            bail!("invalid configuration:\n  experimental.p2p-dangerously-experimental.ttl must not be zero");
         }
-        Ok(PeeringPlan {
+        Ok(P2pPlan {
             ttl,
             failover_after,
             manage_keys: advanced.manage_keys.unwrap_or(false),
@@ -1320,14 +1303,6 @@ impl Config {
     fn plans_and_warnings(&self) -> Result<(Vec<SessionPlan>, Vec<String>)> {
         let mut errors = Vec::new();
         let mut warnings = Vec::new();
-        if self.disabled.is_some() {
-            errors.push(
-                "`disabled` at the top level is now `disabled_hosts`. A group has a \
-                 `disabled = true` of its own, and one word cannot be both a list of \
-                 hosts and a switch."
-                    .to_owned(),
-            );
-        }
         // The two top-level keys that can be quietly wrong. Neither is
         // worth refusing a file over — a hook may be written after the
         // line that names it, and a host may come back — but a typo in
@@ -1352,7 +1327,7 @@ impl Config {
                 ));
             }
         }
-        let peering = match self.peering_plan() {
+        let p2p = match self.p2p_plan() {
             Ok(plan) => Some(plan),
             Err(error) => {
                 errors.push(format!("{error:#}"));
@@ -1415,9 +1390,9 @@ impl Config {
                         (None, false)
                     }
                 };
-            // Peering is a property of the plan, not of reconciliation:
+            // P2P is a property of the plan, not of reconciliation:
             // the mode word carries it, the timing comes from the section.
-            let peering = match (peers, peering) {
+            let p2p = match (peers, p2p) {
                 (true, Some(plan)) => Some(plan),
                 _ => None,
             };
@@ -1495,15 +1470,15 @@ impl Config {
                     continue;
                 }
             }
-            // Peering assumes the alpha is the machine this configuration
+            // P2P assumes the alpha is the machine this configuration
             // runs on: it is the one member that is never dialed, so it
             // has to be the one doing the dialing. A remote alpha would
             // mean a supervisor on a third machine, which the lease and
             // the handoff do not model.
-            if peering.is_some() {
+            if p2p.is_some() {
                 if let Some(EndpointTarget::Remote { .. }) = &alpha {
                     errors.push(format!(
-                        "group '{name}': mode: a peering mode needs a local alpha; '{}' is \
+                        "group '{name}': mode: a p2p mode needs a local alpha; '{}' is \
                          remote",
                         group.alpha
                     ));
@@ -1576,10 +1551,10 @@ impl Config {
             // cycles once per interval: a lease that lives less than two
             // intervals goes stale between renewals and reads as a dead
             // leader every few seconds.
-            if let Some(plan) = peering {
+            if let Some(plan) = p2p {
                 if plan.ttl < interval.saturating_mul(2) {
                     errors.push(format!(
-                        "group '{name}': experimental.peering-dangerously-experimental.ttl ({}s) must be at \
+                        "group '{name}': experimental.p2p-dangerously-experimental.ttl ({}s) must be at \
                          least twice the interval ({}s); the lease is renewed once per cycle",
                         plan.ttl.as_secs(),
                         interval.as_secs()
@@ -1652,9 +1627,9 @@ impl Config {
                 .ignore_mounts
                 .or(self.defaults.ignore_mounts)
                 .unwrap_or(false);
-            let guard_directory_deletes_over = group
-                .guard_directory_deletes_over
-                .or(self.defaults.guard_directory_deletes_over);
+            let guard_dir_deletes_over = group
+                .guard_dir_deletes_over
+                .or(self.defaults.guard_dir_deletes_over);
             let staging =
                 match inherited(group.staging.as_deref(), self.defaults.staging.as_deref()) {
                     None => StagingMode::default(),
@@ -1706,9 +1681,9 @@ impl Config {
                     // A peer is a machine that can take the lead. A local
                     // path is this machine again, and this machine is the
                     // alpha already.
-                    if peering.is_some() {
+                    if p2p.is_some() {
                         errors.push(format!(
-                            "group '{name}': betas: '{beta}': a peering mode needs every beta on \
+                            "group '{name}': betas: '{beta}': a p2p mode needs every beta on \
                              another host"
                         ));
                         continue;
@@ -1756,11 +1731,11 @@ impl Config {
                     max_file_size,
                     max_entry_count,
                     ignore_mounts,
-                    guard_directory_deletes_over,
+                    guard_dir_deletes_over,
                     staging,
                     default_owner: default_owner.clone(),
                     default_group: default_group.clone(),
-                    peering,
+                    p2p,
                     identifier,
                     acknowledge_secrets: group.acknowledge_secrets,
                     shown_path: None,
@@ -2032,7 +2007,7 @@ pub fn parse_duration(spec: &DurationSpec) -> Result<Duration, String> {
 
 /// Every synchronization mode this build reads: its canonical name, the
 /// older spellings still accepted for it, the reconciliation it runs and
-/// whether the name asks for peering.
+/// whether the name asks for p2p.
 ///
 /// One table, read by the parser, by the error a bad name gets, by
 /// [`mode_name`] and by the schema the editor builds its form from. A
@@ -2041,52 +2016,52 @@ pub fn parse_duration(spec: &DurationSpec) -> Result<Duration, String> {
 pub const MODES: &[ModeName] = &[
     ModeName {
         name: "two-way-conflict",
-        also: &["two-way-safe"],
+        also: &[],
         mode: SyncMode::TwoWaySafe,
-        peering: false,
+        p2p: false,
         about: "Both ways. A file both sides changed is reported, never chosen between.",
     },
     ModeName {
         name: "two-way-alpha",
-        also: &["two-way-resolved"],
+        also: &[],
         mode: SyncMode::TwoWayResolved,
-        peering: false,
+        p2p: false,
         about: "Both ways, and alpha wins a collision — except that a deletion never beats an edit.",
     },
     ModeName {
         name: "two-way-alpha-strict",
         also: &[],
         mode: SyncMode::TwoWayStrict,
-        peering: false,
+        p2p: false,
         about: "As two-way-alpha with that exception removed: alpha's deletion beats beta's edit.",
     },
     ModeName {
         name: "one-way-conflict",
-        also: &["one-way-safe"],
+        also: &[],
         mode: SyncMode::OneWaySafe,
-        peering: false,
+        p2p: false,
         about: "Alpha to beta only. A file changed on beta is reported rather than overwritten.",
     },
     ModeName {
         name: "one-way-alpha",
-        also: &["one-way-replica", "mirror"],
+        also: &["mirror"],
         mode: SyncMode::OneWayReplica,
-        peering: false,
+        p2p: false,
         about: "Alpha to beta only, and beta is made to match — what rsync --delete does.",
     },
     ModeName {
-        name: "peering-conflict-dangerously-experimental",
+        name: "p2p-conflict-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWaySafe,
-        peering: true,
-        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/peering.md first.",
+        p2p: true,
+        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/p2p.md first.",
     },
     ModeName {
-        name: "peering-alpha-dangerously-experimental",
+        name: "p2p-alpha-dangerously-experimental",
         also: &[],
         mode: SyncMode::TwoWayResolved,
-        peering: true,
-        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/peering.md first.",
+        p2p: true,
+        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/p2p.md first.",
     },
 ];
 
@@ -2095,14 +2070,14 @@ pub const MODES: &[ModeName] = &[
 /// name is unknown.
 pub const RENAMED_MODES: &[(&str, &str, &str)] = &[
     (
-        "peering-conflict-experimental",
-        "peering-conflict-dangerously-experimental",
-        "peering has known security and collision issues. Read docs/peering.md before enabling it",
+        "p2p-conflict-experimental",
+        "p2p-conflict-dangerously-experimental",
+        "p2p has known security and collision issues. Read docs/p2p.md before enabling it",
     ),
     (
-        "peering-alpha-experimental",
-        "peering-alpha-dangerously-experimental",
-        "peering has known security and collision issues. Read docs/peering.md before enabling it",
+        "p2p-alpha-experimental",
+        "p2p-alpha-dangerously-experimental",
+        "p2p has known security and collision issues. Read docs/p2p.md before enabling it",
     ),
 ];
 
@@ -2115,8 +2090,8 @@ pub struct ModeName {
     pub also: &'static [&'static str],
     /// The reconciliation it runs.
     pub mode: SyncMode,
-    /// Whether the name asks for peering.
-    pub peering: bool,
+    /// Whether the name asks for p2p.
+    pub p2p: bool,
     /// One sentence, for a reader choosing between them.
     pub about: &'static str,
 }
@@ -2150,7 +2125,7 @@ pub const SYMLINK_MODES: &[Word] = &[
     },
     Word {
         word: "raw",
-        also: &["posix-raw"],
+        also: &[],
         about: "Every link is carried exactly as written, including one that points outside the root.",
     },
 ];
@@ -2215,7 +2190,7 @@ pub fn vocabulary(key: &str) -> Option<&'static [Word]> {
         "symlink_mode" => Some(SYMLINK_MODES),
         "staging" => Some(STAGING_MODES),
         "durability" => Some(DURABILITY),
-        "log" => Some(LOG_LEVELS),
+        "log_level" => Some(LOG_LEVELS),
         _ => None,
     }
 }
@@ -2253,7 +2228,7 @@ pub const IGNORE_FILE: &str = "file:";
 pub const ORDER: &[&str] = &[
     // The top of the file.
     "live_reload",
-    "log",
+    "log_level",
     "on_alert",
     "disabled_hosts",
     "power_saver_experimental",
@@ -2264,7 +2239,7 @@ pub const ORDER: &[&str] = &[
     "disabled",
     "ignores",
     "ignore_mounts",
-    "guard_directory_deletes_over",
+    "guard_dir_deletes_over",
     "max_file_size",
     "max_entry_count",
     "symlink_mode",
@@ -2306,7 +2281,7 @@ pub fn unit(key: &str) -> Option<&'static str> {
     Some(match key {
         "interval" => "whole seconds",
         "max_entry_count" => "a whole number of entries",
-        "guard_directory_deletes_over" => "entries in the directory, counted recursively",
+        "guard_dir_deletes_over" => "entries in the directory, counted recursively",
         "max_file_size" => "bytes, or a size: 100MB · 2GiB · 500K",
         "file_mode" | "directory_mode" => "octal permissions: 0600 · 0644 · 0755",
         "ttl" | "timeout" => "a length of time: 30s · 5m · 2h",
@@ -2336,7 +2311,7 @@ pub fn fallback(key: &str) -> Option<String> {
         "durability" => "process".to_owned(),
         "staging" => "state".to_owned(),
         "ignore_mounts" => "false".to_owned(),
-        "guard_directory_deletes_over" => "off: every disappearance propagates".to_owned(),
+        "guard_dir_deletes_over" => "off: every disappearance propagates".to_owned(),
         // `mode` has no fallback on purpose: a group without one, and
         // with no default behind it, is refused rather than guessed at.
         "max_file_size" | "max_entry_count" => "no limit".to_owned(),
@@ -2345,8 +2320,8 @@ pub fn fallback(key: &str) -> Option<String> {
         "settle_after" => format!("{}m", DEFAULT_SETTLE_AFTER.as_secs() / 60),
         "timeout" => format!("{}s", DEFAULT_ALERT_TIMEOUT.as_secs()),
         "repeat_after" => "never".to_owned(),
-        "ttl" => format!("{}s", DEFAULT_PEERING_TTL.as_secs()),
-        "failover_after" => format!("{}s", DEFAULT_PEERING_FAILOVER_AFTER.as_secs()),
+        "ttl" => format!("{}s", DEFAULT_P2P_TTL.as_secs()),
+        "failover_after" => format!("{}s", DEFAULT_P2P_FAILOVER_AFTER.as_secs()),
         _ => return None,
     })
 }
@@ -2397,14 +2372,14 @@ fn annotate(node: &mut serde_json::Value) {
         if let Some(Value::Object(properties)) = map.get_mut("properties") {
             for (key, property) in properties.iter_mut() {
                 // The third of each triple says the word is experimental:
-                // a peering mode is one, and a form that has not been
+                // a p2p mode is one, and a form that has not been
                 // let in does not offer it. The list is here rather than
                 // in the form because this is where the words are.
                 let words: Option<Vec<(&str, &str, bool)>> = match key.as_str() {
                     "mode" => Some(
                         MODES
                             .iter()
-                            .map(|row| (row.name, row.about, row.peering))
+                            .map(|row| (row.name, row.about, row.p2p))
                             .collect(),
                     ),
                     key => vocabulary(key).map(|words| {
@@ -2456,14 +2431,14 @@ fn annotate(node: &mut serde_json::Value) {
 
 /// Parses a synchronization mode name to what reconciliation runs.
 ///
-/// A peering spelling parses to the reconciliation mode it wraps; the
-/// peering itself is a property of the plan, read by [`parse_mode_spec`].
+/// A p2p spelling parses to the reconciliation mode it wraps; the
+/// p2p itself is a property of the plan, read by [`parse_mode_spec`].
 pub fn parse_mode(mode: &str) -> Result<SyncMode, String> {
     parse_mode_spec(mode).map(|(mode, _)| mode)
 }
 
 /// Parses a synchronization mode name: the reconciliation mode, and
-/// whether the name asks for peering.
+/// whether the name asks for p2p.
 pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
     // The names are a grid: direction, then what happens when the two
     // sides disagree about a file — it is reported as a conflict, or alpha
@@ -2474,7 +2449,7 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
         .iter()
         .find(|row| row.name == mode || row.also.contains(&mode))
     {
-        return Ok((row.mode, row.peering));
+        return Ok((row.mode, row.p2p));
     }
     // The old spellings are answered, not merely unknown: the rename is
     // the point, and a configuration that used them should be told why
@@ -2491,7 +2466,7 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
 
 /// Returns the canonical name of a synchronization mode.
 pub fn mode_name(mode: SyncMode) -> &'static str {
-    match MODES.iter().find(|row| row.mode == mode && !row.peering) {
+    match MODES.iter().find(|row| row.mode == mode && !row.p2p) {
         Some(row) => row.name,
         // Unreachable while every mode has a row of its own: the table
         // is the list of modes, not a view of it.
@@ -2641,14 +2616,14 @@ mod tests {
         for row in MODES {
             assert_eq!(
                 parse_mode_spec(row.name).unwrap(),
-                (row.mode, row.peering),
+                (row.mode, row.p2p),
                 "{}",
                 row.name
             );
             for also in row.also {
                 assert_eq!(
                     parse_mode_spec(also).unwrap(),
-                    (row.mode, row.peering),
+                    (row.mode, row.p2p),
                     "{also}"
                 );
             }
@@ -2707,7 +2682,7 @@ mod tests {
     #[ignore = "a look at the schema, not a check"]
     fn show_the_schema() {
         let document = schema();
-        for key in ["live_reload", "disabled_hosts", "log", "on_alert"] {
+        for key in ["live_reload", "disabled_hosts", "log_level", "on_alert"] {
             println!("{key}: {}", document["properties"][key]);
         }
         println!(
@@ -2780,7 +2755,7 @@ mod tests {
         let path = std::path::Path::new("config.toml");
         let error = Config::parse(
             path,
-            "[groups.\"-rf\"]\nmode = \"two-way-safe\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
+            "[groups.\"-rf\"]\nmode = \"two-way-conflict\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
         )
         .expect_err("a dash-led group name is refused");
         let message = format!("{error:#}");
@@ -2790,7 +2765,7 @@ mod tests {
         // A dash elsewhere in the name is fine.
         Config::parse(
             path,
-            "[groups.my-group]\nmode = \"two-way-safe\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
+            "[groups.my-group]\nmode = \"two-way-conflict\"\nalpha = \"/a\"\nbetas = [\"/b\"]\n",
         )
         .expect("a dash inside a name is accepted");
     }
@@ -2822,7 +2797,7 @@ mod tests {
     /// which is exactly how a mode added later was first missed.
     #[test]
     fn the_template_names_every_mode() {
-        let is_mode = |word: &&str| word.contains("-way-") || word.starts_with("peering-");
+        let is_mode = |word: &&str| word.contains("-way-") || word.starts_with("p2p-");
         let named: Vec<&str> = TEMPLATE
             .lines()
             .filter_map(|line| line.strip_prefix("# "))
@@ -2843,24 +2818,21 @@ mod tests {
         }
     }
 
-    /// The pre-rename peering spellings are refused with the new name and
+    /// The pre-rename p2p spellings are refused with the new name and
     /// the reason, not as an unknown mode or field.
     #[test]
-    fn the_old_peering_names_are_answered_with_the_rename() {
-        for old in [
-            "peering-conflict-experimental",
-            "peering-alpha-experimental",
-        ] {
+    fn the_old_p2p_names_are_answered_with_the_rename() {
+        for old in ["p2p-conflict-experimental", "p2p-alpha-experimental"] {
             let error = parse_mode_spec(old).expect_err("the old mode name is refused");
             let new = old.replace("-experimental", "-dangerously-experimental");
             assert!(error.contains(&new), "{error}");
-            assert!(error.contains("docs/peering.md"), "{error}");
+            assert!(error.contains("docs/p2p.md"), "{error}");
         }
         let error = format!(
             "{:#}",
             parse(
                 r#"
-                [experimental.peering-experimental]
+                [experimental.p2p-experimental]
                 ttl = "30s"
 
                 [groups.g]
@@ -2871,10 +2843,7 @@ mod tests {
             .plans()
             .expect_err("the old section name is refused")
         );
-        assert!(
-            error.contains("peering-dangerously-experimental"),
-            "{error}"
-        );
+        assert!(error.contains("p2p-dangerously-experimental"), "{error}");
     }
 
     fn parse(text: &str) -> Config {
@@ -3113,23 +3082,6 @@ mod tests {
         assert_eq!(plan.after(Alert::Errored), Duration::from_secs(120));
     }
 
-    /// A configuration written against the old shape is answered, not
-    /// merely rejected.
-    #[test]
-    fn the_old_alerts_section_says_where_everything_went() {
-        let config = parse(
-            r#"
-            [alerts]
-            on_alert = "notify me"
-            alert_after = "30s"
-            "#,
-        );
-        let error = format!("{:#}", config.alert_plan().expect_err("retired"));
-        assert!(error.contains("[alerts] has moved"), "{error}");
-        assert!(error.contains("top level"), "{error}");
-        assert!(error.contains("[experimental.alerts]"), "{error}");
-    }
-
     #[test]
     fn an_unknown_state_is_refused_with_the_known_ones() {
         let config = parse(
@@ -3151,7 +3103,7 @@ mod tests {
             r#"
             [groups.pull]
             alpha = "build.example.com:/srv/artifacts"
-            mode = "one-way-safe"
+            mode = "one-way-conflict"
             betas = ["/data/artifacts", "mirror.example.com"]
             "#,
         );
@@ -3182,7 +3134,7 @@ mod tests {
             r#"
             [groups.pull]
             alpha = "build.example.com"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/data"]
             "#,
         );
@@ -3198,7 +3150,7 @@ mod tests {
 
             [groups.pull]
             alpha = "build.example.com:/srv/artifacts"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/data/artifacts", "mirror.example.com:/srv/artifacts"]
             "#,
         );
@@ -3210,7 +3162,7 @@ mod tests {
         let config = parse(
             r#"
             [defaults]
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             max_file_size = "100MB"
             max_entry_count = 500000
             staging = "state"
@@ -3270,7 +3222,7 @@ mod tests {
             disabled_hosts = ["down.example.com"]
 
             [defaults]
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             ignores = [".git"]
             interval = 30
 
@@ -3285,7 +3237,7 @@ mod tests {
 
             [groups.backup]
             alpha = "/data"
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             interval = 300
             betas = ["/mnt/backup/data"]
             "#,
@@ -3371,7 +3323,7 @@ mod tests {
             r#"
             [groups.a]
             alpha = "~/x"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host1", "host2"]
             "#,
         );
@@ -3419,7 +3371,7 @@ mod tests {
             r#"
             [groups.x]
             alpha = "~/x"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             beta = ["host"]
             "#,
         )
@@ -3437,10 +3389,7 @@ mod tests {
     /// deliver.
     #[test]
     fn the_example_scripts_are_valid_shell() {
-        for (name, contents) in [
-            ("on-alert.sh", ON_ALERT_EXAMPLE),
-            ("open-status", OPEN_STATUS_EXAMPLE),
-        ] {
+        for (name, contents) in [("on-alert.sh", ON_ALERT_EXAMPLE)] {
             let directory = tempfile::tempdir().expect("a temporary directory");
             let script = directory.path().join(name);
             std::fs::write(&script, contents).expect("the script should be writable");
@@ -3571,28 +3520,6 @@ betas = ["build.example.com:/tmp/beta"]
         assert!(config.groups_led_by("build.example.com").is_empty());
     }
 
-    /// The old spelling parses, so that it can be answered with what to
-    /// write instead rather than with "unknown field `disabled`".
-    #[test]
-    fn the_old_top_level_disabled_says_what_to_write_instead() {
-        let error = parse(
-            r#"
-            disabled = ["down.example.com"]
-
-            [defaults]
-            mode = "two-way-conflict"
-
-            [groups.one]
-            alpha = "/tmp/alpha"
-            betas = ["host:/tmp/beta"]
-            "#,
-        )
-        .plans()
-        .expect_err("the retired key should be refused")
-        .to_string();
-        assert!(error.contains("disabled_hosts"), "{error}");
-    }
-
     /// A group that is off contributes no sessions, and is not held to the
     /// rules its settings would otherwise have to pass.
     #[test]
@@ -3641,7 +3568,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.x]
             alpha = "/a"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host"]
             "#,
         );
@@ -3659,7 +3586,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.x]
             alpha = "/a"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             agent_command = "custom-agent --flag"
             betas = ["host", "/local"]
             "#,
@@ -3700,7 +3627,7 @@ betas = ["build.example.com:/tmp/beta"]
                 r#"
                 [groups.bad]
                 alpha = "{alpha}"
-                mode = "one-way-replica"
+                mode = "one-way-alpha"
                 betas = ["{beta}"]
                 "#
             ));
@@ -3713,7 +3640,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.fine]
             alpha = "/srv/tree"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/srv/tree-backup"]
             "#,
         );
@@ -3725,12 +3652,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.first]
             alpha = "/srv/a"
-            mode = "one-way-safe"
+            mode = "one-way-conflict"
             betas = ["/srv/hub"]
 
             [groups.second]
             alpha = "/srv/hub"
-            mode = "one-way-safe"
+            mode = "one-way-conflict"
             betas = ["/srv/final"]
             "#,
         );
@@ -3812,12 +3739,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.everything]
             alpha = "/"
-            mode = "one-way-safe"
+            mode = "one-way-conflict"
             betas = ["host:/backup"]
 
             [groups.project]
             alpha = "/srv/project"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/laptop/project"]
             "#,
         );
@@ -3893,7 +3820,7 @@ betas = ["build.example.com:/tmp/beta"]
                 r#"
                 [groups.dots]
                 alpha = "{root}"
-                mode = "two-way-safe"
+                mode = "two-way-conflict"
                 betas = ["host:/dots", "other:/dots"]
                 {extra}
                 "#,
@@ -3928,7 +3855,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.dots]
             alpha = "{root}"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host:/dots", "other:/dots"]
             ignores = ["vendor", "!vendor/*.patch"]
             "#,
@@ -3976,13 +3903,13 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.project]
             alpha = "/srv/project"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             ignores = ["dist"]
             betas = ["/backup/project"]
 
             [groups.dist]
             alpha = "/srv/project/dist"
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             betas = ["/web/dist"]
             "#,
         );
@@ -3997,12 +3924,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.project]
             alpha = "/srv/project"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/backup/project"]
 
             [groups.dist]
             alpha = "/srv/project/dist"
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             betas = ["/web/dist"]
             "#,
         );
@@ -4023,12 +3950,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.whole]
             alpha = "/srv/project"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/backup/project"]
 
             [groups.part]
             alpha = "/srv/project/docs"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/laptop/docs"]
             "#,
         );
@@ -4041,12 +3968,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.whole]
             alpha = "/srv/project"
-            mode = "one-way-safe"
+            mode = "one-way-conflict"
             betas = ["/backup/project"]
 
             [groups.part]
             alpha = "/srv/project/docs"
-            mode = "one-way-safe"
+            mode = "one-way-conflict"
             betas = ["/laptop/docs"]
             "#,
         );
@@ -4058,12 +3985,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.star-one]
             alpha = "/hub"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/spoke-one"]
 
             [groups.star-two]
             alpha = "/hub"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["/spoke-two"]
             "#,
         );
@@ -4078,7 +4005,7 @@ betas = ["build.example.com:/tmp/beta"]
     fn nested_betas_on_one_host_in_one_group_are_rejected() {
         // Every beta is written, whatever the mode, so the one-way form
         // follows the same rule.
-        for mode in ["two-way-safe", "one-way-replica"] {
+        for mode in ["two-way-conflict", "one-way-alpha"] {
             let config = parse(&format!(
                 r#"
                 [groups.tree]
@@ -4103,7 +4030,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.tree]
             alpha = "/srv/tree"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host:/tree", "host:/other", "elsewhere:/tree", "/local/tree"]
             "#,
         );
@@ -4157,12 +4084,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.one]
             alpha = "/data"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host:/mirror"]
 
             [groups.two]
             alpha = "/data"
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             betas = ["host:/mirror"]
             "#,
         );
@@ -4181,7 +4108,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.one]
             alpha = "/data"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host", "host"]
             "#,
         );
@@ -4202,17 +4129,17 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.direct]
             alpha = "{data}"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["host:/mirror"]
 
             [groups.dotted]
             alpha = "{data}/."
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             betas = ["host:/mirror"]
 
             [groups.linked]
             alpha = "{alias}"
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             betas = ["host:/mirror"]
             "#,
             data = data.display(),
@@ -4239,12 +4166,12 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.one]
             alpha = "{data}"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["{out}/mirror/new"]
 
             [groups.two]
             alpha = "{alias}"
-            mode = "one-way-replica"
+            mode = "one-way-alpha"
             betas = ["{out_alias}/mirror/new"]
             "#,
             data = data.display(),
@@ -4265,7 +4192,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.x]
             alpha = "relative/alpha"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["./relative-beta", "~user/beta", "/absolute/beta"]
             "#,
         );
@@ -4310,7 +4237,7 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [defaults]
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             symlink_mode = "portable"
             file_mode = "0644"
             directory_mode = "0755"
@@ -4339,7 +4266,7 @@ betas = ["build.example.com:/tmp/beta"]
             r#"
             [groups.x]
             alpha = "/a"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             symlink_mode = "follow"
             file_mode = "0444"
             directory_mode = "banana"
@@ -4379,31 +4306,37 @@ betas = ["build.example.com:/tmp/beta"]
         }
         // The older spellings, and the colloquial one, are still accepted
         // — existing configurations must not break on a rename.
-        assert_eq!(parse_mode("two-way-safe").unwrap(), SyncMode::TwoWaySafe);
         assert_eq!(
-            parse_mode("two-way-resolved").unwrap(),
+            parse_mode("two-way-conflict").unwrap(),
+            SyncMode::TwoWaySafe
+        );
+        assert_eq!(
+            parse_mode("two-way-alpha").unwrap(),
             SyncMode::TwoWayResolved
         );
-        assert_eq!(parse_mode("one-way-safe").unwrap(), SyncMode::OneWaySafe);
         assert_eq!(
-            parse_mode("one-way-replica").unwrap(),
+            parse_mode("one-way-conflict").unwrap(),
+            SyncMode::OneWaySafe
+        );
+        assert_eq!(
+            parse_mode("one-way-alpha").unwrap(),
             SyncMode::OneWayReplica
         );
         assert_eq!(parse_mode("mirror").unwrap(), SyncMode::OneWayReplica);
         assert!(parse_mode("bidirectional").is_err());
     }
 
-    /// The peering spellings parse to the two-way modes they wrap and
-    /// carry the peering flag; a plan spells them back the way they were
+    /// The p2p spellings parse to the two-way modes they wrap and
+    /// carry the p2p flag; a plan spells them back the way they were
     /// written.
     #[test]
-    fn peering_modes_parse_and_print_back() {
+    fn p2p_modes_parse_and_print_back() {
         assert_eq!(
-            parse_mode_spec("peering-conflict-dangerously-experimental").unwrap(),
+            parse_mode_spec("p2p-conflict-dangerously-experimental").unwrap(),
             (SyncMode::TwoWaySafe, true)
         );
         assert_eq!(
-            parse_mode_spec("peering-alpha-dangerously-experimental").unwrap(),
+            parse_mode_spec("p2p-alpha-dangerously-experimental").unwrap(),
             (SyncMode::TwoWayResolved, true)
         );
         assert_eq!(
@@ -4413,13 +4346,13 @@ betas = ["build.example.com:/tmp/beta"]
         // The refusal message advertises them, which the template test
         // also relies on.
         let advertised = parse_mode("nope").unwrap_err();
-        assert!(advertised.contains("peering-conflict-dangerously-experimental"));
-        assert!(advertised.contains("peering-alpha-dangerously-experimental"));
+        assert!(advertised.contains("p2p-conflict-dangerously-experimental"));
+        assert!(advertised.contains("p2p-alpha-dangerously-experimental"));
 
         let config = parse(
             r#"
             [groups.g]
-            mode = "peering-alpha-dangerously-experimental"
+            mode = "p2p-alpha-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["u@h:/tmp/b"]
             "#,
@@ -4427,13 +4360,10 @@ betas = ["build.example.com:/tmp/beta"]
         let plans = config.plans().expect("plans");
         assert_eq!(plans.len(), 1);
         assert_eq!(plans[0].mode, SyncMode::TwoWayResolved);
-        assert_eq!(
-            plans[0].mode_name(),
-            "peering-alpha-dangerously-experimental"
-        );
-        let peering = plans[0].peering.expect("a peering plan");
-        assert_eq!(peering.ttl, DEFAULT_PEERING_TTL);
-        assert_eq!(peering.failover_after, DEFAULT_PEERING_FAILOVER_AFTER);
+        assert_eq!(plans[0].mode_name(), "p2p-alpha-dangerously-experimental");
+        let p2p = plans[0].p2p.expect("a p2p plan");
+        assert_eq!(p2p.ttl, DEFAULT_P2P_TTL);
+        assert_eq!(p2p.failover_after, DEFAULT_P2P_FAILOVER_AFTER);
 
         let config = parse(
             r#"
@@ -4444,36 +4374,36 @@ betas = ["build.example.com:/tmp/beta"]
             "#,
         );
         let plans = config.plans().expect("plans");
-        assert!(plans[0].peering.is_none());
+        assert!(plans[0].p2p.is_none());
         assert_eq!(plans[0].mode_name(), "two-way-alpha");
     }
 
     /// The timing section: read, defaulted, and refused when the wait is
     /// shorter than the lease it is supposed to wait for.
     #[test]
-    fn peering_timing_is_read_defaulted_and_checked() {
+    fn p2p_timing_is_read_defaulted_and_checked() {
         let config = parse(
             r#"
-            [experimental.peering-dangerously-experimental]
+            [experimental.p2p-dangerously-experimental]
             ttl = "10s"
             failover_after = 45
             [groups.g]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["u@h:/tmp/b"]
             "#,
         );
-        let peering = config.plans().expect("plans")[0].peering.expect("peering");
-        assert_eq!(peering.ttl, Duration::from_secs(10));
-        assert_eq!(peering.failover_after, Duration::from_secs(45));
+        let p2p = config.plans().expect("plans")[0].p2p.expect("p2p");
+        assert_eq!(p2p.ttl, Duration::from_secs(10));
+        assert_eq!(p2p.failover_after, Duration::from_secs(45));
 
         let config = parse(
             r#"
-            [experimental.peering-dangerously-experimental]
+            [experimental.p2p-dangerously-experimental]
             ttl = "60s"
             failover_after = "30s"
             [groups.g]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["u@h:/tmp/b"]
             "#,
@@ -4483,24 +4413,24 @@ betas = ["build.example.com:/tmp/beta"]
         assert!(error.contains("shorter than ttl"), "{error}");
 
         // A bad section is an error even for a configuration with no
-        // peering group: an unknown key is refused everywhere.
+        // p2p group: an unknown key is refused everywhere.
         let result: std::result::Result<Config, _> = toml::from_str(
             r#"
-            [experimental.peering-dangerously-experimental]
+            [experimental.p2p-dangerously-experimental]
             lease = "10s"
             "#,
         );
         assert!(result.is_err(), "unknown keys are refused");
     }
 
-    /// Peering names the machine the configuration runs on as the alpha,
+    /// P2P names the machine the configuration runs on as the alpha,
     /// and every peer as another host.
     #[test]
-    fn peering_needs_a_local_alpha_and_remote_betas() {
+    fn p2p_needs_a_local_alpha_and_remote_betas() {
         let config = parse(
             r#"
             [groups.g]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             alpha = "u@h:/tmp/a"
             betas = ["v@k:/tmp/b"]
             "#,
@@ -4511,7 +4441,7 @@ betas = ["build.example.com:/tmp/beta"]
         let config = parse(
             r#"
             [groups.g]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             alpha = "/tmp/a"
             betas = ["/tmp/b", "u@h:/tmp/c"]
             "#,

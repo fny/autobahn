@@ -885,13 +885,13 @@ impl RootObserver {
     fn store_cache(&self, snapshot: &Snapshot) {
         let snapshot = snapshot.clone();
         self.writer.store(self.cache_path.clone(), move || {
-            bincode::serialize(&snapshot).ok()
+            crate::wire::encode(&snapshot).ok()
         });
     }
 
     fn load_cache(&self) -> Option<Snapshot> {
         let data = std::fs::read(&self.cache_path).ok()?;
-        let snapshot: Snapshot = bincode::deserialize(&data).ok()?;
+        let snapshot: Snapshot = crate::wire::decode(&data).ok()?;
         snapshot.root.as_ref()?.validate(false).ok()?;
         Some(snapshot)
     }

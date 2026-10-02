@@ -1,9 +1,9 @@
-//! Peering: the state a host keeps so that a beta can take the lead.
+//! P2P: the state a host keeps so that a beta can take the lead.
 //!
-//! Experimental. A group in a peering mode has one leader — the alpha,
+//! Experimental. A group in a p2p mode has one leader — the alpha,
 //! until it is away long enough — and every other member follows. What
 //! makes a follower able to lead later is state the leader pushes to it
-//! on every cycle, all of it under `~/.autobahn/peering/`:
+//! on every cycle, all of it under `~/.autobahn/p2p/`:
 //!
 //! - `lease.json` — who leads, at what term, and until when. The agent
 //!   refuses writes from a controller whose term is below the lease's.
@@ -32,7 +32,7 @@ use crate::session::ancestor::AncestorStore;
 use crate::tree::{Change, Node};
 
 /// The directory under the state root.
-pub const DIRECTORY: &str = "peering";
+pub const DIRECTORY: &str = "p2p";
 
 /// The lease file's name.
 const LEASE_FILE: &str = "lease.json";
@@ -124,12 +124,12 @@ pub struct State {
 /// that leads writes its own spec instead.
 pub const ALPHA: &str = "alpha";
 
-/// What a supervisor is, in a peering group. Shared by every worker of
+/// What a supervisor is, in a p2p group. Shared by every worker of
 /// the supervisor: a fence answered on one session steps the whole
 /// supervisor down, since the lease is per host, not per session.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Role {
-    /// No plan is in a peering mode.
+    /// No plan is in a p2p mode.
     Off,
     /// This supervisor leads at `term`, and renews leases as `leader`.
     Leader { leader: String, term: u64 },
@@ -218,7 +218,7 @@ pub fn now_seconds() -> u64 {
         .unwrap_or(0)
 }
 
-/// The peering directory under the default state root: `$AUTOBAHN_HOME`
+/// The p2p directory under the default state root: `$AUTOBAHN_HOME`
 /// or `~/.autobahn`, the same place a follower's `watch` will look.
 pub fn directory() -> Result<PathBuf> {
     Ok(crate::paths::default_state_root()?.join(DIRECTORY))
@@ -252,7 +252,7 @@ pub struct LeaseLock {
     _file: std::fs::File,
 }
 
-/// Takes the lease lock of a peering directory, creating both on demand.
+/// Takes the lease lock of a p2p directory, creating both on demand.
 fn lock(directory: &Path, exclusive: bool) -> Result<LeaseLock> {
     use std::os::unix::io::AsRawFd;
     std::fs::create_dir_all(directory)
@@ -403,12 +403,12 @@ fn read_receipt(directory: &Path) -> Result<Option<Receipt>> {
 /// else on the host.
 pub fn write_pushed_file(directory: &Path, name: &str, bytes: &[u8]) -> Result<()> {
     if !is_pushable(name) {
-        bail!("{name:?} is not a file peering pushes");
+        bail!("{name:?} is not a file p2p pushes");
     }
     write_file(directory, name, bytes)
 }
 
-/// Whether a pushed file name is one of the few peering knows about.
+/// Whether a pushed file name is one of the few p2p knows about.
 pub fn is_pushable(name: &str) -> bool {
     let plain = |file: &str| !file.is_empty() && !file.contains('/') && file != "." && file != "..";
     match name {
@@ -420,7 +420,7 @@ pub fn is_pushable(name: &str) -> bool {
     }
 }
 
-/// Writes a file under the peering directory by way of a temporary and a
+/// Writes a file under the p2p directory by way of a temporary and a
 /// rename, durably: the file and its directory are flushed before this
 /// returns. The directory (and `ignores/`) is created on demand.
 ///
@@ -589,10 +589,10 @@ mod tests {
 
     /// The ancestor copy's path is built only from a genuine session
     /// identifier, whoever the caller: a traversal names another session's
-    /// store, or somewhere outside the peering directory altogether.
+    /// store, or somewhere outside the p2p directory altogether.
     #[test]
     fn an_ancestor_copy_path_needs_a_genuine_session() {
-        let directory = Path::new("/state/peering");
+        let directory = Path::new("/state/p2p");
         for session in ["..", "../sessions/x", "a/b", "", "/tmp/x"] {
             let error =
                 ancestor_copy_path(directory, session).expect_err("the session must be refused");
@@ -1138,11 +1138,11 @@ pub struct FollowerStar {
     pub position: usize,
     /// The heartbeat interval, from the plans.
     pub interval: Duration,
-    /// The peering timing, from the pushed configuration.
-    pub timing: crate::config::PeeringPlan,
+    /// The p2p timing, from the pushed configuration.
+    pub timing: crate::config::P2pPlan,
 }
 
-/// The files a follower runs from, read from its peering directory.
+/// The files a follower runs from, read from its p2p directory.
 pub fn pushed_configuration(directory: &Path) -> Result<Option<(String, String)>> {
     let Some(name) = read_pushed_file(directory, "name")? else {
         return Ok(None);
@@ -1162,7 +1162,7 @@ pub fn pushed_configuration(directory: &Path) -> Result<Option<(String, String)>
 /// The pushed configuration is the leader's star: a local alpha and remote
 /// betas, one of which is this host. Turned around, this host is the
 /// alpha — its own root, as a local path — and the other betas stay as
-/// they were. Groups not in a peering mode are the alpha's business and
+/// they were. Groups not in a p2p mode are the alpha's business and
 /// are dropped.
 ///
 /// This host's name is per group: two groups can reach it at two roots,
@@ -1173,7 +1173,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
     let mut config: crate::config::Config =
         toml::from_str(configuration).context("unable to parse the pushed configuration")?;
     config.ignore_directory = Some(directory.join(crate::scan::ignorefile::DIRECTORY));
-    let timing = config.peering_plan()?;
+    let timing = config.p2p_plan()?;
 
     // The name is matched against each beta entry as the leader would
     // have spelled it in full: an entry without a path inherits the
@@ -1195,13 +1195,13 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
     let mut groups = std::collections::BTreeMap::new();
     for (group_name, group) in &config.groups {
         let mode = group.mode.as_deref().or(config.defaults.mode.as_deref());
-        let peering = match mode {
+        let p2p = match mode {
             Some(mode) => crate::config::parse_mode_spec(mode)
-                .map(|(_, peering)| peering)
+                .map(|(_, p2p)| p2p)
                 .unwrap_or(false),
             None => false,
         };
-        if !peering {
+        if !p2p {
             continue;
         }
         let name = match read_pushed_file(directory, &format!("names/{group_name}"))? {
@@ -1247,7 +1247,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
             ..group.clone()
         };
         // The mode spelling is kept as written, so the plans say
-        // "peering" and carry the timing.
+        // "p2p" and carry the timing.
         turned.mode = Some(mode.unwrap_or_default().to_owned());
         groups.insert(group_name.clone(), turned);
         position = Some(match position {
@@ -1256,7 +1256,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
         });
     }
     let (Some(position), Some(leader)) = (position, leader) else {
-        bail!("{name:?} is not a beta of any peering group in the pushed configuration");
+        bail!("{name:?} is not a beta of any p2p group in the pushed configuration");
     };
     config.groups = groups;
     let planned = config
@@ -1304,7 +1304,7 @@ pub fn derive_star(configuration: &str, name: &str, directory: &Path) -> Result<
 /// How long a candidate at `position` waits past a stale lease before it
 /// acts: the configured wait, plus one lease lifetime for every member
 /// ahead of it in the order of succession other than the alpha.
-pub fn takeover_wait(position: usize, timing: &crate::config::PeeringPlan) -> Duration {
+pub fn takeover_wait(position: usize, timing: &crate::config::P2pPlan) -> Duration {
     let ahead = position.saturating_sub(1) as u32;
     timing.failover_after + timing.ttl.saturating_mul(ahead)
 }
@@ -1314,7 +1314,7 @@ mod star_tests {
     use super::*;
 
     const PUSHED: &str = r#"
-        [experimental.peering-dangerously-experimental]
+        [experimental.p2p-dangerously-experimental]
         ttl = "10s"
         failover_after = "20s"
 
@@ -1326,7 +1326,7 @@ mod star_tests {
         betas = ["x@h:/tmp/plain"]
 
         [groups.g]
-        mode = "peering-conflict-dangerously-experimental"
+        mode = "p2p-conflict-dangerously-experimental"
         alpha = "/home/faraz/Workspace/Voltai"
         betas = ["ubuntu@vm", "box2:/srv/ws"]
         ignores = ["target"]
@@ -1355,7 +1355,7 @@ mod star_tests {
             matches!(&plan.alpha, crate::config::EndpointTarget::Local(path)
             if path == std::path::Path::new("/home/faraz/Workspace/Voltai"))
         );
-        assert!(plan.peering.is_some());
+        assert!(plan.p2p.is_some());
         assert!(plan.ignores.iter().any(|p| p == "target"));
         assert_eq!(star.timing.ttl, Duration::from_secs(10));
         assert_eq!(
@@ -1447,7 +1447,7 @@ mod star_tests {
 
         std::fs::write(
             state.join(crate::host::FILE),
-            "agent_command = \"ssh -F /etc/peering autobahn agent\"\n",
+            "agent_command = \"ssh -F /etc/p2p autobahn agent\"\n",
         )
         .unwrap();
         let star = derive_star(&pushed, name, &directory).expect("a star");
@@ -1456,7 +1456,7 @@ mod star_tests {
             Some(vec![
                 "ssh".to_owned(),
                 "-F".to_owned(),
-                "/etc/peering".to_owned(),
+                "/etc/p2p".to_owned(),
                 "autobahn".to_owned(),
                 "agent".to_owned()
             ])
@@ -1471,12 +1471,12 @@ mod star_tests {
     fn two_groups_on_one_host_both_fail_over() {
         const TWO: &str = r#"
             [groups.docs]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             alpha = "/home/f/docs"
             betas = ["box:/srv/docs", "other:/srv/docs"]
 
             [groups.code]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             alpha = "/home/f/code"
             betas = ["box:/srv/code"]
         "#;
@@ -1574,10 +1574,10 @@ pub const ATTACH_SOCKET: &str = "attach.sock";
 /// attach to a leader: an argv, whitespace-split, with `{destination}`
 /// standing for the leader's SSH destination. For tests, and for
 /// transports other than SSH.
-pub const ATTACH_COMMAND_VARIABLE: &str = "AUTOBAHN_PEERING_ATTACH";
+pub const ATTACH_COMMAND_VARIABLE: &str = "AUTOBAHN_P2P_ATTACH";
 
 /// The command the alpha runs to attach to the leader at `destination`:
-/// `ssh <destination> autobahn peering attach`, unless the environment
+/// `ssh <destination> autobahn p2p attach`, unless the environment
 /// says otherwise.
 pub fn attach_argv(destination: &str) -> Vec<String> {
     if let Ok(template) = std::env::var(ATTACH_COMMAND_VARIABLE) {
@@ -1589,7 +1589,7 @@ pub fn attach_argv(destination: &str) -> Vec<String> {
             return argv;
         }
     }
-    crate::transport::ssh_argv_for(destination, "autobahn peering attach")
+    crate::transport::ssh_argv_for(destination, "autobahn p2p attach")
 }
 
 /// The SSH destination of a leader named by its spec (`user@host:path`).

@@ -54,7 +54,7 @@ TOML
 run_mutagen() {    # $1 = scenario dir
   rm -rf ~/.mutagen ~/.mutagen-dev
   "$MU" daemon start > /dev/null 2>&1 || true
-  "$MU" sync create --name=diff --sync-mode=two-way-safe \
+  "$MU" sync create --name=diff --sync-mode=two-way-conflict \
     "$1/src" "$1/dst" > "$1/mu.log" 2>&1 || { echo 1; return; }
   local status
   for _ in $(seq 1 60); do

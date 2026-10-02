@@ -155,14 +155,14 @@ pub enum Request {
     /// without moving its content, and the losing side is the only place
     /// that content exists.
     Rename(String, String),
-    /// Peering: present the controller's lease on this host, renewing it
+    /// P2P: present the controller's lease on this host, renewing it
     /// or learning that a newer leader holds it. Sent first on a channel
-    /// by a controller in a peering mode, and again on every cycle. A
+    /// by a controller in a p2p mode, and again on every cycle. A
     /// channel that presents a term below the host's lease is fenced:
     /// every write it asks for is refused until it presents a term at
     /// least as high.
-    Lease(crate::peering::Lease),
-    /// Peering: the changes that took the leader's ancestor for this
+    Lease(crate::p2p::Lease),
+    /// P2P: the changes that took the leader's ancestor for this
     /// session from `generation - 1` to `generation`, so the host's copy
     /// stays level with the leader's. The answer carries the copy's
     /// generation; one that is not `generation` means the record was not
@@ -171,25 +171,25 @@ pub enum Request {
         generation: u64,
         changes: Vec<Change>,
     },
-    /// Peering: the leader's whole ancestor for this session, replacing
+    /// P2P: the leader's whole ancestor for this session, replacing
     /// the host's copy at `generation`.
     AncestorCheckpoint {
         generation: u64,
         ancestor: Option<crate::tree::Node>,
     },
-    /// Peering: a file a follower needs — `config.toml`, `name`, or
-    /// `ignores/<file>` — written under the host's peering directory.
+    /// P2P: a file a follower needs — `config.toml`, `name`, or
+    /// `ignores/<file>` — written under the host's p2p directory.
     /// Nothing else can be named.
-    PutPeeringFile { name: String, bytes: Vec<u8> },
-    /// Peering: what the host holds for this session.
-    PeeringState,
-    /// Peering, with `manage_keys`: the host's peering key, made if it has
+    PutP2pFile { name: String, bytes: Vec<u8> },
+    /// P2P: what the host holds for this session.
+    P2pState,
+    /// P2P, with `manage_keys`: the host's p2p key, made if it has
     /// none, and its SSH host keys.
-    PeeringKeys,
-    /// Peering, with `manage_keys`: the other betas' keys for the host's
+    P2pKeys,
+    /// P2P, with `manage_keys`: the other betas' keys for the host's
     /// `authorized_keys`, each forced through the gate, and their host keys
-    /// for its peering `known_hosts`. A gated agent refuses this and
-    /// `PeeringKeys`.
+    /// for its p2p `known_hosts`. A gated agent refuses this and
+    /// `P2pKeys`.
     InstallPeers {
         authorized: Vec<String>,
         known_hosts: Vec<String>,
@@ -272,14 +272,14 @@ pub enum Response {
     /// Acknowledgement of Rename.
     Written,
     /// The answer to a presented lease.
-    Lease(crate::peering::LeaseAnswer),
+    Lease(crate::p2p::LeaseAnswer),
     /// The generation the host's ancestor copy stands at after an
     /// `AncestorRecord` or an `AncestorCheckpoint`.
     Recorded { generation: u64 },
     /// What the host holds for the channel's session.
-    PeeringState(crate::peering::State),
-    /// The host's peering key and host keys.
-    PeeringKeys(crate::peerkeys::HostKeys),
+    P2pState(crate::p2p::State),
+    /// The host's p2p key and host keys.
+    P2pKeys(crate::peerkeys::HostKeys),
     /// How far a scan still running has got: sent every half second or
     /// so, only once it has run that long, and always before the scan's
     /// own answer. The controller counts it and keeps reading.

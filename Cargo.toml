@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-bincode = "1.3"
+bincode = { version = "2", default-features = false, features = ["std", "serde"] }
 blake3 = "1"
 caseless = "0.2"
 clap = { version = "4", features = ["derive"] }
@@ -52,13 +52,18 @@ objc2-user-notifications = { version = "0.3", optional = true, default-features 
 block2 = { version = "0.6", optional = true }
 objc2-foundation = { version = "0.3", optional = true, default-features = false, features = ["std", "NSBundle", "NSString", "NSError", "NSDictionary"] }
 
+# Neither GPUI nor winit starts GTK for the menu bar. Name the version
+# muda already uses, on the same targets, so the bar can start it itself.
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
+gtk = { version = "0.18", optional = true }
+
 [features]
-tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
+tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:gtk", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
 # The dash: a window over the fleet, personal and unshipped. Its own
 # binary, autobahn-dash, bundled by apps/dash/build.sh.
-dash = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
+dash = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:gtk", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 
 [dev-dependencies]
 proptest = "1"

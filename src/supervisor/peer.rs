@@ -34,7 +34,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use crate::peering::{self, Lease, Role};
+use crate::p2p::{self, Lease, Role};
 
 use super::ROLE_POLL;
 
@@ -51,20 +51,16 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
                 // that term like any lease; the hosts that moved on since
                 // refuse it, and this peer steps down again.
                 let lease = Lease::new(&star.name, term, star.timing.ttl);
-                if let peering::LeaseAnswer::Refused { current } =
-                    peering::admit_lease(directory, &lease)?
+                if let p2p::LeaseAnswer::Refused { current } = p2p::admit_lease(directory, &lease)?
                 {
                     crate::note!(
-                        "peering: {} took the lead at term {} first; following",
+                        "p2p: {} took the lead at term {} first; following",
                         current.leader,
                         current.term
                     );
                     continue;
                 }
-                crate::note!(
-                    "peering: the lease names {}; leading at term {term}",
-                    star.name
-                );
+                crate::note!("p2p: the lease names {}; leading at term {term}", star.name);
                 lead(directory, state_root, star, term, verbose, stop)?;
             }
             Followed::TakeOver { term } => {
@@ -72,18 +68,17 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
                 // lease: a rival that took this host at the same term or a
                 // later one first wins, and this peer follows on.
                 let lease = Lease::new(&star.name, term, star.timing.ttl);
-                if let peering::LeaseAnswer::Refused { current } =
-                    peering::admit_lease(directory, &lease)?
+                if let p2p::LeaseAnswer::Refused { current } = p2p::admit_lease(directory, &lease)?
                 {
                     crate::note!(
-                        "peering: {} took the lead at term {} first; following",
+                        "p2p: {} took the lead at term {} first; following",
                         current.leader,
                         current.term
                     );
                     continue;
                 }
                 crate::note!(
-                    "peering: the lease went stale; taking the lead as {} at term {term}",
+                    "p2p: the lease went stale; taking the lead as {} at term {term}",
                     star.name
                 );
                 lead(directory, state_root, star, term, verbose, stop)?;
@@ -94,14 +89,14 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
 }
 
 /// The star as the leader last pushed it to this host.
-fn current_star(directory: &Path) -> Result<peering::FollowerStar> {
-    let Some((configuration, name)) = peering::pushed_configuration(directory)? else {
+fn current_star(directory: &Path) -> Result<p2p::FollowerStar> {
+    let Some((configuration, name)) = p2p::pushed_configuration(directory)? else {
         anyhow::bail!(
             "{} holds no pushed configuration; this host is not a peer",
             directory.display()
         );
     };
-    peering::derive_star(&configuration, &name, directory)
+    p2p::derive_star(&configuration, &name, directory)
 }
 
 /// What following ended with.
@@ -125,9 +120,9 @@ enum Followed {
 /// that did in place, and says so once.
 fn follow(
     directory: &Path,
-    mut star: peering::FollowerStar,
+    mut star: p2p::FollowerStar,
     stop: &AtomicBool,
-) -> Result<(Followed, peering::FollowerStar)> {
+) -> Result<(Followed, p2p::FollowerStar)> {
     let mut refused: Option<String> = None;
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -142,16 +137,16 @@ fn follow(
                 let message = format!("{error:#}");
                 if refused.as_ref() != Some(&message) {
                     crate::complain!(
-                        "peering: keeping the star as it was; the pushed one does not derive: \
+                        "p2p: keeping the star as it was; the pushed one does not derive: \
                          {message}"
                     );
                     refused = Some(message);
                 }
             }
         }
-        let wait = peering::takeover_wait(star.position, &star.timing);
-        let lease = peering::read_lease(directory)?;
-        let now = peering::now_seconds();
+        let wait = p2p::takeover_wait(star.position, &star.timing);
+        let lease = p2p::read_lease(directory)?;
+        let now = p2p::now_seconds();
         let standing = match &lease {
             // No lease was ever written: the leader has not been here
             // yet, and there is nothing to take over from.
@@ -190,26 +185,25 @@ enum Standing {
 fn lead(
     directory: &Path,
     state_root: &Path,
-    star: peering::FollowerStar,
+    star: p2p::FollowerStar,
     term: u64,
     verbose: bool,
     stop: &AtomicBool,
 ) -> Result<()> {
     let name = star.name.clone();
     let ttl = star.timing.ttl;
-    // The other betas are dialed with this host's peering key, when the
+    // The other betas are dialed with this host's p2p key, when the
     // alpha set one up, and the host keys it handed out.
-    crate::transport::set_peering_ssh_options(
+    crate::transport::set_p2p_ssh_options(
         crate::peerkeys::ssh_options(directory).unwrap_or_default(),
     );
-    let context =
-        super::PeeringContext::for_leader(directory.to_path_buf(), name.clone(), term, ttl);
+    let context = super::P2pContext::for_leader(directory.to_path_buf(), name.clone(), term, ttl);
     let supervisor =
-        super::Supervisor::new(star.plans, state_root.to_path_buf(), verbose).with_peering(context);
+        super::Supervisor::new(star.plans, state_root.to_path_buf(), verbose).with_p2p(context);
     let inner_stop = AtomicBool::new(false);
     // The attach socket: the alpha dials in here, and its connection
     // becomes the endpoint of the session that has the alpha's side.
-    let socket = directory.join(peering::ATTACH_SOCKET);
+    let socket = directory.join(p2p::ATTACH_SOCKET);
     let listener = bind_attach_socket(directory, &socket)?;
     std::thread::scope(|scope| -> Result<()> {
         let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
@@ -217,7 +211,7 @@ fn lead(
         let supervisor_ref = &supervisor;
         scope.spawn(move || {
             serve_attachments(&listener, acceptor, GREETING_TIMEOUT, |name, connection| {
-                crate::note!("peering: {name} attached");
+                crate::note!("p2p: {name} attached");
                 supervisor_ref.offer_attachment(&name, connection);
             })
         });
@@ -236,7 +230,7 @@ fn lead(
                 break;
             }
             if let Role::Follower { leader, term } = supervisor.role() {
-                crate::note!("peering: {leader} leads at term {term}; following again");
+                crate::note!("p2p: {leader} leads at term {term}; following again");
                 break;
             }
             if renewed.elapsed() >= ttl / 2 {
@@ -246,10 +240,8 @@ fn lead(
                 // here while the sessions are still passing it on;
                 // renewing over that would hand the lead back to nobody and
                 // have this peer take it up again from itself.
-                if let Err(error) =
-                    peering::renew_own_lease(directory, &Lease::new(&name, term, ttl))
-                {
-                    crate::complain!("peering: unable to renew the lease locally: {error:#}");
+                if let Err(error) = p2p::renew_own_lease(directory, &Lease::new(&name, term, ttl)) {
+                    crate::complain!("p2p: unable to renew the lease locally: {error:#}");
                 }
                 renewed = std::time::Instant::now();
             }
@@ -305,7 +297,7 @@ fn serve_attachments(
                     scope.spawn(move || match greet(stream, timeout) {
                         Ok((name, connection)) => attached(name, connection),
                         Err(error) => {
-                            crate::complain!("peering: an attachment was refused: {error:#}")
+                            crate::complain!("p2p: an attachment was refused: {error:#}")
                         }
                     });
                 }
@@ -313,7 +305,7 @@ fn serve_attachments(
                     std::thread::sleep(ROLE_POLL);
                 }
                 Err(error) => {
-                    crate::complain!("peering: the attach socket failed: {error:#}");
+                    crate::complain!("p2p: the attach socket failed: {error:#}");
                     return;
                 }
             }
@@ -355,7 +347,7 @@ fn greet(
         anyhow::bail!("no greeting within {MAXIMUM_GREETING} bytes");
     }
     let name = name.trim().to_owned();
-    if name != peering::ALPHA {
+    if name != p2p::ALPHA {
         anyhow::bail!("{name:?} is not a peer that attaches");
     }
     // The connection is long-lived and idles between cycles: the greeting's
@@ -376,7 +368,7 @@ fn greet(
 /// lead again. The configured alpha is never dialed, so while a beta
 /// leads the alpha makes itself an endpoint by dialing the beta.
 ///
-/// One supervisor runs throughout. While it follows, its peering sessions
+/// One supervisor runs throughout. While it follows, its p2p sessions
 /// wait for the lead and its plain groups keep running: they are the
 /// alpha's alone, whoever leads the star.
 #[allow(clippy::too_many_arguments)]
@@ -397,23 +389,23 @@ pub fn run_alpha(
         .unwrap_or(Duration::from_secs(5));
     let timing = plans
         .iter()
-        .find_map(|plan| plan.peering)
-        .unwrap_or(crate::config::PeeringPlan {
-            ttl: crate::config::DEFAULT_PEERING_TTL,
-            failover_after: crate::config::DEFAULT_PEERING_FAILOVER_AFTER,
+        .find_map(|plan| plan.p2p)
+        .unwrap_or(crate::config::P2pPlan {
+            ttl: crate::config::DEFAULT_P2P_TTL,
+            failover_after: crate::config::DEFAULT_P2P_FAILOVER_AFTER,
             manage_keys: false,
         });
-    let context = super::PeeringContext::for_alpha(
+    let context = super::P2pContext::for_alpha(
         config_path.to_path_buf(),
         directory.to_path_buf(),
         timing.ttl,
     )?;
     if context.role() == Role::Off {
-        anyhow::bail!("no plan is in a peering mode");
+        anyhow::bail!("no plan is in a p2p mode");
     }
     let supervisor = super::Supervisor::new(plans.to_vec(), state_root.to_path_buf(), verbose)
         .with_alerts(alerts.clone())
-        .with_peering(context)
+        .with_p2p(context)
         .with_reload(reloader.cloned());
     let inner_stop = AtomicBool::new(false);
     std::thread::scope(|scope| -> Result<()> {
@@ -448,7 +440,7 @@ fn alpha_roles(
     supervisor: &super::Supervisor,
     policy: &crate::transport::AttachPolicy,
     interval: Duration,
-    timing: crate::config::PeeringPlan,
+    timing: crate::config::P2pPlan,
     stop: &AtomicBool,
     finished: impl Fn() -> bool,
 ) -> Result<()> {
@@ -458,10 +450,10 @@ fn alpha_roles(
         if announced.as_ref() != Some(&role) {
             match &role {
                 Role::Leader { term, .. } => {
-                    crate::note!("peering: leading as the alpha at term {term}")
+                    crate::note!("p2p: leading as the alpha at term {term}")
                 }
                 Role::Follower { leader, term } => {
-                    crate::note!("peering: {leader} leads at term {term}; attaching")
+                    crate::note!("p2p: {leader} leads at term {term}; attaching")
                 }
                 Role::Off => {}
             }
@@ -473,25 +465,25 @@ fn alpha_roles(
         };
         // Attach, and serve as an agent until the leader lets go — it
         // does when it hands the lead back, or dies.
-        let destination = peering::destination_of(&leader).to_owned();
-        let argv = peering::attach_argv(&destination);
+        let destination = p2p::destination_of(&leader).to_owned();
+        let argv = p2p::attach_argv(&destination);
         if let Err(error) = crate::transport::attach_as_agent(&argv, policy) {
-            crate::complain!("peering: the attachment to {leader} ended: {error:#}");
+            crate::complain!("p2p: the attachment to {leader} ended: {error:#}");
         }
         // The lease says whether the lead came back. A stale lease from a
         // beta that died is taken over as a beta would take it — the
         // alpha is the head of the order, so it waits only the configured
         // time.
-        let now = peering::now_seconds();
-        match peering::read_lease(directory)? {
-            Some(lease) if lease.leader == peering::ALPHA => {
+        let now = p2p::now_seconds();
+        match p2p::read_lease(directory)? {
+            Some(lease) if lease.leader == p2p::ALPHA => {
                 supervisor.lead_as_alpha(lease.term)?;
             }
             Some(lease)
                 if lease.is_stale_at(now) && lease.stale_for_at(now) >= timing.failover_after =>
             {
                 crate::note!(
-                    "peering: the lease of {} went stale; leading again",
+                    "p2p: the lease of {} went stale; leading again",
                     lease.leader
                 );
                 // Under the lease lock: a beta that took the lead at this
@@ -530,7 +522,7 @@ pub const STATUS_FILE: &str = "follower.json";
 
 fn write_status(
     directory: &Path,
-    star: &peering::FollowerStar,
+    star: &p2p::FollowerStar,
     lease: Option<&Lease>,
     now: u64,
     standing: &Standing,
@@ -548,7 +540,7 @@ fn write_status(
         stale_seconds: lease
             .map(|lease| lease.stale_for_at(now).as_secs())
             .unwrap_or(0),
-        wait_seconds: peering::takeover_wait(star.position, &star.timing).as_secs(),
+        wait_seconds: p2p::takeover_wait(star.position, &star.timing).as_secs(),
         updated_at: now,
     };
     let bytes = serde_json::to_vec_pretty(&status).context("unable to encode the status")?;
@@ -578,33 +570,33 @@ pub fn is_peer(directory: &Path) -> bool {
     directory.join("name").is_file()
 }
 
-/// The peering directory, for callers that only have the default.
+/// The p2p directory, for callers that only have the default.
 pub fn directory() -> Result<PathBuf> {
-    peering::directory()
+    p2p::directory()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Pushes a star of one peering group with these betas, as a leader
+    /// Pushes a star of one p2p group with these betas, as a leader
     /// pushes its configuration.
     fn push(directory: &Path, betas: &str) {
         let configuration = format!(
             r#"
-            [experimental.peering-dangerously-experimental]
+            [experimental.p2p-dangerously-experimental]
             ttl = "2s"
             failover_after = "2s"
 
             [groups.g]
-            mode = "peering-conflict-dangerously-experimental"
+            mode = "p2p-conflict-dangerously-experimental"
             interval = 1
             alpha = "/home/f/g"
             betas = [{betas}]
             "#
         );
-        peering::write_pushed_file(directory, "config.toml", configuration.as_bytes()).unwrap();
-        peering::write_pushed_file(directory, "name", b"box:/srv/g").unwrap();
+        p2p::write_pushed_file(directory, "config.toml", configuration.as_bytes()).unwrap();
+        p2p::write_pushed_file(directory, "name", b"box:/srv/g").unwrap();
     }
 
     /// The leader keeps pushing while a peer follows. The takeover runs
@@ -619,12 +611,12 @@ mod tests {
         assert!(star.plans.is_empty(), "{:?}", star.plans);
 
         push(directory, r#""box:/srv/g", "other:/srv/g""#);
-        peering::write_lease(
+        p2p::write_lease(
             directory,
             &Lease {
-                leader: peering::ALPHA.to_owned(),
+                leader: p2p::ALPHA.to_owned(),
                 term: 3,
-                renewed_at: peering::now_seconds() - 600,
+                renewed_at: p2p::now_seconds() - 600,
                 ttl_seconds: 2,
             },
         )
@@ -645,8 +637,8 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixStream;
         let keep = tempfile::tempdir().expect("a temporary directory");
-        let directory = keep.path().join("peering");
-        let socket = directory.join(peering::ATTACH_SOCKET);
+        let directory = keep.path().join("p2p");
+        let socket = directory.join(p2p::ATTACH_SOCKET);
         let listener = bind_attach_socket(&directory, &socket).expect("bound");
         let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!((mode(&directory), mode(&socket)), (0o700, 0o600));
@@ -752,7 +744,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path();
         push(directory, r#""box:/srv/g", "other:/srv/g""#);
-        peering::write_lease(
+        p2p::write_lease(
             directory,
             &Lease::new("box:/srv/g", 7, Duration::from_secs(2)),
         )

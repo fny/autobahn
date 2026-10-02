@@ -9,15 +9,31 @@ scripts/build-agents.sh         # cross-build the agents bundle
 gh workflow run ci.yml          # Linux, ARM Linux and macOS
 ```
 
-The binaries that ship are built with `--profile dist`: release, compiled as one codegen unit, which answers edits about 10% faster and takes 40% longer to build, so tests and everyday builds keep `--release`. The static Linux builds (`--target x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`, which the release and `build-agents.sh` make) link mimalloc in place of musl's allocator, and its C needs a musl C compiler: `apt install musl-tools` for x86_64, and for aarch64, where none is packaged, zig (`pip install ziglang`), which `build-agents.sh` and the release pick up through `scripts/zig-cc`. musl's own allocator made a remote-side edit at 420k files 264 ms against mimalloc's 208 on x86_64, and 190 against 130 on Graviton. `main` tunes mimalloc (`tune_allocator`): arenas committed on demand, and freed memory handed back after 50 ms instead of when the freeing thread next allocates, which a sync's idle threads never do. It halves idle memory on small trees and after large transfers, costs nothing measurable on edits up to 200,000 files, and about 2 ms of 19 at 420,000. A `MIMALLOC_*` variable still overrides it, for experiments.
+## Build profiles and allocators
 
-CI runs on every push to `main` and every pull request, except changes that cannot affect a build — Markdown, `docs/`, `bench/`, the README artwork, and the release workflow. There is one macOS job, which runs the suite and then builds the app, signed ad-hoc; the certificate belongs to the release alone. A newer push cancels an older run of the same branch.
+Shipping binaries use `--profile dist`: release optimization with one codegen unit. Recorded edits were about 10% faster, with builds about 40% slower. Routine development and tests use `--release`.
 
-macOS runners are the slow and scarce ones, so the macOS job waits for the Linux job and runs only if it passed — a change that fails there is broken anyway. For a change that cannot touch macOS, put `[skip mac]` in the head commit's message, or in a pull request's title, and the macOS job is skipped while everything else runs. Only the head commit of a push is read, so the marker has to be on the last commit you push.
+Static Linux builds target `x86_64-unknown-linux-musl` and `aarch64-unknown-linux-musl`. They use mimalloc and require a musl C compiler.
+
+For x86-64, install `musl-tools`. For aarch64, the build uses zig from `pip install ziglang` through `scripts/zig-cc`. Both the release workflow and `scripts/build-agents.sh` support it.
+
+At 420k files, recorded remote edits took 264 ms with musl’s allocator and 208 ms with mimalloc on x86-64. Graviton results were 190 ms and 130 ms.
+
+`tune_allocator` commits arenas on demand and returns freed memory after 50 ms. This avoids waiting for another allocation on an idle thread.
+
+The tuning halved idle memory on small trees and after large transfers. It had no measurable edit cost through 200,000 files and added about 2 ms to 19 ms at 420,000. `MIMALLOC_*` variables can override it.
+
+## CI
+
+CI runs on pushes to `main` and pull requests. It skips changes limited to Markdown, `docs/`, `bench/`, README artwork, or the release workflow.
+
+The macOS job runs the suite and builds an ad-hoc-signed tray app. Release certificates are unavailable to ordinary CI. New pushes cancel older runs on the same branch.
+
+The macOS job waits for Linux to pass. For a change that cannot affect macOS, `[skip mac]` in the head commit message or PR title skips that job. Only the final commit of a push is checked.
 
 ## Targeted tests
 
-The full suite takes minutes. Run the part that covers the change:
+Run the suite that covers the change:
 
 ```sh
 cargo test --release --lib -- scan::        # one module
@@ -25,65 +41,81 @@ cargo test --release --test supervisor      # the supervisor integration suite
 cargo test --release --test e2e             # real agents over stdio
 ```
 
-Reconciliation and scanning are shared by everything, so a change there runs the supervisor and e2e suites too.
+Changes to reconciliation or scanning also require supervisor and e2e suites.
 
-The integration suites run with a private `HOME` (`tests/common::isolate_home`). Endpoint locks and agent-side staging live under `$HOME/.autobahn` by design, so that two processes disagreeing about their state root still meet at the lock — which meant that, before this, every test run left staging directories and locks in your real state root.
+Integration tests use a private `HOME` through `tests/common::isolate_home`. Endpoint locks and agent staging live under `$HOME/.autobahn`, even with explicit state-root overrides. Isolation keeps test artifacts out of real user state.
 
-Build the tray feature into its own target directory:
+Build the tray separately:
 
 ```sh
 CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
 ```
 
-That is what `apps/tray/build.sh` does. The login service runs `target/release/autobahn`, and a feature build there replaces it.
+`apps/tray/build.sh` uses this directory. A build in `target/release` can replace the executable used by the login service.
 
 ## Desktop app and shared text
 
-Dash is a separate binary behind `--features dash`, using GPUI Kit and the configuration schema. Its build currently uses Rust 1.98.0, as specified in `apps/dash/build.sh` and `.github/workflows/dash.yml`:
+Dash is a separate binary behind `--features dash`, built with GPUI Kit and the configuration schema. `apps/dash/build.sh` and `.github/workflows/dash.yml` specify Rust 1.98.0:
 
 ```sh
 cargo +1.98.0 build --release --locked --features dash --bin autobahn-dash --target-dir target/dash
 ```
 
-Build the CLI separately and keep it beside `autobahn-dash`, or install it where the app can find it. On macOS, `apps/dash/build.sh` creates an ad-hoc-signed bundle and copies `target/release/autobahn` into it when that command exists. Linux build packages are listed in `.github/workflows/dash.yml`; running it also needs a display server and a Vulkan driver. See [the app guide](./app.md).
+Build the CLI separately and place it beside Dash or in a supported installation path.
 
-The ordinary CI workflow tests the CLI/library and the macOS tray. Dash has its own build workflow; a green ordinary CI run does not establish that Dash builds. Shared interface strings live in `assets/words/en.toml`, read through `src/words.rs`; the catalogue tests check their use across the interfaces. `src/surface.rs` holds the shared UI model and configuration editor.
+On macOS, `apps/dash/build.sh` creates an ad-hoc-signed bundle. It includes `target/release/autobahn` if present.
+
+Linux build packages appear in `.github/workflows/dash.yml`. Runtime also requires a display server and Vulkan driver. See [Dash](./app.md).
+
+Ordinary CI covers the CLI, library, and macOS tray. Dash has a separate workflow, so ordinary CI success does not establish that Dash builds.
+
+Shared strings live in `assets/words/en.toml` and load through `src/words.rs`. Catalog tests check interface usage. `src/surface.rs` contains the shared UI model and configuration editor.
 
 ## The A/B gate
 
-Every hot-path change is measured before it ships, because analysis estimates of these costs have been wrong every time they were tried:
+Measure hot-path changes before release:
 
 ```sh
 bench/ab.sh <binary-A> <binary-B> --legs 5
 ```
 
-It runs two binaries in interleaved legs over one synthetic corpus and reports latency percentiles side by side. Interleaving is what makes the comparison honest on a shared machine: any drift in the machine's state lands on both. A difference smaller than the leg-to-leg spread is noise; a difference that reverses sign between runs is certainly noise. Three legs cannot tell a small effect from chance — use five.
+The harness interleaves two binaries over one synthetic corpus and compares latency percentiles. Interleaving spreads machine-state drift across both builds.
 
-`--remote HOST` puts the destination on another machine over ssh, running each leg's own binary as the agent there, for a change to the wire. `bench/netem.sh` adds delay to a loopback alias with `tc netem`, for a change to the number of round trips — a LAN cannot show one, and a 10 ms link shows every one as 20 ms of median. The `50k-burst` and `chromium-burst` cells copy a module in five times a job and time each burst to convergence, for a change to a cycle's cost rather than its latency.
+A difference smaller than variation between legs is noise. A difference that reverses across runs is also inconclusive. Use five legs for small effects.
 
-`bench/README.md` covers the rest of the harness, and [Benchmarks](./benchmarks.md) the published comparison against mutagen.
+`--remote HOST` tests through SSH with each leg’s own agent binary.
+
+`bench/netem.sh` uses a loopback alias and `tc netem` for round-trip-sensitive changes. A LAN can hide these costs. With 10 ms one-way delay, one extra round trip adds about 20 ms.
+
+The `50k-burst` and `chromium-burst` cells copy a module five times per job and measure each burst through convergence. They measure cycle work rather than isolated-edit latency.
+
+See [Benchmark harness](../bench/README.md) and [Benchmarks](./benchmarks.md).
 
 ## Compatibility epochs
 
-A change that breaks the wire protocol, or that makes two versions disagree about a tree — a scan rule, an ignore rule — must bump `COMPATIBILITY_EPOCH` in `src/protocol.rs`. See [State](./state.md#compatibility-epochs) for how it is enforced. After a bump, rebuild the agents bundle before restarting the supervisor. A released bundle with a stale `MANIFEST` is refused before upload; a hand-built bundle without one reaches the version handshake and is refused there.
+If a change makes builds disagree on wire or tree semantics, increment `COMPATIBILITY_EPOCH` in `src/protocol.rs`. This includes scan and ignore rules.
+
+After an increment, rebuild the agent bundle before restarting the supervisor. A stale released `MANIFEST` causes refusal before upload. A stale hand-built bundle without one fails the remote handshake. See [State](./state.md#compatibility-epochs).
 
 ## The specification
 
-The reconciliation rules, for files and directories across one alpha and any number of betas, and the peering protocol are written in TLA+ under `spec/` and checked exhaustively by TLC. CI's `spec` job runs `spec/check.sh quick`, with the `tla2tools.jar` that `spec/tla2tools.version` pins, — the small configurations, safety only — and then `AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_peering_replay -- --include-ignored` (the TLC tests are `#[ignore]`d, so a run without TLC lists them as ignored), which drives the real `reconcile()` and the real lease code through TLC's own traces and holds them to the spec's `Match`. The full set, with liveness and three betas, is `spec/check.sh` with no argument, or the dispatch-only `spec-full.yml` workflow; the peering liveness configurations take hours and want a large machine. `spec/README.md` has the modes, the sizes, and what TLC taught us about writing them.
+TLA+ models in `spec/` cover reconciliation across one alpha and multiple betas, plus p2p. TLC explores bounded configurations.
+
+CI’s `spec` job runs `spec/check.sh quick` with the version pinned in `spec/tla2tools.version`. It then runs `AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_p2p_replay -- --include-ignored`.
+
+Replay tests drive real `reconcile()` and lease code through TLC traces and compare results with `Match`. Without TLC, these tests remain `#[ignore]`d.
+
+`spec/check.sh` without arguments includes liveness and three-beta models. The manual `spec-full.yml` workflow does the same. P2P liveness can take hours and requires a large machine.
+
+See [Specification guide](../spec/README.md) for modes, bounds, and modeling lessons.
 
 ## Correctness
 
-The correctness work — the invariants the design claims, the code that enforces each one, the tests that check it, and the residuals deliberately left open — is written down in [`correctness/`](./correctness/): [`INVARIANTS.md`](./correctness/INVARIANTS.md) states each invariant with the code and the tests that hold it up, and [`RETAINED.md`](./correctness/RETAINED.md) records the residuals that were chosen rather than forgotten.
+[invariants.md](./correctness/invariants.md) records guarantees, implementation points, and tests. [accepted-risks.md](./correctness/accepted-risks.md) records unresolved risks and their rationale.
 
 ## Lineage
 
-Autobahn is a from-scratch Rust distillation of the architecture that emerged from a deep memory/performance overhaul of [Mutagen]'s synchronization engine: enum-based trees with name-sorted, copy-on-write shared children; scan metadata resident on the nodes themselves; linear- merge reconciliation; streaming transfers end to end. What required convention and adversarial review to keep safe in Go, the borrow checker and `Arc::make_mut` enforce structurally here. [Why mutagen is slower](./mutagen.md) sets out where the difference comes from in mutagen's code.
+Autobahn is a Rust implementation derived from architectural work on [Mutagen](https://github.com/mutagen-io/mutagen) memory use and performance.
 
-[Mutagen]: https://github.com/mutagen-io/mutagen
+It uses enum-based trees, sorted copy-on-write children, metadata on nodes, linear-merge reconciliation, and streaming transfers. Rust ownership and `Arc::make_mut` enforce parts of the sharing discipline.
 
-## See also
-
-- [How autobahn works](./how-it-works.md) — the design and its reasoning
-- [Safety](./safety.md) — what the tests pin
-- [State](./state.md) — agents, epochs, and what lives in `~/.autobahn`
-- [Releases](./releases.md) — tagging, prereleases, and `autobahn update`

@@ -265,16 +265,16 @@ pub struct Session {
     settled_alpha: Option<Node>,
     /// Beta's hierarchy as of the last quiesced cycle.
     settled_beta: Option<Node>,
-    /// Peering: what this session presents to its peer when its
+    /// P2P: what this session presents to its peer when its
     /// supervisor leads. `None` for a plain mode, and for a follower.
-    leadership: Option<crate::peering::Leadership>,
+    leadership: Option<crate::p2p::Leadership>,
     /// When `present_lease` last had the lease accepted, for renewing it
     /// while the session waits between cycles.
     lease_presented_at: Option<std::time::Instant>,
-    /// Peering: which side the peer is. The beta, except for the session
+    /// P2P: which side the peer is. The beta, except for the session
     /// a beta that leads runs against the attached alpha.
-    peer_side: crate::peering::PeerSide,
-    /// Peering: whether the beta's ancestor copy has been compared with
+    peer_side: crate::p2p::PeerSide,
+    /// P2P: whether the beta's ancestor copy has been compared with
     /// this session's ancestor since the session connected. Done once,
     /// after the first accepted lease, so a beta that has no copy — or
     /// one from before a restart — gets a checkpoint even when the cycle
@@ -298,7 +298,7 @@ pub struct Session {
     ignore_mounts: bool,
     /// The directory size at or above which a one-sided disappearance is
     /// disbelieved. Carried here so both reconciliations use the same one.
-    guard_directory_deletes_over: Option<usize>,
+    guard_dir_deletes_over: Option<usize>,
     /// Each side's last scanned root and the problems found in it, so the
     /// next cycle's search can skip what did not change
     /// ([`Node::problems_since`]).
@@ -376,8 +376,8 @@ impl Session {
         self.ignore_mounts = ignore;
     }
 
-    pub fn set_guard_directory_deletes_over(&mut self, over: Option<usize>) {
-        self.guard_directory_deletes_over = over;
+    pub fn set_guard_dir_deletes_over(&mut self, over: Option<usize>) {
+        self.guard_dir_deletes_over = over;
     }
 
     /// What reconciliation is asked to do: the mode, and how suspicious
@@ -385,7 +385,7 @@ impl Session {
     fn policy(&self) -> crate::tree::Policy {
         crate::tree::Policy {
             mode: self.mode,
-            guard_directory_deletes_over: self.guard_directory_deletes_over,
+            guard_dir_deletes_over: self.guard_dir_deletes_over,
         }
     }
 
@@ -594,7 +594,7 @@ impl Session {
             settled_beta: None,
             leadership: None,
             lease_presented_at: None,
-            peer_side: crate::peering::PeerSide::Beta,
+            peer_side: crate::p2p::PeerSide::Beta,
             copy_checked: false,
             _lock: lock,
             mounts,
@@ -602,7 +602,7 @@ impl Session {
             unreadable,
             power_durability: false,
             ignore_mounts: true,
-            guard_directory_deletes_over: None,
+            guard_dir_deletes_over: None,
             scan_problems: [None, None],
             reconcile_memo: None,
         })
@@ -761,13 +761,13 @@ impl Session {
         Ok(())
     }
 
-    /// Peering: adopts (or drops) the leadership this session presents to
+    /// P2P: adopts (or drops) the leadership this session presents to
     /// its beta. Set by a leading supervisor before every attempt, so a
     /// change of term reaches the next cycle.
     pub fn set_leadership(
         &mut self,
-        leadership: Option<crate::peering::Leadership>,
-        side: crate::peering::PeerSide,
+        leadership: Option<crate::p2p::Leadership>,
+        side: crate::p2p::PeerSide,
     ) {
         if leadership != self.leadership || side != self.peer_side {
             self.copy_checked = false;
@@ -776,37 +776,37 @@ impl Session {
         self.peer_side = side;
     }
 
-    /// Peering: the endpoint on the peer's side.
+    /// P2P: the endpoint on the peer's side.
     fn peer(&mut self) -> &mut Box<dyn Endpoint + Send> {
         match self.peer_side {
-            crate::peering::PeerSide::Alpha => &mut self.alpha,
-            crate::peering::PeerSide::Beta => &mut self.beta,
+            crate::p2p::PeerSide::Alpha => &mut self.alpha,
+            crate::p2p::PeerSide::Beta => &mut self.beta,
         }
     }
 
-    /// Peering, with `manage_keys`: the peer host's peering key and host
+    /// P2P, with `manage_keys`: the peer host's p2p key and host
     /// keys, the key made if it had none.
     pub fn peer_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
-        self.peer().peering_keys()
+        self.peer().p2p_keys()
     }
 
-    /// Peering, with `manage_keys`: installs the other betas' keys on the
+    /// P2P, with `manage_keys`: installs the other betas' keys on the
     /// peer host.
     pub fn install_peers(&mut self, authorized: &[String], known_hosts: &[String]) -> Result<()> {
         self.peer().install_peers(authorized, known_hosts)
     }
 
-    /// Peering: writes the files a follower needs onto the beta's host.
-    pub fn push_peering_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
+    /// P2P: writes the files a follower needs onto the beta's host.
+    pub fn push_p2p_files(&mut self, files: &[(String, Vec<u8>)]) -> Result<()> {
         for (name, bytes) in files {
             self.peer()
-                .put_peering_file(name, bytes)
+                .put_p2p_file(name, bytes)
                 .with_context(|| format!("unable to push {name} to the peer"))?;
         }
         Ok(())
     }
 
-    /// Peering, at the start of a cycle: presents the lease to the beta and
+    /// P2P, at the start of a cycle: presents the lease to the beta and
     /// stops the cycle if the host refused it. Then, once per session,
     /// makes sure the beta's ancestor copy matches this session's.
     pub fn present_lease(&mut self) -> Result<()> {
@@ -814,17 +814,17 @@ impl Session {
             return Ok(());
         };
         match self.peer().lease(&leadership.lease())? {
-            crate::peering::LeaseAnswer::Accepted => {
+            crate::p2p::LeaseAnswer::Accepted => {
                 self.lease_presented_at = Some(std::time::Instant::now());
             }
-            crate::peering::LeaseAnswer::Refused { current } => {
+            crate::p2p::LeaseAnswer::Refused { current } => {
                 self.lease_presented_at = None;
-                return Err(crate::peering::Fenced { current }.into());
+                return Err(crate::p2p::Fenced { current }.into());
             }
         }
         if !self.copy_checked {
             let generation = self.ancestor_store.generation();
-            let state = self.peer().peering_state()?;
+            let state = self.peer().p2p_state()?;
             if state.generation != Some(generation) {
                 let ancestor = self.ancestor.clone();
                 self.peer()
@@ -835,7 +835,7 @@ impl Session {
         Ok(())
     }
 
-    /// Peering: presents the lease again when a third of its lifetime has
+    /// P2P: presents the lease again when a third of its lifetime has
     /// passed since it was last accepted. A leading session calls this
     /// while it waits between cycles, so an interval, a long idle spell or
     /// anything else between cycles never lets the lease lapse and hand a
@@ -853,7 +853,7 @@ impl Session {
         }
     }
 
-    /// Peering: brings the peer's copy of the ancestor level with this
+    /// P2P: brings the peer's copy of the ancestor level with this
     /// session's — a checkpoint, when it stands at any other generation —
     /// and confirms it. What a handoff leaves the next leader to adopt must
     /// be this session's history as it stands, not one a record that failed
@@ -864,7 +864,7 @@ impl Session {
             return Ok(());
         }
         let generation = self.ancestor_store.generation();
-        if self.peer().peering_state()?.generation == Some(generation) {
+        if self.peer().p2p_state()?.generation == Some(generation) {
             return Ok(());
         }
         let ancestor = self.ancestor.clone();
@@ -878,7 +878,7 @@ impl Session {
         Ok(())
     }
 
-    /// Peering, after the ancestor advanced: sends the record to the beta,
+    /// P2P, after the ancestor advanced: sends the record to the beta,
     /// and a checkpoint if the copy could not apply it. Best effort — the
     /// ancestor is already recorded here, and a copy that misses a record
     /// asks for a checkpoint on the next one, so a failure costs a
@@ -1045,7 +1045,7 @@ impl Session {
     pub fn run_cycle(&mut self) -> Result<CycleReport> {
         let mut report = CycleReport::default();
 
-        // Peering: the lease goes first. A host that refuses it ends the
+        // P2P: the lease goes first. A host that refuses it ends the
         // cycle before a single byte moves.
         self.present_lease()?;
 
@@ -1340,7 +1340,7 @@ impl Session {
             self.ancestor_store
                 .record(&ancestor_changes, new_ancestor.as_ref())?;
             self.ancestor = new_ancestor;
-            // Peering: the beta's copy follows, after this side's record
+            // P2P: the beta's copy follows, after this side's record
             // is durable — a copy ahead of the truth is the one order
             // that can mislead a leader later.
             self.replicate_ancestor(&ancestor_changes);
@@ -1617,7 +1617,7 @@ fn pump(
 /// ignored entry left behind (the `.DS_Store` of a bare mount point, the
 /// `.git` of a wiped checkout) does not make a root any less emptied. Emptied directories *below* the
 /// root are reconciliation's concern, and only where
-/// `guard_directory_deletes_over` asks for it; a separate whole-tree pass here
+/// `guard_dir_deletes_over` asks for it; a separate whole-tree pass here
 /// measured at twenty milliseconds per cycle on a sixty-thousand-entry
 /// tree, dominating the latency of every edit. The ancestor count — the
 /// only expensive part — runs lazily, only when the rare one-side-empty
@@ -2235,8 +2235,8 @@ mod tests {
             fn transition(&mut self, transitions: Vec<Change>) -> Result<TransitionOutcome> {
                 self.0.transition(transitions)
             }
-            fn peering_state(&mut self) -> Result<crate::peering::State> {
-                Ok(crate::peering::State {
+            fn p2p_state(&mut self) -> Result<crate::p2p::State> {
+                Ok(crate::p2p::State {
                     lease: None,
                     generation: Some(self.1.lock().unwrap().reports),
                 })
@@ -2273,12 +2273,12 @@ mod tests {
         assert!(copy.lock().unwrap().checkpoints.is_empty());
 
         session.set_leadership(
-            Some(crate::peering::Leadership {
-                leader: crate::peering::ALPHA.into(),
+            Some(crate::p2p::Leadership {
+                leader: crate::p2p::ALPHA.into(),
                 term: 1,
                 ttl: std::time::Duration::from_secs(30),
             }),
-            crate::peering::PeerSide::Beta,
+            crate::p2p::PeerSide::Beta,
         );
         copy.lock().unwrap().reports = generation;
         session.level_the_copy().expect("already level");

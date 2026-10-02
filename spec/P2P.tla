@@ -1,6 +1,6 @@
------------------------------ MODULE Peering -----------------------------
+----------------------------- MODULE P2P -----------------------------
 (***************************************************************************)
-(* The star with failover: peering. The reconciliation is Reconcile's,    *)
+(* The star with failover: p2p. The reconciliation is Reconcile's,    *)
 (* unchanged; what this module adds is who runs a cycle, and what keeps   *)
 (* two controllers from ever writing one host.                            *)
 (*                                                                         *)

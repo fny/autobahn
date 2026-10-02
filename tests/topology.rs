@@ -113,7 +113,7 @@ fn a_manual_sync_refuses_a_tree_and_itself() {
         (&source, &alias, "the same tree"),
     ] {
         let before = listing(world.keep.path());
-        let (ok, text) = world.cli(&["sync", path(alpha), path(beta), "--mode", "one-way-replica"]);
+        let (ok, text) = world.cli(&["sync", path(alpha), path(beta), "--mode", "one-way-alpha"]);
         assert!(!ok, "{alpha:?} vs {beta:?} should be refused: {text}");
         assert!(text.contains(how), "{alpha:?} vs {beta:?}: {text}");
         let after = listing(world.keep.path());
@@ -135,7 +135,7 @@ fn a_manual_sync_refuses_a_tree_and_itself() {
         path(&source),
         path(&sibling),
         "--mode",
-        "one-way-replica",
+        "one-way-alpha",
     ]);
     assert!(ok, "{text}");
     assert_eq!(
@@ -166,7 +166,7 @@ fn a_home_root_holding_the_state_root_is_refused_unless_ignored() {
             r#"
             [groups.home]
             alpha = "~"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["{beta}"]
             {ignores}
             "#,
@@ -238,7 +238,7 @@ fn a_root_holding_a_custom_state_root_or_the_configuration_is_refused() {
         r#"
         [groups.tree]
         alpha = "{tree}"
-        mode = "two-way-safe"
+        mode = "two-way-conflict"
         betas = ["{beta}"]
         "#,
         tree = tree.display(),
@@ -316,7 +316,7 @@ fn a_root_holding_credentials_is_warned_about_at_startup() {
             r#"
             [groups.tree]
             alpha = "{tree}"
-            mode = "two-way-safe"
+            mode = "two-way-conflict"
             betas = ["{beta}"]
             {extra}
             "#,

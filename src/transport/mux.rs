@@ -242,9 +242,9 @@ impl Owed {
             Request::Lease(_) => "a lease",
             Request::AncestorRecord { .. } => "an ancestor record",
             Request::AncestorCheckpoint { .. } => "an ancestor checkpoint",
-            Request::PutPeeringFile { .. } => "a peering file",
-            Request::PeeringState => "a peering state query",
-            Request::PeeringKeys => "a peering key",
+            Request::PutP2pFile { .. } => "a p2p file",
+            Request::P2pState => "a p2p state query",
+            Request::P2pKeys => "a p2p key",
             Request::InstallPeers { .. } => "the peers' keys",
         };
         let grace = match request {
@@ -864,7 +864,7 @@ pub struct AgentPool {
     /// How long a session waits on another's establishment, when not
     /// [`POOL_WAIT_TIMEOUT`].
     wait_timeout: Option<std::time::Duration>,
-    /// Peering: connections that dialed *in*, by the peer's name. The
+    /// P2P: connections that dialed *in*, by the peer's name. The
     /// configured alpha attaches to a beta that leads this way, since the
     /// alpha is never dialed; each of its sessions opens its own channels
     /// on the one connection, as sessions share a pooled one.
@@ -872,7 +872,7 @@ pub struct AgentPool {
 }
 
 impl AgentPool {
-    /// Peering: offers a connection a peer opened to this supervisor. Its
+    /// P2P: offers a connection a peer opened to this supervisor. Its
     /// handshake is made here, and the connection kept for every session
     /// with that peer to open its channels on. A later offer for the same
     /// name replaces an earlier one — the peer reconnected — and sessions
@@ -886,7 +886,7 @@ impl AgentPool {
                     .insert(name.to_owned(), connection);
             }
             Err(error) => crate::complain!(
-                "peering: the attached {name} did not complete its handshake: {error:#}"
+                "p2p: the attached {name} did not complete its handshake: {error:#}"
             ),
         }
     }
@@ -901,7 +901,7 @@ impl AgentPool {
             .retain(|key, _| keep(key));
     }
 
-    /// Peering: the connection a peer opened, while it is alive. It stays
+    /// P2P: the connection a peer opened, while it is alive. It stays
     /// here for the next session: one connection serves every session with
     /// the peer, each on channels of its own. Taken by the first session,
     /// it left the peer's other groups with nothing to sync over until the
@@ -1241,7 +1241,7 @@ mod tests {
                 other => panic!("unexpected {other:?}"),
             }
         }
-        let snapshot: crate::tree::Snapshot = bincode::deserialize(&encoded).expect("decode");
+        let snapshot: crate::tree::Snapshot = crate::wire::decode(&encoded).expect("decode");
         let root_node = snapshot.root.as_ref().expect("root");
         assert!(root_node.child("file.txt").is_some());
         assert!(

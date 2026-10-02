@@ -110,14 +110,14 @@ struct Cli {
     allow_root: bool,
 }
 
-/// The peering verbs.
+/// The p2p verbs.
 #[derive(Subcommand)]
-enum PeeringVerb {
+enum P2pVerb {
     /// Bridge standard input and output to the leading supervisor's attach
     /// socket. The alpha runs this over SSH on a beta that leads; it is
     /// not for typing.
     Attach {
-        /// The attach socket (default: the peering directory's).
+        /// The attach socket (default: the p2p directory's).
         #[arg(long)]
         socket: Option<PathBuf>,
     },
@@ -137,22 +137,22 @@ enum PeeringVerb {
 enum ModeArgument {
     /// Both directions; a file changed on both sides is a conflict,
     /// reported and left alone.
-    #[value(name = "two-way-conflict", alias = "two-way-safe")]
+    #[value(name = "two-way-conflict")]
     TwoWaySafe,
     /// Both directions; a file changed on both sides takes alpha's
     /// version, silently.
-    #[value(name = "two-way-alpha", alias = "two-way-resolved")]
+    #[value(name = "two-way-alpha")]
     TwoWayResolved,
     /// two-way-alpha, and alpha's deletion of a file beta edited wins too.
     #[value(name = "two-way-alpha-strict")]
     TwoWayStrict,
     /// Alpha to beta; a change beta made itself is kept and reported as a
     /// conflict.
-    #[value(name = "one-way-conflict", alias = "one-way-safe")]
+    #[value(name = "one-way-conflict")]
     OneWaySafe,
     /// Alpha to beta; beta becomes an exact copy, its own changes
     /// discarded.
-    #[value(name = "one-way-alpha", aliases = ["one-way-replica", "mirror"])]
+    #[value(name = "one-way-alpha", alias = "mirror")]
     OneWayReplica,
 }
 
@@ -361,9 +361,9 @@ enum Command {
     /// exact version, which the controller enforces. It is not an API,
     /// and nothing but autobahn should drive it.
     Agent,
-    /// What a restricted key runs: the agent, `peering attach`, or a signed
+    /// What a restricted key runs: the agent, `p2p attach`, or a signed
     /// install, as `SSH_ORIGINAL_COMMAND` asks — nothing else. Set as the
-    /// forced command of a peering key in `authorized_keys`.
+    /// forced command of a p2p key in `authorized_keys`.
     #[command(hide = true)]
     Gate,
     /// Remove state left behind by sessions the configuration no longer
@@ -471,10 +471,10 @@ enum Command {
     },
     /// Stop the login service and unregister it.
     Uninstall,
-    /// Peering (experimental): attach to a leader, or hand the lead on.
-    Peering {
+    /// P2P (experimental): attach to a leader, or hand the lead on.
+    P2P {
         #[command(subcommand)]
-        verb: PeeringVerb,
+        verb: P2pVerb,
     },
     /// A look at a group's sessions: what each side holds, how the two
     /// differ, whether the baseline reads, what the next cycle would do,
@@ -683,7 +683,7 @@ fn main() {
     let result = match cli.command {
         Command::Agent => serve_agent(std::io::stdin().lock(), std::io::stdout()),
         Command::Gate => autobahn::gate::run(),
-        Command::Peering { verb } => run_peering(verb),
+        Command::P2P { verb } => run_p2p(verb),
         Command::Watch {
             config,
             state_root,
@@ -1519,14 +1519,14 @@ fn peer_plans(
     if config.is_some() {
         return Ok(None);
     }
-    let directory = autobahn::peering::directory()?;
+    let directory = autobahn::p2p::directory()?;
     if !autobahn::supervisor::peer::is_peer(&directory) || paths::default_config_path()?.is_file() {
         return Ok(None);
     }
-    let Some((configuration, name)) = autobahn::peering::pushed_configuration(&directory)? else {
+    let Some((configuration, name)) = autobahn::p2p::pushed_configuration(&directory)? else {
         return Ok(None);
     };
-    let star = autobahn::peering::derive_star(&configuration, &name, &directory)?;
+    let star = autobahn::p2p::derive_star(&configuration, &name, &directory)?;
     let header = match autobahn::supervisor::peer::read_status(&directory)? {
         Some(status) => match &status.lease {
             Some(lease) => format!(
@@ -1549,13 +1549,13 @@ fn peer_plans(
     Ok(Some((star.plans, header)))
 }
 
-/// `autobahn peering …`.
-fn run_peering(verb: PeeringVerb) -> Result<()> {
+/// `autobahn p2p …`.
+fn run_p2p(verb: P2pVerb) -> Result<()> {
     match verb {
-        PeeringVerb::Attach { socket } => {
+        P2pVerb::Attach { socket } => {
             let socket = match socket {
                 Some(socket) => socket,
-                None => autobahn::peering::directory()?.join(autobahn::peering::ATTACH_SOCKET),
+                None => autobahn::p2p::directory()?.join(autobahn::p2p::ATTACH_SOCKET),
             };
             let stream = std::os::unix::net::UnixStream::connect(&socket).with_context(|| {
                 format!(
@@ -1567,7 +1567,7 @@ fn run_peering(verb: PeeringVerb) -> Result<()> {
             let mut writer = stream.try_clone().context("unable to clone the socket")?;
             std::io::Write::write_all(
                 &mut writer,
-                format!("{}\n", autobahn::peering::ALPHA).as_bytes(),
+                format!("{}\n", autobahn::p2p::ALPHA).as_bytes(),
             )
             .context("unable to greet the supervisor")?;
             let mut reader = stream;
@@ -1596,7 +1596,7 @@ fn run_peering(verb: PeeringVerb) -> Result<()> {
             let _ = inbound.join();
             Ok(())
         }
-        PeeringVerb::Yield { to, state_root } => {
+        P2pVerb::Yield { to, state_root } => {
             let state_root = resolve_state_root(state_root)?;
             match autobahn::supervisor::control::send(
                 &state_root,
@@ -1633,7 +1633,7 @@ fn check_startable(config: Option<PathBuf>) -> Result<()> {
     // A peer runs a pushed configuration, unless it has one of its own:
     // then a pushed name is ignored, and its own is what starts.
     if config.is_none() && !path.is_file() {
-        let directory = autobahn::peering::directory()?;
+        let directory = autobahn::p2p::directory()?;
         if autobahn::supervisor::peer::is_peer(&directory) {
             return Ok(());
         }
@@ -1757,7 +1757,7 @@ fn run_watch(
     // start instead once told the user to move one of the two aside — and
     // a name a hostile leader pushed would have them move their own.
     if config.is_none() {
-        let directory = autobahn::peering::directory()?;
+        let directory = autobahn::p2p::directory()?;
         if autobahn::supervisor::peer::is_peer(&directory) && config_path.is_file() {
             autobahn::complain!(
                 "warning: {} names this machine as a peer of another autobahn, but it has a \
@@ -1829,15 +1829,15 @@ fn run_watch(
         move |verbose: bool| -> Result<()> {
             let stop = std::sync::atomic::AtomicBool::new(false);
             loop {
-                // Peering, when any group asks for it. This machine is the
+                // P2P, when any group asks for it. This machine is the
                 // configured alpha of every such group (the configuration
                 // says so), so it leads — unless its own lease file says a
                 // beta led while it was away.
-                let peering = loaded.plans.iter().any(|plan| plan.peering.is_some());
-                if peering {
+                let p2p = loaded.plans.iter().any(|plan| plan.p2p.is_some());
+                if p2p {
                     autobahn::supervisor::peer::run_alpha(
                         &config_path,
-                        &autobahn::peering::directory()?,
+                        &autobahn::p2p::directory()?,
                         &loaded.plans,
                         &loaded.alerts,
                         &state_root,
@@ -3957,15 +3957,20 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
         })?
         .len();
     println!("wrote {}", path.display());
-    for (name, contents) in [
-        ("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE),
-        ("open-status", autobahn::config::OPEN_STATUS_EXAMPLE),
-    ] {
+    for (name, contents) in [("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE)] {
         // An existing script is never replaced, not even under `--force`:
         // the configuration is autobahn's to rewrite, but a hook is a
         // script its owner may have made their own, and there is no way to
         // tell one that was edited from one that was not.
         if let Some(written) = write_example_script(path.parent(), name, contents)? {
+            println!("wrote {}", written.display());
+        }
+    }
+    for (name, contents) in [
+        ("Essential.gitignore", autobahn::config::ESSENTIAL_IGNORES),
+        ("Extended.gitignore", autobahn::config::EXTENDED_IGNORES),
+    ] {
+        if let Some(written) = write_shipped_ignores(path.parent(), name, contents)? {
             println!("wrote {}", written.display());
         }
     }
@@ -4085,6 +4090,33 @@ fn run_availability(
 /// Executable, because the hook runs it as a command. The alerting it does
 /// is experimental — an example to edit, not an interface — while
 /// `on_alert` and the variables it is handed are not.
+/// Writes one of the shipped ignore lists where `file:` entries are
+/// looked up, if there is not one of that name there already.
+///
+/// Its own function rather than another entry in the loop above: those
+/// are scripts and are made executable, and these are lists of patterns.
+/// Like them, an existing file is never replaced — once somebody has
+/// edited their ignores, they are theirs.
+fn write_shipped_ignores(
+    directory: Option<&std::path::Path>,
+    name: &str,
+    contents: &str,
+) -> Result<Option<PathBuf>> {
+    let Some(directory) = directory else {
+        return Ok(None);
+    };
+    let ignores = directory.join(autobahn::scan::ignorefile::DIRECTORY);
+    let path = ignores.join(name);
+    if path.exists() {
+        return Ok(None);
+    }
+    std::fs::create_dir_all(&ignores)
+        .with_context(|| format!("unable to create {}", ignores.display()))?;
+    std::fs::write(&path, contents)
+        .with_context(|| format!("unable to write {}", path.display()))?;
+    Ok(Some(path))
+}
+
 fn write_example_script(
     directory: Option<&std::path::Path>,
     name: &str,
@@ -4838,7 +4870,7 @@ fn render_probed_status(
         // The folder leads, because that is what the reader is thinking
         // about; the group name follows because that is what reset and
         // status take as an argument.
-        // Peering: the role and term ride on the group line, since they
+        // P2P: the role and term ride on the group line, since they
         // belong to the supervisor rather than to any one destination.
         let role = block[0]
             .1
@@ -5374,7 +5406,7 @@ mod tests {
         std::fs::write(
             &config,
             format!(
-                "[groups.g]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
+                "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\", \"{}\"]\n",
                 alpha.display(),
                 differs.display(),
                 agrees.display()

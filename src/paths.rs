@@ -112,7 +112,7 @@ fn home_override_from(value: &str) -> Result<Option<PathBuf>> {
 /// The directories under the state root that hold what autobahn keeps
 /// about hosts, paths and sessions, and are made private at startup with
 /// the root itself.
-pub const PRIVATE_SUBDIRECTORIES: [&str; 4] = ["sessions", "status", "staging", "peering"];
+pub const PRIVATE_SUBDIRECTORIES: [&str; 4] = ["sessions", "status", "staging", "p2p"];
 
 /// Makes the state root, and each of [`PRIVATE_SUBDIRECTORIES`] under it,
 /// a directory only the current user can use (see

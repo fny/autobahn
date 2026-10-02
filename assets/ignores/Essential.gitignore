@@ -1,0 +1,101 @@
+# Files that are unsafe to synchronize.
+#
+# Everything here is a file a running program rewrites in place, or one
+# of several files that only mean anything together. Copying such a file
+# while it is being written gives the other side a torn copy which may
+# cause its program to fail.
+#
+# Add it to your ignore block and feel free to make changes.
+#
+#   [defaults]
+#   ignores = ["file:Essential.gitignore"]
+#
+# What is *not* here: node_modules, target, __pycache__ and the rest.
+
+# ── SQLite ───────────────────────────────────────────────────────────
+
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.db3
+*.s3db
+
+# ── Git ──────────────────────────────────────────────────────────────
+#
+# A bare name, so it matches at any depth: a root holding twenty
+# checkouts excludes all twenty. A slash *inside* a pattern anchors it to
+# the group's own root, so `.git/*` would catch only a repository sitting
+# at the very top. A slash at the end does not anchor — `.git/` searches
+# nested too, and means directories only.
+#
+# No trailing slash here on purpose. In a submodule or a linked worktree
+# `.git` is a file, not a directory, holding one line that names a path
+# on this machine. A directory-only pattern would let it through.
+#
+# This excludes the history too, so a checkout arrives as a working tree
+# and not a repository. To carry the history instead, name
+# Git.gitignore after this file:
+#
+#   ignores = ["file:Essential.gitignore", "file:Git.gitignore"]
+#
+# It undoes the line below and then says what, inside `.git`, still
+# cannot travel.
+.git
+
+# ── Other version control ────────────────────────────────────────────
+
+.svn/
+.hg/
+.bzr/
+_darcs/
+.jj/
+.pijul/
+.fslckout
+_FOSSIL_
+.fos*
+
+# ── Editors mid-edit ─────────────────────────────────────────────────
+
+*.swp
+*.swo
+*.swn
+.#*
+\#*#
+~$*
+.~lock.*#
+
+# ── OS Garbage ───────────────────────────────────────────────────────
+#
+# Indexes, thumbnails and resource forks the operating system maintains
+# per machine. Harmless to lose, endless to synchronize.
+
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.TemporaryItems
+.DocumentRevisions-V100
+.AppleDouble
+Thumbs.db
+desktop.ini
+.directory
+.thumbnails
+.xsession-errors
+
+# ── Unsafe "files" ───────────────────────────────────────────────────
+.nfs*
+.fuse_hidden*
+.gvfs
+lost+found
+.Trash-*
+*.pid

@@ -1,20 +1,20 @@
-//! Peering keys: SSH keys between the betas that can only run autobahn.
+//! P2P keys: SSH keys between the betas that can only run autobahn.
 //!
 //! Any beta must be able to take the lead, so each reaches every other.
 //! With `manage_keys` on, the alpha sets that up itself over the logins it
 //! already has (its sessions with each beta):
 //!
-//! 1. each beta makes a key pair of its own under its peering directory and
+//! 1. each beta makes a key pair of its own under its p2p directory and
 //!    hands back the public half, with its SSH host keys
 //!    ([`ensure_key`]); private keys never leave the host that made them;
 //! 2. each beta is given every *other* beta's public key, in a marked block
 //!    of its `~/.ssh/authorized_keys` that autobahn owns, each line forced
-//!    through the gate ([`crate::gate`]); a peering `known_hosts` holding
+//!    through the gate ([`crate::gate`]); a p2p `known_hosts` holding
 //!    the other betas' host keys; and the gate itself ([`install_peers`]);
-//! 3. a beta leading dials the others with its peering key and that
+//! 3. a beta leading dials the others with its p2p key and that
 //!    `known_hosts` ([`ssh_options`]).
 //!
-//! A gated agent refuses both requests, so a peering key never widens its
+//! A gated agent refuses both requests, so a p2p key never widens its
 //! own access: only the alpha, over the user's own login, manages keys.
 
 use std::collections::BTreeMap;
@@ -23,31 +23,31 @@ use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// The key pair's file, under the peering directory.
+/// The key pair's file, under the p2p directory.
 pub const KEY_FILE: &str = "id_ed25519";
-/// The other betas' host keys, under the peering directory.
+/// The other betas' host keys, under the p2p directory.
 pub const KNOWN_HOSTS_FILE: &str = "known_hosts";
 /// The gate, under `~/.autobahn/bin`.
 pub const GATE_BINARY: &str = "autobahn-gate";
 /// The forced command every managed line carries.
 pub const FORCED: &str = "restrict,command=\"$HOME/.autobahn/bin/autobahn-gate gate\"";
-const BEGIN: &str = "# autobahn peering: managed by autobahn, replaced whole on every change";
-const END: &str = "# autobahn peering: end";
+const BEGIN: &str = "# autobahn p2p: managed by autobahn, replaced whole on every change";
+const END: &str = "# autobahn p2p: end";
 
 /// What a host answers about its keys.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKeys {
-    /// Its peering key's public half, as `ssh-keygen` writes it.
+    /// Its p2p key's public half, as `ssh-keygen` writes it.
     pub public: String,
     /// Its SSH host keys, as `/etc/ssh/ssh_host_*_key.pub` hold them.
     pub host_keys: Vec<String>,
 }
 
-/// Makes this host's peering key pair, unless it has one, and answers with
+/// Makes this host's p2p key pair, unless it has one, and answers with
 /// its public half and the host's SSH host keys.
-pub fn ensure_key(peering_directory: &Path) -> Result<HostKeys> {
-    prepare(peering_directory)?;
-    let private = peering_directory.join(KEY_FILE);
+pub fn ensure_key(p2p_directory: &Path) -> Result<HostKeys> {
+    prepare(p2p_directory)?;
+    let private = p2p_directory.join(KEY_FILE);
     let public = private.with_extension("pub");
     if !private.is_file() || !public.is_file() {
         let _ = std::fs::remove_file(&private);
@@ -55,15 +55,15 @@ pub fn ensure_key(peering_directory: &Path) -> Result<HostKeys> {
         let host = hostname();
         let output = std::process::Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C"])
-            .arg(format!("autobahn-peering@{host}"))
+            .arg(format!("autobahn-p2p@{host}"))
             .arg("-f")
             .arg(&private)
             .stdin(std::process::Stdio::null())
             .output()
-            .context("unable to run ssh-keygen, which making a peering key needs")?;
+            .context("unable to run ssh-keygen, which making a p2p key needs")?;
         if !output.status.success() {
             bail!(
-                "ssh-keygen could not make a peering key: {}",
+                "ssh-keygen could not make a p2p key: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             );
         }
@@ -78,14 +78,14 @@ pub fn ensure_key(peering_directory: &Path) -> Result<HostKeys> {
     })
 }
 
-/// Makes the peering directory, private, and what holds it.
-fn prepare(peering_directory: &Path) -> Result<()> {
-    if let Some(parent) = peering_directory.parent() {
+/// Makes the p2p directory, private, and what holds it.
+fn prepare(p2p_directory: &Path) -> Result<()> {
+    if let Some(parent) = p2p_directory.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("unable to create {}", parent.display()))?;
     }
-    crate::fsutil::private_dir(peering_directory)
-        .with_context(|| format!("unable to prepare {}", peering_directory.display()))
+    crate::fsutil::private_dir(p2p_directory)
+        .with_context(|| format!("unable to prepare {}", p2p_directory.display()))
 }
 
 /// The host's SSH host keys, each `<type> <key>`, from `ssh_host_*_key.pub`.
@@ -124,13 +124,13 @@ fn hostname() -> String {
 /// Installs what the alpha sends a beta: `authorized`, the other betas'
 /// keys, as the marked block of `~/.ssh/authorized_keys` under `home`,
 /// replacing the block there and nothing else; `known_hosts`, the other
-/// betas' host keys, as the peering directory's `known_hosts`; and the gate,
+/// betas' host keys, as the p2p directory's `known_hosts`; and the gate,
 /// as a copy of this executable. Every line is checked to be what the alpha
 /// makes — a key forced through the gate, a host and its key — so nothing
 /// else can be written there this way.
 pub fn install_peers(
     home: &Path,
-    peering_directory: &Path,
+    p2p_directory: &Path,
     authorized: &[String],
     known_hosts: &[String],
 ) -> Result<()> {
@@ -163,9 +163,9 @@ pub fn install_peers(
     write_block(&home.join(".ssh"), authorized)?;
     let mut text = known_hosts.join("\n");
     text.push('\n');
-    prepare(peering_directory)?;
-    std::fs::write(peering_directory.join(KNOWN_HOSTS_FILE), text)
-        .context("unable to write the peering known_hosts")?;
+    prepare(p2p_directory)?;
+    std::fs::write(p2p_directory.join(KNOWN_HOSTS_FILE), text)
+        .context("unable to write the p2p known_hosts")?;
     install_gate(&home.join(".autobahn").join("bin"))
 }
 
@@ -247,15 +247,15 @@ fn install_gate(bin: &Path) -> Result<()> {
         .with_context(|| format!("unable to install {}", target.display()))
 }
 
-/// The line authorizing `public`, a beta's peering key, through the gate.
+/// The line authorizing `public`, a beta's p2p key, through the gate.
 pub fn authorized_line(public: &str, host: &str) -> String {
     let mut words = public.split_whitespace();
     let kind = words.next().unwrap_or_default();
     let key = words.next().unwrap_or_default();
-    format!("{FORCED} {kind} {key} autobahn-peering:{host}")
+    format!("{FORCED} {kind} {key} autobahn-p2p:{host}")
 }
 
-/// What one beta is given: every other beta's peering key, forced through
+/// What one beta is given: every other beta's p2p key, forced through
 /// the gate, and every other beta's host keys, by its host name. `keys` is
 /// every beta's, by host; the beta's own are left out.
 pub fn block_for(host: &str, keys: &BTreeMap<String, HostKeys>) -> (Vec<String>, Vec<String>) {
@@ -277,14 +277,14 @@ pub fn block_for(host: &str, keys: &BTreeMap<String, HostKeys>) -> (Vec<String>,
 }
 
 /// The ssh options a beta leading from here dials the others with: its
-/// peering key, tried first, and the peering `known_hosts` beside the
-/// user's own. None when this host has no peering key.
-pub fn ssh_options(peering_directory: &Path) -> Option<Vec<String>> {
-    let key: PathBuf = peering_directory.join(KEY_FILE);
+/// p2p key, tried first, and the p2p `known_hosts` beside the
+/// user's own. None when this host has no p2p key.
+pub fn ssh_options(p2p_directory: &Path) -> Option<Vec<String>> {
+    let key: PathBuf = p2p_directory.join(KEY_FILE);
     if !key.is_file() {
         return None;
     }
-    let known = peering_directory.join(KNOWN_HOSTS_FILE);
+    let known = p2p_directory.join(KNOWN_HOSTS_FILE);
     let mut options = vec!["-i".to_owned(), key.to_string_lossy().into_owned()];
     if known.is_file() {
         options.push("-o".to_owned());
@@ -328,7 +328,7 @@ mod tests {
 
     fn keys(public: &str) -> HostKeys {
         HostKeys {
-            public: format!("{public} autobahn-peering@x"),
+            public: format!("{public} autobahn-p2p@x"),
             host_keys: vec![public.to_owned()],
         }
     }
@@ -344,16 +344,13 @@ mod tests {
         assert_eq!(
             authorized,
             [format!(
-                "{FORCED} {} autobahn-peering:two",
+                "{FORCED} {} autobahn-p2p:two",
                 KEY.replace("Jl", "Jm")
             )]
         );
         assert_eq!(known_hosts, [format!("two {}", KEY.replace("Jl", "Jm"))]);
         let (authorized, known_hosts) = block_for("two", &known);
-        assert_eq!(
-            authorized,
-            [format!("{FORCED} {KEY} autobahn-peering:u@one")]
-        );
+        assert_eq!(authorized, [format!("{FORCED} {KEY} autobahn-p2p:u@one")]);
         assert_eq!(known_hosts, [format!("one {KEY}")]);
     }
 
@@ -364,21 +361,21 @@ mod tests {
     fn installing_replaces_only_the_managed_block() {
         let keep = tempfile::tempdir().unwrap();
         let home = keep.path();
-        let peering = home.join(".autobahn/peering");
+        let p2p = home.join(".autobahn/p2p");
         std::fs::create_dir_all(home.join(".ssh")).unwrap();
         std::fs::write(home.join(".ssh/authorized_keys"), "ssh-ed25519 AAAA mine\n").unwrap();
         let line = authorized_line(KEY, "two");
         let host = format!("two {KEY}");
         let (lines, hosts) = (vec![line.clone()], vec![host.clone()]);
-        install_peers(home, &peering, &lines, &hosts).unwrap();
-        install_peers(home, &peering, &lines, &hosts).unwrap();
+        install_peers(home, &p2p, &lines, &hosts).unwrap();
+        install_peers(home, &p2p, &lines, &hosts).unwrap();
         let held = std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
         assert_eq!(
             held,
             format!("ssh-ed25519 AAAA mine\n{BEGIN}\n{line}\n{END}\n")
         );
         assert_eq!(
-            std::fs::read_to_string(peering.join(KNOWN_HOSTS_FILE)).unwrap(),
+            std::fs::read_to_string(p2p.join(KNOWN_HOSTS_FILE)).unwrap(),
             format!("{host}\n")
         );
         assert!(home.join(".autobahn/bin").join(GATE_BINARY).is_file());
@@ -391,31 +388,31 @@ mod tests {
             (vec![], vec!["two not-a-key".to_owned()]),
         ] {
             assert!(
-                install_peers(home, &peering, &authorized, &known).is_err(),
+                install_peers(home, &p2p, &authorized, &known).is_err(),
                 "{authorized:?} {known:?}"
             );
         }
         let held_after = std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap();
         assert_eq!(held_after, held, "a refusal writes nothing");
 
-        install_peers(home, &peering, &[], &[]).unwrap();
+        install_peers(home, &p2p, &[], &[]).unwrap();
         assert_eq!(
             std::fs::read_to_string(home.join(".ssh/authorized_keys")).unwrap(),
             "ssh-ed25519 AAAA mine\n"
         );
     }
 
-    /// A host makes its peering key once and keeps it; the options a beta
+    /// A host makes its p2p key once and keeps it; the options a beta
     /// leading from here dials with name it, once there is one.
     #[test]
     fn a_host_makes_its_key_once() {
         let keep = tempfile::tempdir().unwrap();
-        let peering = keep.path().join("peering");
-        assert_eq!(ssh_options(&peering), None);
-        let first = ensure_key(&peering).expect("ssh-keygen makes a key");
+        let p2p = keep.path().join("p2p");
+        assert_eq!(ssh_options(&p2p), None);
+        let first = ensure_key(&p2p).expect("ssh-keygen makes a key");
         assert!(first.public.starts_with("ssh-ed25519 "), "{}", first.public);
-        assert_eq!(ensure_key(&peering).unwrap().public, first.public);
-        let options = ssh_options(&peering).expect("a key");
+        assert_eq!(ensure_key(&p2p).unwrap().public, first.public);
+        let options = ssh_options(&p2p).expect("a key");
         assert_eq!(options[0], "-i");
         assert!(options[1].ends_with(KEY_FILE));
     }

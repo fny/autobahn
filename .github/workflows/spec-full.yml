@@ -1,5 +1,5 @@
 # The specification at its full bounds: every mode of the star with two
-# betas and liveness, three betas under symmetry, and the peering protocol
+# betas and liveness, three betas under symmetry, and the p2p protocol
 # in safety and liveness. Half an hour to an hour per configuration on
 # eight cores; hours on a runner. So it runs only by hand:
 #   gh workflow run spec-full.yml
@@ -29,5 +29,5 @@ jobs:
         run: spec/check.sh conflict alpha strict
       - name: The star, three betas, invariants
         run: spec/check.sh conflict_n3 alpha_n3 strict_n3
-      - name: Peering
-        run: spec/check.sh peering_conflict_safety peering_alpha_safety peering_conflict_liveness peering_alpha_liveness
+      - name: P2P
+        run: spec/check.sh p2p_conflict_safety p2p_alpha_safety p2p_conflict_liveness p2p_alpha_liveness

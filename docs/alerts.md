@@ -1,95 +1,66 @@
 # Alerts (Experimental)
 
-A supervisor running as a login service is invisible by design, which means a conflict or a permission that stopped working sits there with nobody told. `on_alert` runs a command when that happens:
+Autobahn provides an event-driven notification hook, `on_alert`, to notify users about errors, conflicts, and resolutions.
+
+Define `on_alert` at the top level of `~/.autobahn/config.toml`:
 
 ```toml
+# Inline
 on_alert = 'terminal-notifier -title autobahn -appIcon "$AUTOBAHN_ICON" -subtitle "$AUTOBAHN_DETAIL" -message "$AUTOBAHN_SUMMARY"'
-```
 
-That is the whole of it. It sits at the top level of the config because it is the one thing about alerting anyone should have to write.
-
-`on_alert` is the only hook. Which states are alerting is in the summary it is handed, not in which hook is chosen — a hook per state only moved the branching out of the command and into the config, and every state ends the same way, with someone opening a terminal.
-
-The service runs under launchd or systemd with a sparse environment, so give commands absolute paths — and on Linux, `notify-send` needs `DBUS_SESSION_BUS_ADDRESS`.
-
-A hook inherits the environment of the supervisor that runs it, plus the variables below. Under `autobahn watch` in a terminal, that is every variable of that terminal — credentials and tokens exported there included — so a hook you did not write should not run from a shell that holds secrets. Under the login service it is far less: on macOS, launchd's few basics (`HOME`, `USER`, `TMPDIR` and the like), a fixed `PATH` (`/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`), and `AUTOBAHN_HOME` if one was set at install; on Linux, the systemd user manager's environment — `HOME`, a default `PATH`, `XDG_RUNTIME_DIR`, and whatever was imported into it — plus `AUTOBAHN_HOME` likewise.
-
-## What the hook receives
-
-| Variable | What it holds |
-|---|---|
-| `$AUTOBAHN_SUMMARY` | One line. The whole story when one thing is wrong, a count when several — `voltai → fny: 1 conflict`, `boite is unreachable — 5 groups paused`, `2 groups need you, 1 host away`. |
-| `$AUTOBAHN_DETAIL` | One indented line per thing, for a notifier that shows more than a headline. |
-| `$AUTOBAHN_ICON` | Absolute path to autobahn's icon, written into the state directory so a notifier can point at it. |
-| `$AUTOBAHN_STATES` | Comma-separated state names present; `config` when the running supervisor refused an edit to the configuration. |
-| `$AUTOBAHN_ALERT_COUNT` | How many sessions are in the set. |
-| `$AUTOBAHN_EVENT` | `alert`, `repeat`, or `config` — the last for a refused edit to the configuration, fired once per edit, straight from the file rather than through the confirmation below. See [Editing it while it runs](./configuration.md#editing-it-while-it-runs). |
-| stdin | The full `status --json` document — or, for `config`, the notice itself: `{"at": <epoch seconds>, "message": "..."}`. |
-
-Hooks run off the cycle and cannot affect or delay synchronization: a hook is killed if it outstays its timeout, and is skipped while a previous one is still running.
-
-## The example hook (experimental)
-
-A hook is a shell command inside a TOML string, so every quote in it is escaped twice — and a notifier's arguments are mostly quotes. `autobahn init` therefore writes two scripts beside the configuration, and an install writes them the first time:
-
-| file | what it is |
-|---|---|
-| `~/.autobahn/on-alert.sh` | The hook, with a worked example per platform. On macOS: `terminal-notifier` if it is installed (a subtitle and a click), else the built-in notification. On Linux: `notify-send`, with the session bus address worked out when the service did not inherit one. On anything else, or a headless host, a line on standard error, which the log keeps. |
-| `~/.autobahn/open-status` | What a click opens: `autobahn status`, then a pause, because a terminal closes its window as soon as the command exits. |
-
-Point at the first one and the escaping problem goes away:
-
-```toml
+# As a script
 on_alert = "~/.autobahn/on-alert.sh"
 ```
 
-**Experimental.** What the example notices, which notifier it picks, and what it prints may change between releases. `on_alert` itself and the variables it is handed do not: a hook written against the variable table above keeps working.
+The hook inherits the supervisor’s environment. A foreground `autobahn watch` passes its terminal environment, including exported credentials and tokens. Do not run an untrusted hook from a shell that contains secrets.
 
-Neither script is ever replaced once it exists, not even by `autobahn init --force`, because there is no way to tell one that was edited from one that was not. Delete a script to get a fresh copy.
+On macOS, the service inherits launchd basics such as `HOME`, `USER`, and `TMPDIR`. It uses `PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin` and the `AUTOBAHN_HOME` recorded at installation.
 
-## The five states, and how long each must hold
+On Linux, it inherits the systemd user manager’s environment, including `HOME`, a default `PATH`, `XDG_RUNTIME_DIR`, and imported variables. It also receives the installed `AUTOBAHN_HOME`.
 
-A condition must hold before it counts, and how long is built in and tuned per state, because a sleeping laptop and a safety halt do not deserve the same patience:
+## Hook Environment Variables
 
-| state | holds for | why |
-| --- | --- | --- |
-| `halted` | 0s | a safety halt is never transient — except a missing alpha folder, which waits 2m, since a drive often returns with the laptop's wake |
-| `conflicts`, `blocked` | 30s | needs a person, but not this second |
-| `errored` | 2m | transient failures heal in a cycle or two |
-| `unreachable` | 5m | a sleeping laptop is the common case |
+When `on_alert` is executed, Autobahn populates the following environment variables:
 
-What each state means is in [Commands](./commands.md#what-a-sessions-state-means).
+| Variable | Description | Example Content |
+| :--- | :--- | :--- |
+| `$AUTOBAHN_SUMMARY` | High-level summary of active issues | `"myproject → remotehost: 1 conflict"` |
+| `$AUTOBAHN_DETAIL` | Indented per-session diagnostic details | `"src/app.rs (content mismatch)"` |
+| `$AUTOBAHN_ICON` | Absolute path to the Autobahn application icon | `"/Users/user/.autobahn/icon.png"` |
+| `$AUTOBAHN_STATES` | Comma-separated list of alerting states | `"conflicts"`, `"halted"`, or `"config"` |
+| `$AUTOBAHN_ALERT_COUNT` | Total number of sessions currently in an alerting state | `"2"` |
+| `$AUTOBAHN_EVENT` | Trigger event type | `"alert"`, `"repeat"`, or `"config"` |
+| Standard Input (`stdin`) | Full JSON diagnostic payload | Complete output of `autobahn status --json` |
 
-## When it fires
+Hooks execute asynchronously and do not block synchronization cycles. Any hook exceeding the configured execution timeout (30 seconds default) is terminated.
 
-Six rules make it usable rather than maddening:
 
-- **Nothing runs while everything is healthy.** Silence is the normal state.
-- **Nothing runs when it clears, either.** An all-clear asks for no action, and a stream of notifications that ask for nothing is what teaches you to stop reading the ones that do.
-- **A condition must hold without a break.** A wifi handover that takes every session unreachable for eight seconds is never mentioned — it fixed itself. Lapse for one cycle and the clock restarts, so a host flapping just under the threshold never crosses it.
-- **An alert fires when something *joins* the set of sessions in trouble**, never on repetition, and never on recovery. A cascade coming back one host at a time used to notify on the way up as loudly as on the way down; a session that recovers and fails again inside the same episode is the trouble already reported, not new trouble.
-- **A cascade is held and reported once.** A closing laptop does not take its sessions together: each goes when its own connection times out, seconds apart, so every arrival changed the set and every change was news. The window (60 seconds) runs from the first arrival nobody has been told about, not from the latest, so a steady trickle cannot hold the notification back indefinitely.
-- **Trouble that comes and goes is reported once.** A conflict on a file two machines are both editing appears, clears, and returns all day. Everything must stay clear for 15 minutes before a return counts as news rather than as the same trouble continuing — otherwise one flapping session is a notification a minute.
+## State Hold Durations
 
-## `[experimental.alerts]`
+To avoid false alarms from transient network interruptions or brief locks, conditions must persist continuously for a specific duration before triggering an alert:
 
-The alerter's timing. These are not preferences — they are the values that make it correct, and there is no second right answer a reader would discover by trying. The section exists so that finding yourself in it is itself the message.
+| State | Default Hold Duration | Rationale |
+| :--- | :---: | :--- |
+| `halted` | `0s` *(immediate)* | Safety halts (damaged ancestor, conflicting roots) are non-transient. Exception: a missing alpha root waits 2m to accommodate drive remounts. |
+| `conflicts`, `blocked` | `30s` | Requires human intervention, but allows brief window for automated tooling or manual resolution. |
+| `errored` | `2m` | Allows transient filesystem or connection errors to heal automatically. |
+| `unreachable` | `5m` | Accommodates routine laptop sleep or brief network re-connections. |
 
-| Key | Default | What it governs |
-|---|---|---|
-| `alert_after` | 30s | How long a condition must hold before it counts. Written here, it replaces the whole per-state table rather than sitting behind it. |
-| `[experimental.alerts.after]` | see above | Per-state hold times, keyed by state name. Overrides the built-in table one state at a time. |
-| `coalesce_after` | 60s | How long a grown set is held so a cascade arrives as one notification. |
-| `settle_after` | 15m | How long everything must stay clear before trouble returning counts as news. |
-| `repeat_after` | never | Re-fire an unchanged set. Off, and usually should be: a notification that returns while you are already working on it teaches you to ignore it. |
-| `timeout` | 30s | How long the hook may run before it is killed. |
 
-A configuration written against the old `[alerts]` section is told where each key went rather than refused as an unknown field.
+## Coalescing and Anti-Flap Behavior
 
-## See also
+1. **No Alert on Resolution:** The hook fires only when sessions enter a failure state, never on recovery.
+2. **Cascade Coalescing (`coalesce_after = 60s`):** When multiple sessions fail in close succession (e.g., a host disconnects multiple groups), notifications are coalesced into a single consolidated alert.
+3. **Flap Suppression (`settle_after = 15m`):** If an issue resolves and reoccurs within 15 minutes, it is treated as part of the existing incident to prevent notification spam.
 
-- [Configuration](./configuration.md) — the top-level keys
-- [The shop](./shop.md) — `autobahn mi`, where a notification leads
-- [The desktop app](./app.md) — the window and its optional menu bar
-- [The menu bar app](./macos-app.md) — an icon in the colour of the worst session
-- [The log](./logging.md) — the evidence, for the alerts that clear themselves
+## Timing Overrides (`[experimental.alerts]`)
+
+Tune alert thresholds by configuring `[experimental.alerts]` in `config.toml`:
+
+```toml
+[experimental.alerts]
+alert_after    = "30s"   # Global hold duration override
+coalesce_after = "60s"   # Multi-event aggregation window
+settle_after   = "15m"   # Incident closure threshold
+timeout        = "30s"   # Script execution timeout
+```

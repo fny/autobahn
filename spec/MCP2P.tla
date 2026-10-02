@@ -1,5 +1,5 @@
----- MODULE MCPeering ----
-EXTENDS Peering, TLC
+---- MODULE MCP2P ----
+EXTENDS P2P, TLC
 CONSTANTS b1, b2
 MCPaths == {<<"p">>, <<"q">>}
 MCOrder == <<b1, b2>>

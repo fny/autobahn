@@ -2,7 +2,7 @@
 (***************************************************************************)
 (* The reconciler's rules over a hierarchy of paths, as pure operators:   *)
 (* what one cycle of one pair does to its two trees and its ancestor.     *)
-(* Shared by Autobahn.tla (the star, with a fixed leader) and Peering.tla *)
+(* Shared by Autobahn.tla (the star, with a fixed leader) and P2P.tla *)
 (* (the star, with failover). See Autobahn.tla for the reading of the     *)
 (* rules; nothing here refers to a variable.                              *)
 (***************************************************************************)

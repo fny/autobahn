@@ -930,6 +930,78 @@ esac
 # standard error goes to it.
 echo "autobahn: $AUTOBAHN_SUMMARY" >&2
 "##,
+    // 0.4: opened ~/.autobahn/open-status on click, a second script that
+    // `init` no longer writes.
+    r##"#!/bin/sh
+# autobahn — run when a session needs a person. EXPERIMENTAL: an example,
+# not a contract; edit it freely, and expect it to change between releases.
+#
+# Named by `on_alert` in config.toml. What it is handed:
+#
+#   $AUTOBAHN_SUMMARY      one line: the whole story, or a count
+#   $AUTOBAHN_DETAIL       one indented line per session that needs you
+#   $AUTOBAHN_ICON         autobahn's icon, as an absolute path
+#   $AUTOBAHN_STATES       the state names present, comma separated
+#   $AUTOBAHN_ALERT_COUNT  how many sessions are in the set
+#   $AUTOBAHN_EVENT        "alert" the first time, "repeat" after that
+#
+# The service runs with a sparse PATH and a sparse environment, which is
+# why commands are named in full and the bus address is worked out below.
+set -eu
+
+case "$(uname -s)" in
+Darwin)
+    # A click needs a terminal opened around the shop, which `open` does.
+    OPEN="open -a Terminal $HOME/.autobahn/open-status"
+
+    # terminal-notifier carries a subtitle and a click. Homebrew puts it
+    # in one of two places depending on the chip.
+    for notifier in \
+        /opt/homebrew/bin/terminal-notifier \
+        /usr/local/bin/terminal-notifier
+    do
+        [ -x "$notifier" ] || continue
+        exec "$notifier" \
+            -title autobahn -group autobahn \
+            -appIcon "$AUTOBAHN_ICON" \
+            -subtitle "$AUTOBAHN_DETAIL" \
+            -message "$AUTOBAHN_SUMMARY" \
+            -execute "$OPEN"
+    done
+
+    # Built in, and always there. It holds one line and no click. The
+    # summary goes in as an argument, never as part of the AppleScript: it
+    # can hold a file name someone else chose.
+    exec /usr/bin/osascript \
+        -e 'on run argv' \
+        -e 'display notification (item 1 of argv) with title "autobahn"' \
+        -e 'end run' \
+        "$AUTOBAHN_SUMMARY"
+    ;;
+Linux)
+    # notify-send talks to the desktop over the session bus. A service
+    # started by the user's own systemd inherits the address; one started
+    # by the system does not, so it is guessed from the user id.
+    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
+        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
+        export DBUS_SESSION_BUS_ADDRESS
+    fi
+    if command -v notify-send >/dev/null 2>&1; then
+        # Urgency is normal, not critical: a conflict wants attention
+        # today, not a notification that refuses to go away.
+        exec notify-send \
+            --app-name autobahn \
+            --icon "$AUTOBAHN_ICON" \
+            "$AUTOBAHN_SUMMARY" \
+            "$AUTOBAHN_DETAIL"
+    fi
+    ;;
+esac
+
+# No notifier, or a headless host: the log is still the record, and
+# standard error goes to it.
+echo "autobahn: $AUTOBAHN_SUMMARY" >&2
+"##,
 ];
 
 #[cfg(test)]

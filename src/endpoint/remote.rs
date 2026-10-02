@@ -81,12 +81,12 @@ pub struct RemoteEndpoint {
     digester: crate::tree::TreeDigester,
     /// Where this endpoint's scans report that they are running.
     progress: Option<Arc<crate::progress::SideProgress>>,
-    /// Peering: the lease this endpoint last had accepted, and when. Every
+    /// P2P: the lease this endpoint last had accepted, and when. Every
     /// write re-presents it once a third of its lifetime has passed, so a
     /// leader in the middle of a long transfer never lets it lapse — the
     /// agent refuses a lapsed lease's writes, and followers take over a
     /// lapsed lease's host.
-    presented: Option<(crate::peering::Lease, std::time::Instant)>,
+    presented: Option<(crate::p2p::Lease, std::time::Instant)>,
 }
 
 /// Holds a side in its scanning state until the scan returns, however it
@@ -336,7 +336,7 @@ impl RemoteEndpoint {
             bail!("the reassembled snapshot does not match the agent's digest");
         }
         let snapshot: Snapshot =
-            bincode::deserialize(&output).context("unable to decode the reassembled snapshot")?;
+            crate::wire::decode(&output).context("unable to decode the reassembled snapshot")?;
         check_hierarchy(&snapshot)?;
         Ok((snapshot, output))
     }
@@ -462,7 +462,7 @@ impl RemoteEndpoint {
         }
     }
 
-    /// Peering: re-presents the lease before a write once a third of its
+    /// P2P: re-presents the lease before a write once a third of its
     /// lifetime has passed since it was last accepted. Not while a staging
     /// request's answer is still owed, since the renewal's answer would be
     /// read in its place; the next write renews instead.
@@ -474,16 +474,16 @@ impl RemoteEndpoint {
         if self.stage_begin_pending || at.elapsed() < lifetime / 3 {
             return Ok(());
         }
-        let renewed = crate::peering::Lease::new(&lease.leader, lease.term, lifetime);
+        let renewed = crate::p2p::Lease::new(&lease.leader, lease.term, lifetime);
         match self.lease(&renewed)? {
-            crate::peering::LeaseAnswer::Accepted => Ok(()),
-            crate::peering::LeaseAnswer::Refused { current } => {
-                Err(crate::peering::Fenced { current }.into())
+            crate::p2p::LeaseAnswer::Accepted => Ok(()),
+            crate::p2p::LeaseAnswer::Refused { current } => {
+                Err(crate::p2p::Fenced { current }.into())
             }
         }
     }
 
-    /// Peering: the error for a write the agent refused. A refusal that
+    /// P2P: the error for a write the agent refused. A refusal that
     /// says the channel is fenced is followed by one fresh presentation of
     /// the lease: refused, the host is led by another controller, and the
     /// cycle ends `Fenced` so the supervisor steps down at once; accepted,
@@ -497,13 +497,13 @@ impl RemoteEndpoint {
             return remote_error(message);
         };
         let lifetime = std::time::Duration::from_secs(lease.ttl_seconds);
-        let renewed = crate::peering::Lease::new(&lease.leader, lease.term, lifetime);
+        let renewed = crate::p2p::Lease::new(&lease.leader, lease.term, lifetime);
         match self.channel.exchange(Request::Lease(renewed.clone())) {
-            Ok(Response::Lease(crate::peering::LeaseAnswer::Refused { current })) => {
+            Ok(Response::Lease(crate::p2p::LeaseAnswer::Refused { current })) => {
                 self.presented = None;
-                crate::peering::Fenced { current }.into()
+                crate::p2p::Fenced { current }.into()
             }
-            Ok(Response::Lease(crate::peering::LeaseAnswer::Accepted)) => {
+            Ok(Response::Lease(crate::p2p::LeaseAnswer::Accepted)) => {
                 self.presented = Some((renewed, std::time::Instant::now()));
                 remote_error(message)
             }
@@ -648,14 +648,14 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
-    fn lease(&mut self, lease: &crate::peering::Lease) -> Result<crate::peering::LeaseAnswer> {
+    fn lease(&mut self, lease: &crate::p2p::Lease) -> Result<crate::p2p::LeaseAnswer> {
         match self.exchange(Request::Lease(lease.clone()))? {
             Response::Lease(answer) => {
                 self.presented = match &answer {
-                    crate::peering::LeaseAnswer::Accepted => {
+                    crate::p2p::LeaseAnswer::Accepted => {
                         Some((lease.clone(), std::time::Instant::now()))
                     }
-                    crate::peering::LeaseAnswer::Refused { .. } => None,
+                    crate::p2p::LeaseAnswer::Refused { .. } => None,
                 };
                 Ok(answer)
             }
@@ -687,9 +687,9 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
-    fn put_peering_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
+    fn put_p2p_file(&mut self, name: &str, bytes: &[u8]) -> Result<()> {
         self.renew_if_due()?;
-        let request = Request::PutPeeringFile {
+        let request = Request::PutP2pFile {
             name: name.to_owned(),
             bytes: bytes.to_vec(),
         };
@@ -699,18 +699,18 @@ impl Endpoint for RemoteEndpoint {
         }
     }
 
-    fn peering_state(&mut self) -> Result<crate::peering::State> {
-        match self.exchange(Request::PeeringState)? {
-            Response::PeeringState(state) => Ok(state),
-            response => Err(unexpected_response(&response, "peering state")),
+    fn p2p_state(&mut self) -> Result<crate::p2p::State> {
+        match self.exchange(Request::P2pState)? {
+            Response::P2pState(state) => Ok(state),
+            response => Err(unexpected_response(&response, "p2p state")),
         }
     }
 
-    fn peering_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
+    fn p2p_keys(&mut self) -> Result<crate::peerkeys::HostKeys> {
         self.renew_if_due()?;
-        match self.exchange(Request::PeeringKeys)? {
-            Response::PeeringKeys(keys) => Ok(keys),
-            response => Err(unexpected_response(&response, "peering keys")),
+        match self.exchange(Request::P2pKeys)? {
+            Response::P2pKeys(keys) => Ok(keys),
+            response => Err(unexpected_response(&response, "p2p keys")),
         }
     }
 
@@ -1102,8 +1102,8 @@ fn response_kind(response: &Response) -> &'static str {
         Response::Written => "written",
         Response::Lease(_) => "lease",
         Response::Recorded { .. } => "recorded",
-        Response::PeeringState(_) => "peering state",
-        Response::PeeringKeys(_) => "peering keys",
+        Response::P2pState(_) => "p2p state",
+        Response::P2pKeys(_) => "p2p keys",
         Response::ScanProgress { .. } => "scan progress",
         Response::ScanChanges(_) => "scan changes",
     }

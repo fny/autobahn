@@ -231,7 +231,7 @@ fn open_window(
                             "defaults" => Section::Defaults,
                             "experimental" => Section::Advanced,
                             "alerts" => Section::Alerts,
-                            "peering" => Section::Peering,
+                            "p2p" => Section::P2P,
                             "settings" => Section::Settings,
                             name => Section::Group(name.to_owned()),
                         };
@@ -243,7 +243,7 @@ fn open_window(
                     // one gets taken without a hand on the mouse.
                     dash.unlocked = matches!(
                         dash.section,
-                        Section::Advanced | Section::Alerts | Section::Peering
+                        Section::Advanced | Section::Alerts | Section::P2P
                     ) || std::env::var("AUTOBAHN_DESK_EXPERIMENTAL").is_ok();
                     dash.settle(dash.pane, window, cx);
                 }
@@ -462,6 +462,8 @@ pub fn shoot(
     run_with(config, state_root, Some((directory, pane)))
 }
 
+/// A menu bar alone is useful only if its item appeared. Decide that
+/// before opening the window, so a failed bar still leaves a way in.
 fn run_with(
     config: Option<PathBuf>,
     state_root: PathBuf,
@@ -485,30 +487,30 @@ fn run_with(
                 true => crate::dock::Presence::Both,
                 false => crate::dock::read(&state_root),
             };
-            crate::dock::in_the_dock(presence.opens_a_window());
-            let window = open_window(
-                config.clone(),
-                state_root.clone(),
-                wanted,
-                presence.opens_a_window(),
-                cx,
-            );
-            if shots.is_none() && presence.takes_the_menu_bar() {
+            let wants_bar = shots.is_none() && presence.takes_the_menu_bar();
+            let bar = if wants_bar {
                 // The same item in the menu bar the other window puts
                 // there, from the same code: one poll, one notifier, and
                 // "Open the window" when this one has been closed.
-                match crate::menubar::Bar::start(config.clone(), state_root.clone(), || {}) {
-                    Ok(mut bar) => {
-                        bar.window = true;
-                        bar.appear();
-                        cx.set_global(Menubar(bar));
-                        watch_the_bar(config.clone(), state_root.clone(), cx);
+                match start_the_bar(config.clone(), state_root.clone()) {
+                    Ok(bar) => Some(bar),
+                    Err(error) => {
+                        eprintln!(
+                            "{}",
+                            fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
+                        );
+                        None
                     }
-                    Err(error) => eprintln!(
-                        "{}",
-                        fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
-                    ),
                 }
+            } else {
+                None
+            };
+            let shown = presence.opens_a_window() || (wants_bar && bar.is_none());
+            crate::dock::in_the_dock(shown);
+            let window = open_window(config.clone(), state_root.clone(), wanted, shown, cx);
+            if let Some(bar) = bar {
+                cx.set_global(Menubar(bar));
+                watch_the_bar(config.clone(), state_root.clone(), cx);
             }
             let Some((directory, pane)) = shots.clone() else {
                 return;
@@ -538,6 +540,35 @@ fn run_with(
             .detach();
         });
     Ok(())
+}
+
+/// The window can run without the menu bar, even when a backend panics
+/// instead of returning an error. Keep the whole attempt inside the
+/// fence: `appear` reaches the native toolkit after `start` has returned.
+/// Nothing from a failed attempt is kept for the window to poll, and
+/// the usual panic hook still reports where it failed.
+fn start_the_bar(config: Option<PathBuf>, state_root: PathBuf) -> Result<crate::menubar::Bar> {
+    std::panic::catch_unwind(|| {
+        let mut bar = crate::menubar::Bar::start(config, state_root, || {})?;
+        bar.window = true;
+        bar.appear()?;
+        Ok(bar)
+    })
+    .unwrap_or_else(|panic| Err(anyhow::anyhow!(said_by_a_panic(panic))))
+}
+
+/// What a panic said, when it said anything. A panic can carry any
+/// `Send` payload, and the two that reach here in practice are a
+/// `&'static str` from `assert!` and a `String` somebody built; a
+/// panic with nothing to say still deserves a line of its own.
+fn said_by_a_panic(panic: Box<dyn std::any::Any + Send>) -> String {
+    match panic.downcast_ref::<&'static str>() {
+        Some(said) => (*said).to_owned(),
+        None => match panic.downcast_ref::<String>() {
+            Some(said) => said.clone(),
+            None => t("status.menu_bar_panicked").to_owned(),
+        },
+    }
 }
 
 impl Dash {
@@ -3459,7 +3490,7 @@ impl Dash {
             Section::Alerts => self.shape["$defs"]["AlertsAdvanced"]
                 .get("properties")
                 .cloned(),
-            Section::Peering => self.shape["$defs"]["PeeringAdvanced"]
+            Section::P2P => self.shape["$defs"]["P2pAdvanced"]
                 .get("properties")
                 .cloned(),
             Section::Group(_) => self.shape["$defs"]["Group"].get("properties").cloned(),

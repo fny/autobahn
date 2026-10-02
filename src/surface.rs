@@ -36,8 +36,8 @@ pub(crate) enum Section {
     Advanced,
     /// `[experimental.alerts]`: how long a condition must hold.
     Alerts,
-    /// `[experimental.peering-dangerously-experimental]`: the lease timing.
-    Peering,
+    /// `[experimental.p2p-dangerously-experimental]`: the lease timing.
+    P2P,
     /// One `[groups.x]`.
     Group(String),
 }
@@ -49,7 +49,7 @@ impl Section {
             Section::Defaults => t("config.defaults").to_owned(),
             Section::Advanced => t("config.advanced").to_owned(),
             Section::Alerts => t("config.advanced_alerts").to_owned(),
-            Section::Peering => t("config.advanced_peering").to_owned(),
+            Section::P2P => t("config.advanced_p2p").to_owned(),
             Section::Group(name) => name.clone(),
         }
     }
@@ -342,17 +342,14 @@ pub(crate) const SILENT_AT_THE_TOP: &[&str] = &[
     "experimental",
     "disabled",
     "alerts",
-    "peering-experimental",
+    "p2p-experimental",
 ];
 
 /// The same, for `[experimental]`: its two timing tables are sections of
-/// their own, and `peering-experimental` is the spelling that was
+/// their own, and `p2p-experimental` is the spelling that was
 /// renamed.
-pub(crate) const SILENT_IN_ADVANCED: &[&str] = &[
-    "alerts",
-    "peering-dangerously-experimental",
-    "peering-experimental",
-];
+pub(crate) const SILENT_IN_ADVANCED: &[&str] =
+    &["alerts", "p2p-dangerously-experimental", "p2p-experimental"];
 
 /// Session keys nobody should meet before they have gone looking.
 ///
@@ -388,7 +385,7 @@ pub(crate) const EXPERIMENTAL: &[&str] = &[
 /// which is what the `Section` beside it is for.
 pub(crate) fn drawn_with(section: &Section) -> Vec<Section> {
     match section {
-        Section::Advanced => vec![Section::Advanced, Section::Alerts, Section::Peering],
+        Section::Advanced => vec![Section::Advanced, Section::Alerts, Section::P2P],
         alone => vec![alone.clone()],
     }
 }
@@ -409,8 +406,8 @@ pub(crate) fn table_for<'a>(
             .entry("alerts")
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
-        Section::Peering => experimental(document)?
-            .entry("peering-dangerously-experimental")
+        Section::P2P => experimental(document)?
+            .entry("p2p-dangerously-experimental")
             .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
             .as_table_mut(),
         Section::Group(name) => document
@@ -443,7 +440,7 @@ fn in_document(
         Section::Defaults => document.get("defaults")?,
         Section::Advanced => tuning()?,
         Section::Alerts => tuning()?.get("alerts")?,
-        Section::Peering => tuning()?.get("peering-dangerously-experimental")?,
+        Section::P2P => tuning()?.get("p2p-dangerously-experimental")?,
         Section::Group(name) => document.get("groups")?.get(name)?,
     };
     table.get(key).cloned()
@@ -580,7 +577,7 @@ pub(crate) fn fault_at(fault: &str) -> Option<At> {
                     "" => Section::Settings,
                     "experimental" => Section::Advanced,
                     "experimental.alerts" => Section::Alerts,
-                    table if table.contains("peering") => Section::Peering,
+                    table if table.contains("p2p") => Section::P2P,
                     _ => return None,
                 };
                 return Some(offered(section, key.to_owned(), said.to_owned()));
@@ -1328,7 +1325,7 @@ impl Sheet {
 
     /// The sections of the file, in the order they are written.
     pub(crate) fn sections(&self) -> Vec<Section> {
-        // Alerts and peering are not listed: they are drawn inside
+        // Alerts and p2p are not listed: they are drawn inside
         // `[experimental]`, the only place anyone looks for them.
         let mut sections = vec![Section::Settings, Section::Defaults, Section::Advanced];
         if let Some(groups) = self.document.get("groups").and_then(|item| item.as_table()) {
@@ -1641,9 +1638,12 @@ mod tests {
     /// dot and nothing to show for it.
     #[test]
     fn a_refusal_that_is_one_sentence_is_one_fault() {
-        let alone = "log: unknown log level \"loud\" (available: quiet, normal, debug)";
+        let alone = "log_level: unknown log level \"loud\" (available: quiet, normal, debug)";
         assert_eq!(faults(alone), vec![alone.to_owned()]);
-        assert_eq!(fault_at(alone).map(|at| at.key), Some("log".to_owned()));
+        assert_eq!(
+            fault_at(alone).map(|at| at.key),
+            Some("log_level".to_owned())
+        );
     }
 
     /// Eight lines that differ only in a group name are one fault, and
@@ -1753,7 +1753,7 @@ mod tests {
 
         // A complaint that is a sentence, not a key, belongs nowhere in
         // particular and must not be forced under a field.
-        assert!(fault_at("group 'aws': a peering mode needs a local alpha").is_none());
+        assert!(fault_at("group 'aws': a p2p mode needs a local alpha").is_none());
         assert!(fault_at("sessions 'a' and 'b': endpoint nested").is_none());
     }
 
@@ -1761,10 +1761,11 @@ mod tests {
     /// one names the table it is in.
     #[test]
     fn a_fault_anywhere_in_the_file_finds_its_field() {
-        let top = fault_at("log: unknown log level \"loud\" (available: quiet, normal, debug)")
-            .expect("a key at the top of the file");
+        let top =
+            fault_at("log_level: unknown log level \"loud\" (available: quiet, normal, debug)")
+                .expect("a key at the top of the file");
         assert_eq!(top.section, Section::Settings);
-        assert_eq!(top.key, "log");
+        assert_eq!(top.key, "log_level");
         assert_eq!(top.instead, vec!["quiet", "normal", "debug"]);
 
         let timing = fault_at("experimental.alerts.settle_after: invalid duration 'soon'")
@@ -1773,9 +1774,9 @@ mod tests {
         assert_eq!(timing.key, "settle_after");
 
         let lease =
-            fault_at("experimental.peering-dangerously-experimental.ttl: invalid duration 'soon'")
+            fault_at("experimental.p2p-dangerously-experimental.ttl: invalid duration 'soon'")
                 .expect("a key in the lease timing");
-        assert_eq!(lease.section, Section::Peering);
+        assert_eq!(lease.section, Section::P2P);
         assert_eq!(lease.key, "ttl");
 
         let root = fault_at("experimental.allow_root: not a boolean").expect("a key in the table");

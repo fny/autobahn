@@ -4199,7 +4199,7 @@ fn publish_rename(source: &Path, target: &Path, replace: bool) -> io::Result<()>
         // a kernel older than 3.15 has no such call at all (ENOSYS); some
         // stacks answer EOPNOTSUPP. Falling back to the plain rename in
         // those cases keeps the documented check-then-rename window rather
-        // than failing every creation — the residual RETAINED.md section 2
+        // than failing every creation — the residual accepted-risks.md section 2
         // describes.
         if !matches!(
             error.raw_os_error(),
@@ -4707,7 +4707,7 @@ mod tests {
     /// `RENAME_NOREPLACE` on Linux, `renamex_np(RENAME_EXCL)` on macOS.
     /// Platforms with neither — FreeBSD among them — keep the plain
     /// rename and therefore the documented check-then-rename window
-    /// (RETAINED.md section 2); this pins which behavior each gets rather
+    /// (accepted-risks.md section 2); this pins which behavior each gets rather
     /// than assuming the atomic one everywhere.
     #[test]
     fn a_creation_rename_refuses_to_replace() {
@@ -5986,7 +5986,7 @@ mod tests {
         // proven by the poisoned digest surviving the full-metadata match,
         // exactly as an in-process baseline hint would.
         let mut cached: Snapshot =
-            bincode::deserialize(&fs::read(&cache_path).expect("cache should read"))
+            crate::wire::decode(&fs::read(&cache_path).expect("cache should read"))
                 .expect("cache should decode");
         let root_node = cached.root.as_mut().expect("root should exist");
         {
@@ -5999,7 +5999,7 @@ mod tests {
                 _ => panic!("expected a file"),
             }
         }
-        fs::write(&cache_path, bincode::serialize(&cached).expect("encode"))
+        fs::write(&cache_path, crate::wire::encode(&cached).expect("encode"))
             .expect("cache should be writable");
 
         let mut second =

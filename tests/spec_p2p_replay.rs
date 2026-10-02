@@ -1,6 +1,6 @@
-//! The implementation's fence, held to `spec/Peering.tla`.
+//! The implementation's fence, held to `spec/P2P.tla`.
 //!
-//! The peering spec's safety rests on one decision — whether a host admits
+//! The p2p spec's safety rests on one decision — whether a host admits
 //! the lease a controller presents — and on the order betas take over in.
 //! This file plays the spec's leadership game with the real decision: every
 //! host is a directory with a real lease file, presented leases go through
@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use autobahn::endpoint::{achieved_changes, TransitionOutcome};
-use autobahn::peering::{admit_lease, read_lease, write_lease, Lease, LeaseAnswer};
+use autobahn::p2p::{admit_lease, read_lease, write_lease, Lease, LeaseAnswer};
 use autobahn::tree::{apply, reconcile, Change, Content, Digest, FileMetadata, Node, SyncMode};
 
 const PATHS: [&str; 2] = ["p", "q"];
@@ -712,13 +712,13 @@ fn random_games_keep_the_fence_and_the_accounting() {
 /// first live beta acts first — the ordering the spec's `Takeover` assumes.
 #[test]
 fn takeover_waits_grow_with_position() {
-    let timing = autobahn::config::PeeringPlan {
+    let timing = autobahn::config::P2pPlan {
         ttl: Duration::from_secs(30),
         failover_after: Duration::from_secs(120),
         manage_keys: false,
     };
     let waits: Vec<Duration> = (1..=4)
-        .map(|position| autobahn::peering::takeover_wait(position, &timing))
+        .map(|position| autobahn::p2p::takeover_wait(position, &timing))
         .collect();
     assert!(waits.windows(2).all(|w| w[0] < w[1]), "{waits:?}");
     assert_eq!(waits[0], Duration::from_secs(120));
@@ -735,7 +735,7 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
     let betas: Vec<String> = (1..=game.betas).map(|i| format!("b{i}")).collect();
     let module = [
         format!("---- MODULE {name} ----"),
-        "EXTENDS Peering, Sequences, TLC".to_string(),
+        "EXTENDS P2P, Sequences, TLC".to_string(),
         format!("CONSTANTS {}, v1, v2", betas.join(", ")),
         format!(
             "TPaths == {{{}}}",
@@ -773,7 +773,7 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, mode: SyncMode)
 
 #[test]
 #[ignore = "needs TLC: set AUTOBAHN_TLC=1 and run with --ignored"]
-fn traces_are_behaviors_of_the_peering_spec() {
+fn traces_are_behaviors_of_the_p2p_spec() {
     // Ignored, so that a run without TLC lists it as ignored rather than
     // passed; asked for explicitly without TLC, it fails for the same
     // reason.

@@ -305,7 +305,7 @@ mod deep {
         let directory = tempfile::tempdir().expect("temporary directory should be creatable");
         let path = directory.path().join("state");
         let writer = StateWriter::new();
-        writer.store(path.clone(), move || bincode::serialize(&node).ok());
+        writer.store(path.clone(), move || crate::wire::encode(&node).ok());
         writer.flush();
         let written = std::fs::read(&path).expect("the deep tree should have been written");
         assert!(!written.is_empty());

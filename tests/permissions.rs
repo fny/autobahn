@@ -72,7 +72,7 @@ fn init_under_umask_022_leaves_the_state_root_0700_and_the_configuration_0600() 
     succeeded(&autobahn(&home, &["init"]));
     assert_eq!(mode(&home), 0o700);
     assert_eq!(mode(&home.join("config.toml")), 0o600);
-    for name in ["sessions", "status", "staging", "peering"] {
+    for name in ["sessions", "status", "staging", "p2p"] {
         assert_eq!(mode(&home.join(name)), 0o700, "{name}");
     }
 }

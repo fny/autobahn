@@ -88,8 +88,8 @@ mod tests {
     fn a_deep_node_encodes_decodes_and_drops_on_a_deep_thread() {
         spawn_deep(|| {
             let node = chain(5_000);
-            let encoded = bincode::serialize(&node).expect("encodes");
-            let decoded: Node = bincode::deserialize(&encoded).expect("decodes");
+            let encoded = crate::wire::encode(&node).expect("encodes");
+            let decoded: Node = crate::wire::decode(&encoded).expect("decodes");
             assert!(decoded.content_equal(&node, true));
             drop(decoded);
             drop(node);

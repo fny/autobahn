@@ -193,7 +193,10 @@ jobs:
             echo '    xattr -dr com.apple.quarantine "Autobahn Dash.app"'
             echo
             echo "**Linux** — untar, and keep \`autobahn\` beside \`autobahn-dash\`: the app"
-            echo "shells out to it. Needs a Vulkan driver and either Wayland or X11."
+            echo "shells out to it. Needs a Vulkan driver, either Wayland or X11, and"
+            echo "the shared libraries the build links against:"
+            echo
+            echo "    sudo apt install libgtk-3-0 libayatana-appindicator3-1 libxdo3 libvulkan1"
             echo
             echo "Both archives carry the \`autobahn\` command next to the app, so there is"
             echo "nothing else to install."

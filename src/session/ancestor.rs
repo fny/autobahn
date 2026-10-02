@@ -410,7 +410,7 @@ impl AncestorStore {
     /// store that does not exist yet.
     ///
     /// It reads without writing — no normalization, no format rewrite —
-    /// because the store may be someone else's: peering asks this of a
+    /// because the store may be someone else's: p2p asks this of a
     /// leader's copy and of the session's own store alike, and neither
     /// question is a reason to change what the owner finds next.
     pub(crate) fn stored_generation(path: &Path) -> Result<u64> {
@@ -798,7 +798,7 @@ impl AncestorStore {
         intents: &[String],
     ) -> Result<()> {
         let payload =
-            bincode::serialize(&ancestor).context("unable to encode the ancestor checkpoint")?;
+            crate::wire::encode(&ancestor).context("unable to encode the ancestor checkpoint")?;
         let mut data = Vec::with_capacity(payload.len() + 26);
         data.extend_from_slice(&VERSIONED_CHECKPOINT_MAGIC);
         data.extend_from_slice(&CHECKPOINT_VERSION.to_le_bytes());
@@ -907,7 +907,7 @@ const MAXIMUM_RECORD_SIZE: u64 = 1 << 30;
 /// that changes the encoding adds its predecessor's decoder here.
 fn decode_record(version: u16, payload: &[u8]) -> Result<JournalEntry> {
     match version {
-        OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION => bincode::deserialize(payload)
+        OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION => crate::wire::decode(payload)
             .context("unable to decode a record of the ancestor journal"),
         newer => Err(unreadable_checkpoint(newer)),
     }
@@ -939,7 +939,7 @@ struct Record {
 
 /// Encodes one journal record: the checksummed header, then the payload.
 fn encode_record(generation: u64, entry: &JournalEntry) -> Result<Vec<u8>> {
-    let payload = bincode::serialize(entry).context("unable to encode a journal record")?;
+    let payload = crate::wire::encode(entry).context("unable to encode a journal record")?;
     let length = payload.len() as u64;
     let payload_digest = digest(generation, &payload);
     let mut record = Vec::with_capacity(payload.len() + RECORD_HEADER_SIZE);
@@ -1111,7 +1111,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
         // hierarchy. It reads as generation zero.
         0 => {
             let ancestor: Option<Node> =
-                bincode::deserialize(&data).context("unable to decode ancestor")?;
+                crate::wire::decode(&data).context("unable to decode ancestor")?;
             Ok((0, ancestor, size, 0))
         }
         // Format 1 states no version: a marker, a generation, a digest.
@@ -1126,7 +1126,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
                 bail!("the ancestor checkpoint is corrupt");
             }
             let ancestor: Option<Node> =
-                bincode::deserialize(payload).context("unable to decode ancestor")?;
+                crate::wire::decode(payload).context("unable to decode ancestor")?;
             Ok((generation, ancestor, size, 1))
         }
         // Format 2 and later state their version, and the digest covers it.
@@ -1141,7 +1141,7 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
                 bail!("the ancestor checkpoint is corrupt");
             }
             let ancestor: Option<Node> =
-                bincode::deserialize(payload).context("unable to decode ancestor")?;
+                crate::wire::decode(payload).context("unable to decode ancestor")?;
             Ok((generation, ancestor, size, version))
         }
     }
@@ -1405,7 +1405,7 @@ mod tests {
         let keep = tempdir().expect("temporary directory");
         let path = keep.path().join("ancestor");
         let legacy = Some(directory(vec![file("a", 1)]));
-        fs::write(&path, bincode::serialize(&legacy).expect("encodes")).expect("writes");
+        fs::write(&path, crate::wire::encode(&legacy).expect("encodes")).expect("writes");
 
         let (mut store, ancestor, _) = AncestorStore::open(&path).expect("opens");
         assert!(same(&ancestor, &legacy));
@@ -1557,7 +1557,7 @@ mod tests {
         let mut children: Vec<Node> = (0..30_000).map(|i| file(&format!("f{i:06}"), 1)).collect();
         children.sort_by(|a, b| a.name.cmp(&b.name));
         let initial = Some(directory(children.clone()));
-        let hierarchy_bytes = bincode::serialize(&initial).expect("encodes").len() as u64;
+        let hierarchy_bytes = crate::wire::encode(&initial).expect("encodes").len() as u64;
         assert!(
             hierarchy_bytes > MINIMUM_COMPACTION_SIZE,
             "the corpus must be worth journalling: {hierarchy_bytes} bytes"
@@ -1747,7 +1747,7 @@ mod tests {
         // A legacy checkpoint (bare hierarchy, read as generation zero) with
         // a delta journalled on top: the exact shape codex flagged.
         let base = Some(directory(vec![file("a", 1), file("b", 2)]));
-        fs::write(&path, bincode::serialize(&base).expect("encodes")).expect("writes");
+        fs::write(&path, crate::wire::encode(&base).expect("encodes")).expect("writes");
         let (mut store, loaded, _) = AncestorStore::open(&path).expect("opens");
         assert!(same(&loaded, &base));
         let full = Some(directory(vec![file("a", 1), file("b", 2), file("c", 3)]));
@@ -1770,7 +1770,7 @@ mod tests {
         ];
         for (index, remove_first) in residues.iter().enumerate() {
             // Rebuild the pre-reset state each round.
-            fs::write(&path, bincode::serialize(&base).expect("encodes")).expect("writes");
+            fs::write(&path, crate::wire::encode(&base).expect("encodes")).expect("writes");
             let _ = fs::remove_file(journal_path(&path));
             let (mut store, _, _) = match AncestorStore::open(&path) {
                 Ok(opened) => opened,
@@ -2169,7 +2169,7 @@ mod tests {
         let state = Some(directory(vec![file("a", 1), file("b", 2)]));
 
         // Format 0: the bare hierarchy, as builds before journalling wrote.
-        let bare = bincode::serialize(&state).expect("encodes");
+        let bare = crate::wire::encode(&state).expect("encodes");
         fs::write(&path, &bare).expect("writes");
         assert_eq!(checkpoint_version(&bare), 0);
 
@@ -2201,7 +2201,7 @@ mod tests {
         let path = keep.path().join("ancestor");
         let state = Some(directory(vec![file("a", 1)]));
 
-        let payload = bincode::serialize(&state).expect("encodes");
+        let payload = crate::wire::encode(&state).expect("encodes");
         let generation = 7u64;
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&CHECKPOINT_MAGIC);
@@ -2602,7 +2602,7 @@ mod tests {
     /// A record in the format before headers were checksummed: the base
     /// generation, the length, the payload digest, and the payload.
     fn legacy_record(generation: u64, entry: &JournalEntry) -> Vec<u8> {
-        let payload = bincode::serialize(entry).expect("encodes");
+        let payload = crate::wire::encode(entry).expect("encodes");
         let mut record = Vec::new();
         record.extend_from_slice(&generation.to_le_bytes());
         record.extend_from_slice(&(payload.len() as u64).to_le_bytes());
@@ -2614,7 +2614,7 @@ mod tests {
     /// A format-2 checkpoint, as the build before checksummed record
     /// headers wrote it.
     fn format_two_checkpoint(path: &Path, generation: u64, ancestor: &Option<Node>) {
-        let payload = bincode::serialize(ancestor).expect("encodes");
+        let payload = crate::wire::encode(ancestor).expect("encodes");
         let mut data = Vec::new();
         data.extend_from_slice(&VERSIONED_CHECKPOINT_MAGIC);
         data.extend_from_slice(&2u16.to_le_bytes());
@@ -2755,7 +2755,7 @@ mod tests {
         assert!(unresolved.is_empty());
     }
 
-    /// Reading a store's generation — which peering does to a store it
+    /// Reading a store's generation — which p2p does to a store it
     /// does not own — writes nothing: no normalization, no upgrade, and so
     /// no chance to drop what the store's owner still needs.
     #[test]
@@ -2870,10 +2870,10 @@ mod tests {
         ]);
         let intent = JournalEntry::Intent(vec!["x".into(), "y/z".into()]);
         let checkpoint: Option<Node> = Some(every_shape());
-        assert_eq!(hex(&bincode::serialize(&achieved).unwrap()), ACHIEVED_V2);
-        assert_eq!(hex(&bincode::serialize(&intent).unwrap()), INTENT_V2);
+        assert_eq!(hex(&crate::wire::encode(&achieved).unwrap()), ACHIEVED_V2);
+        assert_eq!(hex(&crate::wire::encode(&intent).unwrap()), INTENT_V2);
         assert_eq!(
-            hex(&bincode::serialize(&checkpoint).unwrap()),
+            hex(&crate::wire::encode(&checkpoint).unwrap()),
             CHECKPOINT_V2
         );
         // A whole record: the checksummed header, then the payload.
@@ -2882,7 +2882,7 @@ mod tests {
             format!("{RECORD_V3_HEADER}{INTENT_V2}")
         );
         // And they decode as what they were.
-        let decoded = decode_record(CHECKPOINT_VERSION, &bincode::serialize(&intent).unwrap())
+        let decoded = decode_record(CHECKPOINT_VERSION, &crate::wire::encode(&intent).unwrap())
             .expect("decodes");
         assert!(matches!(decoded, JournalEntry::Intent(paths) if paths == ["x", "y/z"]));
     }

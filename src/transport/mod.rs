@@ -370,7 +370,7 @@ impl Connection {
     pub fn ssh_argv(host: &str, remote_command: Option<&str>) -> Vec<String> {
         let mut argv = vec![ssh_binary()];
         argv.extend(ssh_options().into_iter().map(str::to_owned));
-        argv.extend(peering_ssh_options());
+        argv.extend(p2p_ssh_options());
         // The option terminator keeps a hostile host specification (one
         // beginning with `-`) from being parsed as an SSH option such as
         // `ProxyCommand`, which would mean local command execution.
@@ -496,13 +496,13 @@ struct ChannelLimits {
 ///
 /// The leader never had any access to the alpha: the alpha dials it, and
 /// runs its own agent for it over that connection. So the leader chooses
-/// only which of the alpha's peering sessions a channel is for. What the
+/// only which of the alpha's p2p sessions a channel is for. What the
 /// endpoint is — its root, ignores, modes, owners and staging — is the
 /// alpha's own configuration for that session, whatever the leader asked
 /// for; a session the alpha does not run is refused, and so is a channel
 /// past what its sessions need.
 pub struct AttachPolicy {
-    /// The alpha's own initialization of each peering session, by session
+    /// The alpha's own initialization of each p2p session, by session
     /// identifier.
     sessions: std::collections::HashMap<String, Initialize>,
     /// The sessions a leader has asked for with other settings, said once.
@@ -538,7 +538,7 @@ impl AttachPolicy {
     fn serve(&self, requested: Initialize) -> Result<Initialize> {
         let Some(own) = self.sessions.get(&requested.session) else {
             bail!(
-                "{:?} is not one of this alpha's peering sessions",
+                "{:?} is not one of this alpha's p2p sessions",
                 requested.session
             );
         };
@@ -560,7 +560,7 @@ impl AttachPolicy {
                 .insert(served.session.clone())
         {
             crate::complain!(
-                "peering: the leader asked for other settings for {}; serving this machine's own",
+                "p2p: the leader asked for other settings for {}; serving this machine's own",
                 served.root
             );
         }
@@ -569,7 +569,7 @@ impl AttachPolicy {
 }
 
 /// [`serve_agent`] over an explicit state area, so that a test's agent
-/// keeps its staging, scan caches and peering files in the test's own
+/// keeps its staging, scan caches and p2p files in the test's own
 /// directory rather than in the real `~/.autobahn`.
 #[cfg(test)]
 pub(crate) fn serve_agent_in<R: Read, W: Write + Send>(
@@ -630,7 +630,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
             loop {
                 let frame: protocol::MuxRequest = match read_frame(&mut input)? {
                     Some(frame) => {
-                        bincode::deserialize(&frame).context("unable to decode frame")?
+                        crate::wire::decode_capped(&frame).context("unable to decode frame")?
                     }
                     // A clean end-of-stream is the controller going away, which
                     // ends every channel (the scope joins their threads once
@@ -911,23 +911,23 @@ fn serve_channel<W: Write + Send>(
     let mut digester = crate::tree::TreeDigester::default();
     // The operations of a snapshot delta in flight, drained by ScanPull.
     let mut pending: std::collections::VecDeque<crate::rsync::Op> = Default::default();
-    // Peering. The fence is the lease this channel was refused against:
+    // P2P. The fence is the lease this channel was refused against:
     // while it is set, nothing this channel asks for may change the host.
     // It is per channel, not per connection, because each channel is one
     // controller's session and presents its own term. The ancestor copy
-    // is opened on first use — most channels never see a peering request.
-    let peering_directory = state_root
+    // is opened on first use — most channels never see a p2p request.
+    let p2p_directory = state_root
         .as_ref()
-        .map(|root| root.join(crate::peering::DIRECTORY))
+        .map(|root| root.join(crate::p2p::DIRECTORY))
         .map_err(|error| anyhow!("{error:#}"));
-    let mut fence: Option<crate::peering::Lease> = None;
+    let mut fence: Option<crate::p2p::Lease> = None;
     // The lease this channel was last accepted at. Every write it asks for
     // is checked against the host's lease, under the lease lock, for the
     // whole of the write: a takeover through another channel, another
     // controller's agent, or this host's own peer fences it at once,
     // rather than at its next renewal.
-    let mut accepted: Option<crate::peering::Lease> = None;
-    let mut copy: Option<crate::peering::AncestorCopy> = None;
+    let mut accepted: Option<crate::p2p::Lease> = None;
+    let mut copy: Option<crate::p2p::AncestorCopy> = None;
     while let Ok(request) = requests.recv() {
         #[cfg(test)]
         if PANICKING_SESSIONS
@@ -958,8 +958,8 @@ fn serve_channel<W: Write + Send>(
                 | Request::Rename(..)
                 | Request::AncestorRecord { .. }
                 | Request::AncestorCheckpoint { .. }
-                | Request::PutPeeringFile { .. }
-                | Request::PeeringKeys
+                | Request::PutP2pFile { .. }
+                | Request::P2pKeys
                 | Request::InstallPeers { .. }
         );
         if let (true, Some(held)) = (writes, &fence) {
@@ -975,39 +975,35 @@ fn serve_channel<W: Write + Send>(
         }
         // Held until this request's response is built: the lease cannot
         // change hands while the write runs.
-        let _lease_guard = match (writes, &accepted, &peering_directory) {
-            (true, Some(lease), Ok(directory)) => {
-                match crate::peering::check_write(directory, lease) {
-                    Ok(guard) => Some(guard),
-                    Err(error) => {
-                        if let Some(crate::peering::WriteRefused::Superseded { current, .. }) =
-                            error.downcast_ref::<crate::peering::WriteRefused>()
-                        {
-                            fence = Some(current.clone());
-                        }
-                        if serve_send(output, channel, Response::Error(format!("{error:#}")))
-                            .is_err()
-                        {
-                            return;
-                        }
-                        continue;
+        let _lease_guard = match (writes, &accepted, &p2p_directory) {
+            (true, Some(lease), Ok(directory)) => match crate::p2p::check_write(directory, lease) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    if let Some(crate::p2p::WriteRefused::Superseded { current, .. }) =
+                        error.downcast_ref::<crate::p2p::WriteRefused>()
+                    {
+                        fence = Some(current.clone());
                     }
+                    if serve_send(output, channel, Response::Error(format!("{error:#}"))).is_err() {
+                        return;
+                    }
+                    continue;
                 }
-            }
+            },
             _ => None,
         };
         let result = match request {
-            Request::Lease(lease) => peering_directory
+            Request::Lease(lease) => p2p_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
-                .and_then(|directory| crate::peering::admit_lease(directory, &lease))
+                .and_then(|directory| crate::p2p::admit_lease(directory, &lease))
                 .map(|answer| {
                     match &answer {
-                        crate::peering::LeaseAnswer::Refused { current } => {
+                        crate::p2p::LeaseAnswer::Refused { current } => {
                             fence = Some(current.clone());
                             accepted = None;
                         }
-                        crate::peering::LeaseAnswer::Accepted => {
+                        crate::p2p::LeaseAnswer::Accepted => {
                             fence = None;
                             accepted = Some(lease);
                         }
@@ -1017,7 +1013,7 @@ fn serve_channel<W: Write + Send>(
             Request::AncestorRecord {
                 generation,
                 changes,
-            } => open_copy(&peering_directory, &initialize.session, &mut copy)
+            } => open_copy(&p2p_directory, &initialize.session, &mut copy)
                 .and_then(|copy| {
                     copy.written_by(accepted.as_ref().map(|lease| lease.leader.as_str()))?;
                     copy.record(generation, &changes)
@@ -1026,7 +1022,7 @@ fn serve_channel<W: Write + Send>(
             Request::AncestorCheckpoint {
                 generation,
                 ancestor,
-            } => open_copy(&peering_directory, &initialize.session, &mut copy)
+            } => open_copy(&p2p_directory, &initialize.session, &mut copy)
                 .and_then(|copy| {
                     copy.written_by(accepted.as_ref().map(|lease| lease.leader.as_str()))?;
                     copy.checkpoint(generation, ancestor)
@@ -1037,30 +1033,30 @@ fn serve_channel<W: Write + Send>(
             // would have it start as a follower of whoever sent it. The
             // lease and the ancestor records, which the handback needs,
             // are taken as from any leader.
-            Request::PutPeeringFile { .. } if attached => Err(anyhow!(
+            Request::PutP2pFile { .. } if attached => Err(anyhow!(
                 "an attached alpha takes no pushed files: it runs its own configuration"
             )),
-            Request::PutPeeringFile { name, bytes } => peering_directory
+            Request::PutP2pFile { name, bytes } => p2p_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
-                .and_then(|directory| crate::peering::write_pushed_file(directory, &name, &bytes))
+                .and_then(|directory| crate::p2p::write_pushed_file(directory, &name, &bytes))
                 .map(|()| Response::Written),
             // Keys are managed only over the user's own login: an agent a
-            // gate ran, for a peering key, refuses, so that no peering key
+            // gate ran, for a p2p key, refuses, so that no p2p key
             // can widen its own access.
-            Request::PeeringKeys | Request::InstallPeers { .. } if gated => Err(anyhow!(
-                "an agent run by the gate manages no keys: a peering key cannot widen its own \
+            Request::P2pKeys | Request::InstallPeers { .. } if gated => Err(anyhow!(
+                "an agent run by the gate manages no keys: a p2p key cannot widen its own \
                  access"
             )),
-            Request::PeeringKeys => peering_directory
+            Request::P2pKeys => p2p_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
                 .and_then(|directory| crate::peerkeys::ensure_key(directory))
-                .map(Response::PeeringKeys),
+                .map(Response::P2pKeys),
             Request::InstallPeers {
                 authorized,
                 known_hosts,
-            } => peering_directory
+            } => p2p_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
                 .and_then(|directory| {
@@ -1070,30 +1066,24 @@ fn serve_channel<W: Write + Send>(
                     crate::peerkeys::install_peers(&home, directory, &authorized, &known_hosts)
                 })
                 .map(|()| Response::Written),
-            Request::PeeringState => peering_directory
+            Request::P2pState => p2p_directory
                 .as_ref()
                 .map_err(|e| anyhow!("{e:#}"))
                 .and_then(|directory| {
-                    let lease = crate::peering::read_lease(directory)?;
+                    let lease = crate::p2p::read_lease(directory)?;
                     let generation = match &copy {
                         Some(copy) => Some(copy.generation()),
-                        None if crate::peering::ancestor_copy_path(
-                            directory,
-                            &initialize.session,
-                        )?
-                        .exists() =>
+                        None if crate::p2p::ancestor_copy_path(directory, &initialize.session)?
+                            .exists() =>
                         {
                             Some(
-                                open_copy(&peering_directory, &initialize.session, &mut copy)?
+                                open_copy(&p2p_directory, &initialize.session, &mut copy)?
                                     .generation(),
                             )
                         }
                         None => None,
                     };
-                    Ok(Response::PeeringState(crate::peering::State {
-                        lease,
-                        generation,
-                    }))
+                    Ok(Response::P2pState(crate::p2p::State { lease, generation }))
                 }),
             Request::Scan => reporting_scan(output, channel, &counted, || endpoint.scan())
                 .and_then(|snapshot| {
@@ -1240,7 +1230,7 @@ fn serve_channel<W: Write + Send>(
 /// hierarchy, so that the controller can re-encode the copy it holds and
 /// obtain the exact bytes a delta was computed against.
 pub fn encode_snapshot(snapshot: &Snapshot) -> Result<Vec<u8>> {
-    bincode::serialize(snapshot).context("unable to encode the snapshot")
+    crate::wire::encode(snapshot).context("unable to encode the snapshot")
 }
 
 /// What this channel should record as sent, once a transition succeeds.
@@ -1290,8 +1280,7 @@ fn changed_scan(
 ) -> Result<(Response, Option<Encoding>)> {
     if let Some(sent) = last_sent {
         let changes = exact_changes(sent.root.as_ref(), snapshot.root.as_ref());
-        let small =
-            bincode::serialized_size(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
+        let small = crate::wire::size_of(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
         if small {
             // Both digests are tree digests, which hash only what changed
             // since the digester last saw these trees: no encoding at all
@@ -1571,27 +1560,27 @@ pub fn ssh_argv_for(destination: &str, remote_command: &str) -> Vec<String> {
 }
 
 /// The ssh options a beta leading from this process dials the others
-/// with: its peering key and the peering `known_hosts`
+/// with: its p2p key and the p2p `known_hosts`
 /// ([`crate::peerkeys::ssh_options`]). Empty anywhere else.
-static PEERING_SSH_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static P2P_SSH_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Sets the ssh options every connection this process makes carries, for a
-/// beta about to lead: its peering key, if it has one.
-pub fn set_peering_ssh_options(options: Vec<String>) {
-    *PEERING_SSH_OPTIONS
+/// beta about to lead: its p2p key, if it has one.
+pub fn set_p2p_ssh_options(options: Vec<String>) {
+    *P2P_SSH_OPTIONS
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = options;
 }
 
-fn peering_ssh_options() -> Vec<String> {
-    PEERING_SSH_OPTIONS
+fn p2p_ssh_options() -> Vec<String> {
+    P2P_SSH_OPTIONS
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .clone()
 }
 
-/// Peering: runs `argv` — the alpha's way to a leader, `ssh <leader>
-/// autobahn peering attach` by default — and serves as an agent over its
+/// P2P: runs `argv` — the alpha's way to a leader, `ssh <leader>
+/// autobahn p2p attach` by default — and serves as an agent over its
 /// stdio until the far side closes. The alpha is never dialed; this is
 /// how it makes itself an endpoint of a session a beta leads, serving
 /// only what `policy` says it runs.
@@ -1624,11 +1613,11 @@ pub fn attach_as_agent(argv: &[String], policy: &AttachPolicy) -> Result<()> {
 fn open_copy<'a>(
     directory: &Result<PathBuf>,
     session: &str,
-    slot: &'a mut Option<crate::peering::AncestorCopy>,
-) -> Result<&'a mut crate::peering::AncestorCopy> {
+    slot: &'a mut Option<crate::p2p::AncestorCopy>,
+) -> Result<&'a mut crate::p2p::AncestorCopy> {
     if slot.is_none() {
         let directory = directory.as_ref().map_err(|error| anyhow!("{error:#}"))?;
-        *slot = Some(crate::peering::AncestorCopy::open(directory, session)?);
+        *slot = Some(crate::p2p::AncestorCopy::open(directory, session)?);
     }
     Ok(slot.as_mut().expect("just opened"))
 }
@@ -1708,7 +1697,7 @@ const COMPRESSED_HEADER_SIZE: usize = 5;
 
 // Scratch buffers for frame assembly, reused across sends on this thread.
 //
-// `bincode::serialize` traverses a message once to size it and again to
+// `wire::encode` traverses a message once to size it and again to
 // encode it, then hands back a fresh allocation; `serialize_into` a buffer
 // that already has capacity does one traversal into memory that is already
 // there. On a supply batch — megabytes of file content — the sizing pass is
@@ -1764,7 +1753,7 @@ fn assemble_and_write<W: Write, T: Serialize>(
     scratch: &mut FrameScratch,
 ) -> Result<()> {
     scratch.encoded.clear();
-    bincode::serialize_into(&mut scratch.encoded, message).context("unable to encode frame")?;
+    crate::wire::encode_into(message, &mut scratch.encoded).context("unable to encode frame")?;
     if scratch.encoded.len() > MAXIMUM_MESSAGE_SIZE {
         bail!(
             "outgoing message of {} bytes exceeds the maximum message size of {} bytes",
@@ -1858,7 +1847,7 @@ fn write_chunk<W: Write>(
 /// Reads one frame and decodes it, treating end-of-stream as an error.
 fn receive_frame<R: Read, T: DeserializeOwned>(reader: &mut R) -> Result<T> {
     let payload = read_frame(reader)?.ok_or_else(|| anyhow!("connection closed"))?;
-    bincode::deserialize(&payload).context("unable to decode frame")
+    crate::wire::decode_capped(&payload).context("unable to decode frame")
 }
 
 /// Reads one frame's payload, returning `None` for a clean end-of-stream at a
@@ -2084,8 +2073,8 @@ mod adversarial {
         for _ in 0..20_000 {
             let length = (rng.next() % 128) as usize;
             let body = rng.bytes(length);
-            let _ = bincode::deserialize::<protocol::MuxRequest>(&body);
-            let _ = bincode::deserialize::<protocol::MuxResponse>(&body);
+            let _ = crate::wire::decode::<protocol::MuxRequest>(&body);
+            let _ = crate::wire::decode::<protocol::MuxResponse>(&body);
         }
     }
 }
@@ -2239,7 +2228,7 @@ pub(crate) mod tests {
                 .err()
                 .expect("a session the alpha does not run");
             assert!(
-                format!("{error:#}").contains("not one of this alpha's peering sessions"),
+                format!("{error:#}").contains("not one of this alpha's p2p sessions"),
                 "{error:#}"
             );
         });
@@ -2251,17 +2240,17 @@ pub(crate) mod tests {
             let mut endpoint =
                 crate::endpoint::remote::RemoteEndpoint::connect(client, own.clone()).unwrap();
             let error = endpoint
-                .put_peering_file("name", b"hostile:/x")
+                .put_p2p_file("name", b"hostile:/x")
                 .expect_err("no pushes into an attached alpha");
             assert!(
                 format!("{error:#}").contains("takes no pushed files"),
                 "{error:#}"
             );
-            assert!(!state.join(crate::peering::DIRECTORY).join("name").exists());
-            let lease = crate::peering::Lease::new("box:/x", 4, std::time::Duration::from_secs(30));
+            assert!(!state.join(crate::p2p::DIRECTORY).join("name").exists());
+            let lease = crate::p2p::Lease::new("box:/x", 4, std::time::Duration::from_secs(30));
             assert_eq!(
                 endpoint.lease(&lease).expect("the lease is taken"),
-                crate::peering::LeaseAnswer::Accepted
+                crate::p2p::LeaseAnswer::Accepted
             );
         });
 
@@ -2321,7 +2310,7 @@ pub(crate) mod tests {
             .expect("inside what this machine serves");
     }
 
-    /// An agent a gate ran manages no keys: a peering key cannot make a
+    /// An agent a gate ran manages no keys: a p2p key cannot make a
     /// key, nor install one, whoever holds it.
     #[test]
     fn a_gated_agent_manages_no_keys() {
@@ -2354,10 +2343,7 @@ pub(crate) mod tests {
             let mut endpoint =
                 crate::endpoint::remote::RemoteEndpoint::connect(client, initialize).unwrap();
             for error in [
-                endpoint
-                    .peering_keys()
-                    .map(|_| ())
-                    .expect_err("no key made"),
+                endpoint.p2p_keys().map(|_| ()).expect_err("no key made"),
                 endpoint
                     .install_peers(&[], &[])
                     .expect_err("no key installed"),
@@ -2365,7 +2351,7 @@ pub(crate) mod tests {
                 assert!(format!("{error:#}").contains("cannot widen"), "{error:#}");
             }
             assert!(!state
-                .join(crate::peering::DIRECTORY)
+                .join(crate::p2p::DIRECTORY)
                 .join(crate::peerkeys::KEY_FILE)
                 .exists());
             drop(endpoint);
@@ -2589,7 +2575,7 @@ pub(crate) mod tests {
         assert_eq!(wire[4], FRAME_UNCOMPRESSED);
         let length = u32::from_le_bytes(wire[..4].try_into().expect("length")) as usize;
         assert_eq!(length, wire.len() - 4, "length must cover flag and body");
-        assert_eq!(&wire[5..], &bincode::serialize(&7u8).expect("encode")[..]);
+        assert_eq!(&wire[5..], &crate::wire::encode(&7u8).expect("encode")[..]);
 
         // Compressible frames above the threshold carry the decompressed
         // length after the flag: [len(4)][flag=1][original(4)][lz4].
@@ -2602,7 +2588,7 @@ pub(crate) mod tests {
         let original = u32::from_le_bytes(wire[5..9].try_into().expect("original")) as usize;
         assert_eq!(
             original,
-            bincode::serialize(&repetitive).expect("encode").len()
+            crate::wire::encode(&repetitive).expect("encode").len()
         );
         assert!(wire.len() < repetitive.len(), "compression should have won");
 
@@ -3062,7 +3048,7 @@ pub(crate) mod tests {
                 break;
             }
             batches += 1;
-            let encoded_batch = bincode::serialize(&Response::ScanOps(batch.clone())).unwrap();
+            let encoded_batch = crate::wire::encode(&Response::ScanOps(batch.clone())).unwrap();
             assert!(
                 encoded_batch.len() < protocol::MAXIMUM_FRAME_SIZE as usize / 4,
                 "a batch must fit a frame with room to spare"
@@ -3114,7 +3100,7 @@ pub(crate) mod tests {
             }
         }
         assert_eq!(*blake3::hash(&output).as_bytes(), header.digest);
-        let decoded: Snapshot = bincode::deserialize(&output).expect("decodes");
+        let decoded: Snapshot = crate::wire::decode(&output).expect("decodes");
         match &decoded.root.unwrap().children()[500].content {
             Content::File { digest, .. } => assert_eq!(*digest, [2u8; 32]),
             other => panic!("expected a file, got {other:?}"),

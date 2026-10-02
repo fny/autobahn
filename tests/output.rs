@@ -19,7 +19,7 @@ fn doctor_piped_prints_no_escape_bytes() {
     std::fs::write(
         &config,
         format!(
-            "[groups.g]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
             alpha.display(),
             beta.display()
         ),
@@ -178,7 +178,7 @@ fn status_says_each_configuration_warning_once() {
     std::fs::write(
         &config,
         format!(
-            "[groups.g]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\
+            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\
              ignores = [\"vendor\", \"!vendor/*.patch\"]\n",
             alpha.display(),
             beta.display()

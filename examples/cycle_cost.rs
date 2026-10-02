@@ -161,7 +161,7 @@ fn main() {
 
         let ancestor_path = staging.with_extension("ancestor");
         let started = Instant::now();
-        let data = bincode::serialize(&edited.root.clone()).expect("ancestor encodes");
+        let data = autobahn::wire::encode(&edited.root.clone()).expect("ancestor encodes");
         let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
         let started = Instant::now();
         let temporary = ancestor_path.with_extension("tmp");

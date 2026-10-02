@@ -16,7 +16,7 @@ A **mode** defines two things:
 | `two-way-alpha-strict` | Alpha ↔ Beta | Alpha wins (strict) | Alpha is authoritative, and Alpha's deletions must override Beta's edits. |
 | `one-way-conflict` | Alpha → Beta | Beta changes pause | Deployments where Beta generates local files (logs, caches) that Alpha must not touch. |
 | `one-way-alpha` *(alias: `mirror`)* | Alpha → Beta | Alpha mirrors strictly | Backups and releases where Beta must be an exact, identical replica of Alpha. |
-| `peering-*-dangerously-experimental` | Failover mesh | Conflict or Alpha | Multi-node failover when Alpha goes offline. *(See [Peering](./peering.md))* |
+| `p2p-*-dangerously-experimental` | Failover mesh | Conflict or Alpha | Multi-node failover when Alpha goes offline. *(See [P2P](./p2p.md))* |
 
 
 ## Behavior Matrix
@@ -49,15 +49,15 @@ Because a deletion contains no file content, reconciling a deletion against an a
 * **`two-way-conflict` & `two-way-alpha` (Edit Wins):** If Alpha deletes a file that Beta modified, the system prioritizes preserving data: Beta's edit survives and is copied back to Alpha. (This commonly happens during renames: Alpha renames `foo` to `bar` while Beta edits `foo`; `foo` reappears on Alpha with Beta's changes).
 * **`two-way-alpha-strict` (Deletion Wins):** Removes this safety fallback. Alpha's deletion is absolute. If Alpha deletes a file, Beta's local edits to that file are discarded. Beta can still push newly created files back to Alpha.
 
-### 3. Large Directory Protection (`guard_directory_deletes_over`)
+### 3. Large Directory Protection (`guard_dir_deletes_over`)
 
 When a mounted drive disconnects, an operating system often presents the mount point as a valid, empty folder. Standard three-way sync engines interpret this as: *"Every file inside was intentionally deleted,"* propagating mass deletions to the other side.
 
-This was a mode of its own, `two-way-paranoid`, which did nothing else — so it could not be had alongside a one-way or peering direction. It is a setting now, and works with any mode:
+This was a mode of its own, `two-way-paranoid`, which did nothing else — so it could not be had alongside a one-way or p2p direction. It is a setting now, and works with any mode:
 
 ```toml
 [groups.work]
-guard_directory_deletes_over = 8
+guard_dir_deletes_over = 8
 ```
 
 Set it, and a directory the ancestor recorded with that many entries or more — **counted recursively**, so one subfolder of seven files reaches eight — is no longer trusted when it disappears from exactly one side:
@@ -78,11 +78,11 @@ When an Alpha syncs concurrently to multiple Betas, each pair runs an independen
 
 ---
 
-The legacy spellings `two-way-safe`, `two-way-resolved`, `one-way-safe`, and `one-way-replica` remain aliases of their corresponding core modes. `two-way-paranoid` has been removed; migrate it to `two-way-conflict` with `guard_directory_deletes_over = 8`.
+`two-way-paranoid` has been removed; migrate it to `two-way-conflict` with `guard_dir_deletes_over = 8`.
 
 ## See Also
 
 * [Configuration](./configuration.md) — How to set the `mode` parameter.
 * [Conflicts](./conflicts.md) — Resolving and settling flagged file collisions.
 * [Safety](./safety.md) — Root-level safeguards against accidental wipeouts.
-* [Peering](./peering.md) — Automatic leader failover setup and edge cases. Dangerously experimental, with known security issues.
+* [P2P](./p2p.md) — Automatic leader failover setup and edge cases. Dangerously experimental, with known security issues.

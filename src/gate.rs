@@ -1,6 +1,6 @@
 //! What a restricted key may run.
 //!
-//! A peering key is restricted in `authorized_keys` to one command,
+//! A p2p key is restricted in `authorized_keys` to one command,
 //! `autobahn-gate gate`, so that whoever holds it — another peer that leads,
 //! compromised or not — can run autobahn's agent there and nothing else. The
 //! gate reads what the connection asked for (`SSH_ORIGINAL_COMMAND`) and
@@ -11,7 +11,7 @@
 //!   version and binaries out of it, builds the script again, and requires
 //!   the two to match to the byte; then it runs the installed binary itself,
 //!   without a shell, marked as gated.
-//! - **`autobahn peering attach`**, which the alpha runs on a leader.
+//! - **`autobahn p2p attach`**, which the alpha runs on a leader.
 //! - **`autobahn gate install <release> <version>`**: an agent installed
 //!   from autobahn's signed release, downloaded and checked here
 //!   ([`crate::update::install_release_agent`]). A controller behind the
@@ -19,7 +19,7 @@
 //!
 //! Anything else is refused, saying [`REFUSAL`] so that a controller can
 //! tell a gate from a broken host. The agent a gate runs knows it is gated
-//! ([`GATED_VARIABLE`]) and refuses to manage keys: a peering key cannot
+//! ([`GATED_VARIABLE`]) and refuses to manage keys: a p2p key cannot
 //! widen its own access.
 
 use std::path::{Path, PathBuf};
@@ -42,7 +42,7 @@ pub fn gated() -> bool {
 pub enum Allowed {
     /// The agent: this binary.
     Agent(PathBuf),
-    /// `autobahn peering attach`.
+    /// `autobahn p2p attach`.
     Attach,
     /// An agent installed from a signed release: the release's tag, the
     /// version asked for, and where it goes.
@@ -73,7 +73,7 @@ pub fn run() -> Result<()> {
         Allowed::Attach => std::process::Command::new(
             std::env::current_exe().context("unable to find this executable")?,
         )
-        .args(["peering", "attach"])
+        .args(["p2p", "attach"])
         .env(GATED_VARIABLE, "1")
         .exec(),
         Allowed::Install {
@@ -96,7 +96,7 @@ pub fn run() -> Result<()> {
 /// `platform` this machine's, in bundle naming.
 pub fn judge(requested: &str, home: &Path, platform: &str) -> Result<Allowed> {
     let bin = home.join(".autobahn").join("bin");
-    if requested == "autobahn peering attach" {
+    if requested == "autobahn p2p attach" {
         return Ok(Allowed::Attach);
     }
     if let Some(rest) = requested.strip_prefix("autobahn gate install ") {
@@ -130,7 +130,7 @@ pub fn judge(requested: &str, home: &Path, platform: &str) -> Result<Allowed> {
     }
     bail!(
         "{REFUSAL} refusing {requested:?}: this key runs only the autobahn agent, `autobahn \
-         peering attach`, and `autobahn gate install <release> <version>`"
+         p2p attach`, and `autobahn gate install <release> <version>`"
     )
 }
 
@@ -262,7 +262,7 @@ mod tests {
             asked.replace(VERSION, "../../bin/sh"),
             asked.replace("exec", "eval"),
             asked.replacen(' ', "  ", 1),
-            "autobahn peering attach; id".to_owned(),
+            "autobahn p2p attach; id".to_owned(),
             "autobahn gate install v1.2 0.4.0".to_owned(),
             "autobahn gate install 0.4.0 0.4.0".to_owned(),
             "autobahn gate install v0.4.0 ../x".to_owned(),
@@ -276,7 +276,7 @@ mod tests {
             );
         }
         assert_eq!(
-            judge("autobahn peering attach", keep.path(), "linux-x86_64").unwrap(),
+            judge("autobahn p2p attach", keep.path(), "linux-x86_64").unwrap(),
             Allowed::Attach
         );
         assert_eq!(

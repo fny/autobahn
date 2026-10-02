@@ -330,7 +330,7 @@ mod tests {
 
     fn configuration(alpha: &Path, beta: &Path) -> String {
         format!(
-            "[groups.work]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "[groups.work]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
             alpha.display(),
             beta.display()
         )
@@ -399,7 +399,8 @@ mod tests {
     fn load_refuses_what_start_refuses() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let path = root.path().join("config.toml");
-        std::fs::write(&path, "live_reload = true\nmdoe = \"two-way-safe\"\n").expect("written");
+        std::fs::write(&path, "live_reload = true\nmdoe = \"two-way-conflict\"\n")
+            .expect("written");
         let error = load(&path).expect_err("an unknown key is refused");
         assert!(format!("{error:#}").contains("mdoe"), "{error:#}");
         let alpha = root.path().join("alpha");
@@ -474,7 +475,7 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "{}[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+                    "{}[groups.notes]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
                     configuration(&alpha, &beta),
                     other.display(),
                     root.path().join("other-mirror").display()
@@ -529,12 +530,12 @@ mod tests {
         // The edit read is two groups; the file then becomes three
         // between that read and the load.
         let two = format!(
-            "{one}[groups.notes]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "{one}[groups.notes]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
             other.display(),
             root.path().join("other-mirror").display()
         );
         let three = format!(
-            "{two}[groups.more]\nmode = \"two-way-safe\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "{two}[groups.more]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
             other.display(),
             root.path().join("more-mirror").display()
         );

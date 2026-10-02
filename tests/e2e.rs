@@ -324,11 +324,11 @@ fn beta_addition_semantics_by_mode() {
             SyncMode::OneWaySafe => {
                 assert!(
                     !alpha_added.exists(),
-                    "one-way-safe must not reverse-propagate"
+                    "one-way-conflict must not reverse-propagate"
                 );
                 assert!(
                     beta_added.exists(),
-                    "one-way-safe must preserve beta additions"
+                    "one-way-conflict must preserve beta additions"
                 );
             }
             SyncMode::OneWayReplica => {
@@ -1113,13 +1113,13 @@ fn a_restart_between_the_intent_and_the_record_recovers_to_a_safe_tree() {
     }
 }
 
-/// Peering, against a real agent: a channel that presents a lease term
+/// P2P, against a real agent: a channel that presents a lease term
 /// below the host's is fenced — every write refused, reads still answered
 /// — until it presents a term at least as high; the ancestor copy follows
 /// records and takes a checkpoint when it cannot.
 #[test]
-fn peering_fence_and_ancestor_copy_over_the_wire() {
-    use autobahn::peering::{Lease, LeaseAnswer};
+fn p2p_fence_and_ancestor_copy_over_the_wire() {
+    use autobahn::p2p::{Lease, LeaseAnswer};
     use autobahn::tree::{Change, Node};
     use std::time::Duration;
 
@@ -1135,10 +1135,7 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
             connection,
             Initialize {
                 root: root.to_string_lossy().into_owned(),
-                session: autobahn::session::session_identifier(
-                    &root.to_string_lossy(),
-                    "peering-e2e",
-                ),
+                session: autobahn::session::session_identifier(&root.to_string_lossy(), "p2p-e2e"),
                 ignores: Vec::new(),
                 symlink_mode: SymlinkMode::Raw,
                 file_mode: None,
@@ -1168,7 +1165,7 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
         endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap(),
         LeaseAnswer::Accepted
     );
-    let state = endpoint.peering_state().unwrap();
+    let state = endpoint.p2p_state().unwrap();
     assert_eq!(
         state.lease.as_ref().map(|l| (l.term, l.leader.as_str())),
         Some((5, "alpha"))
@@ -1185,9 +1182,9 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
     // Before the old leader presents anything again, its next write is
     // refused all the same, and ends its cycle fenced by the newer lease.
     let error = endpoint
-        .put_peering_file("name", b"alpha")
+        .put_p2p_file("name", b"alpha")
         .expect_err("a write under a superseded lease is refused");
-    match error.downcast_ref::<autobahn::peering::Fenced>() {
+    match error.downcast_ref::<autobahn::p2p::Fenced>() {
         Some(fenced) => assert_eq!(fenced.current.term, 6),
         None => panic!("the refusal should end the cycle fenced: {error:#}"),
     }
@@ -1200,7 +1197,7 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
     }
     endpoint.scan().expect("reads still answer while fenced");
     let error = endpoint
-        .put_peering_file("name", b"u@h:/x")
+        .put_p2p_file("name", b"u@h:/x")
         .expect_err("a write while fenced is refused");
     assert!(format!("{error:#}").contains("fenced"), "{error:#}");
     let error = endpoint
@@ -1223,7 +1220,7 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
         LeaseAnswer::Accepted
     );
     endpoint
-        .put_peering_file("name", b"u@h:/x")
+        .put_p2p_file("name", b"u@h:/x")
         .expect("writes again");
 
     // The ancestor copy: the first record carries the tree; a record for
@@ -1261,12 +1258,12 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
         new: Some(Node::directory("c", Vec::new())),
     };
     assert_eq!(endpoint.ancestor_record(4, &[addition]).unwrap(), 4);
-    assert_eq!(endpoint.peering_state().unwrap().generation, Some(4));
+    assert_eq!(endpoint.p2p_state().unwrap().generation, Some(4));
     // The copy names who wrote it — the leader this channel was accepted
     // as — which is what a host checks before it takes the copy up.
-    let session = autobahn::session::session_identifier(&root.to_string_lossy(), "peering-e2e");
+    let session = autobahn::session::session_identifier(&root.to_string_lossy(), "p2p-e2e");
     assert_eq!(
-        autobahn::peering::copy_writer(&autobahn::peering::directory().unwrap(), &session)
+        autobahn::p2p::copy_writer(&autobahn::p2p::directory().unwrap(), &session)
             .unwrap()
             .as_deref(),
         Some("alpha")
@@ -1274,16 +1271,16 @@ fn peering_fence_and_ancestor_copy_over_the_wire() {
 
     // A fresh connection sees what the host holds: the copy survived.
     let mut again = connect();
-    let state = again.peering_state().unwrap();
+    let state = again.p2p_state().unwrap();
     assert_eq!(state.generation, Some(4));
     assert_eq!(state.lease.map(|l| l.term), Some(7));
 
     // Only the files a follower needs can be pushed.
     let error = again
-        .put_peering_file("../escape", b"x")
+        .put_p2p_file("../escape", b"x")
         .expect_err("an unknown file name is refused");
     assert!(
-        format!("{error:#}").contains("not a file peering pushes"),
+        format!("{error:#}").contains("not a file p2p pushes"),
         "{error:#}"
     );
 }

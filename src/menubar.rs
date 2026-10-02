@@ -237,24 +237,34 @@ impl Bar {
 
     /// Puts the item in the menu bar, once, and fills it in. macOS
     /// wants this after the application is running, which is why it is
-    /// not part of starting.
-    pub(crate) fn appear(&mut self) {
+    /// not part of starting. A refusal goes back to the surface: the
+    /// dash can still offer its window when there is no item to open it.
+    pub(crate) fn appear(&mut self) -> Result<()> {
         if self.tray.is_some() {
-            return;
+            return Ok(());
         }
+        // Neither GPUI nor winit starts GTK, but muda needs it before
+        // building the item's menu (#12). Both surfaces call here on
+        // their main thread. GTK remembers a successful start on that
+        // thread; without a display it returns an error instead.
+        #[cfg(any(
+            target_os = "linux",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd"
+        ))]
+        gtk::init()?;
+
         let menu = Menu::new();
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_icon(icon(Health::Idle, menu_bar_ink(None)))
             .with_tooltip("autobahn")
-            .build();
-        match tray {
-            Ok(tray) => {
-                self.tray = Some(tray);
-                self.refresh();
-            }
-            Err(error) => eprintln!("unable to put an item in the menu bar: {error}"),
-        }
+            .build()?;
+        self.tray = Some(tray);
+        self.refresh();
+        Ok(())
     }
 
     /// What a menu choice does. `true` when it was Quit, which the
@@ -294,8 +304,12 @@ impl Bar {
     }
 
     /// Rebuilds the report, the menu, and the icon; raises notifications
-    /// for transitions.
+    /// for transitions. The tray's timer still ticks after a refused
+    /// start, but there is then no item to refresh.
     pub(crate) fn refresh(&mut self) {
+        if self.tray.is_none() {
+            return;
+        }
         let report = match self.build_report() {
             Ok(report) => report,
             Err(error) => {
@@ -1094,7 +1108,7 @@ pub(crate) fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
 }
 
 /// How a group is named in the menu: its root, its name, and — when it is
-/// peering — which side is doing the work. A group that is not peering
+/// p2p — which side is doing the work. A group that is not p2p
 /// says nothing about roles, which is every group until someone asks for
 /// one.
 pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {
@@ -1488,6 +1502,80 @@ mod menu_tests {
             }),
             supervisor_mismatch: None,
             supervisor_unresponsive: false,
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod bar_tests {
+    use super::*;
+
+    /// Appearing must start GTK or return a refusal, never panic (#12).
+    /// Each attempt gets a fresh process: GTK belongs to one thread for
+    /// life, and a previous test's start must not hide this one's bug.
+    /// Exercise a missing display even when the test runner has one.
+    #[test]
+    fn appearing_starts_gtk_or_does_without_an_item() {
+        const CHILD: &str = "AUTOBAHN_TEST_BAR_DISPLAY";
+        if std::env::var_os(CHILD).is_none() {
+            for display in ["inherited", "headless"] {
+                let mut command =
+                    std::process::Command::new(std::env::current_exe().expect("the test binary"));
+                command
+                    .args([
+                        "--exact",
+                        "menubar::bar_tests::appearing_starts_gtk_or_does_without_an_item",
+                        "--nocapture",
+                    ])
+                    .env(CHILD, display);
+                if display == "headless" {
+                    command
+                        .env_remove("DISPLAY")
+                        .env_remove("WAYLAND_DISPLAY")
+                        .env("GDK_BACKEND", "x11");
+                }
+                let output = command.output().expect("a fresh process for GTK");
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(output.status.success(), "{display}: {stdout}\n{stderr}");
+                assert!(
+                    stdout.contains("1 passed"),
+                    "the test did not run: {stdout}"
+                );
+            }
+            return;
+        }
+
+        assert!(
+            !gtk::is_initialized(),
+            "this process must start without GTK"
+        );
+        let own = tempfile::tempdir().expect("a temporary state root");
+        let mut bar = Bar::start(
+            Some(own.path().join("config.toml")),
+            own.path().to_owned(),
+            || {},
+        )
+        .expect("a bar");
+        let appeared = bar.appear();
+        if std::env::var(CHILD).as_deref() == Ok("headless") {
+            assert!(appeared.is_err(), "a missing display must be reported");
+        }
+        match appeared {
+            Ok(()) => {
+                assert!(gtk::is_initialized_main_thread());
+                assert!(bar.tray.is_some(), "success means an item appeared");
+                bar.appear()
+                    .expect("an existing item needs no second start");
+            }
+            Err(error) => {
+                assert!(!error.to_string().is_empty(), "a refusal must say why");
+                assert!(bar.tray.is_none());
+                // The standalone tray keeps its timer after a refusal.
+                bar.refresh();
+                bar.finished();
+                assert!(bar.model.is_none(), "no menu is built without an item");
+            }
         }
     }
 }

@@ -118,7 +118,7 @@ jobs:
       - name: The implementation against the spec
         # --include-ignored: the TLC tests are to be marked #[ignore], so a
         # local run without TLC reports them as ignored, not as passed.
-        run: AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_peering_replay -- --include-ignored
+        run: AUTOBAHN_TLC=1 cargo test --release --locked --test spec_replay --test spec_p2p_replay -- --include-ignored
 
   mac:
     # A job with `needs` runs only if what it needs succeeded, and that

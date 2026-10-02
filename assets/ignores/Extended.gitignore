@@ -1,0 +1,156 @@
+# Files that are safe to synchronize and usually not worth it.
+#
+#   [defaults]
+#   ignores = ["file:Essential.gitignore", "file:Extended.gitignore"]
+
+# ── JavaScript and TypeScript ────────────────────────────────────────
+node_modules/
+bower_components/
+.pnpm-store/
+.yarn/cache/
+.yarn/unplugged/
+.next/
+.nuxt/
+.svelte-kit/
+.astro/
+.angular/
+.turbo/
+.parcel-cache/
+.vite/
+.rollup.cache/
+.eslintcache
+.stylelintcache
+*.tsbuildinfo
+
+# ── Python ───────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.venv/
+venv/
+.tox/
+.nox/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.pytype/
+.ipynb_checkpoints/
+pip-wheel-metadata/
+
+# ── Rust ─────────────────────────────────────────────────────────────
+#
+# Cargo.lock is deliberately absent: it belongs on every machine.
+target/
+**/*.rs.bk
+
+# ── Go ───────────────────────────────────────────────────────────────
+#
+# vendor/ is absent on purpose — some projects commit it.
+*.test
+*.out
+
+# ── JVM ──────────────────────────────────────────────────────────────
+.gradle/
+.mvn/wrapper/maven-wrapper.jar
+*.class
+*.jar
+*.war
+*.ear
+hs_err_pid*
+
+# ── Ruby ─────────────────────────────────────────────────────────────
+.bundle/
+vendor/bundle/
+.yardoc/
+
+# ── PHP ──────────────────────────────────────────────────────────────
+.php-cs-fixer.cache
+.phpunit.result.cache
+
+# ── Swift, Xcode, CocoaPods ──────────────────────────────────────────
+.build/
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+Pods/
+
+# ── .NET ─────────────────────────────────────────────────────────────
+obj/
+packages/
+*.user
+
+# ── Elixir and Erlang ────────────────────────────────────────────────
+_build/
+deps/
+.elixir_ls/
+
+# ── Haskell ──────────────────────────────────────────────────────────
+.stack-work/
+dist-newstyle/
+
+# ── Dart and Flutter ─────────────────────────────────────────────────
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# ── Android ──────────────────────────────────────────────────────────
+local.properties
+*.apk
+*.aab
+
+# ── C, C++, CMake ────────────────────────────────────────────────────
+*.o
+*.obj
+*.so
+*.dylib
+*.a
+*.lo
+*.la
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+
+# ── Infrastructure ───────────────────────────────────────────────────
+.terraform/
+.vagrant/
+.serverless/
+
+# ── Machine learning ─────────────────────────────────────────────────
+#
+# Weights are the expensive case: gigabytes that a training run rewrites
+# and a download can replace. Checkpoints you cannot reproduce are not
+# here — remove the lines rather than lose them.
+wandb/
+mlruns/
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.gguf
+
+# ── Coverage and logs ────────────────────────────────────────────────
+coverage/
+htmlcov/
+.coverage
+.nyc_output/
+*.log
+logs/
+
+# ── Editors ──────────────────────────────────────────────────────────
+#
+# .vscode/ is absent on purpose: a shared settings file is often the
+# point of having one.
+.idea/
+*.iml
+*.sublime-workspace
+
+# ── Judgement calls ──────────────────────────────────────────────────
+#
+# These three are output in most projects and source in some. A site with
+# a hand-written `dist/`, or a shell project whose scripts live in `bin/`,
+# wants them deleted from this list.
+dist/
+build/
+out/

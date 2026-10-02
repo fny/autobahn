@@ -51,8 +51,8 @@ pub(crate) mod menubar;
 #[cfg(any(feature = "tray", feature = "dash"))]
 pub(crate) mod native_alert;
 pub mod ownership;
+pub mod p2p;
 pub mod paths;
-pub mod peering;
 pub mod peerkeys;
 pub mod persist;
 pub mod power;
@@ -74,6 +74,9 @@ pub mod transport;
 pub mod tray;
 pub mod tree;
 pub mod update;
+/// Encoding, in one place: the format and the decode limits. Public
+/// so the examples measure what the transport actually does.
+pub mod wire;
 /// What the surfaces say, in one place.
 #[cfg(any(feature = "tray", feature = "dash"))]
 pub(crate) mod words;

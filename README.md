@@ -21,7 +21,7 @@ Point your coding agent at [INSTALL.md](INSTALL.md) for interactive setup, or se
 - **Fast as hell.** Delivers sub-30ms propagation times for small-file updates across trees containing hundreds of thousands of files.
 - **Lightweight.** Employs immutable shared-tree structures in memory, requiring significantly less RAM and idle CPU than conventional sync daemons.
 - **Safe.** Choose a sync policy per group, backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
-- **Reviewed.** Security findings and fixes are recorded in [REVIEWS](REVIEWS/README.md); [accepted risks](docs/correctness/accepted-risks.md) remain.
+- **Reviewed.** Findings from the security reviews are fixed or recorded; the ones that remain are in [accepted risks](docs/correctness/accepted-risks.md), each with its reasoning.
 - **Privacy first.** No cloud service, no account, no third party.
 
 ## Quick Start

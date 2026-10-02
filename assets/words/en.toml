@@ -128,7 +128,7 @@ install_now = "Install Service"
 installing = "Installing…"
 starting = "starting…"
 installed = "Installed: {path}"
-install_failed = "That did not work. ~/.autobahn/install.log says why."
+install_failed = "Failed to install. See ~/.autobahn/install.log."
 by_hand = "Install manually"
 copied = "Command copied. Paste it into a terminal."
 

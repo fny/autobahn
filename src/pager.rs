@@ -105,13 +105,28 @@ pub fn display(label: &str, mut content: impl FnMut() -> String) -> Result<()> {
 
 /// Assembles one frame: the visible slice of the content, then the footer.
 fn paint(lines: &[&str], offset: usize, window: usize, columns: usize, label: &str) -> String {
+    paint_with_style(
+        lines,
+        offset,
+        window,
+        columns,
+        label,
+        crate::style::screen_level(),
+    )
+}
+
+fn paint_with_style(
+    lines: &[&str],
+    offset: usize,
+    window: usize,
+    columns: usize,
+    label: &str,
+    style: crate::style::Level,
+) -> String {
     let mut frame = String::new();
     for line in lines.iter().skip(offset).take(window) {
         let line = only_colour(line);
-        frame.push_str(&truncate(
-            &crate::style::apply(&line, crate::style::screen_level()),
-            columns,
-        ));
+        frame.push_str(&truncate(&crate::style::apply(&line, style), columns));
         frame.push_str("\x1b[K\n");
     }
     // The window is padded to its full height so that a shorter frame does
@@ -388,7 +403,7 @@ mod tests {
     fn only_colour_reaches_the_terminal() {
         let line =
             "\x1b[33mconflicts\x1b[0m: evil\x1b]52;c;cHduZWQ=\x07\r\x1b[2Jdone\x1b[1;32m!\x1b[0m";
-        let frame = paint(&[line], 0, 1, 200, "watching");
+        let frame = paint_with_style(&[line], 0, 1, 200, "watching", crate::style::Level::Colour);
         assert!(frame.contains("\x1b[33mconflicts\x1b[0m"), "{frame:?}");
         assert!(frame.contains("\x1b[1;32m!"), "{frame:?}");
         assert!(

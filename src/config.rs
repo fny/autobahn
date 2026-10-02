@@ -2780,7 +2780,8 @@ mod tests {
             .defaults
             .ignores
             .iter()
-            .any(|pattern| pattern == ".git"));
+            .any(|pattern| pattern == "file:Essential.gitignore"));
+        assert!(ESSENTIAL_IGNORES.lines().any(|pattern| pattern == ".git"));
         assert_eq!(
             config.plans().expect("the template plans").len(),
             0,
@@ -2818,8 +2819,8 @@ mod tests {
         }
     }
 
-    /// The pre-rename p2p spellings are refused with the new name and
-    /// the reason, not as an unknown mode or field.
+    /// Old p2p modes name their replacement; the removed table is an
+    /// unknown field whose error lists the current table.
     #[test]
     fn the_old_p2p_names_are_answered_with_the_rename() {
         for old in ["p2p-conflict-experimental", "p2p-alpha-experimental"] {
@@ -2830,7 +2831,7 @@ mod tests {
         }
         let error = format!(
             "{:#}",
-            parse(
+            toml::from_str::<Config>(
                 r#"
                 [experimental.p2p-experimental]
                 ttl = "30s"
@@ -2840,8 +2841,11 @@ mod tests {
                 betas = ["u@h:/tmp/b"]
                 "#,
             )
-            .plans()
             .expect_err("the old section name is refused")
+        );
+        assert!(
+            error.contains("unknown field `p2p-experimental`"),
+            "{error}"
         );
         assert!(error.contains("p2p-dangerously-experimental"), "{error}");
     }
@@ -3389,21 +3393,19 @@ mod tests {
     /// deliver.
     #[test]
     fn the_example_scripts_are_valid_shell() {
-        for (name, contents) in [("on-alert.sh", ON_ALERT_EXAMPLE)] {
-            let directory = tempfile::tempdir().expect("a temporary directory");
-            let script = directory.path().join(name);
-            std::fs::write(&script, contents).expect("the script should be writable");
-            let checked = std::process::Command::new("sh")
-                .arg("-n")
-                .arg(&script)
-                .output()
-                .expect("sh should run");
-            assert!(
-                checked.status.success(),
-                "{name}: {}",
-                String::from_utf8_lossy(&checked.stderr)
-            );
-        }
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let script = directory.path().join("on-alert.sh");
+        std::fs::write(&script, ON_ALERT_EXAMPLE).expect("the script should be writable");
+        let checked = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .output()
+            .expect("sh should run");
+        assert!(
+            checked.status.success(),
+            "on-alert.sh: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
     }
 
     /// `disable` edits the file people wrote, so what they wrote has to

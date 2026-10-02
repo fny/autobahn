@@ -3957,14 +3957,16 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
         })?
         .len();
     println!("wrote {}", path.display());
-    for (name, contents) in [("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE)] {
-        // An existing script is never replaced, not even under `--force`:
-        // the configuration is autobahn's to rewrite, but a hook is a
-        // script its owner may have made their own, and there is no way to
-        // tell one that was edited from one that was not.
-        if let Some(written) = write_example_script(path.parent(), name, contents)? {
-            println!("wrote {}", written.display());
-        }
+    // An existing script is never replaced, not even under `--force`:
+    // the configuration is autobahn's to rewrite, but a hook is a
+    // script its owner may have made their own, and there is no way to
+    // tell one that was edited from one that was not.
+    if let Some(written) = write_example_script(
+        path.parent(),
+        "on-alert.sh",
+        autobahn::config::ON_ALERT_EXAMPLE,
+    )? {
+        println!("wrote {}", written.display());
     }
     for (name, contents) in [
         ("Essential.gitignore", autobahn::config::ESSENTIAL_IGNORES),

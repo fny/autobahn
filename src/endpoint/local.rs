@@ -6774,6 +6774,14 @@ mod watch_tests {
 
         // Moved away and back, so the watch reaches it only by extension.
         std::fs::rename(root.path().join("vendor"), root.path().join("aside")).unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("aside"),
+            Duration::from_secs(3)
+        ));
+        // Wait for the move away before returning. Otherwise its old
+        // vendor event can satisfy the wait for the directory's return.
+        drop(watcher.take());
         std::fs::rename(root.path().join("aside"), root.path().join("vendor")).unwrap();
         assert!(recorded_within(
             &watcher,

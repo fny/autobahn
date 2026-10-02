@@ -92,10 +92,6 @@ enum ModeArgument {
     /// reported and left alone.
     #[value(name = "two-way-conflict", alias = "two-way-safe")]
     TwoWaySafe,
-    /// two-way-conflict, and a large directory emptied on one side is a
-    /// conflict too, rather than a deletion to propagate.
-    #[value(name = "two-way-paranoid")]
-    TwoWayParanoid,
     /// Both directions; a file changed on both sides takes alpha's
     /// version, silently.
     #[value(name = "two-way-alpha", alias = "two-way-resolved")]
@@ -117,7 +113,6 @@ impl From<ModeArgument> for SyncMode {
     fn from(argument: ModeArgument) -> SyncMode {
         match argument {
             ModeArgument::TwoWaySafe => SyncMode::TwoWaySafe,
-            ModeArgument::TwoWayParanoid => SyncMode::TwoWayParanoid,
             ModeArgument::TwoWayResolved => SyncMode::TwoWayResolved,
             ModeArgument::TwoWayStrict => SyncMode::TwoWayStrict,
             ModeArgument::OneWaySafe => SyncMode::OneWaySafe,

@@ -291,6 +291,9 @@ pub struct Session {
     /// Whether mount points inside the roots are left alone (the default)
     /// or synchronized as part of the tree.
     ignore_mounts: bool,
+    /// The directory size at or above which a one-sided disappearance is
+    /// disbelieved. Carried here so both reconciliations use the same one.
+    guard_directory_deletes_over: Option<usize>,
     /// Each side's last scanned root and the problems found in it, so the
     /// next cycle's search can skip what did not change
     /// ([`Node::problems_since`]).
@@ -366,6 +369,19 @@ impl Session {
     /// mount as.
     pub fn set_ignore_mounts(&mut self, ignore: bool) {
         self.ignore_mounts = ignore;
+    }
+
+    pub fn set_guard_directory_deletes_over(&mut self, over: Option<usize>) {
+        self.guard_directory_deletes_over = over;
+    }
+
+    /// What reconciliation is asked to do: the mode, and how suspicious
+    /// to be of a directory that disappears.
+    fn policy(&self) -> crate::tree::Policy {
+        crate::tree::Policy {
+            mode: self.mode,
+            guard_directory_deletes_over: self.guard_directory_deletes_over,
+        }
     }
 
     /// Opts the ancestor store into power-loss durability: every journal
@@ -580,6 +596,7 @@ impl Session {
             unreadable,
             power_durability: false,
             ignore_mounts: true,
+            guard_directory_deletes_over: None,
             scan_problems: [None, None],
             reconcile_memo: None,
         })
@@ -707,7 +724,7 @@ impl Session {
         alpha: Option<&Node>,
         beta: Option<&Node>,
     ) -> Result<()> {
-        let untouched = reconcile(None, alpha, beta, self.mode);
+        let untouched = reconcile(None, alpha, beta, self.policy());
         let matching = untouched.conflicts.is_empty()
             && untouched.alpha_transitions.is_empty()
             && untouched.beta_transitions.is_empty();
@@ -1076,7 +1093,7 @@ impl Session {
             self.ancestor.as_ref(),
             alpha_root.as_ref(),
             beta_root.as_ref(),
-            self.mode,
+            self.policy(),
             self.reconcile_memo.as_ref(),
         );
         self.reconcile_memo = Some(crate::tree::ReconcileMemo::of(
@@ -1512,8 +1529,8 @@ fn pump(
 /// holding nothing synchronizable, while the other retains content. An
 /// ignored entry left behind (the `.DS_Store` of a bare mount point, the
 /// `.git` of a wiped checkout) does not make a root any less emptied. Emptied directories *below* the
-/// root are reconciliation's concern, and only in the paranoid mode (see
-/// `tree::reconcile::PARANOID_MINIMUM`); a separate whole-tree pass here
+/// root are reconciliation's concern, and only where
+/// `guard_directory_deletes_over` asks for it; a separate whole-tree pass here
 /// measured at twenty milliseconds per cycle on a sixty-thousand-entry
 /// tree, dominating the latency of every edit. The ancestor count — the
 /// only expensive part — runs lazily, only when the rare one-side-empty
@@ -1876,7 +1893,6 @@ mod tests {
         };
         for mode in [
             SyncMode::TwoWaySafe,
-            SyncMode::TwoWayParanoid,
             SyncMode::TwoWayResolved,
             SyncMode::TwoWayStrict,
             SyncMode::OneWaySafe,

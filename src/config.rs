@@ -69,8 +69,6 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 # file. There is no default: direction is never guessed.
 #
 #   two-way-conflict   both ways; a clash is reported and nothing is touched
-#   two-way-paranoid   as above, and a large directory that turns up empty
-#                      on one side is a conflict, not a deletion to copy
 #   two-way-alpha      both ways; alpha's version wins a clash, silently
 #   two-way-alpha-strict  as above, and alpha's deletion of a file beta
 #                      edited wins too (in two-way-alpha the edit survives)
@@ -488,8 +486,22 @@ pub struct Defaults {
     /// The default limit on entries (files, directories, symlinks) per
     /// root. A scan exceeding it fails the session's cycle.
     pub max_entry_count: Option<u64>,
-    /// Whether directories mounted inside a root are left alone (the
-    /// default) rather than synchronized as part of it.
+    /// Entries in a directory at or above which it disappearing from
+    /// exactly one side is disbelieved rather than propagated.
+    ///
+    /// A directory that turns up empty is a conflict; one that is gone
+    /// while the other side still holds what the ancestor recorded is
+    /// put back. Counted recursively, so one subfolder of seven files
+    /// reaches eight. Unset propagates every disappearance, whatever its
+    /// size.
+    ///
+    /// This was the `two-way-paranoid` mode, which did nothing else and
+    /// so could not be had alongside a one-way or peering direction.
+    pub guard_directory_deletes_over: Option<usize>,
+    /// Whether directories mounted inside a root are left alone rather
+    /// than synchronized as part of it. Off unless said otherwise: a
+    /// mount is walked like any other directory, and one that goes away
+    /// where the ancestor held content halts rather than deleting.
     pub ignore_mounts: Option<bool>,
     /// The default staging placement (`state`, `beside-root`, or
     /// `inside-root`).
@@ -548,7 +560,11 @@ pub struct Group {
     /// The limit on entries per root. A scan exceeding it fails the
     /// session's cycle.
     pub max_entry_count: Option<u64>,
-    /// Whether mounts inside the roots are left alone.
+    /// Entries in a directory at or above which it disappearing from
+    /// exactly one side is disbelieved — see the defaults' own.
+    pub guard_directory_deletes_over: Option<usize>,
+    /// Whether mounts inside the roots are left alone. Off unless said
+    /// otherwise.
     pub ignore_mounts: Option<bool>,
     /// The staging placement: `state` (the session state directory),
     /// `beside-root` (a sibling of the synchronization root, guaranteeing
@@ -624,6 +640,9 @@ pub struct SessionPlan {
     /// Whether directories on another device than their root — mount
     /// points — are left alone rather than synchronized.
     pub ignore_mounts: bool,
+    /// The directory size at or above which a one-sided disappearance is
+    /// disbelieved, or `None` to propagate every one of them.
+    pub guard_directory_deletes_over: Option<usize>,
     /// The staging placement for both endpoints.
     pub staging: StagingMode,
     /// The owner for created entries (`None` to leave ownership alone).
@@ -985,7 +1004,6 @@ impl OwnState {
 fn alpha_is_written(mode: SyncMode) -> bool {
     match mode {
         SyncMode::TwoWaySafe
-        | SyncMode::TwoWayParanoid
         | SyncMode::TwoWayResolved
         | SyncMode::TwoWayStrict => true,
         SyncMode::OneWaySafe | SyncMode::OneWayReplica => false,
@@ -1623,7 +1641,10 @@ impl Config {
             let ignore_mounts = group
                 .ignore_mounts
                 .or(self.defaults.ignore_mounts)
-                .unwrap_or(true);
+                .unwrap_or(false);
+            let guard_directory_deletes_over = group
+                .guard_directory_deletes_over
+                .or(self.defaults.guard_directory_deletes_over);
             let staging = match inherited(
                 group.staging.as_deref(),
                 self.defaults.staging.as_deref(),
@@ -1727,6 +1748,7 @@ impl Config {
                     max_file_size,
                     max_entry_count,
                     ignore_mounts,
+                    guard_directory_deletes_over,
                     staging,
                     default_owner: default_owner.clone(),
                     default_group: default_group.clone(),
@@ -2017,13 +2039,6 @@ pub const MODES: &[ModeName] = &[
         about: "Both ways. A file both sides changed is reported, never chosen between.",
     },
     ModeName {
-        name: "two-way-paranoid",
-        also: &[],
-        mode: SyncMode::TwoWayParanoid,
-        peering: false,
-        about: "As two-way-conflict, and a large directory that goes empty or missing on one side is disbelieved rather than propagated.",
-    },
-    ModeName {
         name: "two-way-alpha",
         also: &["two-way-resolved"],
         mode: SyncMode::TwoWayResolved,
@@ -2241,6 +2256,7 @@ pub const ORDER: &[&str] = &[
     "disabled",
     "ignores",
     "ignore_mounts",
+    "guard_directory_deletes_over",
     "max_file_size",
     "max_entry_count",
     "symlink_mode",
@@ -2282,6 +2298,7 @@ pub fn unit(key: &str) -> Option<&'static str> {
     Some(match key {
         "interval" => "whole seconds",
         "max_entry_count" => "a whole number of entries",
+        "guard_directory_deletes_over" => "entries in the directory, counted recursively",
         "max_file_size" => "bytes, or a size: 100MB · 2GiB · 500K",
         "file_mode" | "directory_mode" => "octal permissions: 0600 · 0644 · 0755",
         "ttl" | "timeout" => "a length of time: 30s · 5m · 2h",
@@ -2310,6 +2327,8 @@ pub fn fallback(key: &str) -> Option<String> {
         "symlink_mode" => "raw".to_owned(),
         "durability" => "process".to_owned(),
         "staging" => "state".to_owned(),
+        "ignore_mounts" => "false".to_owned(),
+        "guard_directory_deletes_over" => "off: every disappearance propagates".to_owned(),
         // `mode` has no fallback on purpose: a group without one, and
         // with no default behind it, is refused rather than guessed at.
         "max_file_size" | "max_entry_count" => "no limit".to_owned(),
@@ -2788,7 +2807,7 @@ mod tests {
     /// it. The expected list is taken from the parser's own error rather
     /// than written here as a count: a mode added without a line in the
     /// template then fails this test instead of quietly making the file lie,
-    /// which is exactly how `two-way-paranoid` was first missed.
+    /// which is exactly how a mode added later was first missed.
     #[test]
     fn the_template_names_every_mode() {
         let is_mode = |word: &&str| word.contains("-way-") || word.starts_with("peering-");

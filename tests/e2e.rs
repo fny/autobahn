@@ -248,10 +248,9 @@ fn build_tree(root: &Path) {
     fs::write(root.join("ünïcode").join("ファイル.txt"), "unicode").unwrap();
 }
 
-/// All four synchronization modes.
-const ALL_MODES: [SyncMode; 6] = [
+/// Every synchronization mode.
+const ALL_MODES: [SyncMode; 5] = [
     SyncMode::TwoWaySafe,
-    SyncMode::TwoWayParanoid,
     SyncMode::TwoWayResolved,
     SyncMode::TwoWayStrict,
     SyncMode::OneWaySafe,
@@ -319,7 +318,6 @@ fn beta_addition_semantics_by_mode() {
 
         match mode {
             SyncMode::TwoWaySafe
-            | SyncMode::TwoWayParanoid
             | SyncMode::TwoWayResolved
             | SyncMode::TwoWayStrict => {
                 assert!(alpha_added.exists(), "{mode:?}: addition should propagate");
@@ -356,7 +354,6 @@ fn beta_modification_semantics_by_mode() {
 
         match mode {
             SyncMode::TwoWaySafe
-            | SyncMode::TwoWayParanoid
             | SyncMode::TwoWayResolved
             | SyncMode::TwoWayStrict => {
                 let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();

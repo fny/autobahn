@@ -2841,7 +2841,6 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
 fn resolve_in_every_mode(shape: Shape) {
     for mode in [
         "two-way-conflict",
-        "two-way-paranoid",
         "two-way-alpha",
         "two-way-alpha-strict",
         "one-way-conflict",

@@ -8,7 +8,7 @@
 //! in Mutagen's `reconcile.go` for the derivation of each rule; comments
 //! here summarize rather than re-derive.
 
-use super::{diff_at, path_join, Change, Conflict, Content, Node, SyncMode};
+use super::{diff_at, path_join, Change, Conflict, Content, Node, Policy, SyncMode};
 
 /// The outcome of reconciliation.
 #[derive(Debug, Default)]
@@ -26,7 +26,7 @@ pub struct Reconciliation {
 
 /// The recursive reconciler.
 struct Reconciler<'m> {
-    mode: SyncMode,
+    policy: Policy,
     result: Reconciliation,
     /// The previous reconciliation of the same session, when there is one
     /// to skip against: see [`reconcile_since`].
@@ -239,18 +239,18 @@ fn shallow_equal(a: Option<&Node>, b: Option<&Node>) -> bool {
     }
 }
 
-/// The size at which the paranoid mode stops trusting a one-sided
-/// disappearance. A vanished mount, a wiped checkout, or a tool's cleanup
-/// usually took a substantial tree with it; emptying or removing a small
-/// directory is ordinary housekeeping and propagates in every mode.
-pub const PARANOID_MINIMUM: usize = 8;
-
-/// Whether the ancestor records a directory large enough for the paranoid
-/// mode to guard. Counted only once the cheap shape test has fired, which
-/// keeps the guard off the per-cycle cost of every ordinary reconciliation:
-/// a whole-tree pass measured at twenty milliseconds per cycle on a
-/// sixty-thousand-entry tree.
-fn large_in_ancestor(ancestor: Option<&Node>) -> bool {
+/// Whether the ancestor records a directory big enough to guard. Counted
+/// only once the cheap shape test has fired, which keeps the guard off
+/// the per-cycle cost of every ordinary reconciliation: a whole-tree pass
+/// measured at twenty milliseconds per cycle on a sixty-thousand-entry
+/// tree.
+///
+/// `None` is no guard at all, which is every configuration that does not
+/// ask for one.
+fn large_in_ancestor(ancestor: Option<&Node>, over: Option<usize>) -> bool {
+    let Some(over) = over else {
+        return false;
+    };
     fn entries_below(node: &Node) -> usize {
         node.children()
             .iter()
@@ -258,7 +258,7 @@ fn large_in_ancestor(ancestor: Option<&Node>) -> bool {
             .sum()
     }
     ancestor.is_some_and(|node| {
-        matches!(node.content, Content::Directory(_)) && entries_below(node) >= PARANOID_MINIMUM
+        matches!(node.content, Content::Directory(_)) && entries_below(node) >= over
     })
 }
 
@@ -347,7 +347,7 @@ impl<'m> Reconciler<'m> {
             // Every other mode propagates it. This was once a halt in all
             // of them, and it stopped whole sessions for exactly the tool
             // cleanups above.
-            if self.mode == SyncMode::TwoWayParanoid && !path.is_empty() {
+            if self.policy.guard_directory_deletes_over.is_some() && !path.is_empty() {
                 // Empty means nothing synchronizable: a directory emptied
                 // down to one ignored entry is the same shape.
                 let empty = |node: Option<&Node>| {
@@ -355,7 +355,9 @@ impl<'m> Reconciler<'m> {
                         if matches!(node.content, Content::Directory(_))
                             && !node.holds_synchronizable())
                 };
-                if empty(alpha) != empty(beta) && large_in_ancestor(ancestor) {
+                if empty(alpha) != empty(beta)
+                    && large_in_ancestor(ancestor, self.policy.guard_directory_deletes_over)
+                {
                     let change = |side: Option<&Node>| Change {
                         path: path.to_owned(),
                         old: ancestor.cloned(),
@@ -473,9 +475,8 @@ impl<'m> Reconciler<'m> {
         }
 
         // Alpha and beta disagree at this path; dispatch by mode.
-        match self.mode {
+        match self.policy.mode {
             SyncMode::TwoWaySafe
-            | SyncMode::TwoWayParanoid
             | SyncMode::TwoWayResolved
             | SyncMode::TwoWayStrict => {
                 self.handle_disagreement_bidirectional(path, ancestor, alpha, beta)
@@ -518,9 +519,8 @@ impl<'m> Reconciler<'m> {
         // win against. A deletion made against a *changed* other side is
         // not this shape, so the emptying side can still win: retiring the
         // full copy leaves two pure deletions, and the fuller one carries.
-        if self.mode == SyncMode::TwoWayParanoid
-            && !path.is_empty()
-            && large_in_ancestor(ancestor)
+        if !path.is_empty()
+            && large_in_ancestor(ancestor, self.policy.guard_directory_deletes_over)
             && alpha.is_none() != beta.is_none()
         {
             let alpha_gone = alpha.is_none();
@@ -669,7 +669,7 @@ impl<'m> Reconciler<'m> {
             // wins: a deletion carries nothing to weigh against it, and
             // letting it win would destroy the only copy. In the strict
             // mode alpha's deletion is final, and beta is made to match.
-            if self.mode == SyncMode::TwoWayStrict {
+            if self.policy.mode == SyncMode::TwoWayStrict {
                 let beta_unsynchronizable = blocking(
                     path,
                     ancestor,
@@ -715,7 +715,7 @@ impl<'m> Reconciler<'m> {
 
         // Both sides have non-deletion changes: conflict, or forced
         // resolution in alpha's favor in resolved mode.
-        if matches!(self.mode, SyncMode::TwoWaySafe | SyncMode::TwoWayParanoid) {
+        if self.policy.mode == SyncMode::TwoWaySafe {
             self.result.conflicts.push(Conflict {
                 root: path.to_owned(),
                 alpha_changes: alpha_non_deletion,
@@ -886,9 +886,9 @@ pub fn reconcile(
     ancestor: Option<&Node>,
     alpha: Option<&Node>,
     beta: Option<&Node>,
-    mode: SyncMode,
+    policy: impl Into<Policy>,
 ) -> Reconciliation {
-    reconcile_since(ancestor, alpha, beta, mode, None)
+    reconcile_since(ancestor, alpha, beta, policy, None)
 }
 
 /// [`reconcile`], skipping every subtree whose three inputs are the very
@@ -899,11 +899,11 @@ pub fn reconcile_since(
     ancestor: Option<&Node>,
     alpha: Option<&Node>,
     beta: Option<&Node>,
-    mode: SyncMode,
+    policy: impl Into<Policy>,
     memo: Option<&ReconcileMemo>,
 ) -> Reconciliation {
     let mut reconciler = Reconciler {
-        mode,
+        policy: policy.into(),
         result: Reconciliation::default(),
         memo,
     };
@@ -926,6 +926,16 @@ mod tests {
 
     fn dir(name: &str, children: Vec<Node>) -> Node {
         Node::directory(name, children)
+    }
+
+    /// Two-way conflict, guarding a directory of `over` entries or more.
+    /// What `two-way-paranoid` used to be, now that the threshold is a
+    /// setting instead of the mode.
+    fn guarding(over: usize) -> Policy {
+        Policy {
+            mode: SyncMode::TwoWaySafe,
+            guard_directory_deletes_over: Some(over),
+        }
     }
 
     /// Provenance must survive mutual exclusion. Reproduced before the
@@ -1006,7 +1016,7 @@ mod tests {
             Some(&ancestor),
             Some(&emptied),
             Some(&ancestor),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert_eq!(result.conflicts.len(), 1, "{result:?}");
         let conflict = &result.conflicts[0];
@@ -1026,7 +1036,7 @@ mod tests {
             Some(&ancestor),
             Some(&ancestor),
             Some(&emptied),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert_eq!(result.conflicts.len(), 1);
         assert_eq!(result.conflicts[0].root, "data");
@@ -1071,7 +1081,7 @@ mod tests {
                 Some(&ancestor),
                 Some(alpha),
                 Some(beta),
-                SyncMode::TwoWayParanoid,
+                guarding(8),
             );
             assert_eq!(result.conflicts.len(), 1, "{result:?}");
             assert_eq!(result.conflicts[0].root, "data");
@@ -1091,7 +1101,7 @@ mod tests {
             Some(&ancestor),
             Some(&emptied),
             Some(&ancestor),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert_eq!(result.beta_transitions.len(), 3);
@@ -1111,7 +1121,7 @@ mod tests {
             Some(&ancestor),
             Some(&gone),
             Some(&ancestor),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert!(result.beta_transitions.is_empty(), "{result:?}");
@@ -1126,7 +1136,7 @@ mod tests {
             Some(&ancestor),
             Some(&ancestor),
             Some(&gone),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert_eq!(result.beta_transitions.len(), 1);
         assert!(result.beta_transitions[0].new.is_some());
@@ -1147,7 +1157,7 @@ mod tests {
             Some(&ancestor),
             Some(&gone),
             Some(&ancestor),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert!(result.alpha_transitions.is_empty());
         assert_eq!(result.beta_transitions.len(), 1);
@@ -1167,7 +1177,7 @@ mod tests {
             Some(&ancestor),
             Some(&gone),
             Some(&emptied),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert!(result.alpha_transitions.is_empty(), "{result:?}");
@@ -1191,7 +1201,7 @@ mod tests {
             Some(&ancestor),
             Some(&gone),
             Some(&edited),
-            SyncMode::TwoWayParanoid,
+            guarding(8),
         );
         assert!(result.conflicts.is_empty(), "{result:?}");
         assert_eq!(result.alpha_transitions.len(), 1, "{result:?}");
@@ -1224,7 +1234,6 @@ mod tests {
         );
         for mode in [
             SyncMode::TwoWaySafe,
-            SyncMode::TwoWayParanoid,
             SyncMode::TwoWayResolved,
             SyncMode::OneWaySafe,
             SyncMode::OneWayReplica,
@@ -1607,9 +1616,8 @@ mod tests {
     const NAMES: [&str; 3] = ["a", "b", "c"];
     const DEPTH: usize = 3;
 
-    const MODES: [SyncMode; 6] = [
+    const MODES: [SyncMode; 5] = [
         SyncMode::TwoWaySafe,
-        SyncMode::TwoWayParanoid,
         SyncMode::TwoWayResolved,
         SyncMode::TwoWayStrict,
         SyncMode::OneWaySafe,
@@ -1941,7 +1949,7 @@ mod tests {
         /// Three-way agreement is inert: when ancestor, alpha, and beta all
         /// hold the same content, reconciliation has nothing to say.
         #[test]
-        fn agreement_emits_nothing(spec in instructions(), mode_index in 0usize..6) {
+        fn agreement_emits_nothing(spec in instructions(), mode_index in 0usize..5) {
             let (tree, _, _) = generated(&spec, &[], &[], false);
             let result = reconcile(tree.as_ref(), tree.as_ref(), tree.as_ref(), MODES[mode_index]);
             proptest::prop_assert!(result.alpha_transitions.is_empty());
@@ -1958,7 +1966,7 @@ mod tests {
             ancestor_spec in instructions(),
             alpha_spec in instructions(),
             beta_spec in instructions(),
-            mode_index in 0usize..6,
+            mode_index in 0usize..5,
         ) {
             let mode = MODES[mode_index];
             let (ancestor, alpha, beta) =
@@ -1990,7 +1998,7 @@ mod tests {
             ancestor_spec in instructions(),
             alpha_spec in instructions(),
             beta_spec in instructions(),
-            mode_index in 0usize..6,
+            mode_index in 0usize..5,
         ) {
             let mode = MODES[mode_index];
             let (ancestor, alpha, beta) =
@@ -2030,7 +2038,7 @@ mod tests {
             ancestor_spec in instructions(),
             alpha_spec in instructions(),
             beta_spec in instructions(),
-            mode_index in 0usize..6,
+            mode_index in 0usize..5,
         ) {
             let mode = MODES[mode_index];
             let (ancestor, alpha, beta) =
@@ -2116,7 +2124,6 @@ mod tests {
         let modes = [
             SyncMode::TwoWaySafe,
             SyncMode::TwoWayResolved,
-            SyncMode::TwoWayParanoid,
             SyncMode::TwoWayStrict,
             SyncMode::OneWaySafe,
             SyncMode::OneWayReplica,

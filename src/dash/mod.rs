@@ -3276,22 +3276,39 @@ impl Dash {
     }
 
     /// The one row under the list: a plus that opens the naming dialog.
+    ///
+    /// Built like a section row rather than as a button, because a
+    /// button brings its own padding and the words then start somewhere
+    /// the group names above do not. The plus sits in a box the width
+    /// of a group's dot, so every label in the column lines up.
     fn naming(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         div()
-            .pt(step(2.))
-            .px(step(1.5))
-            // A flex row, so the button is the width of its label
-            // rather than the width of the column it sits in.
+            .id("new-group")
+            .mt(step(1.))
+            .px(step(2.5))
+            .py(step(1.5))
+            .rounded(px(6.))
+            .cursor_pointer()
             .flex()
+            .flex_shrink_0()
+            .items_center()
+            .gap(step(1.5))
+            .text_size(px(12.5))
+            .text_color(rgb(FAINT))
+            .hover(|row| row.bg(rgb(PANEL)).text_color(rgb(INK)))
             .child(
-                Button::new("new-group")
-                    .small()
-                    .ghost()
-                    .label(t("group.add"))
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.ask_name(None, window, cx);
-                    })),
+                div()
+                    .w(px(7.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child("+"),
             )
+            .child(t("group.add"))
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.ask_name(None, window, cx);
+            }))
             .into_any_element()
     }
 

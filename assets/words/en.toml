@@ -192,7 +192,7 @@ advanced_peering = "peering · dangerously experimental"
 
 # Adding, renaming and removing a group.
 [group]
-add = "+ New group"
+add = "New group"
 new_title = "New group"
 rename_title = "Rename the group"
 remove_title = "Remove the group"

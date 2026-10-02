@@ -2072,15 +2072,6 @@ pub const MODES: &[ModeName] = &[
     },
 ];
 
-/// Names that were renamed, and what they were renamed to. A
-/// configuration that uses one is told why rather than merely told the
-/// name is unknown.
-pub const RENAMED_MODES: &[(&str, &str, &str)] = &[(
-    "p2p-conflict-experimental",
-    "p2p-conflict-dangerously-experimental",
-    "p2p has known security and collision issues. Read docs/p2p.md before enabling it",
-)];
-
 /// One row of [`MODES`].
 #[derive(Debug)]
 pub struct ModeName {
@@ -2450,12 +2441,6 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
     {
         return Ok((row.mode, row.p2p));
     }
-    // The old spellings are answered, not merely unknown: the rename is
-    // the point, and a configuration that used them should be told why
-    // rather than quietly carried across.
-    if let Some((_, now, why)) = RENAMED_MODES.iter().find(|(was, ..)| *was == mode) {
-        return Err(format!("mode '{mode}' was renamed to '{now}': {why}"));
-    }
     let expected: Vec<&str> = MODES.iter().map(|row| row.name).collect();
     Err(format!(
         "unknown mode '{mode}' (expected one of: {})",
@@ -2628,11 +2613,6 @@ mod tests {
             }
             assert!(!row.about.is_empty(), "{} says nothing", row.name);
         }
-        for (was, now, _) in RENAMED_MODES {
-            let complaint = parse_mode_spec(was).unwrap_err();
-            assert!(complaint.contains(now), "{complaint}");
-            assert!(parse_mode_spec(now).is_ok(), "{now}");
-        }
         for word in SYMLINK_MODES {
             assert!(parse_symlink_mode(word.word).is_ok(), "{}", word.word);
             for also in word.also {
@@ -2775,11 +2755,14 @@ mod tests {
     fn the_starting_template_loads_and_describes_nothing() {
         let config = parse(TEMPLATE);
         assert_eq!(config.defaults.mode.as_deref(), Some("two-way-conflict"));
+        // A fresh install keeps `.git` out of sync through the essential
+        // ignores, which the template reads from the file it ships with.
         assert!(config
             .defaults
             .ignores
             .iter()
-            .any(|pattern| pattern == ".git"));
+            .any(|pattern| pattern == "file:Essential.gitignore"));
+        assert!(ESSENTIAL_IGNORES.lines().any(|line| line.trim() == ".git"));
         assert_eq!(
             config.plans().expect("the template plans").len(),
             0,
@@ -2815,34 +2798,6 @@ mod tests {
         for mode in named {
             parse_mode(mode).unwrap_or_else(|error| panic!("{mode}: {error}"));
         }
-    }
-
-    /// The pre-rename p2p spellings are refused with the new name and
-    /// the reason, not as an unknown mode or field.
-    #[test]
-    fn the_old_p2p_names_are_answered_with_the_rename() {
-        for old in ["p2p-conflict-experimental"] {
-            let error = parse_mode_spec(old).expect_err("the old mode name is refused");
-            let new = old.replace("-experimental", "-dangerously-experimental");
-            assert!(error.contains(&new), "{error}");
-            assert!(error.contains("docs/p2p.md"), "{error}");
-        }
-        let error = format!(
-            "{:#}",
-            parse(
-                r#"
-                [experimental.p2p-experimental]
-                ttl = "30s"
-
-                [groups.g]
-                primary = "/tmp/a"
-                replicas = ["u@h:/tmp/b"]
-                "#,
-            )
-            .plans()
-            .expect_err("the old section name is refused")
-        );
-        assert!(error.contains("p2p-dangerously-experimental"), "{error}");
     }
 
     fn parse(text: &str) -> Config {
@@ -3383,26 +3338,23 @@ mod tests {
         assert!(toml::from_str::<Config>("disable = [\"host\"]").is_err());
     }
 
-    /// The examples are run by `sh`, so they have to parse as `sh`. A
-    /// broken one would only be discovered by the alert it failed to
-    /// deliver.
+    /// The example is run by `sh`, so it has to parse as `sh`. A broken
+    /// one would only be discovered by the alert it failed to deliver.
     #[test]
-    fn the_example_scripts_are_valid_shell() {
-        for (name, contents) in [("on-alert.sh", ON_ALERT_EXAMPLE)] {
-            let directory = tempfile::tempdir().expect("a temporary directory");
-            let script = directory.path().join(name);
-            std::fs::write(&script, contents).expect("the script should be writable");
-            let checked = std::process::Command::new("sh")
-                .arg("-n")
-                .arg(&script)
-                .output()
-                .expect("sh should run");
-            assert!(
-                checked.status.success(),
-                "{name}: {}",
-                String::from_utf8_lossy(&checked.stderr)
-            );
-        }
+    fn the_example_script_is_valid_shell() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let script = directory.path().join("on-alert.sh");
+        std::fs::write(&script, ON_ALERT_EXAMPLE).expect("the script should be writable");
+        let checked = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&script)
+            .output()
+            .expect("sh should run");
+        assert!(
+            checked.status.success(),
+            "on-alert.sh: {}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
     }
 
     /// `disable` edits the file people wrote, so what they wrote has to

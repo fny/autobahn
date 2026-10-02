@@ -584,7 +584,7 @@ mod tests {
     fn push(directory: &Path, replicas: &str) {
         let configuration = format!(
             r#"
-            [advanced.p2p-dangerously-experimental]
+            [experimental.p2p-dangerously-experimental]
             ttl = "2s"
             failover_after = "2s"
 

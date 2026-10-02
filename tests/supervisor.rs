@@ -3730,7 +3730,7 @@ fn the_primary_gives_each_replica_the_others_keys_through_the_gate() {
     }];
     let plans = world.plans(&format!(
         r#"
-        [advanced.p2p-dangerously-experimental]
+        [experimental.p2p-dangerously-experimental]
         manage_keys = true
 
         [groups.g1]
@@ -4217,7 +4217,7 @@ fn every_group_syncs_over_the_primaries_one_attachment() {
     let peer_script = p2p_agent_script(&world, &peer_home);
     let configuration = format!(
         r#"
-        [advanced.p2p-dangerously-experimental]
+        [experimental.p2p-dangerously-experimental]
         ttl = "2s"
         failover_after = "2s"
 

@@ -68,7 +68,7 @@ jobs:
         # Needs no Mac: build.sh and release.sh run against stand-ins for
         # cargo and Apple's tools, so their own logic is checked on every
         # push, not only on the macOS runner and the release.
-        run: apps/macos/test.sh
+        run: apps/tray/test.sh
       - name: Lints
         run: cargo clippy --release --locked --all-targets -- -D warnings
       # The suite must leave the real ~/.autobahn alone: a test that writes
@@ -159,10 +159,10 @@ jobs:
         # Signed ad-hoc: this job holds no certificate and needs none to
         # prove the app still compiles, bundles its icon, and signs. Real
         # signing belongs to the release, behind approval.
-        run: apps/macos/build.sh
+        run: apps/tray/build.sh
       - name: Check the bundle
         run: |
-          APP=apps/macos/Autobahn.app
+          APP=apps/tray/Autobahn.app
           codesign --verify --strict "$APP"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$APP/Contents/Info.plist"
           ls "$APP/Contents/Resources"

@@ -6,7 +6,7 @@
 # version the bundle claims, and what it assembles. Signing, actool and
 # notarisation are Apple's, and only a Mac can check them.
 #
-#   apps/macos/test.sh
+#   apps/tray/test.sh
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
@@ -22,8 +22,8 @@ pass() { echo "ok: $*"; }
 # [package] table's can be the one read.
 tree() {
     local dir="$1" version="$2"
-    mkdir -p "$dir/apps/macos" "$dir/assets"
-    cp "$HERE"/*.sh "$HERE/Info.plist" "$dir/apps/macos/"
+    mkdir -p "$dir/apps/tray" "$dir/assets"
+    cp "$HERE"/*.sh "$HERE/Info.plist" "$dir/apps/tray/"
     cp "$ROOT/assets/autobahn.icns" "$dir/assets/"
     cat > "$dir/Cargo.toml" <<TOML
 [dependencies.early]
@@ -109,8 +109,8 @@ done
 
 # build.sh with Cargo.toml at a test version: the bundle reports it.
 tree "$WORK/signed" 9.8.7
-if run "$WORK/signed/apps/macos/build.sh"; then
-    plist="$WORK/signed/apps/macos/Autobahn.app/Contents/Info.plist"
+if run "$WORK/signed/apps/tray/build.sh"; then
+    plist="$WORK/signed/apps/tray/Autobahn.app/Contents/Info.plist"
     for key in CFBundleShortVersionString CFBundleVersion; do
         value=$(plist_value "$plist" "$key")
         if [ "$value" = 9.8.7 ]; then pass "build.sh writes $key from Cargo.toml"
@@ -128,7 +128,7 @@ if run "$WORK/signed/apps/macos/build.sh"; then
     if grep -qE '^cargo build( .*)? --locked( |$)' "$WORK/calls"; then
         pass "build.sh builds with --locked"
     else fail "build.sh builds without --locked:"; grep '^cargo ' "$WORK/calls" >&2; fi
-    if [ -x "$WORK/signed/apps/macos/Autobahn.app/Contents/MacOS/autobahn" ]; then
+    if [ -x "$WORK/signed/apps/tray/Autobahn.app/Contents/MacOS/autobahn" ]; then
         pass "build.sh puts the executable in the bundle"
     else fail "build.sh left no executable in the bundle"; fi
 else
@@ -138,7 +138,7 @@ fi
 # A Cargo.toml without a package version is refused, not guessed at.
 tree "$WORK/noversion" 1.0.0
 sed -i.bak '/^version = "1.0.0"/d' "$WORK/noversion/Cargo.toml"
-if run "$WORK/noversion/apps/macos/build.sh"; then
+if run "$WORK/noversion/apps/tray/build.sh"; then
     fail "build.sh built with no version in Cargo.toml"
 else
     pass "build.sh refuses a Cargo.toml with no package version"
@@ -146,7 +146,7 @@ fi
 
 # Nor is a version that would not survive being written into XML.
 tree "$WORK/hostile" '1.0.0</string>'
-if run "$WORK/hostile/apps/macos/build.sh"; then
+if run "$WORK/hostile/apps/tray/build.sh"; then
     fail "build.sh built with the version '1.0.0</string>'"
 else
     pass "build.sh refuses a version with markup in it"
@@ -156,7 +156,7 @@ fi
 # signing identity. This is what CI builds before any certificate exists.
 tree "$WORK/unsigned" 2.0.0
 UNSIGNED="$WORK/unsigned/out/Autobahn.app"
-if run "$WORK/unsigned/apps/macos/build.sh" --unsigned "$UNSIGNED"; then
+if run "$WORK/unsigned/apps/tray/build.sh" --unsigned "$UNSIGNED"; then
     if [ "$(plist_value "$UNSIGNED/Contents/Info.plist" CFBundleVersion)" = 2.0.0 ] &&
        [ -x "$UNSIGNED/Contents/MacOS/autobahn" ]; then
         pass "build.sh --unsigned assembles the bundle where it is told"
@@ -171,7 +171,7 @@ fi
 # release.sh --sign-only: signs, notarises and staples that bundle, and
 # never compiles anything — so no build script runs while the identity is
 # usable.
-if run "$WORK/unsigned/apps/macos/release.sh" --sign-only "$UNSIGNED"; then
+if run "$WORK/unsigned/apps/tray/release.sh" --sign-only "$UNSIGNED"; then
     if grep -q '^cargo ' "$WORK/calls"; then fail "release.sh --sign-only ran cargo"
     else pass "release.sh --sign-only runs no cargo"; fi
     if grep -qF "codesign --force --options runtime --timestamp --sign Developer ID Application: Test (TEAM123456) $UNSIGNED" "$WORK/calls"
@@ -188,20 +188,20 @@ else
 fi
 
 # ...and refuses what is not a bundle, before touching the keychain.
-if run "$WORK/unsigned/apps/macos/release.sh" --sign-only "$WORK/unsigned/nothing.app"; then
+if run "$WORK/unsigned/apps/tray/release.sh" --sign-only "$WORK/unsigned/nothing.app"; then
     fail "release.sh --sign-only accepted a bundle that does not exist"
 elif grep -qE '^(codesign|security|xcrun) ' "$WORK/calls"; then
     fail "release.sh --sign-only reached for Apple's tools with no bundle"
 else pass "release.sh --sign-only refuses a missing bundle"; fi
 
-if run "$WORK/unsigned/apps/macos/release.sh" --sign-only; then
+if run "$WORK/unsigned/apps/tray/release.sh" --sign-only; then
     fail "release.sh --sign-only ran with no bundle named"
 else pass "release.sh --sign-only needs a bundle named"; fi
 
 # release.sh with no arguments still does everything, in that order: the
 # credentials checked first, then the build, then signing.
 tree "$WORK/laptop" 3.0.0
-if run "$WORK/laptop/apps/macos/release.sh"; then
+if run "$WORK/laptop/apps/tray/release.sh"; then
     ident=$(first_call '^security find-identity'); build=$(first_call '^cargo build')
     sign=$(first_call '^codesign --force'); staple=$(first_call '^xcrun stapler staple')
     if [ -n "$ident" ] && [ -n "$build" ] && [ -n "$sign" ] && [ -n "$staple" ] &&
@@ -215,9 +215,9 @@ else
     fail "release.sh with no arguments failed:"; cat "$WORK/out" >&2
 fi
 
-if run "$WORK/laptop/apps/macos/release.sh" --bogus; then
+if run "$WORK/laptop/apps/tray/release.sh" --bogus; then
     fail "release.sh accepted --bogus"
 else pass "release.sh refuses an unknown argument"; fi
 
-if [ "$FAILED" -ne 0 ]; then echo "apps/macos/test.sh: FAILED" >&2; exit 1; fi
-echo "apps/macos/test.sh: all passed"
+if [ "$FAILED" -ne 0 ]; then echo "apps/tray/test.sh: FAILED" >&2; exit 1; fi
+echo "apps/tray/test.sh: all passed"

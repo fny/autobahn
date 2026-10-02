@@ -2514,6 +2514,7 @@ fn connect(
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);
     session.set_ignore_mounts(plan.ignore_mounts);
+    session.set_guard_directory_deletes_over(plan.guard_directory_deletes_over);
     Ok(session)
 }
 

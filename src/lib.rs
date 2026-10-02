@@ -23,6 +23,7 @@
 #![warn(clippy::doc_lazy_continuation)]
 
 pub mod alerts;
+pub mod blocked;
 pub mod config;
 pub mod endpoint;
 pub mod fsutil;
@@ -48,6 +49,30 @@ pub mod supervisor;
 pub mod text;
 pub mod threads;
 pub mod transport;
+/// The application's own presence: the dock icon, and whether there is
+/// a window, a menu bar item, or both.
+#[cfg(feature = "dash")]
+pub mod dock;
+/// What a window over the fleet is, apart from its drawing.
+#[cfg(feature = "dash")]
+pub(crate) mod surface;
+/// Photographing the window, for the screenshots that check it.
+#[cfg(feature = "dash")]
+pub(crate) mod camera;
+/// The window over the fleet: a dashboard, which is what the gauges
+/// of a road vehicle have been called since they stopped mud being
+/// dashed up by the horses.
+#[cfg(feature = "dash")]
+pub mod dash;
+/// What the surfaces say, in one place.
+#[cfg(any(feature = "tray", feature = "dash"))]
+pub(crate) mod words;
+/// Notifications the system posts, for whoever can post them.
+#[cfg(any(feature = "tray", feature = "dash"))]
+pub(crate) mod native_alert;
+/// What the menu bar shows, for the tray and for the dash.
+#[cfg(any(feature = "tray", feature = "dash"))]
+pub(crate) mod menubar;
 #[cfg(feature = "tray")]
 pub mod tray;
 pub mod tree;

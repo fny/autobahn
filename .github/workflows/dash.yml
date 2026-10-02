@@ -1,0 +1,208 @@
+# Builds the dash app for people to try, on every push to its branch.
+#
+# Separate from release.yml, which ships the command on a tag and signs
+# and notarises everything. Nothing here is signed: these are builds to
+# hand to a tester, and the macOS one needs the quarantine bit cleared
+# before it will open. The release workflow is where signing belongs,
+# and this will fold into it when the dash is ready to ship.
+#
+# Three platforms, each built natively rather than cross-compiled: GPUI
+# links against the system's graphics and font libraries, and a sysroot
+# good enough to cross-compile that is more work than a second runner.
+# aarch64 Linux runners are free on public repositories.
+#
+# The result is one prerelease, `dash-latest`, moved to each new build —
+# so there is always one link to send somebody, and it is always the
+# newest. A prerelease because it is exactly that, and because it keeps
+# these builds out of the way of the real releases.
+name: Dash
+
+on:
+  push:
+    branches: [desk-kit]
+    paths:
+      - 'src/**'
+      - 'assets/**'
+      - 'apps/dash/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/dash.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The kit needs a newer compiler than the repository's own pin.
+  TOOLCHAIN: '1.98.0'
+
+jobs:
+  build:
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      # One platform failing should not hide whether the others work,
+      # which is the whole question the first time this runs.
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-arm64
+            runs-on: macos-15
+          - platform: linux-x86_64
+            runs-on: ubuntu-24.04
+          - platform: linux-aarch64
+            runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: dash-${{ matrix.platform }}
+
+      # Two stacks, not one. GPUI wants Vulkan to draw with, xkbcommon and
+      # wayland for the window, fontconfig for the text. The menu bar item
+      # and the notifications are muda, tray-icon and notify-rust, which on
+      # Linux are GTK3 and D-Bus — libgtk-3-dev is what brings glib, gdk,
+      # pango, cairo and atk with it.
+      #
+      # A tester still needs a Vulkan driver and a display server at run
+      # time. That is not this list.
+      - name: Libraries the app links against
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            libxdo-dev \
+            libasound2-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan-dev \
+            libxcb-composite0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            pkg-config \
+            cmake \
+            clang
+
+      - name: Build
+        run: cargo build --release --locked --features dash --bin autobahn-dash
+
+      # The command the window shells out to for resolve, diff and clean.
+      # It travels with the app: a tester has neither on their machine.
+      - name: Build the command beside it
+        run: cargo build --release --locked --bin autobahn
+
+      - name: Bundle the app
+        if: runner.os == 'macOS'
+        run: |
+          APP="Autobahn Dash.app"
+          mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+          cp target/release/autobahn-dash "$APP/Contents/MacOS/autobahn-dash"
+          cp target/release/autobahn "$APP/Contents/MacOS/autobahn"
+          cat > "$APP/Contents/MacOS/Autobahn Dash" <<'LAUNCH'
+          #!/bin/sh
+          exec "$(dirname "$0")/autobahn-dash" "$@"
+          LAUNCH
+          chmod +x "$APP/Contents/MacOS/Autobahn Dash"
+          if xcrun actool assets/Autobahn.icon --compile "$APP/Contents/Resources" \
+               --app-icon Autobahn --platform macosx --minimum-deployment-target 11.0 \
+               --output-partial-info-plist "$(mktemp)" >/dev/null 2>&1; then
+              ICON=Autobahn
+          else
+              cp assets/autobahn.icns "$APP/Contents/Resources/autobahn.icns"
+              ICON=autobahn
+          fi
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleName</key><string>Autobahn Dash</string>
+            <key>CFBundleDisplayName</key><string>Autobahn Dash</string>
+            <key>CFBundleIdentifier</key><string>party.voltai.autobahn.dash</string>
+            <key>CFBundleExecutable</key><string>Autobahn Dash</string>
+            <key>CFBundlePackageType</key><string>APPL</string>
+            <key>CFBundleShortVersionString</key><string>$VERSION</string>
+            <key>CFBundleVersion</key><string>$VERSION</string>
+            <key>CFBundleIconFile</key><string>$ICON</string>
+            <key>CFBundleIconName</key><string>$ICON</string>
+            <key>LSMinimumSystemVersion</key><string>11.0</string>
+            <key>NSHighResolutionCapable</key><true/>
+          </dict>
+          </plist>
+          PLIST
+          # ditto rather than zip, so the bundle's structure survives.
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "autobahn-dash-${{ matrix.platform }}.zip"
+
+      - name: Stage the Linux build
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p stage
+          cp target/release/autobahn-dash target/release/autobahn stage/
+          tar -C stage -czf "autobahn-dash-${{ matrix.platform }}.tar.gz" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: autobahn-dash-${{ matrix.platform }}
+          path: autobahn-dash-${{ matrix.platform }}.*
+          if-no-files-found: error
+
+  publish:
+    name: Publish dash-latest
+    needs: build
+    # A platform that failed should not stop the ones that worked from
+    # reaching the person waiting to try them.
+    if: always() && !cancelled()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: downloaded
+          merge-multiple: true
+
+      - name: What was built
+        run: ls -la downloaded
+
+      - name: Move dash-latest to this build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd downloaded
+          sha256sum * > SHA256SUMS
+          {
+            echo "Unsigned builds of the dash app, from \`${GITHUB_SHA:0:7}\` on \`$GITHUB_REF_NAME\`."
+            echo "Built $(date -u '+%Y-%m-%d %H:%M UTC')."
+            echo
+            echo "**macOS** — unzip, then clear the quarantine bit before it will open:"
+            echo
+            echo '    xattr -dr com.apple.quarantine "Autobahn Dash.app"'
+            echo
+            echo "**Linux** — untar, and keep \`autobahn\` beside \`autobahn-dash\`: the app"
+            echo "shells out to it. Needs a Vulkan driver and either Wayland or X11."
+            echo
+            echo "Both archives carry the \`autobahn\` command next to the app, so there is"
+            echo "nothing else to install."
+          } > notes.md
+          # Deleting and recreating, rather than editing, so the asset list
+          # never mixes this build's files with the last one's.
+          gh release delete dash-latest --yes --cleanup-tag 2>/dev/null || true
+          gh release create dash-latest ./* \
+            --title "Dash (latest build)" \
+            --notes-file notes.md \
+            --prerelease \
+            --target "$GITHUB_SHA"

@@ -69,8 +69,6 @@ pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
 # file. There is no default: direction is never guessed.
 #
 #   two-way-conflict   both ways; a clash is reported and nothing is touched
-#   two-way-paranoid   as above, and a large directory that turns up empty
-#                      on one side is a conflict, not a deletion to copy
 #   two-way-alpha      both ways; alpha's version wins a clash, silently
 #   two-way-alpha-strict  as above, and alpha's deletion of a file beta
 #                      edited wins too (in two-way-alpha the edit survives)
@@ -266,13 +264,14 @@ const DEFAULT_SETTLE_AFTER: Duration = Duration::from_secs(15 * 60);
 
 /// The parsed configuration file.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Config {
-    /// Whether the running supervisor re-reads this file and applies an
-    /// edit in place. On unless said otherwise; off, an edit lands on
+    /// Whether the supervisor reloads this file on a change without a
+    /// restart. On unless said otherwise; off, an edit lands on
     /// `restart` as it used to.
     #[serde(default = "default_reload")]
-    pub reload: bool,
+    pub live_reload: bool,
     /// Run when a session needs a person. The only hook — which states are
     /// alerting is in the message it is handed, not in which hook fires.
     ///
@@ -290,6 +289,7 @@ pub struct Config {
     pub disabled_hosts: Vec<String>,
     /// Retired. Kept only so that a configuration written against the old
     /// spelling is told what to write instead of "unknown field".
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub disabled: Option<toml::Value>,
     /// How much the supervisor writes to its log: "quiet", "normal" (the
     /// default), or "debug". `AUTOBAHN_LOG` overrides it for one run.
@@ -307,13 +307,13 @@ pub struct Config {
     pub groups: BTreeMap<String, Group>,
     /// Tuning that has a correct value already.
     #[serde(default)]
-    pub advanced: Advanced,
+    pub experimental: Advanced,
     /// What is worth saying about this configuration without refusing
     /// it, gathered once per load by [`warnings`](Self::warnings) however
     /// many times its sessions are planned.
     #[serde(skip)]
     warnings: std::sync::OnceLock<Vec<String>>,
-    /// Where `ignore_files` entries are looked up when set: a peer runs the
+    /// Where `file:` entries in `ignores` are looked up when set: a peer runs the
     /// leader's pushed configuration against the pushed ignore files,
     /// not against its own `~/.autobahn/ignores`. Never read from the
     /// file itself.
@@ -321,14 +321,17 @@ pub struct Config {
     pub ignore_directory: Option<PathBuf>,
     /// Retired. Kept only so that a configuration written against the old
     /// shape gets an answer rather than "unknown field `alerts`".
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub alerts: Option<toml::Value>,
 }
 
-/// The `[advanced]` section: settings whose defaults are the right answer.
+/// The `[experimental]` section: settings whose defaults are the right
+/// answer.
 /// Grouped under one heading so that finding yourself here is itself the
 /// message — the subsystem comes second because the warning should land
 /// first.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Advanced {
     /// Alerter timing.
@@ -341,6 +344,7 @@ pub struct Advanced {
     /// Renamed. Kept only so that a configuration written against the old
     /// name gets an answer rather than "unknown field".
     #[serde(default, rename = "peering-experimental")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
     pub retired_peering: Option<toml::Value>,
     /// Let the controller run as root (see `autobahn::root`). Read by
     /// `root::config_allows_root`; here so that the key is known.
@@ -348,14 +352,16 @@ pub struct Advanced {
     pub allow_root: bool,
 }
 
-/// The `[advanced.peering-dangerously-experimental]` section: how long a lease lives,
-/// and how long a peer waits past a dead lease before it takes the lead.
+/// The `[experimental.peering-dangerously-experimental]` section: how long
+/// a lease lives, and how long a peer waits past a dead lease before it
+/// takes the lead.
 ///
 /// As with the alerter's timing, the defaults are the answer. A blip must
 /// never cause a failover, so the wait is long; a leader that is really
 /// gone costs the wait once. Both are here for the fleet that needs them
 /// moved, not for tuning.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct PeeringAdvanced {
     /// How long a lease stays valid after the leader last renewed it. The
@@ -397,11 +403,15 @@ impl Config {
         };
         crate::logging::Level::parse(name)
             .map(Some)
-            .ok_or_else(|| anyhow::anyhow!("unknown log level {name:?} (quiet, normal, or debug)"))
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "log: unknown log level {name:?} (available: quiet, normal, debug)"
+                )
+            })
     }
 }
 
-/// The `[advanced.alerts]` section: how long things must hold, how long to
+/// The `[experimental.alerts]` section: how long things must hold, how long to
 /// wait, and how long before a hook is given up on.
 ///
 /// These are not preferences. They are the values that make the alerter
@@ -409,6 +419,7 @@ impl Config {
 /// reader would discover by trying. They are configurable because a fleet
 /// somewhere will need one of them moved, not because anyone should.
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct AlertsAdvanced {
     /// How long a condition must hold before it counts, for states with no
@@ -437,6 +448,7 @@ pub struct AlertsAdvanced {
 /// A duration as written in the configuration: a plain number of seconds,
 /// or a suffixed string.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum DurationSpec {
     /// A plain number of seconds, matching how `interval` is written.
@@ -447,17 +459,20 @@ pub enum DurationSpec {
 
 /// Settings inherited by every group (each overridable per group).
 #[derive(Debug, Default, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Defaults {
     /// The default synchronization mode.
     pub mode: Option<String>,
     /// Ignore patterns prepended to every group's own.
+    ///
+    /// An entry beginning `file:` names a file of patterns instead of
+    /// being one: `file:Rust.gitignore` is read from `~/.autobahn/ignores`,
+    /// and `file:~/mine` or `file:/etc/mine` from where it says. Its
+    /// patterns are spliced in where the entry sits, so the order on
+    /// screen is the order that applies.
     #[serde(default)]
     pub ignores: Vec<String>,
-    /// Names of files in `~/.autobahn/ignores` whose patterns are applied
-    /// before every group's own, in the order written.
-    #[serde(default)]
-    pub ignore_files: Vec<String>,
     /// The default interval, in seconds, between synchronization cycles.
     pub interval: Option<u64>,
     /// The default durability class for the ancestor journal: "process"
@@ -476,8 +491,22 @@ pub struct Defaults {
     /// The default limit on entries (files, directories, symlinks) per
     /// root. A scan exceeding it fails the session's cycle.
     pub max_entry_count: Option<u64>,
-    /// Whether directories mounted inside a root are left alone (the
-    /// default) rather than synchronized as part of it.
+    /// Entries in a directory at or above which it disappearing from
+    /// exactly one side is disbelieved rather than propagated.
+    ///
+    /// A directory that turns up empty is a conflict; one that is gone
+    /// while the other side still holds what the ancestor recorded is
+    /// put back. Counted recursively, so one subfolder of seven files
+    /// reaches eight. Unset propagates every disappearance, whatever its
+    /// size.
+    ///
+    /// This was the `two-way-paranoid` mode, which did nothing else and
+    /// so could not be had alongside a one-way or peering direction.
+    pub guard_directory_deletes_over: Option<usize>,
+    /// Whether directories mounted inside a root are left alone rather
+    /// than synchronized as part of it. Off unless said otherwise: a
+    /// mount is walked like any other directory, and one that goes away
+    /// where the ancestor held content halts rather than deleting.
     pub ignore_mounts: Option<bool>,
     /// The default staging placement (`state`, `beside-root`, or
     /// `inside-root`).
@@ -491,6 +520,7 @@ pub struct Defaults {
 /// A size limit as written in the configuration: a raw byte count or a
 /// suffixed string.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(untagged)]
 pub enum SizeSpec {
     /// A raw byte count.
@@ -502,6 +532,7 @@ pub enum SizeSpec {
 /// One synchronization group: a local alpha directory fanned out to one or
 /// more beta destinations.
 #[derive(Clone, Debug, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
 pub struct Group {
     /// The alpha synchronization root: a local path (`~` is expanded) or a
@@ -510,50 +541,47 @@ pub struct Group {
     /// The beta destinations (remote `[user@]host[:path]` or local paths).
     #[serde(default)]
     pub betas: Vec<String>,
-    /// The synchronization mode (falls back to the defaults).
+    /// The synchronization mode.
     pub mode: Option<String>,
     /// Ignore patterns, appended to the defaults' patterns.
+    ///
+    /// An entry beginning `file:` names a file of patterns instead of
+    /// being one — see the defaults' `ignores`.
     #[serde(default)]
     pub ignores: Vec<String>,
-    /// Names of files in `~/.autobahn/ignores`, applied after the
-    /// defaults' patterns and before this group's own.
-    #[serde(default)]
-    pub ignore_files: Vec<String>,
-    /// The interval, in seconds, between cycles (falls back to the defaults).
+    /// The interval, in seconds, between cycles.
     pub interval: Option<u64>,
-    /// The durability class for the ancestor journal (falls back to the
-    /// defaults): "process" or "power".
+    /// The durability class for the ancestor journal: "process" or "power".
     pub durability: Option<String>,
-    /// The symbolic link treatment (`ignore`, `portable`, or `raw`; falls
-    /// back to the defaults).
+    /// The symbolic link treatment: `ignore`, `portable`, or `raw`.
     pub symlink_mode: Option<String>,
-    /// The permission bits (octal) for created files (falls back to the
-    /// defaults).
+    /// The permission bits (octal) for created files.
     pub file_mode: Option<String>,
-    /// The permission bits (octal) for created directories (falls back to
-    /// the defaults).
+    /// The permission bits (octal) for created directories.
     pub directory_mode: Option<String>,
-    /// The per-file size limit (falls back to the defaults): larger files
-    /// are left on disk but excluded from synchronization.
+    /// The per-file size limit: larger files are left on disk but
+    /// excluded from synchronization.
     pub max_file_size: Option<SizeSpec>,
-    /// The limit on entries per root (falls back to the defaults). A scan
-    /// exceeding it fails the session's cycle.
+    /// The limit on entries per root. A scan exceeding it fails the
+    /// session's cycle.
     pub max_entry_count: Option<u64>,
-    /// Whether mounts inside the roots are left alone (falls back to the
-    /// defaults, then to `true`).
+    /// Entries in a directory at or above which it disappearing from
+    /// exactly one side is disbelieved — see the defaults' own.
+    pub guard_directory_deletes_over: Option<usize>,
+    /// Whether mounts inside the roots are left alone. Off unless said
+    /// otherwise.
     pub ignore_mounts: Option<bool>,
     /// The staging placement: `state` (the session state directory),
     /// `beside-root` (a sibling of the synchronization root, guaranteeing
     /// same-filesystem renames), or `inside-root` (within the root itself,
-    /// for roots on otherwise unwritable-home hosts). Falls back to the
-    /// defaults.
+    /// for roots on otherwise unwritable-home hosts).
     pub staging: Option<String>,
     /// The owner (name or `id:N`) for created entries, applied by each
-    /// endpoint on its own host (falls back to the defaults). Requires the
-    /// endpoint to have chown rights.
+    /// endpoint on its own host. Requires the endpoint to have chown
+    /// rights.
     pub default_owner: Option<String>,
     /// The group (name or `id:N`) for created entries, applied by each
-    /// endpoint on its own host (falls back to the defaults).
+    /// endpoint on its own host.
     pub default_group: Option<String>,
     /// Turns the whole group off: it plans no sessions at all, as though
     /// it were not written. Its state and its status records stay where
@@ -617,6 +645,9 @@ pub struct SessionPlan {
     /// Whether directories on another device than their root — mount
     /// points — are left alone rather than synchronized.
     pub ignore_mounts: bool,
+    /// The directory size at or above which a one-sided disappearance is
+    /// disbelieved, or `None` to propagate every one of them.
+    pub guard_directory_deletes_over: Option<usize>,
     /// The staging placement for both endpoints.
     pub staging: StagingMode,
     /// The owner for created entries (`None` to leave ownership alone).
@@ -990,7 +1021,6 @@ impl OwnState {
 fn alpha_is_written(mode: SyncMode) -> bool {
     match mode {
         SyncMode::TwoWaySafe
-        | SyncMode::TwoWayParanoid
         | SyncMode::TwoWayResolved
         | SyncMode::TwoWayStrict => true,
         SyncMode::OneWaySafe | SyncMode::OneWayReplica => false,
@@ -1157,17 +1187,17 @@ impl Config {
         if self.alerts.is_some() {
             bail!(
                 "invalid configuration:\n  [alerts] has moved: put `on_alert` at the top \
-                 level, and anything else that was in [alerts] under [advanced.alerts]. \
+                 level, and anything else that was in [alerts] under [experimental.alerts]. \
                  The per-state hold times are now built in, so [alerts.after] can usually \
                  just be deleted."
             );
         }
 
-        let advanced = &self.advanced.alerts;
+        let advanced = &self.experimental.alerts;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| match spec {
             None => Ok(fallback),
             Some(spec) => parse_duration(spec).map_err(|message| {
-                anyhow!("invalid configuration:\n  advanced.alerts.{what}: {message}")
+                anyhow!("invalid configuration:\n  experimental.alerts.{what}: {message}")
             }),
         };
 
@@ -1192,7 +1222,7 @@ impl Config {
             let Some(alert) = Alert::parse(name) else {
                 let known: Vec<&str> = Alert::all().iter().map(|alert| alert.name()).collect();
                 bail!(
-                    "invalid configuration:\n  advanced.alerts.after.{name}: unknown state \
+                    "invalid configuration:\n  experimental.alerts.after.{name}: unknown state \
                      (expected one of: {})",
                     known.join(", ")
                 );
@@ -1200,7 +1230,7 @@ impl Config {
             after.insert(
                 alert,
                 parse_duration(spec).map_err(|message| {
-                    anyhow!("invalid configuration:\n  advanced.alerts.after.{name}: {message}")
+                    anyhow!("invalid configuration:\n  experimental.alerts.after.{name}: {message}")
                 })?,
             );
         }
@@ -1220,23 +1250,23 @@ impl Config {
         })
     }
 
-    /// The peering timing, from `[advanced.peering-dangerously-experimental]` and the
+    /// The peering timing, from `[experimental.peering-dangerously-experimental]` and the
     /// built-in defaults. Resolved whether or not any group is in a
     /// peering mode: a bad value is a configuration error either way.
     pub fn peering_plan(&self) -> Result<PeeringPlan> {
-        if self.advanced.retired_peering.is_some() {
+        if self.experimental.retired_peering.is_some() {
             bail!(
-                "invalid configuration:\n  [advanced.peering-experimental] was renamed to \
-                 [advanced.peering-dangerously-experimental]: peering has known security \
+                "invalid configuration:\n  [experimental.peering-experimental] was renamed to \
+                 [experimental.peering-dangerously-experimental]: peering has known security \
                  and collision issues. Read docs/peering.md before enabling it."
             );
         }
-        let advanced = &self.advanced.peering;
+        let advanced = &self.experimental.peering;
         let duration = |spec: &Option<DurationSpec>, what: &str, fallback: Duration| {
             match spec {
             None => Ok(fallback),
             Some(spec) => parse_duration(spec).map_err(|message| {
-                anyhow!("invalid configuration:\n  advanced.peering-dangerously-experimental.{what}: {message}")
+                anyhow!("invalid configuration:\n  experimental.peering-dangerously-experimental.{what}: {message}")
             }),
         }
         };
@@ -1251,7 +1281,7 @@ impl Config {
         // still good.
         if failover_after < ttl {
             bail!(
-                "invalid configuration:\n  advanced.peering-dangerously-experimental.failover_after \
+                "invalid configuration:\n  experimental.peering-dangerously-experimental.failover_after \
                  ({}s) is shorter than ttl ({}s); a peer must not take the lead while the \
                  lease is still valid",
                 failover_after.as_secs(),
@@ -1259,7 +1289,7 @@ impl Config {
             );
         }
         if ttl.is_zero() {
-            bail!("invalid configuration:\n  advanced.peering-dangerously-experimental.ttl must not be zero");
+            bail!("invalid configuration:\n  experimental.peering-dangerously-experimental.ttl must not be zero");
         }
         Ok(PeeringPlan {
             ttl,
@@ -1304,6 +1334,30 @@ impl Config {
                     .to_owned(),
             );
         }
+        // The two top-level keys that can be quietly wrong. Neither is
+        // worth refusing a file over — a hook may be written after the
+        // line that names it, and a host may come back — but a typo in
+        // either is silent for as long as nobody looks.
+        if let Some(command) = &self.on_alert {
+            let named = command.split_whitespace().next().unwrap_or_default();
+            let looks_like_a_path = named.starts_with('/') || named.starts_with('~');
+            if looks_like_a_path {
+                let path = crate::paths::expand_tilde(named).unwrap_or_else(|_| named.into());
+                if !path.exists() {
+                    warnings.push(format!("on_alert: there is no {} to run", path.display()));
+                }
+            }
+        }
+        let known = self.known_hosts();
+        for host in &self.disabled_hosts {
+            if !known.iter().any(|name| name == host) {
+                warnings.push(format!(
+                    "disabled_hosts: no group names the host {host:?}, so disabling it \
+                     does nothing (available: {})",
+                    known.join(", ")
+                ));
+            }
+        }
         let peering = match self.peering_plan() {
             Ok(plan) => Some(plan),
             Err(error) => {
@@ -1342,17 +1396,29 @@ impl Config {
             if group.disabled {
                 continue;
             }
-            let (mode, peers) = match group.mode.as_deref().or(self.defaults.mode.as_deref()) {
-                Some(mode) => match parse_mode_spec(mode) {
+            // A complaint names the place somebody would go to fix it.
+            // For a value this group wrote that is the group; for one it
+            // inherited it is the defaults, and saying "group 'aws'"
+            // about a line in `[defaults]` sends them to the wrong table
+            // — once per group that inherits it.
+            let blame = |mine: bool, key: &str, message: &dyn std::fmt::Display| match mine {
+                true => format!("group '{name}': {key}: {message}"),
+                false => format!("the defaults' {key}: {message}"),
+            };
+            let (mode, peers) = match inherited(
+                group.mode.as_deref(),
+                self.defaults.mode.as_deref(),
+            ) {
+                Some((mode, mine)) => match parse_mode_spec(mode) {
                     Ok((mode, peers)) => (Some(mode), peers),
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(blame(mine, "mode", &message));
                         (None, false)
                     }
                 },
                 None => {
                     errors.push(format!(
-                        "group '{name}' has no mode and the defaults specify none"
+                        "group '{name}': mode: none here, and the defaults specify none either"
                     ));
                     (None, false)
                 }
@@ -1363,34 +1429,33 @@ impl Config {
                 (true, Some(plan)) => Some(plan),
                 _ => None,
             };
-            let power_durability = match group
-                .durability
-                .as_deref()
-                .or(self.defaults.durability.as_deref())
-                .unwrap_or("process")
-            {
-                "process" => false,
-                "power" => true,
-                other => {
-                    errors.push(format!(
-                        "group '{name}': unknown durability '{other}' \
-                         (expected 'process' or 'power')"
-                    ));
+            let power_durability = match parse_word(
+                DURABILITY,
+                "durability",
+                group
+                    .durability
+                    .as_deref()
+                    .or(self.defaults.durability.as_deref())
+                    .unwrap_or("process"),
+            ) {
+                Ok(word) => word.word == "power",
+                Err(complaint) => {
+                    errors.push(format!("group '{name}': durability: {complaint}"));
                     false
                 }
             };
             if group.alpha.is_empty() {
-                errors.push(format!("group '{name}' has an empty alpha"));
+                errors.push(format!("group '{name}': alpha: cannot be empty"));
             }
             if group.betas.is_empty() {
-                errors.push(format!("group '{name}' has no betas"));
+                errors.push(format!("group '{name}': betas: a group needs at least one"));
             }
             let agent_command = match &group.agent_command {
                 None => None,
                 Some(command) => {
                     let argv: Vec<String> = command.split_whitespace().map(str::to_owned).collect();
                     if argv.is_empty() {
-                        errors.push(format!("group '{name}' has an empty agent_command"));
+                        errors.push(format!("group '{name}': agent_command: cannot be empty"));
                         None
                     } else {
                         Some(argv)
@@ -1411,14 +1476,18 @@ impl Config {
                         // in — a different tree under a service than in a
                         // shell.
                         errors.push(format!(
-                            "group '{name}' alpha '{}' must be an absolute (or ~-relative) path",
+                            "group '{name}': alpha: '{}' must be an absolute (or ~-relative) \
+                             path",
                             group.alpha
                         ));
                         None
                     }
                     Ok(target) => Some(target),
                     Err(message) => {
-                        errors.push(format!("group '{name}' alpha '{}': {message}", group.alpha));
+                        errors.push(format!(
+                            "group '{name}': alpha: '{}': {message}",
+                            group.alpha
+                        ));
                         None
                     }
                 }
@@ -1442,7 +1511,8 @@ impl Config {
             if peering.is_some() {
                 if let Some(EndpointTarget::Remote { .. }) = &alpha {
                     errors.push(format!(
-                        "group '{name}': a peering mode needs a local alpha; '{}' is remote",
+                        "group '{name}': mode: a peering mode needs a local alpha; '{}' is \
+                         remote",
                         group.alpha
                     ));
                     continue;
@@ -1455,39 +1525,34 @@ impl Config {
                 _ => group.alpha.clone(),
             };
 
-            // Widest first, narrowest last, because the last matching
-            // pattern decides: the defaults' files, then the defaults'
-            // own patterns, then the group's files, then the group's own.
-            // A group can therefore re-include something a shared file
-            // excluded, which is the point of having both.
+            // The defaults, then the group, each read straight down: the
+            // last matching pattern decides, so a group re-includes what
+            // the defaults excluded, and within one list the order on
+            // screen is the order that applies. A `file:` entry puts the
+            // file's patterns exactly where the entry sits.
             let mut ignores = Vec::new();
             let mut ignore_errors = Vec::new();
-            for (source, names) in [
-                ("the defaults'", &self.defaults.ignore_files),
-                ("its own", &group.ignore_files),
-            ] {
-                for file in names {
-                    match crate::scan::ignorefile::read(&ignore_directory, file) {
+            for (mine, entries) in [(false, &self.defaults.ignores), (true, &group.ignores)] {
+                for entry in entries {
+                    let Some(file) = entry.strip_prefix(IGNORE_FILE) else {
+                        ignores.push(entry.clone());
+                        continue;
+                    };
+                    match crate::scan::ignorefile::read(&ignore_directory, file.trim()) {
                         Ok(patterns) => ignores.extend(patterns),
                         Err(error) => {
-                            ignore_errors.push(format!("{source} ignore_files: {error:#}"))
+                            ignore_errors.push(blame(mine, "ignores", &format!("{error:#}")))
                         }
                     }
                 }
-                if source == "the defaults'" {
-                    ignores.extend(self.defaults.ignores.iter().cloned());
-                }
             }
-            ignores.extend(group.ignores.iter().cloned());
-            for error in ignore_errors {
-                errors.push(format!("group '{name}': {error}"));
-            }
+            errors.extend(ignore_errors);
             // Compile the combined patterns now, so a bad pattern is a
             // configuration error alongside the others rather than a runtime
             // failure discovered only by the affected session's worker.
             match IgnoreSet::new(&ignores) {
                 Err(error) => {
-                    errors.push(format!("group '{name}': invalid ignore pattern: {error:#}"))
+                    errors.push(format!("group '{name}': ignores: invalid pattern: {error:#}"))
                 }
                 // A line that cannot ever do anything is a mistake worth
                 // refusing, not a preference: combining ignore files
@@ -1504,7 +1569,7 @@ impl Config {
                         compiled
                             .dead_negations()
                             .into_iter()
-                            .map(|dead| format!("group '{name}': {dead}")),
+                            .map(|dead| format!("group '{name}': ignores: {dead}")),
                     )
                 }
             }
@@ -1522,7 +1587,7 @@ impl Config {
             if let Some(plan) = peering {
                 if plan.ttl < interval.saturating_mul(2) {
                     errors.push(format!(
-                        "group '{name}': advanced.peering-dangerously-experimental.ttl ({}s) must be at \
+                        "group '{name}': experimental.peering-dangerously-experimental.ttl ({}s) must be at \
                          least twice the interval ({}s); the lease is renewed once per cycle",
                         plan.ttl.as_secs(),
                         interval.as_secs()
@@ -1530,54 +1595,62 @@ impl Config {
                     continue;
                 }
             }
-            let symlink_mode = match group
-                .symlink_mode
-                .as_deref()
-                .or(self.defaults.symlink_mode.as_deref())
-            {
+            let symlink_mode = match inherited(
+                group.symlink_mode.as_deref(),
+                self.defaults.symlink_mode.as_deref(),
+            ) {
                 None => SymlinkMode::default(),
-                Some(mode) => match parse_symlink_mode(mode) {
+                Some((mode, mine)) => match parse_symlink_mode(mode) {
                     Ok(mode) => mode,
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(blame(mine, "symlink_mode", &message));
                         SymlinkMode::default()
                     }
                 },
             };
-            let mut permission = |value: Option<&str>, directory: bool| match value {
-                None => None,
-                Some(mode) => match parse_permission_mode(mode, directory) {
-                    Ok(bits) => Some(bits),
-                    Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
-                        None
-                    }
-                },
+            let mut permission = |held: Option<(&str, bool)>, directory: bool| {
+                let key = match directory {
+                    true => "directory_mode",
+                    false => "file_mode",
+                };
+                match held {
+                    None => None,
+                    Some((mode, mine)) => match parse_permission_mode(mode, directory) {
+                        Ok(bits) => Some(bits),
+                        Err(message) => {
+                            errors.push(blame(mine, key, &message));
+                            None
+                        }
+                    },
+                }
             };
             let file_mode = permission(
-                group
-                    .file_mode
-                    .as_deref()
-                    .or(self.defaults.file_mode.as_deref()),
+                inherited(
+                    group.file_mode.as_deref(),
+                    self.defaults.file_mode.as_deref(),
+                ),
                 false,
             );
             let directory_mode = permission(
-                group
-                    .directory_mode
-                    .as_deref()
-                    .or(self.defaults.directory_mode.as_deref()),
+                inherited(
+                    group.directory_mode.as_deref(),
+                    self.defaults.directory_mode.as_deref(),
+                ),
                 true,
             );
-            let max_file_size = match group
-                .max_file_size
-                .as_ref()
-                .or(self.defaults.max_file_size.as_ref())
-            {
+            // The same question, for a value that is not a string:
+            // whichever table has it is the one to blame.
+            let size = match (&group.max_file_size, &self.defaults.max_file_size) {
+                (Some(spec), _) => Some((spec, true)),
+                (None, Some(spec)) => Some((spec, false)),
+                (None, None) => None,
+            };
+            let max_file_size = match size {
                 None => None,
-                Some(spec) => match parse_size(spec) {
+                Some((spec, mine)) => match parse_size(spec) {
                     Ok(bytes) => Some(bytes),
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(blame(mine, "max_file_size", &message));
                         None
                     }
                 },
@@ -1586,54 +1659,56 @@ impl Config {
             let ignore_mounts = group
                 .ignore_mounts
                 .or(self.defaults.ignore_mounts)
-                .unwrap_or(true);
-            let staging = match group
-                .staging
-                .as_deref()
-                .or(self.defaults.staging.as_deref())
-            {
+                .unwrap_or(false);
+            let guard_directory_deletes_over = group
+                .guard_directory_deletes_over
+                .or(self.defaults.guard_directory_deletes_over);
+            let staging = match inherited(
+                group.staging.as_deref(),
+                self.defaults.staging.as_deref(),
+            ) {
                 None => StagingMode::default(),
-                Some(mode) => match parse_staging_mode(mode) {
+                Some((mode, mine)) => match parse_staging_mode(mode) {
                     Ok(mode) => mode,
                     Err(message) => {
-                        errors.push(format!("group '{name}': {message}"));
+                        errors.push(blame(mine, "staging", &message));
                         StagingMode::default()
                     }
                 },
             };
-            let mut ownership = |value: Option<&str>, kind: &str| match value {
+            let mut ownership = |held: Option<(&str, bool)>, key: &str| match held {
                 None => None,
-                Some("") => {
-                    errors.push(format!("group '{name}' has an empty {kind}"));
+                Some(("", mine)) => {
+                    errors.push(blame(mine, key, &"cannot be empty"));
                     None
                 }
-                Some(spec) => Some(spec.to_owned()),
+                Some((spec, _)) => Some(spec.to_owned()),
             };
             let default_owner = ownership(
-                group
-                    .default_owner
-                    .as_deref()
-                    .or(self.defaults.default_owner.as_deref()),
+                inherited(
+                    group.default_owner.as_deref(),
+                    self.defaults.default_owner.as_deref(),
+                ),
                 "default_owner",
             );
             let default_group = ownership(
-                group
-                    .default_group
-                    .as_deref()
-                    .or(self.defaults.default_group.as_deref()),
+                inherited(
+                    group.default_group.as_deref(),
+                    self.defaults.default_group.as_deref(),
+                ),
                 "default_group",
             );
 
             for beta in &group.betas {
                 if beta.is_empty() {
-                    errors.push(format!("group '{name}' has an empty beta"));
+                    errors.push(format!("group '{name}': betas: one of them is empty"));
                     continue;
                 }
                 let target =
                     match parse_endpoint(beta, Some(&inherited_path), agent_command.clone()) {
                         Ok(target) => target,
                         Err(message) => {
-                            errors.push(format!("group '{name}' beta '{beta}': {message}"));
+                            errors.push(format!("group '{name}': betas: '{beta}': {message}"));
                             continue;
                         }
                     };
@@ -1643,7 +1718,7 @@ impl Config {
                     // alpha already.
                     if peering.is_some() {
                         errors.push(format!(
-                            "group '{name}' beta '{beta}': a peering mode needs every beta on \
+                            "group '{name}': betas: '{beta}': a peering mode needs every beta on \
                              another host"
                         ));
                         continue;
@@ -1652,7 +1727,7 @@ impl Config {
                     // and the trap that catches unexpanded `~user` forms.
                     if !path.is_absolute() {
                         errors.push(format!(
-                            "group '{name}' beta '{beta}' must be an absolute (or ~-relative) \
+                            "group '{name}': betas: '{beta}' must be an absolute (or ~-relative) \
                              local path"
                         ));
                         continue;
@@ -1691,6 +1766,7 @@ impl Config {
                     max_file_size,
                     max_entry_count,
                     ignore_mounts,
+                    guard_directory_deletes_over,
                     staging,
                     default_owner: default_owner.clone(),
                     default_group: default_group.clone(),
@@ -1827,21 +1903,50 @@ impl Config {
         }
 
         if !errors.is_empty() {
+            let errors = fold(errors);
             bail!("invalid configuration:\n  {}", errors.join("\n  "));
         }
         Ok((plans, warnings))
     }
 }
 
+/// A value and whether this group is where it was written.
+///
+/// Every session setting falls back to `[defaults]`, and a complaint
+/// about an inherited value belongs to the defaults: that is where it
+/// is written and where it would be fixed. Saying "group 'aws'" about
+/// a line in `[defaults]` sends a person to the wrong table, once for
+/// every group that inherits it.
+fn inherited<'a>(own: Option<&'a str>, shared: Option<&'a str>) -> Option<(&'a str, bool)> {
+    match own {
+        Some(value) => Some((value, true)),
+        None => shared.map(|value| (value, false)),
+    }
+}
+
+/// Says each fault once, however many groups ran into it.
+///
+/// Every group is planned in turn, so a value in `[defaults]` is read
+/// once per group that inherits it. Each of those now blames the
+/// defaults rather than the group ([`inherited`]), which makes the
+/// eight copies identical — and identical is what this removes. A
+/// fault that really is a group's own keeps its group, and stays.
+fn fold(errors: Vec<String>) -> Vec<String> {
+    let mut said: Vec<String> = Vec::new();
+    for line in errors {
+        if !said.contains(&line) {
+            said.push(line);
+        }
+    }
+    said
+}
+
 /// Parses a symbolic link mode name.
 pub fn parse_symlink_mode(mode: &str) -> Result<SymlinkMode, String> {
-    match mode {
+    match parse_word(SYMLINK_MODES, "symlink mode", mode)?.word {
         "ignore" => Ok(SymlinkMode::Ignore),
         "portable" => Ok(SymlinkMode::Portable),
-        "raw" | "posix-raw" => Ok(SymlinkMode::Raw),
-        other => Err(format!(
-            "unknown symlink mode '{other}' (expected one of: ignore, portable, raw)"
-        )),
+        _ => Ok(SymlinkMode::Raw),
     }
 }
 
@@ -1869,14 +1974,10 @@ pub fn parse_permission_mode(mode: &str, directory: bool) -> Result<u32, String>
 
 /// Parses a staging placement name.
 pub fn parse_staging_mode(mode: &str) -> Result<StagingMode, String> {
-    match mode {
+    match parse_word(STAGING_MODES, "staging placement", mode)?.word {
         "state" => Ok(StagingMode::State),
         "beside-root" => Ok(StagingMode::BesideRoot),
-        "inside-root" => Ok(StagingMode::InsideRoot),
-        other => Err(format!(
-            "unknown staging placement '{other}' (expected one of: state, beside-root, \
-             inside-root)"
-        )),
+        _ => Ok(StagingMode::InsideRoot),
     }
 }
 
@@ -1939,6 +2040,430 @@ pub fn parse_duration(spec: &DurationSpec) -> Result<Duration, String> {
         .ok_or_else(|| format!("duration '{text}' overflows"))
 }
 
+/// Every synchronization mode this build reads: its canonical name, the
+/// older spellings still accepted for it, the reconciliation it runs and
+/// whether the name asks for peering.
+///
+/// One table, read by the parser, by the error a bad name gets, by
+/// [`mode_name`] and by the schema the editor builds its form from. A
+/// mode is added by adding a row, so none of those four can fall behind
+/// the others.
+pub const MODES: &[ModeName] = &[
+    ModeName {
+        name: "two-way-conflict",
+        also: &["two-way-safe"],
+        mode: SyncMode::TwoWaySafe,
+        peering: false,
+        about: "Both ways. A file both sides changed is reported, never chosen between.",
+    },
+    ModeName {
+        name: "two-way-alpha",
+        also: &["two-way-resolved"],
+        mode: SyncMode::TwoWayResolved,
+        peering: false,
+        about: "Both ways, and alpha wins a collision — except that a deletion never beats an edit.",
+    },
+    ModeName {
+        name: "two-way-alpha-strict",
+        also: &[],
+        mode: SyncMode::TwoWayStrict,
+        peering: false,
+        about: "As two-way-alpha with that exception removed: alpha's deletion beats beta's edit.",
+    },
+    ModeName {
+        name: "one-way-conflict",
+        also: &["one-way-safe"],
+        mode: SyncMode::OneWaySafe,
+        peering: false,
+        about: "Alpha to beta only. A file changed on beta is reported rather than overwritten.",
+    },
+    ModeName {
+        name: "one-way-alpha",
+        also: &["one-way-replica", "mirror"],
+        mode: SyncMode::OneWayReplica,
+        peering: false,
+        about: "Alpha to beta only, and beta is made to match — what rsync --delete does.",
+    },
+    ModeName {
+        name: "peering-conflict-dangerously-experimental",
+        also: &[],
+        mode: SyncMode::TwoWaySafe,
+        peering: true,
+        about: "two-way-conflict, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/peering.md first.",
+    },
+    ModeName {
+        name: "peering-alpha-dangerously-experimental",
+        also: &[],
+        mode: SyncMode::TwoWayResolved,
+        peering: true,
+        about: "two-way-alpha, and a beta may take the lead while alpha is away. Known security and collision issues: read docs/peering.md first.",
+    },
+];
+
+/// Names that were renamed, and what they were renamed to. A
+/// configuration that uses one is told why rather than merely told the
+/// name is unknown.
+pub const RENAMED_MODES: &[(&str, &str, &str)] = &[
+    (
+        "peering-conflict-experimental",
+        "peering-conflict-dangerously-experimental",
+        "peering has known security and collision issues. Read docs/peering.md before enabling it",
+    ),
+    (
+        "peering-alpha-experimental",
+        "peering-alpha-dangerously-experimental",
+        "peering has known security and collision issues. Read docs/peering.md before enabling it",
+    ),
+];
+
+/// One row of [`MODES`].
+#[derive(Debug)]
+pub struct ModeName {
+    /// What this mode is called now, and what `status` prints.
+    pub name: &'static str,
+    /// Older spellings of the same mode, still read.
+    pub also: &'static [&'static str],
+    /// The reconciliation it runs.
+    pub mode: SyncMode,
+    /// Whether the name asks for peering.
+    pub peering: bool,
+    /// One sentence, for a reader choosing between them.
+    pub about: &'static str,
+}
+
+/// One word a configuration key accepts, and what it means.
+///
+/// The same shape as a row of [`MODES`] without the reconciliation: the
+/// parser reads it, the error a wrong word gets is written from it, and
+/// the editor's form offers exactly these.
+#[derive(Debug)]
+pub struct Word {
+    /// The canonical spelling.
+    pub word: &'static str,
+    /// Older or looser spellings that mean the same thing.
+    pub also: &'static [&'static str],
+    /// One line, for a person choosing between them.
+    pub about: &'static str,
+}
+
+/// What `symlink_mode` accepts.
+pub const SYMLINK_MODES: &[Word] = &[
+    Word {
+        word: "ignore",
+        also: &[],
+        about: "Symbolic links are left where they are and never carried.",
+    },
+    Word {
+        word: "portable",
+        also: &[],
+        about: "Links that stay inside the root are carried as links; anything else is refused rather than followed.",
+    },
+    Word {
+        word: "raw",
+        also: &["posix-raw"],
+        about: "Every link is carried exactly as written, including one that points outside the root.",
+    },
+];
+
+/// What `staging` accepts.
+pub const STAGING_MODES: &[Word] = &[
+    Word {
+        word: "state",
+        also: &[],
+        about: "Staged content lives under the state root, off the synchronized tree.",
+    },
+    Word {
+        word: "beside-root",
+        also: &[],
+        about: "Staged content lives next to the root, for a root on a different filesystem from the state.",
+    },
+    Word {
+        word: "inside-root",
+        also: &[],
+        about: "Staged content lives inside the root itself: the last resort, and it shows up in the tree while it is there.",
+    },
+];
+
+/// What `durability` accepts.
+pub const DURABILITY: &[Word] = &[
+    Word {
+        word: "process",
+        also: &[],
+        about: "The journal survives this process dying. The default.",
+    },
+    Word {
+        word: "power",
+        also: &[],
+        about: "Every record is flushed to the disk, so the journal survives the power going out. Slower.",
+    },
+];
+
+/// What `log` accepts.
+pub const LOG_LEVELS: &[Word] = &[
+    Word {
+        word: "quiet",
+        also: &["error", "errors"],
+        about: "Only what went wrong.",
+    },
+    Word {
+        word: "normal",
+        also: &["info"],
+        about: "What went wrong, and what changed. The default.",
+    },
+    Word {
+        word: "debug",
+        also: &["verbose", "trace"],
+        about: "Every decision, named file by file. Megabytes a day.",
+    },
+];
+
+/// The words a configuration key accepts, or `None` where the value is
+/// free text. Keyed by the key as it is written in the file, so the
+/// editor can ask about a field it only knows the name of.
+pub fn vocabulary(key: &str) -> Option<&'static [Word]> {
+    match key {
+        "symlink_mode" => Some(SYMLINK_MODES),
+        "staging" => Some(STAGING_MODES),
+        "durability" => Some(DURABILITY),
+        "log" => Some(LOG_LEVELS),
+        _ => None,
+    }
+}
+
+/// Reads one word from a table, or says what was expected. The canonical
+/// spellings are listed; the older ones are accepted without being
+/// advertised.
+pub fn parse_word<'a>(words: &'a [Word], what: &str, given: &str) -> Result<&'a Word, String> {
+    if let Some(word) = words
+        .iter()
+        .find(|word| word.word == given || word.also.contains(&given))
+    {
+        return Ok(word);
+    }
+    let expected: Vec<&str> = words.iter().map(|word| word.word).collect();
+    Err(format!(
+        "unknown {what} '{given}' (expected one of: {})",
+        expected.join(", ")
+    ))
+}
+
+/// The order the keys of a section are worth reading in.
+///
+/// A schema is a map, so a form built straight from one is alphabetical,
+/// which puts `acknowledge_secrets` above `alpha` and `disabled` nowhere
+/// near the mode it qualifies. This is the reading order; anything not
+/// named here follows, alphabetically.
+/// What marks an `ignores` entry as naming a file of patterns rather
+/// than being one.
+///
+/// A prefix rather than a second key, because the two used to be two
+/// lists applied in an order nobody could see.
+pub const IGNORE_FILE: &str = "file:";
+
+pub const ORDER: &[&str] = &[
+    // The top of the file.
+    "live_reload",
+    "log",
+    "on_alert",
+    "disabled_hosts",
+    "power_saver_experimental",
+    // A group, and the defaults that stand behind one.
+    "alpha",
+    "betas",
+    "mode",
+    "disabled",
+    "ignores",
+    "ignore_mounts",
+    "guard_directory_deletes_over",
+    "max_file_size",
+    "max_entry_count",
+    "symlink_mode",
+    // The experimental tail of a section, in the order a window that
+    // has been let in draws it: the cycle, then how the machinery
+    // works, then how created entries land and who owns them.
+    "interval",
+    "durability",
+    "staging",
+    "agent_command",
+    "acknowledge_secrets",
+    "file_mode",
+    "directory_mode",
+    "default_owner",
+    "default_group",
+    // The timings.
+    "alert_after",
+    "after",
+    "coalesce_after",
+    "settle_after",
+    "repeat_after",
+    "timeout",
+    "ttl",
+    "failover_after",
+    "allow_root",
+];
+
+/// Where a key sits in [`ORDER`], for a form to sort by.
+pub fn order_of(key: &str) -> usize {
+    ORDER
+        .iter()
+        .position(|known| *known == key)
+        .unwrap_or(ORDER.len())
+}
+
+/// The unit a number or a duration is written in, for a form to put
+/// beside the box rather than leave a person guessing.
+pub fn unit(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "interval" => "whole seconds",
+        "max_entry_count" => "a whole number of entries",
+        "guard_directory_deletes_over" => "entries in the directory, counted recursively",
+        "max_file_size" => "bytes, or a size: 100MB · 2GiB · 500K",
+        "file_mode" | "directory_mode" => "octal permissions: 0600 · 0644 · 0755",
+        "ttl" | "timeout" => "a length of time: 30s · 5m · 2h",
+        key if key.ends_with("_after") => "a length of time: 30s · 5m · 2h",
+        "alpha" => "a path, or user@host:path",
+        "betas" | "disabled_hosts" => "one to a line",
+        "ignores" => "one to a line; file:Rust.gitignore reads a file of them",
+        "on_alert" | "agent_command" => "a shell command",
+        _ => return None,
+    })
+}
+
+/// What a key means when the file does not say, where that answer is a
+/// constant in this program rather than something the schema carries.
+///
+/// A form that says "not set" and stops has told a person nothing: the
+/// question they have is what happens then. Everything here is the very
+/// constant the code falls back to, named beside it so the two cannot
+/// drift without this table looking wrong.
+pub fn fallback(key: &str) -> Option<String> {
+    Some(match key {
+        "interval" => DEFAULT_INTERVAL_SECONDS.to_string(),
+        // `endpoint::local`, which is where created entries get their bits.
+        "file_mode" => "0600".to_owned(),
+        "directory_mode" => "0700".to_owned(),
+        "symlink_mode" => "raw".to_owned(),
+        "durability" => "process".to_owned(),
+        "staging" => "state".to_owned(),
+        "ignore_mounts" => "false".to_owned(),
+        "guard_directory_deletes_over" => "off: every disappearance propagates".to_owned(),
+        // `mode` has no fallback on purpose: a group without one, and
+        // with no default behind it, is refused rather than guessed at.
+        "max_file_size" | "max_entry_count" => "no limit".to_owned(),
+        "alert_after" => format!("{}s", DEFAULT_ALERT_AFTER.as_secs()),
+        "coalesce_after" => format!("{}s", DEFAULT_COALESCE_AFTER.as_secs()),
+        "settle_after" => format!("{}m", DEFAULT_SETTLE_AFTER.as_secs() / 60),
+        "timeout" => format!("{}s", DEFAULT_ALERT_TIMEOUT.as_secs()),
+        "repeat_after" => "never".to_owned(),
+        "ttl" => format!("{}s", DEFAULT_PEERING_TTL.as_secs()),
+        "failover_after" => format!("{}s", DEFAULT_PEERING_FAILOVER_AFTER.as_secs()),
+        _ => return None,
+    })
+}
+
+/// What a value is for, where the type alone does not say: a widget hint
+/// for a form, keyed by the key as it is written.
+pub fn widget(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "alpha" => "endpoint",
+        "betas" => "endpoints",
+        "ignores" => "patterns",
+        "disabled_hosts" => "hosts",
+        "on_alert" => "command",
+        "agent_command" => "command",
+        "file_mode" | "directory_mode" => "octal",
+        "max_file_size" => "size",
+        "interval" => "seconds",
+        "ttl" | "timeout" => "duration",
+        key if key.ends_with("_after") => "duration",
+        _ => return None,
+    })
+}
+
+/// The configuration's own shape, for anything that builds a form from
+/// it.
+///
+/// The fields and their types come from the very structs the parser
+/// deserializes into, so a field cannot be in one and not the other. The
+/// words a field accepts come from the tables above, which the parsers
+/// also read. The widget hints say what a value is for. Nothing here is
+/// a second list of anything, which is the whole point.
+#[cfg(feature = "schema")]
+pub fn schema() -> serde_json::Value {
+    let mut document =
+        serde_json::to_value(schemars::schema_for!(Config)).expect("a schema is JSON");
+    annotate(&mut document);
+    document
+}
+
+/// Walks the derived schema and writes what the tables know onto it:
+/// `enum` for a validator, `x-words` for a form that wants to say what
+/// each word means, and `x-widget` for one that wants the right control.
+#[cfg(feature = "schema")]
+fn annotate(node: &mut serde_json::Value) {
+    use serde_json::{json, Value};
+
+    if let Value::Object(map) = node {
+        if let Some(Value::Object(properties)) = map.get_mut("properties") {
+            for (key, property) in properties.iter_mut() {
+                // The third of each triple says the word is experimental:
+                // a peering mode is one, and a form that has not been
+                // let in does not offer it. The list is here rather than
+                // in the form because this is where the words are.
+                let words: Option<Vec<(&str, &str, bool)>> = match key.as_str() {
+                    "mode" => Some(
+                        MODES
+                            .iter()
+                            .map(|row| (row.name, row.about, row.peering))
+                            .collect(),
+                    ),
+                    key => vocabulary(key).map(|words| {
+                        words
+                            .iter()
+                            .map(|word| (word.word, word.about, false))
+                            .collect()
+                    }),
+                };
+                let Value::Object(property) = property else {
+                    continue;
+                };
+                if let Some(words) = words {
+                    property.insert(
+                        "enum".to_owned(),
+                        Value::Array(words.iter().map(|(word, _, _)| json!(word)).collect()),
+                    );
+                    property.insert(
+                        "x-words".to_owned(),
+                        Value::Array(
+                            words
+                                .iter()
+                                .map(|(word, about, kept)| {
+                                    json!({"word": word, "about": about, "experimental": kept})
+                                })
+                                .collect(),
+                        ),
+                    );
+                }
+                if let Some(widget) = widget(key) {
+                    property.insert("x-widget".to_owned(), json!(widget));
+                }
+                if let Some(unit) = unit(key) {
+                    property.insert("x-unit".to_owned(), json!(unit));
+                }
+                if let Some(fallback) = fallback(key) {
+                    property.insert("x-default".to_owned(), json!(fallback));
+                }
+                property.insert("x-order".to_owned(), json!(order_of(key)));
+            }
+        }
+        for (_, value) in map.iter_mut() {
+            annotate(value);
+        }
+    } else if let Value::Array(items) = node {
+        items.iter_mut().for_each(annotate);
+    }
+}
+
 /// Parses a synchronization mode name to what reconciliation runs.
 ///
 /// A peering spelling parses to the reconciliation mode it wraps; the
@@ -1955,48 +2480,35 @@ pub fn parse_mode_spec(mode: &str) -> Result<(SyncMode, bool), String> {
     // wins. The older names (safe, resolved, replica) described the same
     // four modes without exposing that structure; they stay accepted so
     // existing configurations keep working.
-    match mode {
-        "two-way-conflict" | "two-way-safe" => Ok((SyncMode::TwoWaySafe, false)),
-        // Off the grid: two-way-conflict that also refuses to trust a
-        // large directory going empty or missing on one side.
-        "two-way-paranoid" => Ok((SyncMode::TwoWayParanoid, false)),
-        "two-way-alpha" | "two-way-resolved" => Ok((SyncMode::TwoWayResolved, false)),
-        // Off the grid: two-way-alpha with its one exception removed —
-        // alpha's deletion beats beta's edit, instead of yielding to it.
-        "two-way-alpha-strict" => Ok((SyncMode::TwoWayStrict, false)),
-        "one-way-conflict" | "one-way-safe" => Ok((SyncMode::OneWaySafe, false)),
-        // "mirror" is what everyone calls this shape (rsync --delete), so
-        // it is accepted too.
-        "one-way-alpha" | "one-way-replica" | "mirror" => Ok((SyncMode::OneWayReplica, false)),
-        // A third direction: two-way, and the betas can take the lead
-        // while the alpha is away. Experimental, and spelled so.
-        "peering-conflict-dangerously-experimental" => Ok((SyncMode::TwoWaySafe, true)),
-        "peering-alpha-dangerously-experimental" => Ok((SyncMode::TwoWayResolved, true)),
-        // The old spellings are answered, not merely unknown: the rename is
-        // the point, and a configuration that used them should be told why
-        // rather than quietly carried across.
-        "peering-conflict-experimental" | "peering-alpha-experimental" => Err(format!(
-            "mode '{mode}' was renamed to '{}': peering has known security and \
-             collision issues. Read docs/peering.md before enabling it",
-            mode.replace("-experimental", "-dangerously-experimental")
-        )),
-        other => Err(format!(
-            "unknown mode '{other}' (expected one of: two-way-conflict, two-way-paranoid, \
-             two-way-alpha, two-way-alpha-strict, one-way-conflict, one-way-alpha, \
-             peering-conflict-dangerously-experimental, peering-alpha-dangerously-experimental)"
-        )),
+    if let Some(row) = MODES
+        .iter()
+        .find(|row| row.name == mode || row.also.contains(&mode))
+    {
+        return Ok((row.mode, row.peering));
     }
+    // The old spellings are answered, not merely unknown: the rename is
+    // the point, and a configuration that used them should be told why
+    // rather than quietly carried across.
+    if let Some((_, now, why)) = RENAMED_MODES.iter().find(|(was, ..)| *was == mode) {
+        return Err(format!("mode '{mode}' was renamed to '{now}': {why}"));
+    }
+    let expected: Vec<&str> = MODES.iter().map(|row| row.name).collect();
+    Err(format!(
+        "unknown mode '{mode}' (expected one of: {})",
+        expected.join(", ")
+    ))
 }
 
 /// Returns the canonical name of a synchronization mode.
 pub fn mode_name(mode: SyncMode) -> &'static str {
-    match mode {
-        SyncMode::TwoWaySafe => "two-way-conflict",
-        SyncMode::TwoWayParanoid => "two-way-paranoid",
-        SyncMode::TwoWayResolved => "two-way-alpha",
-        SyncMode::TwoWayStrict => "two-way-alpha-strict",
-        SyncMode::OneWaySafe => "one-way-conflict",
-        SyncMode::OneWayReplica => "one-way-alpha",
+    match MODES
+        .iter()
+        .find(|row| row.mode == mode && !row.peering)
+    {
+        Some(row) => row.name,
+        // Unreachable while every mode has a row of its own: the table
+        // is the list of modes, not a view of it.
+        None => "unknown",
     }
 }
 
@@ -2132,6 +2644,139 @@ fn host_of(destination: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+
+    /// Every word in every table is a word its parser takes, and every
+    /// alias means what the row it sits on means. The tables are what
+    /// the error messages and the schema are written from, so a row
+    /// nobody can parse would be an offer the file cannot accept.
+    #[test]
+    fn every_word_the_tables_offer_is_a_word_a_parser_takes() {
+        for row in MODES {
+            assert_eq!(
+                parse_mode_spec(row.name).unwrap(),
+                (row.mode, row.peering),
+                "{}",
+                row.name
+            );
+            for also in row.also {
+                assert_eq!(
+                    parse_mode_spec(also).unwrap(),
+                    (row.mode, row.peering),
+                    "{also}"
+                );
+            }
+            assert!(!row.about.is_empty(), "{} says nothing", row.name);
+        }
+        for (was, now, _) in RENAMED_MODES {
+            let complaint = parse_mode_spec(was).unwrap_err();
+            assert!(complaint.contains(now), "{complaint}");
+            assert!(parse_mode_spec(now).is_ok(), "{now}");
+        }
+        for word in SYMLINK_MODES {
+            assert!(parse_symlink_mode(word.word).is_ok(), "{}", word.word);
+            for also in word.also {
+                assert_eq!(
+                    parse_symlink_mode(also).unwrap(),
+                    parse_symlink_mode(word.word).unwrap()
+                );
+            }
+        }
+        for word in STAGING_MODES {
+            assert!(parse_staging_mode(word.word).is_ok(), "{}", word.word);
+        }
+        for word in LOG_LEVELS {
+            assert_eq!(
+                crate::logging::Level::parse(word.word).map(|level| level.name()),
+                Some(word.word),
+                "{}",
+                word.word
+            );
+            for also in word.also {
+                assert_eq!(
+                    crate::logging::Level::parse(also).map(|level| level.name()),
+                    Some(word.word),
+                    "{also}"
+                );
+            }
+        }
+        // Durability is read where the plans are built, through the same
+        // table reader, so the table is checked against that reader.
+        for word in DURABILITY {
+            assert_eq!(
+                parse_word(DURABILITY, "durability", word.word).unwrap().word,
+                word.word
+            );
+        }
+        let complaint = parse_word(DURABILITY, "durability", "sometimes").unwrap_err();
+        assert!(complaint.contains("process, power"), "{complaint}");
+    }
+
+    /// Prints what the schema says about a few keys, for a person
+    /// building a form against it.
+    #[cfg(feature = "schema")]
+    #[test]
+    #[ignore = "a look at the schema, not a check"]
+    fn show_the_schema() {
+        let document = schema();
+        for key in ["live_reload", "disabled_hosts", "log", "on_alert"] {
+            println!("{key}: {}", document["properties"][key]);
+        }
+        println!("betas: {}", document["$defs"]["Group"]["properties"]["betas"]);
+        println!("ignores: {}", document["$defs"]["Group"]["properties"]["ignores"]);
+    }
+
+
+    /// The schema is the structs the parser uses, with the tables
+    /// written onto it — not a second description that can fall behind.
+    #[cfg(feature = "schema")]
+    #[test]
+    fn the_schema_describes_the_same_file_the_parser_reads() {
+        let document = schema();
+        let groups = &document["properties"]["groups"];
+        assert!(groups.is_object(), "the schema names the groups map");
+        let defaults = &document["$defs"]["Defaults"]["properties"];
+        assert!(
+            defaults.get("interval").is_some(),
+            "a field of the struct is a field of the schema"
+        );
+        assert_eq!(defaults["interval"]["x-widget"], "seconds");
+
+        // Every word the schema offers anywhere is a word the file takes.
+        fn walk(node: &serde_json::Value, found: &mut usize) {
+            if let Some(map) = node.as_object() {
+                if let Some(words) = map.get("x-words").and_then(|words| words.as_array()) {
+                    *found += 1;
+                    for word in words {
+                        let word = word["word"].as_str().expect("a word is text");
+                        assert!(!word.is_empty());
+                    }
+                }
+                for value in map.values() {
+                    walk(value, found);
+                }
+            } else if let Some(items) = node.as_array() {
+                items.iter().for_each(|item| walk(item, found));
+            }
+        }
+        let mut found = 0;
+        walk(&document, &mut found);
+        assert!(found >= 4, "the tables reached the schema: {found}");
+
+        let mode = &document["$defs"]["Group"]["properties"]["mode"];
+        let offered: Vec<&str> = mode["enum"]
+            .as_array()
+            .expect("mode offers words")
+            .iter()
+            .map(|word| word.as_str().expect("a word is text"))
+            .collect();
+        assert_eq!(
+            offered,
+            MODES.iter().map(|row| row.name).collect::<Vec<_>>()
+        );
+        for word in offered {
+            assert!(parse_mode(word).is_ok(), "{word}");
+        }
+    }
     use super::*;
 
     /// A group name that starts with `-` reads as an option to every
@@ -2180,13 +2825,13 @@ mod tests {
     /// it. The expected list is taken from the parser's own error rather
     /// than written here as a count: a mode added without a line in the
     /// template then fails this test instead of quietly making the file lie,
-    /// which is exactly how `two-way-paranoid` was first missed.
+    /// which is exactly how a mode added later was first missed.
     #[test]
     fn the_template_names_every_mode() {
         let is_mode = |word: &&str| word.contains("-way-") || word.starts_with("peering-");
         let named: Vec<&str> = TEMPLATE
             .lines()
-            .filter_map(|line| line.strip_prefix("#   "))
+            .filter_map(|line| line.strip_prefix("# "))
             .filter_map(|line| line.split_whitespace().next())
             .filter(is_mode)
             .collect();
@@ -2221,7 +2866,7 @@ mod tests {
             "{:#}",
             parse(
                 r#"
-                [advanced.peering-experimental]
+                [experimental.peering-experimental]
                 ttl = "30s"
 
                 [groups.g]
@@ -2280,7 +2925,7 @@ mod tests {
             r#"
             on_alert = "notify me"
 
-            [advanced.alerts]
+            [experimental.alerts]
             alert_after = "1s"
             "#,
         );
@@ -2295,17 +2940,174 @@ mod tests {
         }
     }
 
+    /// `file:` splices a file's patterns in where the entry sits, so one
+    /// list says everything and says it in order. The two keys this
+    /// replaced were applied files-then-patterns at each level, which
+    /// nothing on screen showed.
     #[test]
-    fn the_advanced_section_overrides_the_built_in_table() {
+    fn a_file_entry_is_read_where_it_sits() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let ignores = keep.path().join("ignores");
+        std::fs::create_dir_all(&ignores).expect("the directory is made");
+        std::fs::write(ignores.join("Rust.gitignore"), "target/\n*.rlib\n").expect("written");
+
+        let mut config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-conflict"
+            ignores = ["*.log", "file:Rust.gitignore", "!keep.log"]
+
+            [groups.g]
+            alpha = "/tmp/a"
+            betas = ["/tmp/b"]
+            "#,
+        );
+        config.ignore_directory = Some(ignores);
+        let plans = config.plans().expect("the configuration plans");
+        assert_eq!(
+            plans[0].ignores,
+            vec!["*.log", "target/", "*.rlib", "!keep.log"],
+            "the file's patterns land where the entry was written",
+        );
+    }
+
+    /// A `file:` naming nothing is a configuration error, caught when the
+    /// file is read rather than when a session first walks a tree.
+    #[test]
+    fn a_file_entry_that_names_nothing_is_refused() {
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let ignores = keep.path().join("ignores");
+        std::fs::create_dir_all(&ignores).expect("the directory is made");
+        std::fs::write(ignores.join("Rust.gitignore"), "target/\n").expect("written");
+
+        let mut config = parse(
+            r#"
+            [defaults]
+            mode = "two-way-conflict"
+            ignores = ["file:Nope.gitignore"]
+
+            [groups.g]
+            alpha = "/tmp/a"
+            betas = ["/tmp/b"]
+            "#,
+        );
+        config.ignore_directory = Some(ignores);
+        let refused = format!("{:#}", config.plans().expect_err("it is refused"));
+        assert!(refused.contains("ignores"), "{refused}");
+        assert!(refused.contains("Nope.gitignore"), "{refused}");
+        // And it says what there is, so the fix is one word away.
+        assert!(refused.contains("Rust.gitignore"), "{refused}");
+    }
+
+    /// One bad value in `[defaults]` is one fault, however many groups
+    /// inherit it — the file used to come back saying the same sentence
+    /// once per group with a different name in front.
+    #[test]
+    fn a_fault_the_defaults_cause_is_reported_once() {
+        let error = format!(
+            "{:#}",
+            parse(
+                r#"
+                [defaults]
+                mode = "two-way-conflict"
+                max_file_size = "asdf"
+
+                [groups.a]
+                alpha = "/tmp/a"
+                betas = ["/tmp/b"]
+
+                [groups.b]
+                alpha = "/tmp/c"
+                betas = ["/tmp/d"]
+
+                [groups.c]
+                alpha = "/tmp/e"
+                betas = ["/tmp/f"]
+                "#,
+            )
+            .plans()
+            .expect_err("a bad size is refused")
+        );
+        let said = error.matches("invalid size").count();
+        assert_eq!(said, 1, "{error}");
+        // And the key it is about is named, so a form can put it where
+        // the value was typed.
+        assert!(error.contains("max_file_size: invalid size"), "{error}");
+    }
+
+    /// A fault a group wrote itself keeps its group; only the copies
+    /// an inherited value makes are identical, and those collapse.
+    #[test]
+    fn a_groups_own_fault_keeps_its_group() {
+        let folded = fold(vec![
+            "the defaults' mode: unknown mode 'sideways'".to_owned(),
+            "the defaults' mode: unknown mode 'sideways'".to_owned(),
+            "group 'c': mode: unknown mode 'elsewhere'".to_owned(),
+        ]);
+        assert_eq!(folded.len(), 2, "{folded:?}");
+        assert_eq!(folded[0], "the defaults' mode: unknown mode 'sideways'");
+        assert_eq!(folded[1], "group 'c': mode: unknown mode 'elsewhere'");
+    }
+
+    /// An inherited value is the defaults' to answer for, whichever
+    /// group happened to read it.
+    #[test]
+    fn an_inherited_fault_names_the_defaults_not_the_group() {
+        let error = format!(
+            "{:#}",
+            parse(
+                r#"
+                [defaults]
+                mode = "two-way-conflict"
+                symlink_mode = "sideways"
+
+                [groups.a]
+                alpha = "/tmp/a"
+                betas = ["/tmp/b"]
+
+                [groups.b]
+                alpha = "/tmp/c"
+                betas = ["/tmp/d"]
+                "#,
+            )
+            .plans()
+            .expect_err("a bad symlink mode is refused")
+        );
+        assert!(error.contains("the defaults' symlink_mode:"), "{error}");
+        assert!(!error.contains("group 'a'"), "{error}");
+        assert_eq!(error.matches("unknown symlink mode").count(), 1, "{error}");
+
+        // And a group that writes its own bad value answers for it.
+        let its_own = format!(
+            "{:#}",
+            parse(
+                r#"
+                [defaults]
+                mode = "two-way-conflict"
+
+                [groups.a]
+                alpha = "/tmp/a"
+                betas = ["/tmp/b"]
+                symlink_mode = "sideways"
+                "#,
+            )
+            .plans()
+            .expect_err("a bad symlink mode is refused")
+        );
+        assert!(its_own.contains("group 'a': symlink_mode:"), "{its_own}");
+    }
+
+    #[test]
+    fn the_experimental_section_overrides_the_built_in_table() {
         use crate::alerts::Alert;
         let config = parse(
             r#"
             on_alert = "notify me"
 
-            [advanced.alerts]
+            [experimental.alerts]
             coalesce_after = "5s"
 
-            [advanced.alerts.after]
+            [experimental.alerts.after]
             unreachable = "1m"
             "#,
         );
@@ -2331,7 +3133,7 @@ mod tests {
         let error = format!("{:#}", config.alert_plan().expect_err("retired"));
         assert!(error.contains("[alerts] has moved"), "{error}");
         assert!(error.contains("top level"), "{error}");
-        assert!(error.contains("[advanced.alerts]"), "{error}");
+        assert!(error.contains("[experimental.alerts]"), "{error}");
     }
 
     #[test]
@@ -2340,7 +3142,7 @@ mod tests {
             r#"
             on_alert = "notify me"
 
-            [advanced.alerts.after]
+            [experimental.alerts.after]
             exploded = "1m"
             "#,
         );
@@ -2601,10 +3403,10 @@ mod tests {
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(error.contains("unknown mode 'sideways'"), "{error}");
         assert!(error.contains("expected one of"), "{error}");
-        assert!(error.contains("'first' has no betas"), "{error}");
-        assert!(error.contains("'second' has an empty alpha"), "{error}");
+        assert!(error.contains("'first': betas: a group needs at least one"), "{error}");
+        assert!(error.contains("'second': alpha: cannot be empty"), "{error}");
         assert!(
-            error.contains("'second' has no mode and the defaults specify none"),
+            error.contains("'second': mode: none here, and the defaults specify none"),
             "{error}"
         );
     }
@@ -3331,7 +4133,14 @@ betas = ["build.example.com:/tmp/beta"]
             .split(['(', ')', ':', ',', ' ', '\'', '\n'])
             .filter(|word| word.contains("-way-"))
             .collect();
-        assert!(names.len() >= 6, "{advertised}");
+        // Counted from the table rather than written down: a mode added
+        // or dropped should not need this number edited, which is how it
+        // came to say six when there were five.
+        let expected = MODES
+            .iter()
+            .filter(|known| known.name.contains("-way-"))
+            .count();
+        assert_eq!(names.len(), expected, "{advertised}");
         for name in names {
             let mode = parse_mode(name).expect("an advertised mode parses");
             assert_eq!(
@@ -3462,7 +4271,7 @@ betas = ["build.example.com:/tmp/beta"]
         );
         let error = format!("{:#}", config.plans().expect_err("plans should fail"));
         assert!(
-            error.contains("alpha 'relative/alpha' must be an absolute"),
+            error.contains("alpha: 'relative/alpha' must be an absolute"),
             "{error}"
         );
         assert!(
@@ -3645,7 +4454,7 @@ betas = ["build.example.com:/tmp/beta"]
     fn peering_timing_is_read_defaulted_and_checked() {
         let config = parse(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             ttl = "10s"
             failover_after = 45
             [groups.g]
@@ -3660,7 +4469,7 @@ betas = ["build.example.com:/tmp/beta"]
 
         let config = parse(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             ttl = "60s"
             failover_after = "30s"
             [groups.g]
@@ -3677,7 +4486,7 @@ betas = ["build.example.com:/tmp/beta"]
         // peering group: an unknown key is refused everywhere.
         let result: std::result::Result<Config, _> = toml::from_str(
             r#"
-            [advanced.peering-dangerously-experimental]
+            [experimental.peering-dangerously-experimental]
             lease = "10s"
             "#,
         );

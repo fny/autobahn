@@ -645,7 +645,7 @@ impl Shop {
         // as twenty reasons.
         let mut causes: Vec<(&str, &str, Vec<&str>)> = Vec::new();
         for entry in &session.blocked {
-            let (side, path, cause) = crate::blocked_parts(entry);
+            let (side, path, cause) = autobahn::blocked::parts(entry);
             match causes
                 .iter_mut()
                 .find(|(other_side, other, _)| *other_side == side && *other == cause)

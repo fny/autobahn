@@ -68,7 +68,7 @@ pub fn load_bytes(path: &Path, bytes: &[u8]) -> Result<Loaded> {
         plans,
         alerts,
         log_level,
-        reload: configuration.reload,
+        reload: configuration.live_reload,
         text: text.to_owned(),
         warnings: configuration.warnings().to_vec(),
         power_saver: configuration.power_saver_experimental,
@@ -399,7 +399,7 @@ mod tests {
     fn load_refuses_what_start_refuses() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let path = root.path().join("config.toml");
-        std::fs::write(&path, "reload = true\nmdoe = \"two-way-safe\"\n").expect("written");
+        std::fs::write(&path, "live_reload = true\nmdoe = \"two-way-safe\"\n").expect("written");
         let error = load(&path).expect_err("an unknown key is refused");
         assert!(format!("{error:#}").contains("mdoe"), "{error:#}");
         let alpha = root.path().join("alpha");
@@ -411,7 +411,7 @@ mod tests {
         assert!(loaded.reload, "the watch is on unless said otherwise");
         std::fs::write(
             &path,
-            format!("reload = false\n{}", configuration(&alpha, &beta)),
+            format!("live_reload = false\n{}", configuration(&alpha, &beta)),
         )
         .expect("written");
         assert!(!load(&path).expect("loads").reload);

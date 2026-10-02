@@ -5,7 +5,7 @@ Autobahn ships three things. They ship independently. A build that refreshes one
 | what | where it comes from | where it lands |
 |---|---|---|
 | the controller command | `cargo build --release --locked`, or a release asset | `~/.local/bin/autobahn` |
-| the macOS menu bar app | `apps/macos/build.sh`, into `target/tray` | `/Applications/Autobahn.app` |
+| the macOS menu bar app | `apps/tray/build.sh`, into `target/tray` | `/Applications/Autobahn.app` |
 | the agents | the `autobahn-agents.tar.gz` asset | `~/.autobahn/agents`, then each remote host |
 
 A plain `cargo build --release --locked` gives you a new controller only. The menu bar app keeps the binary it was built with. The agent bundle in `~/.autobahn/agents` keeps the binaries the installer put there.
@@ -18,7 +18,7 @@ A tag that starts with `v` starts `.github/workflows/release.yml`.
 
 1. A guard job compares the tag with the `version` key in `Cargo.toml`, and asks the Actions API whether CI's `linux`, `linux-arm`, `mac` and `spec` jobs have all succeeded on the tagged commit, in some push or manually started run of `ci.yml`. If the versions disagree, or any of those jobs has not passed there, the run stops before any build starts.
 2. The Linux job builds static musl binaries for x86-64 and arm64.
-3. The macOS job builds both macOS binaries and the menu bar app, the app with `apps/macos/build.sh --unsigned`, and checks that the app reports the tag's version. Only then does it import the Developer ID certificate and sign them — the app with `apps/macos/release.sh --sign-only` — and Apple notarises them. This job waits for approval, because it holds the secrets.
+3. The macOS job builds both macOS binaries and the menu bar app, the app with `apps/tray/build.sh --unsigned`, and checks that the app reports the tag's version. Only then does it import the Developer ID certificate and sign them — the app with `apps/tray/release.sh --sign-only` — and Apple notarises them. This job waits for approval, because it holds the secrets.
 4. The release job collects every `autobahn-<os>-<arch>` binary into `autobahn-agents.tar.gz`. It writes `SHA256SUMS` over every asset. It signs `SHA256SUMS` with the release key into `SHA256SUMS.minisig`, and checks that signature against `release.pub` before publishing. This job runs in the `release` environment, which waits for approval, because it holds the signing key.
 5. `gh release create` publishes the binaries, the bundle, the app archive, the checksums, the signature and `scripts/install.sh`.
 

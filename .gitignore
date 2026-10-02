@@ -2,10 +2,14 @@
 # Local agent builds; releases build and publish their own
 /dist/
 bench/verify/hosts-*.json
-apps/macos/Autobahn.app/
+apps/tray/Autobahn.app/
 
 # TLC scratch (spec/check.sh)
 spec/states/
 
 # A/B, burst and matrix runs made here; the published ones are committed deliberately
 bench/results-bench-*/
+
+# The dash window's bundle and its build directory: the script makes
+# both, and neither belongs in the repository.
+apps/dash/Autobahn Dash.app/

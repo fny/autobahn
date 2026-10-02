@@ -187,6 +187,13 @@ pub fn loose_write_permissions(path: &std::path::Path) -> Option<String> {
 /// share a file — `a/b` and `a_b` among them — and nothing in the name
 /// comes from the synchronized tree. The viewer opens it after the app
 /// has moved on, so it is left for the startup sweep to remove.
+/// Where the app writes the whole of a warning it could only summarize
+/// in one menu line, for a click to open. One file, overwritten: there is
+/// one warning at a time, and a reader wants the current one.
+pub fn tray_warning_file(state_root: &std::path::Path) -> Result<PathBuf> {
+    Ok(crate::fsutil::private_tmp_root(state_root)?.join("warning.txt"))
+}
+
 pub fn tray_diff_file(
     state_root: &std::path::Path,
     group: &str,

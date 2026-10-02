@@ -11,8 +11,8 @@
 # Only needed for an app someone downloads. A copy that arrives by scp or
 # by autobahn itself is never quarantined, so Gatekeeper never asks.
 #
-#   apps/macos/release.sh                       # build, sign, notarise, staple
-#   apps/macos/release.sh --sign-only <app>     # sign, notarise, staple a built app
+#   apps/tray/release.sh                       # build, sign, notarise, staple
+#   apps/tray/release.sh --sign-only <app>     # sign, notarise, staple a built app
 #   AUTOBAHN_NOTARY_PROFILE=work release.sh     # a different stored credential
 #
 # --sign-only compiles nothing. CI builds with `build.sh --unsigned` first
@@ -24,11 +24,11 @@
 #
 #   AUTOBAHN_NOTARY_KEY=AuthKey_XXXXXXXXXX.p8 AUTOBAHN_NOTARY_KEY_ID=XXXXXXXXXX \
 #   AUTOBAHN_NOTARY_ISSUER=<issuer uuid> AUTOBAHN_RELEASE_ZIP=Autobahn.zip \
-#   apps/macos/release.sh
+#   apps/tray/release.sh
 set -euo pipefail
 usage() { echo "usage: $0 [--sign-only path/to/Autobahn.app]" >&2; exit 2; }
 BUILD=yes
-APP="apps/macos/Autobahn.app"
+APP="apps/tray/Autobahn.app"
 case $# in
     0) ;;
     2) [ "$1" = --sign-only ] || usage
@@ -38,12 +38,12 @@ case $# in
     *) usage ;;
 esac
 cd "$(dirname "${BASH_SOURCE[0]}")/../.."
-source apps/macos/notary.sh
+source apps/tray/notary.sh
 ZIP_OUT="${AUTOBAHN_RELEASE_ZIP:-}"
 
 if [ "$BUILD" = no ] &&
    { [ ! -f "$APP/Contents/Info.plist" ] || [ ! -x "$APP/Contents/MacOS/autobahn" ]; }; then
-    echo "not a built Autobahn.app: $APP (apps/macos/build.sh --unsigned makes one)" >&2
+    echo "not a built Autobahn.app: $APP (apps/tray/build.sh --unsigned makes one)" >&2
     exit 1
 fi
 
@@ -52,7 +52,7 @@ fi
 signing_identity
 notary_credential
 
-if [ "$BUILD" = yes ]; then apps/macos/build.sh --unsigned "$APP"; fi
+if [ "$BUILD" = yes ]; then apps/tray/build.sh --unsigned "$APP"; fi
 
 # Cleared again because a bundle copied in (from another job, say) is
 # tagged anew, and codesign refuses one carrying com.apple.provenance.

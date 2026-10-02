@@ -50,12 +50,13 @@ Eight keys. Unknown keys are refused at startup, not ignored — here and in eve
 | `disabled_hosts` | list of hosts | `[]` | Hosts excluded everywhere. A disabled beta drops that beta; a disabled *alpha* drops the whole group. `autobahn disable --host <host>` edits it for you. |
 | `log` | string | `"normal"` | `quiet`, `normal`, or `debug`. See [The log](./logging.md). |
 | `power_saver_experimental` | bool | `false` | On battery, walk each local root in full every 10 minutes instead of every 2. That walk is the backstop for changes the watcher never reported, and on a laptop it is almost all of autobahn's idle cost; the price is that such a change can take up to 10 minutes to be found. The power source is read at most once a minute, and the log says when it changes. A remote beta's agent is unaffected. Experimental: the name will change. |
-| `reload` | bool | `true` | Whether the running supervisor re-reads this file and applies an edit in place. See [Editing it while it runs](#editing-it-while-it-runs). |
+| `live_reload` | bool | `true` | Whether the supervisor reloads this file on a change without a restart. See [Editing it while it runs](#editing-it-while-it-runs). |
 | `[defaults]` | table | — | Session settings every group inherits. Same keys as a group, minus the endpoints. |
 | `[groups.name]` | table of tables | — | The sync groups, keyed by a name you choose. The name appears in status, alerts, and `resolve`. |
-| `[advanced.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
-| `[advanced.peering-dangerously-experimental]` | table | — | Peering timing, `ttl` and `failover_after`, correct as shipped; and `manage_keys`, off unless set, for the alpha to set up the betas' keys to one another, each restricted to autobahn. See [Peering](./peering.md#restricted-keys). |
-| `advanced.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
+| `[experimental.alerts]` | table | — | Alerter timing. Correct as shipped. See [Alerts](./alerts.md). |
+| `[experimental.peering-dangerously-experimental]` | table | — | Peering timing, `ttl` and `failover_after`, correct as shipped; and `manage_keys`, off unless set, for the alpha to set up the betas' keys to one another, each restricted to autobahn. See [Peering](./peering.md#restricted-keys). |
+| `experimental.allow_root` | bool | `false` | Let `watch`, `sync`, `resolve`, `install` and `start` run as root, as `--allow-root` does. Root with a `$HOME` owned by someone else (`sudo`) is refused regardless. |
+
 
 Why `defaults` is a table and `log` is not: TOML requires bare keys to appear before the first table header. Every `defaults` key is *also* a valid group key, so a bare `mode = …` written after `[groups.x]` would silently become that group's mode — legal, so no error. `on_alert`, `disabled_hosts`, `log`, `power_saver_experimental` and `reload` are valid nowhere else, so the same slip is caught. (`disabled` on its own is a *group* key, and means something else: that one group, off.)
 
@@ -70,13 +71,13 @@ Fourteen keys live in both `[defaults]` and any group, with the group winning. F
 | `disabled` | group | `false` | Turns the group off: no sessions, and its settings are not checked. State is kept, so turning it back on resumes. `autobahn disable --group <name>` sets it. Not to be confused with the top-level `disabled_hosts`. |
 | `mode` | both | required | Synchronization mode. See [Modes](./modes.md). No default — direction is never guessed. |
 | `ignores` | both | `[]` | Gitignore-style patterns. Defaults' patterns apply first, then the group's. See [Ignores](./ignores.md). |
-| `ignore_files` | both | `[]` | Files of patterns, by name or path. See [Ignores](./ignores.md). |
 | `interval` | both | `5` | Seconds between heartbeat cycles. Watching makes this a fallback, not the reaction time. Floored at 1. |
 | `symlink_mode` | both | `"raw"` | `raw` (sync verbatim), `portable` (validate portability), or `ignore`. |
 | `file_mode` / `directory_mode` | both | `600` / `700` | Octal permissions for created files and directories. |
 | `max_file_size` | both | unlimited | Files larger than this (`"100MB"`, `"2GiB"`) stay on disk but are left out of syncing — never mistaken for deletions. |
 | `max_entry_count` | both | unlimited | If a scan finds more entries than this, the cycle fails — a guard against pointing a session at the wrong directory. |
-| `ignore_mounts` | both | `true` | Leave alone any directory mounted inside a root — another disk, a network share, a `tmpfs` — as `rsync -x` and `du -x` do. It is left out on *both* sides, so a real directory at the same path on the other side is neither filled from the mount nor emptied to match it; and when the mount goes away (a drive unplugged) its empty mount point stays left out, so nothing moves. `false` synchronizes what is mounted as part of the tree, and halts rather than deletes when a mount that held content comes back empty. |
+| `ignore_mounts` | both | `false` | By default a mount inside a root is walked as part of the tree, and a mount point that is now empty where the ancestor held content halts the session rather than deleting. `true` leaves any mounted directory alone — another disk, a network share, a `tmpfs` — as `rsync -x` and `du -x` do: it is left out on *both* sides, so a real directory at the same path on the other side is neither filled from the mount nor emptied to match it, and when the mount goes away its empty mount point stays left out, so nothing moves. |
+| `guard_directory_deletes_over` | both | unset | A directory the ancestor recorded with this many entries or more — counted recursively — is not trusted when it disappears from exactly one side: emptied is a conflict, and gone while the other side is untouched is restored. This was the `two-way-paranoid` mode, which did nothing else; as a setting it works with any direction. Unset, every disappearance propagates. See [Large directories](./modes.md#3-large-directory-protection-guard_directory_deletes_over). |
 | `staging` | both | `"state"` | Where in-flight content lives: `state`, `beside-root` (same filesystem as the root — guarantees rename-speed publishing), or `inside-root` (for roots that are the only writable place on their host). |
 | `default_owner` / `default_group` | both | — | Ownership for created entries (`name`, `1000`, or `id:1000`), resolved on each endpoint's own host. Needs chown rights, which in practice means an agent running as root — the one case an agent accepts root. That turns the scanner and transition races in [RETAINED §2](./correctness/RETAINED.md) into privilege escalation, so set it only where root is really meant. |
 | `durability` | both | `"process"` | `process` survives a crashed process; `power` additionally syncs each journal append to stable storage, trading a little latency for power-loss durability. Records that announce a transition are synced either way whenever a remote endpoint is involved. |
@@ -92,7 +93,7 @@ Beyond keys and values it does not know, a configuration is refused at startup, 
 
 A root that holds credentials is warned about, not refused: see `acknowledge_secrets` above.
 
-Separately, `watch`, `sync`, `resolve`, `install` and `start` refuse to run as root, before any session is planned, unless `--allow-root` or `advanced.allow_root` says root is meant; root under someone else's home (`sudo`) is refused regardless.
+Separately, `watch`, `sync`, `resolve`, `install` and `start` refuse to run as root, before any session is planned, unless `--allow-root` or `experimental.allow_root` says root is meant; root under someone else's home (`sudo`) is refused regardless.
 
 ### Symbolic links
 
@@ -125,7 +126,7 @@ The running supervisor reads the file every two seconds and acts on an edit once
 - **It loads.** The sessions wind down between cycles and start again under the new configuration, in the same process: groups added start, groups removed stop, and a group whose settings changed starts over from its kept state. `status` and `mi` show the new sessions; `autobahn watch` on a terminal repaints with them.
 - **It is refused.** The sessions keep running under the configuration that last loaded, and the refusal is said everywhere the supervisor speaks: the log, `status` (a line above the sessions), `mi` (a line under the sign), the tray (a line in the menu, and a notification), and `on_alert` (one firing, `AUTOBAHN_STATES=config`, `AUTOBAHN_EVENT=config`). The line stands until the file loads again. Nothing is retried in the meantime, and the next edit is judged on its own.
 
-`reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
+`live_reload = false` at the top level turns the watch off, and an edit lands on `restart` as before. An edit that *sets* it is the last one applied in place; one that sets it back lands on `restart`. A peer (a machine following a leader's configuration) has no file of its own to watch, and the alpha of a peering group watches its file only while it leads — an edit made while a beta leads is found when the lead comes back.
 
 ## This machine's own settings
 

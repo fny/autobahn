@@ -105,7 +105,7 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
     /// Run `watch`, `sync`, `resolve`, `install` or `start` as root, which
-    /// is refused otherwise (as is `advanced.allow_root = true`).
+    /// is refused otherwise (as is `experimental.allow_root = true`).
     #[arg(long, global = true)]
     allow_root: bool,
 }
@@ -139,10 +139,6 @@ enum ModeArgument {
     /// reported and left alone.
     #[value(name = "two-way-conflict", alias = "two-way-safe")]
     TwoWaySafe,
-    /// two-way-conflict, and a large directory emptied on one side is a
-    /// conflict too, rather than a deletion to propagate.
-    #[value(name = "two-way-paranoid")]
-    TwoWayParanoid,
     /// Both directions; a file changed on both sides takes alpha's
     /// version, silently.
     #[value(name = "two-way-alpha", alias = "two-way-resolved")]
@@ -164,7 +160,6 @@ impl From<ModeArgument> for SyncMode {
     fn from(argument: ModeArgument) -> SyncMode {
         match argument {
             ModeArgument::TwoWaySafe => SyncMode::TwoWaySafe,
-            ModeArgument::TwoWayParanoid => SyncMode::TwoWayParanoid,
             ModeArgument::TwoWayResolved => SyncMode::TwoWayResolved,
             ModeArgument::TwoWayStrict => SyncMode::TwoWayStrict,
             ModeArgument::OneWaySafe => SyncMode::OneWaySafe,
@@ -239,7 +234,7 @@ enum Command {
     /// login; `uninstall` makes it stay gone.
     Stop,
     /// Stop and start the login service — after an upgrade, or after a
-    /// configuration edit when the configuration sets `reload = false`.
+    /// configuration edit when the configuration sets `live_reload = false`.
     Restart,
     /// Everything that needs you: conflicts, blocked paths, and halts,
     /// grouped by cause with the command that clears each one.
@@ -941,7 +936,7 @@ impl std::error::Error for Unsettled {}
 
 /// Refuses the commands that write state or run a configuration's
 /// commands when this is root and nobody said root was meant: by
-/// `--allow-root`, or `advanced.allow_root` in the configuration the
+/// `--allow-root`, or `experimental.allow_root` in the configuration the
 /// command would read. See `autobahn::root`.
 fn refuse_root(command: &Command, allow_root: bool) -> Result<()> {
     let identity = autobahn::root::Identity::current();
@@ -2129,34 +2124,6 @@ fn relative_in(selection: &Selection, index: usize, explicit: Option<String>) ->
     }
 }
 
-/// The path inside a recorded blocked entry.
-///
-/// The entries are written as `side path: message` by the supervisor.
-/// Splitting them back apart is what lets the listing group by cause and
-/// scope by path.
-fn blocked_path(entry: &str) -> Option<&str> {
-    let rest = entry.split_once(' ')?.1;
-    Some(match rest.find(": ") {
-        Some(end) => &rest[..end],
-        None => rest,
-    })
-}
-
-/// The side, path and cause of a recorded blocked entry.
-///
-/// The cause is the innermost message. The wrapping context repeats the
-/// file's own path, so twenty files that failed for one reason would
-/// otherwise read as twenty separate reasons.
-fn blocked_parts(entry: &str) -> (&str, &str, &str) {
-    let (side, rest) = entry.split_once(' ').unwrap_or(("", entry));
-    let (path, message) = match rest.find(": ") {
-        Some(end) => (&rest[..end], &rest[end + 2..]),
-        None => (rest, ""),
-    };
-    let cause = message.rsplit(": ").next().unwrap_or(message);
-    (side, path, cause)
-}
-
 /// Groups paths by where they are, and names the directory each group
 /// shares.
 ///
@@ -2412,7 +2379,7 @@ fn run_issues(
                 session.conflicts.retain(|conflict| keep(&conflict.path));
                 session
                     .blocked
-                    .retain(|blocked| keep(blocked_path(blocked).unwrap_or(blocked)));
+                    .retain(|blocked| keep(autobahn::blocked::path(blocked).unwrap_or(blocked)));
             }
             // A session that failed has no lists to show and still needs
             // someone, so its state is what keeps it here.
@@ -2447,7 +2414,7 @@ fn run_issues(
         let blocked: Vec<&String> = status
             .blocked
             .iter()
-            .filter(|entry| keep(blocked_path(entry).unwrap_or(entry)))
+            .filter(|entry| keep(autobahn::blocked::path(entry).unwrap_or(entry)))
             .collect();
         // A failure has no list of its own and still needs someone. Its
         // state is what puts it here, and a filter that excludes every
@@ -2588,7 +2555,7 @@ fn run_issues(
         // with one fix, and listing them separately hides that.
         let mut causes: Vec<(&str, &str, Vec<&str>)> = Vec::new();
         for entry in &blocked {
-            let (side, path, cause) = blocked_parts(entry);
+            let (side, path, cause) = autobahn::blocked::parts(entry);
             match causes
                 .iter_mut()
                 .find(|(other_side, other_cause, _)| *other_side == side && *other_cause == cause)
@@ -4107,7 +4074,7 @@ fn run_availability(
             );
         }
     }
-    println!("  a running supervisor applies it; with `reload = false`, `autobahn restart`");
+    println!("  a running supervisor applies it; with `live_reload = false`, `autobahn restart`");
     Ok(())
 }
 
@@ -5534,8 +5501,8 @@ mod tests {
         assert!(format!("{error:#}").contains("no sessions"));
     }
     use super::{
-        blocked_fix, blocked_parts, blocked_path, clusters, common_prefix, conflict_filter,
-        format_estimate, parse_remote, render_status_entry, roll_up,
+        blocked_fix, clusters, common_prefix, conflict_filter, format_estimate, parse_remote,
+        render_status_entry, roll_up,
     };
 
     #[test]
@@ -5926,15 +5893,15 @@ mod tests {
         let entry = "beta azure/backend/.ruff_cache/0.9.10/104972: unable to read file: \
                      unable to open /home/ubuntu/Workspace/azure/backend/.ruff_cache/0.9.10/104972: \
                      Permission denied (os error 13)";
-        let (side, path, cause) = blocked_parts(entry);
+        let (side, path, cause) = autobahn::blocked::parts(entry);
         assert_eq!(side, "beta");
         assert_eq!(path, "azure/backend/.ruff_cache/0.9.10/104972");
         assert_eq!(cause, "Permission denied (os error 13)");
-        assert_eq!(blocked_path(entry), Some(path));
+        assert_eq!(autobahn::blocked::path(entry), Some(path));
 
         // A message with no wrapping context is its own cause.
         let (side, path, cause) =
-            blocked_parts("alpha notes.txt: refusing to create over existing content");
+            autobahn::blocked::parts("alpha notes.txt: refusing to create over existing content");
         assert_eq!((side, path), ("alpha", "notes.txt"));
         assert_eq!(cause, "refusing to create over existing content");
     }
@@ -6231,7 +6198,7 @@ mod tests {
         let entry = "alpha recruiting/candidates/Jorge Suárez resume.pdf: \
                      \"Jorge Sua\u{301}rez resume.pdf\" is already here under one entry: \
                      unicode collision";
-        let (side, path, cause) = blocked_parts(entry);
+        let (side, path, cause) = autobahn::blocked::parts(entry);
         assert_eq!(side, "alpha");
         assert_eq!(path, "recruiting/candidates/Jorge Suárez resume.pdf");
         assert_eq!(cause, "unicode collision", "the heading names the rule");
@@ -6241,7 +6208,7 @@ mod tests {
         let other = "alpha recruiting/candidates/Ana Muñoz cv.pdf: \
                      \"Ana Mun\u{303}oz cv.pdf\" is already here under one entry: \
                      unicode collision";
-        assert_eq!(blocked_parts(other).2, cause);
+        assert_eq!(autobahn::blocked::parts(other).2, cause);
 
         // And the fix names what to do about it rather than offering a
         // diff, which for a PDF is no help at all.

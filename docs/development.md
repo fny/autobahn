@@ -35,7 +35,7 @@ Build the tray feature into its own target directory:
 CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
 ```
 
-That is what `apps/macos/build.sh` does. The login service runs `target/release/autobahn`, and a feature build there replaces it.
+That is what `apps/tray/build.sh` does. The login service runs `target/release/autobahn`, and a feature build there replaces it.
 
 ## The A/B gate
 

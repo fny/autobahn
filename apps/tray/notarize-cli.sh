@@ -13,7 +13,7 @@
 # Signs the files it is given IN PLACE. Pass copies: re-signing the binary
 # a running process was started from changes the file under it.
 #
-#   apps/macos/notarize-cli.sh autobahn-darwin-aarch64 autobahn-darwin-x86_64
+#   apps/tray/notarize-cli.sh autobahn-darwin-aarch64 autobahn-darwin-x86_64
 #
 # Credentials as for release.sh: a keychain profile, or an App Store
 # Connect API key through AUTOBAHN_NOTARY_KEY, _KEY_ID and _ISSUER.

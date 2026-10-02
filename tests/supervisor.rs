@@ -2841,7 +2841,6 @@ fn resolve_in(mode: &str, keep: &str, shape: Shape) {
 fn resolve_in_every_mode(shape: Shape) {
     for mode in [
         "two-way-conflict",
-        "two-way-paranoid",
         "two-way-alpha",
         "two-way-alpha-strict",
         "one-way-conflict",
@@ -3392,7 +3391,10 @@ fn a_session_needing_attention_runs_the_configured_hook() {
         interval = 1
         betas = ["{beta}"]
 
-        [advanced.alerts]
+        # Deliberately the old spelling of the section: the supervisor
+        # still reads a file written before `[experimental]` was named,
+        # and this is where that is proved end to end.
+        [experimental.alerts]
         alert_after = "1s"
         # This case is about the hook running at all. Coalescing has its
         # own tests; without this the window would hold the hook for a
@@ -3890,7 +3892,7 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     // lifetime and a wait short enough for a test.
     let pushed = format!(
         r#"
-        [advanced.peering-dangerously-experimental]
+        [experimental.peering-dangerously-experimental]
         ttl = "2s"
         failover_after = "2s"
 
@@ -4032,7 +4034,7 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     // one beta, its own root as the alpha, and the session's identifier.
     let configuration = format!(
         r#"
-        [advanced.peering-dangerously-experimental]
+        [experimental.peering-dangerously-experimental]
         ttl = "2s"
         failover_after = "2s"
 

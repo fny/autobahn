@@ -3,8 +3,8 @@
 **Experimental.** It works, and it is the app the release ships, but its menu, its icon and what it does on a click are still moving. The things it reads — `status --json` and `resolve` — are not, so nothing it shows can go stale behind autobahn's back.
 
 ```sh
-apps/macos/build.sh          # builds Autobahn.app
-open apps/macos/Autobahn.app # or drag it to /Applications
+apps/tray/build.sh          # builds Autobahn.app
+open apps/tray/Autobahn.app # or drag it to /Applications
 ```
 
 `build.sh` signs the bundle with the best identity in your keychain. `build.sh --unsigned` stops at the assembled bundle and touches no keychain; `build.sh [--unsigned] path/to/Autobahn.app` builds somewhere else, the path taken from where you run it. The version the app reports is `Cargo.toml`'s, written into `Info.plist` at build time: build the bundle with `build.sh`, never by copying the template.
@@ -23,7 +23,7 @@ It is a view over `status --json`, polled every few seconds, and holds no state 
 
 ## Starting it
 
-Open `apps/macos/Autobahn.app`, or drag it to `/Applications` and open it there. **It does not start at login on its own**: add it under System Settings → General → Login Items. The supervisor is separate and already survives logout through `autobahn install`; the app only watches it.
+Open `apps/tray/Autobahn.app`, or drag it to `/Applications` and open it there. **It does not start at login on its own**: add it under System Settings → General → Login Items. The supervisor is separate and already survives logout through `autobahn install`; the app only watches it.
 
 From a terminal, `autobahn tray` runs the same menu bar app — but only in a binary built with `--features tray`. A plain build answers that it has no menu bar app. `build.sh` builds that binary into `target/tray` (`AUTOBAHN_TRAY_TARGET` moves it), never `target/release`: the login service runs `target/release/autobahn` through a symlink, and an app build must not replace it.
 
@@ -77,11 +77,11 @@ The menu bar glyph is not this icon. It is the Autobahn sign, drawn in code in `
 
 A downloaded app has to be signed with a Developer ID certificate and notarised — scanned by Apple, with the verdict stapled inside the bundle so Gatekeeper trusts it offline. A copy that arrives by `scp`, or through autobahn itself, is never quarantined and needs none of that.
 
-`apps/macos/release.sh` does the whole thing, on a laptop or in CI:
+`apps/tray/release.sh` does the whole thing, on a laptop or in CI:
 
 ```sh
-apps/macos/release.sh                                    # build, sign, notarise, staple
-apps/macos/release.sh --sign-only apps/macos/Autobahn.app  # sign, notarise, staple a built app
+apps/tray/release.sh                                    # build, sign, notarise, staple
+apps/tray/release.sh --sign-only apps/tray/Autobahn.app  # sign, notarise, staple a built app
 ```
 
 `--sign-only` compiles nothing: it takes a bundle `build.sh --unsigned` made, and signs it. That split is what CI uses, so that every build happens before the signing identity exists.
@@ -95,7 +95,7 @@ xcrun notarytool store-credentials autobahn \
 
 ### In CI
 
-Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job builds and signs everything macOS on one runner: the two command-line binaries, signed and notarised by `apps/macos/notarize-cli.sh`, and the app, attached to the release as `Autobahn-macos-aarch64.zip`. The job builds everything first — the binaries, and the app with `build.sh --unsigned` — and checks that the app's `Info.plist` reports the tag's version. Only then does it import the certificate, and it signs the app with `release.sh --sign-only`, so no dependency's build script or proc macro ever runs while the identity is usable. It is the only job holding the certificate, and it uses the protected `release` environment, which must hold five secrets:
+Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job builds and signs everything macOS on one runner: the two command-line binaries, signed and notarised by `apps/tray/notarize-cli.sh`, and the app, attached to the release as `Autobahn-macos-aarch64.zip`. The job builds everything first — the binaries, and the app with `build.sh --unsigned` — and checks that the app's `Info.plist` reports the tag's version. Only then does it import the certificate, and it signs the app with `release.sh --sign-only`, so no dependency's build script or proc macro ever runs while the identity is usable. It is the only job holding the certificate, and it uses the protected `release` environment, which must hold five secrets:
 
 | secret | what it is |
 |---|---|

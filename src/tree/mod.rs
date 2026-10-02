@@ -111,6 +111,35 @@ impl Drop for Node {
     }
 }
 
+/// What reconciliation is asked to do: the direction and conflict policy,
+/// and how suspicious to be of a directory that disappears.
+///
+/// One value rather than two arguments, because every reconciliation
+/// needs both and a bare `SyncMode` still converts into it — which is
+/// what keeps the forty call sites that have no guard unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Policy {
+    pub mode: SyncMode,
+    /// Entries in the ancestor at or above which a directory that turns
+    /// up empty, or gone, on exactly one side is disbelieved rather than
+    /// propagated: the empty one is a conflict, and a missing one whose
+    /// other side is untouched is restored.
+    ///
+    /// Counted recursively, so one subfolder of seven files reaches
+    /// eight. `None` propagates every disappearance, whatever its size,
+    /// which is what every mode did before this was a setting.
+    pub guard_directory_deletes_over: Option<usize>,
+}
+
+impl From<SyncMode> for Policy {
+    fn from(mode: SyncMode) -> Policy {
+        Policy {
+            mode,
+            guard_directory_deletes_over: None,
+        }
+    }
+}
+
 /// The synchronization mode governing reconciliation directionality and
 /// conflict handling.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -118,13 +147,6 @@ pub enum SyncMode {
     /// Bidirectional synchronization that surfaces conflicts without
     /// resolving them.
     TwoWaySafe,
-    /// `TwoWaySafe`, plus suspicion of large one-sided disappearances: a
-    /// directory the ancestor records with many entries that turns up
-    /// empty on one side is a conflict rather than a deletion to
-    /// propagate, and one that is gone on one side while the other is
-    /// untouched is restored rather than deleted. See
-    /// `reconcile::PARANOID_MINIMUM`.
-    TwoWayParanoid,
     /// Bidirectional synchronization that resolves conflicts in alpha's
     /// favor.
     TwoWayResolved,

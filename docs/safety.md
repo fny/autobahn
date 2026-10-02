@@ -57,7 +57,7 @@ In the default mode, content is overwritten or deleted only when the ancestor pr
 
 Disappearance of a whole root is **halted** rather than propagated. If a synchronization root is empty or gone on exactly one side, the session stops: an unmounted disk is far more likely than a deliberate wipe. A missing *alpha* root is a halt too, never an empty source, so a mistyped path in a mirroring mode cannot empty the destination. A halt needs a person, with one exception: a missing alpha clears on its own when the folder comes back — a drive reconnected, a share remounted — and it alerts only once it has been gone two minutes.
 
-Below the root, a directory emptied on one side is deletions and they propagate — except under `two-way-paranoid`, where a directory of eight or more synchronized entries emptied on one side is a conflict, and one gone on one side is restored. See [Large directories](./modes.md#large-directories).
+Below the root, a directory emptied on one side is deletions and they propagate — unless `guard_directory_deletes_over` is set, where a directory of at least that many synchronized entries emptied on one side is a conflict, and one gone on one side is restored. See [Large directories](./modes.md#large-directories).
 
 ### Both ends play by the same rules (I8)
 
@@ -84,12 +84,12 @@ A configuration mistake is refused at startup with the problem named, not half-a
 - a session whose two sides are one tree, or one inside the other — from a configuration or from `autobahn sync ALPHA BETA`
 - a local root that is, or holds, autobahn's own state or the directory the configuration lives in, unless its ignores keep that out
 - an ignore negation that can never take effect, because a later pattern ignores it again
-- an `ignore_files` entry that is missing, or a relative path
+- an `ignores` `file:` entry that is missing, or a relative path
 - an unknown mode, log level, or alert state
 
 A root that holds credentials — `.ssh`, `.aws` and the like — is not refused, since someone may mean to synchronize them, but `sync` and `watch` warn about it when they start, until the group sets `acknowledge_secrets` or ignores them. See [What is refused](./configuration.md#what-is-refused).
 
-And the commands that act refuse to run as root, unless `--allow-root` or `advanced.allow_root` says root is meant — and never as root under another user's home.
+And the commands that act refuse to run as root, unless `--allow-root` or `experimental.allow_root` says root is meant — and never as root under another user's home.
 
 ## When you act
 
@@ -117,7 +117,7 @@ These are deliberate boundaries, each with its reasoning in [`correctness/RETAIN
 - **Exclusion is per machine, per user, per state root.** The same pair of trees driven from two machines is not detected (§4).
 - **Network filesystems** may never deliver change events and may cache attributes (§3). If a root must live on one, treat this client as its only writer.
 - **A same-length rewrite that restores the modification time** evades change detection. Unchanged-file detection compares modification time, size, inode and file type; the change time (ctime) is not consulted, so restoring the modification time is enough. `autobahn verify` re-reads every byte (§5).
-- **A vanished mount holding fewer than eight entries** — one huge file — evades the mass-disappearance guard (§1), but only with `ignore_mounts = false`. By default a mount inside a root is not synchronized at all, and one that goes away is remembered and left out while its mount point is empty; followed, a mount point that was one and is now empty where the ancestor held content halts.
+- **A mount that was never seen mounted.** A mount inside a root is walked like any other directory unless `ignore_mounts = true`. One that goes away where the ancestor held content halts the session, at any size — but only if an earlier scan recorded it as a mount. A drive mounted and unmounted between two cycles, or a session created while it was already unplugged, is just a directory that emptied, and below the root that propagates as deletions unless `guard_directory_deletes_over` is set.
 - **A power loss** can expose unsynced bytes under a renamed name. The durable ancestor and re-verification restore the tree on the cycles that follow.
 
 ## Filesystems

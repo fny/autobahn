@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 /// The image, at the size a notification shows.
-const IMAGE: &[u8] = include_bytes!("../assets/notification.png");
+pub(crate) const IMAGE: &[u8] = include_bytes!("../assets/notification.png");
 
 /// Writes the icon into the state directory if it is not already there,
 /// and returns its path.

@@ -228,8 +228,10 @@ pub(crate) fn inspect(name: &'static str, root: &str, path: &str) -> Side {
             side.digest = digest;
         }
         Err(error) => {
-            side.trouble =
-                Some(fill("conflicts.unreadable", &[("reason", &error.to_string())]))
+            side.trouble = Some(fill(
+                "conflicts.unreadable",
+                &[("reason", &error.to_string())],
+            ))
         }
     }
     side
@@ -237,7 +239,10 @@ pub(crate) fn inspect(name: &'static str, root: &str, path: &str) -> Side {
 
 /// Reads the file once: says whether it looks binary, and hashes it when
 /// it is small enough to be worth hashing.
-pub(crate) fn read_through(file: &std::path::Path, size: u64) -> std::io::Result<(bool, Option<String>)> {
+pub(crate) fn read_through(
+    file: &std::path::Path,
+    size: u64,
+) -> std::io::Result<(bool, Option<String>)> {
     use std::io::Read;
 
     let mut handle = std::fs::File::open(file)?;
@@ -263,10 +268,7 @@ pub(crate) fn read_through(file: &std::path::Path, size: u64) -> std::io::Result
         }
         read += count as u64;
     }
-    Ok((
-        binary,
-        hash.then(|| hasher.finalize().to_hex().to_string()),
-    ))
+    Ok((binary, hash.then(|| hasher.finalize().to_hex().to_string())))
 }
 
 /// The directory a root names on this machine, or `None` when the root
@@ -346,7 +348,8 @@ pub(crate) const SILENT_AT_THE_TOP: &[&str] = &[
 /// The same, for `[experimental]`: its two timing tables are sections of
 /// their own, and `p2p-experimental` is the spelling that was
 /// renamed.
-pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "p2p-dangerously-experimental", "p2p-experimental"];
+pub(crate) const SILENT_IN_ADVANCED: &[&str] =
+    &["alerts", "p2p-dangerously-experimental", "p2p-experimental"];
 
 /// Session keys nobody should meet before they have gone looking.
 ///
@@ -418,9 +421,7 @@ pub(crate) fn table_for<'a>(
 }
 
 /// The `[experimental]` table, made if the file has none.
-fn experimental<'a>(
-    document: &'a mut toml_edit::DocumentMut,
-) -> Option<&'a mut toml_edit::Table> {
+fn experimental<'a>(document: &'a mut toml_edit::DocumentMut) -> Option<&'a mut toml_edit::Table> {
     document
         .entry("experimental")
         .or_insert(toml_edit::Item::Table(toml_edit::Table::new()))
@@ -683,8 +684,24 @@ pub(crate) fn as_written(text: &str) -> String {
     for letter in text.chars() {
         if matches!(
             letter,
-            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '(' | ')'
-                | '#' | '+' | '-' | '.' | '!' | '|' | '<' | '>' | '~'
+            '\\' | '`'
+                | '*'
+                | '_'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '#'
+                | '+'
+                | '-'
+                | '.'
+                | '!'
+                | '|'
+                | '<'
+                | '>'
+                | '~'
         ) {
             out.push('\\');
         }
@@ -788,9 +805,7 @@ pub(crate) fn describe(progress: &crate::progress::ProgressSnapshot) -> String {
             thousands(walked),
             thousands(expected)
         )),
-        (walked, None) if walked > 0 => {
-            line.push_str(&format!(" · alpha {}", thousands(walked)))
-        }
+        (walked, None) if walked > 0 => line.push_str(&format!(" · alpha {}", thousands(walked))),
         _ => {}
     }
     if let Some(left) = progress.remaining_seconds.filter(|left| *left > 0) {
@@ -915,7 +930,11 @@ pub(crate) fn orders(state: crate::service::ServiceState) -> Vec<Order> {
 }
 
 /// Carries one out, and says what happened either way.
-pub(crate) fn ask(order: Order, config: Option<&std::path::Path>, state_root: &std::path::Path) -> String {
+pub(crate) fn ask(
+    order: Order,
+    config: Option<&std::path::Path>,
+    state_root: &std::path::Path,
+) -> String {
     let done = match order {
         Order::Start => crate::service::start(),
         Order::Stop => crate::service::stop(),
@@ -930,7 +949,10 @@ pub(crate) fn ask(order: Order, config: Option<&std::path::Path>, state_root: &s
         Ok(()) => order.done().to_owned(),
         Err(error) => fill(
             "service.refused",
-            &[("order", order.label()), ("error", &first_line(&format!("{error:#}")))],
+            &[
+                ("order", order.label()),
+                ("error", &first_line(&format!("{error:#}"))),
+            ],
         ),
     }
 }
@@ -1134,7 +1156,9 @@ pub(crate) fn install(state_root: &std::path::Path) -> Result<PathBuf, String> {
 
     let path = install_log(state_root);
     let log = std::fs::File::create(&path).map_err(|error| blame("the install log", error))?;
-    let errors = log.try_clone().map_err(|error| blame("the install log", error))?;
+    let errors = log
+        .try_clone()
+        .map_err(|error| blame("the install log", error))?;
 
     // The child writes straight into the file, so the log grows while
     // the install runs rather than arriving in one piece at the end.
@@ -1162,7 +1186,11 @@ pub(crate) fn install(state_root: &std::path::Path) -> Result<PathBuf, String> {
             Ok(command)
         }
         Some(command) => {
-            let _ = writeln!(note, "the installer failed, but a command is here: {}", command.display());
+            let _ = writeln!(
+                note,
+                "the installer failed, but a command is here: {}",
+                command.display()
+            );
             Ok(command)
         }
         None => {
@@ -1401,7 +1429,10 @@ impl Sheet {
     /// silence.
     pub(crate) fn drop_group(&mut self, name: &str) -> Option<String> {
         let mut document = self.document.clone();
-        let Some(groups) = document.get_mut("groups").and_then(|item| item.as_table_mut()) else {
+        let Some(groups) = document
+            .get_mut("groups")
+            .and_then(|item| item.as_table_mut())
+        else {
             return Some(fill("config.no_such_group", &[("name", name)]));
         };
         if groups.remove(name).is_none() {
@@ -1427,7 +1458,10 @@ impl Sheet {
             return Some(fill("config.group_exists", &[("name", to)]));
         }
         let mut document = self.document.clone();
-        let Some(groups) = document.get_mut("groups").and_then(|item| item.as_table_mut()) else {
+        let Some(groups) = document
+            .get_mut("groups")
+            .and_then(|item| item.as_table_mut())
+        else {
             return Some(fill("config.no_such_group", &[("name", from)]));
         };
         let Some(held) = groups.remove(from) else {
@@ -1581,8 +1615,6 @@ impl Sheet {
             Err(error) => Some(fill("config.unwritable", &[("error", &error.to_string())])),
         }
     }
-
-
 }
 
 #[cfg(test)]
@@ -1608,7 +1640,10 @@ mod tests {
     fn a_refusal_that_is_one_sentence_is_one_fault() {
         let alone = "log_level: unknown log level \"loud\" (available: quiet, normal, debug)";
         assert_eq!(faults(alone), vec![alone.to_owned()]);
-        assert_eq!(fault_at(alone).map(|at| at.key), Some("log_level".to_owned()));
+        assert_eq!(
+            fault_at(alone).map(|at| at.key),
+            Some("log_level".to_owned())
+        );
     }
 
     /// Eight lines that differ only in a group name are one fault, and
@@ -1617,8 +1652,7 @@ mod tests {
     fn one_bad_value_inherited_everywhere_is_one_fault() {
         let refusal = format!(
             "invalid configuration:\n{}",
-            ["  the defaults' ignores: no ignore file named \"asdfasdf\" in /x"; 3]
-                .join("\n")
+            ["  the defaults' ignores: no ignore file named \"asdfasdf\" in /x"; 3].join("\n")
         );
         let one = faults(&refusal);
         assert_eq!(one.len(), 1, "{one:?}");
@@ -1670,19 +1704,29 @@ mod tests {
         };
 
         // Same bytes, same mode: recorded earlier, settled since.
-        let both = agreement(&side("alpha", Some("aa"), false), &side("beta", Some("aa"), false));
+        let both = agreement(
+            &side("alpha", Some("aa"), false),
+            &side("beta", Some("aa"), false),
+        );
         assert!(matches!(both, Some(Agreement::Settled)));
 
         // Same bytes, and the mode is the whole disagreement. The side
         // that is executable is named, because the choice decides it.
-        let mode = agreement(&side("alpha", Some("aa"), false), &side("beta", Some("aa"), true));
+        let mode = agreement(
+            &side("alpha", Some("aa"), false),
+            &side("beta", Some("aa"), true),
+        );
         assert!(
             matches!(mode, Some(Agreement::OnlyTheMode { executable: "beta" })),
             "the executable side is the one named"
         );
 
         // Different bytes, or a file too large to hash, says nothing.
-        assert!(agreement(&side("alpha", Some("aa"), false), &side("beta", Some("bb"), false)).is_none());
+        assert!(agreement(
+            &side("alpha", Some("aa"), false),
+            &side("beta", Some("bb"), false)
+        )
+        .is_none());
         assert!(agreement(&side("alpha", None, false), &side("beta", None, false)).is_none());
     }
 
@@ -1701,8 +1745,8 @@ mod tests {
         assert!(!at.said.contains("available"), "{}", at.said);
         assert!(at.said.starts_with("no ignore file named"), "{}", at.said);
 
-        let mine = fault_at("group 'aws': max_file_size: invalid size 'asdf'")
-            .expect("a group's own key");
+        let mine =
+            fault_at("group 'aws': max_file_size: invalid size 'asdf'").expect("a group's own key");
         assert_eq!(mine.section, Section::Group("aws".to_owned()));
         assert_eq!(mine.key, "max_file_size");
         assert!(mine.instead.is_empty());
@@ -1717,8 +1761,9 @@ mod tests {
     /// one names the table it is in.
     #[test]
     fn a_fault_anywhere_in_the_file_finds_its_field() {
-        let top = fault_at("log_level: unknown log level \"loud\" (available: quiet, normal, debug)")
-            .expect("a key at the top of the file");
+        let top =
+            fault_at("log_level: unknown log level \"loud\" (available: quiet, normal, debug)")
+                .expect("a key at the top of the file");
         assert_eq!(top.section, Section::Settings);
         assert_eq!(top.key, "log_level");
         assert_eq!(top.instead, vec!["quiet", "normal", "debug"]);
@@ -1728,10 +1773,9 @@ mod tests {
         assert_eq!(timing.section, Section::Alerts);
         assert_eq!(timing.key, "settle_after");
 
-        let lease = fault_at(
-            "experimental.p2p-dangerously-experimental.ttl: invalid duration 'soon'",
-        )
-        .expect("a key in the lease timing");
+        let lease =
+            fault_at("experimental.p2p-dangerously-experimental.ttl: invalid duration 'soon'")
+                .expect("a key in the lease timing");
         assert_eq!(lease.section, Section::P2P);
         assert_eq!(lease.key, "ttl");
 
@@ -1764,7 +1808,9 @@ mod tests {
         // filling, rather than a table that quietly does nothing.
         assert_eq!(sheet.make_group("work"), None);
         assert!(sheet.groups().contains(&"work".to_owned()));
-        assert!(sheet.held(&Section::Group("work".to_owned()), "alpha").is_some());
+        assert!(sheet
+            .held(&Section::Group("work".to_owned()), "alpha")
+            .is_some());
         assert!(sheet.refused().is_some(), "an empty alpha is refused");
 
         // A name that is taken, or that a command would read as an
@@ -1783,7 +1829,10 @@ mod tests {
             Some("\"/tmp/a\"".to_owned())
         );
         assert!(sheet.rename_group("reading", "work").is_some(), "taken");
-        assert!(sheet.rename_group("nothing", "x").is_some(), "no such group");
+        assert!(
+            sheet.rename_group("nothing", "x").is_some(),
+            "no such group"
+        );
 
         // And taking one out leaves the rest alone.
         assert_eq!(sheet.drop_group("work"), None);
@@ -1952,5 +2001,3 @@ mod tests {
         assert!(Severity::Bad > Severity::Attention && Severity::Attention > Severity::Fine);
     }
 }
-
-

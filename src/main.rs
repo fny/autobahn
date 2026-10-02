@@ -3957,9 +3957,7 @@ fn run_init(config: Option<PathBuf>, force: bool) -> Result<()> {
         })?
         .len();
     println!("wrote {}", path.display());
-    for (name, contents) in [
-        ("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE),
-    ] {
+    for (name, contents) in [("on-alert.sh", autobahn::config::ON_ALERT_EXAMPLE)] {
         // An existing script is never replaced, not even under `--force`:
         // the configuration is autobahn's to rewrite, but a hook is a
         // script its owner may have made their own, and there is no way to

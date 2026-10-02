@@ -630,8 +630,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
             loop {
                 let frame: protocol::MuxRequest = match read_frame(&mut input)? {
                     Some(frame) => {
-                        crate::wire::decode_capped(&frame)
-                            .context("unable to decode frame")?
+                        crate::wire::decode_capped(&frame).context("unable to decode frame")?
                     }
                     // A clean end-of-stream is the controller going away, which
                     // ends every channel (the scope joins their threads once
@@ -977,24 +976,20 @@ fn serve_channel<W: Write + Send>(
         // Held until this request's response is built: the lease cannot
         // change hands while the write runs.
         let _lease_guard = match (writes, &accepted, &p2p_directory) {
-            (true, Some(lease), Ok(directory)) => {
-                match crate::p2p::check_write(directory, lease) {
-                    Ok(guard) => Some(guard),
-                    Err(error) => {
-                        if let Some(crate::p2p::WriteRefused::Superseded { current, .. }) =
-                            error.downcast_ref::<crate::p2p::WriteRefused>()
-                        {
-                            fence = Some(current.clone());
-                        }
-                        if serve_send(output, channel, Response::Error(format!("{error:#}")))
-                            .is_err()
-                        {
-                            return;
-                        }
-                        continue;
+            (true, Some(lease), Ok(directory)) => match crate::p2p::check_write(directory, lease) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    if let Some(crate::p2p::WriteRefused::Superseded { current, .. }) =
+                        error.downcast_ref::<crate::p2p::WriteRefused>()
+                    {
+                        fence = Some(current.clone());
                     }
+                    if serve_send(output, channel, Response::Error(format!("{error:#}"))).is_err() {
+                        return;
+                    }
+                    continue;
                 }
-            }
+            },
             _ => None,
         };
         let result = match request {
@@ -1078,11 +1073,8 @@ fn serve_channel<W: Write + Send>(
                     let lease = crate::p2p::read_lease(directory)?;
                     let generation = match &copy {
                         Some(copy) => Some(copy.generation()),
-                        None if crate::p2p::ancestor_copy_path(
-                            directory,
-                            &initialize.session,
-                        )?
-                        .exists() =>
+                        None if crate::p2p::ancestor_copy_path(directory, &initialize.session)?
+                            .exists() =>
                         {
                             Some(
                                 open_copy(&p2p_directory, &initialize.session, &mut copy)?
@@ -1091,10 +1083,7 @@ fn serve_channel<W: Write + Send>(
                         }
                         None => None,
                     };
-                    Ok(Response::P2pState(crate::p2p::State {
-                        lease,
-                        generation,
-                    }))
+                    Ok(Response::P2pState(crate::p2p::State { lease, generation }))
                 }),
             Request::Scan => reporting_scan(output, channel, &counted, || endpoint.scan())
                 .and_then(|snapshot| {
@@ -1291,8 +1280,7 @@ fn changed_scan(
 ) -> Result<(Response, Option<Encoding>)> {
     if let Some(sent) = last_sent {
         let changes = exact_changes(sent.root.as_ref(), snapshot.root.as_ref());
-        let small =
-            crate::wire::size_of(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
+        let small = crate::wire::size_of(&changes).is_ok_and(|size| size <= SCAN_CHANGES_MAX_BYTES);
         if small {
             // Both digests are tree digests, which hash only what changed
             // since the digester last saw these trees: no encoding at all
@@ -2355,10 +2343,7 @@ pub(crate) mod tests {
             let mut endpoint =
                 crate::endpoint::remote::RemoteEndpoint::connect(client, initialize).unwrap();
             for error in [
-                endpoint
-                    .p2p_keys()
-                    .map(|_| ())
-                    .expect_err("no key made"),
+                endpoint.p2p_keys().map(|_| ()).expect_err("no key made"),
                 endpoint
                     .install_peers(&[], &[])
                     .expect_err("no key installed"),

@@ -317,9 +317,7 @@ fn beta_addition_semantics_by_mode() {
         harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe
-            | SyncMode::TwoWayResolved
-            | SyncMode::TwoWayStrict => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
                 assert!(alpha_added.exists(), "{mode:?}: addition should propagate");
                 harness.assert_trees_equal("beta addition");
             }
@@ -353,9 +351,7 @@ fn beta_modification_semantics_by_mode() {
         let report = harness.cycle_ok();
 
         match mode {
-            SyncMode::TwoWaySafe
-            | SyncMode::TwoWayResolved
-            | SyncMode::TwoWayStrict => {
+            SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
                 let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
                 assert_eq!(alpha_content, "modified on beta", "{mode:?}");
                 harness.assert_trees_equal("beta modification");
@@ -1139,10 +1135,7 @@ fn p2p_fence_and_ancestor_copy_over_the_wire() {
             connection,
             Initialize {
                 root: root.to_string_lossy().into_owned(),
-                session: autobahn::session::session_identifier(
-                    &root.to_string_lossy(),
-                    "p2p-e2e",
-                ),
+                session: autobahn::session::session_identifier(&root.to_string_lossy(), "p2p-e2e"),
                 ignores: Vec::new(),
                 symlink_mode: SymlinkMode::Raw,
                 file_mode: None,

@@ -51,8 +51,7 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
                 // that term like any lease; the hosts that moved on since
                 // refuse it, and this peer steps down again.
                 let lease = Lease::new(&star.name, term, star.timing.ttl);
-                if let p2p::LeaseAnswer::Refused { current } =
-                    p2p::admit_lease(directory, &lease)?
+                if let p2p::LeaseAnswer::Refused { current } = p2p::admit_lease(directory, &lease)?
                 {
                     crate::note!(
                         "p2p: {} took the lead at term {} first; following",
@@ -61,10 +60,7 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
                     );
                     continue;
                 }
-                crate::note!(
-                    "p2p: the lease names {}; leading at term {term}",
-                    star.name
-                );
+                crate::note!("p2p: the lease names {}; leading at term {term}", star.name);
                 lead(directory, state_root, star, term, verbose, stop)?;
             }
             Followed::TakeOver { term } => {
@@ -72,8 +68,7 @@ pub fn run(directory: &Path, state_root: &Path, verbose: bool, stop: &AtomicBool
                 // lease: a rival that took this host at the same term or a
                 // later one first wins, and this peer follows on.
                 let lease = Lease::new(&star.name, term, star.timing.ttl);
-                if let p2p::LeaseAnswer::Refused { current } =
-                    p2p::admit_lease(directory, &lease)?
+                if let p2p::LeaseAnswer::Refused { current } = p2p::admit_lease(directory, &lease)?
                 {
                     crate::note!(
                         "p2p: {} took the lead at term {} first; following",
@@ -202,8 +197,7 @@ fn lead(
     crate::transport::set_p2p_ssh_options(
         crate::peerkeys::ssh_options(directory).unwrap_or_default(),
     );
-    let context =
-        super::P2pContext::for_leader(directory.to_path_buf(), name.clone(), term, ttl);
+    let context = super::P2pContext::for_leader(directory.to_path_buf(), name.clone(), term, ttl);
     let supervisor =
         super::Supervisor::new(star.plans, state_root.to_path_buf(), verbose).with_p2p(context);
     let inner_stop = AtomicBool::new(false);
@@ -246,9 +240,7 @@ fn lead(
                 // here while the sessions are still passing it on;
                 // renewing over that would hand the lead back to nobody and
                 // have this peer take it up again from itself.
-                if let Err(error) =
-                    p2p::renew_own_lease(directory, &Lease::new(&name, term, ttl))
-                {
+                if let Err(error) = p2p::renew_own_lease(directory, &Lease::new(&name, term, ttl)) {
                     crate::complain!("p2p: unable to renew the lease locally: {error:#}");
                 }
                 renewed = std::time::Instant::now();

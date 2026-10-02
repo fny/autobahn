@@ -31,9 +31,6 @@ enum Wake {
     Done,
 }
 
-
-
-
 use crate::menubar::{Bar, POLL};
 
 /// Runs the tray until quit.
@@ -123,4 +120,3 @@ impl winit::application::ApplicationHandler<Wake> for Bar {
         event_loop.set_control_flow(ControlFlow::Wait);
     }
 }
-

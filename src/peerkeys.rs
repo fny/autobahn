@@ -350,10 +350,7 @@ mod tests {
         );
         assert_eq!(known_hosts, [format!("two {}", KEY.replace("Jl", "Jm"))]);
         let (authorized, known_hosts) = block_for("two", &known);
-        assert_eq!(
-            authorized,
-            [format!("{FORCED} {KEY} autobahn-p2p:u@one")]
-        );
+        assert_eq!(authorized, [format!("{FORCED} {KEY} autobahn-p2p:u@one")]);
         assert_eq!(known_hosts, [format!("one {KEY}")]);
     }
 

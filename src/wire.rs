@@ -109,7 +109,7 @@ mod tests {
             bytes,
             vec![
                 1, 0, 0, 0, 0, 0, 0, 0, // the generation, eight bytes, little-endian
-                1, 0, 0, 0, 0, 0, 0, 0, // the string's length, the same
+                1, 0, 0, 0, 0, 0, 0, 0,    // the string's length, the same
                 b'a', // and its one byte
                 1,    // the bool
             ],

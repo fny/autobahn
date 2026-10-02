@@ -24,7 +24,19 @@
 
 pub mod alerts;
 pub mod blocked;
+/// Photographing the window, for the screenshots that check it.
+#[cfg(feature = "dash")]
+pub(crate) mod camera;
 pub mod config;
+/// The window over the fleet: a dashboard, which is what the gauges
+/// of a road vehicle have been called since they stopped mud being
+/// dashed up by the horses.
+#[cfg(feature = "dash")]
+pub mod dash;
+/// The application's own presence: the dock icon, and whether there is
+/// a window, a menu bar item, or both.
+#[cfg(feature = "dash")]
+pub mod dock;
 pub mod endpoint;
 pub mod fsutil;
 pub mod gate;
@@ -32,16 +44,19 @@ pub mod host;
 pub mod icon;
 pub mod invocation;
 pub mod logging;
+/// What the menu bar shows, for the tray and for the dash.
+#[cfg(any(feature = "tray", feature = "dash"))]
+pub(crate) mod menubar;
+/// Notifications the system posts, for whoever can post them.
+#[cfg(any(feature = "tray", feature = "dash"))]
+pub(crate) mod native_alert;
 pub mod ownership;
-pub mod paths;
 pub mod p2p;
+pub mod paths;
 pub mod peerkeys;
 pub mod persist;
 pub mod power;
 pub mod progress;
-/// Encoding, in one place: the format and the decode limits. Public
-/// so the examples measure what the transport actually does.
-pub mod wire;
 pub mod protocol;
 pub mod root;
 pub mod rsync;
@@ -49,34 +64,19 @@ pub mod scan;
 pub mod service;
 pub mod session;
 pub mod supervisor;
-pub mod text;
-pub mod threads;
-pub mod transport;
-/// The application's own presence: the dock icon, and whether there is
-/// a window, a menu bar item, or both.
-#[cfg(feature = "dash")]
-pub mod dock;
 /// What a window over the fleet is, apart from its drawing.
 #[cfg(feature = "dash")]
 pub(crate) mod surface;
-/// Photographing the window, for the screenshots that check it.
-#[cfg(feature = "dash")]
-pub(crate) mod camera;
-/// The window over the fleet: a dashboard, which is what the gauges
-/// of a road vehicle have been called since they stopped mud being
-/// dashed up by the horses.
-#[cfg(feature = "dash")]
-pub mod dash;
-/// What the surfaces say, in one place.
-#[cfg(any(feature = "tray", feature = "dash"))]
-pub(crate) mod words;
-/// Notifications the system posts, for whoever can post them.
-#[cfg(any(feature = "tray", feature = "dash"))]
-pub(crate) mod native_alert;
-/// What the menu bar shows, for the tray and for the dash.
-#[cfg(any(feature = "tray", feature = "dash"))]
-pub(crate) mod menubar;
+pub mod text;
+pub mod threads;
+pub mod transport;
 #[cfg(feature = "tray")]
 pub mod tray;
 pub mod tree;
 pub mod update;
+/// Encoding, in one place: the format and the decode limits. Public
+/// so the examples measure what the transport actually does.
+pub mod wire;
+/// What the surfaces say, in one place.
+#[cfg(any(feature = "tray", feature = "dash"))]
+pub(crate) mod words;

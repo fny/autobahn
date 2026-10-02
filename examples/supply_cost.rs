@@ -170,7 +170,8 @@ fn main() {
     let second = collect(&mut endpoint, needs.clone());
     let identical = first.len() == second.len()
         && first.iter().zip(second.iter()).all(|(a, b)| {
-            autobahn::wire::encode(a).expect("encodes") == autobahn::wire::encode(b).expect("encodes")
+            autobahn::wire::encode(a).expect("encodes")
+                == autobahn::wire::encode(b).expect("encodes")
         });
     println!(
         "\nbatch determinism: {} batches, identical across two supply streams: {}",

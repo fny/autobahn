@@ -3931,9 +3931,8 @@ fn a_peer_takes_the_lead_when_the_lease_goes_stale() {
     let state_root = world.state_root();
     std::thread::scope(|scope| {
         let _guard = StopGuard(&stop);
-        let peer = scope.spawn(|| {
-            autobahn::supervisor::peer::run(&p2p_directory, &state_root, false, &stop)
-        });
+        let peer = scope
+            .spawn(|| autobahn::supervisor::peer::run(&p2p_directory, &state_root, false, &stop));
         // The peer takes the lead and its file reaches the other beta.
         assert!(
             wait_until(Duration::from_secs(20), || other_root
@@ -4052,8 +4051,7 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     let plans = world.plans(&configuration);
     let name = format!("peer:{}", peer_root.display());
     let p2p_directory = peer_home.join(".autobahn").join("p2p");
-    p2p::write_pushed_file(&p2p_directory, "config.toml", configuration.as_bytes())
-        .unwrap();
+    p2p::write_pushed_file(&p2p_directory, "config.toml", configuration.as_bytes()).unwrap();
     p2p::write_pushed_file(&p2p_directory, "name", name.as_bytes()).unwrap();
     p2p::write_pushed_file(
         &p2p_directory,
@@ -4096,9 +4094,8 @@ fn the_alpha_attaches_to_a_leading_peer_and_gets_the_lead_back() {
     let alerts = autobahn::alerts::AlertPlan::default();
     std::thread::scope(|scope| {
         let _guard = StopGuard(&stop);
-        let peer = scope.spawn(|| {
-            autobahn::supervisor::peer::run(&p2p_directory, &peer_state, true, &stop)
-        });
+        let peer = scope
+            .spawn(|| autobahn::supervisor::peer::run(&p2p_directory, &peer_state, true, &stop));
         assert!(
             wait_until(Duration::from_secs(20), || socket.exists()),
             "the peer should lead and listen for the alpha"

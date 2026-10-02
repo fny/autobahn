@@ -364,10 +364,9 @@ impl P2pShared {
             }
         }
         crate::note!("p2p: handing the lead to {to} at term {next}");
-        if let crate::p2p::LeaseAnswer::Refused { current } = crate::p2p::admit_lease(
-            &self.directory,
-            &crate::p2p::Lease::new(to, next, self.ttl),
-        )? {
+        if let crate::p2p::LeaseAnswer::Refused { current } =
+            crate::p2p::admit_lease(&self.directory, &crate::p2p::Lease::new(to, next, self.ttl))?
+        {
             anyhow::bail!(
                 "{} leads at term {} on this host; there is no lead here to hand on",
                 current.leader,
@@ -471,12 +470,10 @@ impl P2pContext {
                         leader: crate::p2p::ALPHA.to_owned(),
                         term,
                     },
-                    crate::p2p::LeaseAnswer::Refused { current } => {
-                        crate::p2p::Role::Follower {
-                            leader: current.leader,
-                            term: current.term,
-                        }
-                    }
+                    crate::p2p::LeaseAnswer::Refused { current } => crate::p2p::Role::Follower {
+                        leader: current.leader,
+                        term: current.term,
+                    },
                 }
             }
             crate::p2p::AlphaStart::Follow { lease } => crate::p2p::Role::Follower {
@@ -496,12 +493,7 @@ impl P2pContext {
     /// The context for a beta that took the lead: it leads as `leader`
     /// (its own spec) at `term`, runs the pushed configuration, and
     /// pushes the pushed ignore files on.
-    pub fn for_leader(
-        directory: PathBuf,
-        leader: String,
-        term: u64,
-        ttl: Duration,
-    ) -> P2pContext {
+    pub fn for_leader(directory: PathBuf, leader: String, term: u64, ttl: Duration) -> P2pContext {
         P2pContext {
             config_path: directory.join("config.toml"),
             ignores_directory: directory.join(crate::scan::ignorefile::DIRECTORY),
@@ -755,8 +747,7 @@ impl Supervisor {
                 members.push(spec);
             }
         }
-        *p2p
-            .shared
+        *p2p.shared
             .members
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = members;
@@ -1759,9 +1750,7 @@ impl<'a> Worker<'a> {
         };
         match p2p.role() {
             crate::p2p::Role::Off => Ok(None),
-            crate::p2p::Role::Follower { leader, term } => {
-                Err(Following { leader, term }.into())
-            }
+            crate::p2p::Role::Follower { leader, term } => Err(Following { leader, term }.into()),
             crate::p2p::Role::Leader { leader, term } => Ok(Some(crate::p2p::Leadership {
                 leader,
                 term,
@@ -1792,8 +1781,7 @@ impl<'a> Worker<'a> {
             let host = crate::p2p::destination_of(&self.plan.beta_spec()).to_owned();
             if !self.keys_learned {
                 let keys = session.peer_keys()?;
-                p2p
-                    .shared
+                p2p.shared
                     .keys
                     .lock()
                     .unwrap_or_else(|error| error.into_inner())
@@ -3827,8 +3815,7 @@ mod tests {
             },
             ttl,
         );
-        *shared.members.lock().unwrap() =
-            vec![crate::p2p::ALPHA.to_owned(), "box:/x".to_owned()];
+        *shared.members.lock().unwrap() = vec![crate::p2p::ALPHA.to_owned(), "box:/x".to_owned()];
         shared
     }
 

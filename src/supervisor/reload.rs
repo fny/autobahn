@@ -399,7 +399,8 @@ mod tests {
     fn load_refuses_what_start_refuses() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let path = root.path().join("config.toml");
-        std::fs::write(&path, "live_reload = true\nmdoe = \"two-way-conflict\"\n").expect("written");
+        std::fs::write(&path, "live_reload = true\nmdoe = \"two-way-conflict\"\n")
+            .expect("written");
         let error = load(&path).expect_err("an unknown key is refused");
         assert!(format!("{error:#}").contains("mdoe"), "{error:#}");
         let alpha = root.path().join("alpha");

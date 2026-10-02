@@ -505,9 +505,7 @@ impl Registry {
         // caller wants the whole picture and matches it up itself.
         if let ControlRequest::Yield { to } = request {
             let Some(yield_to) = &self.yield_to else {
-                return ControlResponse::Error(
-                    "this supervisor is not leading a p2p group".into(),
-                );
+                return ControlResponse::Error("this supervisor is not leading a p2p group".into());
             };
             return match yield_to(to) {
                 Ok(()) => {

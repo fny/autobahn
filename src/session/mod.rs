@@ -2509,13 +2509,19 @@ mod tests {
         assert!(waited < crate::endpoint::WRITE_GRACE, "{waited:?}");
 
         // Nothing open: quiet after one slice, as before.
-        let (mut session, _state) = settling(vec![activity(1, false)]);
-        let started = std::time::Instant::now();
+        let (mut session, _state) = settling(vec![
+            activity(1, false),
+            activity(1, false),
+            activity(2, false),
+            activity(3, false),
+        ]);
         session.settle(
             std::time::Duration::from_millis(25),
             std::time::Duration::from_millis(5),
         );
-        assert!(started.elapsed() < std::time::Duration::from_millis(25));
+        // Two agreeing samples end the settle. Later activity stays
+        // unread, even if the scheduler delays the quiet slice.
+        assert_eq!(session.primary.change_activity(), Some(activity(2, false)));
     }
 
     /// A file that stays open — a log, a database — holds a settle back no

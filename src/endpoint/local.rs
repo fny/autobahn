@@ -2546,7 +2546,7 @@ impl<'a> Transitioner<'a> {
         while claimed + 1 < count
             && self
                 .helpers
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |free| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |free| {
                     free.checked_sub(1)
                 })
                 .is_ok()
@@ -2960,7 +2960,7 @@ impl<'a> Transitioner<'a> {
                 // Counted down atomically: the publish that takes the
                 // count to zero is the last use, whichever thread it is on.
                 let before = count
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |uses| {
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |uses| {
                         Some(uses.saturating_sub(1))
                     })
                     .unwrap_or(0);
@@ -6823,6 +6823,14 @@ mod watch_tests {
 
         // Moved away and back, so the watch reaches it only by extension.
         std::fs::rename(root.path().join("vendor"), root.path().join("aside")).unwrap();
+        assert!(recorded_within(
+            &watcher,
+            &root.path().join("aside"),
+            Duration::from_secs(3)
+        ));
+        // Wait for the move away before returning. Otherwise its old
+        // vendor event can satisfy the wait for the directory's return.
+        drop(watcher.take());
         std::fs::rename(root.path().join("aside"), root.path().join("vendor")).unwrap();
         assert!(recorded_within(
             &watcher,

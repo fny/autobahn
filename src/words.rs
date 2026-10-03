@@ -63,6 +63,7 @@ pub(crate) fn t(key: &str) -> &'static str {
 ///
 /// Random rather than in order: a person who opens this window twice
 /// a day should not read the same sentence every time.
+#[cfg(any(feature = "dash", test))]
 pub(crate) fn hint() -> &'static str {
     hint_besides("")
 }
@@ -71,6 +72,7 @@ pub(crate) fn hint() -> &'static str {
 ///
 /// A hint that is meant to change and does not looks like a window
 /// that failed to notice the click.
+#[cfg(any(feature = "dash", test))]
 pub(crate) fn hint_besides(showing: &str) -> &'static str {
     static EVERY: OnceLock<Vec<&'static str>> = OnceLock::new();
     let every = EVERY.get_or_init(|| {
@@ -95,7 +97,7 @@ pub(crate) fn hint_besides(showing: &str) -> &'static str {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|since| since.subsec_nanos() as usize)
         .unwrap_or(0);
-    *choosing[now % choosing.len()]
+    choosing[now % choosing.len()]
 }
 
 /// The line for a key, with `{name}` replaced by what is given.

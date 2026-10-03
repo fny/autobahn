@@ -155,7 +155,7 @@ jobs:
           cp target/release/autobahn-dash target/release/autobahn stage/
           tar -C stage -czf "autobahn-dash-${{ matrix.platform }}.tar.gz" .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: autobahn-dash-${{ matrix.platform }}
           path: autobahn-dash-${{ matrix.platform }}.*

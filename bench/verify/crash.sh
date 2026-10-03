@@ -13,7 +13,7 @@
 #   2. No resurrection — content deleted before the crash stays deleted, and
 #      content written before the crash is not replaced by an older version.
 #
-# Fan-out matters here because ten sessions over one alpha share a single
+# Fan-out matters here because ten sessions over one primary share a single
 # observation and a single scan cache, but keep an ancestor each. A crash
 # tears all of that down mid-write at once.
 #
@@ -22,10 +22,10 @@
 # checkpoint-then-clear sequence, which is the one interleaving where a
 # stale journal could be replayed onto a checkpoint that already holds it.
 #
-# Usage: crash.sh [trials] [betas]
+# Usage: crash.sh [trials] [replicas]
 set -euo pipefail
 TRIALS=${1:-40}
-BETAS=${2:-1}
+REPLICAS=${2:-1}
 AB=${AB:-/home/ubuntu/Workspace/autobahn/target/release/autobahn}
 BM=${BM:-/home/ubuntu/Workspace/autobahn/bench/harness/target/release/benchmark}
 PASS=0; FAIL=0; LOST=0
@@ -39,7 +39,7 @@ ROOT=$(mktemp -d /tmp/crashtest.XXXXXX)
 for trial in $(seq 1 "$TRIALS"); do
   W=$ROOT/t$trial
   mkdir -p "$W/src" "$W/state"
-  for b in $(seq 1 "$BETAS"); do mkdir -p "$W/dst$b"; done
+  for b in $(seq 1 "$REPLICAS"); do mkdir -p "$W/dst$b"; done
   # A small tree with a file we will revert, plus filler to make cycles real.
   for i in $(seq 1 200); do printf 'v1-%s' "$i" > "$W/src/f$i.txt"; done
   printf 'ORIGINAL' > "$W/src/target.txt"
@@ -47,13 +47,13 @@ for trial in $(seq 1 "$TRIALS"); do
 
   {
     echo "[groups.crash]"
-    echo "alpha = \"$W/src\""
+    echo "primary = \"$W/src\""
     echo 'mode = "two-way-conflict"'
     echo "interval = 2"
-    printf 'betas = ['
-    for b in $(seq 1 "$BETAS"); do
+    printf 'replicas = ['
+    for b in $(seq 1 "$REPLICAS"); do
       printf '"%s/dst%s"' "$W" "$b"
-      if [ "$b" -lt "$BETAS" ]; then printf ', '; fi
+      if [ "$b" -lt "$REPLICAS" ]; then printf ', '; fi
     done
     printf ']\n'
   } > "$W/ab.toml"
@@ -104,7 +104,7 @@ for trial in $(seq 1 "$TRIALS"); do
 
   ok=1; why=""
   after_target=MISSING; doomed_back=NO
-  for b in $(seq 1 "$BETAS"); do
+  for b in $(seq 1 "$REPLICAS"); do
     dst_m=$("$BM" manifest full "$W/dst$b" 2>/dev/null || true)
     [ "$src_m" != "$dst_m" ] && { ok=0; why="$why diverged(dst$b);"; }
     [ "$(cat "$W/dst$b/target.txt" 2>/dev/null || echo MISSING)" != "REVERTED" ] \

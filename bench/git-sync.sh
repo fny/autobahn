@@ -41,10 +41,10 @@ mkdir -p "$B"
 
 cat > "$W/config.toml" <<TOML
 [groups.repo]
-alpha = "$A"
+primary = "$A"
 mode = "two-way-conflict"
 interval = 2
-betas = ["localhost:$B"]
+replicas = ["localhost:$B"]
 agent_command = "ssh localhost $BIN agent"
 # What is machine-local in .git, and what is transient.
 ignores = [".git/index", ".git/*.lock", ".git/**/*.lock", ".git/logs", ".git/gc.pid", ".git/FETCH_HEAD", ".git/ORIG_HEAD", ".git/COMMIT_EDITMSG"]

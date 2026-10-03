@@ -99,10 +99,10 @@ pub struct Unsynchronizable {
 pub struct ConflictDetail {
     /// The root-relative path.
     pub path: String,
-    /// Alpha's side.
-    pub alpha: ConflictSide,
-    /// Beta's side.
-    pub beta: ConflictSide,
+    /// The primary's side.
+    pub primary: ConflictSide,
+    /// The replica's side.
+    pub replica: ConflictSide,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -111,10 +111,10 @@ pub struct SessionStatus {
     pub group: String,
     /// The destination label (host or local path).
     pub host: String,
-    /// The alpha root.
-    pub alpha: String,
-    /// The beta specification.
-    pub beta: String,
+    /// The primary root.
+    pub primary: String,
+    /// The replica specification.
+    pub replica: String,
     /// The synchronization mode name.
     pub mode: String,
     /// The session state: `synchronized`, `conflicts`, `blocked`,
@@ -123,10 +123,10 @@ pub struct SessionStatus {
     /// The number of cycles completed since the supervisor started this
     /// session.
     pub cycles: u64,
-    /// The transitions applied to alpha and beta by the most recent cycle.
-    pub last_alpha_transitions: usize,
-    /// The transitions applied to beta by the most recent cycle.
-    pub last_beta_transitions: usize,
+    /// The transitions applied to the primary and replica by the most recent cycle.
+    pub last_primary_transitions: usize,
+    /// The transitions applied to the replica by the most recent cycle.
+    pub last_replica_transitions: usize,
     /// The root paths of any conflicts reported by the most recent cycle.
     pub conflicts: Vec<String>,
     /// What each side held at each conflict, as of the cycle that reported
@@ -146,14 +146,14 @@ pub struct SessionStatus {
     pub error: Option<String>,
     /// When this status was recorded, in seconds since the Unix epoch.
     pub updated_at: u64,
-    /// The entry count alpha's last completed scan reported, which is what
+    /// The entry count the primary's last completed scan reported, which is what
     /// the next run's first scan is measured against for an estimate.
     /// Absent in records written before this field existed.
     #[serde(default)]
-    pub alpha_entries: u64,
-    /// The entry count beta's last completed scan reported.
+    pub primary_entries: u64,
+    /// The entry count the replica's last completed scan reported.
     #[serde(default)]
-    pub beta_entries: u64,
+    pub replica_entries: u64,
     /// Files and bytes moved over the session's life, carried across
     /// restarts. The shop's tally.
     #[serde(default)]
@@ -168,7 +168,7 @@ pub struct SessionStatus {
     pub term: u64,
     /// How long the failure recorded here must stand before it alerts,
     /// when that differs from its state's usual patience: a halt that
-    /// clears on its own, like a missing alpha folder.
+    /// clears on its own, like a missing primary folder.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub alert_after_seconds: Option<u64>,
 }
@@ -188,10 +188,10 @@ pub struct SessionOutcome {
 pub struct CycleDigest {
     /// The number of cycles run.
     pub cycles: u64,
-    /// The total transitions applied to alpha.
-    pub alpha_transitions: usize,
-    /// The total transitions applied to beta.
-    pub beta_transitions: usize,
+    /// The total transitions applied to the primary.
+    pub primary_transitions: usize,
+    /// The total transitions applied to the replica.
+    pub replica_transitions: usize,
     /// The number of conflicts reported by the final cycle.
     pub conflicts: usize,
     /// The number of problems reported by the final cycle.
@@ -255,8 +255,8 @@ pub struct P2pContext {
     /// This machine's own p2p directory, where its role is remembered
     /// across restarts.
     directory: PathBuf,
-    /// Where the ignore files the configuration names are: the alpha's
-    /// own `ignores/`, or the pushed copies for a beta that leads.
+    /// Where the ignore files the configuration names are: the primary's
+    /// own `ignores/`, or the pushed copies for a replica that leads.
     ignores_directory: PathBuf,
     /// The role and the handoff, shared with every worker and with the
     /// control socket.
@@ -273,12 +273,12 @@ struct P2pShared {
     ttl: Duration,
     /// The role.
     role: Mutex<crate::p2p::Role>,
-    /// Who the lead may be handed to: the alpha, and every beta this
+    /// Who the lead may be handed to: the primary, and every replica this
     /// supervisor's p2p sessions reach.
     members: Mutex<Vec<String>>,
     /// A handoff, and the sessions that pass it on.
     passing: Mutex<Passing>,
-    /// With `manage_keys`: every beta's p2p key and host keys, by
+    /// With `manage_keys`: every replica's p2p key and host keys, by
     /// host, as its session learned them.
     keys: Mutex<std::collections::BTreeMap<String, crate::peerkeys::HostKeys>>,
 }
@@ -295,10 +295,10 @@ struct Passing {
     running: std::collections::BTreeSet<String>,
     /// The sessions that have handed the handoff's lease on.
     handed: std::collections::BTreeSet<String>,
-    /// Of the running sessions, those with the attached alpha; and those
+    /// Of the running sessions, those with the attached primary; and those
     /// that have finished a cycle with it while this supervisor led. The
-    /// lead goes back to the alpha only once every one has, so that each of
-    /// the alpha's groups is level with it before it leads them again.
+    /// lead goes back to the primary only once every one has, so that each of
+    /// the primary's groups is level with it before it leads them again.
     attached: std::collections::BTreeSet<String>,
     cycled: std::collections::BTreeSet<String>,
 }
@@ -405,12 +405,12 @@ impl P2pShared {
         self.follow_once_passed(&mut passing);
     }
 
-    /// A session with the attached alpha finished a cycle with it.
-    fn cycled_with_alpha(&self, session: &str) {
+    /// A session with the attached primary finished a cycle with it.
+    fn cycled_with_primary(&self, session: &str) {
         self.passing().cycled.insert(session.to_owned());
     }
 
-    /// Whether every running session with the attached alpha has finished
+    /// Whether every running session with the attached primary has finished
     /// a cycle with it.
     fn every_attached_session_cycled(&self) -> bool {
         let passing = self.passing();
@@ -429,17 +429,17 @@ impl P2pShared {
         }
     }
 
-    /// Leads again as the alpha at `term`, the lease having come back to
+    /// Leads again as the primary at `term`, the lease having come back to
     /// it: admitted under the lease lock like any lease, so a newer one a
-    /// beta holds here is never written over. Whether it leads.
-    fn lead_as_alpha(&self, term: u64) -> Result<bool> {
-        let lease = crate::p2p::Lease::new(crate::p2p::ALPHA, term, self.ttl);
+    /// replica holds here is never written over. Whether it leads.
+    fn lead_as_primary(&self, term: u64) -> Result<bool> {
+        let lease = crate::p2p::Lease::new(crate::p2p::PRIMARY, term, self.ttl);
         match crate::p2p::admit_lease(&self.directory, &lease)? {
             crate::p2p::LeaseAnswer::Accepted => {
                 self.passing().handoff = None;
                 *self.role.lock().unwrap_or_else(|error| error.into_inner()) =
                     crate::p2p::Role::Leader {
-                        leader: crate::p2p::ALPHA.to_owned(),
+                        leader: crate::p2p::PRIMARY.to_owned(),
                         term,
                     };
                 Ok(true)
@@ -450,24 +450,24 @@ impl P2pShared {
 }
 
 impl P2pContext {
-    /// The context for a supervisor that is the configured alpha: it
+    /// The context for a supervisor that is the configured primary: it
     /// leads at the term its own lease file remembers, or at a first
-    /// term, unless that file says a beta led while it was away — then it
+    /// term, unless that file says a replica led while it was away — then it
     /// follows, and stays a follower until a later phase hands the lead
     /// back.
-    pub fn for_alpha(
+    pub fn for_primary(
         config_path: PathBuf,
         directory: PathBuf,
         ttl: Duration,
     ) -> Result<P2pContext> {
-        let role = match crate::p2p::alpha_term(&directory)? {
-            crate::p2p::AlphaStart::Lead { term } => {
-                let lease = crate::p2p::Lease::new(crate::p2p::ALPHA, term, ttl);
-                // Under the lease lock: a lease a beta wrote here since it
-                // was read is kept, and the alpha follows it.
+        let role = match crate::p2p::primary_term(&directory)? {
+            crate::p2p::PrimaryStart::Lead { term } => {
+                let lease = crate::p2p::Lease::new(crate::p2p::PRIMARY, term, ttl);
+                // Under the lease lock: a lease a replica wrote here since it
+                // was read is kept, and the primary follows it.
                 match crate::p2p::admit_lease(&directory, &lease)? {
                     crate::p2p::LeaseAnswer::Accepted => crate::p2p::Role::Leader {
-                        leader: crate::p2p::ALPHA.to_owned(),
+                        leader: crate::p2p::PRIMARY.to_owned(),
                         term,
                     },
                     crate::p2p::LeaseAnswer::Refused { current } => crate::p2p::Role::Follower {
@@ -476,7 +476,7 @@ impl P2pContext {
                     },
                 }
             }
-            crate::p2p::AlphaStart::Follow { lease } => crate::p2p::Role::Follower {
+            crate::p2p::PrimaryStart::Follow { lease } => crate::p2p::Role::Follower {
                 leader: lease.leader,
                 term: lease.term,
             },
@@ -490,7 +490,7 @@ impl P2pContext {
         })
     }
 
-    /// The context for a beta that took the lead: it leads as `leader`
+    /// The context for a replica that took the lead: it leads as `leader`
     /// (its own spec) at `term`, runs the pushed configuration, and
     /// pushes the pushed ignore files on.
     pub fn for_leader(directory: PathBuf, leader: String, term: u64, ttl: Duration) -> P2pContext {
@@ -523,10 +523,10 @@ impl P2pContext {
         self.shared.yield_to(to)
     }
 
-    /// Takes the lead back as the alpha at `term`, once the lease names the
-    /// alpha again. Whether it leads.
-    pub fn lead_as_alpha(&self, term: u64) -> Result<bool> {
-        self.shared.lead_as_alpha(term)
+    /// Takes the lead back as the primary at `term`, once the lease names the
+    /// primary again. Whether it leads.
+    pub fn lead_as_primary(&self, term: u64) -> Result<bool> {
+        self.shared.lead_as_primary(term)
     }
 
     /// A handle the control socket can call to yield.
@@ -536,7 +536,7 @@ impl P2pContext {
     }
 
     /// Steps down: another controller holds `current` on some host. The
-    /// alpha's own lease file records it too, so a restart does not come
+    /// the primary's own lease file records it too, so a restart does not come
     /// back leading.
     fn step_down(&self, current: &crate::p2p::Lease) {
         let mut role = self
@@ -569,7 +569,7 @@ impl P2pContext {
     /// configuration, and every ignore file the configuration can name.
     fn pushed_files(
         &self,
-        beta_spec: &str,
+        replica_spec: &str,
         group: &str,
         identifier: &str,
     ) -> Result<Vec<(String, Vec<u8>)>> {
@@ -580,8 +580,8 @@ impl P2pContext {
         // The name twice: per group, since two groups can reach one host
         // at two roots, and host-wide, which is what says the host is a
         // peer at all.
-        files.push(("name".to_owned(), beta_spec.as_bytes().to_vec()));
-        files.push((format!("names/{group}"), beta_spec.as_bytes().to_vec()));
+        files.push(("name".to_owned(), replica_spec.as_bytes().to_vec()));
+        files.push((format!("names/{group}"), replica_spec.as_bytes().to_vec()));
         files.push((format!("sessions/{group}"), identifier.as_bytes().to_vec()));
         let ignores = &self.ignores_directory;
         if let Ok(entries) = std::fs::read_dir(ignores) {
@@ -607,7 +607,7 @@ impl P2pContext {
 struct PassingPlace {
     shared: Option<Arc<P2pShared>>,
     session: String,
-    /// Whether the session is with the attached alpha.
+    /// Whether the session is with the attached primary.
     attached: bool,
 }
 
@@ -620,7 +620,7 @@ impl PassingPlace {
             },
             session: plan.identifier(),
             attached: matches!(
-                &plan.alpha,
+                &plan.primary,
                 EndpointTarget::Remote { destination, .. }
                     if crate::p2p::attached_name(destination).is_some()
             ),
@@ -732,17 +732,17 @@ impl Supervisor {
     /// Adopts a p2p context, so that sessions in a p2p mode lead
     /// (or follow) rather than run as plain sessions.
     pub fn with_p2p(mut self, p2p: P2pContext) -> Supervisor {
-        // Who the lead may be handed to: the alpha, and the beta of every
+        // Who the lead may be handed to: the primary, and the replica of every
         // p2p session this supervisor runs — except the session with
-        // the attached alpha, whose beta is the alpha already.
-        let mut members = vec![crate::p2p::ALPHA.to_owned()];
+        // the attached primary, whose replica is the primary already.
+        let mut members = vec![crate::p2p::PRIMARY.to_owned()];
         for plan in self.plans.iter().filter(|plan| plan.p2p.is_some()) {
             let attached = matches!(
-                &plan.beta,
+                &plan.replica,
                 crate::config::EndpointTarget::Remote { destination, .. }
                     if crate::p2p::attached_name(destination).is_some()
             );
-            let spec = plan.beta_spec();
+            let spec = plan.replica_spec();
             if !attached && !members.contains(&spec) {
                 members.push(spec);
             }
@@ -755,11 +755,11 @@ impl Supervisor {
         self
     }
 
-    /// P2P: takes the lead back as the alpha at `term`. Whether it
+    /// P2P: takes the lead back as the primary at `term`. Whether it
     /// leads; a supervisor without p2p never does.
-    pub fn lead_as_alpha(&self, term: u64) -> Result<bool> {
+    pub fn lead_as_primary(&self, term: u64) -> Result<bool> {
         match &self.p2p {
-            Some(p2p) => p2p.lead_as_alpha(term),
+            Some(p2p) => p2p.lead_as_primary(term),
             None => Ok(false),
         }
     }
@@ -1113,7 +1113,7 @@ impl Supervisor {
                 published: session.published.clone(),
                 group: session.plan.group.clone(),
                 host: session.plan.host.clone(),
-                beta: session.plan.beta_spec(),
+                replica: session.plan.replica_spec(),
                 control: session.control.clone(),
                 progress: session.progress.clone(),
             })
@@ -1246,11 +1246,11 @@ impl Supervisor {
         // rather than merely timed.
         let progress = Arc::<crate::progress::Progress>::default();
         if let Ok(Some(status)) = read_status(&self.state_root, &plan.identifier()) {
-            if status.alpha_entries > 0 {
-                progress.alpha.seed_expected(status.alpha_entries);
+            if status.primary_entries > 0 {
+                progress.primary.seed_expected(status.primary_entries);
             }
-            if status.beta_entries > 0 {
-                progress.beta.seed_expected(status.beta_entries);
+            if status.replica_entries > 0 {
+                progress.replica.seed_expected(status.replica_entries);
             }
             progress.seed_moved(status.moved_files, status.moved_bytes);
         }
@@ -1467,7 +1467,7 @@ fn plan_changes<'a>(
 /// The agent pool keys a plan's sessions connect through: one per remote
 /// side that is dialed rather than attached.
 fn pool_keys(plan: &SessionPlan) -> Vec<Vec<String>> {
-    [&plan.alpha, &plan.beta]
+    [&plan.primary, &plan.replica]
         .into_iter()
         .filter_map(|target| match target {
             EndpointTarget::Remote {
@@ -1525,12 +1525,12 @@ struct Worker<'a> {
     /// P2P, when the supervisor has it and this plan is in a p2p
     /// mode.
     p2p: Option<&'a P2pContext>,
-    /// A digest of the files last pushed to the beta, so they go again
+    /// A digest of the files last pushed to the replica, so they go again
     /// only when they change.
     pushed: Option<[u8; 32]>,
     /// The handoff this worker has already handed on, if any.
     handed: Option<(String, u64)>,
-    /// With `manage_keys`: whether this session's beta told its keys since
+    /// With `manage_keys`: whether this session's replica told its keys since
     /// the session connected, the digest of the keys it was last given,
     /// and the last complaint, said once.
     keys_learned: bool,
@@ -1646,13 +1646,13 @@ impl<'a> Worker<'a> {
 
     /// P2P: which side of this plan the peer is.
     fn peer_side(&self) -> crate::p2p::PeerSide {
-        match &self.plan.alpha {
+        match &self.plan.primary {
             EndpointTarget::Remote { destination, .. }
                 if crate::p2p::attached_name(destination).is_some() =>
             {
-                crate::p2p::PeerSide::Alpha
+                crate::p2p::PeerSide::Primary
             }
-            _ => crate::p2p::PeerSide::Beta,
+            _ => crate::p2p::PeerSide::Replica,
         }
     }
 
@@ -1759,26 +1759,26 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// P2P, with `manage_keys`, as the alpha: learns this session's
-    /// beta's keys, and gives it every other beta's, forced through the
+    /// P2P, with `manage_keys`, as the primary: learns this session's
+    /// the replica's keys, and gives it every other replica's, forced through the
     /// gate, whenever what it should hold changes. Best effort: a failure
     /// is said once and costs nothing but the keys.
     fn manage_keys(&mut self) {
         let (Some(p2p), Some(plan)) = (self.p2p, self.plan.p2p) else {
             return;
         };
-        let alpha_leads = matches!(
+        let primary_leads = matches!(
             p2p.role(),
-            crate::p2p::Role::Leader { ref leader, .. } if leader == crate::p2p::ALPHA
+            crate::p2p::Role::Leader { ref leader, .. } if leader == crate::p2p::PRIMARY
         );
-        if !plan.manage_keys || !alpha_leads {
+        if !plan.manage_keys || !primary_leads {
             return;
         }
         let outcome = (|| -> Result<()> {
             let Some(session) = self.session.as_mut() else {
                 return Ok(());
             };
-            let host = crate::p2p::destination_of(&self.plan.beta_spec()).to_owned();
+            let host = crate::p2p::destination_of(&self.plan.replica_spec()).to_owned();
             if !self.keys_learned {
                 let keys = session.peer_keys()?;
                 p2p.shared
@@ -1824,7 +1824,7 @@ impl<'a> Worker<'a> {
             return Ok(());
         };
         let files = p2p.pushed_files(
-            &self.plan.beta_spec(),
+            &self.plan.replica_spec(),
             &self.plan.group,
             &self.plan.identifier(),
         )?;
@@ -1878,21 +1878,21 @@ impl<'a> Worker<'a> {
         if let Ok((digest, _)) = &result {
             self.cycles += digest.cycles;
         }
-        // P2P: the alpha is back and level. A beta leads only while
-        // the alpha is away, so one settled cycle with the alpha attached
-        // hands the lead back to it — once the alpha's copy of the ancestor
-        // is confirmed level too, since that copy is what the alpha takes
+        // P2P: the primary is back and level. A replica leads only while
+        // the primary is away, so one settled cycle with the primary attached
+        // hands the lead back to it — once the primary's copy of the ancestor
+        // is confirmed level too, since that copy is what the primary takes
         // up. A copy that cannot be brought level waits for the next
         // settled cycle.
         if let (Ok((_, report)), Some(p2p)) = (&result, self.p2p) {
-            if self.peer_side() == crate::p2p::PeerSide::Alpha {
-                p2p.shared.cycled_with_alpha(&self.plan.identifier());
+            if self.peer_side() == crate::p2p::PeerSide::Primary {
+                p2p.shared.cycled_with_primary(&self.plan.identifier());
             }
-            // And not before every other group with the alpha has had a
+            // And not before every other group with the primary has had a
             // cycle with it too: the first of them to settle would
             // otherwise hand the lead back while the rest were still
-            // waiting out a retry, unsynced with the alpha until it led.
-            if self.peer_side() == crate::p2p::PeerSide::Alpha
+            // waiting out a retry, unsynced with the primary until it led.
+            if self.peer_side() == crate::p2p::PeerSide::Primary
                 && report.settled()
                 && p2p.shared.every_attached_session_cycled()
                 && matches!(p2p.role(), crate::p2p::Role::Leader { .. })
@@ -1907,7 +1907,7 @@ impl<'a> Worker<'a> {
                         self.plan.display()
                     ),
                     Ok(()) => {
-                        if let Err(error) = p2p.yield_to(crate::p2p::ALPHA) {
+                        if let Err(error) = p2p.yield_to(crate::p2p::PRIMARY) {
                             crate::complain!(
                                 "[{}] unable to yield: {error:#}",
                                 self.plan.display()
@@ -1961,9 +1961,9 @@ impl<'a> Worker<'a> {
             // holds refuses it here, and this attempt ends without
             // having written a byte — not even the follower's files,
             // which would otherwise overwrite the real leader's. The
-            // attached alpha gets no files: it has its own.
+            // attached primary gets no files: it has its own.
             session.present_lease()?;
-            if side == crate::p2p::PeerSide::Beta {
+            if side == crate::p2p::PeerSide::Replica {
                 self.push_files()?;
                 self.manage_keys();
             }
@@ -1994,8 +1994,8 @@ impl<'a> Worker<'a> {
         let worth_saying = match &outcome {
             Err(_) => true,
             Ok((digest, _)) => {
-                digest.alpha_transitions > 0
-                    || digest.beta_transitions > 0
+                digest.primary_transitions > 0
+                    || digest.replica_transitions > 0
                     || digest.conflicts > 0
                     || digest.problems > 0
                     || digest.cycles > 1
@@ -2013,11 +2013,11 @@ impl<'a> Worker<'a> {
                 elapsed.as_secs_f64(),
                 match &outcome {
                     Ok((digest, _)) => format!(
-                        ": {} inner cycle(s), {} to alpha, {} to beta, {} conflict(s), \
+                        ": {} inner cycle(s), {} to primary, {} to replica, {} conflict(s), \
                          {} blocked",
                         digest.cycles,
-                        digest.alpha_transitions,
-                        digest.beta_transitions,
+                        digest.primary_transitions,
+                        digest.replica_transitions,
                         digest.conflicts,
                         digest.problems
                     ),
@@ -2181,20 +2181,20 @@ impl<'a> Worker<'a> {
         let status = SessionStatus {
             group: self.plan.group.clone(),
             host: self.plan.host.clone(),
-            alpha: self.plan.alpha_spec.clone(),
-            beta: self.plan.beta_spec(),
+            primary: self.plan.primary_spec.clone(),
+            replica: self.plan.replica_spec(),
             mode: self.plan.mode_name().to_owned(),
             state: state.to_owned(),
             cycles: self.cycles,
-            last_alpha_transitions: 0,
-            last_beta_transitions: 0,
+            last_primary_transitions: 0,
+            last_replica_transitions: 0,
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             blocked: Vec::new(),
             error,
             updated_at: epoch_seconds(),
-            alpha_entries: self.progress.alpha.expected_total(),
-            beta_entries: self.progress.beta.expected_total(),
+            primary_entries: self.progress.primary.expected_total(),
+            replica_entries: self.progress.replica.expected_total(),
             moved_files: self.progress.moved().0,
             moved_bytes: self.progress.moved().1,
             role: self.role().label().to_owned(),
@@ -2232,20 +2232,20 @@ impl<'a> Worker<'a> {
         let mut status = SessionStatus {
             group: self.plan.group.clone(),
             host: self.plan.host.clone(),
-            alpha: self.plan.alpha_spec.clone(),
-            beta: self.plan.beta_spec(),
+            primary: self.plan.primary_spec.clone(),
+            replica: self.plan.replica_spec(),
             mode: self.plan.mode_name().to_owned(),
             state: "synchronized".into(),
             cycles: self.cycles,
-            last_alpha_transitions: 0,
-            last_beta_transitions: 0,
+            last_primary_transitions: 0,
+            last_replica_transitions: 0,
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             blocked: Vec::new(),
             error: None,
             updated_at: epoch_seconds(),
-            alpha_entries: self.progress.alpha.expected_total(),
-            beta_entries: self.progress.beta.expected_total(),
+            primary_entries: self.progress.primary.expected_total(),
+            replica_entries: self.progress.replica.expected_total(),
             moved_files: self.progress.moved().0,
             moved_bytes: self.progress.moved().1,
             role: self.role().label().to_owned(),
@@ -2254,8 +2254,8 @@ impl<'a> Worker<'a> {
         };
         match result {
             Ok((digest, report)) => {
-                status.last_alpha_transitions = digest.alpha_transitions;
-                status.last_beta_transitions = digest.beta_transitions;
+                status.last_primary_transitions = digest.primary_transitions;
+                status.last_replica_transitions = digest.replica_transitions;
                 status.conflicts = report
                     .conflicts
                     .iter()
@@ -2275,11 +2275,11 @@ impl<'a> Worker<'a> {
                     "synchronized".into()
                 };
                 if self.verbose {
-                    if digest.alpha_transitions > 0 || digest.beta_transitions > 0 {
+                    if digest.primary_transitions > 0 || digest.replica_transitions > 0 {
                         crate::note!(
-                            "[{display}] synchronized: {} change(s) to alpha, {} change(s) to beta",
-                            digest.alpha_transitions,
-                            digest.beta_transitions
+                            "[{display}] synchronized: {} change(s) to primary, {} change(s) to replica",
+                            digest.primary_transitions,
+                            digest.replica_transitions
                         );
                     }
                     // Only what changed. A session holding the same
@@ -2362,8 +2362,8 @@ fn run_cycles(session: &mut Session, display: &str) -> Result<(CycleDigest, Cycl
     loop {
         let report = session.run_cycle()?;
         digest.cycles += 1;
-        digest.alpha_transitions += report.alpha_transitions;
-        digest.beta_transitions += report.beta_transitions;
+        digest.primary_transitions += report.primary_transitions;
+        digest.replica_transitions += report.replica_transitions;
         digest.conflicts = report.conflicts.len();
         digest.problems = blocked_paths(&report).len();
         if !report.missing_staged_files {
@@ -2421,7 +2421,7 @@ fn run_cycles(session: &mut Session, display: &str) -> Result<(CycleDigest, Cycl
     }
 }
 
-/// Builds a live session for a plan: alpha and beta endpoints (each local
+/// Builds a live session for a plan: primary and replica endpoints (each local
 /// or remote) and the persisted session state under the state root.
 fn connect(
     plan: &SessionPlan,
@@ -2441,22 +2441,24 @@ fn connect(
     // The pair lock is independent of the state root, so two supervisors
     // pointed at different state directories cannot own the same trees.
     let pair_lock =
-        crate::session::EndpointPairLock::acquire(&plan.alpha_identity, &plan.beta_identity)?;
-    let (mut alpha, mut beta) = open_session_endpoints(plan, state_root, pool, one_shot)?;
+        crate::session::EndpointPairLock::acquire(&plan.primary_identity, &plan.replica_identity)?;
+    let (mut primary, mut replica) = open_session_endpoints(plan, state_root, pool, one_shot)?;
     // P2P: a copy of this session's ancestor that a leader pushed here
     // and that is newer than what this directory holds is adopted — under
-    // the lock, before the store is opened. A beta that starts to lead
-    // seeds its session this way; an alpha that gets the lead back takes
-    // up what the beta recorded meanwhile. The copy is checked against
+    // the lock, before the store is opened. A replica that starts to lead
+    // seeds its session this way; a primary that gets the lead back takes
+    // up what the replica recorded meanwhile. The copy is checked against
     // this side first, scanned through the endpoint the session is about
     // to use, so the scan is the session's first one too.
     if let (Some(directory), Some(_)) = (p2p_directory, plan.p2p) {
         let (partner, root, own): (String, _, &mut Box<dyn Endpoint + Send>) =
-            match (&plan.alpha, &plan.beta) {
+            match (&plan.primary, &plan.replica) {
                 (_, EndpointTarget::Local(root)) => {
-                    (crate::p2p::ALPHA.to_owned(), root.clone(), &mut beta)
+                    (crate::p2p::PRIMARY.to_owned(), root.clone(), &mut replica)
                 }
-                (EndpointTarget::Local(root), _) => (plan.beta_spec(), root.clone(), &mut alpha),
+                (EndpointTarget::Local(root), _) => {
+                    (plan.replica_spec(), root.clone(), &mut primary)
+                }
                 _ => anyhow::bail!("a p2p session has a side on this host"),
             };
         let adopted = crate::p2p::adopt_newer_copy(
@@ -2498,7 +2500,7 @@ fn connect(
             ),
         }
     }
-    let mut session = Session::with_lock(alpha, beta, plan.mode, lock)?;
+    let mut session = Session::with_lock(primary, replica, plan.mode, lock)?;
     session.hold(pair_lock);
     session.set_power_durability(plan.power_durability);
     session.set_ignore_mounts(plan.ignore_mounts);
@@ -2548,8 +2550,8 @@ fn open_session_endpoints(
     // check and the use are one resolution, not two.
     let mut frozen: [Option<PathBuf>; 2] = [None, None];
     for (index, (target, planned, side)) in [
-        (&plan.alpha, &plan.alpha_identity, "alpha"),
-        (&plan.beta, &plan.beta_identity, "beta"),
+        (&plan.primary, &plan.primary_identity, "primary"),
+        (&plan.replica, &plan.replica_identity, "replica"),
     ]
     .into_iter()
     .enumerate()
@@ -2565,12 +2567,12 @@ fn open_session_endpoints(
                     resolved = resolved.display()
                 );
             }
-            // A missing alpha stays an error: combined with a mirroring
+            // A missing primary stays an error: combined with a mirroring
             // mode, a mistyped source path would otherwise read as "the
-            // source is empty" and empty the destination. A missing beta is
+            // source is empty" and empty the destination. A missing replica is
             // a legitimate state a transition resolves by creating it.
-            if side == "alpha" && !resolved.exists() {
-                return Err(crate::session::SafetyHalt::AlphaRootMissing(
+            if side == "primary" && !resolved.exists() {
+                return Err(crate::session::SafetyHalt::PrimaryRootMissing(
                     resolved.display().to_string(),
                 )
                 .into());
@@ -2585,7 +2587,7 @@ fn open_session_endpoints(
                 // The frozen resolution from the identity check above —
                 // never a second canonicalization of the original spelling,
                 // which would reopen the window the check just closed.
-                let root = frozen[if side == "alpha" { 0 } else { 1 }]
+                let root = frozen[if side == "primary" { 0 } else { 1 }]
                     .clone()
                     .unwrap_or_else(|| path.clone());
                 let staging = crate::endpoint::local::staging_root_for(
@@ -2659,9 +2661,9 @@ fn open_session_endpoints(
         }
     };
 
-    let alpha = endpoint(&plan.alpha, "alpha")?;
-    let beta = endpoint(&plan.beta, "beta")?;
-    Ok((alpha, beta))
+    let primary = endpoint(&plan.primary, "primary")?;
+    let replica = endpoint(&plan.replica, "replica")?;
+    Ok((primary, replica))
 }
 
 /// How an agent is told to serve one side of a plan's session: at `root`,
@@ -2690,19 +2692,19 @@ fn initialize_for(
     }
 }
 
-/// What the alpha serves a leading beta it attaches to: each of its own
+/// What the primary serves a leading replica it attaches to: each of its own
 /// p2p sessions, its own side of it, as its own configuration has it.
-/// The leader's session keeps the alpha on the alpha side under the same
+/// The leader's session keeps the primary on the primary side under the same
 /// identifier, so that is the side, and the session, it asks for.
 pub fn attach_policy(plans: &[SessionPlan]) -> crate::transport::AttachPolicy {
     crate::transport::AttachPolicy::new(plans.iter().filter_map(|plan| {
-        let (Some(_), EndpointTarget::Local(root)) = (plan.p2p, &plan.alpha) else {
+        let (Some(_), EndpointTarget::Local(root)) = (plan.p2p, &plan.primary) else {
             return None;
         };
         Some(initialize_for(
             plan,
             &root.to_string_lossy(),
-            "alpha",
+            "primary",
             false,
         ))
     }))
@@ -2817,8 +2819,8 @@ pub struct GroupReport {
     pub role: String,
     pub term: u64,
     pub name: String,
-    /// The alpha root as written in the configuration.
-    pub alpha: String,
+    /// The primary root as written in the configuration.
+    pub primary: String,
     pub sessions: Vec<SessionReport>,
 }
 
@@ -2826,16 +2828,16 @@ pub struct GroupReport {
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionReport {
     /// Which session this is: its state identifier, the one thing two
-    /// betas of a group on one host do not share.
+    /// replicas of a group on one host do not share.
     pub session: control::SessionKey,
     /// The destination label status prints (a host, or a local path).
     pub host: String,
     /// The destination as people read it: the host, or `host:path` when
-    /// another beta of the group is on the same host.
+    /// another replica of the group is on the same host.
     #[serde(skip)]
     pub destination: String,
     /// The full destination specification.
-    pub beta: String,
+    pub replica: String,
     pub mode: String,
     /// "never-run", "synchronized", "conflicts", "blocked", "unreachable",
     /// "halted", or "errored".
@@ -2869,12 +2871,12 @@ pub struct SessionReport {
 
 impl SessionReport {
     /// The name that selects this destination alone among its group's, as
-    /// `--host` and `--keep` take it: the host, unless another beta of the
-    /// group is on it, and then the beta's specification.
+    /// `--host` and `--keep` take it: the host, unless another replica of the
+    /// group is on it, and then the replica's specification.
     pub fn selector(&self) -> &str {
         match self.destination.is_empty() || self.destination == self.host {
             true => &self.host,
-            false => &self.beta,
+            false => &self.replica,
         }
     }
 
@@ -2998,7 +3000,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 session: control::SessionKey::of(plan),
                 host: plan.host.clone(),
                 destination: control::destination_of(plan),
-                beta: plan.beta_spec(),
+                replica: plan.replica_spec(),
                 mode: plan.mode_name().to_owned(),
                 state: "never-run".into(),
                 cycles: 0,
@@ -3016,7 +3018,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 session: control::SessionKey::of(plan),
                 host: plan.host.clone(),
                 destination: control::destination_of(plan),
-                beta: plan.beta_spec(),
+                replica: plan.replica_spec(),
                 mode: plan.mode_name().to_owned(),
                 state: classify_state(&status),
                 cycles: status.cycles,
@@ -3036,7 +3038,7 @@ pub fn status_report(plans: &[&SessionPlan], state_root: &Path) -> StatusReport 
                 role: role.clone(),
                 term,
                 name: plan.group.clone(),
-                alpha: plan.alpha_spec.clone(),
+                primary: plan.primary_spec.clone(),
                 sessions: vec![session],
             }),
         }
@@ -3279,8 +3281,8 @@ fn conflict_detail(conflict: &crate::tree::Conflict) -> ConflictDetail {
     };
     ConflictDetail {
         path: conflict.root.clone(),
-        alpha: side(&conflict.alpha_changes),
-        beta: side(&conflict.beta_changes),
+        primary: side(&conflict.primary_changes),
+        replica: side(&conflict.replica_changes),
     }
 }
 
@@ -3288,10 +3290,10 @@ fn conflict_detail(conflict: &crate::tree::Conflict) -> ConflictDetail {
 fn blocked_paths(report: &CycleReport) -> Vec<String> {
     let mut lines = Vec::new();
     for (side, problems) in [
-        ("alpha", &report.alpha_scan_problems),
-        ("alpha", &report.alpha_transition_problems),
-        ("beta", &report.beta_scan_problems),
-        ("beta", &report.beta_transition_problems),
+        ("primary", &report.primary_scan_problems),
+        ("primary", &report.primary_transition_problems),
+        ("replica", &report.replica_scan_problems),
+        ("replica", &report.replica_transition_problems),
     ] {
         for problem in problems.iter() {
             lines.push(format!("{side} {}: {}", problem.path, problem.message));
@@ -3432,7 +3434,7 @@ fn backoff_delay(interval: Duration, consecutive_failures: u32, jitter_percent: 
 
 /// A p2p session's backoff, held under half its lease lifetime. A
 /// leader that backed off for the full five minutes after a blip let its
-/// lease lapse, and a follower took the lead from a healthy alpha; retrying
+/// lease lapse, and a follower took the lead from a healthy primary; retrying
 /// within the lifetime renews the lease before anyone may act on it.
 fn p2p_capped(plan: &SessionPlan, delay: Duration) -> Duration {
     match plan.p2p {
@@ -3552,7 +3554,7 @@ pub fn read_status(state_root: &Path, identifier: &str) -> Result<Option<Session
 mod tests {
     use super::*;
 
-    /// Plans one session whose beta is reached by attachment, and offers
+    /// Plans one session whose replica is reached by attachment, and offers
     /// it a scripted agent that reports the initialization it is sent.
     fn attached_session(
         keep: &Path,
@@ -3561,12 +3563,12 @@ mod tests {
         crate::transport::Connection,
         std::sync::mpsc::Receiver<crate::protocol::Initialize>,
     ) {
-        let alpha = keep.join("alpha");
-        std::fs::create_dir_all(&alpha).expect("alpha should be creatable");
+        let primary = keep.join("primary");
+        std::fs::create_dir_all(&primary).expect("primary should be creatable");
         let text = format!(
-            "[groups.once]\nalpha = \"{}\"\nmode = \"two-way-conflict\"\nbetas = [\"alpha@attached:{}\"]\n",
-            alpha.display(),
-            keep.join("beta").display()
+            "[groups.once]\nprimary = \"{}\"\nmode = \"two-way-conflict\"\nreplicas = [\"primary@attached:{}\"]\n",
+            primary.display(),
+            keep.join("replica").display()
         );
         let plans = crate::config::Config::parse(Path::new("config.toml"), &text)
             .and_then(|config| config.plans())
@@ -3602,7 +3604,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let (plans, client, initialized) = attached_session(keep.path());
         let supervisor = Supervisor::new(plans, keep.path().join("state"), false);
-        supervisor.offer_attachment("alpha", client);
+        supervisor.offer_attachment("primary", client);
         let outcomes = supervisor.run_once();
         assert!(outcomes[0].result.is_err(), "the scripted agent refuses");
         let initialize = initialized
@@ -3613,7 +3615,7 @@ mod tests {
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
         let (plans, client, initialized) = attached_session(keep.path());
         let pool = AgentPool::default();
-        pool.offer_attachment("alpha", client);
+        pool.offer_attachment("primary", client);
         let _ = open_endpoints(&plans[0], &keep.path().join("state"), &pool);
         let initialize = initialized
             .recv_timeout(std::time::Duration::from_secs(10))
@@ -3666,8 +3668,8 @@ mod tests {
         );
         let detail = conflict_detail(&Conflict {
             root: "happy".into(),
-            alpha_changes: Vec::new(),
-            beta_changes: vec![Change {
+            primary_changes: Vec::new(),
+            replica_changes: vec![Change {
                 path: "happy".into(),
                 old: None,
                 new: Some(tree),
@@ -3675,8 +3677,11 @@ mod tests {
         });
 
         // The side is still a directory; what it *holds* is the diagnosis.
-        assert_eq!(detail.beta.kind, "directory");
-        let blocking = detail.beta.unsynchronizable.expect("a cause is recorded");
+        assert_eq!(detail.replica.kind, "directory");
+        let blocking = detail
+            .replica
+            .unsynchronizable
+            .expect("a cause is recorded");
         assert_eq!(blocking.entries, 2);
         // `big.bin` sorts first and would be found first, but it is merely
         // excluded. The unreadable entry is the one worth naming.
@@ -3685,7 +3690,7 @@ mod tests {
 
         // A side with nothing of the kind says nothing, rather than
         // reporting an empty cause.
-        assert!(detail.alpha.unsynchronizable.is_none());
+        assert!(detail.primary.unsynchronizable.is_none());
     }
 
     /// A list that has not changed is not written out again.
@@ -3775,10 +3780,10 @@ mod tests {
         assert!(varied.len() > 1, "jitter should vary across rounds");
     }
 
-    /// A 90-second outage never costs a healthy alpha the lead. However
+    /// A 90-second outage never costs a healthy primary the lead. However
     /// many attempts failed during it, a p2p session retries within
     /// half a lease lifetime of the network coming back, and so renews the
-    /// lease on every beta before the first of them may act — which it
+    /// lease on every replica before the first of them may act — which it
     /// may only a lifetime plus the wait after the last renewal.
     #[test]
     fn a_ninety_second_outage_does_not_cause_a_takeover() {
@@ -3791,12 +3796,12 @@ mod tests {
         };
         plan.p2p = Some(timing);
         let outage = Duration::from_secs(90);
-        let first_beta = timing.ttl + crate::p2p::takeover_wait(1, &timing);
+        let first_replica = timing.ttl + crate::p2p::takeover_wait(1, &timing);
         for failures in 1..=64 {
             let jitter = jitter_percent(&plan.identifier(), failures);
             let retry = p2p_capped(&plan, backoff_delay(plan.interval, failures, jitter));
             assert!(retry <= timing.ttl / 2, "{failures}: {retry:?}");
-            assert!(outage + retry < first_beta, "{failures}: {retry:?}");
+            assert!(outage + retry < first_replica, "{failures}: {retry:?}");
         }
         // A plain session keeps its full backoff.
         plan.p2p = None;
@@ -3806,16 +3811,16 @@ mod tests {
         );
     }
 
-    fn leading_alpha(directory: &Path, ttl: Duration) -> P2pShared {
+    fn leading_primary(directory: &Path, ttl: Duration) -> P2pShared {
         let shared = P2pShared::new(
             directory.to_path_buf(),
             crate::p2p::Role::Leader {
-                leader: crate::p2p::ALPHA.to_owned(),
+                leader: crate::p2p::PRIMARY.to_owned(),
                 term: 3,
             },
             ttl,
         );
-        *shared.members.lock().unwrap() = vec![crate::p2p::ALPHA.to_owned(), "box:/x".to_owned()];
+        *shared.members.lock().unwrap() = vec![crate::p2p::PRIMARY.to_owned(), "box:/x".to_owned()];
         shared
     }
 
@@ -3826,7 +3831,7 @@ mod tests {
     #[test]
     fn a_handoff_completes_with_a_paused_session() {
         let keep = tempfile::tempdir().expect("a temporary directory");
-        let shared = leading_alpha(&keep.path().join("p2p"), Duration::from_secs(30));
+        let shared = leading_primary(&keep.path().join("p2p"), Duration::from_secs(30));
         let follower = crate::p2p::Role::Follower {
             leader: "box:/x".to_owned(),
             term: 4,
@@ -3849,30 +3854,30 @@ mod tests {
 
         // Every session paused: nothing to wait for.
         let keep = tempfile::tempdir().expect("a temporary directory");
-        let shared = leading_alpha(&keep.path().join("p2p"), Duration::from_secs(30));
+        let shared = leading_primary(&keep.path().join("p2p"), Duration::from_secs(30));
         shared.set_running("a", true, false);
         shared.set_running("a", false, false);
         shared.yield_to("box:/x").expect("yields");
         assert_eq!(shared.role(), follower);
     }
 
-    /// The lead goes back to the alpha only once every running session
-    /// with the attached alpha has finished a cycle with it; a session
+    /// The lead goes back to the primary only once every running session
+    /// with the attached primary has finished a cycle with it; a session
     /// that stops running is not waited for.
     #[test]
-    fn the_handback_waits_for_every_group_with_the_alpha() {
+    fn the_handback_waits_for_every_group_with_the_primary() {
         let keep = tempfile::tempdir().expect("a temporary directory");
-        let shared = leading_alpha(&keep.path().join("p2p"), Duration::from_secs(30));
+        let shared = leading_primary(&keep.path().join("p2p"), Duration::from_secs(30));
         shared.set_running("one", true, true);
         shared.set_running("two", true, true);
-        shared.set_running("beta-beta", true, false);
-        shared.cycled_with_alpha("one");
+        shared.set_running("replica-replica", true, false);
+        shared.cycled_with_primary("one");
         assert!(!shared.every_attached_session_cycled());
         shared.set_running("two", false, true);
         assert!(shared.every_attached_session_cycled(), "a stopped session");
         shared.set_running("two", true, true);
         assert!(!shared.every_attached_session_cycled());
-        shared.cycled_with_alpha("two");
+        shared.cycled_with_primary("two");
         assert!(shared.every_attached_session_cycled());
     }
 
@@ -3884,7 +3889,7 @@ mod tests {
     fn a_yield_to_an_unknown_member_is_refused() {
         let keep = tempfile::tempdir().expect("a temporary directory");
         let directory = keep.path().join("p2p");
-        let shared = leading_alpha(&directory, Duration::from_secs(10));
+        let shared = leading_primary(&directory, Duration::from_secs(10));
         let error = shared.yield_to("box:/typo").expect_err("not a member");
         assert!(
             format!("{error:#}").contains("not a member")
@@ -3892,8 +3897,8 @@ mod tests {
             "{error:#}"
         );
         let error = shared
-            .yield_to(crate::p2p::ALPHA)
-            .expect_err("the alpha already leads");
+            .yield_to(crate::p2p::PRIMARY)
+            .expect_err("the primary already leads");
         assert!(format!("{error:#}").contains("already leads"), "{error:#}");
         assert_eq!(crate::p2p::read_lease(&directory).unwrap(), None);
         assert!(matches!(shared.role(), crate::p2p::Role::Leader { .. }));
@@ -3979,7 +3984,7 @@ mod tests {
     fn content_that_never_appears_is_an_error_not_a_success() {
         use crate::tree::{Content, FileMetadata, Node, SyncMode};
 
-        let alpha_root = Node::directory(
+        let primary_root = Node::directory(
             "",
             vec![Node {
                 name: "churning.txt".into(),
@@ -3990,12 +3995,12 @@ mod tests {
                 },
             }],
         );
-        let beta_root = Node::directory("", Vec::new());
+        let replica_root = Node::directory("", Vec::new());
 
         let state = tempfile::tempdir().expect("temporary directory should be creatable");
         let mut session = Session::new(
-            Box::new(ChurningEndpoint { root: alpha_root }),
-            Box::new(ChurningEndpoint { root: beta_root }),
+            Box::new(ChurningEndpoint { root: primary_root }),
+            Box::new(ChurningEndpoint { root: replica_root }),
             SyncMode::TwoWaySafe,
             state.path().join("session"),
         )
@@ -4120,22 +4125,22 @@ mod tests {
         let mut status = SessionStatus {
             group: "g".into(),
             host: "boite".into(),
-            alpha: "~/a".into(),
-            beta: "boite:~/a".into(),
+            primary: "~/a".into(),
+            replica: "boite:~/a".into(),
             mode: "two-way-conflict".into(),
             state: "errored".into(),
             cycles: 3,
-            last_alpha_transitions: 0,
-            last_beta_transitions: 0,
+            last_primary_transitions: 0,
+            last_replica_transitions: 0,
             conflicts: Vec::new(),
             conflict_details: Vec::new(),
             blocked: Vec::new(),
             error: Some(
-                "beta scan failed: the agent connection has failed: connection closed".into(),
+                "replica scan failed: the agent connection has failed: connection closed".into(),
             ),
             updated_at: 12345,
-            alpha_entries: 0,
-            beta_entries: 0,
+            primary_entries: 0,
+            replica_entries: 0,
             moved_files: 0,
             moved_bytes: 0,
             role: String::new(),
@@ -4159,25 +4164,25 @@ mod tests {
         let status = SessionStatus {
             group: "g".into(),
             host: "h".into(),
-            alpha: "~/a".into(),
-            beta: "h:~/a".into(),
+            primary: "~/a".into(),
+            replica: "h:~/a".into(),
             mode: "two-way-conflict".into(),
             state: "conflicts".into(),
             cycles: 3,
-            last_alpha_transitions: 1,
-            last_beta_transitions: 2,
+            last_primary_transitions: 1,
+            last_replica_transitions: 2,
             conflicts: vec!["path/to/conflict".into()],
             conflict_details: Vec::new(),
-            blocked: vec!["beta x: denied".into()],
+            blocked: vec!["replica x: denied".into()],
             error: None,
             updated_at: 12345,
-            alpha_entries: 1_000,
+            primary_entries: 1_000,
             moved_files: 0,
             moved_bytes: 0,
             role: String::new(),
             term: 0,
             alert_after_seconds: None,
-            beta_entries: 1_002,
+            replica_entries: 1_002,
         };
         write_status(directory.path(), "abc123", &status).expect("status should write");
         let loaded = read_status(directory.path(), "abc123")
@@ -4188,8 +4193,8 @@ mod tests {
         assert_eq!(loaded.cycles, 3);
         // The scan totals ride along so the next run's first scan can be
         // measured against them rather than merely timed.
-        assert_eq!(loaded.alpha_entries, 1_000);
-        assert_eq!(loaded.beta_entries, 1_002);
+        assert_eq!(loaded.primary_entries, 1_000);
+        assert_eq!(loaded.replica_entries, 1_002);
         assert_eq!(loaded.conflicts, vec!["path/to/conflict".to_owned()]);
 
         assert!(read_status(directory.path(), "missing")
@@ -4200,12 +4205,12 @@ mod tests {
     fn planned(root: &Path, groups: &[(&str, &str)]) -> Vec<SessionPlan> {
         let mut text = String::new();
         for (group, ignores) in groups {
-            let alpha = root.join(group);
-            std::fs::create_dir_all(&alpha).expect("created");
+            let primary = root.join(group);
+            std::fs::create_dir_all(&primary).expect("created");
             text.push_str(&format!(
-                "[groups.{group}]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\n\
-                 betas = [\"{}\"]\nignores = [{ignores}]\n",
-                alpha.display(),
+                "[groups.{group}]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\n\
+                 replicas = [\"{}\"]\nignores = [{ignores}]\n",
+                primary.display(),
                 root.join(format!("{group}-mirror")).display()
             ));
         }
@@ -4389,9 +4394,9 @@ mod tests {
     fn a_supervisors_state_root_inside_a_root_is_never_synchronized() {
         let root = tempfile::tempdir().expect("a temporary directory");
         let plans = planned(root.path(), &[("home", "")]);
-        let alpha = root.path().join("home");
-        std::fs::write(alpha.join("file.txt"), "synchronized").expect("written");
-        let state_root = alpha.join("custom-state");
+        let primary = root.path().join("home");
+        std::fs::write(primary.join("file.txt"), "synchronized").expect("written");
+        let state_root = primary.join("custom-state");
         std::fs::create_dir_all(state_root.join("sessions")).expect("created");
         std::fs::write(state_root.join("config.toml"), "secret").expect("written");
 
@@ -4422,16 +4427,16 @@ mod tests {
         use control::{ControlRequest, ControlResponse, PartState, ResolutionPart, SessionKey};
 
         let keep = tempfile::tempdir().expect("temporary directory should be creatable");
-        let alpha = keep.path().join("alpha");
-        let beta = keep.path().join("beta");
-        std::fs::create_dir_all(&alpha).unwrap();
-        std::fs::create_dir_all(&beta).unwrap();
-        std::fs::write(alpha.join("keep.txt"), "original").unwrap();
-        std::fs::write(alpha.join("other.txt"), "other").unwrap();
+        let primary = keep.path().join("primary");
+        let replica = keep.path().join("replica");
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::write(primary.join("keep.txt"), "original").unwrap();
+        std::fs::write(primary.join("other.txt"), "other").unwrap();
         let text = format!(
-            "[groups.r]\nalpha = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 3600\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.r]\nprimary = \"{}\"\nmode = \"two-way-conflict\"\ninterval = 3600\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         );
         let plans = crate::config::Config::parse(Path::new("config.toml"), &text)
             .and_then(|config| config.plans())
@@ -4440,8 +4445,8 @@ mod tests {
         let state = keep.path().join("state");
         let outcomes = Supervisor::new(plans.clone(), state.clone(), false).run_once();
         assert!(outcomes[0].result.is_ok(), "the first pass converges");
-        std::fs::write(alpha.join("keep.txt"), "alpha's edit").unwrap();
-        std::fs::write(beta.join("keep.txt"), "beta's edit").unwrap();
+        std::fs::write(primary.join("keep.txt"), "primary's edit").unwrap();
+        std::fs::write(replica.join("keep.txt"), "replica's edit").unwrap();
         Supervisor::new(plans.clone(), state.clone(), false).run_once();
 
         // The first cycle under watch is held still after its scans.
@@ -4483,13 +4488,13 @@ mod tests {
                 .recv_timeout(Duration::from_secs(20))
                 .expect("a cycle starts");
 
-            // Beta's copy as `resolve` reads it.
+            // The replica's copy as `resolve` reads it.
             let pool = AgentPool::default();
             let (_, mut reader) = open_endpoints(&plan, &state, &pool).expect("endpoints open");
-            let root = reader.scan().expect("beta scans").root;
+            let root = reader.scan().expect("replica scans").root;
             let expectation = crate::tree::node_at(root.as_ref(), "keep.txt")
                 .and_then(crate::tree::Node::synchronizable_subtree)
-                .expect("beta holds the file");
+                .expect("replica holds the file");
             let request = ControlRequest::Resolve {
                 id: 7,
                 parts: vec![ResolutionPart {
@@ -4497,7 +4502,7 @@ mod tests {
                     settlement: Settlement {
                         forget: vec!["keep.txt".into()],
                         retire: vec![(
-                            Side::Beta,
+                            Side::Replica,
                             "keep.txt".into(),
                             Retirement::Remove(expectation),
                         )],
@@ -4515,8 +4520,8 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
             assert!(matches!(resolved()[0].1, PartState::Pending));
             assert_eq!(
-                std::fs::read_to_string(beta.join("keep.txt")).unwrap(),
-                "beta's edit"
+                std::fs::read_to_string(replica.join("keep.txt")).unwrap(),
+                "replica's edit"
             );
 
             // Released, the cycle ends, and then the resolution lands.
@@ -4533,14 +4538,14 @@ mod tests {
             }
             assert!(
                 wait(Box::new(|| {
-                    [&alpha, &beta].iter().all(|root| {
+                    [&primary, &replica].iter().all(|root| {
                         std::fs::read_to_string(root.join("keep.txt"))
                             .ok()
                             .as_deref()
-                            == Some("alpha's edit")
+                            == Some("primary's edit")
                     })
                 })),
-                "the kept version reaches beta"
+                "the kept version reaches the replica"
             );
             stop.store(true, Ordering::Relaxed);
             watcher

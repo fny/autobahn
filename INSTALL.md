@@ -20,7 +20,7 @@ When Autobahn installs, it creates a config file in `~/.autobahn/config.toml`. B
 
 ## 2. Managing Syncing
 
-First ask the user which folder they want to sync. Once you have that, move on to determining which hosts the sync should target as betas.
+First ask the user which folder they want to sync. Once you have that, move on to determining which hosts the sync should target as replicas.
 
 Syncing leverages hosts in `~/.ssh/config`. Make sure there's something that can be a sync target there. If not guide the user to add a host.
 

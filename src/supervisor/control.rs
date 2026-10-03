@@ -38,7 +38,7 @@ pub enum ControlRequest {
     /// Report what every supervised session is doing right now. The one
     /// request that reads rather than writes.
     Progress,
-    /// P2P: hand the lead to the named peer — `alpha`, or a beta's
+    /// P2P: hand the lead to the named peer — `primary`, or a replica's
     /// spec — at the next term, and step down.
     Yield {
         /// Who leads next.
@@ -88,11 +88,11 @@ pub struct ResolutionPart {
     pub settlement: crate::session::Settlement,
     /// Whether this part waits for every other part of its resolution.
     ///
-    /// The part that retires alpha's copy, when a destination's version
+    /// The part that retires the primary's copy, when a destination's version
     /// is kept, is applied last: until every other destination's ancestor
-    /// has forgotten the path and its losing copy is gone, alpha's gap
+    /// has forgotten the path and its losing copy is gone, the primary's gap
     /// would read there as a deletion against an edited copy — and an edit
-    /// beats a deletion, so the losing version would come back to alpha
+    /// beats a deletion, so the losing version would come back to the primary
     /// and win. It is not applied at all if another part failed, and it
     /// leaves alone a path another part's copy was refused at.
     pub last: bool,
@@ -165,7 +165,7 @@ pub(crate) struct PendingPart {
 
 /// What tells one session from every other: its state identifier.
 ///
-/// A session's group and host are not enough — two betas of one group on
+/// A session's group and host are not enough — two replicas of one group on
 /// one host share both — and its display label is for people to read. So
 /// everything that keeps track of sessions (control requests, progress,
 /// alert state, the status inventory) keys them by this.
@@ -197,7 +197,7 @@ impl std::fmt::Display for SessionKey {
 }
 
 /// A plan's destination as people read it: its host, or `host:path` when
-/// another beta of its group is on the same host — its display label
+/// another replica of its group is on the same host — its display label
 /// without the group.
 pub fn destination_of(plan: &crate::config::SessionPlan) -> String {
     let display = plan.display();
@@ -213,8 +213,8 @@ pub struct Selector {
     /// The group to select (all groups when absent).
     pub group: Option<String>,
     /// The destination within the group, as `status` names it: a host,
-    /// which selects every beta on it, or a beta's specification (a local
-    /// beta's path, or `host:path`), which selects that one (all
+    /// which selects every replica on it, or a replica's specification (a local
+    /// the replica's path, or `host:path`), which selects that one (all
     /// destinations when absent).
     pub host: Option<String>,
     /// The one session to select, by key (any when absent).
@@ -238,7 +238,7 @@ impl Selector {
             && self
                 .host
                 .as_deref()
-                .is_none_or(|wanted| wanted == entry.host || wanted == entry.beta)
+                .is_none_or(|wanted| wanted == entry.host || wanted == entry.replica)
             && self
                 .session
                 .as_ref()
@@ -387,7 +387,7 @@ pub struct SessionProgress {
 }
 
 /// The live progress of the session `key` names, from a supervisor's
-/// answer. By key, not by group and host, which two betas on one host
+/// answer. By key, not by group and host, which two replicas on one host
 /// share.
 pub fn progress_of<'a>(
     sessions: &'a [SessionProgress],
@@ -459,8 +459,8 @@ pub(crate) struct Entry {
     pub group: String,
     /// The session's destination host.
     pub host: String,
-    /// The session's beta, as its specification reads.
-    pub beta: String,
+    /// The session's replica, as its specification reads.
+    pub replica: String,
     /// The flags the control socket flips and the worker consumes.
     pub control: Arc<WorkerControl>,
     /// What the session is doing, updated by the worker as it works.
@@ -1223,7 +1223,7 @@ mod tests {
             published: Arc::default(),
             group: group.into(),
             host: host.into(),
-            beta: format!("{host}:/tree"),
+            replica: format!("{host}:/tree"),
             control: Arc::default(),
             progress: Arc::default(),
         }
@@ -1499,18 +1499,18 @@ mod tests {
         assert!(matches!(response, ControlResponse::Error(_)));
     }
 
-    /// Two betas of one group on one host share the group and the host;
-    /// a selector tells them apart by the beta's specification, as status
+    /// Two replicas of one group on one host share the group and the host;
+    /// a selector tells them apart by the replica's specification, as status
     /// names it, or by the session's key.
     #[test]
-    fn two_betas_on_one_host_are_selected_apart() {
-        let beta = |path: &str| Entry {
+    fn two_replicas_on_one_host_are_selected_apart() {
+        let replica = |path: &str| Entry {
             session: SessionKey::new(format!("work-{path}")),
-            beta: format!("host:{path}"),
+            replica: format!("host:{path}"),
             ..entry("work", "host")
         };
         let registry = Registry {
-            entries: RwLock::new(vec![beta("/tree"), beta("/tree/nested")]),
+            entries: RwLock::new(vec![replica("/tree"), replica("/tree/nested")]),
             ..registry()
         };
         let paused = |index: usize| {
@@ -1528,7 +1528,7 @@ mod tests {
         }));
         assert!(matches!(response, ControlResponse::Applied { sessions: 2 }));
 
-        // The beta's specification names one.
+        // The replica's specification names one.
         let response = registry.apply(&ControlRequest::Pause(Selector {
             group: Some("work".into()),
             host: Some("host:/tree/nested".into()),

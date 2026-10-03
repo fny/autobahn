@@ -76,8 +76,8 @@ fn step(n: f32) -> Pixels {
     px(STEP * n)
 }
 
-fn tint(colour: u32, alpha: u32) -> Rgba {
-    rgba((colour << 8) | alpha)
+fn tint(colour: u32, opacity: u32) -> Rgba {
+    rgba((colour << 8) | opacity)
 }
 
 /// How much room the window has, which is the only thing the layout
@@ -1253,7 +1253,7 @@ impl Dash {
                             .text_size(px(11.))
                             .text_color(rgb(FAINT))
                             .truncate()
-                            .child(tilde(&group.alpha)),
+                            .child(tilde(&group.primary)),
                     )
                     .child(
                         div()
@@ -1286,7 +1286,7 @@ impl Dash {
                 div()
                     .id(SharedString::from(format!(
                         "row-{}-{}",
-                        group.name, session.beta
+                        group.name, session.replica
                     )))
                     .h(step(9.))
                     .px(step(4.))
@@ -1304,7 +1304,7 @@ impl Dash {
                             .font_family(self.mono.clone())
                             .text_size(px(12.5))
                             .truncate()
-                            .child(tilde(&crate::text::display_safe(&session.beta))),
+                            .child(tilde(&crate::text::display_safe(&session.replica))),
                     )
                     // The mode is the first thing to go: it is the same
                     // for every session of a group nine times in ten.
@@ -1367,7 +1367,7 @@ impl Dash {
             )
             .when_some(session.error.as_ref(), |band, error| {
                 band.child(self.aside(
-                    format!("session-error-{}-{}", group.name, session.beta),
+                    format!("session-error-{}-{}", group.name, session.replica),
                     &crate::text::display_safe(error),
                     RED,
                 ))
@@ -1394,7 +1394,7 @@ impl Dash {
                                 .pb(step(0.5))
                                 .font_family(self.mono.clone())
                                 .child(said(
-                                    format!("waiting-{}-{}-{path}", group.name, session.beta),
+                                    format!("waiting-{}-{}-{path}", group.name, session.replica),
                                     &path,
                                     DIM,
                                     11.,
@@ -1454,8 +1454,8 @@ impl Dash {
                         host: session.host.clone(),
                         path: conflict.path.clone(),
                         blocked: false,
-                        alpha_root: group.alpha.clone(),
-                        beta_root: session.beta.clone(),
+                        primary_root: group.primary.clone(),
+                        replica_root: session.replica.clone(),
                     });
                 }
                 for blocked in &session.blocked {
@@ -1464,8 +1464,8 @@ impl Dash {
                         host: session.host.clone(),
                         path: blocked.clone(),
                         blocked: true,
-                        alpha_root: group.alpha.clone(),
-                        beta_root: session.beta.clone(),
+                        primary_root: group.primary.clone(),
+                        replica_root: session.replica.clone(),
                     });
                 }
             }
@@ -1475,8 +1475,8 @@ impl Dash {
 
     fn open_conflict(&mut self, item: Conflict) {
         self.sides = Some((
-            surface::inspect("alpha", &item.alpha_root, &item.path),
-            surface::inspect("beta", &item.beta_root, &item.path),
+            surface::inspect("primary", &item.primary_root, &item.path),
+            surface::inspect("replica", &item.replica_root, &item.path),
         ));
         self.conflict = Some(item);
         self.diff = None;
@@ -1514,8 +1514,8 @@ impl Dash {
             .flex()
             .flex_col()
             .gap(step(1.5))
-            .child(self.pair(t("fleet.alpha"), tilde(&group.alpha)))
-            .child(self.pair(t("fleet.beta"), tilde(&session.beta)))
+            .child(self.pair(t("fleet.primary"), tilde(&group.primary)))
+            .child(self.pair(t("fleet.replica"), tilde(&session.replica)))
             .child(
                 div()
                     .pt(step(2.))
@@ -1538,10 +1538,10 @@ impl Dash {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let name = group.name.clone();
-        let beta = session.beta.clone();
+        let replica = session.replica.clone();
         let key = session.session.clone();
         Button::new(SharedString::from(format!(
-            "verb-{name}-{beta}-{}",
+            "verb-{name}-{replica}-{}",
             verb.word()
         )))
         .small()
@@ -1549,7 +1549,7 @@ impl Dash {
         .label(verb.word())
         .tooltip(verb.about())
         .on_click(cx.listener(move |this, _, _, cx| {
-            this.control(&name, &beta, &key, verb);
+            this.control(&name, &replica, &key, verb);
             cx.notify();
         }))
         .into_any_element()
@@ -1559,13 +1559,13 @@ impl Dash {
     fn control(
         &mut self,
         group: &str,
-        beta: &str,
+        replica: &str,
         session: &crate::supervisor::control::SessionKey,
         verb: Verb,
     ) {
         let selector = crate::supervisor::control::Selector {
             group: Some(group.to_owned()),
-            host: Some(beta.to_owned()),
+            host: Some(replica.to_owned()),
             session: Some(session.clone()),
         };
         let request = match verb {
@@ -1578,7 +1578,7 @@ impl Dash {
             match crate::supervisor::control::send(&self.state_root, &request) {
                 Ok(_) => fill(
                     "status.control_done",
-                    &[("done", verb.done()), ("beta", beta)],
+                    &[("done", verb.done()), ("replica", replica)],
                 ),
                 Err(error) => format!("{error:#}"),
             },
@@ -1700,10 +1700,10 @@ impl Dash {
         let sides = self.sides.clone();
         let binary = sides
             .as_ref()
-            .is_some_and(|(alpha, beta)| alpha.binary || beta.binary);
+            .is_some_and(|(primary, replica)| primary.binary || replica.binary);
         let keep_host = match item.host.contains(':') {
             true => surface::short_name(&item.host),
-            false => "beta".to_owned(),
+            false => "replica".to_owned(),
         };
         let diff = self.diff.clone();
         div()
@@ -1769,7 +1769,7 @@ impl Dash {
                         )
                     })
                     .when(!item.blocked, |head| {
-                        let alpha = item.clone();
+                        let primary = item.clone();
                         let host = item.clone();
                         let both = item.clone();
                         let shown = item.clone();
@@ -1779,22 +1779,25 @@ impl Dash {
                                 .flex()
                                 .gap(step(1.5))
                                 .child(
-                                    Button::new("keep-alpha")
+                                    Button::new("keep-primary")
                                         .small()
                                         .outline()
-                                        .label(t("conflicts.keep_alpha"))
-                                        .tooltip(t("tip.keep_alpha"))
+                                        .label(t("conflicts.keep_primary"))
+                                        .tooltip(t("tip.keep_primary"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.resolve(&alpha, "alpha");
+                                            this.resolve(&primary, "primary");
                                             cx.notify();
                                         })),
                                 )
                                 .child(
-                                    Button::new("keep-beta")
+                                    Button::new("keep-replica")
                                         .small()
                                         .outline()
-                                        .label(fill("conflicts.keep_beta", &[("name", &keep_host)]))
-                                        .tooltip(t("tip.keep_beta"))
+                                        .label(fill(
+                                            "conflicts.keep_replica",
+                                            &[("name", &keep_host)],
+                                        ))
+                                        .tooltip(t("tip.keep_replica"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let keep = host.host.clone();
                                             this.resolve(&host, &keep);
@@ -1827,8 +1830,8 @@ impl Dash {
                         )
                     }),
             )
-            .when_some(sides.filter(|_| binary), |column, (alpha, beta)| {
-                column.child(self.binary_card(&item, &alpha, &beta, cx))
+            .when_some(sides.filter(|_| binary), |column, (primary, replica)| {
+                column.child(self.binary_card(&item, &primary, &replica, cx))
             })
             .when_some(diff.filter(|_| !binary), |column, diff| {
                 column.child(
@@ -1865,20 +1868,20 @@ impl Dash {
     fn binary_card(
         &self,
         _item: &Conflict,
-        alpha: &Side,
-        beta: &Side,
+        primary: &Side,
+        replica: &Side,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let newer = match (alpha.modified, beta.modified) {
-            (Some(a), Some(b)) if a > b => Some("alpha"),
-            (Some(a), Some(b)) if b > a => Some("beta"),
+        let newer = match (primary.modified, replica.modified) {
+            (Some(a), Some(b)) if a > b => Some("primary"),
+            (Some(a), Some(b)) if b > a => Some("replica"),
             _ => None,
         };
         // Two sides that hash the same are not "one file in two places":
         // reconciliation compares the mode too, so identical content and
         // mode never reaches this pane. Say which of the two remaining
         // cases it is.
-        let agreed = surface::agreement(alpha, beta);
+        let agreed = surface::agreement(primary, replica);
         div()
             .id("binary")
             .flex_1()
@@ -1902,8 +1905,8 @@ impl Dash {
                     .flex()
                     .gap(step(4.))
                     .when(self.room == Room::Tight, |sides| sides.flex_col())
-                    .child(self.side_card(alpha, newer == Some("alpha"), cx))
-                    .child(self.side_card(beta, newer == Some("beta"), cx)),
+                    .child(self.side_card(primary, newer == Some("primary"), cx))
+                    .child(self.side_card(replica, newer == Some("replica"), cx)),
             )
             .when_some(agreed, |card, agreed| {
                 // Settled is good news and reads green. A mode that

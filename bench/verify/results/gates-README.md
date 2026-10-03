@@ -8,7 +8,7 @@ Script: `bench/verify/gates.sh`.
 
 ## Gate 1: does anyone wait for the ancestor tail? — YES
 
-The cycle transitions beta *before* it persists the ancestor, so the tail never delays an isolated save. It does occupy the worker, so a second save landing inside that window waits for it. Ten of each, same session:
+The cycle transitions replica *before* it persists the ancestor, so the tail never delays an isolated save. It does occupy the worker, so a second save landing inside that window waits for it. Ten of each, same session:
 
 | | n | min | p50 | max |
 |---|---|---|---|---|
@@ -27,14 +27,14 @@ Two things worth recording against earlier estimates:
 The sharing probe ran on every reconcile of a real session, reporting the three relationships a three-way walk could prune by:
 
 ```
-[sharing] ancestor-alpha 0.0%  ancestor-beta 0.0%  alpha-beta 0.0%
+[sharing] ancestor-primary 0.0%  ancestor-replica 0.0%  primary-replica 0.0%
 ```
 
 **Identical across all 50 reconciles.** Not rare — zero.
 
 This settles the question permanently. The 2,499/2,501 figure that motivated reconcile pruning was an artifact of `cycle_cost.rs` passing one local scan as two of reconcile's three arguments; it measured how well an incremental rescan preserves storage against the previous scan, which is a different question with a different answer. Codex caught the aliasing, fable predicted the production result would be ~0 on all three, and it is.
 
-The probe was removed once it answered, since the answer will not change: the ancestor is decoded from disk, beta is decoded from the wire, and neither decoding shares allocations with anything.
+The probe was removed once it answered, since the answer will not change: the ancestor is decoded from disk, replica is decoded from the wire, and neither decoding shares allocations with anything.
 
 ## What this authorises
 

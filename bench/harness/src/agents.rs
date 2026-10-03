@@ -255,7 +255,7 @@ fn measure(
     stop_background: &AtomicBool,
 ) -> Result<serde_json::Value, String> {
     // One connection per destination. A pairwise cell passes one address;
-    // a fan-out cell passes one per beta.
+    // a fan-out cell passes one per replica.
     let addresses: Vec<&str> = options
         .observer
         .split(',')

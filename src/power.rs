@@ -13,7 +13,7 @@
 //! minutes rather than two to be found. Changes the watcher reports arrive
 //! as fast as ever, and a watcher that drops events says so and is walked
 //! at once. Only the host this process runs on is consulted, so a remote
-//! beta's agent — which never sees the configuration — walks every two
+//! the replica's agent — which never sees the configuration — walks every two
 //! minutes as before.
 
 use std::sync::atomic::{AtomicBool, Ordering};

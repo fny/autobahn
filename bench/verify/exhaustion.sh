@@ -30,10 +30,10 @@ echo "tree: $(find "$W/src" -type d | wc -l) directories, $(find "$W/src" -type 
 
 cat > "$W/ab.toml" <<TOML
 [groups.exhaust]
-alpha = "$W/src"
+primary = "$W/src"
 mode = "two-way-conflict"
 interval = 3
-betas = ["$W/dst"]
+replicas = ["$W/dst"]
 TOML
 
 setsid "$AB" watch --config "$W/ab.toml" --state-root "$W/state" > "$W/ab.log" 2>&1 &

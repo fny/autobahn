@@ -1,10 +1,10 @@
 #!/bin/bash
 # check.sh — model-check spec/Autobahn.tla in every mode, with TLC.
 #
-#   spec/check.sh              all three modes, two betas, every property
+#   spec/check.sh              all three modes, two replicas, every property
 #   spec/check.sh strict       one mode
 #   spec/check.sh quick        the star at three edits, half a minute: CI's check
-#   spec/check.sh strict_n3    three betas under symmetry: invariants only
+#   spec/check.sh strict_n3    three replicas under symmetry: invariants only
 #   spec/check.sh p2p_conflict_safety   the failover protocol (P2P.tla)
 #   spec/check.sh --traces DIR validate replay traces (see tests/spec_replay.rs)
 #
@@ -85,7 +85,7 @@ if [ "${1:-}" = "--traces" ]; then
     [ $failed = 0 ] && echo "every trace ($count) is a behavior of the spec"
     exit $failed
 fi
-modes="${*:-conflict alpha strict}"
+modes="${*:-conflict primary strict}"
 log="$(mktemp)"
 trap 'rm -f "$log"' EXIT
 status=0

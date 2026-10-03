@@ -4,35 +4,35 @@
 (* unchanged; what this module adds is who runs a cycle, and what keeps   *)
 (* two controllers from ever writing one host.                            *)
 (*                                                                         *)
-(* Hosts are the alpha and the betas. Every host holds a LEASE — the      *)
+(* Hosts are the primary and the replicas. Every host holds a LEASE — the      *)
 (* leader's name and a term — and admits a controller's writes only if   *)
 (* the controller presents a term above the lease's, or the same term    *)
 (* from the same leader. That refusal, the fence, is the whole safety    *)
 (* argument. A controller that is refused steps down and follows.        *)
 (*                                                                         *)
-(* The alpha leads at first. A beta that finds its lease stale takes     *)
+(* The primary leads at first. A replica that finds its lease stale takes     *)
 (* over at the next term — in the model, whenever the leader it knows of *)
 (* is down, or (with Flaky) at any time at all, which stands for a clock *)
-(* that misjudged staleness; the betas take over in their configured     *)
-(* order. When a beta leads, the alpha attaches to it and follows, and   *)
+(* that misjudged staleness; the replicas take over in their configured     *)
+(* order. When a replica leads, the primary attaches to it and follows, and   *)
 (* takes the lead back at the next term once their session has settled. *)
 (*                                                                         *)
-(* Each (alpha, beta) session has an ancestor. The controller that leads *)
+(* Each (primary, replica) session has an ancestor. The controller that leads *)
 (* the session holds the live one (`own`); it replicates it to the other *)
 (* side (`copy`), which may lag. A host that comes to lead a session     *)
 (* adopts its copy when the copy was written after its own store, or it  *)
 (* has no history of its own — the implementation's adopt_newer_copy,    *)
 (* which compares when each was written on the host (`later`). A copy    *)
-(* that lagged when a beta took over carries on from where it lagged, so *)
+(* that lagged when a replica took over carries on from where it lagged, so *)
 (* generations cannot say which is later. Adoption sets aside every path *)
 (* where the copy disagrees with the host's own tree: forgotten, so the  *)
 (* next cycle reconciles it as new. (The implementation keeps the copy's *)
 (* record where the host's file changed since the copy was written; that *)
-(* only keeps an honest record the host has since moved past.) The alpha *)
+(* only keeps an honest record the host has since moved past.) the primary *)
 (* takes the lead back only once its copy is level with the leader's.   *)
 (* With Lies, a partner may write any copy at all, a bounded number of   *)
-(* times: a buggy or dishonest leader. A session between two betas       *)
-(* exists only while a beta leads, and starts without history.           *)
+(* times: a buggy or dishonest leader. A session between two replicas       *)
+(* exists only while a replica leads, and starts without history.           *)
 (*                                                                         *)
 (* Hosts crash and recover (a bounded number of times); a recovered      *)
 (* host comes back as a follower unless its own lease still names it.    *)
@@ -54,20 +54,20 @@
 EXTENDS Reconcile
 
 CONSTANTS
-    Betas,        \* the betas, e.g. {b1, b2}
-    Order,        \* the betas as a sequence: the failover order
+    Replicas,        \* the replicas, e.g. {b1, b2}
+    Order,        \* the replicas as a sequence: the failover order
     MaxEdits,     \* user actions per behavior
     MaxFailures,  \* crashes per behavior
     MaxChanges,   \* changes of leadership per behavior — terms grow with
                   \* them, so without a bound the state space is infinite
-    Flaky,        \* TRUE: a beta may judge a lease stale at any time
+    Flaky,        \* TRUE: a replica may judge a lease stale at any time
     Lies,         \* TRUE: a partner may write a copy that is no record at all
     MaxLies       \* such copies per behavior
 
-ASSUME Mode \in {"conflict", "alpha"}
-ASSUME Len(Order) = Cardinality(Betas) /\ {Order[i] : i \in 1..Len(Order)} = Betas
+ASSUME Mode \in {"conflict", "primary"}
+ASSUME Len(Order) = Cardinality(Replicas) /\ {Order[i] : i \in 1..Len(Order)} = Replicas
 
-Hosts == {"alpha"} \cup Betas
+Hosts == {"primary"} \cup Replicas
 Earlier(b) == {Order[i] : i \in {i \in 1..Len(Order) : \E j \in 1..Len(Order) : Order[j] = b /\ i < j}}
 
 VARIABLES
@@ -76,12 +76,12 @@ VARIABLES
     lease,      \* [Hosts -> [leader: Hosts, term: Nat]]: the fence at each host
     role,       \* [Hosts -> {"leading", "following"}]: what each controller believes
     myterm,     \* [Hosts -> Nat]: the term a controller presents
-    own,        \* [Hosts -> [Betas -> [tree, gen]]]: the (alpha, b) ancestor a host holds as leader
-    copy,       \* [Hosts -> [Betas -> [tree, gen]]]: the (alpha, b) ancestor a host holds as a replica
-    bb,         \* [Betas -> [Betas -> Tree]]: a leading beta's ancestors with the other betas
+    own,        \* [Hosts -> [Replicas -> [tree, gen]]]: the (primary, b) ancestor a host holds as leader
+    copy,       \* [Hosts -> [Replicas -> [tree, gen]]]: the (primary, b) ancestor a host holds as a copy
+    bb,         \* [Replicas -> [Replicas -> Tree]]: a leading replica's ancestors with the other replicas
     conflicts,  \* [Hosts -> [Hosts -> SUBSET Paths]]: what controller c last reported for host h
     writers,    \* [Hosts -> SUBSET [leader, term]]: every lease under which a host was written
-    later,      \* [Hosts -> [Betas -> BOOLEAN]]: the host's copy was written after its own store
+    later,      \* [Hosts -> [Replicas -> BOOLEAN]]: the host's copy was written after its own store
     disputed,   \* SUBSET <<host, path, value>>: what a host held where a copy it adopted disagreed
     written, superseded, discarded,
     edits, failures, changes, lies
@@ -93,15 +93,15 @@ Fresh == [tree |-> Empty, gen |-> 0]
 Init ==
     /\ tree = [h \in Hosts |-> Empty]
     /\ up = [h \in Hosts |-> TRUE]
-    /\ lease = [h \in Hosts |-> [leader |-> "alpha", term |-> 1]]
-    /\ role = [h \in Hosts |-> IF h = "alpha" THEN "leading" ELSE "following"]
-    /\ myterm = [h \in Hosts |-> IF h = "alpha" THEN 1 ELSE 0]
-    /\ own = [h \in Hosts |-> [b \in Betas |-> Fresh]]
-    /\ copy = [h \in Hosts |-> [b \in Betas |-> Fresh]]
-    /\ bb = [b \in Betas |-> [c \in Betas |-> Empty]]
+    /\ lease = [h \in Hosts |-> [leader |-> "primary", term |-> 1]]
+    /\ role = [h \in Hosts |-> IF h = "primary" THEN "leading" ELSE "following"]
+    /\ myterm = [h \in Hosts |-> IF h = "primary" THEN 1 ELSE 0]
+    /\ own = [h \in Hosts |-> [b \in Replicas |-> Fresh]]
+    /\ copy = [h \in Hosts |-> [b \in Replicas |-> Fresh]]
+    /\ bb = [b \in Replicas |-> [c \in Replicas |-> Empty]]
     /\ conflicts = [c \in Hosts |-> [h \in Hosts |-> {}]]
     /\ writers = [h \in Hosts |-> {}]
-    /\ later = [h \in Hosts |-> [b \in Betas |-> FALSE]]
+    /\ later = [h \in Hosts |-> [b \in Replicas |-> FALSE]]
     /\ disputed = {}
     /\ written = {} /\ superseded = {} /\ discarded = {}
     /\ edits = 0 /\ failures = 0 /\ changes = 0 /\ lies = 0
@@ -158,7 +158,7 @@ Recover(h) ==
 Admits(current, presented) ==
     presented.term > current.term \/ (presented.term = current.term /\ presented.leader = current.leader)
 
-\* Adoption, on host h, of its copy of the (alpha, b) session's ancestor:
+\* Adoption, on host h, of its copy of the (primary, b) session's ancestor:
 \* when the copy holds history, and was written after the host's own store
 \* or the host has none. What is taken up is the copy less every path
 \* where it disagrees with the host's tree, and everything beneath: those
@@ -174,8 +174,8 @@ Disputed(h, b) ==
     THEN {<<h, p, tree[h][p]>> : p \in {p \in SetAside(h, b) : tree[h][p] \in Values}}
     ELSE {}
 
-\* A beta takes the lead: its lease looks stale (the leader it knows of is
-\* down, or, if Flaky, whenever), every beta ahead of it in the order is
+\* A replica takes the lead: its lease looks stale (the leader it knows of is
+\* down, or, if Flaky, whenever), every replica ahead of it in the order is
 \* down or is that leader, and it is not leading already.
 Takeover(b) ==
     /\ changes < MaxChanges
@@ -189,42 +189,42 @@ Takeover(b) ==
     /\ own' = [own EXCEPT ![b][b] = Adopted(b, b)]
     /\ later' = [later EXCEPT ![b][b] = IF Adopts(b, b) THEN FALSE ELSE @]
     /\ disputed' = disputed \cup Disputed(b, b)
-    /\ bb' = [bb EXCEPT ![b] = [c \in Betas |-> Empty]]
+    /\ bb' = [bb EXCEPT ![b] = [c \in Replicas |-> Empty]]
     /\ changes' = changes + 1
     /\ UNCHANGED <<tree, up, copy, conflicts, writers, written, superseded, discarded, edits, failures, lies>>
 
-\* The alpha takes the lead back from the beta it follows, once their
-\* session has settled and the alpha's copy of its ancestor is level with
+\* The primary takes the lead back from the replica it follows, once their
+\* session has settled and the primary's copy of its ancestor is level with
 \* the leader's.
 Handoff ==
     /\ changes < MaxChanges
-    /\ up["alpha"] /\ role["alpha"] = "following"
-    /\ LET l == lease["alpha"].leader IN
-       /\ l \in Betas /\ up[l] /\ role[l] = "leading"
-       /\ tree["alpha"] = tree[l]
-       /\ copy["alpha"][l] = own[l][l]
-       /\ LET t == lease["alpha"].term + 1 IN
-          /\ myterm' = [myterm EXCEPT !["alpha"] = t]
-          /\ lease' = [lease EXCEPT !["alpha"] = [leader |-> "alpha", term |-> t]]
-    /\ role' = [role EXCEPT !["alpha"] = "leading"]
-    /\ own' = [own EXCEPT !["alpha"] = [b \in Betas |-> Adopted("alpha", b)]]
-    /\ later' = [later EXCEPT !["alpha"] = [b \in Betas |-> IF Adopts("alpha", b) THEN FALSE ELSE @[b]]]
-    /\ disputed' = disputed \cup UNION {Disputed("alpha", b) : b \in Betas}
+    /\ up["primary"] /\ role["primary"] = "following"
+    /\ LET l == lease["primary"].leader IN
+       /\ l \in Replicas /\ up[l] /\ role[l] = "leading"
+       /\ tree["primary"] = tree[l]
+       /\ copy["primary"][l] = own[l][l]
+       /\ LET t == lease["primary"].term + 1 IN
+          /\ myterm' = [myterm EXCEPT !["primary"] = t]
+          /\ lease' = [lease EXCEPT !["primary"] = [leader |-> "primary", term |-> t]]
+    /\ role' = [role EXCEPT !["primary"] = "leading"]
+    /\ own' = [own EXCEPT !["primary"] = [b \in Replicas |-> Adopted("primary", b)]]
+    /\ later' = [later EXCEPT !["primary"] = [b \in Replicas |-> IF Adopts("primary", b) THEN FALSE ELSE @[b]]]
+    /\ disputed' = disputed \cup UNION {Disputed("primary", b) : b \in Replicas}
     /\ changes' = changes + 1
     /\ UNCHANGED <<tree, up, copy, bb, conflicts, writers, written, superseded, discarded, edits, failures, lies>>
 
 -----------------------------------------------------------------------------
 (* Sessions *)
 
-\* In the alpha mode, the configured alpha's version wins wherever the
-\* alpha is involved, whoever leads; between two betas, the leader's does.
-AlphaSide(c, h) == IF h = "alpha" THEN "alpha" ELSE c
-BetaSide(c, h) == IF h = "alpha" THEN c ELSE h
+\* In the primary mode, the configured primary's version wins wherever the
+\* the primary is involved, whoever leads; between two replicas, the leader's does.
+PrimarySide(c, h) == IF h = "primary" THEN "primary" ELSE c
+ReplicaSide(c, h) == IF h = "primary" THEN c ELSE h
 
 \* The ancestor a controller c uses for its session with host h.
 Anc(c, h) ==
-    IF c = "alpha" THEN own["alpha"][h].tree
-    ELSE IF h = "alpha" THEN own[c][c].tree
+    IF c = "primary" THEN own["primary"][h].tree
+    ELSE IF h = "primary" THEN own[c][c].tree
     ELSE bb[c][h]
 
 \* A cycle of leader c's session with host h: present the lease, and if
@@ -234,51 +234,51 @@ Cycle(c, h) ==
     /\ LET presented == [leader |-> c, term |-> myterm[c]] IN
        IF Admits(lease[h], presented) THEN
          LET a == Anc(c, h)
-             x == tree[AlphaSide(c, h)]
-             y == tree[BetaSide(c, h)]
+             x == tree[PrimarySide(c, h)]
+             y == tree[ReplicaSide(c, h)]
              O == [p \in Paths |-> Outcome(a, x, y, p)]
-             x2 == [p \in Paths |-> O[p].alpha]
-             y2 == [p \in Paths |-> O[p].beta]
+             x2 == [p \in Paths |-> O[p].primary]
+             y2 == [p \in Paths |-> O[p].replica]
              a2 == [p \in Paths |-> O[p].anc]
              bumped(s) == IF s.tree = a2 THEN s ELSE [tree |-> a2, gen |-> s.gen + 1]
          IN
          /\ lease' = [lease EXCEPT ![h] = presented]
          /\ writers' = [writers EXCEPT ![h] = @ \cup {presented}]
-         /\ tree' = [tree EXCEPT ![AlphaSide(c, h)] = x2, ![BetaSide(c, h)] = y2]
+         /\ tree' = [tree EXCEPT ![PrimarySide(c, h)] = x2, ![ReplicaSide(c, h)] = y2]
          \* A store written moves its copy to before it.
-         /\ IF c = "alpha" THEN /\ own' = [own EXCEPT !["alpha"][h] = bumped(@)]
-                                /\ later' = [later EXCEPT !["alpha"][h] = IF a2 = own["alpha"][h].tree THEN @ ELSE FALSE]
+         /\ IF c = "primary" THEN /\ own' = [own EXCEPT !["primary"][h] = bumped(@)]
+                                /\ later' = [later EXCEPT !["primary"][h] = IF a2 = own["primary"][h].tree THEN @ ELSE FALSE]
                                 /\ UNCHANGED bb
-            ELSE IF h = "alpha" THEN /\ own' = [own EXCEPT ![c][c] = bumped(@)]
+            ELSE IF h = "primary" THEN /\ own' = [own EXCEPT ![c][c] = bumped(@)]
                                      /\ later' = [later EXCEPT ![c][c] = IF a2 = own[c][c].tree THEN @ ELSE FALSE]
                                      /\ UNCHANGED bb
             ELSE bb' = [bb EXCEPT ![c][h] = a2] /\ UNCHANGED <<own, later>>
          /\ conflicts' = [conflicts EXCEPT ![c][h] = {p \in Paths : O[p].conflict}]
-         /\ discarded' = discarded \cup Lost(BetaSide(c, h), y, y2, x2, a) \cup Lost(AlphaSide(c, h), x, x2, y2, a)
+         /\ discarded' = discarded \cup Lost(ReplicaSide(c, h), y, y2, x2, a) \cup Lost(PrimarySide(c, h), x, x2, y2, a)
          /\ UNCHANGED <<up, role, myterm, copy, disputed, written, superseded, edits, failures, changes, lies>>
        ELSE
          /\ role' = [role EXCEPT ![c] = "following"]
          /\ UNCHANGED <<tree, up, lease, myterm, own, copy, bb, conflicts, writers, later, disputed, written, superseded, discarded, edits, failures, changes, lies>>
 
-\* The leader of an (alpha, b) session pushes its ancestor to the other
-\* side, which replaces its replica with it — written after the host's own
+\* The leader of a (primary, b) session pushes its ancestor to the other
+\* side, which replaces its copy with it — written after the host's own
 \* store, now. Any lag, since this is its own step.
 Replicate(c, h) ==
     /\ role[c] = "leading" /\ up[c] /\ up[h] /\ h # c
     /\ lease[h].leader = c
-    /\ "alpha" \in {c, h}
-    /\ LET b == BetaSide(c, h) IN
+    /\ "primary" \in {c, h}
+    /\ LET b == ReplicaSide(c, h) IN
        /\ copy[h][b] # own[c][b]
        /\ copy' = [copy EXCEPT ![h][b] = own[c][b]]
        /\ later' = [later EXCEPT ![h][b] = TRUE]
     /\ UNCHANGED <<tree, up, lease, role, myterm, own, bb, conflicts, writers, disputed, written, superseded, discarded, edits, failures, changes, lies>>
 
-\* With Lies: the partner of an (alpha, b) session writes a copy that is
+\* With Lies: the partner of a (primary, b) session writes a copy that is
 \* no record of anything — a buggy leader, or a dishonest one. Only the
 \* partner, since a host takes up a copy from no one else.
 Corrupt(h, b, t) ==
     /\ Lies /\ lies < MaxLies
-    /\ up[h] /\ h \in {"alpha", b}
+    /\ up[h] /\ h \in {"primary", b}
     /\ Formed(t)
     /\ copy' = [copy EXCEPT ![h][b] = [tree |-> t, gen |-> @.gen + 1]]
     /\ later' = [later EXCEPT ![h][b] = TRUE]
@@ -289,17 +289,17 @@ Next ==
     \/ \E h \in Hosts, p \in Paths, v \in Values : Write(h, p, v)
     \/ \E h \in Hosts, p \in Paths : MkDir(h, p) \/ Remove(h, p)
     \/ \E h \in Hosts : Crash(h) \/ Recover(h)
-    \/ \E b \in Betas : Takeover(b)
+    \/ \E b \in Replicas : Takeover(b)
     \/ Handoff
     \/ \E c \in Hosts, h \in Hosts : Cycle(c, h) \/ Replicate(c, h)
-    \/ \E h \in Hosts, b \in Betas, t \in [Paths -> Content] : Corrupt(h, b, t)
+    \/ \E h \in Hosts, b \in Replicas, t \in [Paths -> Content] : Corrupt(h, b, t)
 
 Spec ==
     /\ Init
     /\ [][Next]_vars
     /\ \A c \in Hosts, h \in Hosts : WF_vars(Cycle(c, h)) /\ WF_vars(Replicate(c, h))
     /\ \A h \in Hosts : WF_vars(Recover(h))
-    /\ \A b \in Betas : WF_vars(Takeover(b))
+    /\ \A b \in Replicas : WF_vars(Takeover(b))
     /\ WF_vars(Handoff)
 
 -----------------------------------------------------------------------------
@@ -309,7 +309,7 @@ TypeOK ==
     /\ tree \in [Hosts -> [Paths -> Content]]
     /\ role \in [Hosts -> {"leading", "following"}]
     /\ edits \in 0..MaxEdits /\ failures \in 0..MaxFailures /\ changes \in 0..MaxChanges
-    /\ lies \in 0..MaxLies /\ later \in [Hosts -> [Betas -> BOOLEAN]]
+    /\ lies \in 0..MaxLies /\ later \in [Hosts -> [Replicas -> BOOLEAN]]
 
 WellFormed == \A h \in Hosts : Formed(tree[h])
 
@@ -323,8 +323,8 @@ Accounted ==
 
 NeverDiscards == Mode = "conflict" => discarded = {}
 
-\* The configured alpha's values are never discarded, whoever leads.
-AlphaKeeps == \A d \in discarded : d[1] # "alpha"
+\* The configured primary's values are never discarded, whoever leads.
+PrimaryKeeps == \A d \in discarded : d[1] # "primary"
 
 \* A value a host held where a copy it adopted disagreed is never lost:
 \* on some host still, or replaced by a user, or on record as discarded —

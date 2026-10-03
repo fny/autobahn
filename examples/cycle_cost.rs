@@ -108,7 +108,7 @@ fn main() {
         // could scan it and propagate it.
         drop(restore);
 
-        // Reconcile the edited alpha against the settled ancestor and a beta
+        // Reconcile the edited primary against the settled ancestor and a replica
         // that has not yet seen the edit — the exact three trees a cycle
         // reconciles when one file changes on one side.
         let started = Instant::now();
@@ -120,7 +120,7 @@ fn main() {
         );
         let reconcile_ms = started.elapsed().as_secs_f64() * 1000.0;
         assert_eq!(
-            result.beta_transitions.len(),
+            result.replica_transitions.len(),
             1,
             "one edit should yield one transition"
         );
@@ -148,7 +148,7 @@ fn main() {
         let validate_ms = started.elapsed().as_secs_f64() * 1000.0;
 
         // The same validation, against the hierarchy it was derived from.
-        let derived = autobahn::tree::apply(settled.root.as_ref(), &result.beta_transitions)
+        let derived = autobahn::tree::apply(settled.root.as_ref(), &result.replica_transitions)
             .expect("applies");
         let started = Instant::now();
         derived

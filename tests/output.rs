@@ -10,18 +10,18 @@ use std::process::Command;
 #[test]
 fn doctor_piped_prints_no_escape_bytes() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let alpha = home.path().join("alpha");
-    let beta = home.path().join("beta");
-    std::fs::create_dir_all(&alpha).unwrap();
-    std::fs::create_dir_all(&beta).unwrap();
-    std::fs::write(alpha.join("evil\x1b[31mred"), "content").unwrap();
+    let primary = home.path().join("primary");
+    let replica = home.path().join("replica");
+    std::fs::create_dir_all(&primary).unwrap();
+    std::fs::create_dir_all(&replica).unwrap();
+    std::fs::write(primary.join("evil\x1b[31mred"), "content").unwrap();
     let config = home.path().join("config.toml");
     std::fs::write(
         &config,
         format!(
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();
@@ -67,8 +67,8 @@ fn issues_for_a_path_in_nested_groups_scopes_each_group_to_it() {
     std::fs::write(
         &config,
         format!(
-            "[groups.outer]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\n\
-             [groups.inner]\nmode = \"one-way-alpha\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "[groups.outer]\nmode = \"one-way-primary\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n\n\
+             [groups.inner]\nmode = \"one-way-primary\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
             outer.display(),
             home.path().join("b1").display(),
             inner.display(),
@@ -96,8 +96,8 @@ fn issues_for_a_path_in_nested_groups_scopes_each_group_to_it() {
                 .iter()
                 .map(|path| ConflictDetail {
                     path: path.clone(),
-                    alpha: Default::default(),
-                    beta: Default::default(),
+                    primary: Default::default(),
+                    replica: Default::default(),
                 })
                 .collect(),
             conflicts,
@@ -170,18 +170,18 @@ fn issues_for_a_path_in_nested_groups_scopes_each_group_to_it() {
 #[test]
 fn status_says_each_configuration_warning_once() {
     let home = tempfile::tempdir().expect("a temporary directory");
-    let alpha = home.path().join("alpha");
-    let beta = home.path().join("beta");
-    std::fs::create_dir_all(alpha.join(".ssh")).unwrap();
-    std::fs::create_dir_all(&beta).unwrap();
+    let primary = home.path().join("primary");
+    let replica = home.path().join("replica");
+    std::fs::create_dir_all(primary.join(".ssh")).unwrap();
+    std::fs::create_dir_all(&replica).unwrap();
     let config = home.path().join("config.toml");
     std::fs::write(
         &config,
         format!(
-            "[groups.g]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n\
+            "[groups.g]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n\
              ignores = [\"vendor\", \"!vendor/*.patch\"]\n",
-            alpha.display(),
-            beta.display()
+            primary.display(),
+            replica.display()
         ),
     )
     .unwrap();

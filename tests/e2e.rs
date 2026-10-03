@@ -27,15 +27,15 @@ mod common;
 enum Transport {
     /// Both endpoints in-process.
     Local,
-    /// Beta behind a spawned agent subprocess (the SSH code path).
+    /// Replica behind a spawned agent subprocess (the SSH code path).
     Agent,
 }
 
 /// A test harness holding the roots and session state for one scenario.
 struct Harness {
     _keep: tempfile::TempDir,
-    alpha: PathBuf,
-    beta: PathBuf,
+    primary: PathBuf,
+    replica: PathBuf,
     state: PathBuf,
     mode: SyncMode,
     transport: Transport,
@@ -47,15 +47,15 @@ impl Harness {
     fn new(mode: SyncMode, transport: Transport) -> Harness {
         common::isolate_home();
         let keep = tempfile::tempdir().expect("tempdir");
-        let alpha = keep.path().join("alpha");
-        let beta = keep.path().join("beta");
+        let primary = keep.path().join("primary");
+        let replica = keep.path().join("replica");
         let state = keep.path().join("state");
-        fs::create_dir_all(&alpha).unwrap();
-        fs::create_dir_all(&beta).unwrap();
+        fs::create_dir_all(&primary).unwrap();
+        fs::create_dir_all(&replica).unwrap();
         Harness {
             _keep: keep,
-            alpha,
-            beta,
+            primary,
+            replica,
             state,
             mode,
             transport,
@@ -100,8 +100,8 @@ impl Harness {
                 .cycle()
                 .unwrap_or_else(|e| panic!("{context}: cycle {cycles}: {e:#}"));
             if !report.changed()
-                && report.beta_transition_problems.is_empty()
-                && report.alpha_transition_problems.is_empty()
+                && report.replica_transition_problems.is_empty()
+                && report.primary_transition_problems.is_empty()
                 && !report.missing_staged_files
             {
                 return cycles;
@@ -111,42 +111,42 @@ impl Harness {
     }
 
     fn session(&mut self) -> anyhow::Result<Session> {
-        let (beta, state) = (self.beta.clone(), self.state.clone());
-        self.session_to(&beta, &state)
+        let (replica, state) = (self.replica.clone(), self.state.clone());
+        self.session_to(&replica, &state)
     }
 
-    /// A second destination beside the first, sharing the alpha — another
+    /// A second destination beside the first, sharing the primary — another
     /// session of a fan-out — with state of its own.
-    fn second_beta(&self) -> (PathBuf, PathBuf) {
-        let beta = self._keep.path().join("beta2");
-        fs::create_dir_all(&beta).unwrap();
-        (beta, self.state.join("second"))
+    fn second_replica(&self) -> (PathBuf, PathBuf) {
+        let replica = self._keep.path().join("replica2");
+        fs::create_dir_all(&replica).unwrap();
+        (replica, self.state.join("second"))
     }
 
-    fn session_to(&mut self, beta_root: &Path, state: &Path) -> anyhow::Result<Session> {
+    fn session_to(&mut self, replica_root: &Path, state: &Path) -> anyhow::Result<Session> {
         self.session_counter += 1;
-        let alpha_endpoint: Box<dyn Endpoint + Send> = Box::new(
+        let primary_endpoint: Box<dyn Endpoint + Send> = Box::new(
             LocalEndpoint::new(
-                self.alpha.clone(),
-                state.join("staging-alpha"),
+                self.primary.clone(),
+                state.join("staging-primary"),
                 EndpointOptions {
                     ignores: IgnoreSet::new(&self.ignores)?,
                     ..EndpointOptions::default()
                 },
             )
-            .expect("alpha endpoint"),
+            .expect("primary endpoint"),
         );
-        let beta_endpoint: Box<dyn Endpoint + Send> = match self.transport {
+        let replica_endpoint: Box<dyn Endpoint + Send> = match self.transport {
             Transport::Local => Box::new(
                 LocalEndpoint::new(
-                    beta_root.to_path_buf(),
-                    state.join("staging-beta"),
+                    replica_root.to_path_buf(),
+                    state.join("staging-replica"),
                     EndpointOptions {
                         ignores: IgnoreSet::new(&self.ignores)?,
                         ..EndpointOptions::default()
                     },
                 )
-                .expect("beta endpoint"),
+                .expect("replica endpoint"),
             ),
             Transport::Agent => {
                 let binary = env!("CARGO_BIN_EXE_autobahn").to_owned();
@@ -156,7 +156,7 @@ impl Harness {
                     RemoteEndpoint::connect(
                         connection,
                         Initialize {
-                            root: beta_root.to_string_lossy().into_owned(),
+                            root: replica_root.to_string_lossy().into_owned(),
                             session: autobahn::session::session_identifier(
                                 &state.to_string_lossy(),
                                 "e2e",
@@ -165,7 +165,7 @@ impl Harness {
                             symlink_mode: SymlinkMode::Raw,
                             file_mode: None,
                             directory_mode: None,
-                            side: "beta".into(),
+                            side: "replica".into(),
                             staging: Default::default(),
                             max_file_size: None,
                             max_entry_count: None,
@@ -180,8 +180,8 @@ impl Harness {
             }
         };
         Session::new(
-            alpha_endpoint,
-            beta_endpoint,
+            primary_endpoint,
+            replica_endpoint,
             self.mode,
             state.to_path_buf(),
         )
@@ -192,9 +192,12 @@ impl Harness {
     }
 
     fn assert_trees_equal(&self, context: &str) {
-        let alpha = hash_tree(&self.alpha);
-        let beta = hash_tree(&self.beta);
-        assert_eq!(alpha, beta, "{context}: alpha and beta trees differ");
+        let primary = hash_tree(&self.primary);
+        let replica = hash_tree(&self.replica);
+        assert_eq!(
+            primary, replica,
+            "{context}: primary and replica trees differ"
+        );
     }
 }
 
@@ -254,33 +257,33 @@ const ALL_MODES: [SyncMode; 5] = [
     SyncMode::TwoWayResolved,
     SyncMode::TwoWayStrict,
     SyncMode::OneWaySafe,
-    SyncMode::OneWayReplica,
+    SyncMode::OneWayMirror,
 ];
 
 #[test]
-fn initial_sync_and_alpha_propagation_all_modes_over_agent() {
+fn initial_sync_and_primary_propagation_all_modes_over_agent() {
     for mode in ALL_MODES {
         let mut harness = Harness::new(mode, Transport::Agent);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
         harness.assert_trees_equal("initial");
 
-        // Modify alpha: change, add, remove, chmod, retarget a symlink.
-        fs::write(harness.alpha.join("dir0/nested/file0.txt"), "changed").unwrap();
-        fs::write(harness.alpha.join("dir1/nested/new.txt"), "new").unwrap();
-        fs::remove_file(harness.alpha.join("dir2/nested/file1.txt")).unwrap();
+        // Modify primary: change, add, remove, chmod, retarget a symlink.
+        fs::write(harness.primary.join("dir0/nested/file0.txt"), "changed").unwrap();
+        fs::write(harness.primary.join("dir1/nested/new.txt"), "new").unwrap();
+        fs::remove_file(harness.primary.join("dir2/nested/file1.txt")).unwrap();
         fs::set_permissions(
-            harness.alpha.join("dir3/nested/file2.txt"),
+            harness.primary.join("dir3/nested/file2.txt"),
             fs::Permissions::from_mode(0o755),
         )
         .unwrap();
-        fs::remove_file(harness.alpha.join("dir0/nested/link")).unwrap();
-        std::os::unix::fs::symlink("file2.txt", harness.alpha.join("dir0/nested/link")).unwrap();
-        fs::create_dir_all(harness.alpha.join("dir1/nested/added")).unwrap();
-        fs::write(harness.alpha.join("dir1/nested/added/inner.txt"), "inner").unwrap();
+        fs::remove_file(harness.primary.join("dir0/nested/link")).unwrap();
+        std::os::unix::fs::symlink("file2.txt", harness.primary.join("dir0/nested/link")).unwrap();
+        fs::create_dir_all(harness.primary.join("dir1/nested/added")).unwrap();
+        fs::write(harness.primary.join("dir1/nested/added/inner.txt"), "inner").unwrap();
 
         harness.cycle_ok();
-        harness.assert_trees_equal("alpha propagation");
+        harness.assert_trees_equal("primary propagation");
 
         // A further cycle must be a no-op.
         let report = harness.cycle_ok();
@@ -292,113 +295,119 @@ fn initial_sync_and_alpha_propagation_all_modes_over_agent() {
 }
 
 #[test]
-fn initial_sync_and_alpha_propagation_local_endpoints() {
-    for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayReplica] {
+fn initial_sync_and_primary_propagation_local_endpoints() {
+    for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayMirror] {
         let mut harness = Harness::new(mode, Transport::Local);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
         harness.assert_trees_equal("initial");
-        fs::write(harness.alpha.join("dir0/nested/file0.txt"), "changed").unwrap();
+        fs::write(harness.primary.join("dir0/nested/file0.txt"), "changed").unwrap();
         harness.cycle_ok();
-        harness.assert_trees_equal("alpha propagation");
+        harness.assert_trees_equal("primary propagation");
     }
 }
 
 #[test]
-fn beta_addition_semantics_by_mode() {
+fn replica_addition_semantics_by_mode() {
     for mode in ALL_MODES {
         let mut harness = Harness::new(mode, Transport::Agent);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
 
-        let beta_added = harness.beta.join("dir0/nested/beta-added.txt");
-        let alpha_added = harness.alpha.join("dir0/nested/beta-added.txt");
-        fs::write(&beta_added, "from beta").unwrap();
+        let replica_added = harness.replica.join("dir0/nested/replica-added.txt");
+        let primary_added = harness.primary.join("dir0/nested/replica-added.txt");
+        fs::write(&replica_added, "from replica").unwrap();
         harness.cycle_ok();
 
         match mode {
             SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
-                assert!(alpha_added.exists(), "{mode:?}: addition should propagate");
-                harness.assert_trees_equal("beta addition");
+                assert!(
+                    primary_added.exists(),
+                    "{mode:?}: addition should propagate"
+                );
+                harness.assert_trees_equal("replica addition");
             }
             SyncMode::OneWaySafe => {
                 assert!(
-                    !alpha_added.exists(),
+                    !primary_added.exists(),
                     "one-way-conflict must not reverse-propagate"
                 );
                 assert!(
-                    beta_added.exists(),
-                    "one-way-conflict must preserve beta additions"
+                    replica_added.exists(),
+                    "one-way-conflict must preserve replica additions"
                 );
             }
-            SyncMode::OneWayReplica => {
-                assert!(!beta_added.exists(), "replica must remove beta additions");
-                harness.assert_trees_equal("replica mirroring");
+            SyncMode::OneWayMirror => {
+                assert!(
+                    !replica_added.exists(),
+                    "a mirror must remove replica additions"
+                );
+                harness.assert_trees_equal("mirroring");
             }
         }
     }
 }
 
 #[test]
-fn beta_modification_semantics_by_mode() {
+fn replica_modification_semantics_by_mode() {
     for mode in ALL_MODES {
         let mut harness = Harness::new(mode, Transport::Agent);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
 
         let path = "dir1/nested/file0.txt";
-        fs::write(harness.beta.join(path), "modified on beta").unwrap();
+        fs::write(harness.replica.join(path), "modified on replica").unwrap();
         let report = harness.cycle_ok();
 
         match mode {
             SyncMode::TwoWaySafe | SyncMode::TwoWayResolved | SyncMode::TwoWayStrict => {
-                let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
-                assert_eq!(alpha_content, "modified on beta", "{mode:?}");
-                harness.assert_trees_equal("beta modification");
+                let primary_content = fs::read_to_string(harness.primary.join(path)).unwrap();
+                assert_eq!(primary_content, "modified on replica", "{mode:?}");
+                harness.assert_trees_equal("replica modification");
             }
             SyncMode::OneWaySafe => {
-                // The modification is preserved on beta (reported as a
-                // conflict) and never reaches alpha.
-                let beta_content = fs::read_to_string(harness.beta.join(path)).unwrap();
-                assert_eq!(beta_content, "modified on beta");
-                let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
-                assert_eq!(alpha_content, "content 1/0");
+                // The modification is preserved on the replica (reported as a
+                // conflict) and never reaches the primary.
+                let replica_content = fs::read_to_string(harness.replica.join(path)).unwrap();
+                assert_eq!(replica_content, "modified on replica");
+                let primary_content = fs::read_to_string(harness.primary.join(path)).unwrap();
+                assert_eq!(primary_content, "content 1/0");
                 assert!(!report.conflicts.is_empty(), "expected a conflict report");
             }
-            SyncMode::OneWayReplica => {
-                let beta_content = fs::read_to_string(harness.beta.join(path)).unwrap();
-                assert_eq!(beta_content, "content 1/0", "replica must overwrite");
-                harness.assert_trees_equal("replica overwrite");
+            SyncMode::OneWayMirror => {
+                let replica_content = fs::read_to_string(harness.replica.join(path)).unwrap();
+                assert_eq!(replica_content, "content 1/0", "a mirror must overwrite");
+                harness.assert_trees_equal("mirror overwrite");
             }
         }
     }
 }
 
 #[test]
-fn beta_deletion_semantics_by_mode() {
-    for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayReplica] {
+fn replica_deletion_semantics_by_mode() {
+    for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayMirror] {
         let mut harness = Harness::new(mode, Transport::Agent);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
 
         let path = "dir2/nested/file2.txt";
-        fs::remove_file(harness.beta.join(path)).unwrap();
+        fs::remove_file(harness.replica.join(path)).unwrap();
         harness.cycle_ok();
 
         match mode {
             SyncMode::TwoWaySafe => {
                 assert!(
-                    !harness.alpha.join(path).exists(),
-                    "deletion should propagate to alpha"
+                    !harness.primary.join(path).exists(),
+                    "deletion should propagate to primary"
                 );
-                harness.assert_trees_equal("beta deletion");
+                harness.assert_trees_equal("replica deletion");
             }
-            SyncMode::OneWayReplica => {
+            SyncMode::OneWayMirror => {
                 assert!(
-                    harness.beta.join(path).exists(),
-                    "replica must restore beta deletions"
+                    harness.replica.join(path).exists(),
+                    "a mirror must restore replica deletions"
                 );
-                harness.assert_trees_equal("replica restoration");
+                harness.assert_trees_equal("mirror restoration");
             }
             _ => unreachable!(),
         }
@@ -407,65 +416,69 @@ fn beta_deletion_semantics_by_mode() {
 
 #[test]
 fn divergent_edits_conflict_in_safe_mode_and_resolve_in_resolved_mode() {
-    for (mode, alpha_wins) in [
+    for (mode, primary_wins) in [
         (SyncMode::TwoWaySafe, false),
         (SyncMode::TwoWayResolved, true),
     ] {
         let mut harness = Harness::new(mode, Transport::Agent);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
 
         let path = "dir3/nested/file1.txt";
-        fs::write(harness.alpha.join(path), "alpha version").unwrap();
-        fs::write(harness.beta.join(path), "beta version").unwrap();
+        fs::write(harness.primary.join(path), "primary version").unwrap();
+        fs::write(harness.replica.join(path), "replica version").unwrap();
         let report = harness.cycle_ok();
 
-        if alpha_wins {
+        if primary_wins {
             assert!(report.conflicts.is_empty());
-            let beta_content = fs::read_to_string(harness.beta.join(path)).unwrap();
-            assert_eq!(beta_content, "alpha version");
+            let replica_content = fs::read_to_string(harness.replica.join(path)).unwrap();
+            assert_eq!(replica_content, "primary version");
             harness.assert_trees_equal("resolved conflict");
         } else {
             assert!(!report.conflicts.is_empty(), "expected a conflict");
-            let alpha_content = fs::read_to_string(harness.alpha.join(path)).unwrap();
-            let beta_content = fs::read_to_string(harness.beta.join(path)).unwrap();
-            assert_eq!(alpha_content, "alpha version");
-            assert_eq!(beta_content, "beta version");
+            let primary_content = fs::read_to_string(harness.primary.join(path)).unwrap();
+            let replica_content = fs::read_to_string(harness.replica.join(path)).unwrap();
+            assert_eq!(primary_content, "primary version");
+            assert_eq!(replica_content, "replica version");
         }
     }
 }
 
 #[test]
 fn ignored_content_stays_local_to_each_side() {
-    for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayReplica] {
+    for mode in [SyncMode::TwoWaySafe, SyncMode::OneWayMirror] {
         let mut harness = Harness::new(mode, Transport::Agent).with_ignores(&["scratch", "*.log"]);
-        build_tree(&harness.alpha);
-        fs::create_dir_all(harness.alpha.join("scratch")).unwrap();
+        build_tree(&harness.primary);
+        fs::create_dir_all(harness.primary.join("scratch")).unwrap();
         fs::write(
-            harness.alpha.join("scratch/alpha-only.txt"),
-            "alpha scratch",
+            harness.primary.join("scratch/primary-only.txt"),
+            "primary scratch",
         )
         .unwrap();
-        fs::write(harness.alpha.join("dir0/debug.log"), "alpha log").unwrap();
-        fs::create_dir_all(harness.beta.join("scratch")).unwrap();
-        fs::write(harness.beta.join("scratch/beta-only.txt"), "beta scratch").unwrap();
+        fs::write(harness.primary.join("dir0/debug.log"), "primary log").unwrap();
+        fs::create_dir_all(harness.replica.join("scratch")).unwrap();
+        fs::write(
+            harness.replica.join("scratch/replica-only.txt"),
+            "replica scratch",
+        )
+        .unwrap();
 
         harness.cycle_ok();
 
         // Ignored content is untouched on both sides and never transferred.
-        assert!(harness.alpha.join("scratch/alpha-only.txt").exists());
-        assert!(harness.beta.join("scratch/beta-only.txt").exists());
-        assert!(!harness.beta.join("scratch/alpha-only.txt").exists());
-        assert!(!harness.beta.join("dir0/debug.log").exists());
+        assert!(harness.primary.join("scratch/primary-only.txt").exists());
+        assert!(harness.replica.join("scratch/replica-only.txt").exists());
+        assert!(!harness.replica.join("scratch/primary-only.txt").exists());
+        assert!(!harness.replica.join("dir0/debug.log").exists());
         // Non-ignored content synchronized normally.
-        assert!(harness.beta.join("dir0/nested/file0.txt").exists());
+        assert!(harness.replica.join("dir0/nested/file0.txt").exists());
     }
 }
 
 #[test]
 fn large_file_delta_update_over_agent() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-    fs::create_dir_all(&harness.alpha).unwrap();
+    fs::create_dir_all(&harness.primary).unwrap();
 
     // Build a ~2MB pseudo-random file, sync, then make small edits at the
     // head, middle, and tail (exercising delta reuse of unchanged blocks).
@@ -477,7 +490,7 @@ fn large_file_delta_update_over_agent() {
             .wrapping_add(1442695040888963407);
         data.extend_from_slice(&state.to_le_bytes());
     }
-    fs::write(harness.alpha.join("big.bin"), &data).unwrap();
+    fs::write(harness.primary.join("big.bin"), &data).unwrap();
     harness.cycle_ok();
     harness.assert_trees_equal("large file initial");
 
@@ -485,39 +498,39 @@ fn large_file_delta_update_over_agent() {
     let middle = data.len() / 2;
     data[middle] ^= 0xFF;
     data.extend_from_slice(b"appended tail");
-    fs::write(harness.alpha.join("big.bin"), &data).unwrap();
+    fs::write(harness.primary.join("big.bin"), &data).unwrap();
     harness.cycle_ok();
     harness.assert_trees_equal("large file delta update");
-    assert_eq!(fs::read(harness.beta.join("big.bin")).unwrap(), data);
+    assert_eq!(fs::read(harness.replica.join("big.bin")).unwrap(), data);
 }
 
 #[test]
 fn executability_and_symlink_changes_propagate() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-    build_tree(&harness.alpha);
+    build_tree(&harness.primary);
     harness.cycle_ok();
 
     // Flip executability without changing content.
-    let target = harness.alpha.join("dir0/nested/file0.txt");
+    let target = harness.primary.join("dir0/nested/file0.txt");
     fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
     // Delete a symlink.
-    fs::remove_file(harness.alpha.join("dir1/nested/link")).unwrap();
+    fs::remove_file(harness.primary.join("dir1/nested/link")).unwrap();
     harness.cycle_ok();
     harness.assert_trees_equal("executability and symlink changes");
-    let beta_mode = fs::metadata(harness.beta.join("dir0/nested/file0.txt"))
+    let replica_mode = fs::metadata(harness.replica.join("dir0/nested/file0.txt"))
         .unwrap()
         .permissions()
         .mode();
-    assert_ne!(beta_mode & 0o111, 0, "executability should propagate");
+    assert_ne!(replica_mode & 0o111, 0, "executability should propagate");
 }
 
 #[test]
 fn root_deletion_halts_for_safety() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-    build_tree(&harness.alpha);
+    build_tree(&harness.primary);
     harness.cycle_ok();
 
-    fs::remove_dir_all(&harness.alpha).unwrap();
+    fs::remove_dir_all(&harness.primary).unwrap();
     let error = harness.cycle().expect_err("root deletion must halt");
     let halt = error
         .downcast_ref::<SafetyHalt>()
@@ -527,42 +540,42 @@ fn root_deletion_halts_for_safety() {
         SafetyHalt::RootDeletion | SafetyHalt::RootEmptied
     ));
 
-    // Beta must be untouched.
-    assert!(harness.beta.join("dir0/nested/file0.txt").exists());
+    // The replica must be untouched.
+    assert!(harness.replica.join("dir0/nested/file0.txt").exists());
 }
 
 /// M-33: the one-way modes built a deletion's expected old content from
-/// beta's raw scan, ignored entries included. The endpoint refused to
+/// the replica's raw scan, ignored entries included. The endpoint refused to
 /// remove the untracked `.git` it was told to expect, the directory
 /// survived, and the next cycle proposed the same deletion, forever.
 #[test]
-fn a_one_way_deletion_goes_through_ignored_content_on_beta() {
-    for mode in [SyncMode::OneWayReplica, SyncMode::OneWaySafe] {
+fn a_one_way_deletion_goes_through_ignored_content_on_replica() {
+    for mode in [SyncMode::OneWayMirror, SyncMode::OneWaySafe] {
         let mut harness = Harness::new(mode, Transport::Local).with_ignores(&[".git"]);
-        fs::create_dir_all(harness.alpha.join("d")).unwrap();
-        fs::write(harness.alpha.join("d/f.txt"), "content").unwrap();
-        fs::write(harness.alpha.join("keep.txt"), "stays").unwrap();
+        fs::create_dir_all(harness.primary.join("d")).unwrap();
+        fs::write(harness.primary.join("d/f.txt"), "content").unwrap();
+        fs::write(harness.primary.join("keep.txt"), "stays").unwrap();
         harness.settle("initial");
-        assert!(harness.beta.join("d/f.txt").exists(), "{mode:?}");
-        fs::create_dir_all(harness.beta.join("d/.git")).unwrap();
-        fs::write(harness.beta.join("d/.git/HEAD"), "ref: refs/heads/main").unwrap();
-        harness.settle("beta's ignored content");
+        assert!(harness.replica.join("d/f.txt").exists(), "{mode:?}");
+        fs::create_dir_all(harness.replica.join("d/.git")).unwrap();
+        fs::write(harness.replica.join("d/.git/HEAD"), "ref: refs/heads/main").unwrap();
+        harness.settle("replica's ignored content");
 
-        fs::remove_dir_all(harness.alpha.join("d")).unwrap();
+        fs::remove_dir_all(harness.primary.join("d")).unwrap();
         let mut proposed = 0;
         for _ in 0..2 {
             let report = harness.cycle_ok();
-            proposed += report.beta_transitions;
-            if !harness.beta.join("d").exists() {
+            proposed += report.replica_transitions;
+            if !harness.replica.join("d").exists() {
                 break;
             }
         }
         assert!(
-            !harness.beta.join("d").exists(),
+            !harness.replica.join("d").exists(),
             "{mode:?}: the deletion did not go through within two cycles"
         );
         let report = harness.cycle_ok();
-        proposed += report.beta_transitions;
+        proposed += report.replica_transitions;
         assert!(
             proposed < 3,
             "{mode:?}: the deletion was proposed {proposed} times"
@@ -573,11 +586,11 @@ fn a_one_way_deletion_goes_through_ignored_content_on_beta() {
 #[test]
 fn emptied_root_halts_for_safety() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-    build_tree(&harness.alpha);
+    build_tree(&harness.primary);
     harness.cycle_ok();
 
-    // Empty (but keep) the alpha root.
-    for entry in fs::read_dir(&harness.alpha).unwrap() {
+    // Empty (but keep) the primary root.
+    for entry in fs::read_dir(&harness.primary).unwrap() {
         let path = entry.unwrap().path();
         if path.is_dir() {
             fs::remove_dir_all(path).unwrap();
@@ -587,30 +600,30 @@ fn emptied_root_halts_for_safety() {
     }
     let error = harness.cycle().expect_err("emptied root must halt");
     assert!(error.downcast_ref::<SafetyHalt>().is_some());
-    assert!(harness.beta.join("dir0/nested/file0.txt").exists());
+    assert!(harness.replica.join("dir0/nested/file0.txt").exists());
 }
 
 #[test]
 fn interleaved_bidirectional_activity_converges() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-    build_tree(&harness.alpha);
+    build_tree(&harness.primary);
     harness.cycle_ok();
 
     // Disjoint concurrent activity on both sides across several cycles.
-    fs::write(harness.alpha.join("dir0/nested/alpha-new.txt"), "a1").unwrap();
-    fs::write(harness.beta.join("dir1/nested/beta-new.txt"), "b1").unwrap();
+    fs::write(harness.primary.join("dir0/nested/primary-new.txt"), "a1").unwrap();
+    fs::write(harness.replica.join("dir1/nested/replica-new.txt"), "b1").unwrap();
     harness.cycle_ok();
     harness.assert_trees_equal("first interleaving");
 
-    fs::remove_file(harness.alpha.join("dir1/nested/beta-new.txt")).unwrap();
-    fs::write(harness.beta.join("dir0/nested/alpha-new.txt"), "b2").unwrap();
+    fs::remove_file(harness.primary.join("dir1/nested/replica-new.txt")).unwrap();
+    fs::write(harness.replica.join("dir0/nested/primary-new.txt"), "b2").unwrap();
     harness.cycle_ok();
     harness.assert_trees_equal("second interleaving");
     assert_eq!(
-        fs::read_to_string(harness.alpha.join("dir0/nested/alpha-new.txt")).unwrap(),
+        fs::read_to_string(harness.primary.join("dir0/nested/primary-new.txt")).unwrap(),
         "b2"
     );
-    assert!(!harness.beta.join("dir1/nested/beta-new.txt").exists());
+    assert!(!harness.replica.join("dir1/nested/replica-new.txt").exists());
 }
 
 // ── the reconnect harness: cutting the wire at every frame boundary ──
@@ -807,10 +820,10 @@ impl Harness {
         };
         let connection = Connection::from_streams(reader, writer);
         let result = (|| -> anyhow::Result<CycleReport> {
-            let beta: Box<dyn Endpoint + Send> = Box::new(RemoteEndpoint::connect(
+            let replica: Box<dyn Endpoint + Send> = Box::new(RemoteEndpoint::connect(
                 connection,
                 Initialize {
-                    root: self.beta.to_string_lossy().into_owned(),
+                    root: self.replica.to_string_lossy().into_owned(),
                     session: autobahn::session::session_identifier(
                         &self.state.to_string_lossy(),
                         "e2e",
@@ -819,7 +832,7 @@ impl Harness {
                     symlink_mode: SymlinkMode::Raw,
                     file_mode: None,
                     directory_mode: None,
-                    side: "beta".into(),
+                    side: "replica".into(),
                     staging: Default::default(),
                     max_file_size: None,
                     max_entry_count: None,
@@ -829,15 +842,15 @@ impl Harness {
                     one_shot: false,
                 },
             )?);
-            let alpha: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
-                self.alpha.clone(),
-                self.state.join("staging-alpha"),
+            let primary: Box<dyn Endpoint + Send> = Box::new(LocalEndpoint::new(
+                self.primary.clone(),
+                self.state.join("staging-primary"),
                 EndpointOptions {
                     ignores: IgnoreSet::new(&self.ignores)?,
                     ..EndpointOptions::default()
                 },
             )?);
-            let mut session = Session::new(alpha, beta, self.mode, self.state.clone())?;
+            let mut session = Session::new(primary, replica, self.mode, self.state.clone())?;
             session.run_cycle()
         })();
         let _ = child.kill();
@@ -847,7 +860,7 @@ impl Harness {
 }
 
 /// The change a cut or crashed cycle carries, and the oracle every
-/// recovery from one answers to. Alpha holds a file to rewrite, one to
+/// recovery from one answers to. The primary holds a file to rewrite, one to
 /// delete, and one to replace with a directory; the change rewrites,
 /// creates, deletes and replaces them.
 struct CutScenario {
@@ -876,23 +889,23 @@ impl CutScenario {
 
     /// The converged tree before the change.
     fn prepare(&self, harness: &mut Harness) {
-        fs::write(harness.alpha.join("stable.txt"), b"stable").unwrap();
-        fs::write(harness.alpha.join("modify.txt"), &self.old_bytes).unwrap();
-        fs::write(harness.alpha.join(GONE.0), GONE.1).unwrap();
-        fs::write(harness.alpha.join(MORPH.0), MORPH.1).unwrap();
+        fs::write(harness.primary.join("stable.txt"), b"stable").unwrap();
+        fs::write(harness.primary.join("modify.txt"), &self.old_bytes).unwrap();
+        fs::write(harness.primary.join(GONE.0), GONE.1).unwrap();
+        fs::write(harness.primary.join(MORPH.0), MORPH.1).unwrap();
         harness.cycle_ok();
         harness.cycle_ok();
         harness.assert_trees_equal("pre-cut convergence");
     }
 
-    /// The user's change on alpha, which the next cycle carries.
+    /// The user's change on the primary, which the next cycle carries.
     fn change(&self, harness: &Harness) {
-        fs::write(harness.alpha.join("modify.txt"), &self.new_bytes).unwrap();
-        fs::write(harness.alpha.join("created.bin"), &self.created).unwrap();
-        fs::remove_file(harness.alpha.join(GONE.0)).unwrap();
-        fs::remove_file(harness.alpha.join(MORPH.0)).unwrap();
-        fs::create_dir(harness.alpha.join(MORPH.0)).unwrap();
-        fs::write(harness.alpha.join(MORPH_INNER.0), MORPH_INNER.1).unwrap();
+        fs::write(harness.primary.join("modify.txt"), &self.new_bytes).unwrap();
+        fs::write(harness.primary.join("created.bin"), &self.created).unwrap();
+        fs::remove_file(harness.primary.join(GONE.0)).unwrap();
+        fs::remove_file(harness.primary.join(MORPH.0)).unwrap();
+        fs::create_dir(harness.primary.join(MORPH.0)).unwrap();
+        fs::write(harness.primary.join(MORPH_INNER.0), MORPH_INNER.1).unwrap();
     }
 
     /// Ordinary sessions over the same state, until a cycle moves nothing.
@@ -900,8 +913,8 @@ impl CutScenario {
         let mut last: Option<CycleReport> = None;
         for _ in 0..6 {
             let report = harness.cycle().expect("recovery cycles run");
-            let settled = report.alpha_transitions == 0
-                && report.beta_transitions == 0
+            let settled = report.primary_transitions == 0
+                && report.replica_transitions == 0
                 && !report.missing_staged_files;
             last = Some(report);
             if settled {
@@ -943,7 +956,7 @@ impl CutScenario {
                 other => unreachable!("{other} is not a path of the change"),
             }
         };
-        for root in [&harness.alpha, &harness.beta] {
+        for root in [&harness.primary, &harness.replica] {
             assert_eq!(
                 fs::read(root.join("stable.txt")).ok().as_deref(),
                 Some(&b"stable"[..]),
@@ -967,25 +980,25 @@ impl CutScenario {
         }
         for path in CUT_PATHS {
             let conflicted = report.conflicts.iter().any(|c| c.root == path);
-            let on_alpha = self.is_new(&harness.alpha, path);
-            let on_beta = self.is_new(&harness.beta, path);
-            if path == GONE.0 && !on_alpha && !on_beta {
+            let on_primary = self.is_new(&harness.primary, path);
+            let on_replica = self.is_new(&harness.replica, path);
+            if path == GONE.0 && !on_primary && !on_replica {
                 // An interrupted cycle drops the provenance of every path
-                // it announced, so the file beta still holds reads as a
-                // creation there and comes back to alpha. Undoing a
+                // it announced, so the file replica still holds reads as a
+                // creation there and comes back to the primary. Undoing a
                 // deletion loses nothing; only the old bytes may return.
                 continue;
             }
             if conflicted {
                 assert!(
-                    on_alpha || on_beta,
+                    on_primary || on_replica,
                     "{context}: the latest {path} survives on neither side of its conflict"
                 );
             } else {
                 assert!(
-                    on_alpha && on_beta,
-                    "{context}: the latest {path} was lost (alpha holds it: {on_alpha}, \
-                     beta: {on_beta})"
+                    on_primary && on_replica,
+                    "{context}: the latest {path} was lost (primary holds it: {on_primary}, \
+                     replica: {on_replica})"
                 );
             }
         }
@@ -1066,7 +1079,7 @@ fn the_cut_oracle_fails_a_rollback_of_the_latest_version() {
         let report = CutScenario::recover(&mut harness);
         scenario.assert_recovered(&harness, &report, "unmutated");
 
-        for root in [&harness.alpha, &harness.beta] {
+        for root in [&harness.primary, &harness.replica] {
             mutate(&scenario, root);
         }
         harness.assert_trees_equal(name);
@@ -1081,7 +1094,7 @@ fn the_cut_oracle_fails_a_rollback_of_the_latest_version() {
 }
 
 /// A restart inside the window the journal announces: the process dies
-/// after the intent is recorded — before beta's transition, after it, or
+/// after the intent is recorded — before the replica's transition, after it, or
 /// after every transition but before the achieved ancestor record — and
 /// a fresh session recovers over the same state. The same oracle as the
 /// cut sweep. The death is a panic out of the cycle hook, which unwinds
@@ -1091,8 +1104,8 @@ fn a_restart_between_the_intent_and_the_record_recovers_to_a_safe_tree() {
     let scenario = CutScenario::new();
     for transport in [Transport::Local, Transport::Agent] {
         for point in [
-            CyclePoint::BeforeBetaTransition,
-            CyclePoint::AfterBetaTransition,
+            CyclePoint::BeforeReplicaTransition,
+            CyclePoint::AfterReplicaTransition,
             CyclePoint::BeforeRecord,
         ] {
             let context = format!("{transport:?} {point:?}");
@@ -1140,7 +1153,7 @@ fn p2p_fence_and_ancestor_copy_over_the_wire() {
                 symlink_mode: SymlinkMode::Raw,
                 file_mode: None,
                 directory_mode: None,
-                side: "beta".into(),
+                side: "replica".into(),
                 staging: Default::default(),
                 max_file_size: None,
                 max_entry_count: None,
@@ -1158,17 +1171,17 @@ fn p2p_fence_and_ancestor_copy_over_the_wire() {
     // at the same term from the same leader too.
     let mut endpoint = connect();
     assert_eq!(
-        endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap(),
+        endpoint.lease(&Lease::new("primary", 5, ttl)).unwrap(),
         LeaseAnswer::Accepted
     );
     assert_eq!(
-        endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap(),
+        endpoint.lease(&Lease::new("primary", 5, ttl)).unwrap(),
         LeaseAnswer::Accepted
     );
     let state = endpoint.p2p_state().unwrap();
     assert_eq!(
         state.lease.as_ref().map(|l| (l.term, l.leader.as_str())),
-        Some((5, "alpha"))
+        Some((5, "primary"))
     );
     assert_eq!(state.generation, None, "no ancestor copy yet");
 
@@ -1182,13 +1195,13 @@ fn p2p_fence_and_ancestor_copy_over_the_wire() {
     // Before the old leader presents anything again, its next write is
     // refused all the same, and ends its cycle fenced by the newer lease.
     let error = endpoint
-        .put_p2p_file("name", b"alpha")
+        .put_p2p_file("name", b"primary")
         .expect_err("a write under a superseded lease is refused");
     match error.downcast_ref::<autobahn::p2p::Fenced>() {
         Some(fenced) => assert_eq!(fenced.current.term, 6),
         None => panic!("the refusal should end the cycle fenced: {error:#}"),
     }
-    match endpoint.lease(&Lease::new("alpha", 5, ttl)).unwrap() {
+    match endpoint.lease(&Lease::new("primary", 5, ttl)).unwrap() {
         LeaseAnswer::Refused { current } => {
             assert_eq!(current.term, 6);
             assert_eq!(current.leader, "u@h:/x");
@@ -1216,7 +1229,7 @@ fn p2p_fence_and_ancestor_copy_over_the_wire() {
     ));
     // Presenting a higher term lifts the fence.
     assert_eq!(
-        endpoint.lease(&Lease::new("alpha", 7, ttl)).unwrap(),
+        endpoint.lease(&Lease::new("primary", 7, ttl)).unwrap(),
         LeaseAnswer::Accepted
     );
     endpoint
@@ -1266,7 +1279,7 @@ fn p2p_fence_and_ancestor_copy_over_the_wire() {
         autobahn::p2p::copy_writer(&autobahn::p2p::directory().unwrap(), &session)
             .unwrap()
             .as_deref(),
-        Some("alpha")
+        Some("primary")
     );
 
     // A fresh connection sees what the host holds: the copy survived.
@@ -1300,50 +1313,54 @@ mod collisions {
         fs::read_to_string(root.join(PATH)).unwrap_or_else(|e| panic!("{}: {e}", root.display()))
     }
 
-    /// Alpha's edit is on its way to beta; beta is edited after its scan
+    /// The primary's edit is on its way to the replica; the replica is edited after its scan
     /// and before the publish. The publish must refuse — the file on disk
     /// is not the one the transition was validated against — and the
     /// next cycle sees two edits of one file: a conflict in safe mode,
-    /// alpha's version in resolved mode.
+    /// the primary's version in resolved mode.
     #[test]
-    fn a_write_on_beta_before_its_publish_is_refused_not_overwritten() {
+    fn a_write_on_replica_before_its_publish_is_refused_not_overwritten() {
         for transport in BOTH {
-            for point in [CyclePoint::AfterScans, CyclePoint::BeforeBetaTransition] {
-                for (mode, alpha_wins) in [
+            for point in [CyclePoint::AfterScans, CyclePoint::BeforeReplicaTransition] {
+                for (mode, primary_wins) in [
                     (SyncMode::TwoWaySafe, false),
                     (SyncMode::TwoWayResolved, true),
                 ] {
                     let context = format!("{transport:?}/{point:?}/{mode:?}");
                     let mut harness = Harness::new(mode, transport);
-                    build_tree(&harness.alpha);
+                    build_tree(&harness.primary);
                     harness.cycle_ok();
 
-                    fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
-                    let beta = harness.beta.clone();
+                    fs::write(harness.primary.join(PATH), "primary v2").unwrap();
+                    let replica = harness.replica.clone();
                     let report = harness
                         .cycle_at(point, move || {
-                            fs::write(beta.join(PATH), "beta late").unwrap()
+                            fs::write(replica.join(PATH), "replica late").unwrap()
                         })
                         .unwrap_or_else(|e| panic!("{context}: {e:#}"));
 
                     // The late write survived the cycle that raced it.
-                    assert_eq!(read(&harness.beta), "beta late", "{context}: overwritten");
-                    assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
+                    assert_eq!(
+                        read(&harness.replica),
+                        "replica late",
+                        "{context}: overwritten"
+                    );
+                    assert_eq!(read(&harness.primary), "primary v2", "{context}");
                     assert!(
                         report
-                            .beta_transition_problems
+                            .replica_transition_problems
                             .iter()
                             .any(|p| p.path == PATH),
                         "{context}: the refusal was not reported: {:?}",
-                        report.beta_transition_problems
+                        report.replica_transition_problems
                     );
 
                     // Then the mode decides.
                     let report = harness.cycle_ok();
-                    if alpha_wins {
+                    if primary_wins {
                         assert!(report.conflicts.is_empty(), "{context}");
                         harness.settle(&context);
-                        assert_eq!(read(&harness.beta), "alpha v2", "{context}");
+                        assert_eq!(read(&harness.replica), "primary v2", "{context}");
                         harness.assert_trees_equal(&context);
                     } else {
                         assert!(
@@ -1351,51 +1368,55 @@ mod collisions {
                             "{context}: expected a conflict at {PATH}, got {:?}",
                             report.conflicts
                         );
-                        assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
-                        assert_eq!(read(&harness.beta), "beta late", "{context}");
+                        assert_eq!(read(&harness.primary), "primary v2", "{context}");
+                        assert_eq!(read(&harness.replica), "replica late", "{context}");
                     }
                 }
             }
         }
     }
 
-    /// The mirror image: beta's edit is on its way to alpha, and alpha is
+    /// The mirror image: the replica's edit is on its way to the primary, and the primary is
     /// edited before the publish.
     #[test]
-    fn a_write_on_alpha_before_its_publish_is_refused_not_overwritten() {
+    fn a_write_on_primary_before_its_publish_is_refused_not_overwritten() {
         for transport in BOTH {
-            for (mode, alpha_wins) in [
+            for (mode, primary_wins) in [
                 (SyncMode::TwoWaySafe, false),
                 (SyncMode::TwoWayResolved, true),
             ] {
                 let context = format!("{transport:?}/{mode:?}");
                 let mut harness = Harness::new(mode, transport);
-                build_tree(&harness.alpha);
+                build_tree(&harness.primary);
                 harness.cycle_ok();
 
-                fs::write(harness.beta.join(PATH), "beta v2").unwrap();
-                let alpha = harness.alpha.clone();
+                fs::write(harness.replica.join(PATH), "replica v2").unwrap();
+                let primary = harness.primary.clone();
                 let report = harness
-                    .cycle_at(CyclePoint::BeforeAlphaTransition, move || {
-                        fs::write(alpha.join(PATH), "alpha late").unwrap()
+                    .cycle_at(CyclePoint::BeforePrimaryTransition, move || {
+                        fs::write(primary.join(PATH), "primary late").unwrap()
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
 
-                assert_eq!(read(&harness.alpha), "alpha late", "{context}: overwritten");
-                assert_eq!(read(&harness.beta), "beta v2", "{context}");
+                assert_eq!(
+                    read(&harness.primary),
+                    "primary late",
+                    "{context}: overwritten"
+                );
+                assert_eq!(read(&harness.replica), "replica v2", "{context}");
                 assert!(
                     report
-                        .alpha_transition_problems
+                        .primary_transition_problems
                         .iter()
                         .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
                 let report = harness.cycle_ok();
-                if alpha_wins {
+                if primary_wins {
                     assert!(report.conflicts.is_empty(), "{context}");
                     harness.settle(&context);
-                    assert_eq!(read(&harness.beta), "alpha late", "{context}");
+                    assert_eq!(read(&harness.replica), "primary late", "{context}");
                     harness.assert_trees_equal(&context);
                 } else {
                     assert!(
@@ -1403,30 +1424,30 @@ mod collisions {
                         "{context}: expected a conflict, got {:?}",
                         report.conflicts
                     );
-                    assert_eq!(read(&harness.alpha), "alpha late", "{context}");
-                    assert_eq!(read(&harness.beta), "beta v2", "{context}");
+                    assert_eq!(read(&harness.primary), "primary late", "{context}");
+                    assert_eq!(read(&harness.replica), "replica v2", "{context}");
                 }
             }
         }
     }
 
-    /// Alpha is edited again after its scan, while the cycle is carrying
+    /// Primary is edited again after its scan, while the cycle is carrying
     /// the earlier edit. The bytes pulled are the newer ones and the
     /// transition names the older digest; the two must never be paired.
     /// Whatever the cycle does with that, the next cycles carry the newer
     /// edit and the sides end equal.
     #[test]
-    fn a_second_write_on_alpha_after_its_scan_is_carried_not_mislabeled() {
+    fn a_second_write_on_primary_after_its_scan_is_carried_not_mislabeled() {
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
+            build_tree(&harness.primary);
             harness.cycle_ok();
 
-            fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
-            let alpha = harness.alpha.clone();
+            fs::write(harness.primary.join(PATH), "primary v2").unwrap();
+            let primary = harness.primary.clone();
             let outcome = harness.cycle_at(CyclePoint::AfterScans, move || {
-                fs::write(alpha.join(PATH), "alpha v3, longer").unwrap()
+                fs::write(primary.join(PATH), "primary v3, longer").unwrap()
             });
             // A refused or re-fetched transfer is fine; a halt is not.
             if let Err(error) = &outcome {
@@ -1435,16 +1456,16 @@ mod collisions {
                     "{context}: halted: {error:#}"
                 );
             }
-            // Beta never holds content the ancestor would misdescribe:
+            // The replica never holds content the ancestor would misdescribe:
             // either the old version, or the new one, never a mix.
-            let now = read(&harness.beta);
+            let now = read(&harness.replica);
             assert!(
-                now == "content 1/1" || now == "alpha v3, longer",
-                "{context}: beta holds {now:?}"
+                now == "content 1/1" || now == "primary v3, longer",
+                "{context}: replica holds {now:?}"
             );
 
             harness.settle(&context);
-            assert_eq!(read(&harness.beta), "alpha v3, longer", "{context}");
+            assert_eq!(read(&harness.replica), "primary v3, longer", "{context}");
             harness.assert_trees_equal(&context);
             let report = harness.cycle_ok();
             assert!(
@@ -1455,12 +1476,12 @@ mod collisions {
         }
     }
 
-    /// Alpha deleted the file; beta edits it before the deletion is
+    /// Primary deleted the file; the replica edits it before the deletion is
     /// applied. The deletion must be refused, and the edit then wins over
     /// the deletion — the reconciler's rule for a modification against a
-    /// deletion — landing back on alpha.
+    /// deletion — landing back on the primary.
     #[test]
-    fn a_write_on_beta_racing_a_deletion_keeps_the_edit() {
+    fn a_write_on_replica_racing_a_deletion_keeps_the_edit() {
         for transport in BOTH {
             for (mode, strict) in [
                 (SyncMode::TwoWaySafe, false),
@@ -1469,26 +1490,26 @@ mod collisions {
             ] {
                 let context = format!("{transport:?}/{mode:?}");
                 let mut harness = Harness::new(mode, transport);
-                build_tree(&harness.alpha);
+                build_tree(&harness.primary);
                 harness.cycle_ok();
 
-                fs::remove_file(harness.alpha.join(PATH)).unwrap();
-                let beta = harness.beta.clone();
+                fs::remove_file(harness.primary.join(PATH)).unwrap();
+                let replica = harness.replica.clone();
                 let report = harness
-                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                        fs::write(beta.join(PATH), "beta edit").unwrap()
+                    .cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                        fs::write(replica.join(PATH), "replica edit").unwrap()
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 // Refused in every mode: the racing cycle never deletes
                 // what it did not validate. The mode decides next cycle.
                 assert_eq!(
-                    read(&harness.beta),
-                    "beta edit",
+                    read(&harness.replica),
+                    "replica edit",
                     "{context}: the edit was deleted"
                 );
                 assert!(
                     report
-                        .beta_transition_problems
+                        .replica_transition_problems
                         .iter()
                         .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
@@ -1497,13 +1518,16 @@ mod collisions {
                 harness.settle(&context);
                 if strict {
                     assert!(
-                        !exists(&harness.alpha, PATH),
+                        !exists(&harness.primary, PATH),
                         "{context}: the deletion was undone"
                     );
-                    assert!(!exists(&harness.beta, PATH), "{context}: the edit survived");
+                    assert!(
+                        !exists(&harness.replica, PATH),
+                        "{context}: the edit survived"
+                    );
                 } else {
-                    assert_eq!(read(&harness.alpha), "beta edit", "{context}");
-                    assert_eq!(read(&harness.beta), "beta edit", "{context}");
+                    assert_eq!(read(&harness.primary), "replica edit", "{context}");
+                    assert_eq!(read(&harness.replica), "replica edit", "{context}");
                 }
                 harness.assert_trees_equal(&context);
             }
@@ -1516,46 +1540,50 @@ mod collisions {
         root.join(path).exists()
     }
 
-    /// Alpha turned the file into a directory; beta edits the file before
+    /// Primary turned the file into a directory; the replica edits the file before
     /// the replacement lands. The replacement is refused — the file is not
     /// the one validated against — and the next cycle sees a file edited
     /// on one side and replaced by a directory on the other: a conflict in
     /// safe mode, the directory in resolved mode.
     #[test]
-    fn a_file_edited_on_beta_while_alpha_replaces_it_with_a_directory() {
+    fn a_file_edited_on_replica_while_primary_replaces_it_with_a_directory() {
         for transport in BOTH {
-            for (mode, alpha_wins) in [
+            for (mode, primary_wins) in [
                 (SyncMode::TwoWaySafe, false),
                 (SyncMode::TwoWayResolved, true),
             ] {
                 let context = format!("{transport:?}/{mode:?}");
                 let mut harness = Harness::new(mode, transport);
-                build_tree(&harness.alpha);
+                build_tree(&harness.primary);
                 harness.cycle_ok();
 
-                fs::remove_file(harness.alpha.join(PATH)).unwrap();
-                fs::create_dir(harness.alpha.join(PATH)).unwrap();
-                fs::write(harness.alpha.join(PATH).join("inner.txt"), "inner").unwrap();
-                let beta = harness.beta.clone();
+                fs::remove_file(harness.primary.join(PATH)).unwrap();
+                fs::create_dir(harness.primary.join(PATH)).unwrap();
+                fs::write(harness.primary.join(PATH).join("inner.txt"), "inner").unwrap();
+                let replica = harness.replica.clone();
                 let report = harness
-                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                        fs::write(beta.join(PATH), "beta late").unwrap()
+                    .cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                        fs::write(replica.join(PATH), "replica late").unwrap()
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-                assert_eq!(read(&harness.beta), "beta late", "{context}: overwritten");
+                assert_eq!(
+                    read(&harness.replica),
+                    "replica late",
+                    "{context}: overwritten"
+                );
                 assert!(
                     report
-                        .beta_transition_problems
+                        .replica_transition_problems
                         .iter()
                         .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
                 let report = harness.cycle_ok();
-                if alpha_wins {
+                if primary_wins {
                     assert!(report.conflicts.is_empty(), "{context}");
                     harness.settle(&context);
-                    assert!(harness.beta.join(PATH).is_dir(), "{context}");
+                    assert!(harness.replica.join(PATH).is_dir(), "{context}");
                     harness.assert_trees_equal(&context);
                 } else {
                     assert!(
@@ -1563,55 +1591,55 @@ mod collisions {
                         "{context}: expected a conflict, got {:?}",
                         report.conflicts
                     );
-                    assert!(harness.alpha.join(PATH).is_dir(), "{context}");
-                    assert_eq!(read(&harness.beta), "beta late", "{context}");
+                    assert!(harness.primary.join(PATH).is_dir(), "{context}");
+                    assert_eq!(read(&harness.replica), "replica late", "{context}");
                 }
             }
         }
     }
 
-    /// The other way round: alpha's edit is on its way, and beta turns the
+    /// The other way round: the primary's edit is on its way, and replica turns the
     /// file into a directory before it lands. The edit is refused — there
     /// is no file to replace — and the next cycle sees the same two-sided
-    /// change: a conflict, or alpha's file back in place of the directory.
+    /// change: a conflict, or the primary's file back in place of the directory.
     #[test]
-    fn a_file_replaced_by_a_directory_on_beta_while_alpha_edits_it() {
+    fn a_file_replaced_by_a_directory_on_replica_while_primary_edits_it() {
         for transport in BOTH {
-            for (mode, alpha_wins) in [
+            for (mode, primary_wins) in [
                 (SyncMode::TwoWaySafe, false),
                 (SyncMode::TwoWayResolved, true),
             ] {
                 let context = format!("{transport:?}/{mode:?}");
                 let mut harness = Harness::new(mode, transport);
-                build_tree(&harness.alpha);
+                build_tree(&harness.primary);
                 harness.cycle_ok();
 
-                fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
-                let beta = harness.beta.clone();
+                fs::write(harness.primary.join(PATH), "primary v2").unwrap();
+                let replica = harness.replica.clone();
                 let report = harness
-                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                        fs::remove_file(beta.join(PATH)).unwrap();
-                        fs::create_dir(beta.join(PATH)).unwrap();
-                        fs::write(beta.join(PATH).join("inner.txt"), "beta inner").unwrap();
+                    .cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                        fs::remove_file(replica.join(PATH)).unwrap();
+                        fs::create_dir(replica.join(PATH)).unwrap();
+                        fs::write(replica.join(PATH).join("inner.txt"), "replica inner").unwrap();
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 assert!(
-                    harness.beta.join(PATH).is_dir(),
+                    harness.replica.join(PATH).is_dir(),
                     "{context}: the directory was replaced"
                 );
                 assert!(
                     report
-                        .beta_transition_problems
+                        .replica_transition_problems
                         .iter()
                         .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
                 );
 
                 let report = harness.cycle_ok();
-                if alpha_wins {
+                if primary_wins {
                     assert!(report.conflicts.is_empty(), "{context}");
                     harness.settle(&context);
-                    assert_eq!(read(&harness.beta), "alpha v2", "{context}");
+                    assert_eq!(read(&harness.replica), "primary v2", "{context}");
                     harness.assert_trees_equal(&context);
                 } else {
                     assert!(
@@ -1619,56 +1647,56 @@ mod collisions {
                         "{context}: expected a conflict, got {:?}",
                         report.conflicts
                     );
-                    assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
-                    assert!(harness.beta.join(PATH).is_dir(), "{context}");
+                    assert_eq!(read(&harness.primary), "primary v2", "{context}");
+                    assert!(harness.replica.join(PATH).is_dir(), "{context}");
                 }
             }
         }
     }
 
-    /// Both sides create the same new name, alpha as a directory and beta
-    /// as a file, beta's landing while alpha's is on its way. The creation
+    /// Both sides create the same new name, primary as a directory and replica
+    /// as a file, the replica's landing while the primary's is on its way. The creation
     /// is refused — something is already there — and the next cycle sees
-    /// two creations: a conflict, or alpha's directory.
+    /// two creations: a conflict, or the primary's directory.
     #[test]
-    fn a_name_created_as_a_file_on_beta_while_alpha_creates_a_directory() {
+    fn a_name_created_as_a_file_on_replica_while_primary_creates_a_directory() {
         const NEW: &str = "dir0/nested/fresh";
         for transport in BOTH {
-            for (mode, alpha_wins) in [
+            for (mode, primary_wins) in [
                 (SyncMode::TwoWaySafe, false),
                 (SyncMode::TwoWayResolved, true),
             ] {
                 let context = format!("{transport:?}/{mode:?}");
                 let mut harness = Harness::new(mode, transport);
-                build_tree(&harness.alpha);
+                build_tree(&harness.primary);
                 harness.cycle_ok();
 
-                fs::create_dir(harness.alpha.join(NEW)).unwrap();
-                fs::write(harness.alpha.join(NEW).join("inner.txt"), "inner").unwrap();
-                let beta = harness.beta.clone();
+                fs::create_dir(harness.primary.join(NEW)).unwrap();
+                fs::write(harness.primary.join(NEW).join("inner.txt"), "inner").unwrap();
+                let replica = harness.replica.clone();
                 let report = harness
-                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                        fs::write(beta.join(NEW), "beta file").unwrap()
+                    .cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                        fs::write(replica.join(NEW), "replica file").unwrap()
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 assert!(
-                    harness.beta.join(NEW).is_file(),
+                    harness.replica.join(NEW).is_file(),
                     "{context}: the file was replaced"
                 );
                 assert!(
                     report
-                        .beta_transition_problems
+                        .replica_transition_problems
                         .iter()
                         .any(|p| p.path == NEW),
                     "{context}: the refusal was not reported: {:?}",
-                    report.beta_transition_problems
+                    report.replica_transition_problems
                 );
 
                 let report = harness.cycle_ok();
-                if alpha_wins {
+                if primary_wins {
                     assert!(report.conflicts.is_empty(), "{context}");
                     harness.settle(&context);
-                    assert!(harness.beta.join(NEW).is_dir(), "{context}");
+                    assert!(harness.replica.join(NEW).is_dir(), "{context}");
                     harness.assert_trees_equal(&context);
                 } else {
                     assert!(
@@ -1676,20 +1704,20 @@ mod collisions {
                         "{context}: expected a conflict, got {:?}",
                         report.conflicts
                     );
-                    assert!(harness.alpha.join(NEW).is_dir(), "{context}");
-                    assert!(harness.beta.join(NEW).is_file(), "{context}");
+                    assert!(harness.primary.join(NEW).is_dir(), "{context}");
+                    assert!(harness.replica.join(NEW).is_file(), "{context}");
                 }
             }
         }
     }
 
-    /// Alpha renamed the file — a deletion at the old name and a creation
-    /// at the new one — and beta edits the old name before the deletion
+    /// Primary renamed the file — a deletion at the old name and a creation
+    /// at the new one — and the replica edits the old name before the deletion
     /// lands. The deletion is refused, the creation goes through, and the
-    /// next cycle carries the edit back to alpha: an edit against a
+    /// next cycle carries the edit back to the primary: an edit against a
     /// deletion keeps the edit. Both names end up on both sides.
     #[test]
-    fn a_file_edited_on_beta_while_alpha_renames_it() {
+    fn a_file_edited_on_replica_while_primary_renames_it() {
         const RENAMED: &str = "dir1/nested/file1-renamed.txt";
         for transport in BOTH {
             for (mode, strict) in [
@@ -1699,31 +1727,31 @@ mod collisions {
             ] {
                 let context = format!("{transport:?}/{mode:?}");
                 let mut harness = Harness::new(mode, transport);
-                build_tree(&harness.alpha);
+                build_tree(&harness.primary);
                 harness.cycle_ok();
 
-                fs::rename(harness.alpha.join(PATH), harness.alpha.join(RENAMED)).unwrap();
-                let beta = harness.beta.clone();
+                fs::rename(harness.primary.join(PATH), harness.primary.join(RENAMED)).unwrap();
+                let replica = harness.replica.clone();
                 let report = harness
-                    .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                        fs::write(beta.join(PATH), "beta edit").unwrap()
+                    .cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                        fs::write(replica.join(PATH), "replica edit").unwrap()
                     })
                     .unwrap_or_else(|e| panic!("{context}: {e:#}"));
                 // The racing cycle refuses in every mode: the edit is not
                 // the file the deletion was validated against.
                 assert_eq!(
-                    read(&harness.beta),
-                    "beta edit",
+                    read(&harness.replica),
+                    "replica edit",
                     "{context}: the edit was deleted"
                 );
                 assert_eq!(
-                    fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
+                    fs::read_to_string(harness.replica.join(RENAMED)).unwrap(),
                     "content 1/1",
                     "{context}: the new name did not arrive"
                 );
                 assert!(
                     report
-                        .beta_transition_problems
+                        .replica_transition_problems
                         .iter()
                         .any(|p| p.path == PATH),
                     "{context}: the refusal was not reported"
@@ -1731,19 +1759,22 @@ mod collisions {
 
                 harness.settle(&context);
                 if strict {
-                    // Alpha's deletion is final: the rename stands, the
+                    // The primary's deletion is final: the rename stands, the
                     // edit is gone.
                     assert!(
-                        !exists(&harness.alpha, PATH),
+                        !exists(&harness.primary, PATH),
                         "{context}: the rename was undone"
                     );
-                    assert!(!exists(&harness.beta, PATH), "{context}: the edit survived");
+                    assert!(
+                        !exists(&harness.replica, PATH),
+                        "{context}: the edit survived"
+                    );
                 } else {
                     // The edit beats the deletion: the rename is undone.
-                    assert_eq!(read(&harness.alpha), "beta edit", "{context}");
+                    assert_eq!(read(&harness.primary), "replica edit", "{context}");
                 }
                 assert!(
-                    exists(&harness.alpha, RENAMED) && exists(&harness.beta, RENAMED),
+                    exists(&harness.primary, RENAMED) && exists(&harness.replica, RENAMED),
                     "{context}"
                 );
                 harness.assert_trees_equal(&context);
@@ -1751,24 +1782,24 @@ mod collisions {
         }
     }
 
-    /// Alpha's edit is on its way, and beta renames the file away before
+    /// The primary's edit is on its way, and the replica renames the file away before
     /// it lands. Whatever the racing cycle makes of a replacement with
     /// nothing to replace, the edit must end up under the old name on both
     /// sides and the renamed copy under the new one — no version of the
     /// file is lost, and nothing conflicts.
     #[test]
-    fn a_file_renamed_on_beta_while_alpha_edits_it() {
+    fn a_file_renamed_on_replica_while_primary_edits_it() {
         const RENAMED: &str = "dir1/nested/file1-moved.txt";
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
+            build_tree(&harness.primary);
             harness.cycle_ok();
 
-            fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
-            let beta = harness.beta.clone();
-            let outcome = harness.cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                fs::rename(beta.join(PATH), beta.join(RENAMED)).unwrap()
+            fs::write(harness.primary.join(PATH), "primary v2").unwrap();
+            let replica = harness.replica.clone();
+            let outcome = harness.cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                fs::rename(replica.join(PATH), replica.join(RENAMED)).unwrap()
             });
             if let Err(error) = &outcome {
                 assert!(
@@ -1777,16 +1808,16 @@ mod collisions {
                 );
             }
             assert_eq!(
-                fs::read_to_string(harness.beta.join(RENAMED)).unwrap(),
+                fs::read_to_string(harness.replica.join(RENAMED)).unwrap(),
                 "content 1/1",
                 "{context}: the renamed copy was touched"
             );
 
             harness.settle(&context);
-            assert_eq!(read(&harness.alpha), "alpha v2", "{context}");
-            assert_eq!(read(&harness.beta), "alpha v2", "{context}");
+            assert_eq!(read(&harness.primary), "primary v2", "{context}");
+            assert_eq!(read(&harness.replica), "primary v2", "{context}");
             assert_eq!(
-                fs::read_to_string(harness.alpha.join(RENAMED)).unwrap(),
+                fs::read_to_string(harness.primary.join(RENAMED)).unwrap(),
                 "content 1/1",
                 "{context}: the renamed copy did not arrive"
             );
@@ -1800,45 +1831,48 @@ mod collisions {
         }
     }
 
-    /// Alpha renamed a whole directory, and beta writes a new file into the
+    /// Primary renamed a whole directory, and the replica writes a new file into the
     /// old one before its removal lands. The removal is refused (the
     /// directory no longer holds what was validated), the new name arrives
     /// beside it, and the next cycle keeps the new file: a creation inside
     /// a directory the other side deleted wins over the deletion, which —
-    /// by the reconciler's rule — brings the whole directory back to alpha.
+    /// by the reconciler's rule — brings the whole directory back to the primary.
     /// Nothing is lost; the rename is undone rather than the file.
     #[test]
-    fn a_file_added_on_beta_inside_a_directory_alpha_renames() {
+    fn a_file_added_on_replica_inside_a_directory_primary_renames() {
         const RENAMED: &str = "dir2/nested-renamed";
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
+            build_tree(&harness.primary);
             harness.cycle_ok();
 
-            fs::rename(harness.alpha.join(DIR), harness.alpha.join(RENAMED)).unwrap();
-            let beta = harness.beta.clone();
+            fs::rename(harness.primary.join(DIR), harness.primary.join(RENAMED)).unwrap();
+            let replica = harness.replica.clone();
             let report = harness
-                .cycle_at(CyclePoint::BeforeBetaTransition, move || {
-                    fs::write(beta.join(DIR).join("added.txt"), "added on beta").unwrap()
+                .cycle_at(CyclePoint::BeforeReplicaTransition, move || {
+                    fs::write(replica.join(DIR).join("added.txt"), "added on replica").unwrap()
                 })
                 .unwrap_or_else(|e| panic!("{context}: {e:#}"));
             assert!(
-                exists(&harness.beta, "dir2/nested/added.txt"),
+                exists(&harness.replica, "dir2/nested/added.txt"),
                 "{context}: the added file was deleted"
             );
             assert!(
-                exists(&harness.beta, RENAMED),
+                exists(&harness.replica, RENAMED),
                 "{context}: the renamed directory did not arrive"
             );
             assert!(
-                !report.beta_transition_problems.is_empty(),
+                !report.replica_transition_problems.is_empty(),
                 "{context}: the refusal was not reported"
             );
 
             harness.settle(&context);
-            assert!(exists(&harness.alpha, "dir2/nested/added.txt"), "{context}");
-            assert!(exists(&harness.alpha, RENAMED), "{context}");
+            assert!(
+                exists(&harness.primary, "dir2/nested/added.txt"),
+                "{context}"
+            );
+            assert!(exists(&harness.primary, RENAMED), "{context}");
             harness.assert_trees_equal(&context);
             let report = harness.cycle_ok();
             assert!(
@@ -1849,28 +1883,28 @@ mod collisions {
         }
     }
 
-    /// A write on beta right after alpha's edit was published there. The
-    /// cycle completes as a clean propagation; the write is a fresh beta
-    /// edit that the next cycle carries to alpha — which is only true if
+    /// A write on the replica right after the primary's edit was published there. The
+    /// cycle completes as a clean propagation; the write is a fresh replica
+    /// edit that the next cycle carries to the primary — which is only true if
     /// the endpoint re-announces the paths it just wrote, so the scan
     /// after does not adopt the tree it published.
     #[test]
-    fn a_write_on_beta_right_after_the_publish_is_seen_next_cycle() {
+    fn a_write_on_replica_right_after_the_publish_is_seen_next_cycle() {
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
+            build_tree(&harness.primary);
             harness.cycle_ok();
 
-            fs::write(harness.alpha.join(PATH), "alpha v2").unwrap();
-            let beta = harness.beta.clone();
+            fs::write(harness.primary.join(PATH), "primary v2").unwrap();
+            let replica = harness.replica.clone();
             let report = harness
-                .cycle_at(CyclePoint::AfterBetaTransition, move || {
-                    fs::write(beta.join(PATH), "beta after").unwrap()
+                .cycle_at(CyclePoint::AfterReplicaTransition, move || {
+                    fs::write(replica.join(PATH), "replica after").unwrap()
                 })
                 .unwrap_or_else(|e| panic!("{context}: {e:#}"));
-            assert!(report.beta_transition_problems.is_empty(), "{context}");
-            assert_eq!(read(&harness.beta), "beta after", "{context}");
+            assert!(report.replica_transition_problems.is_empty(), "{context}");
+            assert_eq!(read(&harness.replica), "replica after", "{context}");
 
             let report = harness.cycle_ok();
             assert!(
@@ -1878,7 +1912,11 @@ mod collisions {
                 "{context}: {:?}",
                 report.conflicts
             );
-            assert_eq!(read(&harness.alpha), "beta after", "{context}: not carried");
+            assert_eq!(
+                read(&harness.primary),
+                "replica after",
+                "{context}: not carried"
+            );
             harness.assert_trees_equal(&context);
         }
     }
@@ -1889,13 +1927,13 @@ mod collisions {
 /// snapshot instead of asking the agent again. Over the agent transport,
 /// where the skipped scan is a round trip.
 #[test]
-fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
+fn a_standing_watch_lets_the_next_cycle_skip_the_replica_scan() {
     let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Agent);
-    build_tree(&harness.alpha);
+    build_tree(&harness.primary);
     let mut session = harness.session().expect("session");
     let report = session.run_cycle().expect("initial cycle");
     assert!(
-        !report.beta_scan_skipped,
+        !report.replica_scan_skipped,
         "the first cycle has nothing to reuse"
     );
     // Quiet: a wait that returns false. Late watcher events for the trees
@@ -1915,45 +1953,48 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
     }
     assert!(quiet, "the pair never went quiet");
 
-    // Alpha's edit lands during a wait, not before one. Every wait ends
-    // with beta's watch request running out at the same moment, and its
+    // The primary's edit lands during a wait, not before one. Every wait ends
+    // with the replica's watch request running out at the same moment, and its
     // "nothing changed" answer arriving just after: from then until the
-    // next wait asks again, beta's watch is not standing, and a cycle
-    // rightly scans it. Edited a second into a wait, beta's request has
+    // next wait asks again, the replica's watch is not standing, and a cycle
+    // rightly scans it. Edited a second into a wait, the replica's request has
     // been renewed and has most of its time left when the cycle runs.
-    let alpha_file = harness.alpha.join("dir0/nested/file0.txt");
+    let primary_file = harness.primary.join("dir0/nested/file0.txt");
     let editor = std::thread::spawn(move || {
         std::thread::sleep(std::time::Duration::from_secs(1));
-        fs::write(alpha_file, "edited on alpha").unwrap();
+        fs::write(primary_file, "edited on primary").unwrap();
     });
     assert!(
         session
             .await_change(std::time::Duration::from_secs(5))
             .expect("wait"),
-        "alpha's edit wakes the wait"
+        "primary's edit wakes the wait"
     );
     editor.join().unwrap();
     let report = session.run_cycle().expect("cycle");
     assert!(
-        report.beta_scan_skipped,
-        "beta's watch was standing: its scan is skipped"
+        report.replica_scan_skipped,
+        "replica's watch was standing: its scan is skipped"
     );
-    assert!(!report.alpha_scan_skipped, "alpha changed: it is scanned");
-    assert_eq!(report.beta_transitions, 1);
+    assert!(
+        !report.primary_scan_skipped,
+        "primary changed: it is scanned"
+    );
+    assert_eq!(report.replica_transitions, 1);
     harness.assert_trees_equal("after the skipped scan");
 
-    // Beta changes: its watch answers, and a cycle scans it. Not always
-    // the very next one — a wake from alpha's side, or a late event from
-    // an earlier transition, can bring a cycle (even one that scans beta)
+    // The replica changes: its watch answers, and a cycle scans it. Not always
+    // the very next one — a wake from the primary's side, or a late event from
+    // an earlier transition, can bring a cycle (even one that scans replica)
     // before the kernel has reported this edit; the watch fires moments
     // later and a cycle after carries it. Never lost, only late: so the
-    // test waits for the edit to land on alpha, within a bound, and
-    // separately requires that some cycle on the way scanned beta.
+    // test waits for the edit to land on the primary, within a bound, and
+    // separately requires that some cycle on the way scanned replica.
     const EDIT: &str = "dir1/nested/file1.txt";
-    fs::write(harness.beta.join(EDIT), "edited on beta").unwrap();
+    fs::write(harness.replica.join(EDIT), "edited on replica").unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
     let landed = |harness: &Harness| {
-        fs::read_to_string(harness.alpha.join(EDIT)).is_ok_and(|s| s == "edited on beta")
+        fs::read_to_string(harness.primary.join(EDIT)).is_ok_and(|s| s == "edited on replica")
     };
     let mut scanned = false;
     let mut cycles = 0;
@@ -1962,33 +2003,33 @@ fn a_standing_watch_lets_the_next_cycle_skip_the_beta_scan() {
         if left.is_zero() {
             break;
         }
-        // A quiet wait is not a failure: the cycle after it reuses beta's
+        // A quiet wait is not a failure: the cycle after it reuses the replica's
         // snapshot, and the bound decides.
         session
             .await_change(left.min(std::time::Duration::from_secs(5)))
             .expect("wait");
         let report = session.run_cycle().expect("cycle");
         cycles += 1;
-        scanned |= !report.beta_scan_skipped;
+        scanned |= !report.replica_scan_skipped;
     }
     assert!(
         landed(&harness),
-        "beta's edit did not reach alpha within {cycles} cycles or 20 s"
+        "replica's edit did not reach primary within {cycles} cycles or 20 s"
     );
     assert!(
         scanned,
-        "beta's edit arrived without any cycle scanning beta"
+        "replica's edit arrived without any cycle scanning replica"
     );
     drop(session);
-    harness.assert_trees_equal("after beta's edit");
+    harness.assert_trees_equal("after replica's edit");
 }
 
-/// Two sessions of a fan-out, over one alpha, running at the same time.
+/// Two sessions of a fan-out, over one primary, running at the same time.
 /// One is held by the cycle hook at the point where it is about to write
-/// alpha while the other runs a whole cycle through the same alpha, then
-/// released. Its write must be refused — alpha is no longer what it was
+/// primary while the other runs a whole cycle through the same primary, then
+/// released. Its write must be refused — primary is no longer what it was
 /// validated against — never landed over the other's. Over both
-/// transports; the alpha is always local and shared in-process, which is
+/// transports; the primary is always local and shared in-process, which is
 /// the observer's shared-root path under real contention.
 mod fan_out_races {
     use super::*;
@@ -2043,42 +2084,42 @@ mod fan_out_races {
         })
     }
 
-    /// Both betas edit the same file. The second session to reach alpha
+    /// Both replicas edit the same file. The second session to reach the primary
     /// finds it already changed by the first and is refused; nothing is
     /// overwritten, and the pair is a conflict on its next cycle.
     #[test]
-    fn two_betas_edit_one_file_and_the_later_write_is_refused() {
+    fn two_replicas_edit_one_file_and_the_later_write_is_refused() {
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
-            let (beta2, state2) = harness.second_beta();
+            build_tree(&harness.primary);
+            let (replica2, state2) = harness.second_replica();
             let mut s1 = harness.session().expect("session 1");
-            let mut s2 = harness.session_to(&beta2, &state2).expect("session 2");
+            let mut s2 = harness.session_to(&replica2, &state2).expect("session 2");
             s1.run_cycle().expect("initial 1");
             s2.run_cycle().expect("initial 2");
 
-            fs::write(harness.beta.join(PATH), "from beta1").unwrap();
-            fs::write(beta2.join(PATH), "from beta2").unwrap();
+            fs::write(harness.replica.join(PATH), "from replica1").unwrap();
+            fs::write(replica2.join(PATH), "from replica2").unwrap();
             look_again(&mut [&mut s1, &mut s2]);
-            let report1 = interleave(&mut s1, CyclePoint::BeforeAlphaTransition, || {
+            let report1 = interleave(&mut s1, CyclePoint::BeforePrimaryTransition, || {
                 s2.run_cycle().expect("session 2's cycle");
             })
             .unwrap_or_else(|e| panic!("{context}: {e:#}"));
 
             assert_eq!(
-                read(&harness.alpha, PATH),
-                "from beta2",
+                read(&harness.primary, PATH),
+                "from replica2",
                 "{context}: overwritten"
             );
-            assert_eq!(read(&harness.beta, PATH), "from beta1", "{context}");
+            assert_eq!(read(&harness.replica, PATH), "from replica1", "{context}");
             assert!(
                 report1
-                    .alpha_transition_problems
+                    .primary_transition_problems
                     .iter()
                     .any(|p| p.path == PATH),
                 "{context}: the refusal was not reported: {:?}",
-                report1.alpha_transition_problems
+                report1.primary_transition_problems
             );
             let report1 = s1.run_cycle().expect("session 1 again");
             assert!(
@@ -2086,56 +2127,56 @@ mod fan_out_races {
                 "{context}: expected a conflict, got {:?}",
                 report1.conflicts
             );
-            assert_eq!(read(&harness.alpha, PATH), "from beta2", "{context}");
-            assert_eq!(read(&harness.beta, PATH), "from beta1", "{context}");
-            assert_eq!(read(&beta2, PATH), "from beta2", "{context}");
+            assert_eq!(read(&harness.primary, PATH), "from replica2", "{context}");
+            assert_eq!(read(&harness.replica, PATH), "from replica1", "{context}");
+            assert_eq!(read(&replica2, PATH), "from replica2", "{context}");
         }
     }
 
-    /// The betas edit different files. Both land on alpha, in either
-    /// order, and each beta then gets the other's through alpha.
+    /// The replicas edit different files. Both land on the primary, in either
+    /// order, and each replica then gets the other's through the primary.
     #[test]
-    fn two_betas_edit_different_files_and_both_land() {
+    fn two_replicas_edit_different_files_and_both_land() {
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
-            let (beta2, state2) = harness.second_beta();
+            build_tree(&harness.primary);
+            let (replica2, state2) = harness.second_replica();
             let mut s1 = harness.session().expect("session 1");
-            let mut s2 = harness.session_to(&beta2, &state2).expect("session 2");
+            let mut s2 = harness.session_to(&replica2, &state2).expect("session 2");
             s1.run_cycle().expect("initial 1");
             s2.run_cycle().expect("initial 2");
 
-            fs::write(harness.beta.join(PATH), "from beta1").unwrap();
-            fs::write(beta2.join(OTHER), "from beta2").unwrap();
+            fs::write(harness.replica.join(PATH), "from replica1").unwrap();
+            fs::write(replica2.join(OTHER), "from replica2").unwrap();
             look_again(&mut [&mut s1, &mut s2]);
-            let report1 = interleave(&mut s1, CyclePoint::BeforeAlphaTransition, || {
+            let report1 = interleave(&mut s1, CyclePoint::BeforePrimaryTransition, || {
                 s2.run_cycle().expect("session 2's cycle");
             })
             .unwrap_or_else(|e| panic!("{context}: {e:#}"));
             assert!(
-                report1.alpha_transition_problems.is_empty(),
+                report1.primary_transition_problems.is_empty(),
                 "{context}: {:?}",
-                report1.alpha_transition_problems
+                report1.primary_transition_problems
             );
-            assert_eq!(read(&harness.alpha, PATH), "from beta1", "{context}");
-            assert_eq!(read(&harness.alpha, OTHER), "from beta2", "{context}");
+            assert_eq!(read(&harness.primary, PATH), "from replica1", "{context}");
+            assert_eq!(read(&harness.primary, OTHER), "from replica2", "{context}");
 
             // Each pair levels on its next cycles.
             for _ in 0..3 {
                 s1.run_cycle().expect("1");
                 s2.run_cycle().expect("2");
             }
-            for root in [&harness.alpha, &harness.beta, &beta2] {
+            for root in [&harness.primary, &harness.replica, &replica2] {
                 assert_eq!(
                     read(root, PATH),
-                    "from beta1",
+                    "from replica1",
                     "{context}: {}",
                     root.display()
                 );
                 assert_eq!(
                     read(root, OTHER),
-                    "from beta2",
+                    "from replica2",
                     "{context}: {}",
                     root.display()
                 );
@@ -2144,34 +2185,34 @@ mod fan_out_races {
             drop(s2);
             harness.assert_trees_equal(&context);
             assert_eq!(
-                hash_tree(&harness.alpha),
-                hash_tree(&beta2),
-                "{context}: beta2 differs"
+                hash_tree(&harness.primary),
+                hash_tree(&replica2),
+                "{context}: replica2 differs"
             );
         }
     }
 
-    /// Alpha changes under a session between its scan and its transitions
+    /// Primary changes under a session between its scan and its transitions
     /// — another session lands an edit there — and the held session's own
-    /// beta-bound transition is unaffected; the next cycle carries the
+    /// replica-bound transition is unaffected; the next cycle carries the
     /// other's edit on, with no conflict.
     #[test]
-    fn an_edit_landing_on_alpha_between_a_scan_and_its_transition_is_carried_next_cycle() {
+    fn an_edit_landing_on_primary_between_a_scan_and_its_transition_is_carried_next_cycle() {
         for transport in BOTH {
             let context = format!("{transport:?}");
             let mut harness = Harness::new(SyncMode::TwoWaySafe, transport);
-            build_tree(&harness.alpha);
-            let (beta2, state2) = harness.second_beta();
+            build_tree(&harness.primary);
+            let (replica2, state2) = harness.second_replica();
             let mut s1 = harness.session().expect("session 1");
-            let mut s2 = harness.session_to(&beta2, &state2).expect("session 2");
+            let mut s2 = harness.session_to(&replica2, &state2).expect("session 2");
             s1.run_cycle().expect("initial 1");
             s2.run_cycle().expect("initial 2");
 
-            // Session 1 carries an alpha edit to beta1; while its scans are
-            // done and before it moves anything, session 2 lands beta2's
-            // edit of another file on alpha.
-            fs::write(harness.alpha.join(PATH), "alpha edit").unwrap();
-            fs::write(beta2.join(OTHER), "from beta2").unwrap();
+            // Session 1 carries a primary edit to replica1; while its scans are
+            // done and before it moves anything, session 2 lands replica2's
+            // edit of another file on the primary.
+            fs::write(harness.primary.join(PATH), "primary edit").unwrap();
+            fs::write(replica2.join(OTHER), "from replica2").unwrap();
             look_again(&mut [&mut s1, &mut s2]);
             let report1 = interleave(&mut s1, CyclePoint::AfterScans, || {
                 s2.run_cycle().expect("session 2's cycle");
@@ -2182,14 +2223,14 @@ mod fan_out_races {
                 "{context}: {:?}",
                 report1.conflicts
             );
-            assert_eq!(read(&harness.beta, PATH), "alpha edit", "{context}");
+            assert_eq!(read(&harness.replica, PATH), "primary edit", "{context}");
 
-            // What session 2 landed on alpha reaches beta1 on the cycles
+            // What session 2 landed on the primary reaches replica1 on the cycles
             // that follow, as the watcher reports it, and never as a
             // conflict. (Session 1's own writes may wake it first, so it
             // cycles on each wake until the edit arrives.)
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-            while read(&harness.beta, OTHER) != "from beta2" {
+            while read(&harness.replica, OTHER) != "from replica2" {
                 assert!(
                     std::time::Instant::now() < deadline,
                     "{context}: not carried"
@@ -2205,7 +2246,7 @@ mod fan_out_races {
             for _ in 0..2 {
                 s2.run_cycle().expect("2");
             }
-            assert_eq!(read(&beta2, PATH), "alpha edit", "{context}");
+            assert_eq!(read(&replica2, PATH), "primary edit", "{context}");
         }
     }
 }
@@ -2241,7 +2282,7 @@ mod unreadable_ancestor {
     #[test]
     fn matching_sides_rebuild_it_and_keep_the_old_one() {
         let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
         damage(&harness);
 
@@ -2252,21 +2293,21 @@ mod unreadable_ancestor {
 
         // The rebuilt ancestor is a real one: a deletion propagates as a
         // deletion, not as a file to bring back.
-        fs::remove_file(harness.alpha.join("dir0/nested/file0.txt")).unwrap();
+        fs::remove_file(harness.primary.join("dir0/nested/file0.txt")).unwrap();
         harness.cycle_ok();
-        assert!(!harness.beta.join("dir0/nested/file0.txt").exists());
+        assert!(!harness.replica.join("dir0/nested/file0.txt").exists());
         harness.assert_trees_equal("after the rebuild");
     }
 
     #[test]
     fn differing_sides_halt_and_nothing_moves() {
         let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
         damage(&harness);
         // A deletion the lost ancestor knew about: without it, the file on
-        // beta would look new and come back.
-        fs::remove_file(harness.alpha.join("dir0/nested/file0.txt")).unwrap();
+        // the replica would look new and come back.
+        fs::remove_file(harness.primary.join("dir0/nested/file0.txt")).unwrap();
 
         let error = harness.cycle().expect_err("differing sides must halt");
         assert!(
@@ -2277,17 +2318,17 @@ mod unreadable_ancestor {
             "{error:#}"
         );
         assert!(
-            !harness.alpha.join("dir0/nested/file0.txt").exists(),
+            !harness.primary.join("dir0/nested/file0.txt").exists(),
             "not resurrected"
         );
         assert!(
-            harness.beta.join("dir0/nested/file0.txt").exists(),
+            harness.replica.join("dir0/nested/file0.txt").exists(),
             "not deleted either"
         );
         assert_eq!(set_aside(&harness), 0, "nothing set aside while it halts");
 
         // Settled by hand, it rebuilds on its own.
-        fs::remove_file(harness.beta.join("dir0/nested/file0.txt")).unwrap();
+        fs::remove_file(harness.replica.join("dir0/nested/file0.txt")).unwrap();
         harness.cycle_ok();
         assert!(set_aside(&harness) >= 1);
     }
@@ -2295,7 +2336,7 @@ mod unreadable_ancestor {
     #[test]
     fn damage_a_second_time_is_not_rebuilt_until_a_reset() {
         let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
         damage(&harness);
         harness.cycle_ok();
@@ -2313,7 +2354,7 @@ mod unreadable_ancestor {
     #[test]
     fn a_format_from_another_build_rebuilds_without_counting_as_damage() {
         let mut harness = Harness::new(SyncMode::TwoWaySafe, Transport::Local);
-        build_tree(&harness.alpha);
+        build_tree(&harness.primary);
         harness.cycle_ok();
         // A checkpoint stating a format no build has written yet.
         let mut future = b"ABAHNAN2".to_vec();
@@ -2336,8 +2377,8 @@ mod unreadable_ancestor {
 #[test]
 fn a_one_shot_sync_of_a_deep_chain_succeeds() {
     let directory = tempfile::tempdir().expect("tempdir");
-    let alpha = directory.path().join("a");
-    let beta = directory.path().join("b");
+    let primary = directory.path().join("a");
+    let replica = directory.path().join("b");
     let home = directory.path().join("home");
     fs::create_dir_all(&home).expect("home");
     // 2,500 levels where the platform allows paths that long, else as deep
@@ -2345,7 +2386,7 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
     // about 500 levels, far too shallow to exhaust a default thread stack,
     // so there the overflow this guards against cannot be built this way.
     let path_max = libc::PATH_MAX as usize;
-    let limit = path_max.saturating_sub(96 + beta.as_os_str().len() + 16);
+    let limit = path_max.saturating_sub(96 + replica.as_os_str().len() + 16);
     let depth = 2_500.min(limit / 2);
     if depth <= 1_700 {
         eprintln!(
@@ -2354,7 +2395,7 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
         );
         return;
     }
-    let mut leaf = alpha.clone();
+    let mut leaf = primary.clone();
     for _ in 0..depth {
         leaf.push("d");
     }
@@ -2363,8 +2404,8 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
 
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_autobahn"))
         .arg("sync")
-        .arg(&alpha)
-        .arg(&beta)
+        .arg(&primary)
+        .arg(&replica)
         .arg("--state-dir")
         .arg(directory.path().join("state"))
         .env("AUTOBAHN_HOME", &home)
@@ -2377,7 +2418,7 @@ fn a_one_shot_sync_of_a_deep_chain_succeeds() {
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );
-    let mut copied = beta.clone();
+    let mut copied = replica.clone();
     for _ in 0..depth {
         copied.push("d");
     }

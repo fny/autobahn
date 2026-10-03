@@ -327,10 +327,10 @@ pub struct Progress {
     /// epoch. A cycle moves through several phases, and to whoever is
     /// waiting on it they are one continuous stretch of work.
     working_since: AtomicU64,
-    /// The alpha side's scan progress.
-    pub alpha: Arc<SideProgress>,
-    /// The beta side's scan progress.
-    pub beta: Arc<SideProgress>,
+    /// The primary side's scan progress.
+    pub primary: Arc<SideProgress>,
+    /// The replica side's scan progress.
+    pub replica: Arc<SideProgress>,
     /// Files transferred, and the total this cycle will transfer.
     staged: AtomicU64,
     staged_total: AtomicU64,
@@ -356,8 +356,8 @@ impl Default for Progress {
             phase: AtomicU8::new(Phase::Waiting.as_u8()),
             phase_since: AtomicU64::new(now_millis()),
             working_since: AtomicU64::new(now_millis()),
-            alpha: Arc::default(),
-            beta: Arc::default(),
+            primary: Arc::default(),
+            replica: Arc::default(),
             staged: AtomicU64::new(0),
             staged_total: AtomicU64::new(0),
             staged_bytes: AtomicU64::new(0),
@@ -430,8 +430,8 @@ impl Progress {
     /// Announces the number of changes a cycle is about to apply.
     pub fn begin_applying(&self, changes: u64) {
         self.applied.store(0, Ordering::Relaxed);
-        self.alpha.applied.store(0, Ordering::Relaxed);
-        self.beta.applied.store(0, Ordering::Relaxed);
+        self.primary.applied.store(0, Ordering::Relaxed);
+        self.replica.applied.store(0, Ordering::Relaxed);
         self.applied_total.store(changes, Ordering::Relaxed);
         self.enter(Phase::Applying);
     }
@@ -451,16 +451,16 @@ impl Progress {
     /// The changes applied so far: what the transitioning endpoint has
     /// counted, or what the finished transition reported.
     fn applied_now(&self) -> u64 {
-        let counted =
-            self.alpha.applied.load(Ordering::Relaxed) + self.beta.applied.load(Ordering::Relaxed);
+        let counted = self.primary.applied.load(Ordering::Relaxed)
+            + self.replica.applied.load(Ordering::Relaxed);
         counted.max(self.applied.load(Ordering::Relaxed))
     }
 
     /// Ends the cycle's scans, clears its transfer and apply totals, and
     /// enters `phase`, one of the resting ones: waiting, paused or retrying.
     pub fn rest(&self, phase: Phase) {
-        self.alpha.end(None);
-        self.beta.end(None);
+        self.primary.end(None);
+        self.replica.end(None);
         self.staged_total.store(0, Ordering::Relaxed);
         self.staged_bytes_total.store(0, Ordering::Relaxed);
         self.applied_total.store(0, Ordering::Relaxed);
@@ -471,12 +471,12 @@ impl Progress {
     pub fn snapshot(&self) -> ProgressSnapshot {
         let phase = self.phase();
         let elapsed = elapsed_since(self.phase_since.load(Ordering::Relaxed));
-        let alpha = self
-            .alpha
-            .snapshot(self.beta.expected.load(Ordering::Relaxed));
-        let beta = self
-            .beta
-            .snapshot(self.alpha.expected.load(Ordering::Relaxed));
+        let primary = self
+            .primary
+            .snapshot(self.replica.expected.load(Ordering::Relaxed));
+        let replica = self
+            .replica
+            .snapshot(self.primary.expected.load(Ordering::Relaxed));
         let staged = self.staged.load(Ordering::Relaxed);
         let staged_total = self.staged_total.load(Ordering::Relaxed);
         let applied = self.applied_now();
@@ -486,8 +486,8 @@ impl Progress {
         // makes the phase's unknowable rather than shorter.
         let remaining_seconds = match phase {
             Phase::Scanning => match (
-                alpha.active.then_some(alpha.remaining_seconds),
-                beta.active.then_some(beta.remaining_seconds),
+                primary.active.then_some(primary.remaining_seconds),
+                replica.active.then_some(replica.remaining_seconds),
             ) {
                 (Some(Some(a)), Some(Some(b))) => Some(a.max(b)),
                 (Some(estimate), None) | (None, Some(estimate)) => estimate,
@@ -506,8 +506,8 @@ impl Progress {
                 true => elapsed_since(self.working_since.load(Ordering::Relaxed)).as_secs(),
                 false => 0,
             },
-            alpha,
-            beta,
+            primary,
+            replica,
             staged,
             staged_total,
             staged_bytes: self.staged_bytes.load(Ordering::Relaxed),
@@ -533,10 +533,10 @@ pub struct ProgressSnapshot {
     /// of "has this been going long enough to look stuck", because the
     /// person waiting is waiting on the cycle, not on one of its steps.
     pub working_seconds: u64,
-    /// The alpha side's scan.
-    pub alpha: SideSnapshot,
-    /// The beta side's scan.
-    pub beta: SideSnapshot,
+    /// The primary side's scan.
+    pub primary: SideSnapshot,
+    /// The replica side's scan.
+    pub replica: SideSnapshot,
     /// Files transferred so far, of the total this cycle will transfer.
     pub staged: u64,
     pub staged_total: u64,
@@ -680,15 +680,15 @@ mod tests {
     #[test]
     fn a_side_without_a_history_borrows_its_peers_total() {
         let progress = Progress::default();
-        // Beta has finished a full scan before; alpha never has.
-        progress.beta.end(Some(1_000));
-        progress.alpha.begin(true);
+        // The replica has finished a full scan before; the primary never has.
+        progress.replica.end(Some(1_000));
+        progress.primary.begin(true);
         let snapshot = progress.snapshot();
-        assert_eq!(snapshot.alpha.expected, Some(1_000));
-        // Once alpha has its own history, that is what it uses.
-        progress.alpha.end(Some(4_000));
-        progress.alpha.begin(true);
-        assert_eq!(progress.snapshot().alpha.expected, Some(4_000));
+        assert_eq!(snapshot.primary.expected, Some(1_000));
+        // Once primary has its own history, that is what it uses.
+        progress.primary.end(Some(4_000));
+        progress.primary.begin(true);
+        assert_eq!(progress.snapshot().primary.expected, Some(4_000));
     }
 
     #[test]
@@ -697,23 +697,23 @@ mod tests {
         // cannot be measured against a whole-tree total — extrapolating
         // one would promise minutes for work that takes a second.
         let progress = Progress::default();
-        progress.alpha.end(Some(1_000_000));
-        progress.alpha.begin(false);
+        progress.primary.end(Some(1_000_000));
+        progress.primary.begin(false);
         progress
-            .alpha
+            .primary
             .since
             .store(now_millis().saturating_sub(10_000), Ordering::Relaxed);
-        progress.alpha.advance(1_000, 0);
+        progress.primary.advance(1_000, 0);
         let snapshot = progress.snapshot();
-        assert_eq!(snapshot.alpha.remaining_seconds, None);
+        assert_eq!(snapshot.primary.remaining_seconds, None);
         // The same counters from a full scan do estimate.
-        progress.alpha.begin(true);
+        progress.primary.begin(true);
         progress
-            .alpha
+            .primary
             .since
             .store(now_millis().saturating_sub(10_000), Ordering::Relaxed);
-        progress.alpha.advance(1_000, 0);
-        assert!(progress.snapshot().alpha.remaining_seconds.is_some());
+        progress.primary.advance(1_000, 0);
+        assert!(progress.snapshot().primary.remaining_seconds.is_some());
     }
 
     #[test]
@@ -765,43 +765,43 @@ mod tests {
     #[test]
     fn a_total_a_running_scan_has_passed_is_not_reported() {
         let progress = Progress::default();
-        // Beta has only ever scanned an empty tree; alpha, scanning a real
+        // The replica has only ever scanned an empty tree; primary, scanning a real
         // one, would otherwise be shown as "30,000 of ~1 entries".
-        progress.beta.end(Some(1));
-        progress.alpha.begin(true);
-        progress.alpha.advance(30_000, 0);
-        assert_eq!(progress.snapshot().alpha.expected, None);
+        progress.replica.end(Some(1));
+        progress.primary.begin(true);
+        progress.primary.advance(30_000, 0);
+        assert_eq!(progress.snapshot().primary.expected, None);
 
         // A scan that has *finished* reaches its total exactly, and that
         // total is what the next scan is measured against.
-        progress.alpha.end(Some(30_000));
+        progress.primary.end(Some(30_000));
         let snapshot = progress.snapshot();
-        assert_eq!(snapshot.alpha.expected, Some(30_000));
-        assert!(!snapshot.alpha.active);
+        assert_eq!(snapshot.primary.expected, Some(30_000));
+        assert!(!snapshot.primary.active);
     }
 
     #[test]
     fn scanning_finishes_with_the_slower_side() {
         let progress = Progress::default();
         progress.enter(Phase::Scanning);
-        for side in [&progress.alpha, &progress.beta] {
+        for side in [&progress.primary, &progress.replica] {
             side.end(Some(10_000));
             side.begin(true);
             side.since
                 .store(now_millis().saturating_sub(10_000), Ordering::Relaxed);
         }
-        // Alpha is half done (10s left); beta a quarter (30s left).
-        progress.alpha.advance(5_000, 0);
-        progress.beta.advance(2_500, 0);
+        // The primary is half done (10s left); replica a quarter (30s left).
+        progress.primary.advance(5_000, 0);
+        progress.replica.advance(2_500, 0);
         let snapshot = progress.snapshot();
-        assert_eq!(snapshot.alpha.remaining_seconds, Some(10));
-        assert_eq!(snapshot.beta.remaining_seconds, Some(30));
+        assert_eq!(snapshot.primary.remaining_seconds, Some(10));
+        assert_eq!(snapshot.replica.remaining_seconds, Some(30));
         assert_eq!(snapshot.remaining_seconds, Some(30));
 
         // A side that cannot be estimated makes the phase unknowable
-        // rather than shorter: reporting alpha's ten seconds while beta
+        // rather than shorter: reporting the primary's ten seconds while replica
         // has an unknown number left would be a promise, not an estimate.
-        progress.beta.begin(false);
+        progress.replica.begin(false);
         assert_eq!(progress.snapshot().remaining_seconds, None);
     }
 }

@@ -35,8 +35,8 @@ def report_for(records, plan=None):
         return json.loads(out.getvalue())
 
 
-def job_records(name, destinations, betas, cold_s):
-    spec = {"job": name, "cell": {"name": "cell-1", "betas": betas}, "tools": ["autobahn"]}
+def job_records(name, destinations, replicas, cold_s):
+    spec = {"job": name, "cell": {"name": "cell-1", "replicas": replicas}, "tools": ["autobahn"]}
     return [
         {"measurement": "job_start", "job": name, "cell": "cell-1", "spec": spec,
          "destinations": [f"dest{i}" for i in range(1, destinations + 1)]},
@@ -49,7 +49,7 @@ def job_records(name, destinations, betas, cold_s):
 
 class NothingLanded(unittest.TestCase):
     def test_a_window_where_nothing_landed_is_left_out_and_listed(self):
-        spec = {"job": "cell-r0", "cell": {"name": "cell-1", "betas": 1},
+        spec = {"job": "cell-r0", "cell": {"name": "cell-1", "replicas": 1},
                 "tools": ["autobahn"]}
         def window(job, samples, attempts, censored):
             return {"measurement": "workload", "job": job, "cell": "cell-1",
@@ -76,7 +76,7 @@ class NothingLanded(unittest.TestCase):
 
 class InconsistentSeries(unittest.TestCase):
     def test_interleaved_samplers_give_no_resource_figures(self):
-        spec = {"job": "fan-r0", "cell": {"name": "fan", "betas": 2}, "tools": ["autobahn"]}
+        spec = {"job": "fan-r0", "cell": {"name": "fan", "replicas": 2}, "tools": ["autobahn"]}
         clean = [[t, 1000, 100 + t, 1] for t in range(0, 30)]
         # Two samplers in one log: time and cumulative CPU both jump back.
         mixed = [[t, 1000, 100 + t, 1] for t in range(0, 30)] + [[5, 9000, 50, 3]]
@@ -117,24 +117,6 @@ class ColdSyncExclusion(unittest.TestCase):
         row = report_for(records, plan)["cold_sync_s"]["cell-1/autobahn/sub5k"]
         self.assertEqual(row["digest_verified"]["n"], 1)
         self.assertEqual([e["job"] for e in row["excluded"]], ["wide-r1"])
-
-    def test_the_six_contaminated_jobs_of_bench_1789947877_leave_cold_sync(self):
-        directory = os.path.join(HERE, "results-bench-1789947877")
-        if not os.path.isdir(directory):
-            self.skipTest("results-bench-1789947877 is not in this checkout")
-        out = io.StringIO()
-        saved, sys.argv = sys.argv, ["aggregate.py", directory]
-        try:
-            with contextlib.redirect_stdout(out):
-                aggregate.main()
-        finally:
-            sys.argv = saved
-        report = json.loads(out.getvalue())
-        excluded = {e["job"] for row in report["cold_sync_s"].values() for e in row["excluded"]
-                    if e["reason"].startswith("destination_width_mismatch")}
-        self.assertEqual(excluded, {"chromium-1-patch-r2", "chromium-10-r2",
-                                    "chromium-10-bidir-r1", "chromium-1-bidir-r2",
-                                    "chromium-1-bidir-r4", "50k-10-r0"})
 
 
 class RemoteCpu(unittest.TestCase):

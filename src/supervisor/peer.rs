@@ -2,10 +2,10 @@
 //!
 //! A host that a leader has pushed a name to runs this instead of a plain
 //! supervisor. It has no configuration of its own; it runs the leader's,
-//! turned around so that it is the alpha and every other beta stays a
-//! beta. The configured alpha is not in its star — the alpha is never
-//! dialed — so while a beta leads, the alpha's session waits for the
-//! alpha to dial in (a later phase).
+//! turned around so that it is the primary and every other replica stays a
+//! replica. The configured primary is not in its star — the primary is never
+//! dialed — so while a replica leads, the primary's session waits for the
+//! primary to dial in (a later phase).
 //!
 //! The loop is a two-state machine:
 //!
@@ -13,13 +13,13 @@
 //!   agent, and the star as the leader last pushed it. While the lease is
 //!   fresh, or stale for less than this host's wait, sleep an interval and
 //!   look again. The wait is the configured `failover_after` plus one
-//!   lease lifetime for every beta ahead of this one in the configuration's
-//!   order, so the first live beta acts first without any of them being
+//!   lease lifetime for every replica ahead of this one in the configuration's
+//!   order, so the first live replica acts first without any of them being
 //!   asked. A blip never reaches the wait. A lease that names this host
 //!   is led at once, at its term.
 //! - **Leading.** Write a lease at the next term, run a supervisor over the
 //!   turned-around star, and watch its role. The supervisor's sessions
-//!   present the lease to every other beta on their first cycle; a host
+//!   present the lease to every other replica on their first cycle; a host
 //!   already taken by a newer term refuses it, and the supervisor steps
 //!   down, which ends this state and starts the first one again.
 //!
@@ -192,8 +192,8 @@ fn lead(
 ) -> Result<()> {
     let name = star.name.clone();
     let ttl = star.timing.ttl;
-    // The other betas are dialed with this host's p2p key, when the
-    // alpha set one up, and the host keys it handed out.
+    // The other replicas are dialed with this host's p2p key, when the
+    // primary set one up, and the host keys it handed out.
     crate::transport::set_p2p_ssh_options(
         crate::peerkeys::ssh_options(directory).unwrap_or_default(),
     );
@@ -201,8 +201,8 @@ fn lead(
     let supervisor =
         super::Supervisor::new(star.plans, state_root.to_path_buf(), verbose).with_p2p(context);
     let inner_stop = AtomicBool::new(false);
-    // The attach socket: the alpha dials in here, and its connection
-    // becomes the endpoint of the session that has the alpha's side.
+    // The attach socket: the primary dials in here, and its connection
+    // becomes the endpoint of the session that has the primary's side.
     let socket = directory.join(p2p::ATTACH_SOCKET);
     let listener = bind_attach_socket(directory, &socket)?;
     std::thread::scope(|scope| -> Result<()> {
@@ -259,7 +259,7 @@ fn lead(
 /// How long a connection to the attach socket has to say who it is.
 const GREETING_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// The longest greeting read: a name, which is `alpha`.
+/// The longest greeting read: a name, which is `primary`.
 const MAXIMUM_GREETING: u64 = 64;
 
 /// Binds the attach socket as the control socket is bound: in a private
@@ -281,7 +281,7 @@ fn bind_attach_socket(directory: &Path, socket: &Path) -> Result<std::os::unix::
 
 /// Accepts attachments until `stop`, each on a thread of its own: a
 /// connection that says nothing holds up only itself, until its greeting
-/// times out, and never the alpha dialing in behind it. What greets
+/// times out, and never the primary dialing in behind it. What greets
 /// properly is handed to `attached` with its name.
 fn serve_attachments(
     listener: &std::os::unix::net::UnixListener,
@@ -347,7 +347,7 @@ fn greet(
         anyhow::bail!("no greeting within {MAXIMUM_GREETING} bytes");
     }
     let name = name.trim().to_owned();
-    if name != p2p::ALPHA {
+    if name != p2p::PRIMARY {
         anyhow::bail!("{name:?} is not a peer that attaches");
     }
     // The connection is long-lived and idles between cycles: the greeting's
@@ -363,16 +363,16 @@ fn greet(
     ))
 }
 
-/// The alpha's `watch` when its groups peer: lead until fenced, then
-/// attach to whoever leads until the lease names the alpha again, and
-/// lead again. The configured alpha is never dialed, so while a beta
-/// leads the alpha makes itself an endpoint by dialing the beta.
+/// The primary's `watch` when its groups peer: lead until fenced, then
+/// attach to whoever leads until the lease names the primary again, and
+/// lead again. The configured primary is never dialed, so while a replica
+/// leads the primary makes itself an endpoint by dialing the replica.
 ///
 /// One supervisor runs throughout. While it follows, its p2p sessions
 /// wait for the lead and its plain groups keep running: they are the
-/// alpha's alone, whoever leads the star.
+/// the primary's alone, whoever leads the star.
 #[allow(clippy::too_many_arguments)]
-pub fn run_alpha(
+pub fn run_primary(
     config_path: &Path,
     directory: &Path,
     plans: &[crate::config::SessionPlan],
@@ -395,7 +395,7 @@ pub fn run_alpha(
             failover_after: crate::config::DEFAULT_P2P_FAILOVER_AFTER,
             manage_keys: false,
         });
-    let context = super::P2pContext::for_alpha(
+    let context = super::P2pContext::for_primary(
         config_path.to_path_buf(),
         directory.to_path_buf(),
         timing.ttl,
@@ -411,7 +411,7 @@ pub fn run_alpha(
     std::thread::scope(|scope| -> Result<()> {
         let watcher = scope.spawn(|| supervisor.run_watch(&inner_stop));
         let policy = super::attach_policy(plans);
-        let outcome = alpha_roles(
+        let outcome = primary_roles(
             directory,
             &supervisor,
             &policy,
@@ -431,11 +431,11 @@ pub fn run_alpha(
     // under the new plans.
 }
 
-/// The alpha's part while its supervisor runs: nothing while it leads;
+/// The primary's part while its supervisor runs: nothing while it leads;
 /// while it follows, attach to the leader, and take the lead back when
-/// the lease names the alpha again, or when the leader's lease has been
+/// the lease names the primary again, or when the leader's lease has been
 /// stale for the configured wait.
-fn alpha_roles(
+fn primary_roles(
     directory: &Path,
     supervisor: &super::Supervisor,
     policy: &crate::transport::AttachPolicy,
@@ -450,7 +450,7 @@ fn alpha_roles(
         if announced.as_ref() != Some(&role) {
             match &role {
                 Role::Leader { term, .. } => {
-                    crate::note!("p2p: leading as the alpha at term {term}")
+                    crate::note!("p2p: leading as the primary at term {term}")
                 }
                 Role::Follower { leader, term } => {
                     crate::note!("p2p: {leader} leads at term {term}; attaching")
@@ -471,13 +471,13 @@ fn alpha_roles(
             crate::complain!("p2p: the attachment to {leader} ended: {error:#}");
         }
         // The lease says whether the lead came back. A stale lease from a
-        // beta that died is taken over as a beta would take it — the
-        // alpha is the head of the order, so it waits only the configured
+        // replica that died is taken over as a replica would take it — the
+        // the primary is the head of the order, so it waits only the configured
         // time.
         let now = p2p::now_seconds();
         match p2p::read_lease(directory)? {
-            Some(lease) if lease.leader == p2p::ALPHA => {
-                supervisor.lead_as_alpha(lease.term)?;
+            Some(lease) if lease.leader == p2p::PRIMARY => {
+                supervisor.lead_as_primary(lease.term)?;
             }
             Some(lease)
                 if lease.is_stale_at(now) && lease.stale_for_at(now) >= timing.failover_after =>
@@ -486,10 +486,10 @@ fn alpha_roles(
                     "p2p: the lease of {} went stale; leading again",
                     lease.leader
                 );
-                // Under the lease lock: a beta that took the lead at this
-                // term meanwhile keeps it, and the alpha attaches to it on
+                // Under the lease lock: a replica that took the lead at this
+                // term meanwhile keeps it, and the primary attaches to it on
                 // the next pass.
-                supervisor.lead_as_alpha(lease.term + 1)?;
+                supervisor.lead_as_primary(lease.term + 1)?;
             }
             _ => super::sleep_interruptible(interval, stop),
         }
@@ -579,9 +579,9 @@ pub fn directory() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    /// Pushes a star of one p2p group with these betas, as a leader
+    /// Pushes a star of one p2p group with these replicas, as a leader
     /// pushes its configuration.
-    fn push(directory: &Path, betas: &str) {
+    fn push(directory: &Path, replicas: &str) {
         let configuration = format!(
             r#"
             [experimental.p2p-dangerously-experimental]
@@ -591,8 +591,8 @@ mod tests {
             [groups.g]
             mode = "p2p-conflict-dangerously-experimental"
             interval = 1
-            alpha = "/home/f/g"
-            betas = [{betas}]
+            primary = "/home/f/g"
+            replicas = [{replicas}]
             "#
         );
         p2p::write_pushed_file(directory, "config.toml", configuration.as_bytes()).unwrap();
@@ -601,7 +601,7 @@ mod tests {
 
     /// The leader keeps pushing while a peer follows. The takeover runs
     /// the star as it was last pushed, not as it stood when following
-    /// began: here, a beta that joined the group meanwhile is in it.
+    /// began: here, a replica that joined the group meanwhile is in it.
     #[test]
     fn a_configuration_pushed_while_following_is_the_one_used_at_takeover() {
         let keep = tempfile::tempdir().expect("a temporary directory");
@@ -614,7 +614,7 @@ mod tests {
         p2p::write_lease(
             directory,
             &Lease {
-                leader: p2p::ALPHA.to_owned(),
+                leader: p2p::PRIMARY.to_owned(),
                 term: 3,
                 renewed_at: p2p::now_seconds() - 600,
                 ttl_seconds: 2,
@@ -623,16 +623,16 @@ mod tests {
         .unwrap();
         let (followed, star) = follow(directory, star, &AtomicBool::new(false)).expect("follows");
         assert!(matches!(followed, Followed::TakeOver { term: 4 }));
-        let betas: Vec<String> = star.plans.iter().map(|plan| plan.beta_spec()).collect();
-        assert_eq!(betas, ["other:/srv/g"]);
+        let replicas: Vec<String> = star.plans.iter().map(|plan| plan.replica_spec()).collect();
+        assert_eq!(replicas, ["other:/srv/g"]);
     }
 
-    /// A connection that says nothing holds up only itself: the alpha
+    /// A connection that says nothing holds up only itself: the primary
     /// dialing in behind it attaches at once, and the silent one is closed
     /// when its greeting times out. The socket and its directory are the
     /// owner's alone.
     #[test]
-    fn a_silent_connection_does_not_hold_up_the_alpha() {
+    fn a_silent_connection_does_not_hold_up_the_primary() {
         use std::io::{Read, Write};
         use std::os::unix::fs::PermissionsExt;
         use std::os::unix::net::UnixStream;
@@ -655,16 +655,16 @@ mod tests {
             let mut silent = UnixStream::connect(&socket).expect("connects");
             std::thread::sleep(Duration::from_millis(100));
             let started = std::time::Instant::now();
-            let mut alpha = UnixStream::connect(&socket).expect("connects");
-            alpha.write_all(b"alpha\n").unwrap();
+            let mut primary = UnixStream::connect(&socket).expect("connects");
+            primary.write_all(b"primary\n").unwrap();
             while attached.lock().unwrap().is_empty() {
                 assert!(
                     started.elapsed() < Duration::from_secs(1),
-                    "the alpha was held up behind a silent connection"
+                    "the primary was held up behind a silent connection"
                 );
                 std::thread::sleep(Duration::from_millis(10));
             }
-            assert_eq!(*attached.lock().unwrap(), ["alpha"]);
+            assert_eq!(*attached.lock().unwrap(), ["primary"]);
             silent
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
@@ -674,10 +674,10 @@ mod tests {
         });
     }
 
-    /// A greeting is a short line naming the alpha: an endless one and a
+    /// A greeting is a short line naming the primary: an endless one and a
     /// name that does not attach are refused.
     #[test]
-    fn a_greeting_is_short_and_names_the_alpha() {
+    fn a_greeting_is_short_and_names_the_primary() {
         use std::io::Write;
         use std::os::unix::net::UnixStream;
         let greeting = |sent: &[u8]| {
@@ -690,14 +690,14 @@ mod tests {
             format!("{error:#}").contains("no greeting within"),
             "{error:#}"
         );
-        let error = greeting(b"box2\n").expect_err("not the alpha");
+        let error = greeting(b"box2\n").expect_err("not the primary");
         assert!(
             format!("{error:#}").contains("not a peer that attaches"),
             "{error:#}"
         );
         assert_eq!(
-            greeting(b"alpha\nand the handshake").expect("the alpha"),
-            "alpha"
+            greeting(b"primary\nand the handshake").expect("the primary"),
+            "primary"
         );
     }
 
@@ -720,7 +720,7 @@ mod tests {
             .args([
                 "-c",
                 "import socket,sys; s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); \
-                 s.sendall(b'alpha\\n'); s.recv(1)",
+                 s.sendall(b'primary\\n'); s.recv(1)",
             ])
             .arg(&socket)
             .uid(65534)

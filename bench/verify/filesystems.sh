@@ -33,10 +33,10 @@ printf 'accented'             > "$W/src/$(printf 'caf\xc3\xa9').txt"
 
 cat > "$W/ab.toml" <<TOML
 [groups.fat]
-alpha = "$W/src"
+primary = "$W/src"
 mode = "one-way-conflict"
 interval = 2
-betas = ["$MNT/dst"]
+replicas = ["$MNT/dst"]
 TOML
 
 # The first two passes have nothing to refuse: a failure there is a broken

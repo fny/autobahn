@@ -130,13 +130,13 @@ impl AlertPlan {
 /// One session's alerting conditions, as the supervisor sees them.
 #[derive(Clone, Debug)]
 pub struct SessionAlerts {
-    /// Which session: two betas of one group on one host share the group
+    /// Which session: two replicas of one group on one host share the group
     /// and the host, and are still two sessions.
     pub session: SessionKey,
     pub group: String,
     pub host: String,
     /// The destination as people read it: the host, or `host:path` when
-    /// another beta of the group is on the same host.
+    /// another replica of the group is on the same host.
     pub destination: String,
     /// The conditions it is currently in. Empty means healthy.
     pub alerts: Vec<Alert>,
@@ -350,7 +350,7 @@ impl Alerter {
             } else {
                 groups.insert(session.group.as_str());
                 // A host alone is cut short; a host with a path is what
-                // tells two betas on it apart, and is left whole.
+                // tells two replicas on it apart, and is left whole.
                 let destination = match session.destination == session.host {
                     true => short_host(&session.host, &hosts),
                     false => session.destination.clone(),
@@ -1037,12 +1037,12 @@ mod tests {
         }
     }
 
-    /// Two betas of one group on one host are two sessions: each one's
+    /// Two replicas of one group on one host are two sessions: each one's
     /// trouble is its own, counted and named apart, and one that clears
     /// does not take the other's with it.
     #[test]
-    fn two_betas_on_one_host_alert_apart() {
-        let beta = |path: &str, alerts: &[Alert], summary: &str| SessionAlerts {
+    fn two_replicas_on_one_host_alert_apart() {
+        let replica = |path: &str, alerts: &[Alert], summary: &str| SessionAlerts {
             session: SessionKey::new(format!("work-{path}")),
             destination: format!("host:{path}"),
             ..session_in("work", "host", alerts, summary)
@@ -1050,8 +1050,8 @@ mod tests {
         let mut alerter = Alerter::new(plan());
         let start = Instant::now();
         let both = [
-            beta("/tree", &[Alert::Conflicts], "1 conflict"),
-            beta("/tree/nested", &[Alert::Conflicts], "2 conflicts"),
+            replica("/tree", &[Alert::Conflicts], "1 conflict"),
+            replica("/tree/nested", &[Alert::Conflicts], "2 conflicts"),
         ];
         alerter.observe(&both, start);
         let Some(Fire::Alert {
@@ -1071,24 +1071,24 @@ mod tests {
         // fresh condition on the first is its own news.
         let mut alerter = Alerter::new(plan());
         let first = [
-            beta("/tree", &[Alert::Conflicts], "1 conflict"),
-            beta("/tree/nested", &[], ""),
+            replica("/tree", &[Alert::Conflicts], "1 conflict"),
+            replica("/tree/nested", &[], ""),
         ];
         alerter.observe(&first, start);
         assert!(alerter
             .observe(&first, start + Duration::from_secs(31))
             .is_some());
-        // The other beta's conflicts appear: news, not the same trouble.
+        // The other replica's conflicts appear: news, not the same trouble.
         let second = [
-            beta("/tree", &[Alert::Conflicts], "1 conflict"),
-            beta("/tree/nested", &[Alert::Conflicts], "2 conflicts"),
+            replica("/tree", &[Alert::Conflicts], "1 conflict"),
+            replica("/tree/nested", &[Alert::Conflicts], "2 conflicts"),
         ];
         alerter.observe(&second, start + Duration::from_secs(40));
         let Some(Fire::Alert {
             repeat, sessions, ..
         }) = alerter.observe(&second, start + Duration::from_secs(71))
         else {
-            panic!("the second beta's trouble is news");
+            panic!("the second replica's trouble is news");
         };
         assert!(!repeat);
         assert_eq!(sessions, 2);
@@ -1177,7 +1177,7 @@ mod tests {
         );
         assert_eq!(short_host("boite", &["boite"]), "boite");
         assert_eq!(short_host("faraz.vip", &["faraz.vip"]), "faraz.vip");
-        assert_eq!(short_host("/Users/x/beta.d", &[]), "/Users/x/beta.d");
+        assert_eq!(short_host("/Users/x/replica.d", &[]), "/Users/x/replica.d");
         // Two hosts sharing a first label keep their full names.
         assert_eq!(
             short_host("fny.voltai.party", &["fny.voltai.party", "fny.example.org"]),
@@ -1658,7 +1658,7 @@ mod tests {
 
     #[test]
     fn a_session_that_asks_for_patience_waits_for_it() {
-        // A halt is announced at once; a missing alpha, which is a halt
+        // A halt is announced at once; a missing primary, which is a halt
         // that clears on its own, waits as long as its session asks.
         let mut alerter = Alerter::new(AlertPlan {
             after: BTreeMap::from([(Alert::Halted, Duration::ZERO)]),

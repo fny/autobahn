@@ -486,23 +486,23 @@ pub fn serve_agent<R: Read, W: Write + Send>(input: R, output: W) -> Result<()> 
 /// What a channel may not do, by how its connection came about.
 #[derive(Clone, Copy)]
 struct ChannelLimits {
-    /// The alpha's attachment to a leader: no pushed files.
+    /// The primary's attachment to a leader: no pushed files.
     attached: bool,
     /// An agent a gate ran, for a restricted key: no key management.
     gated: bool,
 }
 
-/// What an alpha that attached to a leading beta serves it.
+/// What a primary that attached to a leading replica serves it.
 ///
-/// The leader never had any access to the alpha: the alpha dials it, and
+/// The leader never had any access to the primary: the primary dials it, and
 /// runs its own agent for it over that connection. So the leader chooses
-/// only which of the alpha's p2p sessions a channel is for. What the
+/// only which of the primary's p2p sessions a channel is for. What the
 /// endpoint is — its root, ignores, modes, owners and staging — is the
-/// alpha's own configuration for that session, whatever the leader asked
-/// for; a session the alpha does not run is refused, and so is a channel
+/// the primary's own configuration for that session, whatever the leader asked
+/// for; a session the primary does not run is refused, and so is a channel
 /// past what its sessions need.
 pub struct AttachPolicy {
-    /// The alpha's own initialization of each p2p session, by session
+    /// The primary's own initialization of each p2p session, by session
     /// identifier.
     sessions: std::collections::HashMap<String, Initialize>,
     /// The sessions a leader has asked for with other settings, said once.
@@ -530,15 +530,15 @@ impl AttachPolicy {
         self.sessions.len() * ATTACHED_CHANNELS_PER_SESSION
     }
 
-    /// What to serve a leader's request for a channel: this alpha's own
+    /// What to serve a leader's request for a channel: this primary's own
     /// initialization of the session it names. Only whether the channel
     /// watches its root is the leader's to say. Settings that differ from
-    /// the alpha's — an edit made while the beta led, say — are served as
-    /// the alpha has them, and said once.
+    /// the primary's — an edit made while the replica led, say — are served as
+    /// the primary has them, and said once.
     fn serve(&self, requested: Initialize) -> Result<Initialize> {
         let Some(own) = self.sessions.get(&requested.session) else {
             bail!(
-                "{:?} is not one of this alpha's p2p sessions",
+                "{:?} is not one of this primary's p2p sessions",
                 requested.session
             );
         };
@@ -652,7 +652,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                             )?;
                             continue;
                         }
-                        // An attached alpha serves its own sessions only,
+                        // An attached primary serves its own sessions only,
                         // as it configures them.
                         let initialize = match policy {
                             None => initialize,
@@ -660,7 +660,7 @@ fn serve_agent_with<R: Read, W: Write + Send>(
                                 let served = match channels.len() < policy.channel_limit() {
                                     true => policy.serve(initialize),
                                     false => Err(anyhow!(
-                                        "an attached alpha holds at most {} channels open",
+                                        "an attached primary holds at most {} channels open",
                                         policy.channel_limit()
                                     )),
                                 };
@@ -1028,13 +1028,13 @@ fn serve_channel<W: Write + Send>(
                     copy.checkpoint(generation, ancestor)
                 })
                 .map(|generation| Response::Recorded { generation }),
-            // An attached alpha has a configuration of its own, and a
+            // An attached primary has a configuration of its own, and a
             // genuine leader never pushes it one: a pushed `name` there
             // would have it start as a follower of whoever sent it. The
             // lease and the ancestor records, which the handback needs,
             // are taken as from any leader.
             Request::PutP2pFile { .. } if attached => Err(anyhow!(
-                "an attached alpha takes no pushed files: it runs its own configuration"
+                "an attached primary takes no pushed files: it runs its own configuration"
             )),
             Request::PutP2pFile { name, bytes } => p2p_directory
                 .as_ref()
@@ -1521,7 +1521,7 @@ fn create_endpoint(initialize: &Initialize, state_root: &Result<PathBuf>) -> Res
         .as_ref()
         .map_err(|error| anyhow!("unable to determine the agent's state directory: {error:#}"))?;
     // Expand a home-relative root against this agent's home directory, so
-    // that a configuration like `alpha = "~/project"` fanned out to several
+    // that a configuration like `primary = "~/project"` fanned out to several
     // hosts lands in each host's own home rather than a literal `~`.
     let root = crate::paths::expand_tilde(&initialize.root)?;
     // What this machine serves is its own to say, whoever is asking.
@@ -1559,13 +1559,13 @@ pub fn ssh_argv_for(destination: &str, remote_command: &str) -> Vec<String> {
     Connection::ssh_argv(destination, Some(remote_command))
 }
 
-/// The ssh options a beta leading from this process dials the others
+/// The ssh options a replica leading from this process dials the others
 /// with: its p2p key and the p2p `known_hosts`
 /// ([`crate::peerkeys::ssh_options`]). Empty anywhere else.
 static P2P_SSH_OPTIONS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// Sets the ssh options every connection this process makes carries, for a
-/// beta about to lead: its p2p key, if it has one.
+/// replica about to lead: its p2p key, if it has one.
 pub fn set_p2p_ssh_options(options: Vec<String>) {
     *P2P_SSH_OPTIONS
         .lock()
@@ -1579,10 +1579,10 @@ fn p2p_ssh_options() -> Vec<String> {
         .clone()
 }
 
-/// P2P: runs `argv` — the alpha's way to a leader, `ssh <leader>
+/// P2P: runs `argv` — the primary's way to a leader, `ssh <leader>
 /// autobahn p2p attach` by default — and serves as an agent over its
-/// stdio until the far side closes. The alpha is never dialed; this is
-/// how it makes itself an endpoint of a session a beta leads, serving
+/// stdio until the far side closes. The primary is never dialed; this is
+/// how it makes itself an endpoint of a session a replica leads, serving
 /// only what `policy` says it runs.
 pub fn attach_as_agent(argv: &[String], policy: &AttachPolicy) -> Result<()> {
     let (program, arguments) = argv
@@ -2102,10 +2102,10 @@ pub(crate) mod tests {
         std::fs::create_dir_all(&root).expect("the root");
 
         for (session, side) in [
-            ("..", "beta"),
-            ("../..", "beta"),
-            ("/tmp/x", "beta"),
-            ("", "beta"),
+            ("..", "replica"),
+            ("../..", "replica"),
+            ("/tmp/x", "replica"),
+            ("", "replica"),
             (
                 crate::session::session_identifier("a", "b").as_str(),
                 "../..",
@@ -2146,12 +2146,12 @@ pub(crate) mod tests {
         assert!(staged.is_empty(), "{staged:?}");
     }
 
-    /// An attached alpha serves the leader its own sessions as its own
+    /// An attached primary serves the leader its own sessions as its own
     /// configuration has them. A leader asking for another root, or for
-    /// none of the ignores, is served the alpha's; a session the alpha does
+    /// none of the ignores, is served the primary's; a session the primary does
     /// not run is refused, and so is a channel past what its sessions need.
     #[test]
-    fn an_attached_alpha_serves_its_own_settings_only() {
+    fn an_attached_primary_serves_its_own_settings_only() {
         use crate::endpoint::Endpoint;
         let keep = tempfile::tempdir().expect("temporary directory");
         let root = keep.path().join("root");
@@ -2168,7 +2168,7 @@ pub(crate) mod tests {
             symlink_mode: crate::scan::SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
-            side: "alpha".into(),
+            side: "primary".into(),
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
@@ -2198,7 +2198,7 @@ pub(crate) mod tests {
                 ..own.clone()
             };
             let mut endpoint = crate::endpoint::remote::RemoteEndpoint::connect(client, hostile)
-                .expect("the alpha's own session is served");
+                .expect("the primary's own session is served");
             let snapshot = endpoint.scan().expect("scanned");
             let tree = snapshot.root.expect("the configured root");
             assert!(matches!(
@@ -2210,7 +2210,7 @@ pub(crate) mod tests {
                     tree.child("secret.key").map(|node| &node.content),
                     Some(crate::tree::Content::Untracked)
                 ),
-                "the alpha's own ignores hold"
+                "the primary's own ignores hold"
             );
             assert!(tree.child("private.txt").is_none());
             assert!(
@@ -2226,14 +2226,14 @@ pub(crate) mod tests {
             };
             let error = crate::endpoint::remote::RemoteEndpoint::connect(client, unknown)
                 .err()
-                .expect("a session the alpha does not run");
+                .expect("a session the primary does not run");
             assert!(
-                format!("{error:#}").contains("not one of this alpha's p2p sessions"),
+                format!("{error:#}").contains("not one of this primary's p2p sessions"),
                 "{error:#}"
             );
         });
 
-        // A genuine leader never pushes the attached alpha a file, and a
+        // A genuine leader never pushes the attached primary a file, and a
         // hostile one's is refused, with nothing written; the lease and the
         // ancestor records the handback needs are taken as from any leader.
         attach(&|client| {
@@ -2241,7 +2241,7 @@ pub(crate) mod tests {
                 crate::endpoint::remote::RemoteEndpoint::connect(client, own.clone()).unwrap();
             let error = endpoint
                 .put_p2p_file("name", b"hostile:/x")
-                .expect_err("no pushes into an attached alpha");
+                .expect_err("no pushes into an attached primary");
             assert!(
                 format!("{error:#}").contains("takes no pushed files"),
                 "{error:#}"
@@ -2290,7 +2290,7 @@ pub(crate) mod tests {
             symlink_mode: crate::scan::SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
-            side: "beta".into(),
+            side: "replica".into(),
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
@@ -2326,7 +2326,7 @@ pub(crate) mod tests {
             symlink_mode: crate::scan::SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
-            side: "beta".into(),
+            side: "replica".into(),
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
@@ -2372,7 +2372,7 @@ pub(crate) mod tests {
             symlink_mode: crate::scan::SymlinkMode::Raw,
             file_mode: None,
             directory_mode: None,
-            side: "beta".into(),
+            side: "replica".into(),
             staging: Default::default(),
             max_file_size: None,
             max_entry_count: None,
@@ -3172,7 +3172,7 @@ pub(crate) mod tests {
                     symlink_mode: crate::scan::SymlinkMode::Raw,
                     file_mode: None,
                     directory_mode: None,
-                    side: "beta".into(),
+                    side: "replica".into(),
                     staging: Default::default(),
                     max_file_size: None,
                     max_entry_count: None,

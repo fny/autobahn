@@ -1,18 +1,18 @@
 # Benchmark matrix: September–October 2026
 
-This document presents the complete benchmark measurement matrix comparing **Autobahn 1.0.0** against **Mutagen 0.19.0-dev** on Linux. The [summary](./benchmarks.md) explains the headline results. Machine-readable metrics, per-run ranges, and raw sample records are archived in [`benchmarks/2026-10-01.json`](../benchmarks/2026-10-01.json).
+This document presents the complete benchmark measurement matrix comparing **Autobahn 1.0.0** against **Mutagen 0.19.0-dev** on Linux. The [summary](./benchmarks.md) explains the headline results. Machine-readable metrics, per-run ranges, exclusions and problem records are in [`benchmarks/2026-10-02.json`](../benchmarks/2026-10-02.json). Raw samples and logs are kept out of the repository.
 
 
-This is the latest recorded matrix, refreshed through October 1. It is a composite of complete cells from identified builds, not a run of today's HEAD. The [summary](./benchmarks.md) explains the headline results. The committed [aggregate](../benchmarks/2026-10-01.json) contains the figures, sample counts, per-run ranges, exclusions, and problem records used below.
+This is one complete set, refreshed through October 2: every cell, both tools, from identified builds rather than a single run of today's HEAD. The five patch cells were re-run on `0c72865`; every other cell is the base run.
 
 ## Provenance & Build Metadata
 
 | Test Cells | Autobahn Build | Run Identifier | Date |
 | :--- | :--- | :--- | :---: |
 | Base Matrix (all cells except 5 patch runs below) | `e7b3ac0` (1.4.0+e16, musl `dist`, mimalloc) | `bench-1790601586` | 2026-09-28 |
-| `50k-1-patch`, `50k-10-patch` | `98598b8` | `bench-1790773610` | 2026-09-30 |
 | `chromium-10-fan-patch` | `0c72865` | `bench-1790869509` | 2026-10-01 |
 | `chromium-1-patch`, `chromium-10-patch` | `0c72865` | `bench-1790873270` | 2026-10-01 |
+| `50k-1-patch`, `50k-10-patch` | `0c72865` | `bench-1790941679` | 2026-10-02 |
 
 
 **Harness Environment:** Ubuntu 24.04 LTS, 8 cores, 16 GB RAM, 3.5 GHz Intel Xeon 8375C
@@ -23,10 +23,10 @@ All percentiles are pooled milliseconds across five repeats. `ab` is Autobahn, `
 
 | Cell | Direction | ab p50 | ab p90 | ab p99 | mu p50 | mu p90 | mu p99 | p50 ratio | Samples ab / mu | Skipped ab / mu |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 50k-1-patch | sub50k:a-to-b | 22.7 | 25.2 | 29.7 | 447.4 | 546.5 | 686.3 | 19.7× | 2,748 / 2,729 | 0 / 0 |
+| 50k-1-patch | sub50k:a-to-b | 22.1 | 24.4 | 27.5 | 430.8 | 507.2 | 625.4 | 19.5× | 2,714 / 2,711 | 0 / 0 |
 | 50k-1 | sub50k:a-to-b | 13.6 | 14.2 | 44.1 | 426.5 | 533.9 | 1,927.5 | 31.4× | 2,756 / 2,722 | 0 / 0 |
 | 50k-10-fan | sub50k:a-to-b | 17.2 | 29.8 | 89.6 | 4,820.0 | 5,320.0 | 5,602.1 | 280.2× | 2,736 / 2,720 | 0 / 0 |
-| 50k-10-patch | sub50k:a-to-b | 22.7 | 27.5 | 35.5 | 709.1 | 2,065.6 | 3,509.4 | 31.2× | 2,728 / 2,703 | 0 / 1 |
+| 50k-10-patch | sub50k:a-to-b | 22.2 | 27.0 | 34.6 | 703.1 | 2,090.1 | 3,558.5 | 31.7× | 2,751 / 2,718 | 0 / 1 |
 | 50k-10 | sub50k:a-to-b | 13.4 | 20.4 | 45.9 | 1,809.8 | 4,185.5 | 5,226.2 | 135.1× | 2,738 / 2,757 | 0 / 0 |
 | 50k-100 | sub50k:a-to-b | 28.3 | 54.7 | 80.3 | 2,139.0 | 4,507.1 | 5,706.2 | 75.6× | 2,742 / 2,745 | 0 / 0 |
 | 5k-1 | sub5k:a-to-b | 12.1 | 12.6 | 14.0 | 74.1 | 77.3 | 1,666.3 | 6.1× | 2,750 / 2,754 | 0 / 0 |
@@ -39,9 +39,9 @@ All percentiles are pooled milliseconds across five repeats. `ab` is Autobahn, `
 | chromium-1 | chromium:a-to-b | 23.8 | 293.0 | 355.8 | 6,232.2 | 8,820.4 | 10,293.3 | 261.9× | 2,730 / 2,741 | 0 / 0 |
 | chromium-10-bidir | chromium:a-to-b | 47.1 | 289.9 | 607.8 | 6,062.7 | 8,540.1 | 10,135.9 | 128.7× | 2,738 / 2,753 | 0 / 1 |
 | chromium-10-bidir | chromium:b-to-a | 74.6 | 368.0 | 697.9 | 6,329.2 | 8,826.1 | 10,838.9 | 84.8× | 2,713 / 2,732 | 0 / 0 |
-| chromium-10-fan-patch | chromium:a-to-b | 42.0 | 67.0 | 107.8 | 11,165.1 | 17,103.1 | 25,404.1 | 265.8× | 2,710 / 1,268 | 0 / 1576 |
+| chromium-10-fan-patch | chromium:a-to-b | 42.0 | 67.0 | 107.8 | 11,165.1 | 17,103.1 | 25,404.1 | 265.8× | 2,710 / 1,268 | 0 / 1,576 |
 | chromium-10-fan | chromium:a-to-b | 43.9 | 441.4 | 822.2 | 10,881.0 | 12,898.8 | 16,194.5 | 247.9× | 2,723 / 2,713 | 0 / 2 |
-| chromium-10-patch | chromium:a-to-b | 34.0 | 44.8 | 58.1 | 7,839.6 | 11,095.3 | 13,304.5 | 230.6× | 2,711 / 1,765 | 0 / 1038 |
+| chromium-10-patch | chromium:a-to-b | 34.0 | 44.8 | 58.1 | 7,839.6 | 11,095.3 | 13,304.5 | 230.6× | 2,711 / 1,765 | 0 / 1,038 |
 | chromium-10 | chromium:a-to-b | 26.7 | 189.0 | 527.1 | 9,202.4 | 12,160.8 | 13,215.0 | 344.7× | 2,736 / 2,734 | 0 / 0 |
 | chromium-100-bidir | chromium:a-to-b | 232.9 | 480.3 | 1,239.4 | 11,331.3 | 15,413.8 | 17,353.7 | 48.7× | 2,731 / 2,720 | 0 / 3 |
 | chromium-100-bidir | chromium:b-to-a | 299.0 | 609.9 | 1,305.5 | 12,128.8 | 16,205.0 | 17,873.0 | 40.6× | 2,740 / 2,709 | 0 / 3 |
@@ -63,21 +63,32 @@ Median of each run's peak resident memory, in MiB (the aggregate's `/proc` KiB d
 
 | Test Cell | Host Endpoint | ab RSS (MiB) | mu RSS (MiB) | ab CPU % | mu CPU % |
 | :--- | :--- | ---:| ---:| ---:| ---:|
-| 50k-1-patch | local / remote | 73.9 / 49.4 | 269.7 / 184.0 | 2.9 / 1.4 | 91.9 / 62.4 |
+| 50k-1-patch | local / remote | 69.4 / 52.1 | 268.5 / 194.6 | 2.8 / 1.3 | 87.2 / 60.5 |
 | 50k-1 | local / remote | 76.7 / 51.4 | 273.4 / 195.6 | 2.7 / 0.8 | 84.5 / 58.3 |
 | 50k-10-fan | local / remote | 565.7 / 404.8 | 2,716.9 / 1,745.1 | 58.8 / 43.3 | 293.2 / 218.0 |
+| 50k-10-patch | local / remote | 76.7 / 48.6 | 271.7 / 199.8 | 10.7 / 5.0 | 55.0 / 45.2 |
 | 50k-10 | local / remote | 89.6 / 40.9 | 266.3 / 198.6 | 11.6 / 4.1 | 27.1 / 24.9 |
 | 50k-100 | local / remote | 107.1 / 50.0 | 277.2 / 206.0 | 36.8 / 17.5 | 48.2 / 46.3 |
+| 50k-burst | local / remote | 217.2 / 131.2 | 777.1 / 581.6 | 77.9 / 97.3 | 46.0 / 84.0 |
 | 5k-1 | local / remote | 28.4 / 19.7 | 52.7 / 32.3 | 0.6 / 0.2 | 9.5 / 6.9 |
 | 5k-10-fan | local / remote | 172.1 / 162.4 | 377.3 / 319.3 | 27.4 / 19.9 | 61.5 / 46.5 |
 | 5k-10 | local / remote | 27.6 / 16.5 | 54.0 / 34.5 | 3.3 / 1.3 | 5.1 / 3.8 |
+| 5k-100 | local / remote | 33.2 / 22.8 | 52.7 / 38.6 | 14.2 / 8.9 | 14.4 / 9.9 |
 | chromium-1-bidir | local / remote | 467.3 / 319.3 | 2,121.8 / 1,377.3 | 21.3 / 28.7 | 155.8 / 138.9 |
 | chromium-1-patch | local / remote | 351.1 / 168.9 | 2,078.4 / 1,367.9 | 16.9 / 5.5 | 158.3 / 119.8 |
 | chromium-1 | local / remote | 479.0 / 170.4 | 2,081.3 / 1,380.4 | 20.3 / 4.8 | 162.8 / 124.9 |
 | chromium-10-bidir | local / remote | 509.7 / 370.1 | 2,128.0 / 1,429.0 | 61.7 / 77.0 | 131.6 / 106.1 |
-| chromium-10-fan | local / remote | 3,449.7 / 1,825.9 | 22,124.6 / 12,861.5 | 278.3 / 185.3 | 1275.3 / 1086.5 |
+| chromium-10-fan-patch | local / remote | 2,085.9 / 1,866.8 | 22,441.9 / 12,848.0 | 178.0 / 222.2 | 1,289.0 / 1,091.4 |
+| chromium-10-fan | local / remote | 3,449.7 / 1,825.9 | 22,124.6 / 12,861.5 | 278.3 / 185.3 | 1,275.3 / 1,086.5 |
+| chromium-10-patch | local / remote | 367.3 / 153.4 | 2,111.0 / 1,427.7 | 50.6 / 19.5 | 110.6 / 123.6 |
 | chromium-10 | local / remote | 529.6 / 157.9 | 2,074.4 / 1,472.1 | 60.2 / 19.3 | 91.8 / 112.4 |
+| chromium-100-bidir | local / remote | 564.6 / 379.9 | 2,034.5 / 1,398.2 | 95.4 / 71.7 | 113.8 / 87.8 |
 | chromium-100 | local / remote | 544.4 / 159.2 | 2,014.3 / 1,451.8 | 94.2 / 37.9 | 105.2 / 123.9 |
+| chromium-burst | local / remote | 385.3 / 216.3 | 1,914.6 / 1,316.8 | 11.5 / 12.2 | 113.2 / 93.1 |
+| two50k-1 | local / remote | 119.6 / 66.0 | 448.9 / 320.8 | 4.8 / 1.4 | 159.8 / 106.5 |
+| two50k-10-fan | local / remote | 838.1 / 662.4 | 4,830.9 / 3,140.0 | 134.7 / 81.9 | 550.0 / 386.8 |
+| two50k-10 | local / remote | 145.2 / 77.2 | 405.2 / 352.2 | 22.7 / 8.8 | 46.0 / 48.7 |
+| two50k-100 | local / remote | 187.0 / 86.1 | 446.6 / 362.0 | 86.9 / 37.4 | 91.5 / 91.5 |
 
 ### Idle
 
@@ -85,14 +96,12 @@ During idle state on a 505k Chromium repository:
 - **Autobahn Controller:** 386.5 MiB RSS, **0.1% CPU**.
 - **Mutagen Controller:** 1,713.3 MiB RSS, **49.9% CPU**.
 
-### Idle
-
 | Test Cell | Host Endpoint | ab RSS (MiB) | mu RSS (MiB) | ab CPU % | mu CPU % |
 | :--- | :--- | ---:| ---:| ---:| ---:|
-| 50k-1-patch | local / remote | 67.9 / 43.0 | 220.3 / 160.2 | 0.1 / 0.0 | 5.7 / 5.8 |
+| 50k-1-patch | local / remote | 67.9 / 43.3 | 229.3 / 159.5 | 0.1 / 0.0 | 5.7 / 5.5 |
 | 50k-1 | local / remote | 67.1 / 43.3 | 214.8 / 163.7 | 0.1 / 0.0 | 5.8 / 5.6 |
 | 50k-10-fan | local / remote | 516.2 / 398.5 | 1,824.4 / 1,591.0 | 0.7 / 0.2 | 56.2 / 59.0 |
-| 50k-10-patch | local / remote | 68.8 / 42.9 | 223.1 / 160.8 | 0.1 / 0.0 | 5.5 / 6.0 |
+| 50k-10-patch | local / remote | 68.3 / 43.1 | 223.0 / 157.3 | 0.1 / 0.0 | 5.7 / 5.7 |
 | 50k-10 | local / remote | 67.5 / 42.7 | 219.5 / 156.2 | 0.1 / 0.0 | 5.8 / 5.6 |
 | 50k-100 | local / remote | 68.2 / 42.7 | 216.3 / 160.4 | 0.1 / 0.0 | 5.7 / 5.8 |
 | 50k-burst | local / remote | 67.8 / 42.8 | 211.4 / 163.6 | 0.1 / 0.0 | 5.6 / 5.9 |

@@ -6,7 +6,7 @@ Everything autobahn does is described in one file, `~/.autobahn/config.toml`. Th
 
 ## The shape
 
-Each **group** fans one source root (the *alpha*) out to any number of destinations (the *betas*). Each (alpha, beta) pair becomes its own session.
+Each **group** fans one source root (the *primary*) out to any number of destinations (the *replicas*). Each (primary, replica) pair becomes its own session.
 
 ```toml
 # ~/.autobahn/config.toml
@@ -19,9 +19,9 @@ ignores = [".git"]
 interval = 5                # heartbeat seconds between cycles
 
 [groups.project]
-alpha = "~/project"         # the source root you edit
-betas = [                   # everywhere it fans out to
-  "build.example.com",              # inherits the alpha path (~/project
+primary = "~/project"         # the source root you edit
+replicas = [                   # everywhere it fans out to
+  "build.example.com",              # inherits the primary path (~/project
                                     # in *that* host's home)
   "user@lab.example.com:/srv/project",
   "/mnt/backup/project",            # local paths work too
@@ -29,9 +29,9 @@ betas = [                   # everywhere it fans out to
 ignores = ["target"]        # appended to the defaults' ignores
 
 [groups.dotfiles]
-alpha = "~/.config/shell"
-betas = ["build.example.com"]
-mode = "one-way-alpha"
+primary = "~/.config/shell"
+replicas = ["build.example.com"]
+mode = "one-way-primary"
 ```
 
 ### Endpoint Syntax
@@ -39,7 +39,7 @@ mode = "one-way-alpha"
 Autobahn uses SSH key-based authentication, s you need to have your target machines in your `~/.ssh/config`.
 
 - **Local Endpoints:** Paths beginning with `/`, `~`, or `./`.
-- **Remote Endpoints:** Standard SSH syntax (`[user@]host[:path]`). If `:path` is omitted, the endpoint defaults to the same path as `alpha` evaluated within the remote user's home directory.
+- **Remote Endpoints:** Standard SSH syntax (`[user@]host[:path]`). If `:path` is omitted, the endpoint defaults to the same path as `primary` evaluated within the remote user's home directory.
 - **SSH Transport:** Autobahn runs persistent SSH connections enforcing secure defaults (`ClearAllForwardings=yes`, `ForwardAgent=no`, `ForwardX11=no`, `PermitLocalCommand=no`, `Compression=no`, `ServerAliveInterval=15`). Custom SSH binaries can be configured using `AUTOBAHN_SSH`.
 
 ## Top-Level Settings
@@ -49,7 +49,7 @@ Top-level keys must precede section headers in the TOML document. Unknown keys a
 | Key | Type | Default | Description |
 | :--- | :---: | :---: | :--- |
 | `on_alert` | string | `""` | Shell command executed when an alert condition persists. See [Alerts](alerts.md). |
-| `disabled_hosts` | list of strings | `[]` | Excludes listed hosts across all groups. Disabling an alpha host suspends its entire group. |
+| `disabled_hosts` | list of strings | `[]` | Excludes listed hosts across all groups. Disabling a primary host suspends its entire group. |
 | `log_level` | string | `"normal"` | Supervisor logging verbosity: `"quiet"`, `"normal"`, or `"debug"`. |
 | `power_saver_experimental` | boolean | `false` | When running on battery power, extends the full-walk audit interval from 2 minutes to 10 minutes. |
 | `live_reload` | boolean | `true` | Automatically detects edits to `config.toml` and reconfigures active workers without restarting the process. |
@@ -65,8 +65,8 @@ Settings defined in `[defaults]` are inherited by all groups. Group-level defini
 
 | Setting | Scope | Default | Description |
 | :--- | :---: | :---: | :--- |
-| `alpha` | Group | *(Required)* | Source root path (local path or `[user@]host:path`). |
-| `betas` | Group | `[]` | List of destination endpoints. |
+| `primary` | Group | *(Required)* | Source root path (local path or `[user@]host:path`). |
+| `replicas` | Group | `[]` | List of destination endpoints. |
 | `mode` | Both | *(Required)* | Synchronization policy. See [Sync Modes](modes.md). |
 | `ignores` | Both | `[]` | Gitignore-compatible exclusion patterns. |
 | `interval` | Both | `5` | Fallback polling interval in seconds between idle synchronization checks. Minimum: 1. |

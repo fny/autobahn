@@ -26,8 +26,8 @@ build_scenario() {   # $1 = scenario dir
     empty_dirs)   mkdir -p "$d/src/empty" "$d/src/also/empty";;
     exec_bits)    printf '#!/bin/sh\n' > "$d/src/run.sh"; chmod 755 "$d/src/run.sh";
                   printf 'plain' > "$d/src/plain.txt";;
-    beta_extra)   printf 'src' > "$d/src/shared.txt"; printf 'only-on-beta' > "$d/dst/extra.txt";;
-    beta_newer)   printf 'from-alpha' > "$d/src/c.txt"; printf 'from-beta' > "$d/dst/c.txt";;
+    replica_extra)   printf 'src' > "$d/src/shared.txt"; printf 'only-on-replica' > "$d/dst/extra.txt";;
+    replica_newer)   printf 'from-primary' > "$d/src/c.txt"; printf 'from-replica' > "$d/dst/c.txt";;
     unicode)      printf 'nfc' > "$d/src/$(printf 'caf\xc3\xa9').txt";;
     big_name)     printf 'x' > "$d/src/$(python3 -c 'print("n"*200)').txt";;
     many_small)   mkdir -p "$d/src/many"; for i in $(seq 1 300); do printf "%s" "$i" > "$d/src/many/f$i"; done;;
@@ -39,10 +39,10 @@ build_scenario() {   # $1 = scenario dir
 run_autobahn() {   # $1 = scenario dir
   cat > "$1/ab.toml" <<TOML
 [groups.diff]
-alpha = "$1/src"
+primary = "$1/src"
 mode = "two-way-conflict"
 interval = 2
-betas = ["$1/dst"]
+replicas = ["$1/dst"]
 TOML
   # Its own state root per scenario: nothing carries over between them,
   # and the real ~/.autobahn is never touched.
@@ -68,7 +68,7 @@ run_mutagen() {    # $1 = scenario dir
   echo 0
 }
 
-for scenario in plain nested empty_dirs exec_bits beta_extra beta_newer unicode big_name many_small replace_type; do
+for scenario in plain nested empty_dirs exec_bits replica_extra replica_newer unicode big_name many_small replace_type; do
   for tool in autobahn mutagen; do
     d=~/diffwork/$scenario-$tool
     build_scenario "$d" "$scenario"

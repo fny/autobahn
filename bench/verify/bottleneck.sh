@@ -53,7 +53,7 @@ rm -rf ~/.autobahn ~/.autobahn-dev ~/state; mkdir -p ~/state
 sync; echo 3 | sudo tee /proc/sys/vm/drop_caches >/dev/null 2>&1 || true
 ssh -n dest 'sync; echo 3 | sudo tee /proc/sys/vm/drop_caches' >/dev/null 2>&1 || true
 expected=$("$BM" manifest cheap "$SRC")
-printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
+printf '[groups.g]\nprimary = "%s"\nmode = "two-way-conflict"\ninterval = 5\nreplicas = ["dest:%s/dest/%s"]\n' \
   "$SRC" "$HOME" "$C" > ~/bn.toml
 t0=$(date +%s.%N)
 setsid "$AB" watch --config ~/bn.toml --state-root ~/state > ~/bn.log 2>&1 &

@@ -1,6 +1,6 @@
 //! The implementation, held to `spec/Autobahn.tla`.
 //!
-//! The spec is a small board game: one alpha, N betas, a small hierarchy
+//! The spec is a small board game: one primary, N replicas, a small hierarchy
 //! of paths, a few file values, and the moves a user or a cycle can make.
 //! TLC plays every sequence of moves and checks the properties. This file
 //! plays the same game with the *real* reconciler making the cycle's move,
@@ -23,7 +23,7 @@ use autobahn::tree::{apply, reconcile, Change, Content, Digest, FileMetadata, No
 /// Paths are sequences of names from the root, prefix-closed, and are
 /// referred to by index.
 struct Board {
-    betas: usize,
+    replicas: usize,
     paths: Vec<Vec<&'static str>>,
     values: Vec<&'static str>,
 }
@@ -32,17 +32,17 @@ impl Board {
     /// The spec's model: `d`, `d/a`, `d/b`, `f`.
     fn small() -> Board {
         Board {
-            betas: 2,
+            replicas: 2,
             paths: vec![vec!["d"], vec!["d", "a"], vec!["d", "b"], vec!["f"]],
             values: vec!["v1", "v2"],
         }
     }
 
-    /// A wider board for the Rust-only runs: three betas, a nested
+    /// A wider board for the Rust-only runs: three replicas, a nested
     /// directory, three values.
     fn wide() -> Board {
         Board {
-            betas: 3,
+            replicas: 3,
             paths: vec![
                 vec!["d"],
                 vec!["d", "a"],
@@ -95,11 +95,11 @@ impl Board {
     }
 }
 
-/// A side of the game: alpha, or beta number i.
+/// A side of the game: primary, or replica number i.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, PartialOrd, Ord)]
 enum Side {
-    Alpha,
-    Beta(usize),
+    Primary,
+    Replica(usize),
 }
 
 /// What a path holds.
@@ -132,8 +132,8 @@ type Tree = Vec<Cell>;
 /// The game's state, as the spec's variables.
 struct Game {
     mode: SyncMode,
-    alpha: Tree,
-    beta: Vec<Tree>,
+    primary: Tree,
+    replica: Vec<Tree>,
     ancestor: Vec<Tree>,
     conflicts: Vec<BTreeSet<usize>>,
     written: BTreeSet<(Side, usize, &'static str)>,
@@ -224,10 +224,10 @@ impl Game {
         let empty = vec![Cell::NoFile; board.paths.len()];
         let mut game = Game {
             mode,
-            alpha: empty.clone(),
-            beta: vec![empty.clone(); board.betas],
-            ancestor: vec![empty; board.betas],
-            conflicts: vec![BTreeSet::new(); board.betas],
+            primary: empty.clone(),
+            replica: vec![empty.clone(); board.replicas],
+            ancestor: vec![empty; board.replicas],
+            conflicts: vec![BTreeSet::new(); board.replicas],
             written: BTreeSet::new(),
             superseded: BTreeSet::new(),
             discarded: BTreeSet::new(),
@@ -242,15 +242,15 @@ impl Game {
 
     fn tree(&self, side: Side) -> &Tree {
         match side {
-            Side::Alpha => &self.alpha,
-            Side::Beta(i) => &self.beta[i],
+            Side::Primary => &self.primary,
+            Side::Replica(i) => &self.replica[i],
         }
     }
 
     fn tree_mut(&mut self, side: Side) -> &mut Tree {
         match side {
-            Side::Alpha => &mut self.alpha,
-            Side::Beta(i) => &mut self.beta[i],
+            Side::Primary => &mut self.primary,
+            Side::Replica(i) => &mut self.replica[i],
         }
     }
 
@@ -311,15 +311,15 @@ impl Game {
     }
 
     /// The spec's `Resolve`: one side's version of the conflict unit.
-    fn resolve(&mut self, i: usize, q: usize, keep_alpha: bool, board: &Board) -> bool {
+    fn resolve(&mut self, i: usize, q: usize, keep_primary: bool, board: &Board) -> bool {
         if !self.conflicts[i].contains(&q) {
             return false;
         }
         for r in board.subtree(q) {
-            let (winner, loser_side) = if keep_alpha {
-                (self.alpha[r], Side::Beta(i))
+            let (winner, loser_side) = if keep_primary {
+                (self.primary[r], Side::Replica(i))
             } else {
-                (self.beta[i][r], Side::Alpha)
+                (self.replica[i][r], Side::Primary)
             };
             let loser = self.tree(loser_side)[r];
             if let Some(v) = loser.value() {
@@ -335,7 +335,7 @@ impl Game {
             "resolve b{} {} keep {}",
             i + 1,
             board.joined(q),
-            if keep_alpha { "alpha" } else { "beta" }
+            if keep_primary { "primary" } else { "replica" }
         ));
         true
     }
@@ -343,9 +343,14 @@ impl Game {
     /// The spec's `Cycle`, with the real reconciler making the move.
     fn cycle(&mut self, i: usize, board: &Board) {
         let ancestor = to_node(&self.ancestor[i], board);
-        let alpha = to_node(&self.alpha, board);
-        let beta = to_node(&self.beta[i], board);
-        let r = reconcile(ancestor.as_ref(), alpha.as_ref(), beta.as_ref(), self.mode);
+        let primary = to_node(&self.primary, board);
+        let replica = to_node(&self.replica[i], board);
+        let r = reconcile(
+            ancestor.as_ref(),
+            primary.as_ref(),
+            replica.as_ref(),
+            self.mode,
+        );
 
         // A perfect transition achieves exactly what it was asked.
         let achieved = |transitions: &[Change]| {
@@ -357,18 +362,20 @@ impl Game {
             };
             achieved_changes(transitions, &outcome).expect("one result per transition")
         };
-        let alpha_after = apply(alpha.as_ref(), &r.alpha_transitions).expect("alpha applies");
-        let beta_after = apply(beta.as_ref(), &r.beta_transitions).expect("beta applies");
+        let primary_after =
+            apply(primary.as_ref(), &r.primary_transitions).expect("primary applies");
+        let replica_after =
+            apply(replica.as_ref(), &r.replica_transitions).expect("replica applies");
         let mut ancestor_changes = r.ancestor_changes.clone();
-        ancestor_changes.extend(achieved(&r.beta_transitions));
-        ancestor_changes.extend(achieved(&r.alpha_transitions));
+        ancestor_changes.extend(achieved(&r.replica_transitions));
+        ancestor_changes.extend(achieved(&r.primary_transitions));
         let ancestor_after = apply(ancestor.as_ref(), &ancestor_changes).expect("ancestor applies");
 
-        let alpha_before = self.alpha.clone();
-        let beta_before = self.beta[i].clone();
+        let primary_before = self.primary.clone();
+        let replica_before = self.replica[i].clone();
         let anc_before = self.ancestor[i].clone();
-        self.alpha = from_node(alpha_after.as_ref(), board);
-        self.beta[i] = from_node(beta_after.as_ref(), board);
+        self.primary = from_node(primary_after.as_ref(), board);
+        self.replica[i] = from_node(replica_after.as_ref(), board);
         self.ancestor[i] = from_node(ancestor_after.as_ref(), board);
         self.conflicts[i] = r
             .conflicts
@@ -384,18 +391,18 @@ impl Game {
         // the trees rather than the rules — so this checks the reconciler
         // instead of restating it.
         for p in 0..board.paths.len() {
-            if let Some(y) = beta_before[p].value() {
+            if let Some(y) = replica_before[p].value() {
                 let changed = anc_before[p] != Cell::File(y);
-                let gone = self.beta[i][p] != Cell::File(y) && self.alpha[p] != Cell::File(y);
+                let gone = self.replica[i][p] != Cell::File(y) && self.primary[p] != Cell::File(y);
                 if changed && gone {
-                    self.discarded.insert((Side::Beta(i), p, y));
+                    self.discarded.insert((Side::Replica(i), p, y));
                 }
             }
-            if let Some(x) = alpha_before[p].value() {
+            if let Some(x) = primary_before[p].value() {
                 let changed = anc_before[p] != Cell::File(x);
-                let gone = self.alpha[p] != Cell::File(x) && self.beta[i][p] != Cell::File(x);
+                let gone = self.primary[p] != Cell::File(x) && self.replica[i][p] != Cell::File(x);
                 if changed && gone {
-                    self.discarded.insert((Side::Alpha, p, x));
+                    self.discarded.insert((Side::Primary, p, x));
                 }
             }
         }
@@ -405,7 +412,8 @@ impl Game {
         if self.conflicts[i].is_empty() {
             for p in 0..board.paths.len() {
                 assert!(
-                    self.ancestor[i][p] == self.alpha[p] && self.ancestor[i][p] == self.beta[i][p],
+                    self.ancestor[i][p] == self.primary[p]
+                        && self.ancestor[i][p] == self.replica[i][p],
                     "pair {} not levelled at {} after a clean cycle\n{}",
                     i + 1,
                     board.joined(p),
@@ -428,14 +436,14 @@ impl Game {
             })
         };
         assert!(
-            formed(&self.alpha),
-            "alpha malformed\n{}",
+            formed(&self.primary),
+            "primary malformed\n{}",
             self.report(board)
         );
-        for i in 0..board.betas {
+        for i in 0..board.replicas {
             assert!(
-                formed(&self.beta[i]),
-                "beta {} malformed\n{}",
+                formed(&self.replica[i]),
+                "replica {} malformed\n{}",
                 i + 1,
                 self.report(board)
             );
@@ -448,8 +456,8 @@ impl Game {
         }
         // Accounted.
         for &(side, p, value) in &self.written {
-            let present = self.alpha[p] == Cell::File(value)
-                || self.beta.iter().any(|b| b[p] == Cell::File(value));
+            let present = self.primary[p] == Cell::File(value)
+                || self.replica.iter().any(|b| b[p] == Cell::File(value));
             let accounted = present
                 || self.superseded.contains(&(p, value))
                 || self.discarded.iter().any(|d| d.1 == p && d.2 == value)
@@ -470,11 +478,11 @@ impl Game {
                 self.report(board)
             );
         }
-        // AlphaKeeps.
+        // PrimaryKeeps.
         for d in &self.discarded {
             assert!(
-                d.0 != Side::Alpha,
-                "alpha lost {} at {} to a beta\n{}",
+                d.0 != Side::Primary,
+                "primary lost {} at {} to a replica\n{}",
                 d.2,
                 board.joined(d.1),
                 self.report(board)
@@ -490,11 +498,11 @@ impl Game {
                 .join(" ")
         };
         format!(
-            "mode {:?}\nsteps:\n  {}\nalpha     {}\nbetas     {:?}\nancestors {:?}\nconflicts {:?}",
+            "mode {:?}\nsteps:\n  {}\nprimary     {}\nreplicas     {:?}\nancestors {:?}\nconflicts {:?}",
             self.mode,
             self.steps.join("\n  "),
-            show(&self.alpha),
-            self.beta.iter().map(&show).collect::<Vec<_>>(),
+            show(&self.primary),
+            self.replica.iter().map(&show).collect::<Vec<_>>(),
             self.ancestor.iter().map(show).collect::<Vec<_>>(),
             self.conflicts
                 .iter()
@@ -511,8 +519,8 @@ impl Game {
                 .collect::<Vec<_>>()
                 .join(" @@ ")
         };
-        let per_beta = |f: &dyn Fn(usize) -> String| -> String {
-            (0..board.betas)
+        let per_replica = |f: &dyn Fn(usize) -> String| -> String {
+            (0..board.replicas)
                 .map(|i| format!("b{} :> {}", i + 1, f(i)))
                 .collect::<Vec<_>>()
                 .join(" @@ ")
@@ -528,11 +536,11 @@ impl Game {
             )
         };
         self.trace.push(format!(
-            "[alpha |-> ({}), beta |-> ({}), ancestor |-> ({}), conflicts |-> ({})]",
-            tree(&self.alpha),
-            per_beta(&|i| format!("({})", tree(&self.beta[i]))),
-            per_beta(&|i| format!("({})", tree(&self.ancestor[i]))),
-            per_beta(&conflicts),
+            "[primary |-> ({}), replica |-> ({}), ancestor |-> ({}), conflicts |-> ({})]",
+            tree(&self.primary),
+            per_replica(&|i| format!("({})", tree(&self.replica[i]))),
+            per_replica(&|i| format!("({})", tree(&self.ancestor[i]))),
+            per_replica(&conflicts),
         ));
     }
 }
@@ -558,8 +566,8 @@ impl Rng {
 fn play(seed: u64, mode: SyncMode, board: &Board, moves: usize) -> Game {
     let mut rng = Rng(seed | 1);
     let mut game = Game::new(mode, board);
-    let sides: Vec<Side> = std::iter::once(Side::Alpha)
-        .chain((0..board.betas).map(Side::Beta))
+    let sides: Vec<Side> = std::iter::once(Side::Primary)
+        .chain((0..board.replicas).map(Side::Replica))
         .collect();
     let mut stalls = 0;
     while game.edits < moves && stalls < 1000 {
@@ -573,7 +581,7 @@ fn play(seed: u64, mode: SyncMode, board: &Board, moves: usize) -> Game {
             2 => game.mkdir(side, p, board),
             3 => game.remove(side, p, board),
             _ => {
-                let i = rng.below(board.betas);
+                let i = rng.below(board.replicas);
                 game.resolve(i, p, rng.below(2) == 0, board)
             }
         };
@@ -584,7 +592,7 @@ fn play(seed: u64, mode: SyncMode, board: &Board, moves: usize) -> Game {
         game.record(board);
         game.check(board);
         for _ in 0..rng.below(3) {
-            let i = rng.below(board.betas);
+            let i = rng.below(board.replicas);
             game.cycle(i, board);
             game.record(board);
             game.check(board);
@@ -592,17 +600,17 @@ fn play(seed: u64, mode: SyncMode, board: &Board, moves: usize) -> Game {
     }
     // Settle: every pair cycles until nothing moves.
     for _ in 0..3 {
-        for i in 0..board.betas {
+        for i in 0..board.replicas {
             game.cycle(i, board);
             game.record(board);
             game.check(board);
         }
     }
     // Converges: level everywhere but under reported conflicts, and in
-    // the alpha modes, level everywhere.
-    for i in 0..board.betas {
+    // the primary modes, level everywhere.
+    for i in 0..board.replicas {
         for p in 0..board.paths.len() {
-            let level = game.alpha[p] == game.beta[i][p];
+            let level = game.primary[p] == game.replica[i][p];
             assert!(
                 level || game.in_conflict(i, p, board),
                 "pair {} did not converge at {}\n{}",
@@ -646,11 +654,11 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, board: &Board, 
     let name = format!("Trace{index}");
     let mode_name = match mode {
         SyncMode::TwoWaySafe => "conflict",
-        SyncMode::TwoWayResolved => "alpha",
+        SyncMode::TwoWayResolved => "primary",
         SyncMode::TwoWayStrict => "strict",
         _ => unreachable!(),
     };
-    let symbols: Vec<String> = (1..=board.betas)
+    let symbols: Vec<String> = (1..=board.replicas)
         .map(|i| format!("b{i}"))
         .chain(board.values.iter().map(|v| v.to_string()))
         .collect();
@@ -664,7 +672,8 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, board: &Board, 
         "VARIABLE i".to_string(),
         // The logged trees and conflicts must be what the spec's own step
         // produces; the bookkeeping variables are the spec's to choose.
-        "Match == /\\ alpha' = Trace[i + 1].alpha /\\ beta' = Trace[i + 1].beta".to_string(),
+        "Match == /\\ primary' = Trace[i + 1].primary /\\ replica' = Trace[i + 1].replica"
+            .to_string(),
         "         /\\ ancestor' = Trace[i + 1].ancestor /\\ conflicts' = Trace[i + 1].conflicts"
             .to_string(),
         "TInit == Init /\\ i = 1".to_string(),
@@ -679,10 +688,10 @@ fn write_trace(dir: &std::path::Path, index: usize, game: &Game, board: &Board, 
     .join("\n");
     std::fs::write(dir.join(format!("{name}.tla")), module).unwrap();
     let cfg = format!(
-        "SPECIFICATION TSpec\nCONSTANTS\n{}    Betas = {{{}}}\n    Paths <- TPaths\n    Values = {{{}}}\n    \
+        "SPECIFICATION TSpec\nCONSTANTS\n{}    Replicas = {{{}}}\n    Paths <- TPaths\n    Values = {{{}}}\n    \
          NoFile = NoFile\n    Dir = Dir\n    Mode = \"{mode_name}\"\n    MaxEdits = {}\nCHECK_DEADLOCK TRUE\n",
         symbols.iter().map(|s| format!("    {s} = {s}\n")).collect::<String>(),
-        (1..=board.betas).map(|i| format!("b{i}")).collect::<Vec<_>>().join(", "),
+        (1..=board.replicas).map(|i| format!("b{i}")).collect::<Vec<_>>().join(", "),
         board.values.join(", "),
         game.edits
     );

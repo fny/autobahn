@@ -1233,14 +1233,14 @@ impl LocalEndpoint {
         let digest = need.request.digest;
         let (path, file) = match self.open_scanned(&need.request.path, &digest) {
             Ok(file) => (need.request.path.clone(), file),
-            Err(primary_error) => self
+            Err(first_error) => self
                 .digest_paths(alternatives, &digest, &need.request.path)
                 .into_iter()
                 .find_map(|candidate| {
                     let file = self.open_scanned(&candidate, &digest).ok()?;
                     Some((candidate, file))
                 })
-                .ok_or(primary_error)?,
+                .ok_or(first_error)?,
         };
         let signature = std::mem::take(&mut need.signature);
         if signature.is_empty() {
@@ -4397,59 +4397,61 @@ mod tests {
     /// A pair of endpoints over two roots, with isolated staging.
     struct Fixture {
         _keep: TempDir,
-        alpha_root: PathBuf,
-        beta_root: PathBuf,
-        alpha: LocalEndpoint,
-        beta: LocalEndpoint,
+        primary_root: PathBuf,
+        replica_root: PathBuf,
+        primary: LocalEndpoint,
+        replica: LocalEndpoint,
     }
 
     impl Fixture {
         fn new() -> Fixture {
             let keep = tempdir().expect("temporary directory should be creatable");
-            let alpha_root = keep.path().join("alpha");
-            let beta_root = keep.path().join("beta");
-            fs::create_dir_all(&alpha_root).expect("alpha root should be creatable");
-            fs::create_dir_all(&beta_root).expect("beta root should be creatable");
-            let alpha = endpoint(&alpha_root, &keep.path().join("staging-alpha"));
-            let beta = endpoint(&beta_root, &keep.path().join("staging-beta"));
+            let primary_root = keep.path().join("primary");
+            let replica_root = keep.path().join("replica");
+            fs::create_dir_all(&primary_root).expect("primary root should be creatable");
+            fs::create_dir_all(&replica_root).expect("replica root should be creatable");
+            let primary = endpoint(&primary_root, &keep.path().join("staging-primary"));
+            let replica = endpoint(&replica_root, &keep.path().join("staging-replica"));
             Fixture {
                 _keep: keep,
-                alpha_root,
-                beta_root,
-                alpha,
-                beta,
+                primary_root,
+                replica_root,
+                primary,
+                replica,
             }
         }
 
-        /// Scans both endpoints and returns the changes that would bring beta
-        /// into agreement with alpha.
-        fn beta_transitions(&mut self) -> Vec<Change> {
-            let alpha = self.alpha.scan().expect("alpha scan should succeed");
-            let beta = self.beta.scan().expect("beta scan should succeed");
-            diff(beta.root.as_ref(), alpha.root.as_ref())
+        /// Scans both endpoints and returns the changes that would bring replica
+        /// into agreement with the primary.
+        fn replica_transitions(&mut self) -> Vec<Change> {
+            let primary = self.primary.scan().expect("primary scan should succeed");
+            let replica = self.replica.scan().expect("replica scan should succeed");
+            diff(replica.root.as_ref(), primary.root.as_ref())
         }
 
-        /// Drives a complete staging exchange from alpha into beta, exactly
+        /// Drives a complete staging exchange from the primary into the replica, exactly
         /// as the session controller does (with a deliberately small batch
         /// size, so that per-file buffers are drained across several pulls).
         fn stage(&mut self, transitions: &[Change]) -> Vec<StagingNeed> {
             let requests = transition_dependencies(transitions);
             let needs = self
-                .beta
+                .replica
                 .stage_begin(requests)
                 .expect("staging should begin");
             if needs.is_empty() {
                 return needs;
             }
-            self.alpha
+            self.primary
                 .supply_open(needs.clone())
                 .expect("supply should open");
             loop {
-                let frames = self.alpha.supply_pull(3).expect("supply should pull");
+                let frames = self.primary.supply_pull(3).expect("supply should pull");
                 if frames.is_empty() {
                     break;
                 }
-                self.beta.stage_push(frames).expect("staging should accept");
+                self.replica
+                    .stage_push(frames)
+                    .expect("staging should accept");
             }
             needs
         }
@@ -4511,35 +4513,55 @@ mod tests {
     fn staging_placements_compute_scan_excluded_locations() {
         use crate::endpoint::StagingMode;
         let root = Path::new("/data/project");
-        let state = PathBuf::from("/state/staging-beta");
+        let state = PathBuf::from("/state/staging-replica");
         assert_eq!(
-            staging_root_for(StagingMode::State, root, state.clone(), "s1", "beta").unwrap(),
+            staging_root_for(StagingMode::State, root, state.clone(), "s1", "replica").unwrap(),
             state
         );
-        let beside =
-            staging_root_for(StagingMode::BesideRoot, root, state.clone(), "s1", "beta").unwrap();
-        assert_eq!(beside, PathBuf::from("/data/.autobahn-tmp-staging-s1-beta"));
-        let inside =
-            staging_root_for(StagingMode::InsideRoot, root, state.clone(), "s1", "beta").unwrap();
+        let beside = staging_root_for(
+            StagingMode::BesideRoot,
+            root,
+            state.clone(),
+            "s1",
+            "replica",
+        )
+        .unwrap();
+        assert_eq!(
+            beside,
+            PathBuf::from("/data/.autobahn-tmp-staging-s1-replica")
+        );
+        let inside = staging_root_for(
+            StagingMode::InsideRoot,
+            root,
+            state.clone(),
+            "s1",
+            "replica",
+        )
+        .unwrap();
         assert_eq!(
             inside,
-            PathBuf::from("/data/project/.autobahn-tmp-staging-s1-beta")
+            PathBuf::from("/data/project/.autobahn-tmp-staging-s1-replica")
         );
         // The root of the filesystem has nothing to stage beside.
-        assert!(
-            staging_root_for(StagingMode::BesideRoot, Path::new("/"), state, "s1", "beta").is_err()
-        );
+        assert!(staging_root_for(
+            StagingMode::BesideRoot,
+            Path::new("/"),
+            state,
+            "s1",
+            "replica"
+        )
+        .is_err());
     }
 
     #[test]
     fn inside_root_staging_is_invisible_to_synchronization() {
         use crate::endpoint::StagingMode;
         let keep = tempdir().expect("temporary directory should be creatable");
-        let alpha_root = keep.path().join("alpha");
-        let beta_root = keep.path().join("beta");
-        fs::create_dir_all(&alpha_root).expect("alpha root should be creatable");
-        fs::create_dir_all(&beta_root).expect("beta root should be creatable");
-        fs::write(alpha_root.join("file.txt"), b"content").expect("file should be writable");
+        let primary_root = keep.path().join("primary");
+        let replica_root = keep.path().join("replica");
+        fs::create_dir_all(&primary_root).expect("primary root should be creatable");
+        fs::create_dir_all(&replica_root).expect("replica root should be creatable");
+        fs::write(primary_root.join("file.txt"), b"content").expect("file should be writable");
 
         let staging = |root: &Path, side: &str| {
             staging_root_for(
@@ -4551,25 +4573,25 @@ mod tests {
             )
             .expect("staging root should compute")
         };
-        let mut alpha = LocalEndpoint::new(
-            alpha_root.clone(),
-            staging(&alpha_root, "alpha"),
+        let mut primary = LocalEndpoint::new(
+            primary_root.clone(),
+            staging(&primary_root, "primary"),
             EndpointOptions::default(),
         )
         .expect("endpoint should be creatable");
-        let mut beta = LocalEndpoint::new(
-            beta_root.clone(),
-            staging(&beta_root, "beta"),
+        let mut replica = LocalEndpoint::new(
+            replica_root.clone(),
+            staging(&replica_root, "replica"),
             EndpointOptions::default(),
         )
         .expect("endpoint should be creatable");
 
         // The staging directories live inside the roots, but never appear
         // in a scan.
-        let snapshot = alpha.scan().expect("alpha scan should succeed");
+        let snapshot = primary.scan().expect("primary scan should succeed");
         let root_node = snapshot.root.as_ref().expect("root should exist");
         assert_eq!(root_node.children().len(), 1);
-        let snapshot = beta.scan().expect("beta scan should succeed");
+        let snapshot = replica.scan().expect("replica scan should succeed");
         assert_eq!(
             snapshot
                 .root
@@ -4588,16 +4610,16 @@ mod tests {
         let uid = unsafe { libc::getuid() };
         let gid = unsafe { libc::getgid() };
         let keep = tempdir().expect("temporary directory should be creatable");
-        let alpha_root = keep.path().join("alpha");
-        let beta_root = keep.path().join("beta");
-        fs::create_dir_all(&alpha_root).expect("alpha root should be creatable");
-        fs::create_dir_all(&beta_root).expect("beta root should be creatable");
-        write(&alpha_root, "dir/file.txt", "content");
+        let primary_root = keep.path().join("primary");
+        let replica_root = keep.path().join("replica");
+        fs::create_dir_all(&primary_root).expect("primary root should be creatable");
+        fs::create_dir_all(&replica_root).expect("replica root should be creatable");
+        write(&primary_root, "dir/file.txt", "content");
 
-        let mut alpha = endpoint(&alpha_root, &keep.path().join("staging-alpha"));
-        let mut beta = LocalEndpoint::new(
-            beta_root.clone(),
-            keep.path().join("staging-beta"),
+        let mut primary = endpoint(&primary_root, &keep.path().join("staging-primary"));
+        let mut replica = LocalEndpoint::new(
+            replica_root.clone(),
+            keep.path().join("staging-replica"),
             EndpointOptions {
                 default_owner: Some(format!("id:{uid}")),
                 default_group: Some(format!("id:{gid}")),
@@ -4606,30 +4628,32 @@ mod tests {
         )
         .expect("endpoint should be creatable");
 
-        let alpha_snapshot = alpha.scan().expect("alpha scan should succeed");
-        let beta_snapshot = beta.scan().expect("beta scan should succeed");
+        let primary_snapshot = primary.scan().expect("primary scan should succeed");
+        let replica_snapshot = replica.scan().expect("replica scan should succeed");
         let changes = crate::tree::reconcile(
             None,
-            alpha_snapshot.root.as_ref(),
-            beta_snapshot.root.as_ref(),
+            primary_snapshot.root.as_ref(),
+            replica_snapshot.root.as_ref(),
             crate::tree::SyncMode::TwoWaySafe,
         )
-        .beta_transitions;
-        let needs = beta
+        .replica_transitions;
+        let needs = replica
             .stage_begin(transition_dependencies(&changes))
             .expect("staging should begin");
-        alpha.supply_open(needs).expect("supply should open");
+        primary.supply_open(needs).expect("supply should open");
         loop {
-            let frames = alpha.supply_pull(usize::MAX).expect("supply should pull");
+            let frames = primary.supply_pull(usize::MAX).expect("supply should pull");
             if frames.is_empty() {
                 break;
             }
-            beta.stage_push(frames).expect("push should succeed");
+            replica.stage_push(frames).expect("push should succeed");
         }
-        let outcome = beta.transition(changes).expect("transition should succeed");
+        let outcome = replica
+            .transition(changes)
+            .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         let metadata =
-            fs::symlink_metadata(beta_root.join("dir/file.txt")).expect("file should exist");
+            fs::symlink_metadata(replica_root.join("dir/file.txt")).expect("file should exist");
         assert_eq!(metadata.uid(), uid);
         assert_eq!(metadata.gid(), gid);
     }
@@ -4746,23 +4770,23 @@ mod tests {
     #[test]
     fn a_created_root_is_probed_before_its_children() {
         let mut fixture = Fixture::new();
-        // The beta root goes missing, so its next scan probes nothing and
+        // The replica root goes missing, so its next scan probes nothing and
         // a root-creating transition is planned.
-        fs::remove_dir_all(&fixture.beta_root).expect("beta root removes");
-        write(&fixture.alpha_root, "a", "lower");
-        write(&fixture.alpha_root, "A", "UPPER");
+        fs::remove_dir_all(&fixture.replica_root).expect("replica root removes");
+        write(&fixture.primary_root, "a", "lower");
+        write(&fixture.primary_root, "A", "UPPER");
         // The wrong conclusion a stale default would carry: the real
         // filesystem is case-sensitive, so `a` and `A` are distinct — but
         // a transitioner trusting this behavior refuses the second as a
         // fold collision.
-        fixture.beta.force_behavior(FilesystemBehavior {
+        fixture.replica.force_behavior(FilesystemBehavior {
             case_insensitive: true,
             ..FilesystemBehavior::default()
         });
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should apply");
         assert!(
@@ -4770,7 +4794,7 @@ mod tests {
             "distinct names on a case-sensitive volume were refused: {:?}",
             outcome.problems
         );
-        assert!(fixture.beta_root.join("a").exists() && fixture.beta_root.join("A").exists());
+        assert!(fixture.replica_root.join("a").exists() && fixture.replica_root.join("A").exists());
     }
 
     /// A staged survivor from an interrupted run is rehashed before its
@@ -4875,26 +4899,26 @@ mod tests {
     #[test]
     fn published_content_moves_out_of_staging_on_its_last_use() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "one.txt", "shared content");
-        write(&fixture.alpha_root, "two.txt", "shared content");
-        write(&fixture.alpha_root, "three.txt", "unique content");
+        write(&fixture.primary_root, "one.txt", "shared content");
+        write(&fixture.primary_root, "two.txt", "shared content");
+        write(&fixture.primary_root, "three.txt", "unique content");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
 
         // Every target holds its content...
-        assert_eq!(read(&fixture.beta_root, "one.txt"), "shared content");
-        assert_eq!(read(&fixture.beta_root, "two.txt"), "shared content");
-        assert_eq!(read(&fixture.beta_root, "three.txt"), "unique content");
+        assert_eq!(read(&fixture.replica_root, "one.txt"), "shared content");
+        assert_eq!(read(&fixture.replica_root, "two.txt"), "shared content");
+        assert_eq!(read(&fixture.replica_root, "three.txt"), "unique content");
         // ...and each digest's last publish consumed its staged file, so
         // the staging root retains no content (only, possibly, empty
         // bookkeeping entries such as the scan cache).
-        let leftovers: Vec<_> = fs::read_dir(fixture._keep.path().join("staging-beta"))
+        let leftovers: Vec<_> = fs::read_dir(fixture._keep.path().join("staging-replica"))
             .expect("staging root should be readable")
             .filter_map(|entry| entry.ok())
             .filter(|entry| entry.metadata().map(|m| m.len() > 0).unwrap_or(false))
@@ -4909,21 +4933,21 @@ mod tests {
     #[test]
     fn supply_recovers_from_an_alternate_path_sharing_the_digest() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "a.txt", "shared content");
-        write(&fixture.alpha_root, "b.txt", "shared content");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "a.txt", "shared content");
+        write(&fixture.primary_root, "b.txt", "shared content");
+        let transitions = fixture.replica_transitions();
         // The first path vanishes after the scan; its content must still
         // be supplied from the surviving duplicate.
-        fs::remove_file(fixture.alpha_root.join("a.txt")).expect("file should be removable");
+        fs::remove_file(fixture.primary_root.join("a.txt")).expect("file should be removable");
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert!(!outcome.missing_staged_files);
-        assert_eq!(read(&fixture.beta_root, "a.txt"), "shared content");
-        assert_eq!(read(&fixture.beta_root, "b.txt"), "shared content");
+        assert_eq!(read(&fixture.replica_root, "a.txt"), "shared content");
+        assert_eq!(read(&fixture.replica_root, "b.txt"), "shared content");
     }
 
     /// A stream's first failures are answered by walking the snapshot for
@@ -4936,28 +4960,28 @@ mod tests {
         let count = TARGETED_SEARCHES * 2 + 1;
         for i in 0..count {
             let content = format!("content {i}");
-            write(&fixture.alpha_root, &format!("a{i:02}.txt"), &content);
+            write(&fixture.primary_root, &format!("a{i:02}.txt"), &content);
             write(
-                &fixture.alpha_root,
+                &fixture.primary_root,
                 &format!("z/deep/copy{i:02}.txt"),
                 &content,
             );
         }
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         for i in 0..count {
-            fs::remove_file(fixture.alpha_root.join(format!("a{i:02}.txt")))
+            fs::remove_file(fixture.primary_root.join(format!("a{i:02}.txt")))
                 .expect("file should be removable");
         }
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert!(!outcome.missing_staged_files);
         for i in 0..count {
             assert_eq!(
-                read(&fixture.beta_root, &format!("a{i:02}.txt")),
+                read(&fixture.replica_root, &format!("a{i:02}.txt")),
                 format!("content {i}")
             );
         }
@@ -4966,13 +4990,13 @@ mod tests {
     #[test]
     fn transition_folds_achieved_results_into_the_snapshot() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "a.txt", "alpha content");
-        write(&fixture.alpha_root, "dir/b.txt", "nested content");
+        write(&fixture.primary_root, "a.txt", "primary content");
+        write(&fixture.primary_root, "dir/b.txt", "nested content");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
 
@@ -4980,43 +5004,43 @@ mod tests {
         // included — and agrees with what a fresh scan observes, which is
         // what lets that scan skip re-digesting the published content.
         let retained = fixture
-            .beta
+            .replica
             .last_snapshot
             .clone()
             .expect("a snapshot should be retained");
         assert_eq!(retained.files, 2);
         assert_eq!(retained.directories, 2);
-        let rescanned = fixture.beta.scan().expect("scan should succeed");
+        let rescanned = fixture.replica.scan().expect("scan should succeed");
         assert!(retained.content_equal(&rescanned));
     }
 
     #[test]
     fn staging_and_transition_round_trip() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "top.txt", "top level");
-        write(&fixture.alpha_root, "dir/inner.txt", "inner content");
-        write(&fixture.alpha_root, "dir/tool.sh", "#!/bin/sh\n");
-        write(&fixture.alpha_root, "dir/empty.txt", "");
+        write(&fixture.primary_root, "top.txt", "top level");
+        write(&fixture.primary_root, "dir/inner.txt", "inner content");
+        write(&fixture.primary_root, "dir/tool.sh", "#!/bin/sh\n");
+        write(&fixture.primary_root, "dir/empty.txt", "");
         fs::set_permissions(
-            fixture.alpha_root.join("dir/tool.sh"),
+            fixture.primary_root.join("dir/tool.sh"),
             Permissions::from_mode(0o755),
         )
         .expect("permissions should be settable");
-        symlink("inner.txt", fixture.alpha_root.join("dir/link"))
+        symlink("inner.txt", fixture.primary_root.join("dir/link"))
             .expect("symlink should be creatable");
-        fs::create_dir_all(fixture.alpha_root.join("empty"))
+        fs::create_dir_all(fixture.primary_root.join("empty"))
             .expect("directory should be creatable");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         let needs = fixture.stage(&transitions);
-        // Every file needs transferring: beta is empty, so nothing can be
+        // Every file needs transferring: the replica is empty, so nothing can be
         // satisfied locally. (The empty file is a need too, and arrives as a
         // bare end-of-file frame.)
         assert_eq!(needs.len(), 4);
         assert!(needs.iter().all(|need| need.signature.is_empty()));
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions.clone())
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
@@ -5025,59 +5049,62 @@ mod tests {
         assert!(outcome.results.iter().all(Option::is_some));
 
         // The destination now matches the source, byte for byte.
-        assert_eq!(read(&fixture.beta_root, "top.txt"), "top level");
-        assert_eq!(read(&fixture.beta_root, "dir/inner.txt"), "inner content");
-        assert_eq!(read(&fixture.beta_root, "dir/empty.txt"), "");
-        assert!(executable(&fixture.beta_root, "dir/tool.sh"));
-        assert!(!executable(&fixture.beta_root, "dir/inner.txt"));
+        assert_eq!(read(&fixture.replica_root, "top.txt"), "top level");
         assert_eq!(
-            fs::read_link(fixture.beta_root.join("dir/link")).expect("link should be readable"),
+            read(&fixture.replica_root, "dir/inner.txt"),
+            "inner content"
+        );
+        assert_eq!(read(&fixture.replica_root, "dir/empty.txt"), "");
+        assert!(executable(&fixture.replica_root, "dir/tool.sh"));
+        assert!(!executable(&fixture.replica_root, "dir/inner.txt"));
+        assert_eq!(
+            fs::read_link(fixture.replica_root.join("dir/link")).expect("link should be readable"),
             Path::new("inner.txt")
         );
-        assert!(fixture.beta_root.join("empty").is_dir());
+        assert!(fixture.replica_root.join("empty").is_dir());
 
-        // A rescan of beta agrees with alpha's hierarchy, and a further
+        // A rescan of the replica agrees with the primary's hierarchy, and a further
         // reconciliation has nothing left to do.
-        let further = fixture.beta_transitions();
+        let further = fixture.replica_transitions();
         assert!(further.is_empty(), "{further:?}");
     }
 
     #[test]
     fn missing_root_is_created_by_transition() {
         let mut fixture = Fixture::new();
-        fs::remove_dir_all(&fixture.beta_root).expect("beta root should be removable");
-        write(&fixture.alpha_root, "dir/inner.txt", "inner");
+        fs::remove_dir_all(&fixture.replica_root).expect("replica root should be removable");
+        write(&fixture.primary_root, "dir/inner.txt", "inner");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         assert_eq!(transitions.len(), 1);
         assert!(transitions[0].path.is_empty());
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert_eq!(read(&fixture.beta_root, "dir/inner.txt"), "inner");
+        assert_eq!(read(&fixture.replica_root, "dir/inner.txt"), "inner");
     }
 
     #[test]
     fn delta_transfer_reuses_the_destination_base() {
         let mut fixture = Fixture::new();
         let shared = pseudo_random(200_000, 0x1234);
-        let mut alpha_content = shared.clone();
-        alpha_content.extend_from_slice(b"alpha tail");
-        let mut beta_content = shared.clone();
-        beta_content.extend_from_slice(b"beta tail, which differs");
-        fs::write(fixture.alpha_root.join("big.bin"), &alpha_content)
+        let mut primary_content = shared.clone();
+        primary_content.extend_from_slice(b"primary tail");
+        let mut replica_content = shared.clone();
+        replica_content.extend_from_slice(b"replica tail, which differs");
+        fs::write(fixture.primary_root.join("big.bin"), &primary_content)
             .expect("file should be writable");
-        fs::write(fixture.beta_root.join("big.bin"), &beta_content)
+        fs::write(fixture.replica_root.join("big.bin"), &replica_content)
             .expect("file should be writable");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         assert_eq!(transitions.len(), 1);
         let requests = transition_dependencies(&transitions);
         let needs = fixture
-            .beta
+            .replica
             .stage_begin(requests)
             .expect("staging should begin");
         assert_eq!(needs.len(), 1);
@@ -5087,13 +5114,13 @@ mod tests {
         assert!(!needs[0].signature.hashes.is_empty());
 
         fixture
-            .alpha
+            .primary
             .supply_open(needs)
             .expect("supply should open");
         let mut blocks = 0u64;
         let mut data = 0usize;
         loop {
-            let frames = fixture.alpha.supply_pull(3).expect("supply should pull");
+            let frames = fixture.primary.supply_pull(3).expect("supply should pull");
             if frames.is_empty() {
                 break;
             }
@@ -5107,7 +5134,7 @@ mod tests {
                 }
             }
             fixture
-                .beta
+                .replica
                 .stage_push(frames)
                 .expect("staging should accept");
         }
@@ -5116,42 +5143,45 @@ mod tests {
         assert!(data < shared.len() / 2, "expected a small literal payload");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert_eq!(
-            fs::read(fixture.beta_root.join("big.bin")).expect("file should be readable"),
-            alpha_content
+            fs::read(fixture.replica_root.join("big.bin")).expect("file should be readable"),
+            primary_content
         );
     }
 
     #[test]
     fn identical_content_elsewhere_is_staged_locally() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "new/copy.txt", "shared content");
-        write(&fixture.alpha_root, "original.txt", "shared content");
-        write(&fixture.beta_root, "original.txt", "shared content");
+        write(&fixture.primary_root, "new/copy.txt", "shared content");
+        write(&fixture.primary_root, "original.txt", "shared content");
+        write(&fixture.replica_root, "original.txt", "shared content");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         let requests = transition_dependencies(&transitions);
         assert_eq!(requests.len(), 1);
         let digest = requests[0].digest;
         let needs = fixture
-            .beta
+            .replica
             .stage_begin(requests)
             .expect("staging should begin");
-        // The content already exists in beta's root, so nothing is needed
-        // from alpha at all.
+        // The content already exists in the replica's root, so nothing is needed
+        // from the primary at all.
         assert!(needs.is_empty(), "{needs:?}");
-        assert!(fixture.beta.staged_path(&digest).exists());
+        assert!(fixture.replica.staged_path(&digest).exists());
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert_eq!(read(&fixture.beta_root, "new/copy.txt"), "shared content");
+        assert_eq!(
+            read(&fixture.replica_root, "new/copy.txt"),
+            "shared content"
+        );
     }
 
     /// A refusal the snapshot predicted is not a disagreement. The parent
@@ -5163,16 +5193,16 @@ mod tests {
     fn a_refused_write_is_not_a_disagreement() {
         use std::os::unix::fs::PermissionsExt;
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "locked/new.txt", "arriving");
-        std::fs::create_dir_all(fixture.beta_root.join("locked")).unwrap();
-        let alpha = fixture.alpha.scan().expect("scan should succeed");
-        fixture.beta.scan().expect("scan should succeed");
-        let expectation = node_at(&alpha, "locked/new.txt");
-        let locked = fixture.beta_root.join("locked");
+        write(&fixture.primary_root, "locked/new.txt", "arriving");
+        std::fs::create_dir_all(fixture.replica_root.join("locked")).unwrap();
+        let primary = fixture.primary.scan().expect("scan should succeed");
+        fixture.replica.scan().expect("scan should succeed");
+        let expectation = node_at(&primary, "locked/new.txt");
+        let locked = fixture.replica_root.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o555)).unwrap();
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "locked/new.txt".into(),
                 old: None,
@@ -5192,16 +5222,20 @@ mod tests {
     #[test]
     fn refuses_to_remove_a_file_modified_since_the_scan() {
         let mut fixture = Fixture::new();
-        write(&fixture.beta_root, "keep.txt", "original content");
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        write(&fixture.replica_root, "keep.txt", "original content");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         let expectation = node_at(&snapshot, "keep.txt");
 
         // The file changes after the scan that the transition was reconciled
         // from, which is precisely the race the validation exists for.
-        write(&fixture.beta_root, "keep.txt", "content changed underneath");
+        write(
+            &fixture.replica_root,
+            "keep.txt",
+            "content changed underneath",
+        );
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "keep.txt".into(),
                 old: Some(expectation),
@@ -5223,7 +5257,7 @@ mod tests {
         assert!(outcome.problems[0].disagreement);
         // The content survives, and the result reflects that.
         assert_eq!(
-            read(&fixture.beta_root, "keep.txt"),
+            read(&fixture.replica_root, "keep.txt"),
             "content changed underneath"
         );
         assert!(outcome.results[0].is_some());
@@ -5232,15 +5266,19 @@ mod tests {
     #[test]
     fn refuses_to_remove_a_directory_containing_unexpected_content() {
         let mut fixture = Fixture::new();
-        write(&fixture.beta_root, "dir/known.txt", "known");
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        write(&fixture.replica_root, "dir/known.txt", "known");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         let expectation = node_at(&snapshot, "dir");
 
         // Content that reconciliation never saw appears after the scan.
-        write(&fixture.beta_root, "dir/extra.txt", "created concurrently");
+        write(
+            &fixture.replica_root,
+            "dir/extra.txt",
+            "created concurrently",
+        );
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "dir".into(),
                 old: Some(expectation),
@@ -5257,12 +5295,12 @@ mod tests {
         );
         // The unexpected file and its directory both survive; the expected
         // child is gone, and the result says so.
-        assert!(fixture.beta_root.join("dir").is_dir());
+        assert!(fixture.replica_root.join("dir").is_dir());
         assert_eq!(
-            read(&fixture.beta_root, "dir/extra.txt"),
+            read(&fixture.replica_root, "dir/extra.txt"),
             "created concurrently"
         );
-        assert!(!fixture.beta_root.join("dir/known.txt").exists());
+        assert!(!fixture.replica_root.join("dir/known.txt").exists());
         let result = outcome.results[0].as_ref().expect("the directory survives");
         assert!(matches!(result.content, Content::Directory(_)));
         assert!(result.children().is_empty());
@@ -5271,10 +5309,10 @@ mod tests {
     #[test]
     fn executability_only_changes_are_applied_in_place() {
         let mut fixture = Fixture::new();
-        write(&fixture.beta_root, "tool.sh", "#!/bin/sh\n");
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        write(&fixture.replica_root, "tool.sh", "#!/bin/sh\n");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         let old = node_at(&snapshot, "tool.sh");
-        let before = inode(&fixture.beta_root, "tool.sh");
+        let before = inode(&fixture.replica_root, "tool.sh");
 
         let Content::File {
             digest, metadata, ..
@@ -5308,29 +5346,33 @@ mod tests {
         assert!(transition_dependencies(&transitions).is_empty());
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert!(executable(&fixture.beta_root, "tool.sh"));
-        assert_eq!(read(&fixture.beta_root, "tool.sh"), "#!/bin/sh\n");
+        assert!(executable(&fixture.replica_root, "tool.sh"));
+        assert_eq!(read(&fixture.replica_root, "tool.sh"), "#!/bin/sh\n");
         // The inode proves the file was chmod'ed rather than rewritten.
-        assert_eq!(inode(&fixture.beta_root, "tool.sh"), before);
+        assert_eq!(inode(&fixture.replica_root, "tool.sh"), before);
     }
 
     #[test]
     fn file_content_replacement_validates_the_old_content() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "file.txt", "alpha content");
-        write(&fixture.beta_root, "file.txt", "beta content");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "file.txt", "primary content");
+        write(&fixture.replica_root, "file.txt", "replica content");
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
 
         // A concurrent modification between staging and transitioning must
         // stop the replacement.
-        write(&fixture.beta_root, "file.txt", "beta content, edited again");
+        write(
+            &fixture.replica_root,
+            "file.txt",
+            "replica content, edited again",
+        );
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions.clone())
             .expect("transition should succeed");
         assert_eq!(outcome.problems.len(), 1);
@@ -5340,28 +5382,28 @@ mod tests {
             outcome.problems[0].message
         );
         assert_eq!(
-            read(&fixture.beta_root, "file.txt"),
-            "beta content, edited again"
+            read(&fixture.replica_root, "file.txt"),
+            "replica content, edited again"
         );
 
         // Rescanning legitimizes the current content, after which the same
         // transition (whose expectation now matches) applies.
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert_eq!(read(&fixture.beta_root, "file.txt"), "alpha content");
+        assert_eq!(read(&fixture.replica_root, "file.txt"), "primary content");
     }
 
     #[test]
     fn missing_staged_content_is_reported_and_creation_is_partial() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "dir/present.txt", "present");
-        write(&fixture.alpha_root, "dir/absent.txt", "absent");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "dir/present.txt", "present");
+        write(&fixture.primary_root, "dir/absent.txt", "absent");
+        let transitions = fixture.replica_transitions();
         let requests = transition_dependencies(&transitions);
         fixture.stage(&transitions);
 
@@ -5371,11 +5413,11 @@ mod tests {
             .iter()
             .find(|request| request.path == "dir/absent.txt")
             .expect("the request should exist");
-        fs::remove_file(fixture.beta.staged_path(&absent.digest))
+        fs::remove_file(fixture.replica.staged_path(&absent.digest))
             .expect("staged content should be removable");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.missing_staged_files);
@@ -5384,8 +5426,8 @@ mod tests {
 
         // The rest of the directory was still created, and the result
         // describes exactly what landed.
-        assert_eq!(read(&fixture.beta_root, "dir/present.txt"), "present");
-        assert!(!fixture.beta_root.join("dir/absent.txt").exists());
+        assert_eq!(read(&fixture.replica_root, "dir/present.txt"), "present");
+        assert!(!fixture.replica_root.join("dir/absent.txt").exists());
         let result = outcome.results[0]
             .as_ref()
             .expect("the directory should have been created");
@@ -5396,15 +5438,15 @@ mod tests {
     #[test]
     fn refuses_to_create_over_existing_content() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "file.txt", "alpha content");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "file.txt", "primary content");
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
 
         // Content appears at the target path after reconciliation decided
         // there was nothing there.
-        write(&fixture.beta_root, "file.txt", "appeared concurrently");
+        write(&fixture.replica_root, "file.txt", "appeared concurrently");
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert_eq!(outcome.problems.len(), 1);
@@ -5417,7 +5459,7 @@ mod tests {
         );
         assert!(outcome.results[0].is_none());
         assert_eq!(
-            read(&fixture.beta_root, "file.txt"),
+            read(&fixture.replica_root, "file.txt"),
             "appeared concurrently"
         );
     }
@@ -5425,13 +5467,13 @@ mod tests {
     #[test]
     fn refuses_root_deletion_and_unsafe_paths() {
         let mut fixture = Fixture::new();
-        write(&fixture.beta_root, "file.txt", "content");
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        write(&fixture.replica_root, "file.txt", "content");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         let root = node_at(&snapshot, "");
         let file = node_at(&snapshot, "file.txt");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![
                 Change {
                     path: String::new(),
@@ -5461,7 +5503,7 @@ mod tests {
             "{}",
             outcome.problems[1].message
         );
-        assert_eq!(read(&fixture.beta_root, "file.txt"), "content");
+        assert_eq!(read(&fixture.replica_root, "file.txt"), "content");
         assert!(outcome.results[0].is_some());
     }
 
@@ -5471,17 +5513,17 @@ mod tests {
         // A file outside the root, reachable through a symbolic link inside
         // it. Removing the link must never touch the target.
         let outside = fixture
-            .beta_root
+            .replica_root
             .parent()
             .expect("parent")
             .join("outside.txt");
         fs::write(&outside, "outside content").expect("file should be writable");
-        symlink(&outside, fixture.beta_root.join("link")).expect("symlink should be creatable");
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        symlink(&outside, fixture.replica_root.join("link")).expect("symlink should be creatable");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         let expectation = node_at(&snapshot, "link");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "link".into(),
                 old: Some(expectation),
@@ -5490,7 +5532,7 @@ mod tests {
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert!(outcome.results[0].is_none());
-        assert!(!fixture.beta_root.join("link").exists());
+        assert!(!fixture.replica_root.join("link").exists());
         assert_eq!(
             fs::read_to_string(&outside).expect("the target should survive"),
             "outside content"
@@ -5500,17 +5542,17 @@ mod tests {
     #[test]
     fn a_retargeted_symbolic_link_is_not_removed() {
         let mut fixture = Fixture::new();
-        write(&fixture.beta_root, "a.txt", "a");
-        write(&fixture.beta_root, "b.txt", "b");
-        symlink("a.txt", fixture.beta_root.join("link")).expect("symlink should be creatable");
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        write(&fixture.replica_root, "a.txt", "a");
+        write(&fixture.replica_root, "b.txt", "b");
+        symlink("a.txt", fixture.replica_root.join("link")).expect("symlink should be creatable");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         let expectation = node_at(&snapshot, "link");
 
-        fs::remove_file(fixture.beta_root.join("link")).expect("link should be removable");
-        symlink("b.txt", fixture.beta_root.join("link")).expect("symlink should be creatable");
+        fs::remove_file(fixture.replica_root.join("link")).expect("link should be removable");
+        symlink("b.txt", fixture.replica_root.join("link")).expect("symlink should be creatable");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "link".into(),
                 old: Some(expectation),
@@ -5523,7 +5565,7 @@ mod tests {
             "{}",
             outcome.problems[0].message
         );
-        assert!(fixture.beta_root.join("link").exists());
+        assert!(fixture.replica_root.join("link").exists());
     }
 
     #[test]
@@ -5531,23 +5573,23 @@ mod tests {
         let mut fixture = Fixture::new();
         // A 20MB file yields far more payload than one batch should carry.
         fs::write(
-            fixture.alpha_root.join("big.bin"),
+            fixture.primary_root.join("big.bin"),
             pseudo_random(20 * 1024 * 1024, 0xBEEF),
         )
         .expect("file should be writable");
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         let requests = transition_dependencies(&transitions);
         let needs = fixture
-            .beta
+            .replica
             .stage_begin(requests)
             .expect("staging should begin");
         fixture
-            .alpha
+            .primary
             .supply_open(needs)
             .expect("supply should open");
 
         let frames = fixture
-            .alpha
+            .primary
             .supply_pull(usize::MAX)
             .expect("supply should pull");
         let bytes: usize = frames
@@ -5568,25 +5610,25 @@ mod tests {
     #[test]
     fn supply_reports_unreadable_files_without_failing_the_stream() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "gone.txt", "content");
-        write(&fixture.alpha_root, "present.txt", "content that stays");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "gone.txt", "content");
+        write(&fixture.primary_root, "present.txt", "content that stays");
+        let transitions = fixture.replica_transitions();
         let requests = transition_dependencies(&transitions);
         let needs = fixture
-            .beta
+            .replica
             .stage_begin(requests)
             .expect("staging should begin");
         assert_eq!(needs.len(), 2);
 
         // The file disappears from the source between staging and supply.
-        fs::remove_file(fixture.alpha_root.join("gone.txt")).expect("file should be removable");
+        fs::remove_file(fixture.primary_root.join("gone.txt")).expect("file should be removable");
         fixture
-            .alpha
+            .primary
             .supply_open(needs.clone())
             .expect("supply should open");
         let mut errors = 0;
         loop {
-            let frames = fixture.alpha.supply_pull(2).expect("supply should pull");
+            let frames = fixture.primary.supply_pull(2).expect("supply should pull");
             if frames.is_empty() {
                 break;
             }
@@ -5596,7 +5638,7 @@ mod tests {
                 }
             }
             fixture
-                .beta
+                .replica
                 .stage_push(frames)
                 .expect("staging should accept");
         }
@@ -5612,16 +5654,19 @@ mod tests {
             .iter()
             .find(|need| need.request.path == "present.txt")
             .expect("the need should exist");
-        assert!(!fixture.beta.staged_path(&gone.request.digest).exists());
-        assert!(fixture.beta.staged_path(&present.request.digest).exists());
+        assert!(!fixture.replica.staged_path(&gone.request.digest).exists());
+        assert!(fixture
+            .replica
+            .staged_path(&present.request.digest)
+            .exists());
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.missing_staged_files);
         assert_eq!(
-            read(&fixture.beta_root, "present.txt"),
+            read(&fixture.replica_root, "present.txt"),
             "content that stays"
         );
     }
@@ -5629,15 +5674,15 @@ mod tests {
     #[test]
     fn staged_content_survives_an_interrupted_cycle() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "file.txt", "content");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "file.txt", "content");
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
 
         // A second staging pass (as a fresh cycle would perform) finds the
         // content already staged and asks for nothing.
         let requests = transition_dependencies(&transitions);
         let needs = fixture
-            .beta
+            .replica
             .stage_begin(requests)
             .expect("staging should begin");
         assert!(needs.is_empty(), "{needs:?}");
@@ -5651,9 +5696,9 @@ mod tests {
     #[test]
     fn unreferenced_staged_content_is_swept_after_a_cycle() {
         let mut fixture = Fixture::new();
-        let staging = fixture._keep.path().join("staging-beta");
-        write(&fixture.alpha_root, "file.txt", "content");
-        let transitions = fixture.beta_transitions();
+        let staging = fixture._keep.path().join("staging-replica");
+        write(&fixture.primary_root, "file.txt", "content");
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
 
         let stray = staging.join("ab".repeat(32));
@@ -5662,11 +5707,15 @@ mod tests {
         fs::write(&temporary, b"mid-write").expect("temporary");
 
         fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
 
-        assert_eq!(read(&fixture.beta_root, "file.txt"), "content", "published");
+        assert_eq!(
+            read(&fixture.replica_root, "file.txt"),
+            "content",
+            "published"
+        );
         assert!(!stray.exists(), "the unreferenced blob is swept");
         assert!(temporary.exists(), "a non-digest name is left alone");
     }
@@ -5677,9 +5726,9 @@ mod tests {
     #[test]
     fn content_requested_this_cycle_is_kept_and_forgotten_content_is_not() {
         let mut fixture = Fixture::new();
-        let staging = fixture._keep.path().join("staging-beta");
-        write(&fixture.alpha_root, "file.txt", "content");
-        let transitions = fixture.beta_transitions();
+        let staging = fixture._keep.path().join("staging-replica");
+        write(&fixture.primary_root, "file.txt", "content");
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         let blob = staging.join(digest_hex(&transition_dependencies(&transitions)[0].digest));
         assert!(blob.exists(), "staged");
@@ -5688,19 +5737,19 @@ mod tests {
         // then transitions nothing: the blob was requested, so it stays.
         let requests = transition_dependencies(&transitions);
         let needs = fixture
-            .beta
+            .replica
             .stage_begin(requests)
             .expect("staging should begin");
         assert!(needs.is_empty(), "{needs:?}");
         fixture
-            .beta
+            .replica
             .transition(Vec::new())
             .expect("an empty transition");
         assert!(blob.exists(), "requested this cycle, so kept");
 
         // A cycle that never asks for it is the signal it is dead.
         fixture
-            .beta
+            .replica
             .transition(Vec::new())
             .expect("an empty transition");
         assert!(!blob.exists(), "unreferenced for a whole cycle, so swept");
@@ -5709,41 +5758,41 @@ mod tests {
     #[test]
     fn type_changing_replacements_remove_then_create() {
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "entry", "now a file");
-        write(&fixture.beta_root, "entry/inner.txt", "was a directory");
+        write(&fixture.primary_root, "entry", "now a file");
+        write(&fixture.replica_root, "entry/inner.txt", "was a directory");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         assert_eq!(transitions.len(), 1);
         assert!(transitions[0].old.is_some() && transitions[0].new.is_some());
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert_eq!(read(&fixture.beta_root, "entry"), "now a file");
+        assert_eq!(read(&fixture.replica_root, "entry"), "now a file");
     }
 
     #[test]
     fn creation_modes_default_conservatively_and_are_configurable() {
         // Defaults: 0600 files, 0700 directories, 0700 executables.
         let mut fixture = Fixture::new();
-        write(&fixture.alpha_root, "dir/plain.txt", "content");
-        write(&fixture.alpha_root, "dir/tool.sh", "#!/bin/sh\n");
+        write(&fixture.primary_root, "dir/plain.txt", "content");
+        write(&fixture.primary_root, "dir/tool.sh", "#!/bin/sh\n");
         fs::set_permissions(
-            fixture.alpha_root.join("dir/tool.sh"),
+            fixture.primary_root.join("dir/tool.sh"),
             Permissions::from_mode(0o755),
         )
         .expect("permissions should be settable");
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         let mode = |path: &str| {
-            fs::symlink_metadata(fixture.beta_root.join(path))
+            fs::symlink_metadata(fixture.replica_root.join(path))
                 .expect("entry should exist")
                 .mode()
                 & 0o777
@@ -5754,9 +5803,9 @@ mod tests {
 
         // Configured modes: 0644/0755, with executability derived (0755).
         let keep = tempdir().expect("temporary directory should be creatable");
-        let root = keep.path().join("beta");
+        let root = keep.path().join("replica");
         fs::create_dir_all(&root).expect("root should be creatable");
-        let mut beta = LocalEndpoint::new(
+        let mut replica = LocalEndpoint::new(
             root.clone(),
             keep.path().join("staging"),
             EndpointOptions {
@@ -5766,11 +5815,11 @@ mod tests {
             },
         )
         .expect("endpoint should be creatable");
-        beta.scan().expect("scan should succeed");
+        replica.scan().expect("scan should succeed");
         let digest = *blake3::hash(b"content").as_bytes();
-        fs::create_dir_all(&beta.staging_root).expect("staging should be creatable");
-        fs::write(beta.staged_path(&digest), b"content").expect("staged content");
-        let outcome = beta
+        fs::create_dir_all(&replica.staging_root).expect("staging should be creatable");
+        fs::write(replica.staged_path(&digest), b"content").expect("staged content");
+        let outcome = replica
             .transition(vec![Change {
                 path: "d".into(),
                 old: None,
@@ -5801,8 +5850,8 @@ mod tests {
     #[test]
     fn symlink_policy_is_enforced_at_creation() {
         let mut fixture = Fixture::new();
-        fixture.beta.symlink_mode = SymlinkMode::Portable;
-        fixture.beta.scan().expect("scan should succeed");
+        fixture.replica.symlink_mode = SymlinkMode::Portable;
+        fixture.replica.scan().expect("scan should succeed");
         let link = |name: &str, target: &str| Change {
             path: name.into(),
             old: None,
@@ -5814,18 +5863,18 @@ mod tests {
             }),
         };
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![link("good", "file.txt"), link("bad", "/etc/passwd")])
             .expect("transition should succeed");
         assert_eq!(outcome.problems.len(), 1, "{:?}", outcome.problems);
         assert!(outcome.problems[0].message.contains("absolute"));
-        assert!(fixture.beta_root.join("good").is_symlink());
-        assert!(!fixture.beta_root.join("bad").is_symlink());
+        assert!(fixture.replica_root.join("good").is_symlink());
+        assert!(!fixture.replica_root.join("bad").is_symlink());
 
         // Ignore mode refuses symlink creation outright.
-        fixture.beta.symlink_mode = SymlinkMode::Ignore;
+        fixture.replica.symlink_mode = SymlinkMode::Ignore;
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![link("also-good", "file.txt")])
             .expect("transition should succeed");
         assert_eq!(outcome.problems.len(), 1);
@@ -5840,16 +5889,16 @@ mod tests {
         // normalization-insensitive) volume; creating both would silently
         // replace the first with the second.
         let mut fixture = Fixture::new();
-        fixture.beta.force_behavior(FilesystemBehavior {
+        fixture.replica.force_behavior(FilesystemBehavior {
             decomposes_unicode: true,
             normalization_insensitive: true,
             ..FilesystemBehavior::default()
         });
-        fixture.beta.scan().expect("scan should succeed");
+        fixture.replica.scan().expect("scan should succeed");
 
         let digest = *blake3::hash(b"content").as_bytes();
-        fs::create_dir_all(&fixture.beta.staging_root).expect("staging root");
-        fs::write(fixture.beta.staged_path(&digest), b"content").expect("staged content");
+        fs::create_dir_all(&fixture.replica.staging_root).expect("staging root");
+        fs::write(fixture.replica.staged_path(&digest), b"content").expect("staged content");
         let child = |name: &str| Node {
             name: name.into(),
             content: Content::File {
@@ -5859,7 +5908,7 @@ mod tests {
             },
         };
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "d".into(),
                 old: None,
@@ -5886,12 +5935,12 @@ mod tests {
         let mut fixture = Fixture::new();
         // NFD on disk simulates a decomposing volume on our byte-preserving
         // test filesystem.
-        write(&fixture.beta_root, "dir/cafe\u{0301}.txt", "content");
-        fixture.beta.force_behavior(FilesystemBehavior {
+        write(&fixture.replica_root, "dir/cafe\u{0301}.txt", "content");
+        fixture.replica.force_behavior(FilesystemBehavior {
             decomposes_unicode: true,
             ..FilesystemBehavior::default()
         });
-        let snapshot = fixture.beta.scan().expect("scan should succeed");
+        let snapshot = fixture.replica.scan().expect("scan should succeed");
         // The scan records the NFC spelling.
         let expectation = node_at(&snapshot, "dir");
         assert!(expectation.child("caf\u{00E9}.txt").is_some());
@@ -5900,7 +5949,7 @@ mod tests {
         // expectation; without recomposition this would refuse with
         // "unexpected content".
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "dir".into(),
                 old: Some(expectation),
@@ -5908,17 +5957,17 @@ mod tests {
             }])
             .expect("transition should succeed");
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
-        assert!(!fixture.beta_root.join("dir").exists());
+        assert!(!fixture.replica_root.join("dir").exists());
     }
 
     #[test]
     fn case_collisions_are_refused_on_case_insensitive_volumes() {
         let mut fixture = Fixture::new();
-        fixture.beta.force_behavior(FilesystemBehavior {
+        fixture.replica.force_behavior(FilesystemBehavior {
             case_insensitive: true,
             ..FilesystemBehavior::default()
         });
-        fixture.beta.scan().expect("scan should succeed");
+        fixture.replica.scan().expect("scan should succeed");
 
         let digest = *blake3::hash(b"content").as_bytes();
         let child = |name: &str| Node {
@@ -5930,11 +5979,11 @@ mod tests {
             },
         };
         // Stage the content so creation can proceed for the survivor.
-        fs::create_dir_all(&fixture.beta.staging_root).expect("staging root");
-        fs::write(fixture.beta.staged_path(&digest), b"content").expect("staged content");
+        fs::create_dir_all(&fixture.replica.staging_root).expect("staging root");
+        fs::write(fixture.replica.staged_path(&digest), b"content").expect("staged content");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(vec![Change {
                 path: "d".into(),
                 old: None,
@@ -6052,21 +6101,21 @@ mod tests {
     #[test]
     fn unrequested_content_is_dropped_and_requested_content_lands() {
         let fixture = Fixture::new();
-        fs::write(fixture.alpha_root.join("wanted.txt"), b"wanted").unwrap();
-        fs::write(fixture.alpha_root.join("held.txt"), b"held").unwrap();
-        // Beta already holds `held`, so it will decline that digest.
-        fs::write(fixture.beta_root.join("held.txt"), b"held").unwrap();
-        let mut alpha = fixture.alpha;
-        let mut beta = fixture.beta;
-        alpha.scan().unwrap();
-        beta.scan().unwrap();
+        fs::write(fixture.primary_root.join("wanted.txt"), b"wanted").unwrap();
+        fs::write(fixture.primary_root.join("held.txt"), b"held").unwrap();
+        // The replica already holds `held`, so it will decline that digest.
+        fs::write(fixture.replica_root.join("held.txt"), b"held").unwrap();
+        let mut primary = fixture.primary;
+        let mut replica = fixture.replica;
+        primary.scan().unwrap();
+        replica.scan().unwrap();
         let wanted = *blake3::hash(b"wanted").as_bytes();
         let held = *blake3::hash(b"held").as_bytes();
         let request = |path: &str, digest| FileRequest {
             path: path.into(),
             digest,
         };
-        let needs = beta
+        let needs = replica
             .stage_begin(vec![
                 request("wanted.txt", wanted),
                 request("held.txt", held),
@@ -6080,7 +6129,7 @@ mod tests {
         assert_eq!(needs[0].request.digest, wanted);
 
         // Supply both anyway, in full, as a sender that did not wait would.
-        alpha
+        primary
             .supply_open(vec![
                 StagingNeed {
                     request: request("held.txt", held),
@@ -6094,34 +6143,34 @@ mod tests {
             .unwrap();
         let mut frames = Vec::new();
         loop {
-            let batch = alpha.supply_pull(64).unwrap();
+            let batch = primary.supply_pull(64).unwrap();
             if batch.is_empty() {
                 break;
             }
             frames.extend(batch);
         }
         assert!(matches!(frames[0], TransferFrame::Begin { digest } if digest == held));
-        beta.stage_push(frames).unwrap();
-        beta.stage_finish().unwrap();
+        replica.stage_push(frames).unwrap();
+        replica.stage_finish().unwrap();
 
         // `wanted` landed from the stream; `held` was never needed and its
-        // unrequested copy went nowhere — beta's own is untouched.
-        let outcome = beta
+        // unrequested copy went nowhere — the replica's own is untouched.
+        let outcome = replica
             .transition(vec![Change {
                 path: "wanted.txt".into(),
                 old: None,
-                new: alpha
+                new: primary
                     .snapshot()
                     .and_then(|s| s.root.as_ref()?.child("wanted.txt").cloned()),
             }])
             .unwrap();
         assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
         assert_eq!(
-            fs::read(fixture.beta_root.join("wanted.txt")).unwrap(),
+            fs::read(fixture.replica_root.join("wanted.txt")).unwrap(),
             b"wanted"
         );
         assert_eq!(
-            fs::read(fixture.beta_root.join("held.txt")).unwrap(),
+            fs::read(fixture.replica_root.join("held.txt")).unwrap(),
             b"held"
         );
     }
@@ -6138,9 +6187,9 @@ mod tests {
         // waiting, until one full window passes quietly.
         let mut quiet = false;
         for _ in 0..20 {
-            fixture.alpha.scan().expect("the settling scan runs");
+            fixture.primary.scan().expect("the settling scan runs");
             if !fixture
-                .alpha
+                .primary
                 .await_change(Duration::from_millis(50))
                 .expect("await should succeed")
             {
@@ -6151,7 +6200,7 @@ mod tests {
         assert!(quiet, "the root never went quiet");
 
         // A write arriving mid-wait is observed well before the timeout.
-        let root = fixture.alpha_root.clone();
+        let root = fixture.primary_root.clone();
         std::thread::scope(|scope| {
             scope.spawn(move || {
                 std::thread::sleep(Duration::from_millis(50));
@@ -6159,7 +6208,7 @@ mod tests {
             });
             let start = Instant::now();
             assert!(fixture
-                .alpha
+                .primary
                 .await_change(Duration::from_secs(10))
                 .expect("await should succeed"));
             assert!(start.elapsed() < Duration::from_secs(5));
@@ -6186,29 +6235,29 @@ mod tests {
         use std::sync::atomic::Ordering;
         let mut fixture = Fixture::new();
         fixture
-            .beta
+            .replica
             .observer
             .suppress_watching
             .store(true, Ordering::SeqCst);
 
         // Converge on the old content first.
-        write(&fixture.alpha_root, "file.txt", "the old contents");
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "file.txt", "the old contents");
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("the converge transition applies");
 
         // The change the racing scan will straddle. The write is announced
-        // to alpha's observer the way any writer in the tool would: without
-        // the announcement, this scan can legitimately serve alpha's
+        // to the primary's observer the way any writer in the tool would: without
+        // the announcement, this scan can legitimately serve the primary's
         // published snapshot while the kernel's event is still in flight,
         // the diff comes back empty, and the test races itself instead of
         // the transition.
-        write(&fixture.alpha_root, "file.txt", "the new contents!!");
-        fixture.alpha.observer.invalidate(["file.txt"]);
-        let transitions = fixture.beta_transitions();
+        write(&fixture.primary_root, "file.txt", "the new contents!!");
+        fixture.primary.observer.invalidate(["file.txt"]);
+        let transitions = fixture.replica_transitions();
         assert!(
             !transitions.is_empty(),
             "the announced change must be visible to reconciliation"
@@ -6217,17 +6266,17 @@ mod tests {
 
         // The sharing session scans inside the announce window: after the
         // paths are invalidated, before any byte is written.
-        let observer = std::sync::Arc::clone(&fixture.beta.observer);
+        let observer = std::sync::Arc::clone(&fixture.replica.observer);
         let racing = std::sync::Arc::new(std::sync::Mutex::new(None));
         let stash = std::sync::Arc::clone(&racing);
-        fixture.beta.between_announce_and_writes = Some(Box::new(move || {
+        fixture.replica.between_announce_and_writes = Some(Box::new(move || {
             *stash.lock().unwrap() = Some(observer.scan(None, None).expect("the racing scan runs"));
         }));
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("the raced transition applies");
-        fixture.beta.between_announce_and_writes = None;
+        fixture.replica.between_announce_and_writes = None;
         assert!(
             outcome.problems.is_empty(),
             "the raced transition refused: {:?}",
@@ -6259,11 +6308,11 @@ mod tests {
         // ...but the completed transition must have outdated its
         // publication: nothing else ever will in the polling fallback.
         assert!(
-            stale_generation < fixture.beta.observer.generation(),
+            stale_generation < fixture.replica.observer.generation(),
             "the stale racing scan still claims the current generation"
         );
         // And a scan now sees what is actually on disk.
-        let fresh = fixture.beta.scan().expect("the follow-up scan runs");
+        let fresh = fixture.replica.scan().expect("the follow-up scan runs");
         assert_eq!(
             digest_of(&fresh),
             *blake3::hash(b"the new contents!!").as_bytes()
@@ -6445,21 +6494,21 @@ mod tests {
         let mut fixture = Fixture::new();
         let genuine: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 249) as u8).collect();
         let tampered: Vec<u8> = (0..96 * 1024u32).map(|i| (i % 247) as u8).collect();
-        let root = fixture.alpha_root.join("payload.bin");
-        fs::write(&root, &genuine).expect("alpha content is writable");
+        let root = fixture.primary_root.join("payload.bin");
+        fs::write(&root, &genuine).expect("primary content is writable");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         // The tamper: same length, wrong bytes, at the digest-named path.
         let digest = *blake3::hash(&genuine).as_bytes();
-        let staged = staged_path(&fixture.beta.staging_root, &digest);
+        let staged = staged_path(&fixture.replica.staging_root, &digest);
         fs::write(&staged, &tampered).expect("the staged file is writable");
 
         let outcome = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("the transition itself runs");
-        let landed = fs::read(fixture.beta_root.join("payload.bin")).ok();
+        let landed = fs::read(fixture.replica_root.join("payload.bin")).ok();
         assert_ne!(
             landed.as_deref(),
             Some(tampered.as_slice()),
@@ -6471,14 +6520,14 @@ mod tests {
         );
 
         // The retransfer converges on the genuine bytes.
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("the follow-up transition runs");
         assert_eq!(
-            fs::read(fixture.beta_root.join("payload.bin"))
+            fs::read(fixture.replica_root.join("payload.bin"))
                 .ok()
                 .as_deref(),
             Some(genuine.as_slice())
@@ -6493,23 +6542,23 @@ mod tests {
     fn a_staged_symlink_is_never_published_by_the_move_path() {
         let mut fixture = Fixture::new();
         let genuine: Vec<u8> = (0..64 * 1024u32).map(|i| (i % 233) as u8).collect();
-        fs::write(fixture.alpha_root.join("payload.bin"), &genuine)
-            .expect("alpha content is writable");
+        fs::write(fixture.primary_root.join("payload.bin"), &genuine)
+            .expect("primary content is writable");
 
-        let transitions = fixture.beta_transitions();
+        let transitions = fixture.replica_transitions();
         fixture.stage(&transitions);
         let digest = *blake3::hash(&genuine).as_bytes();
-        let staged = staged_path(&fixture.beta.staging_root, &digest);
-        let decoy = fixture.beta.staging_root.join("decoy");
+        let staged = staged_path(&fixture.replica.staging_root, &digest);
+        let decoy = fixture.replica.staging_root.join("decoy");
         fs::write(&decoy, &genuine).expect("the decoy is writable");
         fs::remove_file(&staged).expect("the staged file is removable");
         std::os::unix::fs::symlink(&decoy, &staged).expect("the swap succeeds");
 
         let _ = fixture
-            .beta
+            .replica
             .transition(transitions)
             .expect("the transition itself runs");
-        let target = fixture.beta_root.join("payload.bin");
+        let target = fixture.replica_root.join("payload.bin");
         if let Ok(metadata) = fs::symlink_metadata(&target) {
             // Not landing at all is safe; landing as anything but the
             // verified regular file is not.
@@ -7055,9 +7104,12 @@ mod apply_path_tests {
         endpoint.scan().expect("scan");
         let changes = vec![
             Change {
-                path: ".autobahn-tmp-staging-s-beta".into(),
+                path: ".autobahn-tmp-staging-s-replica".into(),
                 old: None,
-                new: Some(Node::directory(".autobahn-tmp-staging-s-beta", Vec::new())),
+                new: Some(Node::directory(
+                    ".autobahn-tmp-staging-s-replica",
+                    Vec::new(),
+                )),
             },
             Change {
                 path: ".autobahn-tmp-x".into(),
@@ -7076,7 +7128,7 @@ mod apply_path_tests {
         let outcome = endpoint.transition(changes).expect("transition");
         let problems = problem_paths(&outcome);
         for path in [
-            ".autobahn-tmp-staging-s-beta",
+            ".autobahn-tmp-staging-s-replica",
             ".autobahn-tmp-x",
             "d/.autobahn-tmp-recv-1-1",
         ] {
@@ -7108,7 +7160,7 @@ mod apply_path_tests {
             &fixture.root,
             PathBuf::new(),
             "s1",
-            "beta",
+            "replica",
         )
         .expect("staging root");
         let target = fixture.outside.join("planted");
@@ -7130,7 +7182,7 @@ mod apply_path_tests {
     fn new_staging_directories_are_private_in_every_placement() {
         use crate::endpoint::StagingMode;
         let keep = tempdir().expect("temporary directory");
-        let state = keep.path().join("state/staging/s1-beta");
+        let state = keep.path().join("state/staging/s1-replica");
         for mode in [
             StagingMode::State,
             StagingMode::BesideRoot,
@@ -7138,8 +7190,8 @@ mod apply_path_tests {
         ] {
             let root = keep.path().join(format!("{mode:?}")).join("root");
             fs::create_dir_all(&root).expect("root");
-            let staging =
-                staging_root_for(mode, &root, state.clone(), "s1", "beta").expect("staging root");
+            let staging = staging_root_for(mode, &root, state.clone(), "s1", "replica")
+                .expect("staging root");
             endpoint_staging_in(&root, staging.clone())
                 .stage_begin(Vec::new())
                 .expect("staging begins");
@@ -7890,7 +7942,7 @@ mod supply_receive_tests {
                 symlink_mode: SymlinkMode::Raw,
                 file_mode: None,
                 directory_mode: None,
-                side: "alpha".into(),
+                side: "primary".into(),
                 staging: Default::default(),
                 max_file_size: None,
                 max_entry_count: None,
@@ -7922,14 +7974,14 @@ mod supply_receive_tests {
         assert_refused(&frames);
     }
 
-    /// Two scanned endpoints: `alpha` supplies, `beta` receives.
+    /// Two scanned endpoints: `primary` supplies, `replica` receives.
     struct Pair {
         keep: TempDir,
-        alpha: LocalEndpoint,
-        beta: LocalEndpoint,
-        alpha_root: PathBuf,
-        beta_root: PathBuf,
-        beta_staging: PathBuf,
+        primary: LocalEndpoint,
+        replica: LocalEndpoint,
+        primary_root: PathBuf,
+        replica_root: PathBuf,
+        replica_staging: PathBuf,
         /// The changes the last [`Pair::begin`] staged for.
         changes: Vec<Change>,
     }
@@ -7945,44 +7997,44 @@ mod supply_receive_tests {
             ..EndpointOptions::default()
         };
         let keep = tempdir().expect("temporary directory should be creatable");
-        let alpha_root = keep.path().join("alpha");
-        let beta_root = keep.path().join("beta");
-        let beta_staging = keep.path().join("staging-beta");
-        fs::create_dir_all(&alpha_root).expect("root should be creatable");
-        fs::create_dir_all(&beta_root).expect("root should be creatable");
-        let alpha = LocalEndpoint::new(
-            alpha_root.clone(),
-            keep.path().join("staging-alpha"),
+        let primary_root = keep.path().join("primary");
+        let replica_root = keep.path().join("replica");
+        let replica_staging = keep.path().join("staging-replica");
+        fs::create_dir_all(&primary_root).expect("root should be creatable");
+        fs::create_dir_all(&replica_root).expect("root should be creatable");
+        let primary = LocalEndpoint::new(
+            primary_root.clone(),
+            keep.path().join("staging-primary"),
             options(),
         )
         .expect("endpoint should be creatable");
-        let beta = LocalEndpoint::new(beta_root.clone(), beta_staging.clone(), options())
+        let replica = LocalEndpoint::new(replica_root.clone(), replica_staging.clone(), options())
             .expect("endpoint should be creatable");
         Pair {
             keep,
-            alpha,
-            beta,
-            alpha_root,
-            beta_root,
-            beta_staging,
+            primary,
+            replica,
+            primary_root,
+            replica_root,
+            replica_staging,
             changes: Vec::new(),
         }
     }
 
     impl Pair {
-        /// Scans both sides and begins staging beta's requests for every
-        /// file alpha holds, opening alpha's supply of what beta needs.
+        /// Scans both sides and begins staging the replica's requests for every
+        /// file primary holds, opening the primary's supply of what replica needs.
         fn begin(&mut self) -> Vec<StagingNeed> {
-            let alpha = self.alpha.scan().expect("scan should succeed");
-            let beta = self.beta.scan().expect("scan should succeed");
-            let changes = crate::tree::diff(beta.root.as_ref(), alpha.root.as_ref());
+            let primary = self.primary.scan().expect("scan should succeed");
+            let replica = self.replica.scan().expect("scan should succeed");
+            let changes = crate::tree::diff(replica.root.as_ref(), primary.root.as_ref());
             let requests = crate::session::transition_dependencies(&changes);
             self.changes = changes;
             let needs = self
-                .beta
+                .replica
                 .stage_begin(requests)
                 .expect("staging should begin");
-            self.alpha
+            self.primary
                 .supply_open(needs.clone())
                 .expect("supply should open");
             needs
@@ -7991,11 +8043,13 @@ mod supply_receive_tests {
         /// Pulls and pushes until the supply is exhausted.
         fn drain(&mut self) {
             loop {
-                let frames = self.alpha.supply_pull(4).expect("supply should pull");
+                let frames = self.primary.supply_pull(4).expect("supply should pull");
                 if frames.is_empty() {
                     return;
                 }
-                self.beta.stage_push(frames).expect("staging should accept");
+                self.replica
+                    .stage_push(frames)
+                    .expect("staging should accept");
             }
         }
     }
@@ -8018,16 +8072,18 @@ mod supply_receive_tests {
     #[test]
     fn an_interrupted_receive_leaves_a_private_temporary() {
         let mut pair = pair();
-        fs::write(pair.alpha_root.join("big.bin"), vec![3u8; 1 << 20])
+        fs::write(pair.primary_root.join("big.bin"), vec![3u8; 1 << 20])
             .expect("file should be writable");
         pair.begin();
-        let frames = pair.alpha.supply_pull(2).expect("supply should pull");
+        let frames = pair.primary.supply_pull(2).expect("supply should pull");
         assert!(matches!(
             frames.as_slice(),
             [TransferFrame::Begin { .. }, TransferFrame::Op(_)]
         ));
-        pair.beta.stage_push(frames).expect("staging should accept");
-        let temporaries = receive_temporaries(&pair.beta_staging);
+        pair.replica
+            .stage_push(frames)
+            .expect("staging should accept");
+        let temporaries = receive_temporaries(&pair.replica_staging);
         assert_eq!(temporaries.len(), 1, "{temporaries:?}");
         let mode = fs::symlink_metadata(&temporaries[0])
             .expect("temporary should exist")
@@ -8052,30 +8108,31 @@ mod supply_receive_tests {
 
         // Received content.
         let mut pair = pair();
-        fs::write(pair.alpha_root.join("a.txt"), b"received").expect("file should be writable");
+        fs::write(pair.primary_root.join("a.txt"), b"received").expect("file should be writable");
         let needs = pair.begin();
         let target = pair.keep.path().join("received-target");
-        plant(&pair.beta_staging, "recv", &target);
+        plant(&pair.replica_staging, "recv", &target);
         pair.drain();
         assert!(!target.exists(), "a receive wrote through a planted link");
-        assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
+        assert!(pair.replica.staged_path(&needs[0].request.digest).is_file());
 
         // A local copy.
         let mut pair = self::pair();
-        fs::write(pair.alpha_root.join("copy.txt"), b"shared").expect("file should be writable");
-        fs::write(pair.alpha_root.join("original.txt"), b"shared")
+        fs::write(pair.primary_root.join("copy.txt"), b"shared").expect("file should be writable");
+        fs::write(pair.primary_root.join("original.txt"), b"shared")
             .expect("file should be writable");
-        fs::write(pair.beta_root.join("original.txt"), b"shared").expect("file should be writable");
-        fs::create_dir_all(&pair.beta_staging).expect("staging should be creatable");
+        fs::write(pair.replica_root.join("original.txt"), b"shared")
+            .expect("file should be writable");
+        fs::create_dir_all(&pair.replica_staging).expect("staging should be creatable");
         let target = pair.keep.path().join("copy-target");
-        plant(&pair.beta_staging, "copy", &target);
+        plant(&pair.replica_staging, "copy", &target);
         let needs = pair.begin();
         assert!(needs.is_empty(), "{needs:?}");
         assert!(
             !target.exists(),
             "a local copy wrote through a planted link"
         );
-        assert!(pair.beta.staged_path(&digest_of(b"shared")).is_file());
+        assert!(pair.replica.staged_path(&digest_of(b"shared")).is_file());
     }
 
     /// A staging failure's error, which crosses the wire to the peer,
@@ -8083,17 +8140,17 @@ mod supply_receive_tests {
     #[test]
     fn a_staging_failure_names_no_staging_path() {
         let mut pair = pair();
-        fs::write(pair.alpha_root.join("a.txt"), b"content").expect("file should be writable");
+        fs::write(pair.primary_root.join("a.txt"), b"content").expect("file should be writable");
         pair.begin();
-        fs::remove_dir_all(&pair.beta_staging).expect("staging should be removable");
-        let frames = pair.alpha.supply_pull(4).expect("supply should pull");
+        fs::remove_dir_all(&pair.replica_staging).expect("staging should be removable");
+        let frames = pair.primary.supply_pull(4).expect("supply should pull");
         let error = pair
-            .beta
+            .replica
             .stage_push(frames)
             .expect_err("staging without a staging directory must fail");
         let text = format!("{error:#}");
         assert!(
-            !text.contains(&*pair.beta_staging.to_string_lossy()),
+            !text.contains(&*pair.replica_staging.to_string_lossy()),
             "{text}"
         );
         assert!(!text.contains(TEMPORARY_PREFIX), "{text}");
@@ -8104,7 +8161,7 @@ mod supply_receive_tests {
     fn drain_counting_errors(pair: &mut Pair) -> usize {
         let mut errors = 0;
         loop {
-            let frames = pair.alpha.supply_pull(4).expect("supply should pull");
+            let frames = pair.primary.supply_pull(4).expect("supply should pull");
             if frames.is_empty() {
                 return errors;
             }
@@ -8112,7 +8169,9 @@ mod supply_receive_tests {
                 .iter()
                 .filter(|frame| matches!(frame, TransferFrame::EndOfFile { error: Some(_) }))
                 .count();
-            pair.beta.stage_push(frames).expect("staging should accept");
+            pair.replica
+                .stage_push(frames)
+                .expect("staging should accept");
         }
     }
 
@@ -8122,29 +8181,31 @@ mod supply_receive_tests {
     #[test]
     fn a_file_truncated_mid_supply_ends_in_an_error_and_converges_next_cycle() {
         let mut pair = pair();
-        let path = pair.alpha_root.join("big.bin");
+        let path = pair.primary_root.join("big.bin");
         fs::write(&path, vec![5u8; 1 << 20]).expect("file should be writable");
         let needs = pair.begin();
-        let frames = pair.alpha.supply_pull(2).expect("supply should pull");
+        let frames = pair.primary.supply_pull(2).expect("supply should pull");
         assert!(matches!(
             frames.as_slice(),
             [TransferFrame::Begin { .. }, TransferFrame::Op(_)]
         ));
-        pair.beta.stage_push(frames).expect("staging should accept");
+        pair.replica
+            .stage_push(frames)
+            .expect("staging should accept");
         File::options()
             .write(true)
             .open(&path)
             .and_then(|file| file.set_len(1 << 19))
             .expect("file should be truncatable");
         assert_eq!(drain_counting_errors(&mut pair), 1);
-        assert!(!pair.beta.staged_path(&needs[0].request.digest).exists());
-        assert!(receive_temporaries(&pair.beta_staging).is_empty());
+        assert!(!pair.replica.staged_path(&needs[0].request.digest).exists());
+        assert!(receive_temporaries(&pair.replica_staging).is_empty());
 
         // The next cycle.
         let needs = pair.begin();
         assert_eq!(drain_counting_errors(&mut pair), 0);
         assert_eq!(needs[0].request.digest, digest_of(&vec![5u8; 1 << 19]));
-        assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
+        assert!(pair.replica.staged_path(&needs[0].request.digest).is_file());
     }
 
     /// A file that grows after its first frame has gone out supplies
@@ -8152,18 +8213,20 @@ mod supply_receive_tests {
     #[test]
     fn a_file_grown_mid_supply_supplies_what_was_scanned() {
         let mut pair = pair();
-        let path = pair.alpha_root.join("big.bin");
+        let path = pair.primary_root.join("big.bin");
         fs::write(&path, vec![5u8; 1 << 20]).expect("file should be writable");
         let needs = pair.begin();
-        let frames = pair.alpha.supply_pull(2).expect("supply should pull");
-        pair.beta.stage_push(frames).expect("staging should accept");
+        let frames = pair.primary.supply_pull(2).expect("supply should pull");
+        pair.replica
+            .stage_push(frames)
+            .expect("staging should accept");
         File::options()
             .append(true)
             .open(&path)
             .and_then(|mut file| file.write_all(&[6u8; 1 << 20]))
             .expect("file should grow");
         assert_eq!(drain_counting_errors(&mut pair), 0);
-        assert!(pair.beta.staged_path(&needs[0].request.digest).is_file());
+        assert!(pair.replica.staged_path(&needs[0].request.digest).is_file());
     }
 
     /// A destination base that shrinks between staging and the push fails
@@ -8175,23 +8238,23 @@ mod supply_receive_tests {
         let names = ["one.bin", "two.bin", "three.bin"];
         for (seed, name) in names.iter().enumerate() {
             let base = pseudo_random(256 * 1024, seed as u64);
-            fs::write(pair.beta_root.join(name), &base).expect("file should be writable");
+            fs::write(pair.replica_root.join(name), &base).expect("file should be writable");
             let mut changed = base;
-            changed.extend_from_slice(b"appended on alpha");
-            fs::write(pair.alpha_root.join(name), &changed).expect("file should be writable");
+            changed.extend_from_slice(b"appended on primary");
+            fs::write(pair.primary_root.join(name), &changed).expect("file should be writable");
         }
         let needs = pair.begin();
         assert_eq!(needs.len(), 3);
         assert!(needs.iter().all(|need| !need.signature.is_empty()));
-        // Beta's base for two.bin goes short after its signature was taken.
+        // The replica's base for two.bin goes short after its signature was taken.
         File::options()
             .write(true)
-            .open(pair.beta_root.join("two.bin"))
+            .open(pair.replica_root.join("two.bin"))
             .and_then(|file| file.set_len(1024))
             .expect("file should be truncatable");
         pair.drain();
         for need in &needs {
-            let staged = pair.beta.staged_path(&need.request.digest).is_file();
+            let staged = pair.replica.staged_path(&need.request.digest).is_file();
             assert_eq!(
                 staged,
                 need.request.path != "two.bin",
@@ -8199,26 +8262,26 @@ mod supply_receive_tests {
                 need.request.path
             );
         }
-        assert!(receive_temporaries(&pair.beta_staging).is_empty());
+        assert!(receive_temporaries(&pair.replica_staging).is_empty());
 
         let changes = std::mem::take(&mut pair.changes);
         let outcome = pair
-            .beta
+            .replica
             .transition(changes)
             .expect("transition should succeed");
         // two.bin is not published: its content is missing, and its base
         // changed since the scan besides.
         assert!(outcome.missing_staged_files || !outcome.problems.is_empty());
         assert_eq!(
-            fs::metadata(pair.beta_root.join("two.bin"))
+            fs::metadata(pair.replica_root.join("two.bin"))
                 .expect("file should exist")
                 .len(),
             1024
         );
         for name in ["one.bin", "three.bin"] {
             assert_eq!(
-                fs::read(pair.beta_root.join(name)).expect("file should be readable"),
-                fs::read(pair.alpha_root.join(name)).expect("file should be readable"),
+                fs::read(pair.replica_root.join(name)).expect("file should be readable"),
+                fs::read(pair.primary_root.join(name)).expect("file should be readable"),
                 "{name}"
             );
         }
@@ -8229,14 +8292,14 @@ mod supply_receive_tests {
         pair.drain();
         let changes = std::mem::take(&mut pair.changes);
         let outcome = pair
-            .beta
+            .replica
             .transition(changes)
             .expect("transition should succeed");
         assert!(!outcome.missing_staged_files, "{:?}", outcome.problems);
         for name in names {
             assert_eq!(
-                fs::read(pair.beta_root.join(name)).expect("file should be readable"),
-                fs::read(pair.alpha_root.join(name)).expect("file should be readable"),
+                fs::read(pair.replica_root.join(name)).expect("file should be readable"),
+                fs::read(pair.primary_root.join(name)).expect("file should be readable"),
                 "{name}"
             );
         }

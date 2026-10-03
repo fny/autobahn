@@ -1585,16 +1585,16 @@ mod tests {
     fn fixture() -> TempDir {
         let directory = tempdir().expect("temporary directory should be creatable");
         let root = directory.path();
-        write(root, "alpha.txt", "alpha");
-        write(root, "beta.txt", "beta contents");
+        write(root, "primary.txt", "primary");
+        write(root, "replica.txt", "replica contents");
         write(root, "nested/inner.txt", "inner");
         write(root, "nested/deeper/leaf.txt", "leaf");
         write(root, "tool.sh", "#!/bin/sh\n");
         fs::set_permissions(root.join("tool.sh"), fs::Permissions::from_mode(0o755))
             .expect("permissions should be settable");
-        symlink("alpha.txt", root.join("link")).expect("symlink should be creatable");
+        symlink("primary.txt", root.join("link")).expect("symlink should be creatable");
         write(root, "excluded/secret.txt", "secret");
-        write(root, ".autobahn-tmp-staging-s1-beta", "staging");
+        write(root, ".autobahn-tmp-staging-s1-replica", "staging");
         directory
     }
 
@@ -1603,7 +1603,7 @@ mod tests {
         // Reproduced before the fix: a user file named `.autobahn-tmp-notes`
         // was silently invisible to every scan — never synchronized, never
         // reported — while the roots diverged.
-        assert!(autobahn_temporary(".autobahn-tmp-staging-s1-beta"));
+        assert!(autobahn_temporary(".autobahn-tmp-staging-s1-replica"));
         assert!(autobahn_temporary(".autobahn-tmp-recv-1234-7"));
         assert!(autobahn_temporary(".autobahn-tmp-probe-1234-7-token"));
         assert!(!autobahn_temporary(".autobahn-tmp-notes"));
@@ -2447,17 +2447,20 @@ mod tests {
         assert_eq!(
             names,
             vec![
-                "alpha.txt",
-                "beta.txt",
                 "excluded",
                 "link",
                 "nested",
+                "primary.txt",
+                "replica.txt",
                 "tool.sh"
             ]
         );
 
         // Files carry correct digests and executability.
-        assert_eq!(file_content(root, "alpha.txt"), (digest_of("alpha"), false));
+        assert_eq!(
+            file_content(root, "primary.txt"),
+            (digest_of("primary"), false)
+        );
         assert_eq!(
             file_content(root, "nested/deeper/leaf.txt"),
             (digest_of("leaf"), false)
@@ -2469,7 +2472,7 @@ mod tests {
 
         // Symbolic link targets are stored verbatim.
         match &child(root, "link").content {
-            Content::Symlink { target } => assert_eq!(target, "alpha.txt"),
+            Content::Symlink { target } => assert_eq!(target, "primary.txt"),
             other => panic!("expected a symlink, found {other:?}"),
         }
 
@@ -2479,9 +2482,9 @@ mod tests {
         assert!(excluded.children().is_empty());
 
         // File metadata is recorded for digest reuse.
-        match &child(root, "alpha.txt").content {
+        match &child(root, "primary.txt").content {
             Content::File { metadata, .. } => {
-                assert_eq!(metadata.size, 5);
+                assert_eq!(metadata.size, 7);
                 assert_ne!(metadata.inode, 0);
                 assert_eq!(metadata.mode & MODE_TYPE_MASK, 0o100000);
             }
@@ -2500,8 +2503,8 @@ mod tests {
         assert_eq!(snapshot.symlinks, 1);
         assert_eq!(
             snapshot.total_file_size,
-            ("alpha".len()
-                + "beta contents".len()
+            ("primary".len()
+                + "replica contents".len()
                 + "inner".len()
                 + "leaf".len()
                 + "#!/bin/sh\n".len()) as u64
@@ -2542,14 +2545,14 @@ mod tests {
 
         // Rewrite one root-level file with content of a different length, so
         // that the change is visible regardless of mtime granularity.
-        write(root_path, "alpha.txt", "alpha, revised");
+        write(root_path, "primary.txt", "primary, revised");
         let rescan = scan_fixture(root_path, Some(&baseline));
         let rescan_root = rescan.root.as_ref().expect("root should exist");
 
         // The rewritten file is re-digested...
         assert_eq!(
-            file_content(rescan_root, "alpha.txt").0,
-            digest_of("alpha, revised")
+            file_content(rescan_root, "primary.txt").0,
+            digest_of("primary, revised")
         );
         // ...the changed directory's storage is fresh...
         assert!(!Arc::ptr_eq(
@@ -2563,7 +2566,7 @@ mod tests {
         ));
         assert_eq!(
             rescan.total_file_size,
-            baseline.total_file_size + ("alpha, revised".len() - "alpha".len()) as u64
+            baseline.total_file_size + ("primary, revised".len() - "primary".len()) as u64
         );
     }
 
@@ -2571,7 +2574,7 @@ mod tests {
     fn matching_metadata_reuses_the_baseline_digest() {
         let directory = fixture();
         let root_path = directory.path();
-        age(root_path, "alpha.txt");
+        age(root_path, "primary.txt");
         let mut baseline = scan_fixture(root_path, None);
 
         // Poison a baseline digest without touching the file. A scan that
@@ -2581,7 +2584,7 @@ mod tests {
         let root = baseline.root.as_mut().expect("root should exist");
         if let Content::Directory(children) = &mut root.content {
             for child in Arc::make_mut(children) {
-                if child.name == "alpha.txt" {
+                if child.name == "primary.txt" {
                     if let Content::File { digest, .. } = &mut child.content {
                         *digest = poison;
                     }
@@ -2591,14 +2594,14 @@ mod tests {
 
         let rescan = scan_fixture(root_path, Some(&baseline));
         let rescan_root = rescan.root.as_ref().expect("root should exist");
-        assert_eq!(file_content(rescan_root, "alpha.txt").0, poison);
+        assert_eq!(file_content(rescan_root, "primary.txt").0, poison);
         // A file whose size changed is re-read despite the baseline entry.
-        write(root_path, "beta.txt", "beta contents, extended");
+        write(root_path, "replica.txt", "replica contents, extended");
         let third = scan_fixture(root_path, Some(&rescan));
         let third_root = third.root.as_ref().expect("root should exist");
         assert_eq!(
-            file_content(third_root, "beta.txt").0,
-            digest_of("beta contents, extended")
+            file_content(third_root, "replica.txt").0,
+            digest_of("replica contents, extended")
         );
     }
 

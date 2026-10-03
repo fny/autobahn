@@ -34,10 +34,10 @@ ssh -n dest "pgrep -x benchmark > /dev/null" \
 sleep 2
 cat > "$OUT/ab.toml" <<TOML
 [groups.soak]
-alpha = "$HOME/corpus/$CORPUS"
+primary = "$HOME/corpus/$CORPUS"
 mode = "two-way-conflict"
 interval = 5
-betas = ["dest:$HOME/dest/$CORPUS"]
+replicas = ["dest:$HOME/dest/$CORPUS"]
 TOML
 setsid nohup "$AB" watch --config "$OUT/ab.toml" --state-root "$STATE" \
   > "$OUT/autobahn.log" 2>&1 < /dev/null &

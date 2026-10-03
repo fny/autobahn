@@ -5,7 +5,7 @@ The latest recorded comparison measures Autobahn v1.0.0 against mutagen 0.19.0-d
 
 The [matrix](./benchmark-matrix.md#provenance) identifies the measured builds. These results do not establish the performance of later commits.
 
-The [aggregate](../benchmarks/2026-10-01.json) contains every published figure. See the [harness guide](../bench/README.md) for methods.
+The [aggregate](../benchmarks/2026-10-02.json) contains every published figure. See the [harness guide](../bench/README.md) for methods.
 
 ## Headline
 
@@ -34,7 +34,7 @@ Cells cover replacements, large-file patches, bidirectional edits, ten-destinati
 
 ## Tails and Latency
 
-On Chromium with 100 editors per side, base-build alpha-to-beta p50 was 232.9 ms and beta-to-alpha p50 was 299.0 ms. Their p99 values were 1,239.4 ms and 1,305.5 ms. This cell has no later audit-build rerun.
+On Chromium with 100 editors per side, base-build primary-to-replica p50 was 232.9 ms and replica-to-primary p50 was 299.0 ms. Their p99 values were 1,239.4 ms and 1,305.5 ms. This cell has no later audit-build rerun.
 
 The October 1 Chromium patch runs measured later fixes:
 

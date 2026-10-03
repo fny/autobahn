@@ -27,8 +27,8 @@ A `⚠ configuration refused …` line means the supervisor rejected a configura
   │ ▾ 2 conflicts                       both sides changed these │
   │     happy                                    deleted on ours │
   │     voltagen                                 deleted on ours │
-  │ ▸ 1 blocked on alpha                       unicode collision │
-  │ ▾ 20 blocked on beta            Permission denied (os error) │
+  │ ▸ 1 blocked on primary                       unicode collision │
+  │ ▾ 20 blocked on replica            Permission denied (os error) │
   │   ▾ azure/backend/.ruff_cache/0.9.10/                     16 │
   │       10497280429343070344                                   │
   │   ▸ arcturus/frontend/apps/web/public/static/              4 │

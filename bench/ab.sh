@@ -212,10 +212,10 @@ leg() {
         || fail_leg "$name" "the observer exited at start" "$RESULTS/observer-$name.log"
 
     if [ -n "$REMOTE" ]; then
-        printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s:%s"]\nagent_command = "ssh %s %s agent"\n' \
+        printf '[groups.g]\nprimary = "%s"\nmode = "two-way-conflict"\ninterval = 5\nreplicas = ["%s:%s"]\nagent_command = "ssh %s %s agent"\n' \
             "$CORPUS" "$REMOTE" "$dest" "$REMOTE" "$binary" > "$WORK/$name.toml"
     else
-        printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["%s"]\n' \
+        printf '[groups.g]\nprimary = "%s"\nmode = "two-way-conflict"\ninterval = 5\nreplicas = ["%s"]\n' \
             "$CORPUS" "$dest" > "$WORK/$name.toml"
     fi
     local t0 t1

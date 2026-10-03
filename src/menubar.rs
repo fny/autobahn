@@ -585,7 +585,7 @@ impl Bar {
                     );
                     let _ = item.append(&PredefinedMenuItem::separator());
                     for (label, keep) in [
-                        (t("menu.keep_alpha").to_owned(), "alpha".to_owned()),
+                        (t("menu.keep_primary").to_owned(), "primary".to_owned()),
                         (
                             fill("menu.keep_host", &[("name", session.label())]),
                             session.selector().to_owned(),
@@ -1088,7 +1088,7 @@ pub(crate) fn warning_line(whole: &str) -> String {
 }
 
 /// The configuration's shape: group names and their sessions, by key —
-/// two betas on one host are two entries, and swapping one for another is
+/// two replicas on one host are two entries, and swapping one for another is
 /// a new shape.
 pub(crate) fn shape_of(report: &StatusReport) -> Vec<(String, Vec<String>)> {
     report
@@ -1120,7 +1120,7 @@ pub(crate) fn group_label(group: &crate::supervisor::GroupReport) -> String {
     fill(
         "menu.group",
         &[
-            ("alpha", &group.alpha),
+            ("primary", &group.primary),
             ("name", &group.name),
             ("role", role),
         ],
@@ -1192,8 +1192,8 @@ pub(crate) fn status_dot(health: Health) -> muda::Icon {
                     }
                 }
             }
-            let alpha = (covered * 255 / (SS * SS)) as u8;
-            rgba.extend_from_slice(&[r, g, b, alpha]);
+            let opacity = (covered * 255 / (SS * SS)) as u8;
+            rgba.extend_from_slice(&[r, g, b, opacity]);
         }
     }
     muda::Icon::from_rgba(rgba, SIZE, SIZE).expect("a valid dot")

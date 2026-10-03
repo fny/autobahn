@@ -28,7 +28,7 @@ Point your coding agent at [INSTALL.md](INSTALL.md) for interactive setup, or se
 
 After you [install Autobahn](INSTALL.md) you need to set up your configuration. By default, the configuration is written to `~/.autobahn/config.toml`. You can edit it by hand or use [the app](docs/app.md).
 
-Each group connects one root, called alpha, to one or more destinations, called betas. Sync can be one-way, bidirectional, or P2P (experimental.)
+Each group connects one root, the primary, to one or more destinations, the replicas. Sync can be one-way, bidirectional, or P2P (experimental.)
 
 ```toml
 # ~/.autobahn/config.toml
@@ -38,10 +38,10 @@ mode = "two-way-conflict"   # sync modes explained below
 ignores = [".git", "node_modules"]
 
 [groups.project]
-alpha = "~/project"
-betas = [                   # sync targets
+primary = "~/project"
+replicas = [                   # sync targets
   "user@audi.de:/srv/car",  #  - fully specified
-  "mercedes-benz.de",       #  - inherits alpha path
+  "mercedes-benz.de",       #  - inherits primary path
   "/mnt/backup/project",    #  - local paths work too
 ]
 ignores = ["target"]        # appended to the defaults' ignores
@@ -61,11 +61,11 @@ Start with `two-way-conflict` for editing on both sides. It propagates changes i
 | Mode | Behavior |
 | --- | --- |
 | `two-way-conflict` | Bidirectional sync with conflict reports |
-| `two-way-alpha` | Favors alpha in conflicts with deletion safeguards |
-| `two-way-alpha-strict` | Favors alpha, including alpha deletions |
-| `one-way-conflict` | Reports beta changes that prevent a safe copy |
-| `one-way-alpha` (alias: `mirror`) | Makes beta match alpha |
-| `p2p-*-dangerously-experimental` | Lets a beta lead while alpha is offline |
+| `two-way-primary` | Favors the primary in conflicts, with deletion safeguards |
+| `two-way-primary-strict` | Favors the primary, including its deletions |
+| `one-way-conflict` | Reports changes on the replica that prevent a safe copy |
+| `one-way-primary` (alias: `mirror`) | Makes the replica match the primary |
+| `p2p-*-dangerously-experimental` | Lets a replica lead while the primary is offline |
 
 For mode details, see [Modes](docs/modes.md) and [Conflict Resolution](docs/conflicts.md).
 
@@ -115,7 +115,7 @@ In addition to the standard CLI, several user interfaces are available:
 on_alert = "~/.autobahn/on-alert.sh"   # written for you by `autobahn init`
 ```
 
-None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them in beta.
+None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them experimental.
 
 ## AI Disclaimer
 

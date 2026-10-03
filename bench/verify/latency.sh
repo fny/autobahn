@@ -27,7 +27,7 @@ rm -rf "$HOME"/corpus/*/probe
 ssh -n dest 'rm -rf ~/dest/*/probe ~/arrivals.txt' >/dev/null 2>&1
 mkdir -p "$SRC/probe"
 
-printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
+printf '[groups.g]\nprimary = "%s"\nmode = "two-way-conflict"\ninterval = 5\nreplicas = ["dest:%s/dest/%s"]\n' \
   "$SRC" "$HOME" "$C" > ~/lat.toml
 setsid "$AB" watch --config ~/lat.toml --state-root ~/state > ~/lat.log 2>&1 &
 AUTOBAHN=$!

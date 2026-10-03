@@ -59,8 +59,8 @@ enum Key {
 /// Whose version wins a dispute.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Winner {
-    Alpha,
-    Beta,
+    Primary,
+    Replica,
     Both,
 }
 
@@ -92,7 +92,7 @@ struct Row {
 
 /// The counter, open on one order.
 struct Counter {
-    /// The order's session: its group and host are shared by every beta
+    /// The order's session: its group and host are shared by every replica
     /// of the group on that host.
     session: SessionKey,
     cursor: usize,
@@ -276,7 +276,7 @@ impl Shop {
     }
 
     /// An order's destination as the rail names it: its host, cut short,
-    /// or the host and path when another beta of the group shares the
+    /// or the host and path when another replica of the group shares the
     /// host.
     fn destination_name(&self, session: &SessionReport) -> String {
         match session.destination.is_empty() || session.destination == session.host {
@@ -427,8 +427,8 @@ impl Shop {
             question: format!(
                 "keep {} for {} — overwrites the other side everywhere. y/n",
                 match winner {
-                    Winner::Alpha => "ours".to_owned(),
-                    Winner::Beta => format!("{host}'s"),
+                    Winner::Primary => "ours".to_owned(),
+                    Winner::Replica => format!("{host}'s"),
                     Winner::Both => "both".to_owned(),
                 },
                 match paths.len() {
@@ -446,8 +446,8 @@ impl Shop {
             return;
         };
         let keep = match pending.winner {
-            Winner::Alpha => "alpha".to_owned(),
-            Winner::Beta => session.selector().to_owned(),
+            Winner::Primary => "primary".to_owned(),
+            Winner::Replica => session.selector().to_owned(),
             Winner::Both => "both".to_owned(),
         };
         let group = group.to_owned();
@@ -570,12 +570,12 @@ impl Shop {
         // has nothing to settle and is worth opening anyway: this is the
         // only place the shop says where a session syncs from and to, how
         // long it has been running, and how much it has carried.
-        let alpha = self
+        let primary = self
             .report
             .groups
             .iter()
             .find(|candidate| candidate.name == group)
-            .map(|candidate| candidate.alpha.clone())
+            .map(|candidate| candidate.primary.clone())
             .unwrap_or_default();
         let mut fact = |label: &str, detail: String| {
             if !detail.is_empty() {
@@ -589,8 +589,8 @@ impl Shop {
                 });
             }
         };
-        fact("from", alpha);
-        fact("to", session.beta.clone());
+        fact("from", primary);
+        fact("to", session.replica.clone());
         fact("mode", session.mode.clone());
         let cycles = match session.age_seconds {
             Some(age) => format!("{} · last {age}s ago", thousands(session.cycles)),
@@ -598,7 +598,7 @@ impl Shop {
         };
         fact("cycles", cycles);
         if let Some(progress) = &session.progress {
-            let entries = match (progress.alpha.expected, progress.beta.expected) {
+            let entries = match (progress.primary.expected, progress.replica.expected) {
                 (Some(a), Some(b)) => format!("{} here · {} there", thousands(a), thousands(b)),
                 (Some(a), None) | (None, Some(a)) => thousands(a),
                 (None, None) => String::new(),
@@ -777,7 +777,7 @@ impl Shop {
 /// sharpest case is a deletion: one side has the file and the other does
 /// not. Naming only the path leaves the reader to go and look.
 ///
-/// "ours" and "theirs" rather than alpha and the destination's name,
+/// "ours" and "theirs" rather than the primary and the destination's name,
 /// because those are the words on the keys that settle it.
 fn sides(session: &SessionReport, path: &str) -> String {
     let Some(detail) = session
@@ -787,7 +787,7 @@ fn sides(session: &SessionReport, path: &str) -> String {
     else {
         return String::new();
     };
-    let (ours, theirs) = (&detail.alpha, &detail.beta);
+    let (ours, theirs) = (&detail.primary, &detail.replica);
     match (ours.present, theirs.present) {
         // The deletion cases, said outright.
         (false, true) => "deleted on ours".to_owned(),
@@ -1292,7 +1292,7 @@ fn outcome_word(state: &str) -> (&'static str, &'static str) {
         "conflicts" => ("disputed", "\x1b[33m"),
         "blocked" => ("delivery blocked", "\x1b[33m"),
         "halted" => ("kitchen closed", "\x1b[31m"),
-        "unreachable" => ("beta unreachable", "\x1b[31m"),
+        "unreachable" => ("replica unreachable", "\x1b[31m"),
         "errored" => ("burnt", "\x1b[31m"),
         "following" => ("another branch", "\x1b[2m"),
         "paused" => ("on break", "\x1b[2m"),
@@ -1412,7 +1412,11 @@ fn help_page() -> Vec<String> {
             "\x1b[31m",
             "halted for safety; it will not act",
         ),
-        ("beta unreachable", "\x1b[31m", "the beta cannot be reached"),
+        (
+            "replica unreachable",
+            "\x1b[31m",
+            "the replica cannot be reached",
+        ),
         ("burnt", "\x1b[31m", "the cycle failed"),
         ("on break", "\x1b[2m", "paused"),
         (
@@ -1536,8 +1540,8 @@ fn parse(bytes: &[u8]) -> (Vec<Key>, Vec<u8>) {
             [b'?', ..] => (Some(Key::Help), 1),
             [b'l', ..] | [b'\r', ..] | [b'\n', ..] => (Some(Key::Open), 1),
             [b'f', ..] => (Some(Key::Flush), 1),
-            [b'o', ..] => (Some(Key::Keep(Winner::Alpha)), 1),
-            [b't', ..] => (Some(Key::Keep(Winner::Beta)), 1),
+            [b'o', ..] => (Some(Key::Keep(Winner::Primary)), 1),
+            [b't', ..] => (Some(Key::Keep(Winner::Replica)), 1),
             [b'b', ..] => (Some(Key::Keep(Winner::Both)), 1),
             [b'c', ..] => (Some(Key::Copy), 1),
             [b' ', ..] => (Some(Key::Mark), 1),
@@ -1748,7 +1752,7 @@ mod tests {
             session: SessionKey::default(),
             host: "boite".into(),
             destination: String::new(),
-            beta: "boite".into(),
+            replica: "boite".into(),
             mode: "two-way-conflict".into(),
             state: state.into(),
             cycles: 1,
@@ -1780,9 +1784,9 @@ mod tests {
         // state would make the column jump as sessions moved between them.
         let session = |state: &str| SessionReport {
             session: SessionKey::default(),
-            host: "beta".into(),
+            host: "replica".into(),
             destination: String::new(),
-            beta: "beta".into(),
+            replica: "replica".into(),
             mode: "two-way-conflict".into(),
             state: state.into(),
             cycles: 1,
@@ -1869,8 +1873,8 @@ mod tests {
         assert_eq!(
             parse(b"otb").0,
             vec![
-                Key::Keep(Winner::Alpha),
-                Key::Keep(Winner::Beta),
+                Key::Keep(Winner::Primary),
+                Key::Keep(Winner::Replica),
                 Key::Keep(Winner::Both)
             ]
         );
@@ -1900,19 +1904,19 @@ mod tests {
         };
         let gone = ConflictSide::default();
 
-        let session = |alpha: ConflictSide, beta: ConflictSide| SessionReport {
+        let session = |primary: ConflictSide, replica: ConflictSide| SessionReport {
             session: SessionKey::default(),
             host: "boite".into(),
             destination: String::new(),
-            beta: "boite".into(),
+            replica: "boite".into(),
             mode: "two-way-conflict".into(),
             state: "conflicts".into(),
             cycles: 1,
             age_seconds: Some(1),
             conflicts: vec![ConflictDetail {
                 path: "happy".into(),
-                alpha,
-                beta,
+                primary,
+                replica,
             }],
             blocked: Vec::new(),
             error: None,
@@ -1980,8 +1984,8 @@ mod tests {
             phase: Phase::Scanning,
             seconds: working_seconds,
             working_seconds,
-            alpha: side(),
-            beta: side(),
+            primary: side(),
+            replica: side(),
             staged: 0,
             staged_total: 0,
             staged_bytes: 0,
@@ -2017,8 +2021,8 @@ mod tests {
             session: SessionKey::default(),
             host: "fny".into(),
             destination: String::new(),
-            beta: "ubuntu@fny:~/w".into(),
-            mode: "p2p-alpha-dangerously-experimental".into(),
+            replica: "ubuntu@fny:~/w".into(),
+            mode: "p2p-primary-dangerously-experimental".into(),
             state: "synchronized".into(),
             cycles: 3,
             age_seconds: Some(1),
@@ -2034,7 +2038,7 @@ mod tests {
             role: role.to_owned(),
             term: 1,
             name: "voltai".into(),
-            alpha: "~/Workspace/Voltai".into(),
+            primary: "~/Workspace/Voltai".into(),
             sessions: vec![session.clone()],
         };
         let report = |role: &str| StatusReport {
@@ -2077,17 +2081,17 @@ mod tests {
         );
     }
 
-    /// Two betas of one group on one host are two orders: each is named
+    /// Two replicas of one group on one host are two orders: each is named
     /// by its path on the rail, the counter opens on the one chosen, and a
-    /// settlement there names that beta alone.
+    /// settlement there names that replica alone.
     #[test]
-    fn two_betas_on_one_host_are_two_orders() {
+    fn two_replicas_on_one_host_are_two_orders() {
         use autobahn::supervisor::{GroupReport, StatusReport};
         let session = |path: &str| SessionReport {
             session: SessionKey::new(format!("g-{path}")),
             host: "boite".into(),
             destination: format!("boite:{path}"),
-            beta: format!("boite:{path}"),
+            replica: format!("boite:{path}"),
             mode: "two-way-conflict".into(),
             state: "conflicts".into(),
             cycles: 1,
@@ -2112,7 +2116,7 @@ mod tests {
                     role: String::new(),
                     term: 0,
                     name: "g".into(),
-                    alpha: "~/w".into(),
+                    primary: "~/w".into(),
                     sessions: vec![session("/a"), session("/b")],
                 }],
                 config_notice: None,
@@ -2136,7 +2140,7 @@ mod tests {
 
         shop.press(Key::Open);
         let (_, open) = shop.at_counter().expect("the counter is open");
-        assert_eq!(open.beta, "boite:/b");
+        assert_eq!(open.replica, "boite:/b");
         assert_eq!(open.selector(), "boite:/b");
     }
 
@@ -2186,17 +2190,17 @@ mod tests {
             session: SessionKey::default(),
             host: "boite".into(),
             destination: String::new(),
-            beta: "boite:~/w".into(),
+            replica: "boite:~/w".into(),
             mode: "two-way-conflict".into(),
             state: "conflicts".into(),
             cycles: 1,
             age_seconds: Some(1),
             conflicts: vec![ConflictDetail {
                 path: name.into(),
-                alpha: ConflictSide::default(),
-                beta: ConflictSide::default(),
+                primary: ConflictSide::default(),
+                replica: ConflictSide::default(),
             }],
-            blocked: vec![format!("beta {name}/x: Permission denied (os error 13)")],
+            blocked: vec![format!("replica {name}/x: Permission denied (os error 13)")],
             error: Some(format!("unable to read {name}")),
             progress: None,
             alerts: Vec::new(),
@@ -2215,7 +2219,7 @@ mod tests {
                     role: String::new(),
                     term: 0,
                     name: "g".into(),
-                    alpha: "~/w".into(),
+                    primary: "~/w".into(),
                     sessions: vec![session],
                 }],
                 config_notice: None,

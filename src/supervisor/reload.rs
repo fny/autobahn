@@ -132,8 +132,8 @@ pub struct Reloader {
     pending: Mutex<Option<Loaded>>,
     /// The bytes the running configuration came from — or the last edit
     /// refused, which has been heard about. Kept across watches, so an
-    /// edit made while no supervisor was watching (the alpha attached to
-    /// a beta that led) is found by the next one.
+    /// edit made while no supervisor was watching (the primary attached to
+    /// a replica that led) is found by the next one.
     applied: Mutex<Option<Vec<u8>>>,
     /// Runs between the read that settles an edit and its load, so a test
     /// can write the file in between.
@@ -328,11 +328,11 @@ fn alert(plan: &crate::alerts::AlertPlan, state_root: &Path, notice: &Notice) {
 mod tests {
     use super::*;
 
-    fn configuration(alpha: &Path, beta: &Path) -> String {
+    fn configuration(primary: &Path, replica: &Path) -> String {
         format!(
-            "[groups.work]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-            alpha.display(),
-            beta.display()
+            "[groups.work]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+            primary.display(),
+            replica.display()
         )
     }
 
@@ -359,13 +359,13 @@ mod tests {
         std::fs::write(&path, "").expect("written");
         let error = load_for_startup(&path).expect_err("no sessions is refused at startup");
         assert!(format!("{error:#}").contains("no sessions"), "{error:#}");
-        let alpha = root.path().join("alpha");
-        std::fs::create_dir_all(&alpha).expect("created");
+        let primary = root.path().join("primary");
+        std::fs::create_dir_all(&primary).expect("created");
         std::fs::write(
             &path,
             format!(
                 "{}disabled = true\n",
-                configuration(&alpha, &root.path().join("beta"))
+                configuration(&primary, &root.path().join("replica"))
             ),
         )
         .expect("written");
@@ -379,13 +379,13 @@ mod tests {
         let path = root.path().join("config.toml");
         std::fs::write(&path, "").expect("written");
         assert!(load(&path).expect("an empty file loads").plans.is_empty());
-        let alpha = root.path().join("alpha");
-        std::fs::create_dir_all(&alpha).expect("created");
+        let primary = root.path().join("primary");
+        std::fs::create_dir_all(&primary).expect("created");
         std::fs::write(
             &path,
             format!(
                 "{}disabled = true\n",
-                configuration(&alpha, &root.path().join("beta"))
+                configuration(&primary, &root.path().join("replica"))
             ),
         )
         .expect("written");
@@ -403,16 +403,16 @@ mod tests {
             .expect("written");
         let error = load(&path).expect_err("an unknown key is refused");
         assert!(format!("{error:#}").contains("mdoe"), "{error:#}");
-        let alpha = root.path().join("alpha");
-        let beta = root.path().join("beta");
-        std::fs::create_dir_all(&alpha).expect("created");
-        std::fs::write(&path, configuration(&alpha, &beta)).expect("written");
+        let primary = root.path().join("primary");
+        let replica = root.path().join("replica");
+        std::fs::create_dir_all(&primary).expect("created");
+        std::fs::write(&path, configuration(&primary, &replica)).expect("written");
         let loaded = load(&path).expect("a plain configuration loads");
         assert_eq!(loaded.plans.len(), 1);
         assert!(loaded.reload, "the watch is on unless said otherwise");
         std::fs::write(
             &path,
-            format!("live_reload = false\n{}", configuration(&alpha, &beta)),
+            format!("live_reload = false\n{}", configuration(&primary, &replica)),
         )
         .expect("written");
         assert!(!load(&path).expect("loads").reload);
@@ -446,11 +446,11 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let state_root = root.path().join("state");
         std::fs::create_dir_all(&state_root).expect("created");
-        let alpha = root.path().join("alpha");
-        let beta = root.path().join("beta");
-        std::fs::create_dir_all(&alpha).expect("created");
+        let primary = root.path().join("primary");
+        let replica = root.path().join("replica");
+        std::fs::create_dir_all(&primary).expect("created");
         let path = root.path().join("config.toml");
-        std::fs::write(&path, configuration(&alpha, &beta)).expect("written");
+        std::fs::write(&path, configuration(&primary, &replica)).expect("written");
         let reloader = Reloader::new(path.clone()).with_interval(Duration::from_millis(10));
 
         // Untouched, the watch stands: nothing loads, nothing is refused.
@@ -475,8 +475,8 @@ mod tests {
             std::fs::write(
                 &path,
                 format!(
-                    "{}[groups.notes]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
-                    configuration(&alpha, &beta),
+                    "{}[groups.notes]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
+                    configuration(&primary, &replica),
                     other.display(),
                     root.path().join("other-mirror").display()
                 ),
@@ -499,15 +499,19 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let state_root = root.path().join("state");
         std::fs::create_dir_all(&state_root).expect("created");
-        let alpha = root.path().join("alpha");
-        std::fs::create_dir_all(&alpha).expect("created");
+        let primary = root.path().join("primary");
+        std::fs::create_dir_all(&primary).expect("created");
         let path = root.path().join("config.toml");
-        std::fs::write(&path, configuration(&alpha, &root.path().join("beta"))).expect("written");
-        let reloader = Reloader::new(path.clone()).with_interval(Duration::from_millis(10));
-        // No watch stands while the alpha follows a beta that leads; the
-        // edit is still an edit when it leads again.
-        std::fs::write(&path, configuration(&alpha, &root.path().join("elsewhere")))
+        std::fs::write(&path, configuration(&primary, &root.path().join("replica")))
             .expect("written");
+        let reloader = Reloader::new(path.clone()).with_interval(Duration::from_millis(10));
+        // No watch stands while the primary follows a replica that leads; the
+        // edit is still an edit when it leads again.
+        std::fs::write(
+            &path,
+            configuration(&primary, &root.path().join("elsewhere")),
+        )
+        .expect("written");
         let pending = watched(&reloader, &state_root, Duration::from_secs(5), || {});
         assert!(pending);
         assert!(reloader.take().is_some());
@@ -518,24 +522,24 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let state_root = root.path().join("state");
         std::fs::create_dir_all(&state_root).expect("created");
-        let alpha = root.path().join("alpha");
+        let primary = root.path().join("primary");
         let other = root.path().join("other");
-        std::fs::create_dir_all(&alpha).expect("created");
+        std::fs::create_dir_all(&primary).expect("created");
         std::fs::create_dir_all(&other).expect("created");
         let path = root.path().join("config.toml");
-        let one = configuration(&alpha, &root.path().join("beta"));
+        let one = configuration(&primary, &root.path().join("replica"));
         std::fs::write(&path, &one).expect("written");
         let reloader = Reloader::new(path.clone()).with_interval(Duration::from_millis(10));
 
         // The edit read is two groups; the file then becomes three
         // between that read and the load.
         let two = format!(
-            "{one}[groups.notes]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "{one}[groups.notes]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
             other.display(),
             root.path().join("other-mirror").display()
         );
         let three = format!(
-            "{two}[groups.more]\nmode = \"two-way-conflict\"\nalpha = \"{}\"\nbetas = [\"{}\"]\n",
+            "{two}[groups.more]\nmode = \"two-way-conflict\"\nprimary = \"{}\"\nreplicas = [\"{}\"]\n",
             other.display(),
             root.path().join("more-mirror").display()
         );

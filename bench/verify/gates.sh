@@ -2,7 +2,7 @@
 # Gate 1: does anyone wait for the ancestor tail?
 # Gate 2: do the three reconcile inputs share storage in a real session?
 #
-# The cycle transitions beta before it persists the ancestor, so the tail
+# The cycle transitions replica before it persists the ancestor, so the tail
 # does not delay an isolated save. It occupies the worker, though, so a
 # second save landing inside that window waits for it. Comparing an
 # isolated save against the second of two saves 100ms apart measures
@@ -32,7 +32,7 @@ rm -rf ~/.autobahn ~/.autobahn-dev ~/state ~/arrivals.txt; mkdir -p ~/state
 rm -rf "$SRC/probe"; mkdir -p "$SRC/probe"
 ssh -n dest "rm -rf ~/dest/$C/probe" >/dev/null 2>&1
 
-printf '[groups.g]\nalpha = "%s"\nmode = "two-way-conflict"\ninterval = 5\nbetas = ["dest:%s/dest/%s"]\n' \
+printf '[groups.g]\nprimary = "%s"\nmode = "two-way-conflict"\ninterval = 5\nreplicas = ["dest:%s/dest/%s"]\n' \
   "$SRC" "$HOME" "$C" > ~/gates.toml
 AUTOBAHN_SHARING_PROBE=1 setsid "$AB" watch --config ~/gates.toml --state-root ~/state \
   > ~/gates.log 2>&1 &
@@ -44,7 +44,7 @@ kill -0 "$AUTOBAHN" 2>/dev/null \
 # A pre-seeded destination matches immediately, so a manifest comparison
 # proves nothing about whether the session is running yet. Wait for the
 # session itself: one completed reconcile, then a canary edit that actually
-# lands on beta. The first cycle over 505k entries scans both sides, walks
+# lands on the replica. The first cycle over 505k entries scans both sides, walks
 # the whole tree, and writes the initial ancestor, which takes minutes.
 # A completed cycle announces itself; the sharing probe this used to wait
 # on was removed once it had answered its question.

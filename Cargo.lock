@@ -623,7 +623,7 @@ dependencies = [
  "lz4_flex",
  "mimalloc",
  "minisign-verify",
- "muda",
+ "muda 0.21.0",
  "notify 6.1.1",
  "notify-rust",
  "objc2 0.6.4",
@@ -4789,6 +4789,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "muda"
+version = "0.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6744ab645ebe79f9c428455c7cb9dfa4275fa3b50a25408e08f927da8dc618c"
+dependencies = [
+ "crossbeam-channel",
+ "dpi",
+ "gtk",
+ "keyboard-types",
+ "libc",
+ "objc2 0.6.4",
+ "objc2-app-kit 0.3.2",
+ "objc2-core-foundation",
+ "objc2-foundation 0.3.2",
+ "once_cell",
+ "png 0.18.1",
+ "thiserror 2.0.20",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "multiversion_no_op"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8299,7 +8320,7 @@ dependencies = [
  "crossbeam-channel",
  "dirs 7.0.0",
  "libappindicator",
- "muda",
+ "muda 0.20.0",
  "objc2 0.6.4",
  "objc2-app-kit 0.3.2",
  "objc2-core-foundation",

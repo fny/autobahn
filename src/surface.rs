@@ -1264,7 +1264,15 @@ pub(crate) fn mend_service() -> Option<String> {
         return None;
     }
     let was = tilde(&registered.executable.display().to_string());
-    let mended = crate::service::retarget(&command).and_then(|()| crate::service::restart());
+    // Reloading the definition starts the service on macOS, so a restart
+    // there killed the supervisor two seconds into its first cycle and
+    // started a second one; `start` leaves a running one alone. systemd
+    // only reloads, so there it is restarted.
+    let begin = match cfg!(target_os = "macos") {
+        true => crate::service::start,
+        false => crate::service::restart,
+    };
+    let mended = crate::service::retarget(&command).and_then(|()| begin());
     Some(match mended {
         Ok(()) => fill(
             "service.mended",

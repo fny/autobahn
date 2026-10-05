@@ -470,6 +470,9 @@ pub struct AutobahnApp {
     knocked_at: Option<Instant>,
     shape: serde_json::Value,
     said: Option<String>,
+    /// The message last copied from the footer, so its button can say so
+    /// for as long as that message is the one showing.
+    copied: Option<String>,
     /// Whether there is an `autobahn` to talk to. Read once at the
     /// start and again after an install, because it is the answer to
     /// "is this window of any use yet".
@@ -722,6 +725,7 @@ impl AutobahnApp {
             knocked_at: None,
             shape: crate::config::schema(),
             said: None,
+            copied: None,
             command_build: surface::command_build(),
             supervisor_build: surface::SupervisorBuild::Absent,
         };
@@ -943,7 +947,7 @@ impl Render for AutobahnApp {
                         Pane::Service => self.service_pane(cx),
                         Pane::Hosts => self.hosts(cx),
                     })
-                    .child(self.footer()),
+                    .child(self.footer(cx)),
             )
     }
 }
@@ -1265,11 +1269,14 @@ impl AutobahnApp {
         }
     }
 
-    fn footer(&self) -> AnyElement {
+    fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
         let age = self
             .read_at
             .map(|at| format_age(at.elapsed().as_secs()))
             .unwrap_or_else(|| t("fleet.never").to_owned());
+        // Whether the message showing is the one last copied, which is
+        // what the button says until the message changes.
+        let copied = self.said.is_some() && self.copied == self.said;
         div()
             .h(step(7.5))
             .flex_shrink_0()
@@ -1312,13 +1319,37 @@ impl AutobahnApp {
                             }),
                     }),
             )
-            .child(
-                div()
+            // A message is something to keep: an error to paste into a
+            // report, a path to paste into a terminal. It is cut short to
+            // fit the line, so the button takes all of it. A hint is not
+            // worth keeping, and beside one the line says how fresh the
+            // window is instead.
+            .child(match self.said.is_some() {
+                true => div().flex_shrink_0().pl(step(4.)).child(
+                    Button::new("copy-said")
+                        .xsmall()
+                        .outline()
+                        .label(match copied {
+                            true => t("status.copied"),
+                            false => t("status.copy"),
+                        })
+                        .tooltip(t("tip.copy_said"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(said) = this.said.clone() {
+                                cx.write_to_clipboard(ClipboardItem::new_string(
+                                    surface::for_the_clipboard(&said),
+                                ));
+                                this.copied = Some(said);
+                                cx.notify();
+                            }
+                        })),
+                ),
+                false => div()
                     .flex_shrink_0()
                     .pl(step(4.))
                     .text_color(rgb(FAINT))
                     .child(fill("fleet.read_ago", &[("age", &age)])),
-            )
+            })
             .into_any_element()
     }
 

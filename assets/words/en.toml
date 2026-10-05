@@ -217,6 +217,8 @@ made = "Created {name}. Set its primary and replicas, then save."
 renamed = "Renamed to {name}. Save the configuration to apply."
 
 [status]
+copy = "Copy"
+copied = "Copied"
 ran = "{command} finished"
 unreachable_command = "cannot run autobahn: {error}"
 revealed = "Opened {path}"
@@ -245,6 +247,7 @@ paused = "paused"
 resumed = "resumed"
 
 [tip]
+copy_said = "Copy this whole message."
 flush = "Request a sync cycle for this session now."
 verify = "Re-read every file on the next cycle."
 pause = "Pause sync cycles for this session."

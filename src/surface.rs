@@ -779,6 +779,16 @@ pub(crate) fn thousands(n: u64) -> String {
     out
 }
 
+/// A message as it goes to the clipboard: every line of it, with the
+/// line breaks kept and any other control character written out, so
+/// what is pasted into a terminal is text and nothing else.
+pub(crate) fn for_the_clipboard(said: &str) -> String {
+    said.lines()
+        .map(|line| crate::text::display_safe(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// A path under the home directory, written the way a person writes it.
 /// The rows in one card then measure against each other rather than
 /// against the length of a home directory nobody is reading.
@@ -1741,6 +1751,17 @@ impl Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// All of a message is copied, line breaks and all; a control
+    /// character in it arrives written out, not as itself.
+    #[test]
+    fn a_copied_message_keeps_its_lines_and_no_control_characters() {
+        assert_eq!(
+            for_the_clipboard("update failed:\n  werk \u{1b}[31m→ halle\n  lack"),
+            "update failed:\n  werk \\x1b[31m→ halle\n  lack"
+        );
+        assert_eq!(for_the_clipboard("one line"), "one line");
+    }
 
     /// The command older than the app is updated; a supervisor that is
     /// not the installed command is restarted; an app older than its

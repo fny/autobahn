@@ -265,6 +265,7 @@ fn open_window(
                 }
                 dash
             });
+            cx.set_global(Desk(dash.downgrade()));
             cx.new(|cx| Root::new(dash, window, cx))
         })
         .expect("unable to open the window");
@@ -282,45 +283,84 @@ struct Menubar(crate::menubar::Bar);
 
 impl Global for Menubar {}
 
+/// The window's state, kept by the process so the application's menu
+/// can turn the window to a pane. Weak: a closed window takes it along.
+struct Desk(WeakEntity<AutobahnApp>);
+
+impl Global for Desk {}
+
+actions!(autobahn, [OpenSettings, QuitApp]);
+
+/// Puts the window in front, opening one when there is none: what the
+/// menu bar's "Open the window" asks for, and a click on the dock icon.
+fn show_the_window(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
+    // Asking for the window is asking to be an application with one,
+    // dock icon and all.
+    crate::dock::in_the_dock(true);
+    cx.activate(true);
+    if cx.windows().is_empty() {
+        open_window(config, state_root, None, true, false, cx);
+    } else {
+        for window in cx.windows() {
+            window
+                .update(cx, |_, window, _| window.activate_window())
+                .ok();
+        }
+    }
+}
+
+/// The window on its settings: what Settings… in the application's menu
+/// and ⌘, ask for.
+fn open_settings(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
+    crate::dock::in_the_dock(true);
+    cx.activate(true);
+    let desk = cx.try_global::<Desk>().and_then(|desk| desk.0.upgrade());
+    match (desk, cx.windows().first().copied()) {
+        (Some(desk), Some(window)) => {
+            window
+                .update(cx, |_, window, cx| {
+                    window.activate_window();
+                    desk.update(cx, |desk, cx| {
+                        desk.pane = Pane::Config;
+                        desk.section = Section::Settings;
+                        desk.settle(Pane::Config, window, cx);
+                        cx.notify();
+                    });
+                })
+                .ok();
+        }
+        _ => {
+            let pane = Some("config:settings".to_owned());
+            open_window(config, state_root, pane, true, false, cx);
+        }
+    }
+}
+
 /// Keeps the item up to date and answers what is chosen in it.
 fn watch_the_bar(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
-    cx.spawn(async move |cx| {
-        loop {
-            let sleep = cx.background_executor().timer(crate::menubar::POLL);
-            sleep.await;
-            cx.update(|cx| {
-                let mut show = false;
-                let mut quit = false;
-                cx.update_global::<Menubar, ()>(|menubar, _| {
-                    while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
-                        match menubar.0.chose(&event.id) {
-                            Some(crate::menubar::Action::Quit) => quit = true,
-                            Some(crate::menubar::Action::Show) => show = true,
-                            _ => {}
-                        }
-                    }
-                    menubar.0.finished();
-                });
-                if quit {
-                    cx.quit();
-                }
-                if show {
-                    // Asking for the window is asking to be an
-                    // application with one, dock icon and all.
-                    crate::dock::in_the_dock(true);
-                    cx.activate(true);
-                    if cx.windows().is_empty() {
-                        open_window(config.clone(), state_root.clone(), None, true, false, cx);
-                    } else {
-                        for window in cx.windows() {
-                            window
-                                .update(cx, |_, window, _| window.activate_window())
-                                .ok();
-                        }
+    cx.spawn(async move |cx| loop {
+        let sleep = cx.background_executor().timer(crate::menubar::POLL);
+        sleep.await;
+        cx.update(|cx| {
+            let mut show = false;
+            let mut quit = false;
+            cx.update_global::<Menubar, ()>(|menubar, _| {
+                while let Ok(event) = muda::MenuEvent::receiver().try_recv() {
+                    match menubar.0.chose(&event.id) {
+                        Some(crate::menubar::Action::Quit) => quit = true,
+                        Some(crate::menubar::Action::Show) => show = true,
+                        _ => {}
                     }
                 }
+                menubar.0.finished();
             });
-        }
+            if quit {
+                cx.quit();
+            }
+            if show {
+                show_the_window(config.clone(), state_root.clone(), cx);
+            }
+        });
     })
     .detach();
 }
@@ -506,87 +546,119 @@ fn run_with(
     // The icons are files the kit embeds, so the application has to be
     // told where its assets come from or every one of them draws as
     // nothing.
-    gpui_kit::application()
-        .with_assets(gpui_kit::assets::Assets)
-        .run(move |cx: &mut App| {
-            gpui_kit::init(cx);
-            cx.activate(true);
+    let application = gpui_kit::application().with_assets(gpui_kit::assets::Assets);
+    // A click on the dock icon while no window is showing: the window
+    // was closed and the menu bar item kept the application alive, and
+    // the click used to do nothing at all.
+    {
+        let config = config.clone();
+        let state_root = state_root.clone();
+        application.on_reopen(move |cx| {
+            show_the_window(config.clone(), state_root.clone(), cx);
+        });
+    }
+    application.run(move |cx: &mut App| {
+        gpui_kit::init(cx);
+        cx.activate(true);
+        let config = config.clone();
+        let state_root = state_root.clone();
+        // The application's own menu: where macOS keeps Settings…
+        // and Quit, and where ⌘, and ⌘Q are looked for.
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("cmd-q", QuitApp, None),
+        ]);
+        cx.on_action(|_: &QuitApp, cx| cx.quit());
+        cx.on_action({
             let config = config.clone();
             let state_root = state_root.clone();
-            let pane = pane.clone();
-            let wanted = pane.clone();
-            // What this machine asked for: a window, a menu bar item, or
-            // both. A screenshot always wants the window, whatever the
-            // file says.
-            let settings = match shot.is_some() {
-                true => crate::preferences::Settings::default(),
-                false => crate::preferences::read(&state_root),
-            };
-            let presence = settings.presence;
-            let wants_bar = shot.is_none() && presence.takes_the_menu_bar();
-            let bar = if wants_bar {
-                // The same item in the menu bar the other window puts
-                // there, from the same code: one poll, one notifier, and
-                // "Open the window" when this one has been closed.
-                match start_the_bar(config.clone(), state_root.clone()) {
-                    Ok(bar) => Some(bar),
-                    Err(error) => {
-                        eprintln!(
-                            "{}",
-                            fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            };
-            let shown = presence.opens_a_window() || (wants_bar && bar.is_none());
-            crate::dock::in_the_dock(shown);
-            // The bar notifies when there is one. When there is not —
-            // a window-only presence, or a bar that would not start —
-            // the window does it instead, so the choice of where the
-            // app appears never decides whether anything tells you.
-            let speaks = settings.notify && bar.is_none();
-            let window = open_window(
-                config.clone(),
-                state_root.clone(),
-                wanted,
-                shown,
-                speaks,
-                cx,
-            );
-            if let Some(bar) = bar {
-                cx.set_global(Menubar(bar));
-                watch_the_bar(config.clone(), state_root.clone(), cx);
+            move |_: &OpenSettings, cx| {
+                open_settings(config.clone(), state_root.clone(), cx);
             }
-            let Some(directory) = shot.clone() else {
-                return;
-            };
-            cx.spawn(async move |cx| {
-                let sleep = cx.background_executor().timer(Duration::from_millis(900));
-                sleep.await;
-                let name = pane.clone().unwrap_or_else(|| "groups".to_owned());
-                let path = directory.join(format!("kit-{name}.png"));
-                let taken = window.update(cx, |_, window, _| {
-                    let bounds = window.bounds();
-                    crate::camera::grab(
-                        bounds.origin.x.to_f64(),
-                        bounds.origin.y.to_f64(),
-                        bounds.size.width.to_f64(),
-                        bounds.size.height.to_f64(),
-                    )
-                    .and_then(|frame| Ok(frame.save(&path)?))
-                });
-                match taken {
-                    Ok(Ok(())) => println!("{}", path.display()),
-                    Ok(Err(error)) => eprintln!("unable to photograph: {error:#}"),
-                    Err(error) => eprintln!("the window went away: {error}"),
-                }
-                cx.update(|cx| cx.quit());
-            })
-            .detach();
         });
+        cx.set_menus(vec![Menu {
+            name: t("app.window").into(),
+            items: vec![
+                MenuItem::action(t("app.menu_settings"), OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action(t("app.menu_quit"), QuitApp),
+            ],
+            disabled: false,
+        }]);
+        let pane = pane.clone();
+        let wanted = pane.clone();
+        // What this machine asked for: a window, a menu bar item, or
+        // both. A screenshot always wants the window, whatever the
+        // file says.
+        let settings = match shot.is_some() {
+            true => crate::preferences::Settings::default(),
+            false => crate::preferences::read(&state_root),
+        };
+        let presence = settings.presence;
+        let wants_bar = shot.is_none() && presence.takes_the_menu_bar();
+        let bar = if wants_bar {
+            // The same item in the menu bar the other window puts
+            // there, from the same code: one poll, one notifier, and
+            // "Open the window" when this one has been closed.
+            match start_the_bar(config.clone(), state_root.clone()) {
+                Ok(bar) => Some(bar),
+                Err(error) => {
+                    eprintln!(
+                        "{}",
+                        fill("status.no_menu_bar", &[("error", &format!("{error:#}"))])
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let shown = presence.opens_a_window() || (wants_bar && bar.is_none());
+        crate::dock::in_the_dock(shown);
+        // The bar notifies when there is one. When there is not —
+        // a window-only presence, or a bar that would not start —
+        // the window does it instead, so the choice of where the
+        // app appears never decides whether anything tells you.
+        let speaks = settings.notify && bar.is_none();
+        let window = open_window(
+            config.clone(),
+            state_root.clone(),
+            wanted,
+            shown,
+            speaks,
+            cx,
+        );
+        if let Some(bar) = bar {
+            cx.set_global(Menubar(bar));
+            watch_the_bar(config.clone(), state_root.clone(), cx);
+        }
+        let Some(directory) = shot.clone() else {
+            return;
+        };
+        cx.spawn(async move |cx| {
+            let sleep = cx.background_executor().timer(Duration::from_millis(900));
+            sleep.await;
+            let name = pane.clone().unwrap_or_else(|| "groups".to_owned());
+            let path = directory.join(format!("kit-{name}.png"));
+            let taken = window.update(cx, |_, window, _| {
+                let bounds = window.bounds();
+                crate::camera::grab(
+                    bounds.origin.x.to_f64(),
+                    bounds.origin.y.to_f64(),
+                    bounds.size.width.to_f64(),
+                    bounds.size.height.to_f64(),
+                )
+                .and_then(|frame| Ok(frame.save(&path)?))
+            });
+            match taken {
+                Ok(Ok(())) => println!("{}", path.display()),
+                Ok(Err(error)) => eprintln!("unable to photograph: {error:#}"),
+                Err(error) => eprintln!("the window went away: {error}"),
+            }
+            cx.update(|cx| cx.quit());
+        })
+        .detach();
+    });
     Ok(())
 }
 

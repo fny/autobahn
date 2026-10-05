@@ -2,6 +2,8 @@
 name = "autobahn"
 window = "Autobahn"
 surface = "dash"
+menu_settings = "Settings…"
+menu_quit = "Quit Autobahn"
 
 [pane]
 groups = "Groups"

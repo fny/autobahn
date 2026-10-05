@@ -184,8 +184,14 @@ impl Registration {
 /// `--config` and `--state-root` are written absolute: a login service
 /// starts in a working directory nobody chose, so a relative path typed
 /// here would later name something else.
-pub fn install(config: Option<&Path>, state_root: Option<&Path>) -> Result<()> {
-    let executable = std::env::current_exe().context("unable to locate this executable")?;
+///
+/// `executable` is the `autobahn` command, and the caller says where it
+/// is. This used to ask for the running program's own path, which is the
+/// command only when the command is what is running: asked from the app,
+/// it registered `autobahn-app watch`, which that program answers with
+/// "unknown argument watch" and launchd starts again every ten seconds.
+pub fn install(executable: &Path, config: Option<&Path>, state_root: Option<&Path>) -> Result<()> {
+    let executable = executable.to_path_buf();
     // A login service inherits none of the shell's environment, so an
     // `AUTOBAHN_HOME` in effect at install time is written into the unit:
     // otherwise the service would keep its state in `~/.autobahn` while

@@ -904,7 +904,12 @@ pub(crate) fn ask(
         // The window's own config and state root, not the defaults: a
         // service watching a different file than this form edits would
         // look like the form doing nothing.
-        Order::Install => crate::service::install(config, Some(state_root)),
+        // The command's path, not this program's: the service runs
+        // `autobahn watch`, and this program is autobahn-app.
+        Order::Install => match found() {
+            Some(command) => crate::service::install(&command, config, Some(state_root)),
+            None => Err(anyhow::anyhow!("the autobahn command is not installed")),
+        },
         Order::Uninstall => crate::service::uninstall(),
     };
     match done {
@@ -1332,6 +1337,121 @@ pub(crate) fn advice(
         return Some(Advice::Restart);
     }
     (numbers(command) > numbers(app)).then_some(Advice::NewerApp)
+}
+
+/// Registers and starts the login service once the installer has put the
+/// command at `command`, and says how the whole install went: one press
+/// on the welcome pane ends with a supervisor running, rather than with a
+/// command and a page that says there is no supervisor.
+///
+/// Only over a configuration the supervisor would start on. A fresh
+/// install's describes no sessions, and a service registered over that
+/// exits at once and is started again every ten seconds until someone
+/// adds a group; `autobahn start` refuses the same file for the same
+/// reason. What happened goes to `install.log` as well.
+pub(crate) fn serve_after_install(
+    command: &std::path::Path,
+    config: Option<&std::path::Path>,
+    state_root: &std::path::Path,
+) -> String {
+    use std::io::Write;
+    let path = tilde(&command.display().to_string());
+    let registered = (|| -> anyhow::Result<bool> {
+        let file = match config {
+            Some(file) => file.to_path_buf(),
+            None => crate::paths::default_config_path()?,
+        };
+        let loaded = crate::supervisor::reload::load(&file)?;
+        if loaded.plans.is_empty() {
+            return Ok(false);
+        }
+        crate::config::OwnState::new(state_root, Some(&file)).check_plans(&loaded.plans)?;
+        crate::service::install(command, config, Some(state_root))?;
+        Ok(true)
+    })();
+    let (line, said) = match registered {
+        Ok(true) => (
+            "installed and started the login service".to_owned(),
+            fill("welcome.serving", &[("path", &path)]),
+        ),
+        Ok(false) => (
+            "the configuration describes no sessions, so no login service was installed".to_owned(),
+            fill("welcome.no_sessions", &[("path", &path)]),
+        ),
+        Err(error) => {
+            let error = first_line(&format!("{error:#}"));
+            (
+                format!("the login service was not installed: {error}"),
+                fill("welcome.not_serving", &[("path", &path), ("error", &error)]),
+            )
+        }
+    };
+    if let Ok(mut note) = std::fs::OpenOptions::new()
+        .append(true)
+        .open(install_log(state_root))
+    {
+        let _ = writeln!(note, "{line}");
+    }
+    said
+}
+
+/// Whether a login service registered to run `executable` cannot be
+/// running the command: it names the app, which v1.0.0 registered in the
+/// command's place, or a file that is not there any more.
+///
+/// Deliberately no wider than that. A command kept under another name,
+/// or somewhere this window would not look, is somebody's own
+/// arrangement and is left alone.
+fn wrong_program(executable: &std::path::Path) -> bool {
+    executable
+        .file_name()
+        .is_some_and(|name| name == "autobahn-app")
+        || !runnable(executable)
+}
+
+/// Points a login service that runs the wrong program at the command,
+/// starts it, and says so. `None` when there was nothing to mend.
+///
+/// Start at login in v1.0.0 registered `autobahn-app watch`. Whoever
+/// switched it on there still has that registration after updating the
+/// app: a service file names one path, and nothing rewrites it but an
+/// install. So the app looks when it opens. The arguments and the state
+/// root are kept; only the program changes.
+pub(crate) fn mend_service() -> Option<String> {
+    let registered = crate::service::registration().ok()??;
+    if !wrong_program(&registered.executable) {
+        return None;
+    }
+    let command = found()?;
+    if wrong_program(&command) {
+        return None;
+    }
+    let was = tilde(&registered.executable.display().to_string());
+    // Reloading the definition starts the service on macOS, so a restart
+    // there killed the supervisor two seconds into its first cycle and
+    // started a second one; `start` leaves a running one alone. systemd
+    // only reloads, so there it is restarted.
+    let begin = match cfg!(target_os = "macos") {
+        true => crate::service::start,
+        false => crate::service::restart,
+    };
+    let mended = crate::service::retarget(&command).and_then(|()| begin());
+    Some(match mended {
+        Ok(()) => fill(
+            "service.mended",
+            &[
+                ("was", was.as_str()),
+                ("now", &tilde(&command.display().to_string())),
+            ],
+        ),
+        Err(error) => fill(
+            "service.not_mended",
+            &[
+                ("was", was.as_str()),
+                ("error", &first_line(&format!("{error:#}"))),
+            ],
+        ),
+    })
 }
 
 /// Runs one of the command's own subcommands and says what it said.
@@ -1800,6 +1920,24 @@ mod tests {
             advice(app, Some(&new), &other("1.0.1+e1")),
             Some(Advice::Restart)
         );
+    }
+
+    /// The app, or nothing at all, is not the command; the command is,
+    /// wherever it is kept.
+    #[test]
+    fn a_service_that_runs_the_app_or_a_missing_file_is_wrong() {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let program = |name: &str| {
+            let path = keep.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\n").expect("written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+            path
+        };
+        assert!(!wrong_program(&program("autobahn")));
+        assert!(wrong_program(&program("autobahn-app")));
+        assert!(wrong_program(&keep.path().join("gone")));
     }
 
     /// A file with no experimental table gets one under the name the

@@ -649,6 +649,12 @@ pub(crate) fn run_action(
     config: Option<&PathBuf>,
     state_root: &std::path::Path,
 ) -> Result<()> {
+    // The command, which is this program in the tray and is not in the
+    // app: there this program is autobahn-app, which knows no `resolve`
+    // and no `diff`.
+    #[cfg(feature = "app")]
+    let exe = crate::surface::exe();
+    #[cfg(not(feature = "app"))]
     let exe = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("autobahn"));
     // --config and --state-root belong to the subcommand, so they go
     // after it.

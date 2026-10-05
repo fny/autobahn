@@ -8,7 +8,7 @@ Autobahn keeps folders on your machine in sync with remotes faster than you can 
 
 <img src="assets/autobahn-typing.gif" alt="Typing on a laptop, synced live to a remote host over SSH" width="720">
 
-To get started, make sure your remotes are [accessible over SSH with your private key](docs/ssh.md). Then install the [desktop app](#desktop-app) or the [CLI](#getting-started).
+To get started, make sure your remotes are [accessible over SSH with your private key](docs/ssh.md). Then install the [desktop app](#desktop-app) or the [CLI](#getting-started-with-the-cli).
 
 > ✨ Want to support Autobahn? Want to use Autobahn free of AGPLv3? <br />
 > Simply donate to the [Justice-in-Education Initiative](docs/donations.md).
@@ -20,7 +20,6 @@ These people bought books for people who need a second chance. Thank you!
 <a href="https://github.com/ChrisMckerracher"><img src="https://github.com/ChrisMckerracher.png?size=96" width="40" height="40" alt="Christopher Mckerracher" title="Christopher Mckerracher" align="middle"></a> &nbsp;[Christopher Mckerracher](https://github.com/ChrisMckerracher)
 
 **$50 of $10,000** on the [road to MIT](DONORS.md#the-road-to-mit). See [all donors](DONORS.md), or [become one](docs/donations.md).
-
 
 ## The Problem
 
@@ -34,24 +33,10 @@ Unhinged solution: keep everything in sync so editing local files is practically
 
 - **Fast as hell.** Delivers sub-30ms propagation times for updates across trees containing hundreds of thousands of files.
 - **Lightweight.** Employs immutable shared-tree structures in memory, requiring significantly less RAM and idle CPU than conventional sync daemons.
-- **Safe.** Choose a sync policy per group that matches your risk profile backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
+- **Safe.** Choose a sync policy per group that matches your risk profile, backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
 - **Reviewed to death.** GLM 5.3, KIMI 3, Astra, and Fable were used to perform correctness and security reviews.
 - **Privacy first.** No cloud service, no account, no third party.
 
-## Desktop App
-
-Autobahn comes with an optional desktop app and menu bar item which makes managing the supervisor and syncing simple. Masochists are welcome to use the CLI alone (next section.)
-
-<img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
-
-Install the latest version from the [releases page](https://github.com/fny/autobahn/releases).
-
-- **macOS** — open `Autobahn.app`
-- **Linux** — extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the desktop libraries the workflow lists.
-
-To learn more, see the [application's documentation](docs/app.md).
-
-Make sure you have your [SSH configuration](docs/ssh.md) set up appropriately.
 
 ## Getting Started with the CLI
 
@@ -61,9 +46,9 @@ Install the CLI by hand or by telling an LLM to read [INSTALL.md](INSTALL.md):
 curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
-Afterwards, you need to set up your configuration. By default, the configuration is written to `~/.autobahn/config.toml`. You can edit it by hand or use the [desktop app](docs/app.md).
+Afterwards, you need to set up your configuration. By default, the configuration is written to `~/.autobahn/config.toml`. You can edit it by hand or use the [desktop app](#desktop-app).
 
-Each group connects one root, the primary, to one or more destinations, the replicas. Sync can be one-way, bidirectional (see [Sync Modes](#sync-modes) below.) For full configuration details, read see [Configuration](docs/configuration.md).
+Each group connects one root, the primary, to one or more destinations, the replicas. Sync can be one-way or bidirectional (see [Sync Modes](#sync-modes) below). For full configuration details, see [Configuration](docs/configuration.md).
 
 ```toml
 # ~/.autobahn/config.toml
@@ -90,7 +75,22 @@ replicas = ["/Volumes/Backup/Workspace"]    #  - local paths work too
 
 Finally, run `autobahn install` to install the login service or run `autobahn watch` to keep a sync running until Ctrl-C.
 
-Make sure you can connect to your remotes with your [SSH configuration](docs/ssh.md) too!
+Make sure you have your [SSH configuration](docs/ssh.md) set up so you can connect to your remotes!
+
+## Desktop App
+
+Autobahn comes with an poorly tested desktop app and menu bar item which make managing the supervisor and syncing simple. Masochists are welcome to use the CLI alone.
+
+<img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
+
+Install the latest version from the [releases page](https://github.com/fny/autobahn/releases).
+
+- **macOS** — open `Autobahn.app`
+- **Linux** — extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the desktop libraries the workflow lists.
+
+To learn more, see the [application's documentation](docs/app.md).
+
+Make sure you have your [SSH configuration](docs/ssh.md) set up so you can connect to your remotes!
 
 ## Sync Modes
 
@@ -112,13 +112,13 @@ For mode details, see [Modes](docs/modes.md) and [Conflict Resolution](docs/conf
 Read [P2P](docs/p2p.md) before P2P use.
 
 > [!CAUTION]
-> If your primary is *empty* and you sync in `mirror` mode you will erase your replicas.
+> If your primary is *empty* and you sync in `mirror` mode, you will erase your replicas.
 
 All other sync modes are not destructive on a first pass. To learn more, see [First Sync](docs/modes.md#first-sync).
 
 ## Benchmarks
 
-Autobahn began as an effort to reduce the memory use of [Mutagen](https://mutagen.io/) which offers similar sync features, and then I got carried away.
+Autobahn began as an effort to reduce the memory use of [Mutagen](https://mutagen.io/), which offers similar sync features, and then I got carried away.
 
 | Measurement | Autobahn | mutagen | Ratio |
 | --- | --: | --: | --: |
@@ -132,7 +132,7 @@ See [Benchmarks](docs/benchmarks.md) for details.
 
 ## Safety
 
-*Autobahn guarantees data integrity as much as possible.* Programs holding files open, network mounts, and mucking with metadata [can cause problems](docs/correctness/accepted-risks.md). Autobahn will break some programs (e.g. git) not due to correctness but rather due to syncing machine specific files. You can use ignores to prevent these issues, and there are clever ways to keep things like [git in sync](docs/git.md).
+*Autobahn guarantees data integrity as much as possible.* Programs holding files open, network mounts, and mucking with metadata [can cause problems](docs/correctness/accepted-risks.md). Autobahn will break some programs (e.g. git) not due to correctness but rather due to syncing machine-specific files. You can use ignores to prevent these issues, and there are clever ways to keep things like [git in sync](docs/git.md).
 
 ### Empirically
 
@@ -161,7 +161,7 @@ In addition to the standard CLI, several user interfaces are available:
 on_alert = "~/.autobahn/on-alert.sh"   # written for you by `autobahn init`
 ```
 
-None of this has undergone nearly the same level of testing as `autobahn` itself, so consider them experimental.
+None of this has undergone nearly the same level of testing as `autobahn` itself, so consider it experimental.
 
 ## AI Disclaimer
 

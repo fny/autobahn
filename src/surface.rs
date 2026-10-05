@@ -346,7 +346,7 @@ pub(crate) const SILENT_IN_ADVANCED: &[&str] = &["alerts", "p2p-dangerously-expe
 ///
 /// They are drawn at the foot of the section they belong to, under the
 /// same heading as `[experimental]`, and only for a window that has
-/// been let in. See `Dash::unlocked`.
+/// been let in. See `AutobahnApp::unlocked`.
 pub(crate) const EXPERIMENTAL: &[&str] = &[
     "power_saver_experimental",
     "interval",

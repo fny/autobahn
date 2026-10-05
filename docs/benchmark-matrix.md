@@ -1,21 +1,19 @@
-# Benchmark matrix: September–October 2026
+# Benchmark Matrix: September–October 2026
 
-This document presents the complete benchmark measurement matrix comparing **Autobahn 1.0.0** against **Mutagen 0.19.0-dev** on Linux. The [summary](./benchmarks.md) explains the headline results. Machine-readable metrics, per-run ranges, exclusions and problem records are in [`benchmarks/2026-10-02.json`](../benchmarks/2026-10-02.json). Raw samples and logs are kept out of the repository.
-
-This is one complete set, refreshed through October 2: every cell, both tools, from identified builds rather than a single run of today's HEAD. The five patch cells were re-run on `0c72865`; every other cell is the base run.
+This document presents the complete benchmark measurement matrix comparing **Autobahn 1.0.0 prerelease (0.4.0)** against **Mutagen 0.19.0-dev** on Linux. The [summary](./benchmarks.md) explains the headline results. Machine-readable metrics, per-run ranges, exclusions and problem records are in [`benchmarks/2026-10-02.json`](../benchmarks/2026-10-02.json). Raw samples and logs are kept out of the repository.
 
 ## Provenance & Build Metadata
 
 | Test Cells | Autobahn Build | Run Identifier | Date |
 | :-- | :-- | :-- | :-: |
-| Base Matrix (all cells except 5 patch runs below) | `e7b3ac0` (1.4.0+e16, musl `dist`, mimalloc) | `bench-1790601586` | 2026-09-28 |
-| `chromium-10-fan-patch` | `0c72865` | `bench-1790869509` | 2026-10-01 |
-| `chromium-1-patch`, `chromium-10-patch` | `0c72865` | `bench-1790873270` | 2026-10-01 |
-| `50k-1-patch`, `50k-10-patch` | `0c72865` | `bench-1790941679` | 2026-10-02 |
+| Base Matrix (all cells except 5 patch runs below) | `6a23ace` (0.4.0+e16, musl `dist`, mimalloc) | `bench-1790601586` | 2026-09-28 |
+| `chromium-10-fan-patch` | `fe4685a` (0.4.0+e17) | `bench-1790869509` | 2026-10-01 |
+| `chromium-1-patch`, `chromium-10-patch` | `fe4685a` (0.4.0+e17) | `bench-1790873270` | 2026-10-01 |
+| `50k-1-patch`, `50k-10-patch` | `fe4685a` (0.4.0+e17) | `bench-1790941679` | 2026-10-02 |
 
 **Harness Environment:** Ubuntu 24.04 LTS, 8 cores, 16 GB RAM, 3.5 GHz Intel Xeon 8375C
 
-## Propagation latency
+## Propagation Latency
 
 All percentiles are pooled milliseconds across five repeats. `ab` is Autobahn, `mu` is mutagen. Samples and skipped ticks are shown as `ab / mu`. `-bidir` measures each direction separately; `-fan` has ten destinations; `-patch` changes ranges within large files instead of replacing small files. The direction labels retain the corpus identity for two-tree cells.
 
@@ -130,7 +128,7 @@ During idle state on a 505k Chromium repository:
 | two50k-10 | local / remote | 115.0 / 70.8 | 343.9 / 284.5 | 0.2 / 0.0 | 9.9 / 10.6 |
 | two50k-100 | local / remote | 115.4 / 64.4 | 349.7 / 288.6 | 0.2 / 0.0 | 10.0 / 10.2 |
 
-## First synchronization
+## First Synchronization
 
 Dedicated `coldsync-*` cells start with empty destinations. Values are median digest-verified seconds across five repeats, including verification and completion polling.
 
@@ -158,4 +156,4 @@ These values are median wall seconds for repeated module copies, including conve
 
 - [Benchmarks](./benchmarks.md): Results summary and methodology
 - [Development](./development.md#the-ab-gate): The benchmark harness and A/B comparisons
-- [Architecture](./architecture.md): The design behind the measured performance.
+- [Architecture](./architecture.md): The design behind the measured performance

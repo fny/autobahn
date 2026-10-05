@@ -17,9 +17,10 @@
 # it would buy runner time, and runner time is free on a public
 # repository.
 #
-# A release requires every job here — linux, linux-arm, mac and spec — to
-# have succeeded on the tagged commit (release.yml's version job), so
-# renaming one means changing that list too. For a commit CI skipped:
+# A release requires every job here — linux, linux-arm, mac, spec,
+# features-app and features-tray — to have succeeded on the tagged
+# commit (release.yml's version job), so renaming one means changing
+# that list too. For a commit CI skipped:
 #   gh workflow run ci.yml --ref <tag>
 name: CI
 
@@ -177,3 +178,55 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Tests
         run: cargo test --release --locked
+
+  # The library under the app's feature and under the tray's. Neither is on
+  # in the jobs above, so the code behind them, and its tests, compiled
+  # nowhere a pull request is checked: gpui-kit 0.7 removed a function the
+  # app calls and its pull request went green, and three of these tests had
+  # been failing on main unnoticed. One feature per job, as each binary is
+  # built: with both on, one could lean on code only the other turns on.
+  # Alongside the others rather than after Linux: GPUI is the longest
+  # build in the tree, and nothing waits on it.
+  features:
+    name: features-${{ matrix.feature }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        feature: [app, tray]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: features-${{ matrix.feature }}
+      # The list app.yml installs, for the same reasons; keep the two in
+      # step. The tray needs only the GTK half, but one list is simpler
+      # than two that drift.
+      - name: Libraries the app and the tray link against
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            libxdo-dev \
+            libasound2-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan-dev \
+            libxcb-composite0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            pkg-config \
+            cmake \
+            clang
+      - name: Tests
+        run: cargo test --release --locked --features ${{ matrix.feature }} --lib

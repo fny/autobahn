@@ -1,0 +1,98 @@
+# The whole suite, many times, on the same commit, by hand. A test that
+# fails in some runs and passes in others is flaky; this names each one and
+# says how often it failed. Linux and macOS each build once, then run the
+# suite in a loop on one runner, so ten runs cost one build, not ten.
+#   gh workflow run flaky.yml [-f runs=10] [-f ref=<sha>] [-f threads=1]
+#
+# threads changes how many tests run at once. Most flaky tests are races:
+# 1 hides the ones that fight each other, a high number crowds the runner
+# and shakes out the ones that depend on timing.
+name: Flaky tests
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: How many times to run the suite
+        default: "10"
+      ref:
+        description: Commit to test (default, the branch you run it on)
+        default: ""
+      threads:
+        description: Tests at once (default, one per core)
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  suite:
+    strategy:
+      # One platform's failures must not cancel the other's count.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-15]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the tests
+        run: cargo test --release --locked --no-run
+      - name: Run the suite
+        shell: bash
+        env:
+          RUNS: ${{ inputs.runs }}
+          THREADS: ${{ inputs.threads }}
+          RUST_BACKTRACE: "1"
+        run: |
+          logs="$RUNNER_TEMP/flaky"
+          mkdir -p "$logs"
+          args=()
+          if [ -n "$THREADS" ]; then args=(-- "--test-threads=$THREADS"); fi
+          for i in $(seq "$RUNS"); do
+            echo "::group::run $i"
+            # --no-fail-fast: one failing test binary must not hide the rest.
+            if ! cargo test --release --locked --no-fail-fast "${args[@]}" 2>&1 | tee "$logs/$i.log"; then
+              echo "$i" >> "$logs/failed-runs"
+            fi
+            echo "::endgroup::"
+          done
+      - name: Count the failures
+        if: always()
+        shell: bash
+        env:
+          RUNS: ${{ inputs.runs }}
+        run: |
+          cd "$RUNNER_TEMP/flaky"
+          failed_runs=$(wc -l < failed-runs 2>/dev/null | tr -d ' ' || true)
+          failed_runs=${failed_runs:-0}
+          # cargo names a failure as "test <name> ... FAILED".
+          grep -h '^test .* \.\.\. FAILED$' ./*.log 2>/dev/null |
+            sed -e 's/^test //' -e 's/ \.\.\. FAILED$//' |
+            sort | uniq -c | sort -rn > counts || true
+          {
+            echo "## ${{ matrix.os }}: $failed_runs of $RUNS runs failed"
+            echo
+            if [ -s counts ]; then
+              echo "| Test | Failed | Verdict |"
+              echo "| --- | --: | --- |"
+              while read -r n name; do
+                if [ "$n" -ge "$RUNS" ]; then verdict="broken, fails every run"; else verdict="flaky"; fi
+                echo "| \`$name\` | $n of $RUNS | $verdict |"
+              done < counts
+            elif [ "$failed_runs" != 0 ]; then
+              echo "Runs $(tr '\n' ' ' < failed-runs)failed without naming a test: a crash, a hang or a build error. Read their logs above."
+            else
+              echo "No test failed."
+            fi
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+          [ "$failed_runs" = 0 ]

@@ -9,7 +9,7 @@ scripts/build-agents.sh         # cross-build the agents bundle
 gh workflow run ci.yml          # Linux, ARM Linux and macOS
 ```
 
-## Build profiles and allocators
+## Build Profiles and Allocators
 
 Shipping binaries use `--profile dist`: release optimization with one codegen unit. Recorded edits were about 10% faster, with builds about 40% slower. Routine development and tests use `--release`.
 
@@ -31,11 +31,13 @@ The macOS job runs the suite and builds an ad-hoc-signed tray app. Release certi
 
 Every job runs on every push that reaches them; nothing is opt-in. The macOS job waits for Linux and is the longest at about fifteen minutes, but linux, linux-arm and spec are all done around eight whether it runs or not, and runner time is free on a public repository — so skipping it would buy a green tick sooner and nothing else.
 
+The library is also tested under the `app` and the `tray` features, one job each (`features-app`, `features-tray`), since no other job turns either on. They run alongside the rest, on Linux, with the system libraries the app links against.
+
 The app build is a separate workflow on its own path filter, eight minutes across three runners in parallel, finishing inside the time CI takes anyway.
 
-A release needs `linux`, `linux-arm`, `mac` and `spec` to have passed on the tagged commit. Since they all run on every push to main, tagging a commit that is green is enough; `release.yml` names the recovery when it is not.
+A release needs `linux`, `linux-arm`, `mac`, `spec`, `features-app` and `features-tray` to have passed on the tagged commit. Since they all run on every push to main, tagging a commit that is green is enough; `release.yml` names the recovery when it is not.
 
-## Targeted tests
+## Targeted Tests
 
 Run the suite that covers the change:
 
@@ -57,31 +59,31 @@ CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
 
 `apps/tray/build.sh` uses this directory. A build in `target/release` can replace the executable used by the login service.
 
-## Desktop app and shared text
+## Desktop App and Shared Text
 
-Dash is a separate binary behind `--features app`, built with GPUI Kit and the configuration schema. `apps/app/build.sh` and `.github/workflows/app.yml` specify Rust 1.98.0:
+The Desktop App is a separate binary behind `--features app`, built with GPUI Kit and the configuration schema. `apps/app/build.sh` and `.github/workflows/app.yml` specify Rust 1.98.0:
 
 ```sh
 cargo +1.98.0 build --release --locked --features app --bin autobahn-app --target-dir target/app
 ```
 
-Build the CLI separately and place it beside Dash or in a supported installation path.
+Build the CLI separately and place it beside the desktop app or in a supported installation path.
 
 On macOS, `apps/app/build.sh` creates an ad-hoc-signed bundle. No copy of `autobahn` goes inside it: the window finds the command beside itself first, so a bundled one would override the installed copy the supervisor is actually running. A release replaces the ad-hoc signature with a Developer ID one — see [Releases](./releases.md#signing-and-notarising-macos).
 
-Linux build packages appear in `.github/workflows/app.yml`. Runtime also requires a display server and Vulkan driver. See [Dash](./app.md).
+Linux build packages appear in `.github/workflows/app.yml`. Runtime also requires a display server and Vulkan driver. See [Desktop App](./app.md).
 
-Ordinary CI covers the CLI, library, and macOS tray. Dash has a separate workflow, so ordinary CI success does not establish that Dash builds.
+Ordinary CI covers the CLI, library, and macOS tray. The Desktop App has a separate workflow, so ordinary CI success does not establish that the Desktop App builds.
 
 Shared strings live in `assets/words/en.toml` and load through `src/words.rs`. Catalog tests check interface usage. `src/surface.rs` contains the shared UI model and configuration editor.
 
-### The menu bar app bundle
+### The Menu Bar App Bundle
 
 `apps/tray/build.sh` builds `Autobahn Tray.app`. It signs with the best identity in your keychain; `--unsigned` stops at the assembled bundle and touches no keychain, and a path argument builds somewhere else, resolved from where you run it. The version the app reports comes from `Cargo.toml`, written into `Info.plist` at build time — so build with `build.sh`, never by copying the template.
 
 `build.sh` puts the binary in `target/tray` (`AUTOBAHN_TRAY_TARGET` moves it), never `target/release`: the login service runs `target/release/autobahn` through a symlink, and an app build must not replace it.
 
-### The icon
+### The Icon
 
 `assets/Autobahn.icon` is an Icon Composer bundle (Icon Composer ships inside Xcode). `build.sh` compiles it with Xcode's `actool`, exactly as Xcode would: the bundle gets `Assets.car` carrying the light, dark, and tinted variants macOS 26 draws, plus `Autobahn.icns` as the flat fallback for older systems. Without Xcode it falls back to the committed `assets/autobahn.icns`.
 
@@ -89,11 +91,11 @@ Shared strings live in `assets/words/en.toml` and load through `src/words.rs`. C
 
 The menu bar glyph is not this icon. It is the Autobahn sign, drawn in code in `src/menubar.rs`; `assets/sign.svg` is the same shape at full size.
 
-### A guided tour
+### A Guided Tour
 
 `scripts/mi` runs a guided tour against throwaway directories — every command, and every state a session can report, printed as the binary actually produces them.
 
-## The A/B gate
+## The A/B Gate
 
 Measure hot-path changes before release:
 
@@ -113,13 +115,13 @@ The `50k-burst` and `chromium-burst` cells copy a module five times per job and 
 
 The harness lives in `bench/`, which is not tracked — hundreds of megabytes of corpora and run output. Its own `README.md` documents it; the figures it produced are in [Benchmarks](./benchmarks.md).
 
-## Compatibility epochs
+## Compatibility Epochs
 
 If a change makes builds disagree on wire or tree semantics, increment `COMPATIBILITY_EPOCH` in `src/protocol.rs`. This includes scan and ignore rules.
 
 After an increment, rebuild the agent bundle before restarting the supervisor. A stale released `MANIFEST` causes refusal before upload. A stale hand-built bundle without one fails the remote handshake. See [State](./state.md#compatibility-epochs).
 
-## The specification
+## The Specification
 
 TLA+ models in `spec/` cover reconciliation across one primary and multiple replicas, plus p2p. TLC explores bounded configurations.
 
@@ -148,5 +150,5 @@ It uses enum-based trees, sorted copy-on-write children, metadata on nodes, line
 - [Specification](../spec/README.md): Formal models and implementation replay
 - [Benchmarks](./benchmarks.md): Recorded performance comparisons
 - [Releases](./releases.md): Release builds, signing, and distribution
-- [Dash](./app.md): Desktop app behavior
-- [Menu bar item](./tray.md): Tray app behavior and platform limitations.
+- [Desktop App](./app.md): Desktop app behavior
+- [Menu Bar Item](./tray.md): Tray app behavior and platform limitations

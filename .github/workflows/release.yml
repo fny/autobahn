@@ -78,7 +78,7 @@ jobs:
               --jq '.jobs[] | select(.conclusion == "success") | .name' || exit 1
           done) || exit 1
           missing=
-          for job in linux linux-arm mac spec; do
+          for job in linux linux-arm mac spec features-app features-tray; do
             printf '%s\n' "$passed" | grep -qx -- "$job" || missing="$missing $job"
           done
           if [ -n "$missing" ]; then
@@ -88,7 +88,7 @@ jobs:
             echo "and, once it is green, re-run this workflow or push the tag again." >&2
             exit 1
           fi
-          echo "CI passed on $sha: linux, linux-arm, mac and spec"
+          echo "CI passed on $sha: linux, linux-arm, mac, spec, features-app and features-tray"
 
   linux:
     needs: version
@@ -145,6 +145,71 @@ jobs:
         with:
           name: autobahn-${{ matrix.platform }}
           path: autobahn-${{ matrix.platform }}
+          if-no-files-found: error
+
+  app-linux:
+    # The desktop app for Linux, built on each architecture natively, as
+    # app.yml does: GPUI links against the system's graphics and font
+    # libraries, which a static musl cross-build cannot carry. Unsigned —
+    # Linux has no Gatekeeper to satisfy. Named Autobahn-*, like the macOS
+    # app, which keeps it out of the lower-case autobahn-* glob the release
+    # job turns into the agents bundle.
+    #
+    # Built on Ubuntu 24.04, so it needs a glibc at least that new.
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - platform: linux-x86_64
+            runs-on: ubuntu-24.04
+          - platform: linux-aarch64
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+    env:
+      # The kit needs a newer compiler than the rest of the tree, as in app.yml.
+      TOOLCHAIN: '1.98.0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: |
+          rustup toolchain install "$TOOLCHAIN" --profile minimal
+          rustup default "$TOOLCHAIN"
+      - name: Libraries the app links against
+        # The same list as app.yml.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            libdbus-1-dev \
+            libxdo-dev \
+            libasound2-dev \
+            libfontconfig-dev \
+            libwayland-dev \
+            libxkbcommon-x11-dev \
+            libssl-dev \
+            libzstd-dev \
+            libvulkan-dev \
+            libxcb-composite0-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            pkg-config \
+            cmake \
+            clang
+      - name: Build
+        run: cargo build --release --locked --features app --bin autobahn-app
+      - name: Archive
+        run: |
+          mkdir stage
+          cp target/release/autobahn-app stage/
+          tar -C stage -czf "Autobahn-${{ matrix.platform }}.tar.gz" .
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: Autobahn-${{ matrix.platform }}
+          path: Autobahn-${{ matrix.platform }}.tar.gz
           if-no-files-found: error
 
   mac:
@@ -277,7 +342,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [linux, mac]
+    needs: [linux, mac, app-linux]
     runs-on: ubuntu-latest
     # For MINISIGN_SECRET_KEY, which signs the checksums. The environment
     # asks for approval, so nothing is signed that a person did not let
@@ -301,7 +366,7 @@ jobs:
           merge-multiple: true
       - name: Assemble the agents bundle and checksums
         # The agents bundle takes the lower-case autobahn-* binaries, which
-        # now include the signed macOS ones; the app archive is Autobahn-*.
+        # now include the signed macOS ones; the app archives are Autobahn-*.
         #
         # The MANIFEST names the build of every binary in it — version,
         # epoch, and blake3 — so a controller refuses to upload a stale
@@ -330,7 +395,7 @@ jobs:
           # The installer as of this tag, so releases/latest/download/install.sh
           # installs the release it came with, not whatever main holds.
           cp source/scripts/install.sh install.sh
-          sha256sum autobahn-* Autobahn-*.zip install.sh > SHA256SUMS
+          sha256sum autobahn-* Autobahn-*.zip Autobahn-*.tar.gz install.sh > SHA256SUMS
       - name: Sign the checksums
         # The checksums come from this same release, so on their own they
         # prove only that a download is intact. The signature, by a key
@@ -379,6 +444,8 @@ jobs:
             autobahn-agents.tar.gz \
             Autobahn-Tray-macos-aarch64.zip \
             Autobahn-macos-aarch64.zip \
+            Autobahn-linux-x86_64.tar.gz \
+            Autobahn-linux-aarch64.tar.gz \
             install.sh \
             SHA256SUMS \
             SHA256SUMS.minisig

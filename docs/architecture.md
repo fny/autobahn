@@ -16,7 +16,7 @@ Autobahn eliminates this overhead by enforcing an **immutable, shared in-memory 
 > [!IMPORTANT]
 > Pointer identity proves subtree equality, but the inverse does not hold: two independently scanned trees containing identical file contents do not share storage pointers. The system uses pointer identity strictly to prove equivalence, never to prove divergence.
 
-## 2. Change Detection: High-Speed Watchers with Bounded Auditing
+## 2. Change Detection: High-Speed Watchers With Bounded Auditing
 
 Autobahn couples asynchronous kernel filesystem event notifications (`inotify` on Linux, `FSEvents` on macOS) with periodic background audits:
 
@@ -66,4 +66,4 @@ Synchronization sessions execute within dedicated worker threads coordinated by 
 - [Invariants](./correctness/invariants.md): Guarantees, implementation references, and tests
 - [State](./state.md): Stored configuration, session baselines, and agent bundles
 - [Benchmarks](./benchmarks.md): Measured latency and resource use
-- [Development](./development.md): Build instructions, tests, and performance checks.
+- [Development](./development.md): Build instructions, tests, and performance checks

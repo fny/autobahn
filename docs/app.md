@@ -1,27 +1,23 @@
-# Dash
+# Desktop App
 
-Dash is Autobahn's desktop app, and it ships as `Autobahn.app`. It is an easy-to-use way to manage your sync sessions. If you don't already have the supervisor installed, the app will offer to install it for you.
+The desktop app, `Autobahn.app`, is an easy way to manage your sync sessions. If the `autobahn` command isn't installed yet, the app offers to install it for you.
 
 ## Download
 
-Two channels.
+Download the app from the [releases page](https://github.com/fny/autobahn/releases).
 
-**Tagged releases** carry `Autobahn-macos-aarch64.zip`, signed with a Developer ID and notarised, so it opens without a quarantine step.
-
-**`app-latest`** is the moving prerelease the `app.yml` workflow publishes from every push to main that touches the app: macOS Apple Silicon and Linux x86-64/arm64, **unsigned**. A platform whose build failed is simply absent, so check the release notes for the build commit and what it contains.
-
-- **macOS** — open `Autobahn.app`. From a tagged release it is signed and just opens; from `app-latest` it is not, so a downloaded copy is quarantined and the release notes explain the step to clear it.
-- **Linux** — extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the desktop libraries the workflow lists.
+- **macOS (Apple Silicon):** `Autobahn-macos-aarch64.zip`. Unzip it and open `Autobahn.app`. It's signed and notarized, so it opens without any extra steps.
+- **Linux (`x86_64` or `aarch64`):** `Autobahn-linux-x86_64.tar.gz` or `Autobahn-linux-aarch64.tar.gz`. Extract it and run `./autobahn-app`. You need a graphical session (Wayland or X11) and a Vulkan driver. On Ubuntu or Debian, this installs the libraries it uses: `sudo apt install libgtk-3-0 libayatana-appindicator3-1 libxdo3 libvulkan1`. It's built on Ubuntu 24.04, so older distributions may be missing a new enough glibc.
 
 ## First Run
 
 ![The welcome screen, offering to install the autobahn command](../assets/screenshots/welcome.png)
 
-Dash needs the `autobahn` command, which is a separate download — no copy travels inside the app. It looks beside itself first, then in `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and your PATH.
+The app needs the `autobahn` command, which is a separate download. It looks beside itself first, then in `~/.local/bin`, `/usr/local/bin`, `/opt/homebrew/bin`, and your PATH.
 
 If it finds none, a welcome screen offers to run the installer for you or to copy the shell command and run it yourself. Installer output goes to `install.log` under the state root, and the Log pane shows it as it happens.
 
-Then configure a group before starting the service — see [Installation](../INSTALL.md).
+Then set up a group before starting the service. See [Configuration](./configuration.md) and [SSH Setup](./ssh.md).
 
 Keep the command matched to the running supervisor. A version mismatch is reported in the status area rather than left to surprise you.
 
@@ -38,13 +34,13 @@ Keep the command matched to the running supervisor. A version mismatch is report
 | **Service** | Program and service state, with install, start, stop, restart, and cleanup. |
 | **Config** | Top-level settings, defaults, and groups, which can be added, renamed, or removed. |
 
-Conflict actions run the same operations as the command line — see [Conflicts](./conflicts.md). Dash never merges file contents. A conflict can be about a file's executable bit, a symbolic link, or a directory, so there is not always a text difference to show.
+Conflict actions run the same operations as the command line — see [Conflicts](./conflicts.md). The app never merges file contents. A conflict can be about a file's executable bit, a symbolic link, or a directory, so there is not always a text difference to show.
 
 **Diff** puts the two sides underneath, labelled by side rather than by the files actually compared:
 
 ![The Conflicts pane with a unified diff open between the primary and a replica](../assets/screenshots/conflicts.png)
 
-## Editing configuration
+## Editing Configuration
 
 ![The Configuration pane, editing the top-level settings](../assets/screenshots/configuration.png)
 
@@ -54,7 +50,7 @@ Advanced fields fold away. Experimental controls appear after five clicks on the
 
 A running supervisor picks up a saved file through [live reload](./configuration.md#live-reload-behavior). With live reload off, restart it to apply the change.
 
-## Choosing what shows
+## Choosing What Shows
 
 ![The Service pane: the supervisor, login service, notifications, and what the app shows](../assets/screenshots/service.png)
 
@@ -69,34 +65,34 @@ notify = true       # whether the app raises desktop notifications itself
 
 ## Notifications
 
-Dash raises desktop notifications under exactly the rules an `on_alert` hook would use: a condition has to hold before it counts, only something _joining_ the set in trouble is news, a cascade is gathered into one, and recovery is silent. See [Alerts](./alerts.md).
+The app raises desktop notifications under exactly the rules an `on_alert` hook would use: a condition has to hold before it counts, only something _joining_ the set in trouble is news, a cascade is gathered into one, and recovery is silent. See [Alerts](./alerts.md).
 
 This does not depend on showing a menu bar item. A window with no menu bar still notifies — choosing where the app appears is not a choice about whether anything tells you a session has halted. Exactly one thing speaks per app: the menu bar item when there is one, the window when there is not.
 
 Turn them off with the switch in the Service pane.
 
-**Do not leave them on alongside an `on_alert` hook.** The hook follows the same rules, so both means being told everything twice. The Service pane says so when it finds a hook configured and the switch still on; turn off whichever you want less. A hook you add while Dash is open is noticed within a few seconds, without a restart.
+**Do not leave them on alongside an `on_alert` hook.** The hook follows the same rules, so both means being told everything twice. The Service pane says so when it finds a hook configured and the switch still on; turn off whichever you want less. A hook you add while the app is open is noticed within a few seconds, without a restart.
 
-## Starting at login
+## Starting at Login
 
-**Dash does not start itself.** Add it under System Settings → General → Login Items on macOS, or your desktop's autostart settings on Linux.
+**The app does not start itself.** Add it under System Settings → General → Login Items on macOS, or your desktop's autostart settings on Linux.
 
-**The supervisor is separate.** `autobahn install`, or the service controls in the Service pane, registers it to start at login. That is what keeps your files in sync; Dash only watches it.
+**The supervisor is separate.** `autobahn install`, or the service controls in the Service pane, registers it to start at login. That is what keeps your files in sync; the app only watches it.
 
 ## Options
 
-`--config FILE` and `--state-root DIRECTORY`. Without them Dash uses the default configuration and state root (`AUTOBAHN_HOME`, or `~/.autobahn`).
+`--config FILE` and `--state-root DIRECTORY`. Without them the app uses the default configuration and state root (`AUTOBAHN_HOME`, or `~/.autobahn`).
 
 ## On Linux
 
-Dash runs from the `app-latest` archives, including its menu bar item — though the item is the half most likely not to appear. The tray libraries need GTK started on the thread running the event loop, and neither GPUI nor winit provides one, so expect the window and treat the item as a bonus. A failure there leaves the window up with a one-line complaint rather than taking the app down.
+On Linux, the menu bar item is the part most likely not to appear. The tray libraries need GTK started on the thread running the event loop, and neither GPUI nor winit provides one, so expect the window and treat the item as a bonus. A failure there leaves the window up with a one-line complaint rather than taking the app down.
 
 ## See Also
 
 - [Configuration](./configuration.md): Settings available in the configuration editor
 - [Conflicts](./conflicts.md): Conflict inspection and resolution actions
 - [Alerts](./alerts.md): Notification rules and custom hooks
-- [Menu bar item](./tray.md): The Dash menu bar item and standalone tray app
-- [Terminal interface](./shop.md): Session monitoring and control in a terminal
-- [Development](./development.md#desktop-app-and-shared-text): How to build Dash
-- [Releases](./releases.md#signing-and-notarising-macos): macOS signing and notarization.
+- [Menu Bar Item](./tray.md): The app's menu bar item and the standalone tray app
+- [Terminal Interface](./shop.md): Session monitoring and control in a terminal
+- [Development](./development.md#desktop-app-and-shared-text): How to build the app
+- [Releases](./releases.md#signing-and-notarising-macos): macOS signing and notarization

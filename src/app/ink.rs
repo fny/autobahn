@@ -204,13 +204,13 @@ mod tests {
             Some(RED)
         );
         assert_eq!(colour_of(LINE, "2026-09-24"), Some(FAINT));
-        assert_eq!(colour_of(LINE, "[halle"), Some(BLUE));
+        assert_eq!(colour_of(LINE, "[dev@halle"), Some(BLUE));
         assert_eq!(colour_of(LINE, "replica path"), Some(INK));
     }
 
     #[test]
     fn chatter_is_dim_from_end_to_end() {
-        for needle in ["2026-09-24", "debug:", "[halle", "cycle"] {
+        for needle in ["2026-09-24", "debug:", "[dev@halle", "cycle"] {
             assert_eq!(colour_of(CHATTER, needle), Some(FAINT), "{needle}");
         }
     }

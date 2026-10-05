@@ -22,7 +22,7 @@ That last rule is what makes negations useful: `*.log` followed by `!keep.log` i
 - **Last Match Wins:** Later rules override earlier rules. For example, `*.log` followed by `!important.log` ignores all logs except `important.log`.
 - **Dead Negation Validation:** If a negation (`!file`) is completely superseded by a subsequent catch-all rule, the configuration compiler rejects the rule set at load time as an unexecutable configuration error.
 
-## Where patterns come from
+## Where Patterns Come From
 
 The defaults, then the group, each read straight down the list. Last match wins, so a group can re-include something the defaults excluded:
 
@@ -32,7 +32,7 @@ defaults.ignores  →  group.ignores
 
 Within one list the order written is the order applied, including the files a `file:` entry pulls in.
 
-## Ignore files
+## Ignore Files
 
 Store reusable pattern lists in `~/.autobahn/ignores` and reference them from the configuration:
 
@@ -76,6 +76,6 @@ Resolution rules:
 ## See Also
 
 - [Configuration](./configuration.md): Default and group-specific ignore settings
-- [Git checkouts](./git.md): Which Git files to synchronize or exclude
+- [Git Checkouts](./git.md): Which Git files to synchronize or exclude
 - [Modes](./modes.md): Deletion policies and directory protection
-- [State](./state.md): The `ignores/` directory and state root locations.
+- [State](./state.md): The `ignores/` directory and state root locations

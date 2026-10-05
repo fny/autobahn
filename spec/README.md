@@ -27,7 +27,7 @@ On first use, the script downloads the jar to `~/.local/lib` and checks its dige
 
 For a TLC upgrade, update the pin rather than removing verification.
 
-## Implementation replay
+## Implementation Replay
 
 `tests/spec_replay.rs` runs real `reconcile()` cycles and checks the same properties across thousands of random games. These Rust checks always run.
 
@@ -67,7 +67,7 @@ Leadership changes require a bound because each increments the term. An unbounde
 
 `Autobahn_quick.cfg` checks the star with three edits in about half a minute. Use it before full runs after changes to shared rules.
 
-## Peering replay
+## Peering Replay
 
 `tests/spec_peering_replay.rs` uses real lease files and the agent’s `read_lease`, `Lease::admits`, and `write_lease` sequence.
 
@@ -75,7 +75,7 @@ It uses real `is_stale_at` with a simulated clock, real `takeover_wait`, and rea
 
 Three-replica random games check invariants in Rust. Two-replica games also produce TLC traces. Replay matches trees, liveness, leases, and roles while leaving ancestor stores to the model.
 
-## Model limits
+## Model Limits
 
 The peering model represents staleness nondeterministically. It does not model clock behavior, network partitions separately from crashes, `yield`, or unfenced one-off commands.
 

@@ -1,49 +1,78 @@
 # Autobahn <picture><source media="(prefers-color-scheme: dark)" srcset="assets/sign-readme-white.svg"><img src="assets/sign-readme.svg" alt="" height="23"></picture>
 
-_Subsecond sync with German precision._
+[![Release](https://img.shields.io/github/v/release/fny/autobahn)](https://github.com/fny/autobahn/releases) [![CI](https://github.com/fny/autobahn/actions/workflows/ci.yml/badge.svg)](https://github.com/fny/autobahn/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-AGPL--3.0%20or%20Donor%27s-blue)](#license) [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#system-requirements--limitations) [![Donate](https://img.shields.io/badge/donate-Justice--in--Education-ff69b4)](docs/donations.md)
 
-Keep your files in sync as fast as you (or an agent) edit them across a fleet.
+*Subsecond sync with German precision.*
+
+Autobahn keeps folders on your machine in sync with remotes faster than you can type. Here's a recorded demo with a save after each keystroke:
+
+<img src="assets/autobahn-typing.gif" alt="Typing on a laptop, synced live to a remote host over SSH" width="720">
+
+To get started, make sure your remotes are [accessible over SSH with your private key](docs/ssh.md). Then install the [desktop app](#desktop-app) or the [CLI](#getting-started).
+
+> ✨ Want to support Autobahn? Want to use Autobahn free of AGPLv3? <br />
+> Simply donate to the [Justice-in-Education Initiative](docs/donations.md).
+
+## Donors
+
+These people bought books for someone who needs a second chance. Thank you!
+
+<a href="https://github.com/ChrisMckerracher"><img src="https://github.com/ChrisMckerracher.png?size=96" width="40" height="40" alt="Christopher Mckerracher" title="Christopher Mckerracher" align="middle"></a> &nbsp;[Christopher Mckerracher](https://github.com/ChrisMckerracher)
+
+**$50 of $10,000** on the [road to MIT](DONORS.md#the-road-to-mit). See [all donors](DONORS.md), or [become one](docs/donations.md).
+
+
+## The Problem
+
+- Browsing files over SSH or NFS is clunky.
+- Agents can't run `--dangerously` on your local files without putting your machine at risk.
+- Some sync tools require gigs of RAM for big trees, or a cloud account, or both.
+
+Solution: keep everything in sync so editing local files is practically the same as editing remote ones.
+
+## Why Autobahn
+
+- **Fast as hell.** Delivers sub-30ms propagation times for updates across trees containing hundreds of thousands of files.
+- **Lightweight.** Employs immutable shared-tree structures in memory, requiring significantly less RAM and idle CPU than conventional sync daemons.
+- **Safe.** Choose a sync policy per group that matches your risk profile backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
+- **Reviewed to death.** GLM 5.3, KIMI 3, Astra, and Fable were used to perform correctness and security reviews.
+- **Privacy first.** No cloud service, no account, no third party.
+
+## Desktop App
+
+Autobahn comes with a desktop app and menu bar item which makes managing the supervisor and syncing simple:
+
+<img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
+
+Install the latest version from the [releases page](https://github.com/fny/autobahn/releases).
+
+- **macOS** — open `Autobahn.app`
+- **Linux** — extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the desktop libraries the workflow lists.
+
+To learn more, see the [application's documentation](docs/app.md).
+
+Make sure you have your [SSH configuration](docs/ssh.md) set up appropriately.
+
+## Getting Started
+
+Install the CLI by hand or by telling an LLM to read [INSTALL.md](INSTALL.md):
 
 ```sh
 curl -fsSL https://github.com/fny/autobahn/releases/latest/download/install.sh | sh
 ```
 
-You can also point your coding agent at [INSTALL.md](INSTALL.md) for interactive setup or install [Dash](docs/app.md) from its [releases page](https://github.com/fny/autobahn/releases).
+Afterwards, you need to set up your configuration. By default, the configuration is written to `~/.autobahn/config.toml`. You can edit it by hand or use the [desktop app](docs/app.md).
 
-<img src="assets/screenshots/groups.png" alt="Dash showing three sync groups across four sessions, all synchronized" width="900">
-
-> ✨ Want to support Autobahn? Want to use Autobahn free of AGPLv3?
->
-> ✨ Simply donate to the [Justice-in-Education Initiative](docs/donations.md).
-
-## The Problem
-
-- Browsing files over SSH or NFS is clunky.
-- Agents that run `--dangerously` should do it in a VM elsewhere, but you can't use your local tools.
-- Some sync tools require gigs of RAM for big trees, or a cloud account, or both.
-
-Solution: keep everything in sync so editing local files is the same as editing remote ones.
-
-## Why Autobahn
-
-- **Fast as hell.** Delivers sub-30ms propagation times for small-file updates across trees containing hundreds of thousands of files.
-- **Lightweight.** Employs immutable shared-tree structures in memory, requiring significantly less RAM and idle CPU than conventional sync daemons.
-- **Safe.** Choose a sync policy per group that matches your risk profile backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
-- **Reviewed to death.** GLM 5.3, KIMI 3, Astra, and Fable were used to perform correctness and secuirty reviews.
-- **Privacy first.** No cloud service, no account, no third party.
-
-## Quick Start
-
-After you [install Autobahn](INSTALL.md) you need to set up your configuration. By default, the configuration is written to `~/.autobahn/config.toml`. You can edit it by hand or use [Dash](docs/app.md).
-
-Each group connects one root, the primary, to one or more destinations, the replicas. Sync can be one-way, bidirectional, or P2P (experimental.)
+Each group connects one root, the primary, to one or more destinations, the replicas. Sync can be one-way, bidirectional (see [Sync Modes](#sync-modes) below.) For full configuration details, read see [Configuration](docs/configuration.md).
 
 ```toml
 # ~/.autobahn/config.toml
 
 [defaults]
 mode = "two-way-conflict"                   # sync modes explained below
-ignores = ["file:Essential.gitignore"]      # written by `autobahn init`
+ignores = ["file:Essential.gitignore"]      # you can include ignores by file
+                                            # or written explicitly
+                                            # this one is from ~/.autobahn/ignores/
 
 [groups.work]
 primary = "~/Workspace"
@@ -59,14 +88,13 @@ primary = "~/Workspace"
 replicas = ["/Volumes/Backup/Workspace"]    #  - local paths work too
 ```
 
-```sh
-autobahn watch              # monitor every session as a one off
-autobahn install            # or install as a login service
-```
+Finally, run `autobahn install` to install the login service or run `autobahn watch` to keep a sync running until Ctrl-C.
+
+Make sure you can connect to your remotes with your [SSH configuration](docs/ssh.md) too!
 
 ## Sync Modes
 
-Autobahn has several sync modes with different resolution strsategies.
+Autobahn has several sync modes with different resolution strategies.
 
 Start with `two-way-conflict` for editing on both sides. It propagates changes in either direction and reports competing edits for you to resolve.
 
@@ -92,7 +120,7 @@ Autobahn began as an effort to reduce the memory use of [Mutagen](https://mutage
 | Small-file edit, Chromium, 1 editor, p50 | **23.8 ms** | 6,232.2 ms | 261.9× |
 | Small-file edit, 50k subset, 10 editors, p50 | **13.4 ms** | 1,809.8 ms | 135.1× |
 | Peak controller memory, Chromium, 1 editor | **479 MiB** | 2,081 MiB | 4.3× |
-| Idle controller CPU, Chromium | **0.1% of a core** | 49.9% | rounded values |
+| Idle controller CPU, Chromium | **0.1% of a core** | 49.9% | >300× |
 | First sync, Chromium | **228.1 s** | 454.8 s | 2.0× |
 
 See [Benchmarks](docs/benchmarks.md) for details.
@@ -117,9 +145,9 @@ See [Safety](docs/safety.md) for guarantees and the related invariants in [Corre
 
 In addition to the standard CLI, several user interfaces are available:
 
-- **[Dash](docs/app.md):** Experimental desktop window.
-- **[Menu bar item](docs/tray.md):** Status light and a menu without need for the full app.
-- **[Terminal UI](docs/shop.md):** Interactive curses-based console monitor (`autobahn shop`).
+- **[Desktop App](docs/app.md):** Experimental desktop window.
+- **[Menu Bar Item](docs/tray.md):** Status light and a menu without need for the full app.
+- **[Terminal UI](docs/shop.md):** Interactive curses-based console monitor (`autobahn mi`).
 - **[Alert Hooks](docs/alerts.md):** Event notification script support (`on_alert`).
 
 ```toml
@@ -130,7 +158,7 @@ None of this has undergone nearly the same level of testing as `autobahn` itself
 
 ## AI Disclaimer
 
-This project was heavily vibe coded, and with great vibe coding comes great responsibility. So I have: scanned every line in this repo, run extensive soak testing, used Autobahn myself for weeks, had guardrail-free models run security scans, and put it through thousands of benchmark runs. Most of the internal documentation was first drafted by LLMs. Please forgive the lingering Claudeisms.
+This project was heavily vibe coded, and with great vibe coding comes great responsibility. As such, I have scanned every line in this repo, run extensive soak testing, used Autobahn myself for weeks, had guardrail-free models run security scans, and put it through thousands of benchmark runs. While all of the documentation was drafted by LLMs, I've rewritten much of it. Please forgive any lingering Claudeisms.
 
 ## Contributing
 
@@ -165,14 +193,14 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 - [Benchmark Results](docs/benchmarks.md)
 - [Full Benchmark Matrix](docs/benchmark-matrix.md)
 - [Invariants](docs/correctness/invariants.md)
-- [Accepted risks](docs/correctness/accepted-risks.md)
+- [Accepted Risks](docs/correctness/accepted-risks.md)
 - [Development Guide](docs/development.md)
 - [Release Process](docs/releases.md)
-- [Roadmap and proposals](docs/wishlist.md)
+- [Roadmap and Proposals](docs/wishlist.md)
 
 ## System Requirements & Limitations
 
-- **Supported Platforms:** Linux (`x86_64`, `aarch64`) and macOS (`Apple Silicon`).
+- **Supported Platforms:** Linux (`x86_64`, `aarch64`) and macOS (Intel and Apple Silicon). The desktop apps are Apple Silicon only.
 - **Filesystems:** Requires local POSIX filesystems. Network filesystems (NFS, SMB, CIFS) receive best-effort support only.
 - **Editor Saves on macOS:** On macOS, atomic save operations (write-temporary and rename) lack immediate completion events from the kernel, occasionally requiring an extra polling cycle compared to Linux. Details are available in [Architecture](docs/architecture.md).
 
@@ -180,5 +208,5 @@ This project was heavily vibe coded, and with great vibe coding comes great resp
 
 Autobahn is dual licensed: `AGPL-3.0-or-later OR LicenseRef-Commercial`.
 
-- **[AGPL-3.0-or-later](LICENSE)**: free for any use with copy left caveats
-- **[Donor's](DONOR-LICENSE.md)** [donate to Justice-In-Education](docs/donations.md) to use Autobahn free of GPL
+- **[AGPL-3.0-or-later](LICENSE)**: free for any use with copyleft caveats
+- **[Donate to Justice-in-Education](docs/donations.md)** to use Autobahn free of the AGPL

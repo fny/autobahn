@@ -4,13 +4,15 @@ This document describes the distribution architecture, release validation pipeli
 
 ## Distributed Artifact Components
 
-A standard release publishes three independent artifacts:
+A standard release publishes these artifacts:
 
 | Artifact | Source Target | Destination Path |
 | :-- | :-- | :-- |
 | **Controller Executable** | `cargo build --profile dist` | `~/.local/bin/autobahn` |
 | **Remote Agents Bundle** | `scripts/build-agents.sh` | `~/.autobahn/agents/` |
 | **macOS Menu Bar App** | `apps/tray/build.sh` | `/Applications/Autobahn Tray.app` |
+| **macOS Desktop App** | `apps/app/build.sh` | `/Applications/Autobahn.app` |
+| **Linux Desktop App** | `cargo build --features app` | wherever you extract it |
 
 ## Release Pipeline Architecture
 
@@ -101,6 +103,8 @@ xcrun notarytool store-credentials autobahn \
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job builds and signs everything macOS on one runner: the two command-line binaries, signed and notarised by `apps/tray/notarize-cli.sh`, and both apps — the window as `Autobahn-macos-aarch64.zip` and the menu bar one as `Autobahn-Tray-macos-aarch64.zip`. Each is notarised on its own submission, because a ticket is stapled to one bundle.
 
+The `app-linux` job builds the window app for Linux on native `x86_64` and `aarch64` runners, as `Autobahn-linux-x86_64.tar.gz` and `Autobahn-linux-aarch64.tar.gz`. These are unsigned, since Linux has nothing like Gatekeeper, but they are in `SHA256SUMS` with everything else, so the minisign signature covers them.
+
 The job builds everything first — the binaries and both bundles — and checks that each `Info.plist` reports the tag's version. Only then does it import the certificate and sign with `release.sh --sign-only`, so no dependency's build script or proc macro ever runs while the identity is usable.
 
 It is the only job holding the certificate, and it uses the protected `release` environment, which must hold five secrets:
@@ -121,7 +125,7 @@ The certificate can sign anything as you, so it is kept where it can do the leas
 
 If the certificate ever leaks, revoke it in your Apple Developer account.
 
-Both apps are Apple Silicon only; the command-line binaries cover Intel as well. A command-line binary cannot be stapled, so Gatekeeper checks its notarisation online the first time it runs. The runner's default Xcode may be older than 26, whose `actool` is the only one that compiles the Icon Composer bundle; the job picks Xcode 26 when the runner has it, and otherwise `build.sh` uses the committed `assets/autobahn.icns`, the same icon without the macOS 26 variants.
+On macOS, both apps are Apple Silicon only; the command-line binaries cover Intel as well. A command-line binary cannot be stapled, so Gatekeeper checks its notarisation online the first time it runs. The runner's default Xcode may be older than 26, whose `actool` is the only one that compiles the Icon Composer bundle; the job picks Xcode 26 when the runner has it, and otherwise `build.sh` uses the committed `assets/autobahn.icns`, the same icon without the macOS 26 variants.
 
 ## See Also
 
@@ -129,5 +133,5 @@ Both apps are Apple Silicon only; the command-line binaries cover Intel as well.
 - [Commands](./commands.md#manage-the-service-and-updates): Service management and updates
 - [Development](./development.md): Local builds and required checks
 - [State](./state.md): Agent bundles, deployment, and compatibility epochs
-- [Menu bar item](./tray.md): The standalone tray app
-- [Dash](./app.md#download): Desktop app downloads and release channels.
+- [Menu Bar Item](./tray.md): The standalone tray app
+- [Desktop App](./app.md#download): Desktop app downloads

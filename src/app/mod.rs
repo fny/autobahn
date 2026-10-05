@@ -219,7 +219,7 @@ fn open_window(
             // with its difference already read — the only way a picture
             // of either is taken without a hand on the mouse.
             //
-            // Split before the window is built, because `Dash::new`
+            // Split before the window is built, because `AutobahnApp::new`
             // reads the fleet once, and `conflicts:diff` has to be
             // true by then or that first reading passes it by.
             let asked = pane.as_deref().map(|pane| match pane.split_once(':') {
@@ -230,7 +230,7 @@ fn open_window(
                 .as_ref()
                 .is_some_and(|(_, section)| section.as_deref() == Some("diff"));
             let dash = cx.new(|cx| {
-                let mut dash = Dash::new(config, state_root, speaks, first_diff, cx);
+                let mut dash = AutobahnApp::new(config, state_root, speaks, first_diff, cx);
                 if let Some((pane, section)) = asked.as_ref() {
                     let (pane, section) = (pane.as_str(), section.as_deref());
                     dash.pane = match pane {
@@ -375,7 +375,7 @@ impl SearchableListItem for Choice {
 type Choices = SelectState<SearchableVec<Choice>>;
 
 /// What the window is showing.
-pub struct Dash {
+pub struct AutobahnApp {
     config: Option<PathBuf>,
     /// The face anything a person compares is set in.
     mono: SharedString,
@@ -628,7 +628,7 @@ fn said_by_a_panic(panic: Box<dyn std::any::Any + Send>) -> String {
     }
 }
 
-impl Dash {
+impl AutobahnApp {
     fn new(
         config: Option<PathBuf>,
         state_root: PathBuf,
@@ -668,7 +668,7 @@ impl Dash {
         // uninformative way, so the window opens on the one pane that can
         // explain why.
         let ready = surface::installed();
-        let mut dash = Dash {
+        let mut dash = AutobahnApp {
             config,
             mono: SharedString::from(mono.to_owned()),
             state_root,
@@ -898,7 +898,7 @@ impl Dash {
     }
 }
 
-impl Render for Dash {
+impl Render for AutobahnApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let pane = self.pane;
         let room = Room::of(window);
@@ -937,7 +937,7 @@ impl Render for Dash {
     }
 }
 
-impl Dash {
+impl AutobahnApp {
     fn rail(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let waiting = self.waiting();
         let running = self.report.as_ref().map(|report| report.supervisor_running);
@@ -1533,7 +1533,7 @@ impl Dash {
     }
 }
 
-impl Dash {
+impl AutobahnApp {
     /// What a pane needs read before it is looked at.
     fn settle(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         match pane {
@@ -2801,7 +2801,11 @@ impl Dash {
                         cx.notify();
                     })),
             )
-            .children(note.map(|note| div().text_size(px(11.)).text_color(rgb(FAINT)).child(note)))
+            // The loader's own words, often a path or a parse error naming
+            // a line and column. Drawn through `said` like every other
+            // complaint, so it can be selected and pasted rather than
+            // retyped off the screen.
+            .children(note.map(|note| said("welcome-note", note.as_ref(), FAINT, 11.)))
             .into_any_element()
     }
 

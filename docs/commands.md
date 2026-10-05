@@ -75,14 +75,13 @@ autobahn uninstall         # stop it and unregister it
 A running supervisor performs the same checks on configuration edits. With live reload enabled, edits require no restart. An upgrade requires a restart.
 
 ```sh
-
 autobahn update            # install the latest release over this one
 autobahn update --dry-run  # ...or just say what it would install
 ```
 
-See [Configuration](./configuration.md) for service installation and [Releases](./releases.md) for updates.
+See [Releases](./releases.md) for how updates work.
 
-## What `status` shows
+## What `status` Shows
 
 After a session works for five seconds, `status` shows its phase, elapsed time, and available progress:
 
@@ -155,7 +154,7 @@ Version 3 added `config_notice`, present while the supervisor rejects a configur
 
 `--filter` applies to JSON. `--depth` affects the list display only.
 
-Session alerts receive this same document. Configuration-refusal alerts receive the notice object described in [Alerts](./alerts.md). The [terminal interface](./shop.md), [Dash](./app.md) and [the menu bar item](./tray.md) use status data.
+Session alerts receive this same document. Configuration-refusal alerts receive the notice object described in [Alerts](./alerts.md). The [terminal interface](./shop.md), [Desktop App](./app.md) and [the menu bar item](./tray.md) use status data.
 
 ## One-off Syncs and Scripting
 
@@ -196,8 +195,8 @@ One-off runs share session state with the supervisor for the same roots. Deletio
 - [Configuration](./configuration.md): Configuration files, groups, and session settings
 - [Conflicts](./conflicts.md): The `issues`, `conflicts`, `diff`, and `resolve` commands
 - [State](./state.md): Session baselines, cleanup, and stored files
-- [Logging and diagnostics](./logging.md): Log locations and verbosity controls
-- [Terminal interface](./shop.md): Interactive session control with `autobahn mi`
-- [Dash](./app.md): Session control through the desktop app
+- [Logging and Diagnostics](./logging.md): Log locations and verbosity controls
+- [Terminal Interface](./shop.md): Interactive session control with `autobahn mi`
+- [Desktop App](./app.md): Session control through the desktop app
 - [Alerts](./alerts.md): Notifications and custom hooks
-- [Releases](./releases.md): Updates, release contents, and signature verification.
+- [Releases](./releases.md): Updates, release contents, and signature verification

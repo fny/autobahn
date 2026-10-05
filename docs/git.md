@@ -10,7 +10,7 @@ To carry the history, do not exclude `.git` wholesale. The patterns that must co
 # ~/.autobahn/config.toml
 
 [groups.work]
-mode  = "two-way-conflict"
+mode = "two-way-conflict"
 primary = "~/Workspace"
 replicas = ["dev@build.audi.de:/home/dev/workspace"]
 ignores = [
@@ -57,4 +57,4 @@ git config worktree.useRelativePaths true
 - [Ignores](./ignores.md): Pattern syntax, ignore files, and precedence
 - [Configuration](./configuration.md): Group definitions and ignore settings
 - [Modes](./modes.md): Direction and conflict policies for synchronized checkouts
-- [Conflicts](./conflicts.md): How to inspect and resolve competing changes.
+- [Conflicts](./conflicts.md): How to inspect and resolve competing changes

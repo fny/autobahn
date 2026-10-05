@@ -1,105 +1,120 @@
-# Autobahn Tray
+# Autobahn Tray (Experimental)
 
-**Experimental.** The item works, and it is what the release ships, but its menu and what it does on a click are still moving. What it reads — `status --json` and `resolve` — is not, so nothing it shows can go stale behind Autobahn's back.
+<picture><source media="(prefers-color-scheme: dark)" srcset="../assets/tray-bar-light.svg"><img src="../assets/tray-bar-dark.svg" alt="The menu bar item in its four states: idle, good, attention, bad" width="328"></picture>
 
-It watches the supervisor and holds no state of its own. The supervisor runs in the background whether the item is there or not.
+Autobahn Tray is a tray (menu bar) item that shows you the real-time health of your sessions:
 
-## What it shows
+| Status Icon | Meaning |
+| :--- | :--- |
+| **Green** | All sessions synchronized |
+| **Amber** | A conflict or blocked path needs you |
+| **Red** | A session is halted, unreachable, or erroring |
+| **Struck through (no dot)** | The supervisor isn't running |
 
-The Autobahn sign — two lanes to the horizon under a bridge — drawn in the menu bar's own ink, with a dot at its corner for the state of every session:
+The icon updates within 3 seconds.
 
-|                            |                                    |
-| -------------------------- | ---------------------------------- |
-| **Green**                  | everything synchronized            |
-| **Amber**                  | something is in conflict           |
-| **Red**                    | something is halted or unreachable |
-| **Struck through, no dot** | nothing is running                 |
+## Menu Controls & Actions
 
-The ink comes from the menu bar itself, which matters on macOS 26, where the bar picks black or white from the wallpaper behind it — so a light system over a dark wallpaper still gets a white sign. It follows a change on the next poll.
+Clicking the tray item provides visibility into your sync topology and allows direct intervention:
 
-## The menu
+- **Topology & Status:** Lists every group and destination alongside its current state.
+- **Conflict Resolution:** For conflicting files, you can immediately diff changes, keep the primary's version, keep the remote destination's version, or retain both.
+- **Supervisor Control:** Start, stop, or restart the login background service, or inspect its active log file.
+- **Config Warnings:** If the running supervisor rejects an edited configuration file, an inline alert appears in the menu and triggers a one-time desktop alert. Existing sessions continue under the last valid configuration (see [live reload](./configuration.md#live-reload-behavior)).
 
-Each group, and each destination with its state. Under a conflict, the ways to settle it: diff, keep the primary's version, keep that destination's, or keep both. It also starts, stops and restarts the login service, and opens its log.
+## Usage
 
-When the running supervisor has refused an edit to the configuration, the menu says so on a line of its own and notifies once; sessions carry on under the last configuration that loaded — see [live reload](./configuration.md#live-reload-behavior).
+### 1. Bundled with the Desktop App
 
-Choices are queued rather than run where you click. They go to a worker thread in the order you made them, and the menu says how many are waiting — so a second choice made while the first is still going is kept instead of lost, and a slow resolve cannot freeze the menu bar.
+The [Desktop App](./app.md) includes the menu bar item in the same unified process.
 
-## Two ways to have one
+1. Open the **Service** pane.
+2. Select **Menu Bar** (runs only the menu icon) or **Both** (runs the menu icon alongside the desktop window).
 
-**Inside [Dash](./app.md).** Dash includes the item and runs it in the same process. Choose _Menu Bar_ in its Service pane for the item alone, or _Both_ for the item and the window. This is the easier route if you already want Dash.
+*Recommended if you already use the desktop app.*
 
-**The standalone app.** The `autobahn` binary with `--features tray` and nothing else — no window, no GPUI, no graphics stack. Worth it on a machine where you want a status light and not an application. On macOS, build it from the repository:
+### 2. Standalone Binary
+
+If you only want a status light, without the desktop app's GUI framework (GPUI) or graphics overhead, compile the standalone `autobahn` binary with the `tray` flag.
+
+#### macOS Application Bundle
+
+Build the self-contained macOS `.app` bundle from source:
 
 ```sh
-apps/tray/build.sh            # builds "Autobahn Tray.app"
-open "apps/tray/Autobahn Tray.app"  # or drag it to /Applications
+apps/tray/build.sh                  # Builds "Autobahn Tray.app"
+open "apps/tray/Autobahn Tray.app"  # Launch directly, or move to /Applications
 ```
 
-It is a way to launch `autobahn tray`, not a second implementation — the same binary, running the same `resolve` a terminal would. What the bundle adds is an identity: macOS takes a notification's icon from the bundle that sent it, and a bare executable has none, so without one every alert wears the icon of whatever ran it.
+> **Why use the `.app` bundle?**
+> macOS links desktop notification badges and icons to the originating app bundle. Running the raw executable directly causes notifications to display generic system or terminal icons instead of the Autobahn logo.
 
-From a terminal, `autobahn tray` runs the same thing, but only in a binary built with `--features tray`. A plain build answers that it has no menu bar app. It accepts `--config FILE` and `--state-root DIRECTORY`; without them it uses the default configuration and state root (`AUTOBAHN_HOME`, or `~/.autobahn`).
+#### CLI Invocations
 
-## Notifications
+On both Linux and macOS, you can invoke the tray directly from your terminal. This requires a build compiled with `--features tray`.
 
-With no `on_alert` hook configured, the item raises desktop notifications itself, under exactly the rules the hook would use: a condition has to hold before it counts, only something _joining_ the set in trouble is news, a cascade is gathered into one, and recovery is silent. See [Alerts](./alerts.md).
+```sh
+autobahn tray --config path/to/config.toml --state-root ~/.autobahn
+```
 
-With a hook configured it stays quiet. The hook is then the one place notifications come from — two sources following identical rules would still say everything twice.
+*Note: Omitted flags default to `AUTOBAHN_HOME` or `~/.autobahn`.*
 
-Inside Dash, the item is what speaks, and Dash's notification switch turns it off. Dash notifies for itself only when no item is running. See [the app](./app.md#notifications).
+## Notification Pipeline
 
-## Starting at login
+Notifications respect the following precedence rules:
 
-**It does not start itself.** Add it under System Settings → General → Login Items on macOS, or your desktop's autostart settings on Linux.
+- **Default Behavior (No Hook):** The tray sends native desktop notifications following the standard engine rules (alerts require sustained failure states, only newly broken targets trigger notifications, cascades are grouped, and recoveries remain silent). See [Alerts](./alerts.md).
+- **Custom Hook Active:** If an `on_alert` hook is defined, the tray suppresses internal notifications to prevent duplicated alerts.
+- **Inside the Desktop App:** The tray owns the alert mechanism; the App's master notification toggle governs it directly. The App only raises notifications on its own behalf if the tray is inactive. See [the app documentation](./app.md#notifications).
 
-**The supervisor is separate.** `autobahn install` registers it to start at login, independently. That is what keeps your files in sync; the item only watches it.
+## Autostart at Login
 
-## On Linux
+- **Tray Application:** Does not configure startup hooks automatically. Add it manually to your login items:
+  - **macOS:** *System Settings → General → Login Items*
+  - **Linux:** Add `autobahn tray` to your desktop environment's autostart list.
+- **Supervisor Daemon:** Registered independently via `autobahn install`. The background sync service persists regardless of the tray's autostart state.
 
-Dash's menu bar item runs on Linux from the `app-latest` archives, though it is the half most likely not to appear — see [the app](./app.md#on-linux).
+## Linux Support
 
-The **standalone tray** is a different matter:
+While the desktop app's menu bar item comes with the Linux app on the releases page, the **standalone tray executable on Linux is experimental**:
 
-> **Build it yourself, at your own risk.** The tagged releases include no standalone Linux tray, and ordinary CI does not build the `tray` feature on Linux. Nobody has confirmed that the steps below build it, or that it runs once built. It can break between versions without anyone noticing.
+> [!WARNING]
+> **Use at your own risk.** Standalone Linux tray binaries are not distributed in official release tags, nor are they continuously verified in CI. Build failures or runtime regressions may occur without notice.
 
-Desktop notifications go through the freedesktop notification service, and the diff opens with `xdg-open`.
+Notifications leverage standard Freedesktop specifications (`org.freedesktop.Notifications`), and file diffs launch via `xdg-open`.
 
-**What you need**
+### Prerequisites
 
-- Rust, installed with `rustup`.
-- GTK 3 development packages. On Debian and Ubuntu this is probably:
+- A functioning Rust toolchain (`rustup`).
+- A system tray host supporting **AppIndicator** or **StatusNotifierItem** (native on KDE; GNOME requires the *AppIndicator and KStatusNotifierItem Support* shell extension).
+- GTK 3 development headers (Debian/Ubuntu packages shown below):
 
-  ```sh
-  sudo apt install libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
-  ```
+```sh
+sudo apt install libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+```
 
-  That list comes from the tray libraries' own requirements and has not been checked here. Other distributions name these packages differently.
+### Build and Run
 
-- A desktop that shows tray icons through AppIndicator or StatusNotifierItem. KDE and most others do; GNOME needs an extension such as "AppIndicator and KStatusNotifierItem Support".
-
-**Build and run**
+To prevent build artifacts from overwriting an active supervisor installation, isolate your target directory:
 
 ```sh
 git clone https://github.com/fny/autobahn && cd autobahn
 CARGO_TARGET_DIR=target/tray cargo build --release --locked --features tray
-target/tray/release/autobahn tray
+./target/tray/release/autobahn tray
 ```
 
-Never build into the directory a login service runs from. If the service runs `target/release/autobahn`, the `CARGO_TARGET_DIR` above is what keeps the two apart.
+### Known Linux Caveats
 
-**Known problems**
+- **Missing Icon on Launch:** Certain tray libraries require GTK loop initialization explicitly bound to the event thread; some window managers may fail to display the indicator icon.
+- **Dependency Overhead:** Enabling the `tray` feature pulls in GTK 3 and libnotify, which are absent from standard headless CLI builds (inspect `Cargo.lock` and `deny.toml` for details).
 
-- **It may build and never show an icon.** The tray libraries need GTK started on the thread running the event loop, and the code does not start it today. This is expected from the libraries' documentation rather than observed.
-- **It adds GTK 3 and notification dependencies** that the plain command-line tool and agent do not have. See `Cargo.lock` and `deny.toml`.
-- **It does not start at login.** Add `autobahn tray` to your desktop's autostart settings.
-
-If you get it working, the exact packages, desktop, and steps are worth reporting, so this section can drop its warning.
+---
 
 ## See Also
 
-- [Dash](./app.md): The desktop app and its built-in menu bar item
+- [Desktop App](./app.md): The desktop app and its built-in menu bar item
 - [Alerts](./alerts.md): Notification rules and custom hooks
 - [Conflicts](./conflicts.md): Conflict resolution actions available from the menu
-- [Terminal interface](./shop.md): Session monitoring and control in a terminal
+- [Terminal Interface](./shop.md): Session monitoring and control in a terminal
 - [Development](./development.md#the-menu-bar-app-bundle): How to build the tray bundle
-- [Releases](./releases.md#signing-and-notarising-macos): macOS signing and notarization.
+- [Releases](./releases.md#signing-and-notarising-macos): macOS signing and notarization

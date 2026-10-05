@@ -1,26 +1,22 @@
-# Builds the app for people to try, on a push to main that touches it.
-# Eight minutes across three runners in parallel, so it finishes inside
-# the time CI takes anyway and never delays anything. Runner time is
-# free on a public repository, so there is nothing to save by asking
-# for it, and a channel that always matches main cannot go stale
-# without anybody noticing — which is what the branch it used to watch
-# did.
+# Builds the app on a push to main that touches it, so a change that
+# breaks the app's build shows up then rather than when a tag is cut:
+# ordinary CI tests the app's library code (ci.yml's features-app) but
+# does not build its binary. Eight minutes across three runners in
+# parallel, so it finishes inside the time CI takes anyway and never
+# delays anything. Runner time is free on a public repository.
 #
-# Separate from release.yml, which ships the command on a tag and signs
-# and notarises everything. Nothing here is signed: these are builds to
-# hand to a tester, and the macOS one needs the quarantine bit cleared
-# before it will open. The release workflow is where signing belongs,
-# and this will fold into it when the app is ready to ship.
+# Nothing here is published. release.yml ships the app on a tag, signed
+# and notarised, and that is the one people download. Each build is kept
+# as a workflow artifact, for when a build between releases is wanted;
+# it is unsigned, so the macOS one needs the quarantine bit cleared
+# before it will open:
+#
+#     xattr -dr com.apple.quarantine "Autobahn.app"
 #
 # Three platforms, each built natively rather than cross-compiled: GPUI
 # links against the system's graphics and font libraries, and a sysroot
 # good enough to cross-compile that is more work than a second runner.
 # aarch64 Linux runners are free on public repositories.
-#
-# The result is one prerelease, `app-latest`, moved to each new build —
-# so there is always one link to send somebody, and it is always the
-# newest. A prerelease because it is exactly that, and because it keeps
-# these builds out of the way of the real releases.
 name: App
 
 on:
@@ -36,12 +32,9 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
-# One build at a time per branch. Without this, two pushes in the eight
-# minutes a build takes leave two `publish` jobs racing to delete and
-# recreate the same release — which is not one operation, so the loser
-# can leave `app-latest` short a platform or without its tag.
+# One build at a time per branch: a newer push makes the older build moot.
 concurrency:
   group: app-${{ github.ref }}
   cancel-in-progress: true
@@ -112,11 +105,11 @@ jobs:
             cmake \
             clang
 
-      # Lints here rather than in ci.yml: the app's half of the tree is
-      # gpui-kit, which ordinary CI never compiles, so linting it there
-      # would make every push pay for a dependency only this workflow
-      # builds. One platform is enough — the lint is the same on all
-      # three, and the other two would only repeat it.
+      # Lints here rather than in ci.yml: ci.yml compiles gpui-kit only to
+      # test the library, and a lint there would build it a second time,
+      # in clippy's mode, on every push. One platform is enough — the
+      # lint is the same on all three, and the other two would only
+      # repeat it.
       - name: Lints
         if: matrix.platform == 'linux-x86_64'
         run: cargo clippy --release --locked --all-targets --features app -- -D warnings
@@ -174,52 +167,3 @@ jobs:
           path: autobahn-app-${{ matrix.platform }}.*
           if-no-files-found: error
 
-  publish:
-    name: Publish app-latest
-    needs: build
-    # A platform that failed should not stop the ones that worked from
-    # reaching the person waiting to try them.
-    if: always() && !cancelled()
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/download-artifact@v8
-        with:
-          path: downloaded
-          merge-multiple: true
-
-      - name: What was built
-        run: ls -la downloaded
-
-      - name: Move app-latest to this build
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          cd downloaded
-          sha256sum * > SHA256SUMS
-          # The notes are written outside `downloaded/`, because the upload
-          # below is `./*` and they are the release's body, not a download.
-          {
-            echo "Unsigned builds of the app, from \`${GITHUB_SHA:0:7}\` on \`$GITHUB_REF_NAME\`."
-            echo "Built $(date -u '+%Y-%m-%d %H:%M UTC')."
-            echo
-            echo "**macOS** — unzip, then clear the quarantine bit before it will open:"
-            echo
-            echo '    xattr -dr com.apple.quarantine "Autobahn.app"'
-            echo
-            echo "**Linux** — untar and run \`./autobahn-app\`. Needs a Vulkan driver,"
-            echo "either Wayland or X11, and the shared libraries the build links against:"
-            echo
-            echo "    sudo apt install libgtk-3-0 libayatana-appindicator3-1 libxdo3 libvulkan1"
-            echo
-            echo "The \`autobahn\` command is a separate download and is not in here. The"
-            echo "app offers to install it on first run if it cannot find one."
-          } > "$RUNNER_TEMP/notes.md"
-          # Deleting and recreating, rather than editing, so the asset list
-          # never mixes this build's files with the last one's.
-          gh release delete app-latest --yes --cleanup-tag 2>/dev/null || true
-          gh release create app-latest ./* \
-            --title "Dash (latest build)" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            --prerelease \
-            --target "$GITHUB_SHA"

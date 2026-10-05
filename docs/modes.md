@@ -84,4 +84,4 @@ When a Primary syncs concurrently to multiple Replicas, each pair runs an indepe
 - [Safety](./safety.md): Safeguards for file changes and deletions
 - [Ignores](./ignores.md#interaction-between-ignores-and-deletions): How ignore rules interact with deletions
 - [Limitations](./limitations.md#one-supervisor-per-folder): The one-supervisor requirement for shared folders
-- [P2P](./p2p.md): Experimental leadership failover between hosts.
+- [P2P](./p2p.md): Experimental leadership failover between hosts

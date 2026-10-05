@@ -1,6 +1,6 @@
-# Benchmark: Autobahn vs mutagen
+# Benchmark: Autobahn vs Mutagen
 
-The latest recorded comparison measures Autobahn v1.0.0 against mutagen 0.19.0-dev.
+The latest recorded comparison measures Autobahn 1.0.0 prerelease (0.4.0) against mutagen 0.19.0-dev.
 
 The [matrix](./benchmark-matrix.md#provenance--build-metadata) identifies the measured builds. These results do not establish the performance of later commits.
 
@@ -14,10 +14,10 @@ The [aggregate](../benchmarks/2026-10-02.json) contains every published figure. 
 | Small-file edit, 50k subset, 10 editors, p50 | **13.4 ms** | 1,809.8 ms | 135.1× |
 | Large-file patch, Chromium, 1 editor, p50 | **33.1 ms** | 7,575.9 ms | 228.9× |
 | Peak controller memory, Chromium, 1 editor | **479 MiB** | 2,081 MiB | 4.3× |
-| Idle controller CPU, Chromium, 1 editor | **0.1% of a core** | 49.9% | rounded measurements |
+| Idle controller CPU, Chromium, 1 editor | **0.1% of a core** | 49.9% | >300× |
 | First sync, Chromium, one destination | **228.1 s** | 454.8 s | 2.0× |
 
-Memory is the median of per-run peak RSS during the workload. It is controller-side process-tree memory, including transport children, not the sum of both hosts. The idle CPU values are rounded to a tenth of a percentage point, so a precise speedup ratio would be misleading.
+Memory is the median of per-run peak RSS during the workload. It is controller-side process-tree memory, including transport children, not the sum of both hosts. The idle CPU values are rounded to a tenth of a percentage point. At 0.1% that rounding is half the value, so dividing gives anywhere from 332× to 999× and a precise figure would be invented. The table states the floor.
 
 ## Methodology
 
@@ -49,7 +49,7 @@ Some mutagen patch runs skipped many ticks. Slower completion reduced their achi
 
 ## Memory, CPU, and First Sync
 
-Controller memory depends on workload and topology. The Chromium small-file cell used 479 MiB. The later ten-destination Chromium patch cell used about 2.14 GiB.
+Controller memory depends on workload and topology. The Chromium small-file cell used 479 MiB. The later ten-destination Chromium patch cell used about 2.04 GiB.
 
 Neither figure defines a universal per-file cost. The matrix reports idle and workload resources for each host.
 
@@ -66,6 +66,6 @@ Cells used different machine groups. The fan-out result does not show that addin
 
 ## See Also
 
-- [Benchmark matrix](./benchmark-matrix.md): Complete measurements and build details
+- [Benchmark Matrix](./benchmark-matrix.md): Complete measurements and build details
 - [Architecture](./architecture.md): Scanning, change detection, and transfer design
-- [Development](./development.md#the-ab-gate): The benchmark harness and A/B comparisons.
+- [Development](./development.md#the-ab-gate): The benchmark harness and A/B comparisons

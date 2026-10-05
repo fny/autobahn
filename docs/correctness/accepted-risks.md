@@ -1,8 +1,8 @@
-# Accepted risks
+# Accepted Risks
 
 This document describes unresolved risks that limit [the invariants](./invariants.md). Each section explains what can go wrong, why the risk remains, when to reconsider it, and possible fixes.
 
-## 1. An unmounted disk can look like deleted files
+## 1. An Unmounted Disk Can Look Like Deleted Files
 
 **Risk.** Autobahn protects against missing mounts only when it previously recorded the path as a mount. If a disk is absent during the first scan, its mount directory looks like an ordinary empty directory.
 
@@ -28,7 +28,7 @@ The scanner can also ask the kernel whether each directory is a mount point, eve
 
 This reduces the risk to mounts that are absent whenever autobahn checks. No scan can distinguish a disk absent at every scan from an ordinary empty directory.
 
-## 2. A file can change after the last check
+## 2. A File Can Change After the Last Check
 
 **Risk.** Before autobahn replaces or removes an entry, it checks that the entry still matches the last scan. A program can save changes between that check and the operation. Autobahn catches and restores most such saves, but these cases remain:
 
@@ -65,7 +65,7 @@ These tests deliberately replace directories with links during the vulnerable wi
 
 **Possible fixes.** Autobahn can retain a replaced file for a few seconds and check it again before deletion. This can catch further writes through an open file. Content supply can also use the same directory walk as reads and moves.
 
-## 3. Network filesystems can hide changes
+## 3. Network Filesystems Can Hide Changes
 
 **Risk.** Autobahn warns at startup for NFS, SMB/CIFS, and FUSE roots. Support is best effort and assumes a single writer.
 
@@ -77,7 +77,7 @@ Attribute caches can hide another client's writes from both scans and checks bef
 
 **Possible fixes.** The first step is `fstat` after `open` on destructive paths. A further option is a mode that accounts for the mount type and disables digest reuse. Tests against a real NFS server are necessary before autobahn expands its support guarantees.
 
-## 4. Separate supervisors can write to the same folder
+## 4. Separate Supervisors Can Write to the Same Folder
 
 **Risk.** Autobahn supports [one supervisor per folder](../limitations.md#one-supervisor-per-folder), but it does not enforce that limit. Two configurations can pair the same folder with different endpoints. Each supervisor then writes to the shared folder using its own ancestor.
 
@@ -95,7 +95,7 @@ A full fix requires endpoint locks on every host, including agents. The protocol
 
 **Possible fix.** Advisory locks can use the resolved endpoint identity under the default state root of the endpoint host. Read-only primaries in one-way synchronization can use shared locks. Writable endpoints require exclusive locks. The existing pair lock can remain.
 
-## 5. Changed content can retain the same metadata
+## 5. Changed Content Can Retain the Same Metadata
 
 **Risk.** A scan reuses a recorded checksum if the file's modification time, size, inode, and type are unchanged (`src/scan/mod.rs`). A program can rewrite a file in place, keep its length, and restore its timestamp. All four values then match, so both full and incremental scans miss the changed content.
 
@@ -119,7 +119,7 @@ A systemd timer or launchd job can do the same. No new feature is necessary. An 
 
 Scheduled verification supports correctness for build output. It does not provide tamper detection or containment.
 
-## 6. P2P trusts every machine in the group
+## 6. P2P Trusts Every Machine in the Group
 
 **Risk.** P2P is dangerously experimental because its trust model gives every replica access to its peers. This access allows leadership to move between hosts.
 
@@ -147,4 +147,4 @@ The access restrictions exist and are documented. They remain off by default bec
 - [Limitations](../limitations.md): Supported environments and operational restrictions
 - [Configuration](../configuration.md): Deletion guards, mount handling, and host access policy
 - [Commands](../commands.md): The `verify` command for forced content reads
-- [P2P security](../p2p.md#security-boundaries--access-control): Restricted SSH keys and directory access controls.
+- [P2P Security](../p2p.md#security-boundaries--access-control): Restricted SSH keys and directory access controls

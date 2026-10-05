@@ -13,7 +13,7 @@ Configure verbosity via `~/.autobahn/config.toml` or override at runtime:
 
 ```toml
 # ~/.autobahn/config.toml
-log = "normal"  # "quiet" | "normal" (default) | "debug"
+log_level = "normal"  # "quiet" | "normal" (default) | "debug"
 ```
 
 ```sh
@@ -42,5 +42,5 @@ Autobahn automatically manages log rotation:
 - [Commands](./commands.md): Status inspection and session diagnostics
 - [Configuration](./configuration.md#top-level-settings): The `log_level` setting
 - [State](./state.md): Log locations and cleanup behavior
-- [Dash](./app.md): The Log pane
-- [Alerts](./alerts.md): Notifications for errors, conflicts, and recovery.
+- [Desktop App](./app.md): The Log pane
+- [Alerts](./alerts.md): Notifications for errors, conflicts, and recovery

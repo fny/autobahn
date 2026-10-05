@@ -1508,7 +1508,7 @@ mod menu_tests {
         };
         let warning = warning_of(&report, None).expect("a warning");
         assert!(
-            warning.line.starts_with("⚠ configuration refused:"),
+            warning.line.starts_with("⚠ configuration rejected:"),
             "{}",
             warning.line
         );

@@ -13,7 +13,7 @@ Enable it by specifying a p2p mode on the group:
 # ~/.autobahn/config.toml (on Primary controller)
 
 [groups.notes]
-mode  = "p2p-conflict-dangerously-experimental" # or p2p-primary-dangerously-experimental
+mode = "p2p-conflict-dangerously-experimental"  # or p2p-primary-dangerously-experimental
 primary = "~/Documents/Notes"                   # the coordinator
 replicas = [                                    # peers in designated failover order
   "laptop.bmw.de",
@@ -35,8 +35,6 @@ manage_keys    = true      # Automatically provisions restricted SSH keys
 ## Architectural Mechanics
 
 ### Lease-Based Write Fencing
-
-2.
 
 Leadership authority is established via a cryptographic lease file (`~/.autobahn/p2p/lease.json`) renewed each cycle:
 
@@ -102,8 +100,8 @@ The agent strictly rejects any connection requesting access to paths outside the
 
 ## See Also
 
-- [Accepted risks](./correctness/accepted-risks.md#6-p2p-trusts-every-machine-in-the-group): Peer trust and unresolved leadership collisions
+- [Accepted Risks](./correctness/accepted-risks.md#6-p2p-trusts-every-machine-in-the-group): Peer trust and unresolved leadership collisions
 - [Modes](./modes.md): Synchronization modes without leadership failover
 - [Configuration](./configuration.md): Mode settings and host access policy
 - [Safety](./safety.md): Synchronization safeguards and the host trust model
-- [Limitations](./limitations.md): Supported environments and operational restrictions.
+- [Limitations](./limitations.md): Supported environments and operational restrictions

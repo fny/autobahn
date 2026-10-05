@@ -2,7 +2,7 @@
   "provenance": {
     "date": "2026-10-02",
     "base_run": "bench-1790601586",
-    "base_commit": "e7b3ac0",
+    "base_commit": "6a23ace",
     "base_date": "2026-09-28",
     "updates": {
       "1790869509": [
@@ -18,16 +18,16 @@
       ]
     },
     "update_commits": {
-      "1790869509": "0c72865",
-      "1790873270": "0c72865",
-      "1790941679": "0c72865"
+      "1790869509": "fe4685a",
+      "1790873270": "fe4685a",
+      "1790941679": "fe4685a"
     },
     "update_dates": {
       "1790869509": "2026-10-01",
       "1790873270": "2026-10-01",
       "1790941679": "2026-10-02"
     },
-    "note": "One complete set: every cell, both tools. The five patch cells were re-run on 0c72865; the rest are the base run. Aggregated from the merged raw results, which are kept out of the repository. See docs/benchmark-matrix.md."
+    "note": "One complete set: every cell, both tools. The five patch cells were re-run on fe4685a; the rest are the base run. Aggregated from the merged raw results, which are kept out of the repository. See docs/benchmark-matrix.md."
   },
   "plan": {
     "jobs": 160,

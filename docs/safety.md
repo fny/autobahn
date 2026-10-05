@@ -72,7 +72,7 @@ Autobahn's safety invariants are verified through automated testing pipelines:
 - **Crash Point Enumeration:** The ancestor journal is truncated at every byte offset to ensure crash-recovery mechanisms consistently yield valid states.
 - **Fault-Injection & Mutation Testing:** Key validation checks in the source code are systematically disabled in mutation tests to confirm test suites detect the breakage.
 - **Schedule Interleaving Sweeps:** Multi-threaded randomized test runners simulate race conditions between scanner invalidations and file transitions.
-- **Formal Independent Security Audits:** What they found is fixed, or written down in [accepted risks](./correctness/accepted-risks.md).
+- **Independent Model Reviews:** Reviews by several AI models from different labs. What they found is fixed, or written down in [accepted risks](./correctness/accepted-risks.md).
 
 ## Operational Boundaries
 
@@ -90,8 +90,8 @@ Guarantees operate within explicit physical and software constraints:
 ## See Also
 
 - [Invariants](./correctness/invariants.md): Guarantees, implementation references, and tests
-- [Accepted risks](./correctness/accepted-risks.md): Unresolved risks and possible fixes
+- [Accepted Risks](./correctness/accepted-risks.md): Unresolved risks and possible fixes
 - [Limitations](./limitations.md): Supported environments and operational restrictions
 - [Modes](./modes.md): Conflict policies and deletion guards
 - [Conflicts](./conflicts.md): How to inspect and resolve preserved changes
-- [State](./state.md): Ancestor baselines and stored session data.
+- [State](./state.md): Ancestor baselines and stored session data

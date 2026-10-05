@@ -1,27 +1,28 @@
 #!/bin/sh
 
 # Quick and dirty notification script for autobahn alerts.
-# Use it directly or as a model for creating your own notification scripts.
-# Warning: this hasn't been tested extensively.
 #
-# Autobahn sets these variables before it runs this script:
+# Use it as is or as a model for creating your own notification scripts.
 #
-#   $AUTOBAHN_SUMMARY      one line that says what happened, or how many
-#   $AUTOBAHN_DETAIL       one indented line for each session that needs you
-#   $AUTOBAHN_ICON         the full path to Autobahn's icon
-#   $AUTOBAHN_STATES       the states involved, separated by commas
-#   $AUTOBAHN_ALERT_COUNT  how many sessions need you
-#   $AUTOBAHN_EVENT        "alert" the first time, "repeat" after that
+# Environment variables exported by Autobahn before execution:
 #
-# The login service runs with a short PATH and few environment variables.
-# So commands are written with their full path, and the bus address is
-# worked out below.
+#   $AUTOBAHN_SUMMARY      Single-line event summary or alert count
+#   $AUTOBAHN_DETAIL       Indented details for each session requiring action
+#   $AUTOBAHN_ICON         Absolute path to the Autobahn icon
+#   $AUTOBAHN_STATES       Comma-separated list of active states
+#   $AUTOBAHN_ALERT_COUNT  Number of sessions requiring attention
+#   $AUTOBAHN_EVENT        Trigger type ("alert" for initial, "repeat" for re-notifies)
+#
+# Execution context:
+#   Executed by login services under a minimal PATH and environment.
+#   Commands require full binary paths, and dynamic variables (like D-Bus)
+#   must be resolved manually.
 set -eu
 
 case "$(uname -s)" in
 Darwin)
-    # terminal-notifier can show a subtitle. Homebrew installs it in one
-    # of two places, depending on the chip.
+    # Try terminal-notifier (supports subtitles; path depends on Apple Silicon
+    # vs. Intel Homebrew)
     for notifier in \
         /opt/homebrew/bin/terminal-notifier \
         /usr/local/bin/terminal-notifier
@@ -34,10 +35,8 @@ Darwin)
             -message "$AUTOBAHN_SUMMARY"
     done
 
-    # osascript is built into macOS, so it is always there. It shows one
-    # line, and a click on it does nothing. The summary is passed as an
-    # argument, never as part of the AppleScript, because it can contain a
-    # file name that someone else chose.
+    # macOS fallback: osascript is always available. Pass summary as an argument
+    # to avoid injection vulnerabilities.
     exec /usr/bin/osascript \
         -e 'on run argv' \
         -e 'display notification (item 1 of argv) with title "autobahn"' \
@@ -45,16 +44,14 @@ Darwin)
         "$AUTOBAHN_SUMMARY"
     ;;
 Linux)
-    # notify-send reaches the desktop over the session bus. A service
-    # started by your own systemd gets the bus address. A service started
-    # by the system does not, so the address is built from your user id.
+    # Ensure D-Bus session bus address is set when executed under system-level
+    # daemon context
     if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
         DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
         export DBUS_SESSION_BUS_ADDRESS
     fi
     if command -v notify-send >/dev/null 2>&1; then
-        # The urgency is normal, not critical. A conflict needs attention
-        # today. It does not need a notification that never goes away.
+        # Send desktop notification using default (non-persistent) urgency
         exec notify-send \
             --app-name autobahn \
             --icon "$AUTOBAHN_ICON" \
@@ -64,6 +61,6 @@ Linux)
     ;;
 esac
 
-# There is no notifier, or this host has no desktop. The message goes to
-# standard error, which ends up in the log.
+# Fallback for headless environments, non-desktop hosts, or missing notification
+# binaries.
 echo "autobahn: $AUTOBAHN_SUMMARY" >&2

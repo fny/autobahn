@@ -628,6 +628,23 @@ fn run_with(
             speaks,
             cx,
         );
+        // A login service left running the wrong program is put right
+        // once, here, and the window says so. Not for a picture, and not
+        // when the command or the service is being stood in for: then
+        // what is registered on this machine is not this run's to touch.
+        let stood_in = [surface::TOLD_WHERE, crate::service::TOLD_STATE]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some());
+        if shot.is_none() && !stood_in {
+            if let Some(said) = surface::mend_service() {
+                if let Some(desk) = cx.try_global::<Desk>().and_then(|desk| desk.0.upgrade()) {
+                    desk.update(cx, |desk, cx| {
+                        desk.said = Some(said);
+                        cx.notify();
+                    });
+                }
+            }
+        }
         if let Some(bar) = bar {
             cx.set_global(Menubar(bar));
             watch_the_bar(config.clone(), state_root.clone(), cx);

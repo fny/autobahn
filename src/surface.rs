@@ -1232,6 +1232,57 @@ pub(crate) fn serve_after_install(
     said
 }
 
+/// Whether a login service registered to run `executable` cannot be
+/// running the command: it names the app, which v1.0.0 registered in the
+/// command's place, or a file that is not there any more.
+///
+/// Deliberately no wider than that. A command kept under another name,
+/// or somewhere this window would not look, is somebody's own
+/// arrangement and is left alone.
+fn wrong_program(executable: &std::path::Path) -> bool {
+    executable
+        .file_name()
+        .is_some_and(|name| name == "autobahn-app")
+        || !runnable(executable)
+}
+
+/// Points a login service that runs the wrong program at the command,
+/// starts it, and says so. `None` when there was nothing to mend.
+///
+/// Start at login in v1.0.0 registered `autobahn-app watch`. Whoever
+/// switched it on there still has that registration after updating the
+/// app: a service file names one path, and nothing rewrites it but an
+/// install. So the app looks when it opens. The arguments and the state
+/// root are kept; only the program changes.
+pub(crate) fn mend_service() -> Option<String> {
+    let registered = crate::service::registration().ok()??;
+    if !wrong_program(&registered.executable) {
+        return None;
+    }
+    let command = found()?;
+    if wrong_program(&command) {
+        return None;
+    }
+    let was = tilde(&registered.executable.display().to_string());
+    let mended = crate::service::retarget(&command).and_then(|()| crate::service::restart());
+    Some(match mended {
+        Ok(()) => fill(
+            "service.mended",
+            &[
+                ("was", was.as_str()),
+                ("now", &tilde(&command.display().to_string())),
+            ],
+        ),
+        Err(error) => fill(
+            "service.not_mended",
+            &[
+                ("was", was.as_str()),
+                ("error", &first_line(&format!("{error:#}"))),
+            ],
+        ),
+    })
+}
+
 /// Runs one of the command's own subcommands and says what it said.
 ///
 /// The window does the small things itself, through the library; the
@@ -1649,6 +1700,24 @@ impl Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The app, or nothing at all, is not the command; the command is,
+    /// wherever it is kept.
+    #[test]
+    fn a_service_that_runs_the_app_or_a_missing_file_is_wrong() {
+        use std::os::unix::fs::PermissionsExt;
+        let keep = tempfile::tempdir().expect("a temporary directory");
+        let program = |name: &str| {
+            let path = keep.path().join(name);
+            std::fs::write(&path, "#!/bin/sh\n").expect("written");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("executable");
+            path
+        };
+        assert!(!wrong_program(&program("autobahn")));
+        assert!(wrong_program(&program("autobahn-app")));
+        assert!(wrong_program(&keep.path().join("gone")));
+    }
 
     /// A file with no experimental table gets one under the name the
     /// section has now.

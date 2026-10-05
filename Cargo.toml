@@ -1,6 +1,6 @@
 [package]
 name = "autobahn"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 description = "Fast, safe, SSH-focused bidirectional file synchronization"
 license = "AGPL-3.0-or-later OR LicenseRef-Commercial"

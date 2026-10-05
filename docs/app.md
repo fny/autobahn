@@ -7,7 +7,7 @@ The desktop app, `Autobahn.app`, is an easy way to manage your sync sessions. If
 Download the app from the [releases page](https://github.com/fny/autobahn/releases).
 
 - **macOS (Apple Silicon):** `Autobahn-macos-aarch64.zip`. Unzip it and open `Autobahn.app`. It's signed and notarized, so it opens without any extra steps.
-- **Linux (`x86_64` or `aarch64`):** `Autobahn-linux-x86_64.tar.gz` or `Autobahn-linux-aarch64.tar.gz`. Extract it and run `./autobahn-app`. You need a graphical session (Wayland or X11) and a Vulkan driver. On Ubuntu or Debian, this installs the libraries it uses: `sudo apt install libgtk-3-0 libayatana-appindicator3-1 libxdo3 libvulkan1`. It's built on Ubuntu 24.04, so older distributions may be missing a new enough glibc.
+- **Linux (`x86_64` or `aarch64`):** `Autobahn-linux-x86_64.tar.gz` or `Autobahn-linux-aarch64.tar.gz`. Extract it and run `./autobahn-app`. You need a graphical session (Wayland or X11) and a Vulkan driver. On Ubuntu or Debian, this installs the libraries it uses: `sudo apt install libgtk-4-1 libvulkan1`. It's built on Ubuntu 24.04, so older distributions may be missing a new enough glibc.
 
 ## First Run
 

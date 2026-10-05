@@ -1,5 +1,36 @@
 # Commands
 
+## All Commands
+
+| Command | What It Does |
+| --- | --- |
+| `status` | Show the state of every session |
+| `start` | Start the login service |
+| `stop` | Stop the login service until the next login |
+| `restart` | Stop the login service and start it again |
+| `issues` | List everything that needs you |
+| `mi` | The shop |
+| `tray` | Run the menu bar app. Experimental |
+| `diff` | Show how the two sides of a file differ |
+| `resolve` | Settle conflicts by choosing which side to keep |
+| `agent` | Run as a sync agent. Autobahn starts this on remote hosts; it is not for you to run |
+| `clean` | Delete saved state for sessions that are no longer in the configuration |
+| `flush` | Sync now, without waiting |
+| `disable` | Turn off a group or a host in the configuration |
+| `enable` | Turn a group or a host back on |
+| `init` | Write a first configuration file |
+| `install` | Set up the login service and start it |
+| `uninstall` | Stop the login service and remove it |
+| `p2p` | P2P (experimental): connect to a leader, or hand the lead to another machine |
+| `doctor` | Inspect a group's sessions. Changes nothing |
+| `reset` | Forget what a group's sessions last synced |
+| `sync` | Sync two folders once |
+| `update` | Install the newest release |
+| `verify` | Check every file's content on the next cycle |
+| `watch` | Run every session in this terminal until you stop it |
+
+These are the lines `autobahn --help` prints. For a command's arguments and options, run `autobahn <command> --help`, or `-h` for a short version.
+
 ## Create a Configuration
 
 ```sh
@@ -17,31 +48,32 @@ An existing configuration requires `--force` to replace it. The command keeps th
 These commands work with a foreground `watch` supervisor or the login service:
 
 ```sh
-autobahn status            # what every session is doing, or last did
-autobahn status work       # ...filtered to one group
-autobahn status .          # ...to whatever syncs the working directory
+autobahn status            # the state of every session
+autobahn status work       # ...for one group
+autobahn status .          # ...for the group that syncs this folder
 autobahn status ~/Workspace  # ...or any folder inside a synchronized root
-autobahn status --conflicts   # list every conflicting path, not a count
-autobahn status --live     # ...repainting, as it happens (Ctrl-C leaves)
+autobahn status --conflicts   # list every path in conflict, not just a count
+autobahn status --live     # ...kept up to date as it happens (Ctrl-C leaves)
 autobahn status --json     # the same, as one versioned document
 
-autobahn sync              # one pass over every session, then exit
-autobahn flush             # sync everything right now
-autobahn doctor project    # look, change nothing: both sides, how they
+autobahn sync              # sync every session once, then exit
+autobahn flush             # sync now, without waiting
+autobahn doctor project    # inspect, change nothing: both sides, how they
                            # differ, the baseline, and what a reset would do
-autobahn reset project     # forget the baseline; next cycle merges both
-                           # sides additively (resurrects deletions)
-autobahn verify project    # next cycle re-reads every byte, catching
-                           # content whose metadata never moved
-autobahn clean --dry-run   # what state belongs to sessions no longer
-autobahn clean             # in the config; then remove it
-autobahn clean --agents    # also prune superseded agents on remote hosts
+autobahn reset project     # forget what the group last synced; the next
+                           # cycle merges both sides and only adds
+                           # (deleted files come back)
+autobahn verify project    # next cycle checks every file's content, to
+                           # catch changes whose metadata stayed the same
+autobahn clean --dry-run   # show the saved state of sessions that are no
+autobahn clean             # longer in the config; then delete it
+autobahn clean --agents    # also remove old agents on remote hosts
 
 autobahn mi                # the shop: watch it work, and clear the queue
                            # (? explains every word on the screen)
 ```
 
-`reset` requires a group name and discards its baseline. The next cycle merges both sides additively, which can restore deleted files.
+`reset` requires a group name and forgets its baseline. The next cycle merges both sides and only adds, so deleted files can come back.
 
 Before a reset, run `doctor`. It scans both sides and reports whether they match and what a reset will copy. It changes neither the folders nor the baseline and can run beside the supervisor. If both sides match, a reset requires no copies.
 
@@ -50,10 +82,10 @@ See [State](./state.md) for `clean` and [Conflicts](./conflicts.md) for conflict
 ## Disable and Enable Synchronization
 
 ```sh
-autobahn disable --host lager    # off everywhere it appears
-autobahn enable  --host lager
-autobahn disable --group lack    # the whole group, sessions and all
-autobahn enable  --group lack
+autobahn disable --host lager    # turn the host off in every group
+autobahn enable  --host lager    # turn it back on
+autobahn disable --group lack    # turn the whole group off
+autobahn enable  --group lack    # turn it back on
 ```
 
 These commands edit `~/.autobahn/config.toml` and preserve comments. A host enters or leaves `disabled_hosts`. A group gains or loses `disabled = true`.
@@ -63,11 +95,11 @@ An unknown name produces an error with valid names. Disabling preserves session 
 ## Manage the Service and Updates
 
 ```sh
-autobahn install           # register the supervisor as a login service
-autobahn start             # start the registered service
-autobahn stop
-autobahn restart
-autobahn uninstall         # stop it and unregister it
+autobahn install           # set up the login service and start it
+autobahn start             # start the login service
+autobahn stop              # stop it until the next login
+autobahn restart           # stop it and start it again
+autobahn uninstall         # stop it and remove it
 ```
 
 `start` and `restart` validate the configuration before changing the service. They reject unknown keys, unsupported modes, and groups without sessions. If validation fails, the service remains unchanged.
@@ -75,7 +107,7 @@ autobahn uninstall         # stop it and unregister it
 A running supervisor performs the same checks on configuration edits. With live reload enabled, edits require no restart. An upgrade requires a restart.
 
 ```sh
-autobahn update            # install the latest release over this one
+autobahn update            # install the newest release
 autobahn update --dry-run  # ...or just say what it would install
 ```
 

@@ -92,20 +92,20 @@ const HELP_STYLES: clap::builder::Styles = clap::builder::Styles::styled()
     .literal(clap::builder::styling::Style::new().bold())
     .placeholder(clap::builder::styling::Style::new());
 
-/// Fast, safe, SSH-focused bidirectional file synchronization.
+/// Keep folders in sync between machines, over SSH.
 #[derive(Parser)]
 #[command(
     name = "autobahn",
     version,
-    about,
     styles = HELP_STYLES,
     disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
-    /// Run `watch`, `sync`, `resolve`, `install` or `start` as root, which
-    /// is refused otherwise (as is `experimental.allow_root = true`).
+    /// Allow `watch`, `sync`, `resolve`, `install` and `start` to run as
+    /// root. They refuse otherwise. `experimental.allow_root = true` in the
+    /// configuration does the same.
     #[arg(long, global = true)]
     allow_root: bool,
 }
@@ -113,15 +113,16 @@ struct Cli {
 /// The p2p verbs.
 #[derive(Subcommand)]
 enum P2pVerb {
-    /// Bridge standard input and output to the leading supervisor's attach
-    /// socket. The primary runs this over SSH on a replica that leads; it is
-    /// not for typing.
+    /// Connect standard input and output to the leading supervisor.
+    ///
+    /// The primary runs this over SSH on a replica that leads. It is not
+    /// meant to be typed.
     Attach {
-        /// The attach socket (default: the p2p directory's).
+        /// The attach socket. Defaults to the one in the p2p directory.
         #[arg(long)]
         socket: Option<PathBuf>,
     },
-    /// Hand the lead to a peer: `primary`, or a replica's spec.
+    /// Hand the lead to another machine: `primary`, or a replica's spec.
     Yield {
         /// Who leads next.
         #[arg(long)]
@@ -135,23 +136,24 @@ enum P2pVerb {
 /// The synchronization mode, as expressed on the command line.
 #[derive(Clone, Copy, ValueEnum)]
 enum ModeArgument {
-    /// Both directions; a file changed on both sides is a conflict,
+    /// Sync both ways. A file changed on both sides is a conflict: it is
     /// reported and left alone.
     #[value(name = "two-way-conflict")]
     TwoWaySafe,
-    /// Both directions; a file changed on both sides takes the primary's
-    /// version, silently.
+    /// Sync both ways. A file changed on both sides takes the primary's
+    /// version, with no report.
     #[value(name = "two-way-primary")]
     TwoWayResolved,
-    /// two-way-primary, and the primary's deletion of a file replica edited wins too.
+    /// Like two-way-primary. The primary's delete also wins over an edit on
+    /// the replica.
     #[value(name = "two-way-primary-strict")]
     TwoWayStrict,
-    /// Primary to the replica; a change replica made itself is kept and reported as a
-    /// conflict.
+    /// Copy from the primary to the replica. A change made on the replica
+    /// is kept and reported as a conflict.
     #[value(name = "one-way-conflict")]
     OneWaySafe,
-    /// Primary to the replica; the replica becomes an exact copy, its own changes
-    /// discarded.
+    /// Copy from the primary to the replica. The replica becomes an exact
+    /// copy, and its own changes are thrown away.
     #[value(name = "one-way-primary", alias = "mirror")]
     OneWayMirror,
 }
@@ -171,11 +173,11 @@ impl From<ModeArgument> for SyncMode {
 /// The symbolic link mode, as expressed on the command line.
 #[derive(Clone, Copy, ValueEnum)]
 enum SymlinkModeArgument {
-    /// Symbolic links are invisible to synchronization.
+    /// Skip symbolic links.
     Ignore,
-    /// Only portable symbolic links (relative, within the root) synchronize.
+    /// Sync only portable links: relative ones that stay inside the root.
     Portable,
-    /// Symbolic links synchronize verbatim.
+    /// Sync symbolic links exactly as they are.
     Raw,
 }
 
@@ -191,452 +193,495 @@ impl From<SymlinkModeArgument> for SymlinkMode {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Show the recorded status of every configured session, grouped by
-    /// group (optionally filtered by group and host).
+    /// Show the state of every session.
+    ///
+    /// Sessions are listed by group. Name a group, or a group and a host,
+    /// to see fewer.
     Status {
-        /// The configuration file (defaults to
-        /// ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
-        /// Filter to a group, by its name or by its folder — an absolute
-        /// path, a `~` path, or `.` for the working directory. A folder
-        /// inside a synchronized root selects the group that covers it,
-        /// so `autobahn status .` answers "what syncs where I am?".
+        /// Show one group. Give its name or its folder: an absolute path, a
+        /// `~` path, or `.` for the folder you are in. A folder inside a
+        /// synchronized root selects the group that covers it, so `autobahn
+        /// status .` answers "what syncs where I am?".
         group: Option<String>,
-        /// Filter to a destination host (or local replica path) within the
-        /// group.
+        /// Show one destination in the group: a host, or a local replica
+        /// path.
         host: Option<String>,
-        /// List every conflicting path rather than a count and an example.
+        /// List every path in conflict, not just a count and one example.
         #[arg(long)]
         conflicts: bool,
-        /// Repaint continuously instead of printing once, showing every
-        /// session's phase as it happens. A read-only window onto the
-        /// running supervisor; `watch` is the same display, but it also
-        /// does the synchronizing. Ctrl-C leaves.
+        /// Keep the display up to date instead of printing once. It shows
+        /// what each session is doing as it happens. It only reads from the
+        /// running supervisor; `watch` shows the same display and also does
+        /// the syncing. Ctrl-C leaves.
         #[arg(long)]
         live: bool,
-        /// Print the report as JSON — the same document every user
-        /// interface reads.
+        /// Print the report as JSON. Every user interface reads this same
+        /// document.
         #[arg(long)]
         json: bool,
-        /// Show every destination in full, including groups that are all
-        /// synchronized (which otherwise take one line each).
+        /// Show every destination in full. Without this, a group that is
+        /// fully synchronized takes one line.
         #[arg(long)]
         all: bool,
     },
-    /// Start the installed login service. With none installed, this
-    /// refuses and points at `install` (or `watch`, to run here instead).
+    /// Start the login service.
+    ///
+    /// If no service is installed, this refuses and points you to
+    /// `install`, or to `watch` to run in this terminal.
     Start,
-    /// Stop the login service. It stays registered and returns at the next
-    /// login; `uninstall` makes it stay gone.
+    /// Stop the login service until the next login.
+    ///
+    /// The service stays registered, so it starts again at the next login.
+    /// Use `uninstall` to remove it for good.
     Stop,
-    /// Stop and start the login service — after an upgrade, or after a
-    /// configuration edit when the configuration sets `live_reload = false`.
+    /// Stop the login service and start it again.
+    ///
+    /// Use this after an upgrade. Use it after a configuration edit too,
+    /// when the configuration sets `live_reload = false`.
     Restart,
-    /// Everything that needs you: conflicts, blocked paths, and halts,
-    /// grouped by cause with the command that clears each one.
+    /// List everything that needs you.
+    ///
+    /// That is conflicts, blocked paths and halts. They are grouped by
+    /// cause, and each one comes with the command that clears it.
     #[command(alias = "conflicts")]
     Issues {
-        /// A group name, or a folder (`.`, an absolute path, a `~` path)
-        /// inside a synchronized root. Omit for every group.
+        /// A group name, or a folder inside a synchronized root: `.`, an
+        /// absolute path, or a `~` path. Leave it out for every group.
         selector: Option<String>,
-        /// The root-relative path to look under, when the selector was a
-        /// group or a folder. Scopes the listing to that subtree.
+        /// Look only under this path. It is relative to the root, and it is
+        /// for when the selector is a group or a folder.
         path: Option<String>,
-        /// Filter to a destination within the group.
+        /// Only this destination in the group.
         #[arg(long)]
         host: Option<String>,
-        /// Roll conflicts up to this many path segments and show a count
-        /// for each: `--depth 1` lists the top-level folders in conflict.
+        /// Group conflicts by their first N path segments and show a count
+        /// for each. `--depth 1` lists the top-level folders in conflict.
         #[arg(long, value_name = "N")]
         depth: Option<usize>,
         /// Show only conflicts whose path matches. A pattern with no glob
-        /// characters matches anywhere in the path, case-insensitively
-        /// (`--filter fahrwerk`); one with them is a glob, anchored to the
-        /// root when it contains a slash and matched at any depth when it
-        /// does not (`--filter '*.ts'`, `--filter 'fahrwerk/**'`).
+        /// characters matches anywhere in the path, ignoring case
+        /// (`--filter fahrwerk`). A pattern with glob characters is a glob:
+        /// with a slash it is matched from the root, and without one it is
+        /// matched at any depth (`--filter '*.ts'`, `--filter
+        /// 'fahrwerk/**'`).
         #[arg(long, value_name = "PATTERN")]
         filter: Option<String>,
-        /// Print as JSON: the status report, restricted to sessions in
+        /// Print as JSON: the status report, with only the sessions in
         /// conflict.
         #[arg(long)]
         json: bool,
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
     /// The shop.
+    ///
+    /// A playful live view of your sessions, in the terminal. Experimental.
     Mi {
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Run the menu bar app: an icon whose colour is the state of every
-    /// session, a menu with the detail, and the ways to settle each
-    /// conflict. Experimental. Built with the `tray` feature.
+    /// Run the menu bar app. Experimental.
+    ///
+    /// The color of its icon shows the state of every session. Its menu
+    /// shows the detail, and the ways to settle each conflict. It needs a
+    /// build with the `tray` feature.
     Tray {
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
     /// Show how the two sides of a file differ.
     ///
-    /// The file may be named by a filesystem path inside a synchronized
-    /// root (`autobahn diff ./src/main.rs`), or by group and root-relative
-    /// path (`autobahn diff project src/main.rs`). With several
-    /// destinations, name one with --host; otherwise each is shown.
+    /// Name the file by its path inside a synchronized root (`autobahn diff
+    /// ./src/main.rs`), or by its group and its path from the root
+    /// (`autobahn diff project src/main.rs`). When a group has several
+    /// destinations, name one with --host. Otherwise each one is shown.
     Diff {
-        /// A group name, or a path — to the file itself, or to a folder
+        /// A group name, or a path: to the file itself, or to a folder
         /// inside a synchronized root.
         selector: String,
-        /// The root-relative path, when the selector was a group or folder.
+        /// The path from the root, when the selector is a group or a
+        /// folder.
         path: Option<String>,
-        /// The destination to compare against (defaults to every one).
+        /// The destination to compare with. Defaults to every one.
         #[arg(long)]
         host: Option<String>,
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Resolve conflicts by choosing which side's version wins.
+    /// Settle conflicts by choosing which side to keep.
     ///
-    /// The winner is named by what `status` calls it: `primary`, or a
-    /// destination's host (or local path). Its content is put on the primary and
-    /// every other destination, so one command settles a conflict across
-    /// a whole fan-out. `both` keeps the winner in place and renames the
-    /// other side's version aside as `<name>.<side>` before propagating.
+    /// Name the winner the way `status` does: `primary`, or a destination's
+    /// host or local path. The winner's content is put on the primary and
+    /// on every other destination, so one command settles a conflict across
+    /// a whole group. `both` keeps the winner in place, and first renames
+    /// the other side's version to `<name>.<side>`.
     ///
-    /// Resolution makes the sides agree; the next cycle records the
-    /// agreement and the conflict is gone. Nothing here touches the
-    /// ancestor.
+    /// Resolving makes the sides agree. The next cycle records that they
+    /// agree, and the conflict is gone. Nothing here changes the ancestor.
     Resolve {
-        /// A group name, or a path — to the conflicting file itself, or to a
-        /// folder inside a synchronized root.
+        /// A group name, or a path: to the file in conflict, or to a folder
+        /// inside a synchronized root.
         selector: String,
-        /// The root-relative paths, when the selector was a group or
-        /// folder. Several may be given; each losing side is then read once
-        /// for all of them rather than once per path.
+        /// The paths from the root, when the selector is a group or a
+        /// folder. You can give several. Each losing side is then read once
+        /// for all of them, not once per path.
         paths: Vec<String>,
-        /// Whose version wins: `primary`, a destination host or path, or
+        /// Which side wins: `primary`, a destination host or path, or
         /// `both`.
         #[arg(long)]
         keep: String,
-        /// Resolve every conflict in the selected sessions the same way.
+        /// Settle every conflict in the selected sessions the same way.
         #[arg(long)]
         all: bool,
-        /// Do not ask. Resolution overwrites a file someone edited, on
-        /// every destination in the group, so it asks first by default.
+        /// Do not ask first. Resolving overwrites a file someone edited, on
+        /// every destination in the group, so it asks by default.
         #[arg(long, short = 'y')]
         yes: bool,
-        /// Filter to a destination within the group.
+        /// Only this destination in the group.
         #[arg(long)]
         host: Option<String>,
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Run as a synchronization agent on standard input/output (invoked on
-    /// remote hosts by the sync command; not intended for interactive use).
+    /// Run as a sync agent. Autobahn starts this on remote hosts; it is not
+    /// for you to run.
     ///
-    /// The protocol it speaks is autobahn's own and changes between
-    /// releases without notice — every agent must be the controller's
-    /// exact version, which the controller enforces. It is not an API,
-    /// and nothing but autobahn should drive it.
+    /// It talks over standard input and output. The protocol is Autobahn's
+    /// own and changes between releases without notice. Every agent must be
+    /// the exact version of its controller, and the controller checks this.
+    /// It is not an API, and nothing but Autobahn should drive it.
     Agent,
-    /// What a restricted key runs: the agent, `p2p attach`, or a signed
-    /// install, as `SSH_ORIGINAL_COMMAND` asks — nothing else. Set as the
-    /// forced command of a p2p key in `authorized_keys`.
+    /// Run what a restricted SSH key is allowed to run.
+    ///
+    /// That is the agent, `p2p attach`, or a signed install, as
+    /// `SSH_ORIGINAL_COMMAND` asks. Nothing else. Set this as the forced
+    /// command of a p2p key in `authorized_keys`.
     #[command(hide = true)]
     Gate,
-    /// Remove state left behind by sessions the configuration no longer
-    /// describes: their ancestors, status records, staged content, and
-    /// endpoint locks. State for a running session is never touched, and
-    /// the files in the synchronized trees are never touched by anything.
+    /// Delete saved state for sessions that are no longer in the
+    /// configuration.
+    ///
+    /// That is their ancestors, status records, staged content and endpoint
+    /// locks. State for a running session is never touched. The files in
+    /// your synchronized folders are never touched by anything here.
     Clean {
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
-        /// Show what would be removed without removing it.
+        /// Show what would be removed, and remove nothing.
         #[arg(long)]
         dry_run: bool,
-        /// Also remove staged content this machine holds *as an agent* for
-        /// sessions driven from other machines, when it has not been
-        /// touched for this many days. Such content is a transfer cache
-        /// whose owner cannot be identified from here, so it is left alone
-        /// unless asked.
+        /// Also remove staged content that this machine holds as an agent
+        /// for sessions run from other machines, when it has not been
+        /// touched for this many days. That content is a transfer cache,
+        /// and its owner cannot be known from here, so it is left alone
+        /// unless you ask.
         #[arg(long, value_name = "DAYS")]
         agent_staging_older_than: Option<u64>,
-        /// Also remove superseded agent binaries from the remote hosts this
-        /// configuration names. Agents are installed per version and
-        /// nothing has ever removed them, so a host accumulates one ~5 MB
-        /// binary per version it has ever been contacted by. Off by
-        /// default: everything else here is local, and this reaches out
-        /// over SSH to every configured host.
+        /// Also remove old agent binaries from the remote hosts in this
+        /// configuration. Agents are installed once per version and nothing
+        /// else removes them, so a host collects one binary of about 5 MB
+        /// for each version that has contacted it. Off by default:
+        /// everything else here is local, and this connects over SSH to
+        /// every configured host.
         #[arg(long)]
         agents: bool,
-        /// How many superseded agent binaries to leave on each host, so an
-        /// older controller reconnecting still finds its agent in place.
-        /// The version in use is always kept and does not count.
+        /// How many old agent binaries to leave on each host, so that an
+        /// older controller that reconnects still finds its agent. The
+        /// version in use is always kept and is not counted.
         #[arg(long, value_name = "N", default_value_t = 1)]
         keep_agents: usize,
-        /// Also remove the state of sessions the configuration describes
-        /// but has turned off. Kept by default, so enabling a group or a
-        /// host resumes where it left off rather than re-merging.
+        /// Also remove the state of sessions that are in the configuration
+        /// but turned off. It is kept by default, so that enabling a group
+        /// or a host continues where it stopped and does not merge again.
         #[arg(long)]
         include_disabled: bool,
-        /// Remove disabled sessions' state without asking.
+        /// Remove the state of disabled sessions without asking.
         #[arg(long, requires = "include_disabled")]
         yes: bool,
     },
-    /// Wake configured sessions in a running supervisor for an immediate
-    /// synchronization cycle.
+    /// Sync now, without waiting.
+    ///
+    /// This wakes sessions in a running supervisor so that they start a
+    /// cycle at once. Name a group, or a group and a host, to wake fewer.
     Flush {
-        /// Filter to a group.
+        /// Only this group.
         group: Option<String>,
-        /// Filter to a destination within the group.
+        /// Only this destination in the group.
         host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Turn a host or a group off in the configuration. A disabled host
-    /// drops from every group it appears in; a disabled group runs
-    /// nothing at all. Neither loses its state: enabling resumes.
+    /// Turn off a group or a host in the configuration.
+    ///
+    /// A disabled host is dropped from every group it is in. A disabled
+    /// group runs nothing at all. Neither loses its state: enabling it
+    /// continues from where it stopped.
     Disable {
-        /// The host to disable everywhere.
+        /// The host to turn off, in every group.
         #[arg(long, group = "target")]
         host: Option<String>,
-        /// The group to disable.
+        /// The group to turn off.
         #[arg(long, group = "target")]
         group: Option<String>,
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Turn a host or a group back on: the counterpart of `disable`.
+    /// Turn a group or a host back on.
+    ///
+    /// This undoes `disable`.
     Enable {
-        /// The host to enable.
+        /// The host to turn on.
         #[arg(long, group = "target")]
         host: Option<String>,
-        /// The group to enable.
+        /// The group to turn on.
         #[arg(long, group = "target")]
         group: Option<String>,
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
     },
-    /// Write a starting configuration: the defaults, every mode explained,
-    /// and one example group to edit. Refuses to replace one that exists.
+    /// Write a first configuration file.
+    ///
+    /// It holds the defaults, an explanation of every mode, and one example
+    /// group to edit. It refuses to replace a file that exists.
     Init {
-        /// Where to write it (defaults to ~/.autobahn/config.toml).
+        /// Where to write it. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Replace an existing configuration, keeping the old one beside it.
+        /// Replace an existing configuration. The old one is kept beside
+        /// it.
         #[arg(long)]
         force: bool,
     },
-    /// Register the supervisor as a login service — launchd on macOS, a
-    /// systemd user unit on Linux — and start it now. It then runs across
-    /// logouts and reboots, restarting if it exits, logging to
+    /// Set up the login service and start it.
+    ///
+    /// The supervisor is registered with launchd on macOS, or as a systemd
+    /// user unit on Linux. After that it keeps running across logouts and
+    /// reboots, and it is started again if it exits. It logs to
     /// ~/.autobahn/service.log.
     Install {
-        /// Bake this configuration file into the service (defaults to
-        /// ~/.autobahn/config.toml).
+        /// The configuration file the service will use. Defaults to
+        /// ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Bake this state root into the service (defaults to ~/.autobahn).
+        /// The state root the service will use. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Stop the login service and unregister it.
+    /// Stop the login service and remove it.
     Uninstall,
-    /// P2P (experimental): attach to a leader, or hand the lead on.
+    /// P2P (experimental): connect to a leader, or hand the lead to another
+    /// machine.
     P2P {
         #[command(subcommand)]
         verb: P2pVerb,
     },
-    /// A look at a group's sessions: what each side holds, how the two
-    /// differ, whether the baseline reads, what the next cycle would do,
-    /// and what a reset would do. Changes neither folder nor the baseline
-    /// (a scan refreshes its scan cache, as every scan does), and runs
-    /// beside a supervisor.
+    /// Inspect a group's sessions. Changes nothing.
+    ///
+    /// It shows what each side holds, how the two differ, whether the
+    /// baseline can be read, what the next cycle would do, and what a reset
+    /// would do. It changes neither folder, and it does not change the
+    /// baseline. (A scan updates its scan cache, as every scan does.) It
+    /// can run while a supervisor is running.
     Doctor {
-        /// The group to look at, by its name or by its folder.
+        /// The group to inspect. Give its name or its folder.
         group: String,
-        /// Filter to a destination within the group.
+        /// Only this destination in the group.
         host: Option<String>,
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Prints the baseline formats this build reads, for `autobahn update`
-    /// to ask a downloaded build before installing it.
+    /// Print the baseline formats this build can read.
+    ///
+    /// `autobahn update` asks a downloaded build this before it installs
+    /// it.
     #[command(hide = true)]
     Formats,
-    /// Reset sessions in a running supervisor: their synchronization
-    /// baselines are discarded, so the next cycle merges both sides
-    /// additively (resurrecting deletions). The group is required — a
-    /// reset is deliberate, never a default.
+    /// Forget what a group's sessions last synced.
+    ///
+    /// This throws away the sync baselines of sessions in a running
+    /// supervisor. The next cycle then merges both sides and only adds:
+    /// nothing is deleted, so files you deleted on one side come back. You
+    /// must name the group. A reset is always a choice, never a default.
     Reset {
         /// The group to reset.
         group: String,
-        /// Filter to a destination within the group.
+        /// Only this destination in the group.
         host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Synchronize two roots, each a local path or a remote specification.
+    /// Sync two folders once.
     ///
-    /// Either root accepts a local path or an scp-style remote specification
-    /// ([user@]host:path), which connects over SSH (installing the matching
-    /// agent on the remote host on first contact).
+    /// Each root is a local path, or a remote one written like scp:
+    /// [user@]host:path. A remote root is reached over SSH, and the
+    /// matching agent is installed on the remote host at first contact.
     Sync {
-        /// The primary synchronization root (a local path or [user@]host:path).
-        /// With no roots at all, every session in the configuration is
-        /// synchronized once instead.
+        /// The primary root: a local path or [user@]host:path. With no
+        /// roots at all, every session in the configuration is synced once.
         primary: Option<String>,
-        /// The replica synchronization root (a local path or [user@]host:path).
+        /// The replica root: a local path or [user@]host:path.
         replica: Option<String>,
-        /// The configuration file, for the no-roots form (defaults to
-        /// ~/.autobahn/config.toml).
+        /// The configuration file, when no roots are given. Defaults to
+        /// ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root, for the no-roots form (defaults to
-        /// ~/.autobahn).
+        /// The state root, when no roots are given. Defaults to
+        /// ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
-        /// The synchronization mode.
+        /// The sync mode.
         #[arg(long, value_enum, default_value = "two-way-conflict")]
         mode: ModeArgument,
-        /// Ignore patterns (gitignore-style; repeatable).
+        /// A pattern to ignore, written like a gitignore line. Can be
+        /// repeated.
         #[arg(long = "ignore")]
         ignores: Vec<String>,
-        /// Symbolic link handling: ignore, portable, or raw.
+        /// What to do with symbolic links: ignore, portable, or raw.
         #[arg(long, value_enum, default_value = "raw")]
         symlink_mode: SymlinkModeArgument,
-        /// Permission bits (octal) for created files (default 0600).
+        /// Permission bits, in octal, for files it creates. Defaults to
+        /// 0600.
         #[arg(long)]
         file_mode: Option<String>,
-        /// Permission bits (octal) for created directories (default 0700).
+        /// Permission bits, in octal, for directories it creates. Defaults
+        /// to 0700.
         #[arg(long)]
         directory_mode: Option<String>,
-        /// Keep running, synchronizing whenever content changes.
+        /// Keep running, and sync whenever content changes.
         #[arg(long)]
         watch: bool,
-        /// The polling interval, in seconds, used with --watch.
+        /// How often to check for changes, in seconds. Used with --watch.
         #[arg(long, default_value_t = 5)]
         interval: u64,
-        /// Override the session state directory (defaults to
-        /// ~/.autobahn/sessions/<session-id>).
+        /// The session's state directory. Defaults to
+        /// ~/.autobahn/sessions/<session-id>.
         #[arg(long)]
         state_dir: Option<PathBuf>,
-        /// Advanced: connect replica through this agent command (whitespace
-        /// split into argv) instead of SSH, treating REPLICA as the remote
-        /// root path. Used for testing and custom transports.
+        /// Advanced: reach the replica through this agent command instead
+        /// of SSH. The command is split on spaces, and REPLICA is then the
+        /// root path on the remote side. For testing and custom transports.
         #[arg(long)]
         replica_agent: Option<String>,
-        /// Advanced: connect primary through this agent command (whitespace
-        /// split into argv) instead of SSH, treating PRIMARY as the remote
-        /// root path. Used for testing and custom transports.
+        /// Advanced: reach the primary through this agent command instead
+        /// of SSH. The command is split on spaces, and PRIMARY is then the
+        /// root path on the remote side. For testing and custom transports.
         #[arg(long)]
         primary_agent: Option<String>,
     },
-    /// Install the latest release over this one: the command, and the
-    /// agent bundle the controller streams to remote hosts.
+    /// Install the newest release.
     ///
-    /// The bundle is refreshed before the login service restarts, so a
-    /// controller never comes back on a version whose agents it cannot
-    /// install. The binary and bundle it replaces are kept until the
-    /// service is confirmed running the new build, and restored if it is
-    /// not.
+    /// This replaces the command, and the agent bundle that the controller
+    /// sends to remote hosts. The bundle is updated before the login
+    /// service restarts, so a controller never comes back on a version
+    /// whose agents it cannot install. The old binary and bundle are kept
+    /// until the service is confirmed to run the new build, and they are
+    /// put back if it does not.
     Update {
-        /// Install this release rather than the latest stable one.
-        /// Prereleases are never picked up by default: a tester opts in
-        /// here by tag (`--version v0.5.0-dev.1`).
+        /// Install this release, not the latest stable one. Prereleases are
+        /// never chosen by default; a tester asks for one by tag
+        /// (`--version v0.5.0-dev.1`).
         #[arg(long, value_name = "TAG")]
         version: Option<String>,
-        /// Install the command here (defaults to ~/.local/bin, or
-        /// $AUTOBAHN_BIN_DIR).
+        /// Where to install the command. Defaults to ~/.local/bin, or
+        /// $AUTOBAHN_BIN_DIR.
         #[arg(long, value_name = "DIR", alias = "prefix")]
         bin_dir: Option<PathBuf>,
-        /// Leave the agent bundle alone. Only safe when every host you
-        /// synchronize with shares this machine's platform.
+        /// Leave the agent bundle alone. Only safe when every host you sync
+        /// with has the same platform as this machine.
         #[arg(long)]
         no_agents: bool,
-        /// Report what would be installed, and where, without changing
-        /// anything.
+        /// Say what would be installed, and where, and change nothing.
         #[arg(long)]
         dry_run: bool,
-        /// When the login service runs an executable other than the one
-        /// being updated, point it at the updated one instead of refusing.
+        /// When the login service runs a different executable from the one
+        /// being updated, point it at the updated one. Without this, the
+        /// update refuses.
         #[arg(long)]
         retarget: bool,
     },
-    /// Re-read every file's content on the sessions' next cycle, making
-    /// content that changed without its metadata moving (restored
-    /// timestamps, reproducible-build rewrites) visible and synchronized.
+    /// Check every file's content on the next cycle.
+    ///
+    /// This reads every file again on the sessions' next cycle. Content
+    /// that changed while its metadata stayed the same is then seen and
+    /// synced. That happens with restored timestamps and with reproducible
+    /// builds.
     Verify {
-        /// Filter to a group (defaults to every session).
+        /// Only this group. Defaults to every session.
         group: Option<String>,
-        /// Filter to a destination within the group.
+        /// Only this destination in the group.
         host: Option<String>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
     },
-    /// Run every configured session here, in this terminal, until
-    /// interrupted. On a terminal the display is a live `autobahn status`;
-    /// when the output is a file or a pipe, one line is logged per event.
+    /// Run every session in this terminal until you stop it.
     ///
-    /// The configuration fans groups of one local primary directory out to
-    /// any number of local or remote replicas; see the documentation for the
-    /// format. Sessions run in parallel, and a session whose destination is
-    /// unreachable backs off and heals automatically — it never blocks the
-    /// others. To keep this running when no terminal is, see `install`.
+    /// On a terminal, the display is a live `autobahn status`. When the
+    /// output goes to a file or a pipe, one line is logged per event.
+    ///
+    /// The configuration describes groups. Each group syncs one local
+    /// primary folder with any number of local or remote replicas; see the
+    /// documentation for the format. Sessions run at the same time. A
+    /// session that cannot reach its destination waits longer between tries
+    /// and recovers by itself, and it never blocks the others. To keep this
+    /// running with no terminal open, see `install`.
     Watch {
-        /// The configuration file (defaults to ~/.autobahn/config.toml).
+        /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
-        /// Override the state root (defaults to ~/.autobahn).
+        /// The state root. Defaults to ~/.autobahn.
         #[arg(long)]
         state_root: Option<PathBuf>,
-        /// In the live display, list every conflicting path rather than a
-        /// count and an example.
+        /// In the live display, list every path in conflict, not just a
+        /// count and one example.
         #[arg(long)]
         conflicts: bool,
-        /// Log one line per event even on a terminal, instead of the live
+        /// Log one line per event, even on a terminal, instead of the live
         /// display.
         #[arg(long)]
         log: bool,
-        /// Write the detail needed to explain a cycle after it has gone:
-        /// timings, what content was asked for and whether it arrived, and
-        /// what the supervisor decided next. Equivalent to `log = "debug"`
-        /// in the configuration, or `AUTOBAHN_LOG=debug`.
+        /// Log the detail needed to explain a cycle afterwards: timings,
+        /// what content was asked for and whether it arrived, and what the
+        /// supervisor decided next. The same as `log_level = "debug"` in
+        /// the configuration, or `AUTOBAHN_LOG=debug`.
         #[arg(long)]
         debug: bool,
     },

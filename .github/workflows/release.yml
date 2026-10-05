@@ -24,6 +24,11 @@ on:
 permissions:
   contents: read
 
+# Every binary built here names the commit it was built from, beside its
+# version: `autobahn --version`, and the app's Service page.
+env:
+  AUTOBAHN_COMMIT: ${{ github.sha }}
+
 jobs:
   # The tag is what names the agent on every remote host: the controller
   # runs ~/.autobahn/bin/autobahn-<package version>+e<epoch> and uploads an

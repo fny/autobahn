@@ -1171,6 +1171,159 @@ pub(crate) fn install(state_root: &std::path::Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Which build the command is, in its own words, and where it is.
+///
+/// The app and the command are two programs, installed and updated
+/// apart, so the app's own version says nothing about the command's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CommandBuild {
+    /// What `autobahn --version` prints after the name.
+    pub version: String,
+    pub path: PathBuf,
+}
+
+/// Asks the command which build it is. It runs the command, so it is
+/// asked once and again after an install or an update, not every frame.
+pub(crate) fn command_build() -> Option<CommandBuild> {
+    let path = found()?;
+    let output = std::process::Command::new(&path)
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|output| output.status.success())?;
+    let said = String::from_utf8_lossy(&output.stdout);
+    let said = said.trim();
+    Some(CommandBuild {
+        version: said.strip_prefix("autobahn ").unwrap_or(said).to_owned(),
+        path,
+    })
+}
+
+/// Which build the running supervisor is, as far as it can be asked.
+///
+/// A supervisor is the command as it was when the service last started
+/// it: updating the command changes the file and not the process.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SupervisorBuild {
+    /// Running, and this app's own version.
+    Same,
+    /// Running another version: the one it named, or one from before
+    /// supervisors could say.
+    Other(Option<String>),
+    /// Running, and not answering.
+    Silent,
+    /// Not running.
+    Absent,
+}
+
+/// Asks the running supervisor which build it is.
+pub(crate) fn supervisor_build(state_root: &std::path::Path) -> SupervisorBuild {
+    use crate::supervisor::control::Probe;
+    match crate::supervisor::control::probe(state_root) {
+        Probe::Answered(_) => SupervisorBuild::Same,
+        Probe::Mismatch(version) => SupervisorBuild::Other(version),
+        Probe::Unresponsive => SupervisorBuild::Silent,
+        Probe::Absent => SupervisorBuild::Absent,
+    }
+}
+
+impl SupervisorBuild {
+    /// The line for it under "this build".
+    pub(crate) fn said(&self) -> String {
+        match self {
+            SupervisorBuild::Same => fill(
+                "service.build_running",
+                &[("version", &crate::protocol::version())],
+            ),
+            SupervisorBuild::Other(Some(version)) => {
+                fill("service.build_running", &[("version", version)])
+            }
+            SupervisorBuild::Other(None) => t("service.build_older").to_owned(),
+            SupervisorBuild::Silent => t("service.build_silent").to_owned(),
+            SupervisorBuild::Absent => t("service.build_absent").to_owned(),
+        }
+    }
+
+    /// Its package version, when it is running and said one. An empty
+    /// one for a supervisor too old to say: it matches nothing.
+    fn package(&self) -> Option<String> {
+        match self {
+            SupervisorBuild::Same => Some(package(&crate::protocol::version()).to_owned()),
+            SupervisorBuild::Other(version) => {
+                Some(package(version.as_deref().unwrap_or_default()).to_owned())
+            }
+            SupervisorBuild::Silent | SupervisorBuild::Absent => None,
+        }
+    }
+}
+
+/// What to do when the app, the command and the supervisor are not one
+/// build.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Advice {
+    /// The command is older than the app: update it.
+    UpdateCommand,
+    /// The supervisor is not the command that is installed: restart it.
+    Restart,
+    /// The app is older than the command: get the newer app.
+    NewerApp,
+}
+
+impl Advice {
+    pub(crate) fn said(self) -> &'static str {
+        match self {
+            Advice::UpdateCommand => t("service.advice_update"),
+            Advice::Restart => t("service.advice_restart"),
+            Advice::NewerApp => t("service.advice_app"),
+        }
+    }
+}
+
+/// The package version inside a build's description: `1.0.0` out of
+/// `1.0.0+e1 (1941064)` and out of `1.0.0 (1941064)`.
+fn package(build: &str) -> &str {
+    let end = build
+        .find(|character: char| character == '+' || character.is_whitespace())
+        .unwrap_or(build.len());
+    &build[..end]
+}
+
+/// A package version's numbers, for telling older from newer.
+fn numbers(package: &str) -> Vec<u64> {
+    package
+        .split(|character: char| !character.is_ascii_digit())
+        .take_while(|part| !part.is_empty())
+        .filter_map(|part| part.parse().ok())
+        .collect()
+}
+
+/// What to do about the three builds, most useful first, or nothing.
+///
+/// An older command comes first: the update restarts the service
+/// itself, so it settles the supervisor too. Then a supervisor that is
+/// not the installed command, which a restart settles. Last an app
+/// older than its command, which only a download settles. Two builds of
+/// one version are not told apart here, because the supervisor names a
+/// version and no commit.
+pub(crate) fn advice(
+    app: &str,
+    command: Option<&CommandBuild>,
+    supervisor: &SupervisorBuild,
+) -> Option<Advice> {
+    let command = package(&command?.version);
+    let app = package(app);
+    if numbers(command) < numbers(app) {
+        return Some(Advice::UpdateCommand);
+    }
+    if supervisor
+        .package()
+        .is_some_and(|running| running != command)
+    {
+        return Some(Advice::Restart);
+    }
+    (numbers(command) > numbers(app)).then_some(Advice::NewerApp)
+}
+
 /// Runs one of the command's own subcommands and says what it said.
 ///
 /// The window does the small things itself, through the library; the
@@ -1588,6 +1741,45 @@ impl Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The command older than the app is updated; a supervisor that is
+    /// not the installed command is restarted; an app older than its
+    /// command is told so; and three of a kind are left alone.
+    #[test]
+    fn three_builds_that_differ_say_what_to_do() {
+        let command = |version: &str| CommandBuild {
+            version: version.to_owned(),
+            path: PathBuf::from("/usr/local/bin/autobahn"),
+        };
+        let other = |version: &str| SupervisorBuild::Other(Some(version.to_owned()));
+        let app = "1.0.1+e1 (a1b2c3d)";
+        let same = command("1.0.1 (a1b2c3d)");
+        assert_eq!(advice(app, Some(&same), &other("1.0.1+e1")), None);
+        assert_eq!(advice(app, Some(&same), &SupervisorBuild::Absent), None);
+        assert_eq!(advice(app, None, &other("0.9.0+e1")), None);
+        let old = command("1.0.0 (1941064)");
+        assert_eq!(
+            advice(app, Some(&old), &other("1.0.0+e1")),
+            Some(Advice::UpdateCommand)
+        );
+        assert_eq!(
+            advice(app, Some(&same), &other("1.0.0+e1")),
+            Some(Advice::Restart)
+        );
+        assert_eq!(
+            advice(app, Some(&same), &SupervisorBuild::Other(None)),
+            Some(Advice::Restart)
+        );
+        let new = command("1.10.0");
+        assert_eq!(
+            advice(app, Some(&new), &other("1.10.0+e2")),
+            Some(Advice::NewerApp)
+        );
+        assert_eq!(
+            advice(app, Some(&new), &other("1.0.1+e1")),
+            Some(Advice::Restart)
+        );
+    }
 
     /// A file with no experimental table gets one under the name the
     /// section has now.

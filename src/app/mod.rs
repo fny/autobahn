@@ -474,6 +474,12 @@ pub struct AutobahnApp {
     /// start and again after an install, because it is the answer to
     /// "is this window of any use yet".
     ready: bool,
+    /// Which build the command is. Asked when `ready` is, and again
+    /// after an update, since asking runs the command.
+    command_build: Option<surface::CommandBuild>,
+    /// Which build the running supervisor is. Asked while the service
+    /// pane is the one being looked at.
+    supervisor_build: surface::SupervisorBuild,
     /// Whether an install is running. The button it came from is not
     /// offered twice, and the log is what says how it is going.
     installing: bool,
@@ -716,6 +722,8 @@ impl AutobahnApp {
             knocked_at: None,
             shape: crate::config::schema(),
             said: None,
+            command_build: surface::command_build(),
+            supervisor_build: surface::SupervisorBuild::Absent,
         };
         dash.refresh();
         cx.spawn(async move |this, cx| {
@@ -812,6 +820,9 @@ impl AutobahnApp {
 
     fn refresh(&mut self) {
         self.read_at = Some(Instant::now());
+        if self.pane == Pane::Service {
+            self.supervisor_build = surface::supervisor_build(&self.state_root);
+        }
         let path = match &self.config {
             Some(path) => path.clone(),
             None => match crate::paths::default_config_path() {
@@ -1554,6 +1565,9 @@ impl AutobahnApp {
                 }
             }
             Pane::Log if self.log.is_none() => self.read_log(window, cx),
+            Pane::Service => {
+                self.supervisor_build = surface::supervisor_build(&self.state_root);
+            }
             Pane::Config if self.sheet.is_none() => self.read_sheet(),
             _ => {}
         }
@@ -2360,6 +2374,25 @@ impl AutobahnApp {
     /// which build it is. The other panes are about the groups.
     fn service_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let registered = surface::service_state();
+        let app_build = crate::protocol::build();
+        let advice = surface::advice(
+            &app_build,
+            self.command_build.as_ref(),
+            &self.supervisor_build,
+        );
+        let update = Button::new("update")
+            .small()
+            .label(t("service.update"))
+            .tooltip(t("tip.service_update"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.update(cx);
+                cx.notify();
+            }));
+        // The button that settles the advice is the one that stands out.
+        let update = match advice {
+            Some(surface::Advice::UpdateCommand) => update.primary(),
+            _ => update.outline(),
+        };
         let running = self.report.as_ref().map(|report| report.supervisor_running);
         let installed = !matches!(registered, Some(crate::service::ServiceState::NotInstalled));
         let (state, colour) = match running {
@@ -2573,15 +2606,38 @@ impl AutobahnApp {
             // Which build this is, and how to stop it being this one.
             .child(
                 self.block(t("service.version"))
-                    .child(
-                        div()
-                            .font_family(self.mono.clone())
-                            // The heading says which build; the line says
-                            // what it is. Saying "this build is" under a
-                            // heading reading "this build" is one of them
-                            // too many.
-                            .child(said("service-build", &crate::protocol::version(), DIM, 12.)),
-                    )
+                    // Three programs, each its own build: the app, the
+                    // command on disk, and the supervisor, which is the
+                    // command as it was when the service last started it.
+                    .child(self.build_row(t("service.build_app"), "build-app", &app_build))
+                    .when_some(self.command_build.clone(), |block, command| {
+                        block.child(self.build_row(
+                            t("service.build_command"),
+                            "build-command",
+                            &fill(
+                                "service.build_at",
+                                &[
+                                    ("version", command.version.as_str()),
+                                    ("path", &tilde(&command.path.display().to_string())),
+                                ],
+                            ),
+                        ))
+                    })
+                    .child(self.build_row(
+                        t("service.build_supervisor"),
+                        "build-supervisor",
+                        &self.supervisor_build.said(),
+                    ))
+                    // And what to do when they are not one build.
+                    .when_some(advice, |block, advice| {
+                        block.child(
+                            div()
+                                .max_w(px(620.))
+                                .text_size(px(11.5))
+                                .text_color(rgb(AMBER))
+                                .child(advice.said()),
+                        )
+                    })
                     .child(
                         div()
                             .max_w(px(620.))
@@ -2589,21 +2645,45 @@ impl AutobahnApp {
                             .text_color(rgb(FAINT))
                             .child(t("service.update_about")),
                     )
-                    .child(
-                        div().flex().child(
-                            Button::new("update")
-                                .small()
-                                .outline()
-                                .label(t("service.update"))
-                                .tooltip(t("tip.service_update"))
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.update(cx);
-                                    cx.notify();
-                                })),
-                        ),
-                    ),
+                    .child(div().flex().gap(step(1.5)).child(update).when(
+                        advice == Some(surface::Advice::Restart),
+                        |row| {
+                            row.child(
+                                Button::new("restart-build")
+                                    .small()
+                                    .primary()
+                                    .label(surface::Order::Restart.label())
+                                    .tooltip(surface::Order::Restart.about())
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.order(surface::Order::Restart);
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    )),
             )
             .into_any_element()
+    }
+
+    /// One program and the build it is, under "this build".
+    fn build_row(&self, name: &'static str, id: &'static str, build: &str) -> Div {
+        div()
+            .flex()
+            .items_start()
+            .gap(step(2.5))
+            .child(
+                div()
+                    .w(px(112.))
+                    .flex_shrink_0()
+                    .text_size(px(11.))
+                    .text_color(rgb(DIM))
+                    .child(name),
+            )
+            .child(
+                div()
+                    .font_family(self.mono.clone())
+                    .child(said(id, build, DIM, 12.)),
+            )
     }
 
     /// Wakes or re-reads every session, rather than one.
@@ -2718,6 +2798,7 @@ impl AutobahnApp {
                 .await;
             this.update(cx, |this, cx| {
                 this.said = Some(done);
+                this.command_build = surface::command_build();
                 this.read_at = None;
                 cx.notify();
             })
@@ -2843,6 +2924,7 @@ impl AutobahnApp {
             this.update(cx, |this, cx| {
                 this.installing = false;
                 this.ready = surface::installed();
+                this.command_build = surface::command_build();
                 this.said = Some(match done {
                     Ok(command) => fill(
                         "welcome.installed",

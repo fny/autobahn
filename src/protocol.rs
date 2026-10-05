@@ -392,9 +392,53 @@ pub fn version() -> String {
     format!("{}+e{}", env!("CARGO_PKG_VERSION"), COMPATIBILITY_EPOCH)
 }
 
+/// The commit this build was made from, when whoever built it said:
+/// `AUTOBAHN_COMMIT` in the environment of the build, which the release
+/// workflow and the app's build scripts set. A plain `cargo build` names
+/// none, and is not rebuilt for every commit to find one out.
+pub fn commit() -> Option<&'static str> {
+    shortened(option_env!("AUTOBAHN_COMMIT")?)
+}
+
+/// A commit as it is shown: a full hash cut to the seven characters git
+/// prints, anything else as it was given, and nothing for nothing.
+fn shortened(said: &str) -> Option<&str> {
+    let said = said.trim();
+    let full = said.len() == 40 && said.bytes().all(|byte| byte.is_ascii_hexdigit());
+    match (said.is_empty(), full) {
+        (true, _) => None,
+        (false, true) => Some(&said[..7]),
+        (false, false) => Some(said),
+    }
+}
+
+/// The version a person reads: [`version`], and the commit when it is
+/// known. For display only. The handshake and the agent's file name use
+/// [`version`], or every build between releases would install an agent of
+/// its own on every host.
+pub fn build() -> String {
+    match commit() {
+        Some(commit) => format!("{} ({commit})", version()),
+        None => version(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A full hash is cut to what git prints; a short one, or one that
+    /// says the tree was modified, is shown as given; nothing is nothing.
+    #[test]
+    fn a_commit_is_shown_short() {
+        assert_eq!(
+            shortened("1941064d2f0c3b1a9e8f7a6b5c4d3e2f1a0b9c8d"),
+            Some("1941064")
+        );
+        assert_eq!(shortened("c9af4bd, modified"), Some("c9af4bd, modified"));
+        assert_eq!(shortened(" c9af4bd\n"), Some("c9af4bd"));
+        assert_eq!(shortened(""), None);
+    }
 
     /// The version goes unquoted into the home-relative remote command
     /// that runs the agent (`transport::install`). That is safe only while

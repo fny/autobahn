@@ -41,6 +41,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The build names the commit it was made from, beside its version.
+  AUTOBAHN_COMMIT: ${{ github.sha }}
   # The kit needs a newer compiler than the repository's own pin.
   TOOLCHAIN: '1.98.0'
 

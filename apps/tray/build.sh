@@ -39,6 +39,18 @@ VERSION=$(crate_version Cargo.toml)
 # nothing broke, but the service was one restart away from running
 # whatever the last unrelated build left there. Same fragility as a stale
 # agent bundle, and the same fix: separate outputs, nothing shared.
+# The commit this build is made from, for the version a person reads. A
+# workflow says which. Here git is asked, and a tree with changes in it
+# says so. Without git the build names no commit.
+AUTOBAHN_COMMIT="${AUTOBAHN_COMMIT:-}"
+if [ -z "$AUTOBAHN_COMMIT" ] && command -v git >/dev/null 2>&1; then
+    AUTOBAHN_COMMIT=$(git rev-parse --short=7 HEAD 2>/dev/null || true)
+    if [ -n "$AUTOBAHN_COMMIT" ] && ! git diff --quiet HEAD 2>/dev/null; then
+        AUTOBAHN_COMMIT="$AUTOBAHN_COMMIT, modified"
+    fi
+fi
+export AUTOBAHN_COMMIT
+
 TARGET="${AUTOBAHN_TRAY_TARGET:-target/tray}"
 CARGO_TARGET_DIR="$TARGET" cargo build --release --locked --features tray
 rm -rf "$APP"

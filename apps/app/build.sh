@@ -19,6 +19,18 @@ cd "$(dirname "$0")/../.."
 TARGET="${AUTOBAHN_APP_TARGET:-target/app}"
 APP="apps/app/Autobahn.app"
 
+# The commit this build is made from, for the version a person reads. A
+# workflow says which. Here git is asked, and a tree with changes in it
+# says so. Without git the build names no commit.
+AUTOBAHN_COMMIT="${AUTOBAHN_COMMIT:-}"
+if [ -z "$AUTOBAHN_COMMIT" ] && command -v git >/dev/null 2>&1; then
+    AUTOBAHN_COMMIT=$(git rev-parse --short=7 HEAD 2>/dev/null || true)
+    if [ -n "$AUTOBAHN_COMMIT" ] && ! git diff --quiet HEAD 2>/dev/null; then
+        AUTOBAHN_COMMIT="$AUTOBAHN_COMMIT, modified"
+    fi
+fi
+export AUTOBAHN_COMMIT
+
 # GPUI Kit wants a newer compiler than the repository's default.
 cargo +1.98.0 build --release --features app --target-dir "$TARGET" --bin autobahn-app
 

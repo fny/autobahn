@@ -93,10 +93,21 @@ const HELP_STYLES: clap::builder::Styles = clap::builder::Styles::styled()
     .placeholder(clap::builder::styling::Style::new());
 
 /// Keep folders in sync between machines, over SSH.
+/// What `--version` prints after the name: the package version, and the
+/// commit the build was made from when it is known. The version comes
+/// first and alone, because `update` reads it from a downloaded build.
+fn version_line() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| match autobahn::protocol::commit() {
+        Some(commit) => format!("{} ({commit})", env!("CARGO_PKG_VERSION")),
+        None => env!("CARGO_PKG_VERSION").to_owned(),
+    })
+}
+
 #[derive(Parser)]
 #[command(
     name = "autobahn",
-    version,
+    version = version_line(),
     styles = HELP_STYLES,
     disable_help_subcommand = true
 )]
@@ -1949,6 +1960,13 @@ fn run_watch(
         // Written as the log is, so a closed standard output costs the line
         // and not the supervisor.
         use std::io::Write;
+        // Which build, first: a log is read long after the build that
+        // wrote it has been replaced.
+        let _ = writeln!(
+            std::io::stdout(),
+            "autobahn {}",
+            autobahn::protocol::build()
+        );
         let _ = writeln!(
             std::io::stdout(),
             "supervising {sessions} session(s); status is available via `autobahn status`"

@@ -190,11 +190,7 @@ impl Registration {
 /// command only when the command is what is running: asked from the app,
 /// it registered `autobahn-app watch`, which that program answers with
 /// "unknown argument watch" and launchd starts again every ten seconds.
-pub fn install(
-    executable: &Path,
-    config: Option<&Path>,
-    state_root: Option<&Path>,
-) -> Result<()> {
+pub fn install(executable: &Path, config: Option<&Path>, state_root: Option<&Path>) -> Result<()> {
     let executable = executable.to_path_buf();
     // A login service inherits none of the shell's environment, so an
     // `AUTOBAHN_HOME` in effect at install time is written into the unit:

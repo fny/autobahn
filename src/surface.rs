@@ -1212,8 +1212,7 @@ pub(crate) fn serve_after_install(
             fill("welcome.serving", &[("path", &path)]),
         ),
         Ok(false) => (
-            "the configuration describes no sessions, so no login service was installed"
-                .to_owned(),
+            "the configuration describes no sessions, so no login service was installed".to_owned(),
             fill("welcome.no_sessions", &[("path", &path)]),
         ),
         Err(error) => {

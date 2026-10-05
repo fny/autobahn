@@ -35,95 +35,12 @@
 
 /// A starting configuration, written by `autobahn init`.
 ///
-/// It lives here, beside the schema it has to satisfy, so the test below
-/// can hold it to that schema: a template that does not load would be a
-/// poor way to meet the tool. The example group is commented out, so a
-/// fresh install describes no sessions and starts nothing until someone
-/// means it to.
-pub const TEMPLATE: &str = r##"# autobahn — what stays in sync, and where.
-# Written by `autobahn init`. Every key is explained in docs/configuration.md.
-#
-# An unknown key is refused when autobahn starts, rather than ignored, so a
-# typo here tells you instead of quietly doing nothing.
-
-# Run when a session needs a person: a conflict, a halt, a host that has
-# been away a while. It is the only hook — which state it is in is in the
-# message, not in which hook runs. Uncomment it and make it something your
-# desktop shows.
-# on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
-#
-# `autobahn init` writes an example hook beside this file — it notifies
-# with whatever the machine has, and a click opens the status. Point at it
-# instead of writing the command here, and every quote stops being escaped
-# twice. The script is experimental; the variables it reads are not.
-# on_alert = "~/.autobahn/on-alert.sh"
-
-# How much the supervisor writes to its log: quiet, normal, or debug.
-# Every line carries a timestamp whichever you pick.
-# log_level = "normal"
-
-[defaults]
-# Inherited by every group below. Any group can override any of it.
-
-# The mode is a direction, and what happens when both sides changed one
-# file. There is no default: direction is never guessed.
-#
-#   two-way-conflict        both ways; a clash is reported and nothing is touched
-#   two-way-primary         both ways; the primary's version wins a clash, silently
-#   two-way-primary-strict  as above, and the primary's deletion of a file the
-#                           replica edited wins too (in two-way-primary the edit
-#                           survives)
-#   one-way-conflict        primary to replica; an edit on the replica is reported,
-#                           not overwritten
-#   one-way-primary         primary to replica; the replica is made identical (also
-#                           spelled "mirror")
-#
-# Dangerously experimental: as the two-way modes, and a replica takes the lead
-# while the primary is away. Known security and collision issues are open;
-# read docs/p2p.md first. The primary must be this machine.
-#   p2p-conflict-dangerously-experimental
-#   p2p-primary-dangerously-experimental
-mode = "two-way-conflict"
-
-# Applied everywhere, in gitignore syntax: a bare name matches at any
-# depth, a leading "/" anchors to the root of the group, "!" puts something
-# back, and the last pattern that matches decides.
-#
-# A "file:" entry reads a file of patterns from ~/.autobahn/ignores
-# instead of being one, and its patterns land where the entry sits — so
-# the order you read is the order that applies.
-#
-# Essential.gitignore is files that are unsafe to carry, not merely
-# untidy: a database being written, one file of a set that only means
-# anything together, a lock that is true on one machine. Extended adds
-# build output and dependency trees — safe to carry and rarely worth it.
-# Both were written beside this file; read them and edit them.
-ignores = [
-  "file:Essential.gitignore",
-  # "file:Extended.gitignore",
-]
-
-# Seconds between heartbeat cycles. Both sides also watch the filesystem,
-# so this is the fallback, not how fast a change travels.
-interval = 5
-
-# A group sends one source folder (the primary) to any number of
-# destinations (the replicas). Each pair is its own session, and one failing
-# never stops the others.
-#
-# This example is commented out, so a fresh install starts nothing. Edit
-# the paths, uncomment it, and run `autobahn watch`.
-#
-# [groups.work]
-# primary = "~/Workspace"
-# replicas = [
-#   "laptop.bmw.de",                     # uses the primary's path on that host
-#   "dev@build.audi.de:/home/dev/work",  # or name a path
-#   "/Volumes/Backup/Workspace",         # a local path works too
-# ]
-# ignores = ["dist", "*.log"]            # added to the defaults' ignores
-# disabled = true                        # turns the whole group off
-"##;
+/// A file, so it is edited as the TOML it is, and built into the
+/// program, so there is nothing to ship beside it. The test below holds
+/// it to the schema: a template that does not load would be a poor way to
+/// meet the tool. The example group is commented out, so a fresh install
+/// describes no sessions and starts nothing until someone means it to.
+pub const TEMPLATE: &str = include_str!("../assets/config/config.toml");
 
 /// The example hook `autobahn init` writes beside the configuration, and
 /// the click target it names.
@@ -154,72 +71,11 @@ pub const EXTENDED_IGNORES: &str = include_str!("../assets/ignores/Extended.giti
 /// shell command inside a TOML string: every quote in it is escaped twice,
 /// and a notifier's arguments are mostly quotes. It also leaves somewhere
 /// to put a second thought later, such as a different notifier per state.
-pub const ON_ALERT_EXAMPLE: &str = r##"#!/bin/sh
-# autobahn — run when a session needs a person. EXPERIMENTAL: an example,
-# not a contract; edit it freely, and expect it to change between releases.
-#
-# Named by `on_alert` in config.toml. What it is handed:
-#
-#   $AUTOBAHN_SUMMARY      one line: the whole story, or a count
-#   $AUTOBAHN_DETAIL       one indented line per session that needs you
-#   $AUTOBAHN_ICON         autobahn's icon, as an absolute path
-#   $AUTOBAHN_STATES       the state names present, comma separated
-#   $AUTOBAHN_ALERT_COUNT  how many sessions are in the set
-#   $AUTOBAHN_EVENT        "alert" the first time, "repeat" after that
-#
-# The service runs with a sparse PATH and a sparse environment, which is
-# why commands are named in full and the bus address is worked out below.
-set -eu
-
-case "$(uname -s)" in
-Darwin)
-    # terminal-notifier carries a subtitle. Homebrew puts it in one of two
-    # places depending on the chip.
-    for notifier in \
-        /opt/homebrew/bin/terminal-notifier \
-        /usr/local/bin/terminal-notifier
-    do
-        [ -x "$notifier" ] || continue
-        exec "$notifier" \
-            -title autobahn -group autobahn \
-            -appIcon "$AUTOBAHN_ICON" \
-            -subtitle "$AUTOBAHN_DETAIL" \
-            -message "$AUTOBAHN_SUMMARY"
-    done
-
-    # Built in, and always there. It holds one line and no click. The
-    # summary goes in as an argument, never as part of the AppleScript: it
-    # can hold a file name someone else chose.
-    exec /usr/bin/osascript \
-        -e 'on run argv' \
-        -e 'display notification (item 1 of argv) with title "autobahn"' \
-        -e 'end run' \
-        "$AUTOBAHN_SUMMARY"
-    ;;
-Linux)
-    # notify-send talks to the desktop over the session bus. A service
-    # started by the user's own systemd inherits the address; one started
-    # by the system does not, so it is guessed from the user id.
-    if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]; then
-        DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$(id -u)/bus"
-        export DBUS_SESSION_BUS_ADDRESS
-    fi
-    if command -v notify-send >/dev/null 2>&1; then
-        # Urgency is normal, not critical: a conflict wants attention
-        # today, not a notification that refuses to go away.
-        exec notify-send \
-            --app-name autobahn \
-            --icon "$AUTOBAHN_ICON" \
-            "$AUTOBAHN_SUMMARY" \
-            "$AUTOBAHN_DETAIL"
-    fi
-    ;;
-esac
-
-# No notifier, or a headless host: the log is still the record, and
-# standard error goes to it.
-echo "autobahn: $AUTOBAHN_SUMMARY" >&2
-"##;
+///
+/// A file here too, for the same reason as the template. Every script
+/// this has ever been is kept in `alerts::SHIPPED_ON_ALERT_EXAMPLES`, byte
+/// for byte, so a change to the file is a new entry there.
+pub const ON_ALERT_EXAMPLE: &str = include_str!("../assets/config/on-alert.sh");
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Component, Path, PathBuf};

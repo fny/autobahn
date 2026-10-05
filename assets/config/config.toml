@@ -1,0 +1,118 @@
+# Autobahn configuration: which folders stay in sync, and where.
+# Written by `autobahn init`. See docs/configuration.md for details.
+
+# You can run commands when alerts and resolutions fire:
+# on_alert = "terminal-notifier -title autobahn -message \"$AUTOBAHN_SUMMARY\""
+#
+# You can also use a script: `autobahn init` writes an example script
+# on-alert.sh that you can modify or use. See that file for available variables.
+# on_alert = "~/.autobahn/on-alert.sh"
+
+# If you're using notifications from the desktop app, don't use on_alert.
+
+# How much the supervisor writes to its log: quiet, normal, or debug.
+# log_level = "normal"
+
+[defaults]
+# Default settings inherited by all groups below.
+# Any group can override these settings, except `ignores`, which appends.
+
+# Synchronization Mode:
+# Controls data transfer direction and how conflicts are resolved when a file
+# is modified on both sides. You must choose one.
+#
+# Core Modes:
+#
+#   two-way-conflict        Bidirectional sync (default). When a file is edited
+#                           on both sides, the conflict is reported and left
+#                           alone until you choose which version to keep.
+#                           Safest choice for active two-way editing.
+#
+#   two-way-primary         Bidirectional sync. The primary's version wins any
+#                           conflict, except that a deletion on the primary
+#                           never overwrites an active edit on a replica.
+#
+#   two-way-primary-strict  Bidirectional sync. The primary wins all conflicts
+#                           strictly, and deletions on the primary override
+#                           edits on replicas.
+#
+#   one-way-conflict        Unidirectional sync (primary to replica). Edits
+#                           made on the replica are protected and reported as
+#                           conflicts rather than being overwritten.
+#
+#   one-way-primary         Unidirectional mirror (primary to replica). The
+#                           replica is made an exact copy of the primary. Any
+#                           extra or modified files on the replica are deleted
+#                           or overwritten (equivalent to `rsync --delete`).
+#
+# Experimental Failover Mesh (Peer-to-Peer):
+# A replica can temporarily assume leadership if the primary goes offline.
+# Known security and collision considerations apply; read docs/p2p.md first.
+#
+#   p2p-conflict-dangerously-experimental
+#   p2p-primary-dangerously-experimental
+mode = "two-way-conflict"
+
+# File & Directory Exclusions (Ignores):
+# Exclude patterns follow standard .gitignore syntax:
+#   - Names match anywhere in the tree (e.g. "target", "*.log")
+#   - Leading "/" anchors to the root (e.g. "/build")
+#   - "!" un-ignores / includes a previously excluded pattern
+#
+# A "file:" entry loads patterns from a file in ~/.autobahn/ignores/.
+# Group-level `ignores` append to these defaults rather than replacing them.
+#
+#   Essential.gitignore  Files unsafe to sync across machines (e.g. .git,
+#                        .DS_Store, locks, live databases). Keep this enabled.
+#   Extended.gitignore   Common build artifacts, caches, and dependency trees
+#                        (node_modules, target, venv, etc.). Optional.
+ignores = [
+  "file:Essential.gitignore",
+  # "file:Extended.gitignore",
+]
+
+# Sync Heartbeat Interval:
+# (You shouldnt need to change this).
+# Seconds between fallback sync cycles. Autobahn primarily syncs in real time
+# using filesystem event watchers, so changes travel immediately (sub-second).
+# This interval acts as a safety heartbeat to catch missed events or recover
+# after network reconnections.
+# interval = 5
+
+# Optional Default Policies:
+#
+# Symbolic link handling: "raw" (verbatim link entry; default), "portable"
+# (enforces relative targets within root), or "ignore".
+# symlink_mode = "raw"
+#
+# Skip individual files exceeding this size limit (e.g. "50MB", "1GiB"):
+# max_file_size = "500MB"
+#
+# Safeguard against accidental mass directory deletion (e.g. unmounted drives):
+# guard_dir_deletes_over = 8
+
+# Synchronization Groups:
+# A group pairs one source folder (the primary) with one or more destination
+# targets (the replicas). Each (primary, replica) pair runs as an independent
+# session.
+#
+# Endpoint Syntax:
+#   - Local path:   "~/Workspace" or "/path/to/folder"
+#   - Remote host:  "hostname" (connects via SSH; inherits the primary path
+#                   in the remote user's home directory)
+#   - Explicit SSH: "user@host:/path/to/dir"
+#
+# Quick Start:
+#   1. Uncomment the example group below.
+#   2. Adjust the `primary` and `replicas` paths for your workflow.
+#   3. Run `autobahn watch` to start synchronizing.
+#
+# [groups.work]
+# primary = "~/Workspace"
+# replicas = [
+#   "laptop.bmw.de",                     # the same path on that host
+#   "dev@build.audi.de:/home/dev/work",  # explicit remote path
+#   "/Volumes/Backup/Workspace",         # secondary local backup path
+# ]
+# ignores = ["dist", "*.log"]            # added to the defaults
+# disabled = true                        # turns the group off

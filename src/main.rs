@@ -692,9 +692,15 @@ fn main() {
             debug,
         } => run_watch(config, state_root, conflicts, log, debug),
         Command::Install { config, state_root } => {
-            let executable =
-                std::env::current_exe().context("unable to locate this executable")?;
-            autobahn::service::install(&executable, config.as_deref(), state_root.as_deref())
+            std::env::current_exe()
+                .context("unable to locate this executable")
+                .and_then(|executable| {
+                    autobahn::service::install(
+                        &executable,
+                        config.as_deref(),
+                        state_root.as_deref(),
+                    )
+                })
                 .map(|()| {
                     println!("installed and started the login service");
                 })

@@ -23,10 +23,10 @@
 #
 # Core Modes:
 #
-#   two-way-conflict        Bidirectional sync (default). When a file is edited
-#                           on both sides, the conflict is reported and left
-#                           alone until you choose which version to keep.
-#                           Safest choice for active two-way editing.
+#   two-way-conflict        Bidirectional sync. When a file is edited on both
+#                           sides, the conflict is reported and left alone
+#                           until you choose which version to keep. Safest
+#                           choice for active two-way editing.
 #
 #   two-way-primary         Bidirectional sync. The primary's version wins any
 #                           conflict, except that a deletion on the primary
@@ -72,7 +72,7 @@ ignores = [
 ]
 
 # Sync Heartbeat Interval:
-# (You shouldnt need to change this).
+# (You shouldn't need to change this).
 # Seconds between fallback sync cycles. Autobahn primarily syncs in real time
 # using filesystem event watchers, so changes travel immediately (sub-second).
 # This interval acts as a safety heartbeat to catch missed events or recover

@@ -23,8 +23,11 @@ toml = "1.1"
 unicode-normalization = "0.1"
 
 # The menu bar app, behind a feature so the agent build stays lean.
-tray-icon = { version = "0.26", optional = true }
-muda = { version = "0.21", optional = true }
+# On Linux the item is a StatusNotifierItem over D-Bus (ksni) and the
+# menu is GTK 4: the GTK 3 path these crates default to pins glib 0.18,
+# which carries RUSTSEC-2024-0429 and will not move (gtk3-rs is done).
+tray-icon = { version = "0.26", default-features = false, features = ["ksni", "muda-gtk4"], optional = true }
+muda = { version = "0.21", default-features = false, features = ["gtk4"], optional = true }
 winit = { version = "0.30", optional = true }
 notify-rust = { version = "4", optional = true }
 toml_edit = "0.25.15"
@@ -56,16 +59,16 @@ objc2-foundation = { version = "0.3", optional = true, default-features = false,
 # Neither GPUI nor winit starts GTK for the menu bar. Name the version
 # muda already uses, on the same targets, so the bar can start it itself.
 [target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd", target_os = "openbsd"))'.dependencies]
-gtk = { version = "0.18", optional = true }
+gtk4 = { version = "0.11", features = ["v4_12"], optional = true }
 
 [features]
-tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:gtk", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
+tray = ["dep:tray-icon", "dep:muda", "dep:winit", "dep:notify-rust", "dep:gtk4", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 # The configuration's own shape, for anything that builds a form from it.
 schema = ["dep:schemars"]
 # The window over the fleet. Its own binary, autobahn-app, bundled by
 # apps/app/build.sh. Named for what it is rather than what it is
 # called, so the product name can move without the plumbing.
-app = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:gtk", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
+app = ["dep:gpui-kit", "dep:image", "schema", "dep:tray-icon", "dep:muda", "dep:notify-rust", "dep:gtk4", "dep:objc2", "dep:objc2-app-kit", "dep:objc2-user-notifications", "dep:block2", "dep:objc2-foundation"]
 
 [dev-dependencies]
 proptest = "1"

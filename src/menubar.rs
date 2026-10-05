@@ -240,7 +240,7 @@ impl Bar {
             target_os = "netbsd",
             target_os = "openbsd"
         ))]
-        gtk::init()?;
+        gtk4::init()?;
 
         let menu = Menu::new();
         let tray = TrayIconBuilder::new()
@@ -1595,7 +1595,7 @@ mod bar_tests {
         }
 
         assert!(
-            !gtk::is_initialized(),
+            !gtk4::is_initialized(),
             "this process must start without GTK"
         );
         let own = tempfile::tempdir().expect("a temporary state root");
@@ -1611,7 +1611,7 @@ mod bar_tests {
         }
         match appeared {
             Ok(()) => {
-                assert!(gtk::is_initialized_main_thread());
+                assert!(gtk4::is_initialized_main_thread());
                 assert!(bar.tray.is_some(), "success means an item appeared");
                 bar.appear()
                     .expect("an existing item needs no second start");

@@ -87,10 +87,10 @@ Notifications leverage standard Freedesktop specifications (`org.freedesktop.Not
 
 - A functioning Rust toolchain (`rustup`).
 - A system tray host supporting **AppIndicator** or **StatusNotifierItem** (native on KDE; GNOME requires the *AppIndicator and KStatusNotifierItem Support* shell extension).
-- GTK 3 development headers (Debian/Ubuntu packages shown below):
+- GTK 4 development headers (Debian/Ubuntu package shown below):
 
 ```sh
-sudo apt install libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+sudo apt install libgtk-4-dev
 ```
 
 ### Build and Run

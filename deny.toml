@@ -25,12 +25,13 @@ version = 2
 # written in Cargo.toml can be replaced, which is how bincode's
 # RUSTSEC-2025-0141 was answered — it is postcard now. One buried in
 # gpui-kit's tree cannot. Today that is `paste`, `instant` and
-# `rustybuzz` under the app, `proc-macro-error` under GTK and
-# `ttf-parser` under winit's Wayland decorations: five advisories, all
-# unmaintained, none with a safe upgrade, none ours to fix. They leave
-# when the crates above them update, and an ignore entry each would be
-# a hand-kept list of one decision, growing as somebody else's tree
-# ages, read by nobody after the third copy.
+# `rustybuzz` under the app, and `ttf-parser` under winit's Wayland
+# decorations: four advisories, all unmaintained, none with a safe
+# upgrade, none ours to fix. (`proc-macro-error` left with GTK 3, when
+# the tray moved to GTK 4 and ksni over glib 0.18's RUSTSEC-2024-0429.)
+# They leave when the crates above them update, and an ignore entry
+# each would be a hand-kept list of one decision, growing as somebody
+# else's tree ages, read by nobody after the third copy.
 unmaintained = "workspace"
 
 # Every licence a dependency may carry. A crate offering a choice needs

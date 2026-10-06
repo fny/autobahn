@@ -142,6 +142,13 @@ trait Service {
     fn registration(&self) -> Result<Option<service::Registration>>;
     /// Points it at another executable.
     fn retarget(&self, executable: &Path) -> Result<()>;
+    /// Whether pointing the registration elsewhere also starts the
+    /// service again. launchd starts a job as it is loaded, so on macOS
+    /// a retarget is already a restart, and another right after it
+    /// would kill a supervisor that had only just come up.
+    fn retarget_restarts(&self) -> bool {
+        false
+    }
     /// Asks the service manager to restart it.
     fn restart(&self) -> Result<()>;
     /// Waits for it to report running, and says what it last reported.
@@ -178,6 +185,10 @@ impl Service for Installed {
 
     fn retarget(&self, executable: &Path) -> Result<()> {
         service::retarget(executable)
+    }
+
+    fn retarget_restarts(&self) -> bool {
+        cfg!(target_os = "macos")
     }
 
     fn restart(&self) -> Result<()> {
@@ -403,6 +414,7 @@ fn install(
 
     // 5b. The service, pointed at what was just installed, when it ran
     //     something else and --retarget said to.
+    let mut restarted_by_retarget = false;
     if let Some(from) = retarget_from {
         if let Err(error) = service.retarget(&target) {
             // The definition may have been written before what failed: it
@@ -423,6 +435,7 @@ fn install(
         }
         undo.retarget_from = Some(from);
         println!("  pointed the login service at {}", target.display());
+        restarted_by_retarget = service.retarget_restarts();
     }
 
     // 6 and 7. The service, and the proof that it came back on this build.
@@ -430,7 +443,14 @@ fn install(
         .as_ref()
         .and_then(service::Registration::state_root)
         .unwrap_or_else(|| state_root.clone());
-    restart_service(installed, service, &reported, &probe_root, undo)
+    restart_service(
+        installed,
+        service,
+        &reported,
+        &probe_root,
+        undo,
+        restarted_by_retarget,
+    )
 }
 
 /// Whether a service registered to run `registered` runs whatever is put
@@ -595,6 +615,7 @@ fn restart_service(
     reported: &str,
     state_root: &Path,
     mut undo: Undo,
+    already_restarted: bool,
 ) -> Result<()> {
     if installed == ServiceState::NotInstalled {
         undo.commit();
@@ -603,7 +624,12 @@ fn restart_service(
         return Ok(());
     }
 
-    let restarted = service.restart();
+    // Pointing launchd at the new binary loaded it, which started it:
+    // that was the restart, and what follows only confirms it came up.
+    let restarted = match already_restarted {
+        true => Ok(()),
+        false => service.restart(),
+    };
     if let Err(error) = &restarted {
         eprintln!("  the restart failed: {error}");
     }
@@ -642,15 +668,20 @@ fn restart_service(
             if let Err(error) = undo.roll_back_files() {
                 bail!("{why}, and {error:#}");
             }
+            let mut restarted_back = false;
             if let Some(from) = undo.retarget_from.take() {
-                if let Err(error) = service.retarget(&from) {
-                    eprintln!(
+                match service.retarget(&from) {
+                    Ok(()) => restarted_back = service.retarget_restarts(),
+                    Err(error) => eprintln!(
                         "  unable to point the login service back at {}: {error:#}",
                         from.display()
-                    );
+                    ),
                 }
             }
-            let second = service.restart();
+            let second = match restarted_back {
+                true => Ok(()),
+                false => service.restart(),
+            };
             let back = service.wait_running();
             match (second.is_ok(), back) {
                 (true, ServiceState::Running) => bail!(

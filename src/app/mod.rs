@@ -514,6 +514,14 @@ pub struct AutobahnApp {
     said: Option<String>,
     /// What kind of thing the footer's message is, which is its colour.
     tone: Tone,
+    /// Whether the fleet is being read right now, off the main thread.
+    refreshing: bool,
+    /// What the service manager said at the last reading, so that no
+    /// frame runs launchctl to find out.
+    service_state: Option<crate::service::ServiceState>,
+    /// Whether a resolve, or a diff, is running off the main thread.
+    resolving: bool,
+    diffing: bool,
     /// The message last copied from the footer, and when: the button says
     /// Copied for a moment, while that message is the one showing.
     copied: Option<String>,
@@ -827,6 +835,10 @@ impl AutobahnApp {
             shape: crate::config::schema(),
             said: None,
             tone: Tone::Plain,
+            refreshing: false,
+            service_state: None,
+            resolving: false,
+            diffing: false,
             copied: None,
             copied_at: None,
             doctor: None,
@@ -834,7 +846,7 @@ impl AutobahnApp {
             command_build: surface::command_build(),
             supervisor_build: surface::SupervisorBuild::Absent,
         };
-        dash.refresh();
+        dash.refresh(cx);
         cx.spawn(async move |this, cx| {
             loop {
                 // The kit's GPUI hands out its timers through the
@@ -845,7 +857,7 @@ impl AutobahnApp {
                     // A tailing log asks for a frame of its own: the reading
                     // itself needs a window, and only `render` has one.
                     if this.installing
-                        || this.refresh_if_due()
+                        || this.refresh_if_due(cx)
                         || (this.log_tail && this.pane == Pane::Log)
                     {
                         cx.notify();
@@ -874,7 +886,10 @@ impl AutobahnApp {
         self.typed_at.is_some_and(|at| at.elapsed() >= pause)
     }
 
-    fn refresh_if_due(&mut self) -> bool {
+    fn refresh_if_due(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.refreshing {
+            return false;
+        }
         let due = match self.read_at {
             None => true,
             Some(at) => {
@@ -888,7 +903,7 @@ impl AutobahnApp {
         if !due {
             return false;
         }
-        self.refresh();
+        self.refresh(cx);
         true
     }
 
@@ -942,57 +957,100 @@ impl AutobahnApp {
         );
     }
 
-    fn refresh(&mut self) {
-        self.read_at = Some(Instant::now());
-        if self.pane == Pane::Service {
-            self.supervisor_build = surface::supervisor_build(&self.state_root);
+    /// Reads the fleet off the main thread: the status files, the
+    /// configuration, the running supervisor over its socket, and what
+    /// the service manager says. A supervisor that has wedged answers
+    /// nothing for five seconds, and a window that waited for it on the
+    /// main thread froze for five of every seven; this one keeps the
+    /// last report until the next arrives.
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if self.refreshing {
+            return;
         }
         let path = match &self.config {
-            Some(path) => path.clone(),
-            None => match crate::paths::default_config_path() {
-                Ok(path) => path,
-                Err(_) => return,
-            },
+            Some(path) => Some(path.clone()),
+            None => crate::paths::default_config_path().ok(),
         };
-        self.hook_set = crate::config::Config::load(&path)
-            .map(|config| config.on_alert.is_some())
-            .unwrap_or(false);
-        match crate::supervisor::shown_plans(&path, &self.state_root) {
-            Ok(shown) => {
-                let selected: Vec<&crate::config::SessionPlan> = shown.plans.iter().collect();
-                self.report = Some(status_report(&selected, &self.state_root));
-            }
-            Err(error) => {
-                // One line, and the first fault rather than every
-                // group's copy of it: the status bar has one line.
-                let said = format!("{error:#}");
-                let first = surface::faults(&said)
-                    .into_iter()
-                    .next()
-                    .unwrap_or_else(|| surface::first_line(&said));
-                self.say(
-                    fill("status.config_refused", &[("error", &first)]),
-                    Tone::Trouble,
-                );
-            }
-        }
-        // The dock icon carries what needs a person, so a glance at it
-        // answers the question the window was opened to answer.
-        crate::dock::badge(self.waiting());
-        // The first report is the first chance to pick a conflict.
-        if self.open_first_diff {
-            if let Some(first) = self.waiting_list().into_iter().find(|item| !item.blocked) {
-                self.open_conflict(first.clone());
-                self.read_diff(&first);
-                self.open_first_diff = false;
-            }
-        }
-        // And the notification, when no menu bar item is raising it.
-        // The same report, the same rules; the notifier was told at
-        // startup whether it is the one speaking.
-        if let (Some(notifier), Some(report)) = (self.notifier.as_mut(), self.report.as_ref()) {
-            notifier.observe(report);
-        }
+        let Some(path) = path else {
+            return;
+        };
+        self.refreshing = true;
+        let state_root = self.state_root.clone();
+        let asks_supervisor = self.pane == Pane::Service;
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    let hook_set = crate::config::Config::load(&path)
+                        .map(|config| config.on_alert.is_some())
+                        .unwrap_or(false);
+                    let report = crate::supervisor::shown_plans(&path, &state_root)
+                        .map(|shown| {
+                            let selected: Vec<&crate::config::SessionPlan> =
+                                shown.plans.iter().collect();
+                            status_report(&selected, &state_root)
+                        })
+                        .map_err(|error| {
+                            // One line, and the first fault rather than
+                            // every group's copy of it: the status bar
+                            // has one line.
+                            let said = format!("{error:#}");
+                            surface::faults(&said)
+                                .into_iter()
+                                .next()
+                                .unwrap_or_else(|| surface::first_line(&said))
+                        });
+                    let supervisor =
+                        asks_supervisor.then(|| surface::supervisor_build(&state_root));
+                    Refreshed {
+                        hook_set,
+                        report,
+                        supervisor,
+                        service: surface::service_state(),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.refreshing = false;
+                this.read_at = Some(Instant::now());
+                this.hook_set = read.hook_set;
+                this.service_state = read.service;
+                if let Some(supervisor) = read.supervisor {
+                    this.supervisor_build = supervisor;
+                }
+                match read.report {
+                    Ok(report) => this.report = Some(report),
+                    Err(first) => this.say(
+                        fill("status.config_refused", &[("error", &first)]),
+                        Tone::Trouble,
+                    ),
+                }
+                // The dock icon carries what needs a person, so a glance
+                // at it answers the question the window was opened to
+                // answer.
+                crate::dock::badge(this.waiting());
+                // The first report is the first chance to pick a conflict.
+                if this.open_first_diff {
+                    if let Some(first) = this.waiting_list().into_iter().find(|item| !item.blocked)
+                    {
+                        this.open_conflict(first.clone());
+                        this.read_diff(&first, cx);
+                        this.open_first_diff = false;
+                    }
+                }
+                // And the notification, when no menu bar item is raising
+                // it. The same report, the same rules; the notifier was
+                // told at startup whether it is the one speaking.
+                if let (Some(notifier), Some(report)) =
+                    (this.notifier.as_mut(), this.report.as_ref())
+                {
+                    notifier.observe(report);
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn working(&self) -> bool {
@@ -1082,7 +1140,7 @@ impl AutobahnApp {
         // What the service manager says, which is not the same question
         // as whether a supervisor is answering: one can be registered
         // and stopped, or running from a terminal with none registered.
-        let registered = surface::service_state();
+        let registered = self.service_state;
         let (service, colour) = match running {
             Some(true) => (t("fleet.supervisor_running"), GREEN),
             Some(false) => match registered {
@@ -1245,14 +1303,29 @@ impl AutobahnApp {
     }
 
     /// Asks the service manager for something, and says what came back.
-    fn order(&mut self, order: surface::Order) {
-        self.say_result(surface::ask(
-            order,
-            self.config.as_deref(),
-            &self.state_root,
-        ));
-        // Whatever it did, the fleet is a different shape now.
-        self.read_at = None;
+    fn order(&mut self, order: surface::Order, cx: &mut Context<Self>) {
+        // launchctl can take a moment, and a stop waits for the
+        // supervisor: off the main thread, with the bar saying so.
+        self.say(
+            fill("service.asking", &[("order", order.label())]),
+            Tone::Plain,
+        );
+        let config = self.config.clone();
+        let state_root = self.state_root.clone();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move { surface::ask(order, config.as_deref(), &state_root) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.say_result(done);
+                // Whatever it did, the fleet is a different shape now.
+                this.read_at = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The panes as a row, when the window is too narrow for a rail.
@@ -1654,7 +1727,7 @@ impl AutobahnApp {
                     .label(t("group.disable"))
                     .tooltip(t("tip.group_disable"))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.disable_group(&disable);
+                        this.disable_group(&disable, cx);
                         cx.notify();
                     })),
             )
@@ -1838,12 +1911,25 @@ impl AutobahnApp {
     /// Turns a group off in the configuration, as `autobahn disable
     /// --group` does. Its state is kept; the Configuration page is where
     /// it is turned back on, since a group that is off leaves this page.
-    fn disable_group(&mut self, name: &str) {
-        self.say_result(surface::ran(
-            &["disable", "--group", name],
-            self.config.as_deref(),
-        ));
-        self.read_at = None;
+    fn disable_group(&mut self, name: &str, cx: &mut Context<Self>) {
+        self.say(fill("group.disabling", &[("name", name)]), Tone::Plain);
+        let name = name.to_owned();
+        let config = self.config.clone();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(
+                    async move { surface::ran(&["disable", "--group", &name], config.as_deref()) },
+                )
+                .await;
+            this.update(cx, |this, cx| {
+                this.say_result(done);
+                this.read_at = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn session_row(
@@ -2056,9 +2142,8 @@ impl AutobahnApp {
                 }
             }
             Pane::Log if self.log.is_none() => self.read_log(window, cx),
-            Pane::Service => {
-                self.supervisor_build = surface::supervisor_build(&self.state_root);
-            }
+            // The next reading asks the supervisor which build it is.
+            Pane::Service => self.read_at = None,
             Pane::Config if self.sheet.is_none() => self.read_sheet(),
             _ => {}
         }
@@ -2403,10 +2488,11 @@ impl AutobahnApp {
                                     Button::new("keep-primary")
                                         .small()
                                         .outline()
+                                        .disabled(self.resolving)
                                         .label(t("conflicts.keep_primary"))
                                         .tooltip(t("tip.keep_primary"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.resolve(&primary, "primary");
+                                            this.resolve(&primary, "primary", cx);
                                             cx.notify();
                                         })),
                                 )
@@ -2414,6 +2500,7 @@ impl AutobahnApp {
                                     Button::new("keep-replica")
                                         .small()
                                         .outline()
+                                        .disabled(self.resolving)
                                         .label(fill(
                                             "conflicts.keep_replica",
                                             &[("name", &keep_host)],
@@ -2421,7 +2508,7 @@ impl AutobahnApp {
                                         .tooltip(t("tip.keep_replica"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             let keep = host.host.clone();
-                                            this.resolve(&host, &keep);
+                                            this.resolve(&host, &keep, cx);
                                             cx.notify();
                                         })),
                                 )
@@ -2429,10 +2516,11 @@ impl AutobahnApp {
                                     Button::new("keep-both")
                                         .small()
                                         .outline()
+                                        .disabled(self.resolving)
                                         .label(t("conflicts.keep_both"))
                                         .tooltip(t("tip.keep_both"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.resolve(&both, "both");
+                                            this.resolve(&both, "both", cx);
                                             cx.notify();
                                         })),
                                 )
@@ -2440,10 +2528,11 @@ impl AutobahnApp {
                                     row.child(
                                         Button::new("show-diff")
                                             .small()
+                                            .disabled(self.diffing)
                                             .label(t("conflicts.show_difference"))
                                             .tooltip(t("tip.show_difference"))
                                             .on_click(cx.listener(move |this, _, _, cx| {
-                                                this.read_diff(&shown);
+                                                this.read_diff(&shown, cx);
                                                 cx.notify();
                                             })),
                                     )
@@ -2886,7 +2975,7 @@ impl AutobahnApp {
     /// back at the next login, how much of itself the app shows, and
     /// which build it is. The other panes are about the groups.
     fn service_pane(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let registered = surface::service_state();
+        let registered = self.service_state;
         let app_build = crate::protocol::build();
         let advice = surface::advice(
             &app_build,
@@ -2959,7 +3048,7 @@ impl AutobahnApp {
                                     .label(order.label())
                                     .tooltip(order.about())
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.order(order);
+                                        this.order(order, cx);
                                         cx.notify();
                                     }))
                                 }),
@@ -2979,10 +3068,13 @@ impl AutobahnApp {
                                 .checked(installed)
                                 .tooltip(t("tip.at_login"))
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.order(match installed {
-                                        true => surface::Order::Uninstall,
-                                        false => surface::Order::Install,
-                                    });
+                                    this.order(
+                                        match installed {
+                                            true => surface::Order::Uninstall,
+                                            false => surface::Order::Install,
+                                        },
+                                        cx,
+                                    );
                                     cx.notify();
                                 })),
                         )
@@ -3168,7 +3260,7 @@ impl AutobahnApp {
                                     .label(surface::Order::Restart.label())
                                     .tooltip(surface::Order::Restart.about())
                                     .on_click(cx.listener(|this, _, _, cx| {
-                                        this.order(surface::Order::Restart);
+                                        this.order(surface::Order::Restart, cx);
                                         cx.notify();
                                     })),
                             )
@@ -4965,79 +5057,126 @@ impl AutobahnApp {
 
     // ── what the window does to the fleet ────────────────────────────
 
-    fn resolve(&mut self, item: &Conflict, keep: &str) {
-        let mut command = std::process::Command::new(surface::exe());
-        // This row's destination, not the whole group: the conflict is
-        // one session's, and the command would otherwise reach for every
-        // destination in the group, including one that is away.
-        command
-            .arg("resolve")
-            .arg(&item.group)
-            .arg(&item.path)
-            .arg("--keep")
-            .arg(keep)
-            .arg("--host")
-            .arg(&item.host)
-            .arg("--yes")
-            .arg("--state-root")
-            .arg(&self.state_root);
-        if let Some(config) = &self.config {
-            command.arg("--config").arg(config);
+    /// Settles a conflict off the main thread: `resolve` scans both
+    /// sides of the session, which on a large tree takes a while.
+    fn resolve(&mut self, item: &Conflict, keep: &str, cx: &mut Context<Self>) {
+        if self.resolving {
+            return;
         }
-        match command.output() {
-            Ok(output) if output.status.success() => {
-                self.conflict = None;
-                self.sides = None;
-                self.diff = None;
-                self.say(
-                    fill(
-                        "status.kept",
-                        &[
-                            ("keep", keep),
-                            ("path", &crate::text::display_safe(&item.path)),
-                        ],
-                    ),
-                    Tone::Done,
-                );
-            }
-            Ok(output) => self.say(
-                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                Tone::Trouble,
-            ),
-            Err(error) => self.say(
-                fill("status.resolve_failed", &[("error", &error.to_string())]),
-                Tone::Trouble,
-            ),
-        }
-        self.read_at = None;
+        self.resolving = true;
+        let path = crate::text::display_safe(&item.path).to_string();
+        self.say(
+            fill("conflicts.resolving", &[("keep", keep), ("path", &path)]),
+            Tone::Plain,
+        );
+        let item = item.clone();
+        let keep = keep.to_owned();
+        let config = self.config.clone();
+        let state_root = self.state_root.clone();
+        cx.spawn(async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut command = std::process::Command::new(surface::exe());
+                    // This row's destination, not the whole group: the
+                    // conflict is one session's, and the command would
+                    // otherwise reach for every destination in the
+                    // group, including one that is away.
+                    command
+                        .arg("resolve")
+                        .arg(&item.group)
+                        .arg(&item.path)
+                        .arg("--keep")
+                        .arg(&keep)
+                        .arg("--host")
+                        .arg(&item.host)
+                        .arg("--yes")
+                        .arg("--state-root")
+                        .arg(&state_root);
+                    if let Some(config) = &config {
+                        command.arg("--config").arg(config);
+                    }
+                    match command.output() {
+                        Ok(output) if output.status.success() => {
+                            Ok(fill("status.kept", &[("keep", &keep), ("path", &path)]))
+                        }
+                        Ok(output) => {
+                            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+                        }
+                        Err(error) => Err(fill(
+                            "status.resolve_failed",
+                            &[("error", &error.to_string())],
+                        )),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.resolving = false;
+                if done.is_ok() {
+                    this.conflict = None;
+                    this.sides = None;
+                    this.diff = None;
+                }
+                this.say_result(done);
+                this.read_at = None;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
-    fn read_diff(&mut self, item: &Conflict) {
-        let mut command = std::process::Command::new(surface::exe());
-        // This row's destination: without it the command compares every
-        // destination in turn, and a file that is identical on the first
-        // one read as identical, with the real difference further down.
-        command
-            .arg("diff")
-            .arg(&item.group)
-            .arg(&item.path)
-            .arg("--host")
-            .arg(&item.host)
-            .arg("--state-root")
-            .arg(&self.state_root);
-        if let Some(config) = &self.config {
-            command.arg("--config").arg(config);
+    /// Reads a conflict's diff off the main thread: `diff` fetches one
+    /// side over SSH, and a slow host is not the window's to wait for.
+    fn read_diff(&mut self, item: &Conflict, cx: &mut Context<Self>) {
+        if self.diffing {
+            return;
         }
-        self.diff = Some(match command.output() {
-            Ok(output) if !output.stdout.is_empty() => {
-                String::from_utf8_lossy(&output.stdout).into_owned()
-            }
-            Ok(output) => match String::from_utf8_lossy(&output.stderr).trim() {
-                "" => t("status.diff_same").to_owned(),
-                complaint => complaint.to_owned(),
-            },
-            Err(error) => fill("status.diff_failed", &[("error", &error.to_string())]),
-        });
+        self.diffing = true;
+        self.diff = Some(t("conflicts.diff_reading").to_owned());
+        let item = item.clone();
+        let config = self.config.clone();
+        let state_root = self.state_root.clone();
+        cx.spawn(async move |this, cx| {
+            let read = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut command = std::process::Command::new(surface::exe());
+                    // This row's destination: without it the command
+                    // compares every destination in turn, and a file that
+                    // is identical on the first one read as identical,
+                    // with the real difference further down.
+                    command
+                        .arg("diff")
+                        .arg(&item.group)
+                        .arg(&item.path)
+                        .arg("--host")
+                        .arg(&item.host)
+                        .arg("--state-root")
+                        .arg(&state_root);
+                    if let Some(config) = &config {
+                        command.arg("--config").arg(config);
+                    }
+                    match command.output() {
+                        Ok(output) if !output.stdout.is_empty() => {
+                            String::from_utf8_lossy(&output.stdout).into_owned()
+                        }
+                        Ok(output) => match String::from_utf8_lossy(&output.stderr).trim() {
+                            "" => t("status.diff_same").to_owned(),
+                            complaint => complaint.to_owned(),
+                        },
+                        Err(error) => fill("status.diff_failed", &[("error", &error.to_string())]),
+                    }
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.diffing = false;
+                this.diff = Some(read);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     fn reveal(&mut self, file: &std::path::Path) {
@@ -5054,6 +5193,17 @@ enum Tone {
     Done,
     /// Something that did not.
     Trouble,
+}
+
+/// One reading of the fleet, taken off the main thread.
+struct Refreshed {
+    hook_set: bool,
+    /// The report, or the first fault of a configuration that does not
+    /// load.
+    report: Result<StatusReport, String>,
+    /// Which build the supervisor is, when the service pane asked.
+    supervisor: Option<surface::SupervisorBuild>,
+    service: Option<crate::service::ServiceState>,
 }
 
 /// A group's doctor report, open under its card.

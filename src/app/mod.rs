@@ -25,6 +25,7 @@ use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
 use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, InputHighlighter, Textarea, TextareaState,
 };
+use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
@@ -292,6 +293,25 @@ struct Desk(WeakEntity<AutobahnApp>);
 impl Global for Desk {}
 
 actions!(autobahn, [OpenSettings, QuitApp]);
+
+/// What a group's menu asks for: the action its items dispatch, carrying
+/// the group's name, since one menu is drawn per card.
+#[derive(Clone, PartialEq, Debug, gpui_kit::Action)]
+#[action(namespace = autobahn, no_json)]
+struct AskGroup {
+    group: String,
+    what: GroupAsk,
+}
+
+/// The five things a group's menu offers.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum GroupAsk {
+    Doctor,
+    Flush,
+    Verify,
+    Reset,
+    Disable,
+}
 
 /// Puts the window in front, opening one when there is none: what the
 /// menu bar's "Open the window" asks for, and a click on the dock icon.
@@ -613,6 +633,25 @@ fn run_with(
             move |_: &OpenSettings, cx| {
                 open_settings(config.clone(), state_root.clone(), cx);
             }
+        });
+        // A group's menu items dispatch through the window they were
+        // opened in, so, as with ⌘,, the window is turned after the
+        // current update rather than inside it.
+        cx.on_action(|asked: &AskGroup, cx| {
+            let asked = asked.clone();
+            cx.defer(move |cx| {
+                let desk = cx.try_global::<Desk>().and_then(|desk| desk.0.upgrade());
+                if let (Some(desk), Some(window)) = (desk, cx.windows().first().copied()) {
+                    window
+                        .update(cx, |_, _, cx| {
+                            desk.update(cx, |desk, cx| {
+                                desk.ask_group(&asked.group, asked.what, cx);
+                                cx.notify();
+                            });
+                        })
+                        .ok();
+                }
+            });
         });
         cx.set_menus(vec![Menu {
             name: t("app.window").into(),
@@ -1684,7 +1723,7 @@ impl AutobahnApp {
                             .text_color(rgb(colour))
                             .child(summary),
                     )
-                    .child(self.group_buttons(&group.name, cx)),
+                    .child(self.group_menu(&group.name)),
             )
             .when_some(
                 self.doctor
@@ -1696,76 +1735,44 @@ impl AutobahnApp {
             .into_any_element()
     }
 
-    /// What can be asked of a whole group, on its card. The safe ones are
-    /// plain buttons; the two that change the configuration or bring
-    /// deleted files back are quieter, and Reset asks before it acts.
-    fn group_buttons(&self, name: &str, cx: &mut Context<Self>) -> Div {
-        let reading = self.doctoring.as_deref() == Some(name);
-        let button = |id: &str, label: &'static str, tip: &'static str| {
-            Button::new(SharedString::from(format!("group-{id}-{name}")))
-                .xsmall()
-                .outline()
-                .label(label)
-                .tooltip(tip)
-        };
-        let (doctor, flush, verify, reset, disable) = (
-            name.to_owned(),
-            name.to_owned(),
-            name.to_owned(),
-            name.to_owned(),
-            name.to_owned(),
-        );
-        div()
-            .flex_shrink_0()
-            .flex()
-            .gap(step(1.5))
-            .child(
-                button("doctor", t("group.doctor"), t("tip.group_doctor"))
-                    .disabled(reading)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.read_doctor(&doctor, false, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                button("flush", t("verb.flush"), t("tip.group_flush")).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.group_control(&flush, Verb::Flush);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                button("verify", t("verb.verify"), t("tip.group_verify")).on_click(cx.listener(
-                    move |this, _, _, cx| {
-                        this.group_control(&verify, Verb::Verify);
-                        cx.notify();
-                    },
-                )),
-            )
-            .child(
-                Button::new(SharedString::from(format!("group-reset-{name}")))
-                    .xsmall()
-                    .ghost()
-                    .label(t("group.reset"))
-                    .tooltip(t("tip.group_reset"))
-                    .disabled(reading)
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.read_doctor(&reset, true, cx);
-                        cx.notify();
-                    })),
-            )
-            .child(
-                Button::new(SharedString::from(format!("group-disable-{name}")))
-                    .xsmall()
-                    .ghost()
-                    .label(t("group.disable"))
-                    .tooltip(t("tip.group_disable"))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.disable_group(&disable, cx);
-                        cx.notify();
-                    })),
-            )
+    /// What can be asked of a whole group, behind one button on its card:
+    /// five buttons on every card was clutter. The safe ones come first;
+    /// the two that change the configuration or bring deleted files back
+    /// sit below a line, and Reset asks before it acts.
+    fn group_menu(&self, name: &str) -> impl IntoElement {
+        let group = name.to_owned();
+        Button::new(SharedString::from(format!("group-menu-{name}")))
+            .xsmall()
+            .ghost()
+            .icon(IconName::EllipsisVertical)
+            .tooltip(t("tip.group_menu"))
+            .dropdown_menu(move |menu, _, _| {
+                let ask = |what: GroupAsk| -> Box<dyn Action> {
+                    Box::new(AskGroup {
+                        group: group.clone(),
+                        what,
+                    })
+                };
+                menu.menu(t("group.doctor"), ask(GroupAsk::Doctor))
+                    .menu(t("verb.flush"), ask(GroupAsk::Flush))
+                    .menu(t("verb.verify"), ask(GroupAsk::Verify))
+                    .separator()
+                    .menu(t("group.disable"), ask(GroupAsk::Disable))
+                    .menu_element(ask(GroupAsk::Reset), |_, _| {
+                        div().text_color(rgb(RED)).child(t("group.reset"))
+                    })
+            })
+    }
+
+    /// One of the menu's asks, carried out.
+    fn ask_group(&mut self, name: &str, what: GroupAsk, cx: &mut Context<Self>) {
+        match what {
+            GroupAsk::Doctor => self.read_doctor(name, false, cx),
+            GroupAsk::Flush => self.group_control(name, Verb::Flush),
+            GroupAsk::Verify => self.group_control(name, Verb::Verify),
+            GroupAsk::Reset => self.read_doctor(name, true, cx),
+            GroupAsk::Disable => self.disable_group(name, cx),
+        }
     }
 
     /// A group's doctor report, under its card. Asked about a reset, it
@@ -2071,52 +2078,6 @@ impl AutobahnApp {
                     &crate::text::display_safe(error),
                     RED,
                 ))
-            })
-            // A halt names doctor and reset; here they are, beside it.
-            .when(session.state == "halted", |band| {
-                let (doctor, reset) = (group.name.clone(), group.name.clone());
-                let reading = self.doctoring.as_deref() == Some(group.name.as_str());
-                band.child(
-                    div()
-                        .pl(step(8.))
-                        .pb(step(2.5))
-                        .flex()
-                        .gap(step(1.5))
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "halted-doctor-{}-{}",
-                                group.name, session.replica
-                            )))
-                            .xsmall()
-                            .outline()
-                            .label(t("group.doctor"))
-                            .tooltip(t("tip.group_doctor"))
-                            .disabled(reading)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.read_doctor(&doctor, false, cx);
-                                    cx.notify();
-                                },
-                            )),
-                        )
-                        .child(
-                            Button::new(SharedString::from(format!(
-                                "halted-reset-{}-{}",
-                                group.name, session.replica
-                            )))
-                            .xsmall()
-                            .ghost()
-                            .label(t("group.reset"))
-                            .tooltip(t("tip.group_reset"))
-                            .disabled(reading)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.read_doctor(&reset, true, cx);
-                                    cx.notify();
-                                },
-                            )),
-                        ),
-                )
             })
             // What is waiting reads across the card, the reason first.
             .when(open, |band| {

@@ -1290,7 +1290,11 @@ impl SupervisorBuild {
     /// one for a supervisor too old to say: it matches nothing.
     fn package(&self) -> Option<String> {
         match self {
-            SupervisorBuild::Same(_) => Some(package(&crate::protocol::version()).to_owned()),
+            // Its own words when it said them; this build's otherwise,
+            // which is what "same" means.
+            SupervisorBuild::Same(build) => {
+                Some(package(build.as_deref().unwrap_or(&crate::protocol::version())).to_owned())
+            }
             SupervisorBuild::Other(version) => {
                 Some(package(version.as_deref().unwrap_or_default()).to_owned())
             }
@@ -2026,7 +2030,15 @@ mod tests {
         );
         let modified = SupervisorBuild::Same(Some("1.0.1+e1 (a1b2c3d, modified)".to_owned()));
         assert_eq!(advice(app, Some(&same), &modified), Some(Advice::Restart));
-        assert_eq!(advice(app, Some(&same), &SupervisorBuild::Same(None)), None);
+        // A supervisor that could not say its build is this build's
+        // version, whatever that is today.
+        let now = env!("CARGO_PKG_VERSION");
+        let this_app = format!("{now}+e1 (a1b2c3d)");
+        let this_command = command(&format!("{now} (a1b2c3d)"));
+        assert_eq!(
+            advice(&this_app, Some(&this_command), &SupervisorBuild::Same(None)),
+            None
+        );
         let new = command("1.10.0");
         assert_eq!(
             advice(app, Some(&new), &other("1.10.0+e2")),

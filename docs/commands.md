@@ -58,8 +58,9 @@ autobahn status --json     # the same, as one versioned document
 
 autobahn sync              # sync every session once, then exit
 autobahn flush             # sync now, without waiting
-autobahn doctor project    # inspect, change nothing: both sides, how they
+autobahn doctor project    # inspect, change nothing: both sides, where they
                            # differ, the baseline, and what a reset would do
+autobahn doctor project --verbose   # ...listing every differing path
 autobahn reset project     # forget what the group last synced; the next
                            # cycle merges both sides and only adds
                            # (deleted files come back)
@@ -75,7 +76,7 @@ autobahn mi                # the shop: watch it work, and clear the queue
 
 `reset` requires a group name and forgets its baseline. The next cycle merges both sides and only adds, so deleted files can come back.
 
-Before a reset, run `doctor`. It scans both sides and reports whether they match and what a reset will copy. It changes neither the folders nor the baseline and can run beside the supervisor. If both sides match, a reset requires no copies.
+Before a reset, run `doctor`. It scans both sides and lists where they differ, folded so that a folder whose entries all differ is one line and a folder where several do is one line with a count ("shared/ 53 of 61 entries differ"). `--verbose` lists every path. It then says what a reset would copy, in files and bytes, and how many differing files would become conflicts. It changes neither the folders nor the baseline and can run beside the supervisor. If both sides match, a reset copies nothing.
 
 See [State](./state.md) for `clean` and [Conflicts](./conflicts.md) for conflict commands.
 

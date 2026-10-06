@@ -531,6 +531,11 @@ enum Command {
         group: String,
         /// Only this destination in the group.
         host: Option<String>,
+        /// List every path. Without this, a folder whose entries all
+        /// differ is one line, and a folder where several do is one line
+        /// with a count.
+        #[arg(long)]
+        verbose: bool,
         /// The configuration file. Defaults to ~/.autobahn/config.toml.
         #[arg(long)]
         config: Option<PathBuf>,
@@ -797,9 +802,10 @@ fn main() {
         Command::Doctor {
             group,
             host,
+            verbose,
             config,
             state_root,
-        } => run_doctor(config, state_root, &group, host.as_deref()),
+        } => run_doctor(config, state_root, &group, host.as_deref(), verbose),
         Command::Formats => {
             let (oldest, newest) = autobahn::session::ancestor::readable_formats();
             println!("ancestor {oldest} {newest}");
@@ -1310,6 +1316,7 @@ fn run_doctor(
     state_root: Option<PathBuf>,
     group: &str,
     host: Option<&str>,
+    verbose: bool,
 ) -> Result<()> {
     use autobahn::tree::reconcile;
     // Every line goes out through the one decision about styling, so a
@@ -1392,104 +1399,71 @@ fn run_doctor(
             ),
         }
 
-        let describe = |reconciliation: &autobahn::tree::Reconciliation| -> Vec<String> {
-            let mut lines = Vec::new();
-            for (change, direction) in reconciliation
-                .primary_transitions
-                .iter()
-                .map(|change| (change, "to primary"))
-                .chain(
-                    reconciliation
-                        .replica_transitions
-                        .iter()
-                        .map(|change| (change, "to replica")),
-                )
-            {
-                let verb = match (&change.old, &change.new) {
-                    (None, Some(_)) => "copy",
-                    (Some(_), None) => "delete",
-                    _ => "replace",
-                };
-                let path = if change.path.is_empty() {
-                    "(the root)"
-                } else {
-                    &change.path
-                };
-                lines.push(format!("{verb} {path} {direction}"));
-            }
-            for conflict in &reconciliation.conflicts {
-                let path = if conflict.root.is_empty() {
-                    "(the root)"
-                } else {
-                    &conflict.root
-                };
-                lines.push(format!("conflict at {path}"));
-            }
-            lines
-        };
-        let show = |heading: &str, lines: &[String]| {
-            say!("  {heading}");
-            // Each line names paths the other side chose: shown escaped.
-            for line in lines.iter().take(8) {
-                say!("    {}", display_safe(line));
-            }
-            if lines.len() > 8 {
-                say!("    … {} more", thousands((lines.len() - 8) as u64));
-            }
-        };
-
         // What the next cycle would do: the baseline against both sides.
         let mode = plan.mode;
         if let Ok((baseline, _)) = &ancestor {
-            let next = describe(&reconcile(
+            let next = reconcile(
                 baseline.as_ref(),
                 primary.root.as_ref(),
                 replica.root.as_ref(),
                 mode,
-            ));
-            if next.is_empty() {
+            );
+            let lines = differences(&next, primary.root.as_ref(), replica.root.as_ref(), verbose);
+            if lines.is_empty() {
                 say!("  the next cycle: nothing to do — in sync");
             } else {
-                show(&format!("the next cycle would ({}):", next.len()), &next);
+                say!("  the next cycle would change {}:", places(lines.len()));
+                for line in &lines {
+                    say!("    {}", display_safe(line));
+                }
             }
         }
 
         // What a reset would do: the same, with no history at all.
-        let reset = describe(&reconcile(
-            None,
+        let reset = reconcile(None, primary.root.as_ref(), replica.root.as_ref(), mode);
+        let lines = differences(
+            &reset,
             primary.root.as_ref(),
             replica.root.as_ref(),
-            mode,
-        ));
-        if reset.is_empty() {
-            say!("  a reset: \x1b[32mfree\x1b[0m — the two sides match");
-        } else {
-            show(
-                &format!(
-                    "a reset would ({}) — with no baseline, whatever is on one side only is \
-                     copied to the other, including what was deleted on purpose:",
-                    reset.len()
-                ),
-                &reset,
-            );
-        }
-
-        // Folders populated on one side and empty or gone on the other: the
-        // shape of a vanished mount, and of an emptied tree.
-        let mut lopsided = Vec::new();
-        lopsided_folders(
-            primary.root.as_ref(),
-            replica.root.as_ref(),
-            "",
-            &mut lopsided,
+            verbose,
         );
-        if lopsided.is_empty() {
-            say!("  folders full on one side and empty on the other: none");
+        if lines.is_empty() {
+            say!("  the two sides match — a reset would copy nothing");
         } else {
-            show(
-                "folders full on one side and empty on the other:",
-                &lopsided,
+            say!("  the two sides differ in {}:", places(lines.len()));
+            for line in &lines {
+                say!("    {}", display_safe(line));
+            }
+            let (to_primary, to_replica) = (
+                carried(&reset.primary_transitions),
+                carried(&reset.replica_transitions),
             );
+            let mut sentence = String::from("  a reset would copy ");
+            sentence.push_str(&match (to_primary.0 > 0, to_replica.0 > 0) {
+                (true, true) => format!(
+                    "{} to the primary and {} to the replica",
+                    amount(to_primary),
+                    amount(to_replica)
+                ),
+                (true, false) => format!("{} to the primary", amount(to_primary)),
+                (false, true) => format!("{} to the replica", amount(to_replica)),
+                (false, false) => "nothing".to_owned(),
+            });
+            if !reset.conflicts.is_empty() {
+                sentence.push_str(&format!(
+                    ", and {} that differ would become conflicts",
+                    match reset.conflicts.len() {
+                        1 => "1 file".to_owned(),
+                        n => format!("{} files", thousands(n as u64)),
+                    }
+                ));
+            }
+            sentence
+                .push_str(". What was deleted on purpose on one side comes back from the other.");
+            say!("{sentence}");
+            if !verbose && lines.iter().any(|line| line.contains(" of ")) {
+                say!("  (`--verbose` lists every path)");
+            }
         }
         say!();
     }
@@ -1499,60 +1473,204 @@ fn run_doctor(
     Ok(())
 }
 
-/// Walks two trees together, collecting the folders that hold eight or
-/// more entries on one side and are empty or absent on the other.
-fn lopsided_folders(
+/// One of the ways the two sides differ, as the reconciler reports it:
+/// a path, and what is true of it.
+struct Difference {
+    path: String,
+    /// The words after the path: "only on the primary", "differs".
+    kind: &'static str,
+    /// Files and bytes under it, when it is a whole folder or a file.
+    files: u64,
+    bytes: u64,
+    /// Whether the path is a folder on the side that has it.
+    folder: bool,
+}
+
+/// Files and bytes in the synchronizable part of a tree.
+fn files_and_bytes(node: &autobahn::tree::Node) -> (u64, u64) {
+    use autobahn::tree::Content;
+    match &node.content {
+        Content::File { metadata, .. } => (1, metadata.size),
+        Content::Directory(_) => node
+            .children()
+            .iter()
+            .map(files_and_bytes)
+            .fold((0, 0), |(f, b), (df, db)| (f + df, b + db)),
+        _ => (0, 0),
+    }
+}
+
+/// How the two sides differ, one line each, folded so that a thousand
+/// paths read as a handful of lines.
+///
+/// The reconciler already names a folder once when the whole of it is
+/// on one side only. What it lists one by one are entries inside a
+/// folder both sides have: those are folded here into "folder/: 53 of
+/// 61 entries differ". With `verbose`, every path is its own line.
+fn differences(
+    reconciliation: &autobahn::tree::Reconciliation,
     primary: Option<&autobahn::tree::Node>,
     replica: Option<&autobahn::tree::Node>,
-    path: &str,
-    found: &mut Vec<String>,
-) {
-    use autobahn::tree::{Content, Node};
-    fn below(node: &Node) -> usize {
-        node.children().iter().map(|child| 1 + below(child)).sum()
-    }
-    let directory = |node: Option<&Node>| matches!(node, Some(node) if matches!(node.content, Content::Directory(_)));
-    let empty =
-        |node: Option<&Node>| !directory(node) || node.is_some_and(|n| n.children().is_empty());
-    if !path.is_empty() && empty(primary) != empty(replica) {
-        let (populated, side) = if empty(primary) {
-            (replica, "replica")
-        } else {
-            (primary, "primary")
-        };
-        let count = populated.map(below).unwrap_or(0);
-        if count >= 8 {
-            found.push(format!(
-                "{path} — {} entries on {side}, empty or gone on the other",
-                thousands(count as u64)
-            ));
-            return;
+    verbose: bool,
+) -> Vec<String> {
+    use autobahn::tree::Content;
+    let mut found: Vec<Difference> = Vec::new();
+    // A transition to one side carries the other side's content: what
+    // is copied to the primary was only on the replica.
+    for (changes, kind_copy, kind_delete, kind_replace) in [
+        (
+            &reconciliation.primary_transitions,
+            "only on the replica",
+            "deleted on the replica",
+            "the replica's version wins",
+        ),
+        (
+            &reconciliation.replica_transitions,
+            "only on the primary",
+            "deleted on the primary",
+            "the primary's version wins",
+        ),
+    ] {
+        for change in changes {
+            let (kind, node) = match (&change.old, &change.new) {
+                (None, Some(new)) => (kind_copy, Some(new)),
+                (Some(old), None) => (kind_delete, Some(old)),
+                (_, new) => (kind_replace, new.as_ref()),
+            };
+            let (files, bytes) = node.map(files_and_bytes).unwrap_or((0, 0));
+            found.push(Difference {
+                path: change.path.clone(),
+                kind,
+                files,
+                bytes,
+                folder: node.is_some_and(|node| matches!(node.content, Content::Directory(_))),
+            });
         }
     }
-    if !directory(primary) || !directory(replica) {
-        return;
+    for conflict in &reconciliation.conflicts {
+        found.push(Difference {
+            path: conflict.root.clone(),
+            kind: "differs",
+            files: 1,
+            bytes: 0,
+            folder: false,
+        });
     }
-    let left = primary.map(Node::children).unwrap_or(&[]);
-    let right = replica.map(Node::children).unwrap_or(&[]);
-    let mut names: Vec<&str> = left
-        .iter()
-        .chain(right.iter())
-        .map(|child| child.name.as_str())
-        .collect();
-    names.sort_unstable();
-    names.dedup();
-    for name in names {
-        let child_path = if path.is_empty() {
-            name.to_owned()
-        } else {
-            format!("{path}/{name}")
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let shown = |path: &str| -> String {
+        match path.is_empty() {
+            true => "(the root)".to_owned(),
+            false => path.to_owned(),
+        }
+    };
+    let one = |difference: &Difference| -> String {
+        let path = shown(&difference.path);
+        match difference.folder {
+            true => format!(
+                "{path}/  {}, {}  {}",
+                match difference.files {
+                    1 => "1 file".to_owned(),
+                    n => format!("{} files", thousands(n)),
+                },
+                format_bytes(difference.bytes),
+                difference.kind
+            ),
+            false => format!("{path}  {}", difference.kind),
+        }
+    };
+    if verbose {
+        return found.iter().map(one).collect();
+    }
+
+    // Fold the entries of one folder that share a kind into one line.
+    // A whole folder on one side only stays its own line: the reconciler
+    // has folded it already.
+    let parent = |path: &str| path.rsplit_once('/').map(|(folder, _)| folder.to_owned());
+    let mut lines: Vec<(String, String)> = Vec::new();
+    let mut index = 0;
+    while index < found.len() {
+        let difference = &found[index];
+        let folder = parent(&difference.path);
+        let alike: Vec<&Difference> = match &folder {
+            Some(folder) if !difference.folder => found[index..]
+                .iter()
+                .take_while(|other| parent(&other.path).as_deref() == Some(folder.as_str()))
+                .filter(|other| other.kind == difference.kind && !other.folder)
+                .collect(),
+            _ => Vec::new(),
         };
-        lopsided_folders(
-            primary.and_then(|node| node.child(name)),
-            replica.and_then(|node| node.child(name)),
-            &child_path,
-            found,
-        );
+        if alike.len() >= 2 {
+            let folder = folder.expect("a folder for every entry folded");
+            let entries = |root: Option<&autobahn::tree::Node>| {
+                node_at(root, &folder)
+                    .map(|node| node.children().len())
+                    .unwrap_or(0)
+            };
+            let total = entries(primary).max(entries(replica));
+            // Several entries: the kind in the plural.
+            let kind = match difference.kind {
+                "differs" => "differ",
+                other => other,
+            };
+            lines.push((
+                folder.clone(),
+                format!(
+                    "{folder}/  {} of {} entries {kind}",
+                    thousands(alike.len() as u64),
+                    thousands(total as u64)
+                ),
+            ));
+            // Everything folded is consumed; the rest of the folder goes
+            // on to the next round.
+            let folded: Vec<usize> = found[index..]
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| {
+                    parent(&other.path).as_deref() == Some(folder.as_str())
+                        && other.kind == difference.kind
+                        && !other.folder
+                })
+                .map(|(offset, _)| index + offset)
+                .collect();
+            let mut keep = Vec::with_capacity(found.len());
+            for (at, item) in found.into_iter().enumerate() {
+                if !folded.contains(&at) {
+                    keep.push(item);
+                }
+            }
+            found = keep;
+            continue;
+        }
+        lines.push((difference.path.clone(), one(difference)));
+        index += 1;
+    }
+    lines.sort_by(|a, b| a.0.cmp(&b.0));
+    lines.into_iter().map(|(_, line)| line).collect()
+}
+
+/// Files and bytes a set of transitions carries to a side.
+fn carried(changes: &[autobahn::tree::Change]) -> (u64, u64) {
+    changes
+        .iter()
+        .filter_map(|change| change.new.as_ref())
+        .map(files_and_bytes)
+        .fold((0, 0), |(f, b), (df, db)| (f + df, b + db))
+}
+
+/// "1,002 files (3.9 GB)".
+fn amount((files, bytes): (u64, u64)) -> String {
+    match files {
+        1 => format!("1 file ({})", format_bytes(bytes)),
+        n => format!("{} files ({})", thousands(n), format_bytes(bytes)),
+    }
+}
+
+/// "1 place" or "14 places".
+fn places(count: usize) -> String {
+    match count {
+        1 => "1 place".to_owned(),
+        n => format!("{} places", thousands(n as u64)),
     }
 }
 

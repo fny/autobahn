@@ -514,6 +514,9 @@ pub struct AutobahnApp {
     said: Option<String>,
     /// What kind of thing the footer's message is, which is its colour.
     tone: Tone,
+    /// When the footer's message was said. A plain or green one gives way
+    /// to a hint after a while; a red one stays until the next action.
+    said_at: Option<Instant>,
     /// Whether the fleet is being read right now, off the main thread.
     refreshing: bool,
     /// What the service manager said at the last reading, so that no
@@ -835,6 +838,7 @@ impl AutobahnApp {
             shape: crate::config::schema(),
             said: None,
             tone: Tone::Plain,
+            said_at: None,
             refreshing: false,
             service_state: None,
             resolving: false,
@@ -858,6 +862,7 @@ impl AutobahnApp {
                     // itself needs a window, and only `render` has one.
                     if this.installing
                         || this.refresh_if_due(cx)
+                        || this.expire_said()
                         || (this.log_tail && this.pane == Pane::Log)
                     {
                         cx.notify();
@@ -911,6 +916,29 @@ impl AutobahnApp {
     fn say(&mut self, said: impl Into<String>, tone: Tone) {
         self.said = Some(said.into());
         self.tone = tone;
+        self.said_at = Some(Instant::now());
+    }
+
+    /// Lets a message go once it has been read: a plain or green one
+    /// after a few seconds, a red one never on its own. The hints had no
+    /// turn otherwise, since nothing else ever cleared the line. Says
+    /// whether anything changed.
+    fn expire_said(&mut self) -> bool {
+        const SAID_FOR: Duration = Duration::from_secs(8);
+        let stale = self.said.is_some()
+            && self.tone != Tone::Trouble
+            && self.said_at.is_some_and(|at| at.elapsed() >= SAID_FOR);
+        if stale {
+            self.clear_said();
+        }
+        stale
+    }
+
+    /// Takes the message down and gives the bar a fresh hint.
+    fn clear_said(&mut self) {
+        self.said = None;
+        self.said_at = None;
+        self.hint = SharedString::from(crate::words::hint_besides(&self.hint));
     }
 
     /// Puts an outcome in the footer: what worked in green, what did not
@@ -1397,8 +1425,9 @@ impl AutobahnApp {
                 // A new pane is a new look at the window, which is the
                 // moment a second hint is worth reading. Never the one
                 // already there: a line that was meant to change and
-                // did not reads as a click that did not land.
-                this.hint = SharedString::from(crate::words::hint_besides(&this.hint));
+                // did not reads as a click that did not land. What the
+                // last pane said goes with it, red or not.
+                this.clear_said();
                 this.settle(pane, window, cx);
                 cx.notify();
             }))

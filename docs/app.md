@@ -36,6 +36,8 @@ Keep the command matched to the running supervisor. A version mismatch is report
 
 Conflict actions run the same operations as the command line — see [Conflicts](./conflicts.md). The app never merges file contents. A conflict can be about a file's executable bit, a symbolic link, or a directory, so there is not always a text difference to show.
 
+The queue groups conflicts by folder. A folder row has its own **Keep** buttons, which settle every conflict under it in one command. Tick any rows, and a bar appears with the same buttons for the ticked set; three ticked conflicts cost one scan, not three. The same file on two hosts is two rows, and each row names its host. From the Groups page, a session's "N conflicts" line has a **See them** link that opens this pane narrowed to that session; the chip at the top of the queue shows every session again.
+
 **Diff** puts the two sides underneath, labelled by side rather than by the files actually compared:
 
 ![The Conflicts pane with a unified diff open between the primary and a replica](../assets/screenshots/conflicts.png)

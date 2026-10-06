@@ -20,6 +20,37 @@ use gpui_kit::*;
 
 use super::{AMBER, BLUE, DIM, FAINT, GREEN, INK, RED};
 
+/// Fills the gaps between coloured runs, so `range` comes back covered
+/// end to end and in order, which is the contract of `styles`.
+fn cover(
+    runs: &[(Range<usize>, HighlightStyle)],
+    range: &Range<usize>,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let mut out = Vec::new();
+    let mut at = range.start;
+    for (span, style) in runs {
+        if span.end <= at {
+            continue;
+        }
+        if span.start >= range.end {
+            break;
+        }
+        let start = span.start.max(at);
+        let end = span.end.min(range.end);
+        if at < start {
+            out.push((at..start, HighlightStyle::default()));
+        }
+        if start < end {
+            out.push((start..end, *style));
+        }
+        at = end;
+    }
+    if at < range.end {
+        out.push((at..range.end, HighlightStyle::default()));
+    }
+    out
+}
+
 /// A line's own colour, chosen from the word that opens its message.
 fn ink_for(word: &str) -> u32 {
     match word {
@@ -139,29 +170,79 @@ impl InputHighlighter for LogInk {
         // The contract is full cover: every byte of `range` named once,
         // in order. Ours name only the coloured parts, so the gaps are
         // filled here rather than stored.
-        let mut out = Vec::new();
-        let mut at = range.start;
-        for (span, style) in &self.runs {
-            if span.end <= at {
-                continue;
+        cover(&self.runs, range)
+    }
+
+    fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
+        Vec::new()
+    }
+}
+
+/// A unified diff's colour: a line is one thing from end to end, and
+/// its first character says which.
+fn diff_style(line: &str) -> HighlightStyle {
+    let (colour, ground) = match line.as_bytes().first() {
+        _ if line.starts_with("+++") || line.starts_with("---") => (FAINT, None),
+        _ if line.starts_with("diff ") || line.starts_with("index ") => (FAINT, None),
+        Some(b'+') => (GREEN, Some(GREEN)),
+        Some(b'-') => (RED, Some(RED)),
+        Some(b'@') => (BLUE, Some(BLUE)),
+        Some(b'\\') => (FAINT, None),
+        _ => (DIM, None),
+    };
+    HighlightStyle {
+        color: Some(rgb(colour).into()),
+        background_color: ground.map(|ground| rgba((ground << 8) | 0x14).into()),
+        ..Default::default()
+    }
+}
+
+/// The diff's highlighter: one run per line.
+pub(super) struct DiffInk {
+    runs: Vec<(Range<usize>, HighlightStyle)>,
+}
+
+impl DiffInk {
+    pub(super) fn new() -> Self {
+        DiffInk { runs: Vec::new() }
+    }
+
+    fn read(text: &str) -> Vec<(Range<usize>, HighlightStyle)> {
+        let mut runs = Vec::new();
+        let mut at = 0usize;
+        for line in text.split_inclusive('\n') {
+            let bare = line.trim_end_matches(['\n', '\r']);
+            if !bare.is_empty() {
+                runs.push((at..at + bare.len(), diff_style(bare)));
             }
-            if span.start >= range.end {
-                break;
-            }
-            let start = span.start.max(at);
-            let end = span.end.min(range.end);
-            if at < start {
-                out.push((at..start, HighlightStyle::default()));
-            }
-            if start < end {
-                out.push((start..end, *style));
-            }
-            at = end;
+            at += line.len();
         }
-        if at < range.end {
-            out.push((at..range.end, HighlightStyle::default()));
-        }
-        out
+        runs
+    }
+}
+
+impl InputHighlighter for DiffInk {
+    fn language(&self) -> SharedString {
+        "diff".into()
+    }
+
+    fn update(
+        &mut self,
+        _edit: Option<InputEdit>,
+        text: &Rope,
+        _folding: bool,
+        _window: &mut Window,
+        _cx: &mut Context<EditorState>,
+    ) {
+        self.runs = DiffInk::read(&text.to_string());
+    }
+
+    fn styles(
+        &self,
+        range: &Range<usize>,
+        _resolver: &dyn HighlightStyleResolver,
+    ) -> Vec<(Range<usize>, HighlightStyle)> {
+        cover(&self.runs, range)
     }
 
     fn fold_ranges(&self, _text: &Rope) -> Vec<FoldRange> {
@@ -174,7 +255,7 @@ mod tests {
     // No glob from the parent here: `use gpui_kit::*` brings the kit's own
     // `test` macro with it, and the attribute below would then expand into
     // itself for ever.
-    use super::{LogInk, AMBER, BLUE, FAINT, INK, RED};
+    use super::{DiffInk, LogInk, AMBER, BLUE, DIM, FAINT, GREEN, INK, RED};
     use gpui_kit::component::input::{HighlightStyleResolver, InputHighlighter};
     use gpui_kit::{HighlightStyle, Rgba};
 
@@ -213,6 +294,30 @@ mod tests {
         for needle in ["2026-09-24", "debug:", "[dev@halle", "cycle"] {
             assert_eq!(colour_of(CHATTER, needle), Some(FAINT), "{needle}");
         }
+    }
+
+    #[test]
+    fn a_diff_line_takes_the_colour_of_its_sign() {
+        let diff = "--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n same\n";
+        let colour_at = |needle: &str| {
+            let at = diff.find(needle).unwrap();
+            DiffInk::read(diff)
+                .iter()
+                .find(|(span, _)| span.contains(&at))
+                .and_then(|(_, style)| style.color)
+                .map(|colour| {
+                    let rgba = Rgba::from(colour);
+                    ((rgba.r * 255.).round() as u32) << 16
+                        | ((rgba.g * 255.).round() as u32) << 8
+                        | (rgba.b * 255.).round() as u32
+                })
+        };
+        assert_eq!(colour_at("--- a/x"), Some(FAINT));
+        assert_eq!(colour_at("+++ b/x"), Some(FAINT));
+        assert_eq!(colour_at("@@"), Some(BLUE));
+        assert_eq!(colour_at("-old"), Some(RED));
+        assert_eq!(colour_at("+new"), Some(GREEN));
+        assert_eq!(colour_at(" same"), Some(DIM));
     }
 
     #[test]

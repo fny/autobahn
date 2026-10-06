@@ -15,12 +15,14 @@
 
 mod ink;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::dialog::{Dialog, DialogButtonProps};
 use gpui_kit::component::input::{
     Editor, EditorState, InputEvent, InputHighlighter, Textarea, TextareaState,
@@ -28,6 +30,7 @@ use gpui_kit::component::input::{
 use gpui_kit::component::menu::DropdownMenu as _;
 use gpui_kit::component::searchable_list::{SearchableListItem, SearchableVec};
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::text::{SelectionFormat, TextView};
 use gpui_kit::component::{
@@ -459,7 +462,17 @@ pub struct AutobahnApp {
     /// difference when it has been asked for.
     conflict: Option<Conflict>,
     sides: Option<(Side, Side)>,
+    /// The one session the conflicts pane is narrowed to, when a
+    /// session's own conflicts line brought the window here.
+    conflict_filter: Option<(String, String)>,
+    /// The conflicts ticked for settling together.
+    ticked: BTreeSet<Ticket>,
     diff: Option<String>,
+    /// The diff, in the kit's read-only editor, so it selects and copies
+    /// a line at a time; and the text it was made from, so a diff that
+    /// has not changed keeps its view and its scroll.
+    diff_view: Option<Entity<EditorState>>,
+    diff_shown: String,
     /// The log, in the kit's own code editor: selectable, searchable
     /// with control-F, and set in the monospace the theme names.
     log: Option<Entity<EditorState>>,
@@ -562,6 +575,8 @@ pub struct AutobahnApp {
     /// The group whose report is being read right now, since reading
     /// scans both sides of every session and takes as long as that takes.
     doctoring: Option<String>,
+    /// Whether an order to the service manager is being carried out.
+    ordering: bool,
     /// Whether there is an `autobahn` to talk to. Read once at the
     /// start and again after an install, because it is the answer to
     /// "is this window of any use yet".
@@ -850,7 +865,11 @@ impl AutobahnApp {
             selected: None,
             conflict: None,
             sides: None,
+            conflict_filter: None,
+            ticked: BTreeSet::new(),
             diff: None,
+            diff_view: None,
+            diff_shown: String::new(),
             log: None,
             log_path: None,
             log_lines: 0,
@@ -892,6 +911,7 @@ impl AutobahnApp {
             copied_at: None,
             doctor: None,
             doctoring: None,
+            ordering: false,
             command_build: surface::command_build(),
             supervisor_build: surface::SupervisorBuild::Absent,
         };
@@ -1172,6 +1192,7 @@ impl Render for AutobahnApp {
         let pane = self.pane;
         let room = Room::of(window);
         self.room = room;
+        self.keep_diff_view(window, cx);
         // Nothing else in this window can say anything true without a
         // command to ask, so nothing else is drawn.
         if !self.ready || pane == Pane::Welcome {
@@ -1383,6 +1404,7 @@ impl AutobahnApp {
             fill("service.asking", &[("order", order.label())]),
             Tone::Plain,
         );
+        self.ordering = true;
         let config = self.config.clone();
         let state_root = self.state_root.clone();
         cx.spawn(async move |this, cx| {
@@ -1391,6 +1413,7 @@ impl AutobahnApp {
                 .spawn(async move { surface::ask(order, config.as_deref(), &state_root) })
                 .await;
             this.update(cx, |this, cx| {
+                this.ordering = false;
                 this.say_result(done);
                 // Whatever it did, the fleet is a different shape now.
                 this.read_at = None;
@@ -1548,11 +1571,12 @@ impl AutobahnApp {
         }
     }
 
+    /// Whether something slow is running that the bar is talking about.
+    fn busy(&self) -> bool {
+        self.resolving || self.diffing || self.ordering || self.doctoring.is_some()
+    }
+
     fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
-        let age = self
-            .read_at
-            .map(|at| format_age(at.elapsed().as_secs()))
-            .unwrap_or_else(|| t("fleet.never").to_owned());
         // Whether the message showing was copied a moment ago, which is
         // what the button says for that moment.
         const COPIED_FOR: Duration = Duration::from_secs(2);
@@ -1589,6 +1613,9 @@ impl AutobahnApp {
                             None => FAINT,
                         }))
                     })
+                    // Something slow turns while it runs, so a bar that
+                    // reads the same for seconds is seen to be waiting.
+                    .when(self.busy(), |line| line.child(Spinner::new().small()))
                     .child(match &self.said {
                         Some(said) => div()
                             .text_color(rgb(colour))
@@ -1640,11 +1667,7 @@ impl AutobahnApp {
                             }
                         })),
                 ),
-                false => div()
-                    .flex_shrink_0()
-                    .pl(step(4.))
-                    .text_color(rgb(FAINT))
-                    .child(fill("fleet.read_ago", &[("age", &age)])),
+                false => div(),
             })
             .into_any_element()
     }
@@ -1731,6 +1754,30 @@ impl AutobahnApp {
                     .filter(|doctored| doctored.group == group.name),
                 |band, doctored| band.child(self.doctor_panel(&doctored, cx)),
             )
+            // While the report is being read, its place says so.
+            .when(
+                self.doctoring.as_deref() == Some(group.name.as_str()),
+                |band| {
+                    band.child(
+                        div()
+                            .px(step(4.))
+                            .py(step(2.5))
+                            .flex()
+                            .items_center()
+                            .gap(step(2.))
+                            .border_b_1()
+                            .border_color(rgb(HAIR))
+                            .bg(rgb(RAISED))
+                            .child(Spinner::new().small())
+                            .child(
+                                div()
+                                    .text_size(px(11.5))
+                                    .text_color(rgb(DIM))
+                                    .child(t("group.doctor_reading")),
+                            ),
+                    )
+                },
+            )
             .children(rows)
             .into_any_element()
     }
@@ -1753,47 +1800,39 @@ impl AutobahnApp {
                         what,
                     })
                 };
-                // Each item says what it does when hovered, as the
-                // buttons it replaced did.
-                let item =
-                    |id: &'static str, label: &'static str, tip: &'static str, colour: u32| {
-                        move |_: &mut Window, _: &mut App| {
-                            div()
-                                .id(id)
-                                .w_full()
-                                .text_color(rgb(colour))
-                                .tooltip(move |window, cx| {
-                                    gpui_kit::component::tooltip::Tooltip::new(tip)
-                                        .build(window, cx)
-                                })
-                                .child(label)
-                        }
-                    };
+                // What each one does sits under its name. A tooltip
+                // would open under the mouse, on top of the menu.
+                let item = |label: &'static str, about: &'static str, colour: u32| {
+                    move |_: &mut Window, _: &mut App| {
+                        div()
+                            .w(px(230.))
+                            .py(px(2.))
+                            .flex()
+                            .flex_col()
+                            .child(div().text_color(rgb(colour)).child(label))
+                            .child(div().text_size(px(11.)).text_color(rgb(FAINT)).child(about))
+                    }
+                };
                 menu.menu_element(
                     ask(GroupAsk::Doctor),
-                    item("menu-doctor", t("group.doctor"), t("tip.group_doctor"), INK),
+                    item(t("group.doctor"), t("tip.group_doctor"), INK),
                 )
                 .menu_element(
                     ask(GroupAsk::Flush),
-                    item("menu-flush", t("verb.flush"), t("tip.group_flush"), INK),
+                    item(t("verb.flush"), t("tip.group_flush"), INK),
                 )
                 .menu_element(
                     ask(GroupAsk::Verify),
-                    item("menu-verify", t("verb.verify"), t("tip.group_verify"), INK),
+                    item(t("verb.verify"), t("tip.group_verify"), INK),
                 )
                 .separator()
                 .menu_element(
                     ask(GroupAsk::Disable),
-                    item(
-                        "menu-disable",
-                        t("group.disable"),
-                        t("tip.group_disable"),
-                        INK,
-                    ),
+                    item(t("group.disable"), t("tip.group_disable"), INK),
                 )
                 .menu_element(
                     ask(GroupAsk::Reset),
-                    item("menu-reset", t("group.reset"), t("tip.group_reset"), RED),
+                    item(t("group.reset"), t("tip.group_reset"), RED),
                 )
             })
     }
@@ -1813,10 +1852,10 @@ impl AutobahnApp {
     /// is the thing to read first, and the Merge button sits with it.
     fn doctor_panel(&self, doctored: &Doctored, cx: &mut Context<Self>) -> Div {
         let name = doctored.group.clone();
-        let title = match doctored.offer_reset {
-            true => fill("group.reset_title", &[("name", &name)]),
-            false => fill("group.doctor_title", &[("name", &name)]),
-        };
+        // A plain report needs no title; a reset's says what Merge does.
+        let title = doctored
+            .offer_reset
+            .then(|| fill("group.reset_title", &[("name", &name)]));
         let report = doctored.report.clone();
         let merging = name.clone();
         div()
@@ -1838,12 +1877,9 @@ impl AutobahnApp {
                             .min_w(px(0.))
                             .text_size(px(11.5))
                             .font_weight(FontWeight::MEDIUM)
-                            .text_color(rgb(match doctored.offer_reset {
-                                true => AMBER,
-                                false => DIM,
-                            }))
+                            .text_color(rgb(AMBER))
                             .truncate()
-                            .child(title),
+                            .children(title),
                     )
                     .when(doctored.offer_reset, |row| {
                         row.child(
@@ -1887,28 +1923,24 @@ impl AutobahnApp {
             )
             // The report takes the height it needs and the page scrolls
             // as a whole: a scrolling box inside a scrolling page catches
-            // the wheel and holds it.
+            // the wheel and holds it. It is a fenced block in the kit's
+            // selectable view, which keeps every line and its indentation
+            // as the report wrote them, and lets a person take a line
+            // without taking the whole: Copy takes the whole.
             .child(
                 div()
                     .w_full()
                     .min_w(px(0.))
                     .px(step(4.))
                     .pb(step(3.))
-                    .font_family(self.mono.clone())
-                    .text_size(px(11.))
-                    .text_color(rgb(DIM))
-                    .flex()
-                    .flex_col()
-                    // One line at a time, as the diff is drawn: the
-                    // selectable view is Markdown underneath, and Markdown
-                    // joins lines and drops the indentation the report is
-                    // made of. Copy takes the whole report instead.
-                    .children(report.lines().map(|line| {
-                        div().child(match line.trim().is_empty() {
-                            true => "\u{a0}".to_owned(),
-                            false => crate::text::display_safe(line).to_string(),
-                        })
-                    })),
+                    .child(
+                        TextView::markdown(
+                            SharedString::from(format!("doctor-report-{name}")),
+                            format!("```text\n{}\n```", lines_safe(&report)),
+                        )
+                        .selectable(true)
+                        .selection_format(SelectionFormat::Plain),
+                    ),
             )
     }
 
@@ -1920,7 +1952,6 @@ impl AutobahnApp {
             return;
         }
         self.doctoring = Some(name.to_owned());
-        self.say(fill("group.doctoring", &[("name", name)]), Tone::Plain);
         let group = name.to_owned();
         let config = self.config.clone();
         let state_root = self.state_root.clone();
@@ -2126,16 +2157,45 @@ impl AutobahnApp {
             // What is waiting reads across the card, the reason first.
             .when(open, |band| {
                 let mut band = band;
+                let conflicts_heading = counted("waiting.conflict", session.conflicts.len(), &[]);
                 for (heading, paths) in surface::waiting_groups(session) {
+                    // The conflicts line leads to the pane that settles
+                    // them, narrowed to this session.
+                    let leads = heading == conflicts_heading;
+                    let (to_group, to_host) = (group.name.clone(), session.host.clone());
                     band = band.child(
                         div()
                             .pl(step(8.))
                             .pr(step(4.))
                             .pb(step(0.5))
+                            .flex()
+                            .items_center()
+                            .gap(step(2.))
                             .text_size(px(11.))
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(rgb(AMBER))
-                            .child(heading),
+                            .child(heading)
+                            .when(leads, |line| {
+                                line.child(
+                                    Button::new(SharedString::from(format!(
+                                        "see-{}-{}",
+                                        group.name, session.replica
+                                    )))
+                                    .xsmall()
+                                    .ghost()
+                                    .label(t("conflicts.see"))
+                                    .tooltip(t("tip.see_conflicts"))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_conflicts_for(
+                                            to_group.clone(),
+                                            to_host.clone(),
+                                            window,
+                                            cx,
+                                        );
+                                        cx.notify();
+                                    })),
+                                )
+                            }),
                     );
                     for path in paths {
                         band = band.child(
@@ -2170,7 +2230,7 @@ impl AutobahnApp {
                     // A conflict first — those have something to do
                     // about them — but an empty pane beside a list of
                     // one is worse than opening the one.
-                    let waiting = self.waiting_list();
+                    let waiting = self.shown_waiting();
                     let first = waiting
                         .iter()
                         .find(|it| !it.blocked)
@@ -2216,6 +2276,35 @@ impl AutobahnApp {
             }
         }
         waiting
+    }
+
+    /// What the conflicts pane lists: everything, or one session's.
+    fn shown_waiting(&self) -> Vec<Conflict> {
+        let waiting = self.waiting_list();
+        match &self.conflict_filter {
+            None => waiting,
+            Some((group, host)) => waiting
+                .into_iter()
+                .filter(|item| item.group == *group && item.host == *host)
+                .collect(),
+        }
+    }
+
+    /// Opens the conflicts pane on one session's conflicts alone.
+    fn open_conflicts_for(
+        &mut self,
+        group: String,
+        host: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.conflict_filter = Some((group, host));
+        self.conflict = None;
+        self.sides = None;
+        self.diff = None;
+        self.pane = Pane::Conflicts;
+        self.clear_said();
+        self.settle(Pane::Conflicts, window, cx);
     }
 
     fn open_conflict(&mut self, item: Conflict) {
@@ -2335,8 +2424,9 @@ impl AutobahnApp {
     // ── the conflicts ────────────────────────────────────────────────
 
     fn conflicts(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let waiting = self.waiting_list();
-        if waiting.is_empty() {
+        let waiting = self.shown_waiting();
+        let filter = self.conflict_filter.clone();
+        if waiting.is_empty() && filter.is_none() {
             return empty(t("conflicts.none"));
         }
         let open = self.conflict.clone();
@@ -2345,6 +2435,7 @@ impl AutobahnApp {
         // half a window wide beside a detail that is the other half is
         // two things neither of which can be read.
         let showing_detail = room == Room::Tight && open.is_some();
+        let ticked = self.ticked.clone();
         div()
             .flex_1()
             .min_h(px(0.))
@@ -2352,85 +2443,47 @@ impl AutobahnApp {
             .when(!showing_detail, |pane| {
                 pane.child(
                     div()
-                        .id("queue")
                         .when(room > Room::Tight, |queue| {
                             queue.w(px(352.)).flex_shrink_0()
                         })
                         .when(room == Room::Tight, |queue| queue.flex_1().min_w(px(0.)))
                         .h_full()
-                        .overflow_y_scroll()
-                        .p(step(3.))
                         .flex()
                         .flex_col()
-                        .gap(step(0.5))
                         .border_r_1()
                         .border_color(rgb(LINE))
                         .bg(rgb(SUNK))
-                        .children(waiting.into_iter().enumerate().map(|(index, item)| {
-                            let chosen = open.as_ref() == Some(&item);
-                            let name = item
-                                .path
-                                .rsplit('/')
-                                .next()
-                                .unwrap_or(&item.path)
-                                .to_owned();
-                            let where_ = match item.path.rsplit_once('/') {
-                                Some((directory, _)) => format!("{} · {directory}/", item.group),
-                                None => item.group.clone(),
-                            };
-                            let colour = match item.blocked {
-                                true => RED,
-                                false => AMBER,
-                            };
-                            let word = match item.blocked {
-                                true => t("conflicts.blocked"),
-                                false => t("conflicts.conflict"),
-                            };
-                            let taken = item.clone();
+                        // Arriving from a session's conflicts line narrows
+                        // the queue to that session. The chip says so, and
+                        // lets go of it.
+                        .when_some(filter, |queue, (group, host)| {
+                            queue.child(self.filter_chip(&group, &host, cx))
+                        })
+                        .child(
                             div()
-                                .id(SharedString::from(format!("waiting-{index}")))
-                                .px(step(2.5))
-                                .py(step(1.5))
-                                .rounded(px(6.))
-                                .cursor_pointer()
+                                .id("queue")
+                                .flex_1()
+                                .min_h(px(0.))
+                                .overflow_y_scroll()
+                                .p(step(3.))
                                 .flex()
                                 .flex_col()
-                                .gap(px(1.))
-                                .when(chosen, |row| row.bg(rgb(RAISED)))
-                                .hover(|row| row.bg(rgb(PANEL)))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(step(1.5))
-                                        .child(dot(colour))
-                                        .child(
-                                            div()
-                                                .flex_1()
-                                                .min_w(px(0.))
-                                                .font_family(self.mono.clone())
-                                                .text_size(px(12.5))
-                                                .truncate()
-                                                .child(
-                                                    crate::text::display_safe(&name).to_string(),
-                                                ),
-                                        )
-                                        .child(pill(word, colour)),
-                                )
-                                .child(
-                                    div()
-                                        .pl(step(3.5))
-                                        .font_family(self.mono.clone())
-                                        .text_size(px(10.5))
-                                        .text_color(rgb(FAINT))
-                                        .truncate()
-                                        .child(where_),
-                                )
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.open_conflict(taken.clone());
-                                    cx.notify();
-                                }))
-                        })),
+                                .gap(step(0.5))
+                                .when(waiting.is_empty(), |queue| {
+                                    queue.child(
+                                        div()
+                                            .p(step(3.))
+                                            .text_size(px(12.))
+                                            .text_color(rgb(FAINT))
+                                            .child(t("conflicts.none_here")),
+                                    )
+                                })
+                                .children(self.folder_rows(&waiting, open.as_ref(), &ticked, cx)),
+                        )
+                        // The bar for the ticked ones, while anything is.
+                        .when(!ticked.is_empty(), |queue| {
+                            queue.child(self.ticked_bar(&waiting, &ticked, cx))
+                        }),
                 )
             })
             .when(room > Room::Tight || showing_detail, |pane| {
@@ -2442,15 +2495,350 @@ impl AutobahnApp {
             .into_any_element()
     }
 
+    /// The chip that says which session the queue is narrowed to.
+    fn filter_chip(&self, group: &str, host: &str, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .px(step(3.))
+            .pt(step(3.))
+            .flex()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(1.))
+                    .pl(step(2.))
+                    .pr(step(0.5))
+                    .py(px(2.))
+                    .rounded(px(6.))
+                    .bg(tint(AMBER, 0x20))
+                    .font_family(self.mono.clone())
+                    .text_size(px(11.))
+                    .text_color(rgb(AMBER))
+                    .child(format!("{group} → {}", destination_of(host)))
+                    .child(
+                        Button::new("clear-filter")
+                            .xsmall()
+                            .ghost()
+                            .label("×")
+                            .tooltip(t("tip.clear_filter"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.conflict_filter = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    /// The queue, folder by folder: a row for the folder, with its own
+    /// Keep buttons that settle everything under it, and a row for each
+    /// conflict inside. The same file on two hosts is two rows, and each
+    /// says which host it is on.
+    fn folder_rows(
+        &self,
+        waiting: &[Conflict],
+        open: Option<&Conflict>,
+        ticked: &BTreeSet<Ticket>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut folders: Vec<((String, String), Vec<Conflict>)> = Vec::new();
+        for item in waiting {
+            let key = (item.group.clone(), folder_of(&item.path));
+            match folders.iter_mut().find(|(other, _)| *other == key) {
+                Some((_, items)) => items.push(item.clone()),
+                None => folders.push((key, vec![item.clone()])),
+            }
+        }
+        let mut rows = Vec::new();
+        for (index, ((group, folder), items)) in folders.into_iter().enumerate() {
+            rows.push(self.folder_row(index, &group, &folder, &items, ticked, cx));
+            for (at, item) in items.iter().enumerate() {
+                let chosen = open == Some(item);
+                let is_ticked = ticked.contains(&ticket(item));
+                rows.push(self.conflict_row(index, at, item, &folder, chosen, is_ticked, cx));
+            }
+        }
+        rows
+    }
+
+    fn folder_row(
+        &self,
+        index: usize,
+        group: &str,
+        folder: &str,
+        items: &[Conflict],
+        ticked: &BTreeSet<Ticket>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Blocked paths are listed with their folder, but nothing here
+        // settles them: that takes a hand on the file's permissions.
+        let settleable: Vec<Conflict> =
+            items.iter().filter(|item| !item.blocked).cloned().collect();
+        let all_ticked =
+            !settleable.is_empty() && settleable.iter().all(|item| ticked.contains(&ticket(item)));
+        let tickets: Vec<Ticket> = settleable.iter().map(ticket).collect();
+        let label = match folder.is_empty() {
+            true => group.to_owned(),
+            false => format!("{group} · {folder}/"),
+        };
+        div()
+            .px(step(1.))
+            .pt(step(2.))
+            .pb(step(1.))
+            .flex()
+            .flex_col()
+            .gap(step(1.))
+            .when(index > 0, |row| {
+                row.mt(step(1.5)).border_t_1().border_color(rgb(HAIR))
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(1.5))
+                    .when(!settleable.is_empty(), |row| {
+                        row.child(self.tick_box(
+                            format!("tick-folder-{index}"),
+                            all_ticked,
+                            tickets,
+                            t("tip.tick_folder"),
+                            cx,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_family(self.mono.clone())
+                            .text_size(px(11.))
+                            .text_color(rgb(DIM))
+                            .truncate()
+                            .child(crate::text::display_safe(&label).to_string()),
+                    )
+                    .child(pill(items.len().to_string(), DIM)),
+            )
+            .when(!settleable.is_empty(), |row| {
+                row.child(
+                    div()
+                        .pl(step(5.5))
+                        .flex()
+                        .flex_wrap()
+                        .gap(step(1.))
+                        .children(self.keep_buttons(&format!("folder-{index}"), settleable, cx)),
+                )
+            })
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn conflict_row(
+        &self,
+        index: usize,
+        at: usize,
+        item: &Conflict,
+        folder: &str,
+        chosen: bool,
+        is_ticked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let name = item
+            .path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&item.path)
+            .to_owned();
+        let where_ = match folder.is_empty() {
+            true => format!("{} → {}", item.group, destination_of(&item.host)),
+            false => format!(
+                "{} → {} · {folder}/",
+                item.group,
+                destination_of(&item.host)
+            ),
+        };
+        let colour = match item.blocked {
+            true => RED,
+            false => AMBER,
+        };
+        let word = match item.blocked {
+            true => t("conflicts.blocked"),
+            false => t("conflicts.conflict"),
+        };
+        let taken = item.clone();
+        div()
+            .id(SharedString::from(format!("waiting-{index}-{at}")))
+            .px(step(2.5))
+            .py(step(1.5))
+            .rounded(px(6.))
+            .cursor_pointer()
+            .flex()
+            .flex_col()
+            .gap(px(1.))
+            .when(chosen, |row| row.bg(rgb(RAISED)))
+            .hover(|row| row.bg(rgb(PANEL)))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(step(1.5))
+                    .when(!item.blocked, |row| {
+                        row.child(self.tick_box(
+                            format!("tick-{index}-{at}"),
+                            is_ticked,
+                            vec![ticket(item)],
+                            t("tip.tick"),
+                            cx,
+                        ))
+                    })
+                    .child(dot(colour))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .font_family(self.mono.clone())
+                            .text_size(px(12.5))
+                            .truncate()
+                            .child(crate::text::display_safe(&name).to_string()),
+                    )
+                    .child(pill(word, colour)),
+            )
+            .child(
+                div()
+                    .pl(step(3.5))
+                    .font_family(self.mono.clone())
+                    .text_size(px(10.5))
+                    .text_color(rgb(FAINT))
+                    .truncate()
+                    .child(where_),
+            )
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_conflict(taken.clone());
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// A checkbox that ticks these conflicts. Its click is its own: the
+    /// row around it opens the conflict, and ticking is not opening.
+    fn tick_box(
+        &self,
+        id: String,
+        checked: bool,
+        tickets: Vec<Ticket>,
+        tip: &'static str,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(
+                Checkbox::new(SharedString::from(id))
+                    .checked(checked)
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |this, wanted: &bool, _, cx| {
+                        for ticket in &tickets {
+                            match *wanted {
+                                true => this.ticked.insert(ticket.clone()),
+                                false => this.ticked.remove(ticket),
+                            };
+                        }
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// Three ways to settle these conflicts together.
+    fn keep_buttons(
+        &self,
+        id: &str,
+        items: Vec<Conflict>,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        [
+            (
+                Keep::Primary,
+                t("conflicts.keep_primary"),
+                t("tip.many_primary"),
+            ),
+            (
+                Keep::Replica,
+                t("conflicts.keep_replicas"),
+                t("tip.many_replica"),
+            ),
+            (Keep::Both, t("conflicts.both"), t("tip.many_both")),
+        ]
+        .into_iter()
+        .map(|(keep, label, tip)| {
+            let items = items.clone();
+            Button::new(SharedString::from(format!("{id}-{}", keep.name())))
+                .xsmall()
+                .outline()
+                .disabled(self.resolving || items.is_empty())
+                .label(label)
+                .tooltip(tip)
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.settle_all(&items, keep, cx);
+                    cx.notify();
+                }))
+                .into_any_element()
+        })
+        .collect()
+    }
+
+    /// The bar under the queue while anything is ticked: how many, and
+    /// the three ways to settle them in one go.
+    fn ticked_bar(
+        &self,
+        waiting: &[Conflict],
+        ticked: &BTreeSet<Ticket>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let chosen: Vec<Conflict> = waiting
+            .iter()
+            .filter(|item| !item.blocked && ticked.contains(&ticket(item)))
+            .cloned()
+            .collect();
+        div()
+            .px(step(3.))
+            .py(step(2.))
+            .border_t_1()
+            .border_color(rgb(LINE))
+            .bg(rgb(PANEL))
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap(step(1.))
+            .child(
+                div()
+                    .flex_1()
+                    .text_size(px(11.))
+                    .text_color(rgb(DIM))
+                    .whitespace_nowrap()
+                    .child(fill(
+                        "conflicts.selected",
+                        &[("count", &chosen.len().to_string())],
+                    )),
+            )
+            .children(self.keep_buttons("ticked", chosen, cx))
+            .child(
+                Button::new("ticked-clear")
+                    .xsmall()
+                    .ghost()
+                    .label(t("conflicts.clear"))
+                    .tooltip(t("tip.clear_ticked"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.ticked.clear();
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     fn conflict_detail(&mut self, item: Conflict, cx: &mut Context<Self>) -> AnyElement {
         let sides = self.sides.clone();
         let binary = sides
             .as_ref()
             .is_some_and(|(primary, replica)| primary.binary || replica.binary);
-        let keep_host = match item.host.contains(':') {
-            true => surface::short_name(&item.host),
-            false => "replica".to_owned(),
-        };
+        let keep_host = destination_of(&item.host);
         let diff = self.diff.clone();
         div()
             .flex_1()
@@ -2532,7 +2920,7 @@ impl AutobahnApp {
                                         .label(t("conflicts.keep_primary"))
                                         .tooltip(t("tip.keep_primary"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.resolve(&primary, "primary", cx);
+                                            this.settle_all(&[primary.clone()], Keep::Primary, cx);
                                             cx.notify();
                                         })),
                                 )
@@ -2547,8 +2935,7 @@ impl AutobahnApp {
                                         ))
                                         .tooltip(t("tip.keep_replica"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            let keep = host.host.clone();
-                                            this.resolve(&host, &keep, cx);
+                                            this.settle_all(&[host.clone()], Keep::Replica, cx);
                                             cx.notify();
                                         })),
                                 )
@@ -2560,7 +2947,7 @@ impl AutobahnApp {
                                         .label(t("conflicts.keep_both"))
                                         .tooltip(t("tip.keep_both"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.resolve(&both, "both", cx);
+                                            this.settle_all(&[both.clone()], Keep::Both, cx);
                                             cx.notify();
                                         })),
                                 )
@@ -2608,34 +2995,39 @@ impl AutobahnApp {
             .when_some(sides.filter(|_| binary), |column, (primary, replica)| {
                 column.child(self.binary_card(&item, &primary, &replica, cx))
             })
-            .when_some(diff.filter(|_| !binary), |column, diff| {
+            // While the diff is being read, its place says so.
+            .when(self.diffing && !binary, |column| {
                 column.child(
                     div()
-                        .id("diff")
-                        .flex_1()
-                        .min_h(px(0.))
-                        .overflow_scroll()
-                        .px(step(4.5))
+                        .px(step(6.))
                         .py(step(4.))
-                        .font_family(self.mono.clone())
-                        .text_size(px(11.))
                         .flex()
-                        .flex_col()
-                        .children(diff.lines().map(|line| {
-                            let (colour, ground) = match line.chars().next() {
-                                Some('+') => (GREEN, tint(GREEN, 0x14)),
-                                Some('-') => (RED, tint(RED, 0x14)),
-                                Some('@') => (BLUE, tint(BLUE, 0x10)),
-                                _ => (DIM, rgba(0x00000000)),
-                            };
+                        .items_center()
+                        .gap(step(2.))
+                        .child(Spinner::new().small())
+                        .child(
                             div()
-                                .px(step(1.5))
-                                .bg(ground)
-                                .text_color(rgb(colour))
-                                .child(crate::text::display_safe(line).to_string())
-                        })),
+                                .text_size(px(11.5))
+                                .text_color(rgb(DIM))
+                                .child(t("conflicts.diff_reading")),
+                        ),
                 )
             })
+            // The diff sits in the kit's read-only editor: it wraps to fit,
+            // selects, and copies a line at a time; the button is how the
+            // whole of it leaves.
+            .when_some(
+                self.diff_view.clone().filter(|_| !binary && diff.is_some()),
+                |column, view| {
+                    column.child(
+                        div()
+                            .flex_1()
+                            .min_h(px(0.))
+                            .p(step(3.))
+                            .child(Editor::new(&view).readonly(true).h_full()),
+                    )
+                },
+            )
             .into_any_element()
     }
 
@@ -2969,7 +3361,7 @@ impl AutobahnApp {
                         Ok(manifest) => div()
                             .font_family(self.mono.clone())
                             .text_size(px(11.))
-                            .text_color(rgb(DIM))
+                            .text_color(rgb(INK))
                             .flex()
                             .flex_col()
                             .gap(px(1.))
@@ -5099,63 +5491,137 @@ impl AutobahnApp {
 
     /// Settles a conflict off the main thread: `resolve` scans both
     /// sides of the session, which on a large tree takes a while.
-    fn resolve(&mut self, item: &Conflict, keep: &str, cx: &mut Context<Self>) {
-        if self.resolving {
+    /// Settles these conflicts one way, however many and wherever they
+    /// are: one `resolve` per session they belong to, each naming every
+    /// path of its own, so a folder of twenty costs one scan, not twenty.
+    fn settle_all(&mut self, items: &[Conflict], keep: Keep, cx: &mut Context<Self>) {
+        let mut jobs: Vec<(String, String, Vec<String>)> = Vec::new();
+        for item in items.iter().filter(|item| !item.blocked) {
+            match jobs
+                .iter_mut()
+                .find(|(group, host, _)| *group == item.group && *host == item.host)
+            {
+                Some((_, _, paths)) => paths.push(item.path.clone()),
+                None => jobs.push((
+                    item.group.clone(),
+                    item.host.clone(),
+                    vec![item.path.clone()],
+                )),
+            }
+        }
+        self.run_resolve(jobs, keep, cx);
+    }
+
+    /// Runs the jobs off the main thread, one `resolve` each, and says
+    /// how it went. A job is one session's paths.
+    fn run_resolve(
+        &mut self,
+        jobs: Vec<(String, String, Vec<String>)>,
+        keep: Keep,
+        cx: &mut Context<Self>,
+    ) {
+        if self.resolving || jobs.is_empty() {
             return;
         }
         self.resolving = true;
-        let path = crate::text::display_safe(&item.path).to_string();
-        self.say(
-            fill("conflicts.resolving", &[("keep", keep), ("path", &path)]),
-            Tone::Plain,
-        );
-        let item = item.clone();
-        let keep = keep.to_owned();
+        let count: usize = jobs.iter().map(|(_, _, paths)| paths.len()).sum();
+        // What the bar says: the winner, and the path when there is one.
+        let winner = match (keep, jobs.as_slice()) {
+            (Keep::Primary, _) => "primary".to_owned(),
+            (Keep::Both, _) => "both".to_owned(),
+            (Keep::Replica, [(_, host, _)]) => host.clone(),
+            (Keep::Replica, _) => "replica".to_owned(),
+        };
+        let (saying, kept) = match count {
+            1 => {
+                let path = crate::text::display_safe(&jobs[0].2[0]).to_string();
+                (
+                    fill("conflicts.resolving", &[("keep", &winner), ("path", &path)]),
+                    fill("status.kept", &[("keep", &winner), ("path", &path)]),
+                )
+            }
+            _ => {
+                let count = count.to_string();
+                (
+                    fill(
+                        "conflicts.resolving_several",
+                        &[("keep", &winner), ("count", &count)],
+                    ),
+                    fill(
+                        "status.kept_several",
+                        &[("keep", &winner), ("count", &count)],
+                    ),
+                )
+            }
+        };
+        self.say(saying, Tone::Plain);
+        let settled: Vec<Ticket> = jobs
+            .iter()
+            .flat_map(|(group, host, paths)| {
+                paths
+                    .iter()
+                    .map(move |path| (group.clone(), host.clone(), path.clone()))
+            })
+            .collect();
         let config = self.config.clone();
         let state_root = self.state_root.clone();
         cx.spawn(async move |this, cx| {
             let done = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut command = std::process::Command::new(surface::exe());
-                    // This row's destination, not the whole group: the
-                    // conflict is one session's, and the command would
-                    // otherwise reach for every destination in the
-                    // group, including one that is away.
-                    command
-                        .arg("resolve")
-                        .arg(&item.group)
-                        .arg(&item.path)
-                        .arg("--keep")
-                        .arg(&keep)
-                        .arg("--host")
-                        .arg(&item.host)
-                        .arg("--yes")
-                        .arg("--state-root")
-                        .arg(&state_root);
-                    if let Some(config) = &config {
-                        command.arg("--config").arg(config);
-                    }
-                    match command.output() {
-                        Ok(output) if output.status.success() => {
-                            Ok(fill("status.kept", &[("keep", &keep), ("path", &path)]))
+                    for (group, host, paths) in &jobs {
+                        let mut command = std::process::Command::new(surface::exe());
+                        // This session's destination, not the whole group:
+                        // the command would otherwise reach for every
+                        // destination in the group, including one that is
+                        // away.
+                        command
+                            .arg("resolve")
+                            .arg(group)
+                            .args(paths)
+                            .arg("--keep")
+                            .arg(keep.word(host))
+                            .arg("--host")
+                            .arg(host)
+                            .arg("--yes")
+                            .arg("--state-root")
+                            .arg(&state_root);
+                        if let Some(config) = &config {
+                            command.arg("--config").arg(config);
                         }
-                        Ok(output) => {
-                            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+                        match command.output() {
+                            Ok(output) if output.status.success() => {}
+                            Ok(output) => {
+                                return Err(String::from_utf8_lossy(&output.stderr)
+                                    .trim()
+                                    .to_owned())
+                            }
+                            Err(error) => {
+                                return Err(fill(
+                                    "status.resolve_failed",
+                                    &[("error", &error.to_string())],
+                                ))
+                            }
                         }
-                        Err(error) => Err(fill(
-                            "status.resolve_failed",
-                            &[("error", &error.to_string())],
-                        )),
                     }
+                    Ok(kept)
                 })
                 .await;
             this.update(cx, |this, cx| {
                 this.resolving = false;
                 if done.is_ok() {
-                    this.conflict = None;
-                    this.sides = None;
-                    this.diff = None;
+                    for ticket in &settled {
+                        this.ticked.remove(ticket);
+                    }
+                    let open_settled = this
+                        .conflict
+                        .as_ref()
+                        .is_some_and(|open| settled.contains(&ticket(open)));
+                    if open_settled {
+                        this.conflict = None;
+                        this.sides = None;
+                        this.diff = None;
+                    }
                 }
                 this.say_result(done);
                 this.read_at = None;
@@ -5168,12 +5634,44 @@ impl AutobahnApp {
 
     /// Reads a conflict's diff off the main thread: `diff` fetches one
     /// side over SSH, and a slow host is not the window's to wait for.
+    /// Keeps the diff's editor in step with the diff. Made here, where
+    /// the window is: the diff itself arrives from a thread that has
+    /// none, and the editor cannot be made without one.
+    fn keep_diff_view(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(text) = self.diff.clone() else {
+            self.diff_view = None;
+            self.diff_shown.clear();
+            return;
+        };
+        if self.diff_view.is_some() && self.diff_shown == text {
+            return;
+        }
+        let shown = lines_safe(&text);
+        let view = cx.new(|cx| {
+            let mut state = EditorState::new(window, cx)
+                .language("diff")
+                .line_number(false)
+                .scroll_beyond_last_line(Some(0))
+                .default_value(shown);
+            state.set_highlighter_factory(
+                Rc::new(|language| match language {
+                    "diff" => Some(Box::new(ink::DiffInk::new()) as Box<dyn InputHighlighter>),
+                    _ => None,
+                }),
+                cx,
+            );
+            state
+        });
+        self.diff_view = Some(view);
+        self.diff_shown = text;
+    }
+
     fn read_diff(&mut self, item: &Conflict, cx: &mut Context<Self>) {
         if self.diffing {
             return;
         }
         self.diffing = true;
-        self.diff = Some(t("conflicts.diff_reading").to_owned());
+        self.diff = None;
         let item = item.clone();
         let config = self.config.clone();
         let state_root = self.state_root.clone();
@@ -5294,6 +5792,56 @@ impl Verb {
     }
 }
 
+/// Whose version wins when conflicts are settled.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Keep {
+    Primary,
+    Replica,
+    Both,
+}
+
+impl Keep {
+    /// The word `resolve --keep` takes. A replica is named by its host.
+    fn word(self, host: &str) -> String {
+        match self {
+            Keep::Primary => "primary".to_owned(),
+            Keep::Both => "both".to_owned(),
+            Keep::Replica => host.to_owned(),
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Keep::Primary => "primary",
+            Keep::Replica => "replica",
+            Keep::Both => "both",
+        }
+    }
+}
+
+/// What names one conflict: its group, its session's host, its path.
+type Ticket = (String, String, String);
+
+fn ticket(item: &Conflict) -> Ticket {
+    (item.group.clone(), item.host.clone(), item.path.clone())
+}
+
+/// The folder a path is in, from the root; empty at the root.
+fn folder_of(path: &str) -> String {
+    path.rsplit_once('/')
+        .map(|(folder, _)| folder.to_owned())
+        .unwrap_or_default()
+}
+
+/// How a row names its session's destination: the host, or "replica"
+/// for a path on this machine. The status's label is one or the other.
+fn destination_of(host: &str) -> String {
+    match host.starts_with('/') || host.starts_with('~') {
+        true => "replica".to_owned(),
+        false => surface::short_name(host),
+    }
+}
+
 // ── the small pieces ─────────────────────────────────────────────────
 
 /// A line of the loader's own words, which a person can select and copy.
@@ -5312,6 +5860,16 @@ fn said(id: impl Into<SharedString>, words: &str, colour: u32, size: f32) -> imp
         .selection_format(SelectionFormat::Plain)
         .text_size(px(size))
         .text_color(rgb(colour))
+}
+
+/// A block of text with its control characters escaped, line by line:
+/// the whole at once would escape the newlines too, and the lines would
+/// run together with a `\n` written between them.
+fn lines_safe(text: &str) -> String {
+    text.lines()
+        .map(|line| crate::text::display_safe(line).into_owned())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn dot(colour: u32) -> Div {

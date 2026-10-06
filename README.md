@@ -85,7 +85,7 @@ Autobahn ships with a desktop app and menu bar item that are about as well teste
 - **macOS**: [Apple Silicon](https://github.com/fny/autobahn/releases/latest/download/Autobahn-macos-aarch64.zip), Intel you build
 - **Linux**: [x86_64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-x86_64.tar.gz), [aarch64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-aarch64.tar.gz)
 
-On Linux, extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the [desktop libraries the workflow lists](https://github.com/fny/autobahn/blob/5692537/.github/workflows/app.yml#L90-L98).
+On Linux, extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the packages listed in the archive's `APT_REQUIREMENTS.txt`, whose header shows the one command that installs them.
 
 <img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
 

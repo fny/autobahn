@@ -103,7 +103,7 @@ xcrun notarytool store-credentials autobahn \
 
 Pushing a `v*` tag runs `.github/workflows/release.yml`, whose `mac` job builds and signs everything macOS on one runner: the two command-line binaries, signed and notarised by `apps/tray/notarize-cli.sh`, and both apps — the window as `Autobahn-macos-aarch64.zip` and the menu bar one as `Autobahn-Tray-macos-aarch64.zip`. Each is notarised on its own submission, because a ticket is stapled to one bundle.
 
-The `app-linux` job builds the window app for Linux on native `x86_64` and `aarch64` runners, as `Autobahn-linux-x86_64.tar.gz` and `Autobahn-linux-aarch64.tar.gz`. These are unsigned, since Linux has nothing like Gatekeeper, but they are in `SHA256SUMS` with everything else, so the minisign signature covers them.
+The `app-linux` job builds the window app for Linux on native `x86_64` and `aarch64` runners, as `Autobahn-linux-x86_64.tar.gz` and `Autobahn-linux-aarch64.tar.gz`. These are unsigned, since Linux has nothing like Gatekeeper, but they are in `SHA256SUMS` with everything else, so the minisign signature covers them. Each carries an `APT_REQUIREMENTS.txt` written by `scripts/apt-requirements.sh` at build time: the Debian or Ubuntu packages that own the libraries the binary links, with the build image's versions in its header.
 
 The job builds everything first — the binaries and both bundles — and checks that each `Info.plist` reports the tag's version. Only then does it import the certificate and sign with `release.sh --sign-only`, so no dependency's build script or proc macro ever runs while the identity is usable.
 

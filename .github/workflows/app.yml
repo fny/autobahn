@@ -157,9 +157,13 @@ jobs:
 
       - name: Stage the Linux build
         if: runner.os == 'Linux'
+        # With the packages the binary needs at run time, read off the
+        # binary itself, so the list is as true as the build.
         run: |
           mkdir -p stage
           cp target/release/autobahn-app stage/
+          sh scripts/apt-requirements.sh target/release/autobahn-app stage/APT_REQUIREMENTS.txt
+          cat stage/APT_REQUIREMENTS.txt
           tar -C stage -czf "autobahn-app-${{ matrix.platform }}.tar.gz" .
 
       - uses: actions/upload-artifact@v7

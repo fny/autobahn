@@ -206,9 +206,13 @@ jobs:
       - name: Build
         run: cargo build --release --locked --features app --bin autobahn-app
       - name: Archive
+        # With APT_REQUIREMENTS.txt beside the binary: the packages it
+        # needs at run time, read off the binary itself, as app.yml does.
         run: |
           mkdir stage
           cp target/release/autobahn-app stage/
+          sh scripts/apt-requirements.sh target/release/autobahn-app stage/APT_REQUIREMENTS.txt
+          cat stage/APT_REQUIREMENTS.txt
           tar -C stage -czf "Autobahn-${{ matrix.platform }}.tar.gz" .
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

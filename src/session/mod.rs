@@ -51,7 +51,7 @@ pub enum SafetyHalt {
     /// The session's ancestor cannot be read, and the two sides differ, so
     /// there is no safe way to tell a deletion from a creation or an edit
     /// from a stale copy. When they match it is rebuilt instead.
-    #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and the two sides differ, so nothing was synchronized; without that record deletions would come back and edits could be overwritten. `autobahn doctor <group>` shows how they differ. Once they match it rebuilds on its own, or `autobahn reset <group>` merges them")]
+    #[error("halted: this build cannot read the saved record of what the two sides last agreed on ({0}), and the two sides differ, so nothing was synchronized: without that record, deleted files would come back and edits could be overwritten. `autobahn doctor <group>` shows how the sides differ. Once they match, the record rebuilds itself; `autobahn reset <group>` merges them instead")]
     AncestorUnreadable(String),
     /// A directory that was a mount point, synchronized as part of the tree
     /// because mounts are not ignored, is now empty or gone where the
@@ -62,7 +62,7 @@ pub enum SafetyHalt {
     MountVanished(&'static str, String),
     /// The ancestor is damaged again after being rebuilt once. A disk that
     /// damages one will damage another; it is not rebuilt twice.
-    #[error("halted: this session's record of what the two sides last agreed on cannot be read ({0}), and it was rebuilt once already after the same kind of damage; a disk that damages one will damage another, so it is not rebuilt again. Check the disk, then `autobahn reset <group>`")]
+    #[error("halted: this build cannot read the saved record of what the two sides last agreed on ({0}), and it was rebuilt once already after the same kind of damage. A disk that damages one record will damage the next, so it is not rebuilt again. Check the disk, then `autobahn reset <group>`")]
     AncestorDamagedAgain(String),
 }
 

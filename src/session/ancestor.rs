@@ -1040,12 +1040,23 @@ fn unreadable_checkpoint(found: u16) -> anyhow::Error {
 /// differently: a format is expected across upgrades, corruption twice on
 /// one session is a disk to distrust.
 #[derive(Debug, thiserror::Error)]
-#[error(
-    "the ancestor is format {found}, and this build reads formats \
-     {OLDEST_READABLE_CHECKPOINT} to {CHECKPOINT_VERSION}"
-)]
+#[error("{}", unknown_format_words(*found))]
 pub struct UnknownFormat {
     pub found: u16,
+}
+
+/// What refusing a record of format `found` says: the formats this build
+/// reads, as one number when there is one.
+fn unknown_format_words(found: u16) -> String {
+    match OLDEST_READABLE_CHECKPOINT == CHECKPOINT_VERSION {
+        true => format!(
+            "the record is format {found}, and this build reads format {CHECKPOINT_VERSION}"
+        ),
+        false => format!(
+            "the record is format {found}, and this build reads formats \
+             {OLDEST_READABLE_CHECKPOINT} to {CHECKPOINT_VERSION}"
+        ),
+    }
 }
 
 /// The formats this build reads, oldest and newest — what `autobahn

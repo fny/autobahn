@@ -14,9 +14,9 @@ If total donations surpass $10K, I pledge to relicense Autobahn under the MIT Li
 
 Justice-in-Education provides higher education access to incarcerated populations with the aim of combating mass incarceration and reducing recidivism.
 
-- Rikers Education Program: Delivers college courses and workshops for detained young people at the Rikers Island jail complex.
-- Prison Education Program: Brings credit-bearing Columbia courses to students inside regional state prisons (such as Sing Sing, Taconic, Bedford Hills, and Green Haven).
-- JIE Scholars Program: Helps motivated returning citizens take tuition-free, credit-bearing courses (starting with University Writing) at Columbia, offering comprehensive tutoring, advising, and re-entry support.
+- [Rikers Education Program](https://justiceineducation.columbia.edu/programs-overview/rikers-education-program/): Delivers college courses and workshops to incarcerated men and women at the Rikers Island jail complex.
+- [Prison Education Program](https://justiceineducation.columbia.edu/programs-overview/prison-education-program/): Brings credit-bearing Columbia courses to students inside regional state prisons (such as Sing Sing, Taconic, Bedford Hills, and Green Haven).
+- [JIE Scholars Program](https://justiceineducation.columbia.edu/jie-scholars-overview/): Helps motivated returning citizens take tuition-free, credit-bearing courses (starting with University Writing) at Columbia, offering comprehensive tutoring, advising, and re-entry support.
 
 Rehabilitative programs like these have been proven to reduce recidivism:
 

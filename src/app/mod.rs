@@ -1859,12 +1859,20 @@ impl AutobahnApp {
                     .px(step(4.))
                     .pb(step(3.))
                     .font_family(self.mono.clone())
-                    .child(said(
-                        SharedString::from(format!("doctor-text-{name}")),
-                        &crate::text::display_safe(&report),
-                        DIM,
-                        11.,
-                    )),
+                    .text_size(px(11.))
+                    .text_color(rgb(DIM))
+                    .flex()
+                    .flex_col()
+                    // One line at a time, as the diff is drawn: the
+                    // selectable view is Markdown underneath, and Markdown
+                    // joins lines and drops the indentation the report is
+                    // made of. Copy takes the whole report instead.
+                    .children(report.lines().map(|line| {
+                        div().child(match line.trim().is_empty() {
+                            true => "\u{a0}".to_owned(),
+                            false => crate::text::display_safe(line).to_string(),
+                        })
+                    })),
             )
     }
 

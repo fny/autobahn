@@ -779,6 +779,29 @@ pub(crate) fn thousands(n: u64) -> String {
     out
 }
 
+/// What went wrong, out of a session's error, for a column with room for
+/// one thing. An unreachable host's error is wrapped twice: "unable to
+/// reach X: " in front and ": unable to synchronize with X" behind, and
+/// the row already names X. What is left is the reason: the ssh message.
+pub(crate) fn cause(error: &str) -> String {
+    let error = error.trim();
+    let without_tail = match error.rfind(": unable to synchronize with ") {
+        Some(at) => &error[..at],
+        None => error,
+    };
+    let without_head = match without_tail.strip_prefix("unable to reach ") {
+        Some(rest) => rest
+            .split_once(": ")
+            .map(|(_, rest)| rest)
+            .unwrap_or(without_tail),
+        None => without_tail,
+    };
+    match without_head.trim() {
+        "" => error.to_owned(),
+        cause => cause.to_owned(),
+    }
+}
+
 /// A message as it goes to the clipboard: every line of it, with the
 /// line breaks kept and any other control character written out, so
 /// what is pasted into a terminal is text and nothing else.
@@ -1871,6 +1894,27 @@ impl Sheet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The wrappers around an unreachable host's error go; the reason
+    /// stays. Any other error is shown whole.
+    #[test]
+    fn a_cause_is_the_error_without_its_wrappers() {
+        assert_eq!(
+            cause(
+                "unable to reach dev@halle: ssh: Could not resolve hostname halle: nodename \
+                 nor servname provided, or not known: unable to synchronize with dev@halle"
+            ),
+            "ssh: Could not resolve hostname halle: nodename nor servname provided, or not known"
+        );
+        assert_eq!(
+            cause("unable to synchronize with dev@halle"),
+            "unable to synchronize with dev@halle"
+        );
+        assert_eq!(
+            cause("halted: the primary folder is missing"),
+            "halted: the primary folder is missing"
+        );
+    }
 
     /// All of a message is copied, line breaks and all; a control
     /// character in it arrives written out, not as itself.

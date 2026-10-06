@@ -3295,19 +3295,32 @@ fn run_resolve(
         }
     }
 
-    // Every session in the group is opened, because the winner's content
-    // must reach every destination — including sessions the selector did
-    // not name, when the winner is one destination and the path conflicts
-    // on another.
-    let pool = autobahn::transport::mux::AgentPool::default();
-    let mut endpoints = Vec::new();
-    for plan in &group_plans {
-        endpoints.push(autobahn::supervisor::open_endpoints(
-            plan,
-            &state_root,
-            &pool,
-        )?);
+    // A session is opened when it is first needed, not up front. When the
+    // primary's version is kept, only the sessions that hold the conflict
+    // do anything, and a destination that is away must not stop them: it
+    // takes the primary's new content on its own next cycle. When a
+    // destination's version is kept, every session is needed, because the
+    // winner's content reaches the others through the primary.
+    type Pair = (
+        Box<dyn autobahn::endpoint::Endpoint + Send>,
+        Box<dyn autobahn::endpoint::Endpoint + Send>,
+    );
+    fn opened<'a>(
+        endpoints: &'a mut [Option<Pair>],
+        index: usize,
+        plan: &autobahn::config::SessionPlan,
+        state_root: &Path,
+        pool: &autobahn::transport::mux::AgentPool,
+    ) -> Result<&'a mut Pair> {
+        if endpoints[index].is_none() {
+            endpoints[index] = Some(autobahn::supervisor::open_endpoints(
+                plan, state_root, pool,
+            )?);
+        }
+        Ok(endpoints[index].as_mut().expect("opened above"))
     }
+    let pool = autobahn::transport::mux::AgentPool::default();
+    let mut endpoints: Vec<Option<Pair>> = (0..group_plans.len()).map(|_| None).collect();
 
     let paths: std::collections::BTreeSet<String> = targets
         .iter()
@@ -3401,9 +3414,10 @@ fn run_resolve(
         if here.is_empty() {
             continue;
         }
+        let pair = opened(&mut endpoints, index, plan, &state_root, &pool)?;
         let endpoint = match primary {
-            true => &mut endpoints[index].0,
-            false => &mut endpoints[index].1,
+            true => &mut pair.0,
+            false => &mut pair.1,
         };
         let root = scan(endpoint, &side)?;
         losers.push(Loser {
@@ -3424,11 +3438,13 @@ fn run_resolve(
     // compared against, and what the next cycle must be seen to keep.
     let (winner_name, winner_root) = match winner {
         Winner::Primary | Winner::Both => {
-            ("primary".to_owned(), scan(&mut endpoints[0].0, "primary")?)
+            let pair = opened(&mut endpoints, 0, group_plans[0], &state_root, &pool)?;
+            ("primary".to_owned(), scan(&mut pair.0, "primary")?)
         }
         Winner::Replica(w) => {
             let host = group_plans[w].host.clone();
-            let root = scan(&mut endpoints[w].1, &host)?;
+            let pair = opened(&mut endpoints, w, group_plans[w], &state_root, &pool)?;
+            let root = scan(&mut pair.1, &host)?;
             (host, root)
         }
     };
@@ -3627,7 +3643,8 @@ fn run_resolve(
             // next runs.
             let scanned = match (winner, replica_loser) {
                 (Winner::Replica(w), None) if w != index => {
-                    Some(scan(&mut endpoints[index].1, &plan.host)?)
+                    let pair = opened(&mut endpoints, index, plan, &state_root, &pool)?;
+                    Some(scan(&mut pair.1, &plan.host)?)
                 }
                 _ => None,
             };
@@ -3810,7 +3827,6 @@ fn run_resolve(
         // This command owns every session: their locks are held. The parts
         // go in the order the supervisor would apply them, each through a
         // session opened on the endpoints already read.
-        let mut endpoints: Vec<Option<_>> = endpoints.into_iter().map(Some).collect();
         let mut locks: Vec<Option<_>> = locks.into_iter().map(Some).collect();
         parts.sort_by_key(|(_, _, last)| *last);
         let mut refused_paths: Vec<String> = Vec::new();
@@ -3828,7 +3844,12 @@ fn run_resolve(
                 }
                 settlement.spare(&refused_paths);
             }
-            let (primary, replica) = endpoints[index].take().expect("one part per session");
+            let (primary, replica) = match endpoints[index].take() {
+                Some(pair) => pair,
+                None => {
+                    autobahn::supervisor::open_endpoints(group_plans[index], &state_root, &pool)?
+                }
+            };
             let lock = locks[index].take().expect("one part per session");
             let applied = autobahn::session::Session::with_lock(
                 primary,

@@ -2075,6 +2075,29 @@ impl AutobahnApp {
                                                 cx.notify();
                                             })),
                                     )
+                                })
+                                // The diff wraps to fit and is read in
+                                // place; the button is how it leaves.
+                                .when(!binary && self.diff.is_some(), |row| {
+                                    row.child(
+                                        Button::new("copy-diff")
+                                            .small()
+                                            .outline()
+                                            .label(t("conflicts.copy_diff"))
+                                            .tooltip(t("tip.copy_diff"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(diff) = this.diff.clone() {
+                                                    cx.write_to_clipboard(
+                                                        ClipboardItem::new_string(
+                                                            surface::for_the_clipboard(&diff),
+                                                        ),
+                                                    );
+                                                    this.said =
+                                                        Some(t("conflicts.diff_copied").to_owned());
+                                                    cx.notify();
+                                                }
+                                            })),
+                                    )
                                 }),
                         )
                     }),
@@ -2106,7 +2129,6 @@ impl AutobahnApp {
                                 .px(step(1.5))
                                 .bg(ground)
                                 .text_color(rgb(colour))
-                                .whitespace_nowrap()
                                 .child(crate::text::display_safe(line).to_string())
                         })),
                 )
@@ -2332,12 +2354,7 @@ impl AutobahnApp {
             .map(|(index, (host, count, worst, state, error))| {
                 let said = error
                     .filter(|_| worst != Severity::Fine)
-                    .map(|error| {
-                        crate::text::display_safe(
-                            error.rsplit(": ").next().unwrap_or(error.as_str()),
-                        )
-                        .to_string()
-                    })
+                    .map(|error| crate::text::display_safe(&surface::cause(&error)).to_string())
                     .unwrap_or(state);
                 div()
                     .h(step(9.))
@@ -2347,10 +2364,15 @@ impl AutobahnApp {
                     .gap(step(3.))
                     .when(index > 0, |row| row.border_t_1().border_color(rgb(HAIR)))
                     .child(dot(colour_of(worst)))
+                    // The host takes what a host name needs; the message
+                    // takes the rest, since it is what someone came to read.
                     .child(
                         div()
-                            .flex_1()
-                            .min_w(px(0.))
+                            .w(match room {
+                                Room::Wide => px(280.),
+                                _ => px(200.),
+                            })
+                            .flex_shrink_0()
                             .font_family(self.mono.clone())
                             .text_size(px(12.5))
                             .truncate()
@@ -2359,11 +2381,8 @@ impl AutobahnApp {
                     .when(room > Room::Tight, |row| {
                         row.child(
                             div()
-                                .w(match room {
-                                    Room::Wide => px(320.),
-                                    _ => px(200.),
-                                })
-                                .flex_shrink_0()
+                                .flex_1()
+                                .min_w(px(0.))
                                 .font_family(self.mono.clone())
                                 .text_size(px(11.))
                                 .text_color(rgb(colour_of(worst)))
@@ -4573,12 +4592,17 @@ impl AutobahnApp {
 
     fn resolve(&mut self, item: &Conflict, keep: &str) {
         let mut command = std::process::Command::new(surface::exe());
+        // This row's destination, not the whole group: the conflict is
+        // one session's, and the command would otherwise reach for every
+        // destination in the group, including one that is away.
         command
             .arg("resolve")
             .arg(&item.group)
             .arg(&item.path)
             .arg("--keep")
             .arg(keep)
+            .arg("--host")
+            .arg(&item.host)
             .arg("--yes")
             .arg("--state-root")
             .arg(&self.state_root);
@@ -4606,10 +4630,15 @@ impl AutobahnApp {
 
     fn read_diff(&mut self, item: &Conflict) {
         let mut command = std::process::Command::new(surface::exe());
+        // This row's destination: without it the command compares every
+        // destination in turn, and a file that is identical on the first
+        // one read as identical, with the real difference further down.
         command
             .arg("diff")
             .arg(&item.group)
             .arg(&item.path)
+            .arg("--host")
+            .arg(&item.host)
             .arg("--state-root")
             .arg(&self.state_root);
         if let Some(config) = &self.config {

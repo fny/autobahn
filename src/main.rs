@@ -3532,7 +3532,25 @@ fn run_resolve(
         if here.is_empty() {
             continue;
         }
-        let pair = opened(&mut endpoints, index, plan, &state_root, &pool)?;
+        // A destination that is away cannot lose its copy now. When the
+        // primary's version is kept, every session here holds the
+        // conflict and has to be reached. When a destination's is, the
+        // others only clear the way: one that is away keeps its copy and
+        // its record, takes the primary's new content on its own next
+        // cycle, and reports there whatever still differs.
+        let pair = match opened(&mut endpoints, index, plan, &state_root, &pool) {
+            Ok(pair) => pair,
+            Err(error) if matches!(winner, Winner::Replica(w) if w != index) => {
+                let why = format!("{error:#}");
+                eprintln!(
+                    "  {} is away, so its copy stays until it is back: {}",
+                    plan.host,
+                    why.lines().next().unwrap_or_default()
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         let endpoint = match primary {
             true => &mut pair.0,
             false => &mut pair.1,

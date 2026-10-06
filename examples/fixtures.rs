@@ -190,7 +190,10 @@ fn write(fixture: &Fixture, at: &Path, now: u64) -> Result<Vec<String>> {
     if fixture.installed {
         std::fs::create_dir_all(shim.parent().expect("bin has a parent"))
             .context("unable to make the shim directory")?;
-        std::fs::write(&shim, SHIM).context("unable to write the shim")?;
+        // The shim is this build's version, or the service pane would
+        // advise updating a command that is only a stand-in.
+        std::fs::write(&shim, SHIM.replace("VERSION", env!("CARGO_PKG_VERSION")))
+            .context("unable to write the shim")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -222,7 +225,7 @@ const SHIM: &str = r#"#!/bin/sh
 # the app believes the command is installed, and answers plausibly when a
 # button shells out to it.
 case "$1" in
-  --version) echo "autobahn 1.0.0+e1 (fixture)" ;;
+  --version) echo "autobahn VERSION" ;;
   status)    echo "3 sessions, 1 needs you" ;;
   clean)     echo "nothing to clean" ;;
   resolve)   echo "resolved (fixture: nothing moved)" ;;
@@ -642,6 +645,9 @@ fn supervise(at: &Path) -> Result<()> {
                 notice: None,
                 logging_failed: false,
             }),
+            // The build the app compares against the command's: this
+            // one's, so the service pane has nothing to advise.
+            Ok(ControlRequest::Build) => ControlResponse::Build(autobahn::protocol::build()),
             // A button was pressed. Say it applied to nothing rather
             // than pretending to have done work.
             Ok(_) => ControlResponse::Applied { sessions: 0 },

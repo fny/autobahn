@@ -4,6 +4,7 @@
 #   scripts/views.sh list                 the fixtures and what each is for
 #   scripts/views.sh show calm conflicts  open one, to tweak how it looks
 #   scripts/views.sh sheet                photograph all of them, tiled
+#   scripts/views.sh docs                 remake the five pictures the docs use
 #
 # The fixtures are built by examples/fixtures.rs into target/views. Each
 # one is a configuration and a state root the app reads as if it were
@@ -129,8 +130,38 @@ sheet)
   fi
   ;;
 
+docs)
+  # The pictures README.md and docs/app.md show, from the fixtures they
+  # were always taken from: the welcome splash with nothing installed,
+  # three panes of a calm fleet, and the conflicts pane of a troubled
+  # one with its first diff open.
+  build
+  rm -rf "$shots"
+  mkdir -p "$shots"
+  # The window as it opens by default. A calm fleet's three groups end
+  # halfway down it, so that picture is taken in a shorter window and
+  # ends with them.
+  take() {
+    fixture=$1
+    pane=$2
+    name=$3
+    height=$4
+    into="$shots/$fixture"
+    mkdir -p "$into"
+    AUTOBAHN_DESK_WIDTH=1240 AUTOBAHN_DESK_HEIGHT="$height" \
+      launch "$fixture" --pane "$pane" --shoot "$into" >/dev/null
+    mv "$into/kit-$pane.png" "$here/assets/screenshots/$name.png"
+    echo "assets/screenshots/$name.png"
+  }
+  take fresh welcome welcome 820
+  take calm groups groups 520
+  take calm config configuration 820
+  take calm service service 820
+  take trouble conflicts:diff conflicts 820
+  ;;
+
 *)
-  sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
   exit 1
   ;;
 esac

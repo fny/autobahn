@@ -4,12 +4,15 @@
 #
 #   scripts/apt-requirements.sh target/release/autobahn-app stage/APT_REQUIREMENTS.txt
 #
-# The binary's own shared libraries are read off it (its NEEDED entries,
-# not the whole closure ldd would print), found on this machine, and traced
-# to the package that owns each; apt brings in what those packages need.
-# The build image's distribution, architecture and package versions go in
-# the header, with the commit from AUTOBAHN_COMMIT when the build set one,
-# so a reader knows exactly what the list was true of.
+# Two kinds of library are read off the binary: the ones it is linked
+# against (its NEEDED entries, not the whole closure ldd would print) and
+# the ones it opens by name while running, which ldd never sees: Wayland
+# and EGL for the window, and the Vulkan loader, which wgpu asks for by
+# name. Each is found on this machine and traced to the package that owns
+# it; apt brings in what those packages need. The build image's
+# distribution, architecture and package versions go in the header, with
+# the commit from AUTOBAHN_COMMIT when the build set one, so a reader knows
+# exactly what the list was true of.
 #
 # Linux only: it asks dpkg, so it runs where the binary was built.
 set -eu
@@ -48,6 +51,32 @@ for soname in $(objdump -p "$binary" | awk '/NEEDED/ {print $2}'); do
     fi
     packages="$packages $owner"
 done
+
+# The package that owns a library the loader knows by this name, or
+# nothing: a name the build image has no library for is not listed, since
+# these are opened when wanted rather than at start.
+owner_by_name() {
+    path=$(ldconfig -p | awk -v want="$1" '$1 == want {print $NF; exit}')
+    [ -n "$path" ] || return 0
+    owner=$(dpkg -S "$path" 2>/dev/null | head -n 1 | cut -d: -f1)
+    if [ -z "$owner" ]; then
+        owner=$(dpkg -S "$(realpath "$path")" 2>/dev/null | head -n 1 | cut -d: -f1)
+    fi
+    echo "$owner"
+}
+# Names written into the binary, plus the Vulkan loader, which ash asks
+# for through its own path. An unversioned name is a development alias of
+# a versioned one that is listed beside it.
+by_name=$(strings -n 6 "$binary" | grep -oE 'lib[A-Za-z0-9_+-]*\.so(\.[0-9]+)*' | sort -u)
+for soname in $by_name libvulkan.so.1; do
+    case "$soname" in
+        *.so) continue ;;
+    esac
+    owner=$(owner_by_name "$soname")
+    if [ -n "$owner" ]; then
+        packages="$packages $owner"
+    fi
+done
 # shellcheck disable=SC2086
 packages=$(printf '%s\n' $packages | sort -u)
 
@@ -85,9 +114,10 @@ fi
 #   grep -v '^#' APT_REQUIREMENTS.txt | xargs sudo apt-get install -y
 #
 # Generated at build time by reading the shared libraries autobahn-app is
-# linked against and asking dpkg which package owns each one
-# (scripts/apt-requirements.sh in the repository). Debian and other Ubuntu
-# releases use the same names, give or take a suffix.
+# linked against, and the ones it opens by name while running, and asking
+# dpkg which package owns each one (scripts/apt-requirements.sh in the
+# repository). Debian and other Ubuntu releases use the same names, give
+# or take a suffix.
 #
 # Aside from the packages here you also need:
 #   - a Vulkan driver for your GPU: mesa-vulkan-drivers for Intel and AMD,

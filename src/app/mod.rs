@@ -64,7 +64,9 @@ const LINE: u32 = 0x282f39;
 const HAIR: u32 = 0x1d232b;
 const INK: u32 = 0xe7ebf0;
 const DIM: u32 = 0x9ba6b2;
-const FAINT: u32 = 0x69727e;
+// No gray darker than DIM: the quiet text under a field reads at the
+// same strength as a group's name in the configuration list.
+const FAINT: u32 = DIM;
 const GREEN: u32 = 0x3fb97a;
 const AMBER: u32 = 0xe0ae42;
 const RED: u32 = 0xe8796a;
@@ -510,9 +512,12 @@ pub struct AutobahnApp {
     knocked_at: Option<Instant>,
     shape: serde_json::Value,
     said: Option<String>,
-    /// The message last copied from the footer, so its button can say so
-    /// for as long as that message is the one showing.
+    /// What kind of thing the footer's message is, which is its colour.
+    tone: Tone,
+    /// The message last copied from the footer, and when: the button says
+    /// Copied for a moment, while that message is the one showing.
     copied: Option<String>,
+    copied_at: Option<Instant>,
     /// A group's doctor report, open under its card: the group, the
     /// report, and whether a reset is being asked about, in which case
     /// the report is what to read before saying yes.
@@ -655,7 +660,7 @@ fn run_with(
             if let Some(said) = surface::mend_service() {
                 if let Some(desk) = cx.try_global::<Desk>().and_then(|desk| desk.0.upgrade()) {
                     desk.update(cx, |desk, cx| {
-                        desk.said = Some(said);
+                        desk.say_result(said);
                         cx.notify();
                     });
                 }
@@ -821,7 +826,9 @@ impl AutobahnApp {
             knocked_at: None,
             shape: crate::config::schema(),
             said: None,
+            tone: Tone::Plain,
             copied: None,
+            copied_at: None,
             doctor: None,
             doctoring: None,
             command_build: surface::command_build(),
@@ -885,6 +892,21 @@ impl AutobahnApp {
         true
     }
 
+    /// Puts a line in the footer, coloured by what kind of line it is.
+    fn say(&mut self, said: impl Into<String>, tone: Tone) {
+        self.said = Some(said.into());
+        self.tone = tone;
+    }
+
+    /// Puts an outcome in the footer: what worked in green, what did not
+    /// in red.
+    fn say_result(&mut self, outcome: Result<String, String>) {
+        match outcome {
+            Ok(said) => self.say(said, Tone::Done),
+            Err(said) => self.say(said, Tone::Trouble),
+        }
+    }
+
     /// One click on the wordmark. Five in a row open the door.
     ///
     /// In a row, and within a few seconds of each other: a person who
@@ -911,12 +933,12 @@ impl AutobahnApp {
         if !self.unlocked && matches!(self.section, Section::Advanced) {
             self.section = Section::Settings;
         }
-        self.said = Some(
+        self.say(
             match self.unlocked {
                 true => t("status.unlocked"),
                 false => t("status.locked"),
-            }
-            .to_owned(),
+            },
+            Tone::Plain,
         );
     }
 
@@ -948,7 +970,10 @@ impl AutobahnApp {
                     .into_iter()
                     .next()
                     .unwrap_or_else(|| surface::first_line(&said));
-                self.said = Some(fill("status.config_refused", &[("error", &first)]));
+                self.say(
+                    fill("status.config_refused", &[("error", &first)]),
+                    Tone::Trouble,
+                );
             }
         }
         // The dock icon carries what needs a person, so a glance at it
@@ -1175,10 +1200,13 @@ impl AutobahnApp {
     fn show_as(&mut self, presence: crate::preferences::Presence) {
         self.presence = presence;
         crate::dock::in_the_dock(presence.opens_a_window());
-        self.said = Some(match self.keep_settings() {
-            Some(error) => fill("presence.unwritable", &[("error", &error)]),
-            None => t("presence.at_next_launch").to_owned(),
-        });
+        match self.keep_settings() {
+            Some(error) => self.say(
+                fill("presence.unwritable", &[("error", &error)]),
+                Tone::Trouble,
+            ),
+            None => self.say(t("presence.at_next_launch"), Tone::Plain),
+        }
     }
 
     /// Turns the app's own notifications on or off.
@@ -1190,13 +1218,19 @@ impl AutobahnApp {
         if let Some(notifier) = self.notifier.as_mut() {
             notifier.wanted(wanted);
         }
-        self.said = Some(match self.keep_settings() {
-            Some(error) => fill("presence.unwritable", &[("error", &error)]),
-            None => match wanted {
-                true => t("presence.notify_on").to_owned(),
-                false => t("presence.notify_off").to_owned(),
-            },
-        });
+        match self.keep_settings() {
+            Some(error) => self.say(
+                fill("presence.unwritable", &[("error", &error)]),
+                Tone::Trouble,
+            ),
+            None => self.say(
+                match wanted {
+                    true => t("presence.notify_on"),
+                    false => t("presence.notify_off"),
+                },
+                Tone::Done,
+            ),
+        }
     }
 
     /// Writes both of this machine's choices, which share one file.
@@ -1212,7 +1246,7 @@ impl AutobahnApp {
 
     /// Asks the service manager for something, and says what came back.
     fn order(&mut self, order: surface::Order) {
-        self.said = Some(surface::ask(
+        self.say_result(surface::ask(
             order,
             self.config.as_deref(),
             &self.state_root,
@@ -1372,9 +1406,17 @@ impl AutobahnApp {
             .read_at
             .map(|at| format_age(at.elapsed().as_secs()))
             .unwrap_or_else(|| t("fleet.never").to_owned());
-        // Whether the message showing is the one last copied, which is
-        // what the button says until the message changes.
-        let copied = self.said.is_some() && self.copied == self.said;
+        // Whether the message showing was copied a moment ago, which is
+        // what the button says for that moment.
+        const COPIED_FOR: Duration = Duration::from_secs(2);
+        let copied = self.said.is_some()
+            && self.copied == self.said
+            && self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FOR);
+        let colour = match self.tone {
+            Tone::Plain => DIM,
+            Tone::Done => GREEN,
+            Tone::Trouble => RED,
+        };
         div()
             .h(step(7.5))
             .flex_shrink_0()
@@ -1402,7 +1444,7 @@ impl AutobahnApp {
                     })
                     .child(match &self.said {
                         Some(said) => div()
-                            .text_color(rgb(DIM))
+                            .text_color(rgb(colour))
                             .truncate()
                             .child(crate::text::display_safe(said).to_string()),
                         // Nothing to say is a place to teach something:
@@ -1438,7 +1480,16 @@ impl AutobahnApp {
                                     surface::for_the_clipboard(&said),
                                 ));
                                 this.copied = Some(said);
+                                this.copied_at = Some(Instant::now());
                                 cx.notify();
+                                // A frame when the moment is over, so the
+                                // label goes back without waiting for
+                                // the next poll.
+                                cx.spawn(async move |this, cx| {
+                                    cx.background_executor().timer(COPIED_FOR).await;
+                                    this.update(cx, |_, cx| cx.notify()).ok();
+                                })
+                                .detach();
                             }
                         })),
                 ),
@@ -1669,7 +1720,7 @@ impl AutobahnApp {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         surface::for_the_clipboard(&doctored.report),
                                     ));
-                                    this.said = Some(t("group.doctor_copied").to_owned());
+                                    this.say(t("group.doctor_copied"), Tone::Done);
                                     cx.notify();
                                 }
                             })),
@@ -1710,7 +1761,7 @@ impl AutobahnApp {
             return;
         }
         self.doctoring = Some(name.to_owned());
-        self.said = Some(fill("group.doctoring", &[("name", name)]));
+        self.say(fill("group.doctoring", &[("name", name)]), Tone::Plain);
         let group = name.to_owned();
         let config = self.config.clone();
         let state_root = self.state_root.clone();
@@ -1724,16 +1775,16 @@ impl AutobahnApp {
                 .await;
             this.update(cx, |this, cx| {
                 this.doctoring = None;
-                let report = match done {
-                    Ok(report) => report,
-                    Err(report) => report,
+                let (report, tone) = match done {
+                    Ok(report) => (report, Tone::Plain),
+                    Err(report) => (report, Tone::Trouble),
                 };
                 this.doctor = Some(Doctored {
                     group: group.clone(),
                     report,
                     offer_reset,
                 });
-                this.said = Some(fill("group.doctored", &[("name", &group)]));
+                this.say(fill("group.doctored", &[("name", &group)]), tone);
                 cx.notify();
             })
             .ok();
@@ -1754,12 +1805,13 @@ impl AutobahnApp {
             Verb::Pause => crate::supervisor::control::ControlRequest::Pause(selector),
             Verb::Resume => crate::supervisor::control::ControlRequest::Resume(selector),
         };
-        self.said = Some(
-            match crate::supervisor::control::send(&self.state_root, &request) {
-                Ok(_) => fill("group.controlled", &[("done", verb.done()), ("name", name)]),
-                Err(error) => format!("{error:#}"),
-            },
-        );
+        match crate::supervisor::control::send(&self.state_root, &request) {
+            Ok(_) => self.say(
+                fill("group.controlled", &[("done", verb.done()), ("name", name)]),
+                Tone::Done,
+            ),
+            Err(error) => self.say(format!("{error:#}"), Tone::Trouble),
+        }
         self.read_at = None;
     }
 
@@ -1775,12 +1827,10 @@ impl AutobahnApp {
                 session: None,
             },
         );
-        self.said = Some(
-            match crate::supervisor::control::send(&self.state_root, &request) {
-                Ok(_) => fill("group.reset_done", &[("name", name)]),
-                Err(error) => format!("{error:#}"),
-            },
-        );
+        match crate::supervisor::control::send(&self.state_root, &request) {
+            Ok(_) => self.say(fill("group.reset_done", &[("name", name)]), Tone::Done),
+            Err(error) => self.say(format!("{error:#}"), Tone::Trouble),
+        }
         self.doctor = None;
         self.read_at = None;
     }
@@ -1789,7 +1839,7 @@ impl AutobahnApp {
     /// --group` does. Its state is kept; the Configuration page is where
     /// it is turned back on, since a group that is off leaves this page.
     fn disable_group(&mut self, name: &str) {
-        self.said = Some(surface::ran(
+        self.say_result(surface::ran(
             &["disable", "--group", name],
             self.config.as_deref(),
         ));
@@ -2144,15 +2194,16 @@ impl AutobahnApp {
             Verb::Pause => crate::supervisor::control::ControlRequest::Pause(selector),
             Verb::Resume => crate::supervisor::control::ControlRequest::Resume(selector),
         };
-        self.said = Some(
-            match crate::supervisor::control::send(&self.state_root, &request) {
-                Ok(_) => fill(
+        match crate::supervisor::control::send(&self.state_root, &request) {
+            Ok(_) => self.say(
+                fill(
                     "status.control_done",
                     &[("done", verb.done()), ("replica", replica)],
                 ),
-                Err(error) => format!("{error:#}"),
-            },
-        );
+                Tone::Done,
+            ),
+            Err(error) => self.say(format!("{error:#}"), Tone::Trouble),
+        }
         self.read_at = None;
     }
 
@@ -2413,8 +2464,10 @@ impl AutobahnApp {
                                                             surface::for_the_clipboard(&diff),
                                                         ),
                                                     );
-                                                    this.said =
-                                                        Some(t("conflicts.diff_copied").to_owned());
+                                                    this.say(
+                                                        t("conflicts.diff_copied"),
+                                                        Tone::Done,
+                                                    );
                                                     cx.notify();
                                                 }
                                             })),
@@ -3158,12 +3211,13 @@ impl AutobahnApp {
             // Pause and Resume are a session's, not the fleet's.
             _ => return,
         };
-        self.said = Some(
-            match crate::supervisor::control::send(&self.state_root, &request) {
-                Ok(_) => fill("service.asked_everything", &[("done", verb.done())]),
-                Err(error) => format!("{error:#}"),
-            },
-        );
+        match crate::supervisor::control::send(&self.state_root, &request) {
+            Ok(_) => self.say(
+                fill("service.asked_everything", &[("done", verb.done())]),
+                Tone::Done,
+            ),
+            Err(error) => self.say(format!("{error:#}"), Tone::Trouble),
+        }
         self.read_at = None;
     }
 
@@ -3199,7 +3253,7 @@ impl AutobahnApp {
     /// state root and deciding what is nobody's is three hundred lines
     /// that already exist and are already tested.
     fn clean(&mut self, cx: &mut Context<Self>) {
-        self.said = Some(t("service.cleaning_now").to_owned());
+        self.say(t("service.cleaning_now"), Tone::Plain);
         let config = self.config.clone();
         cx.spawn(async move |this, cx| {
             let done = cx
@@ -3207,7 +3261,7 @@ impl AutobahnApp {
                 .spawn(async move { surface::ran(&["clean", "--yes"], config.as_deref()) })
                 .await;
             this.update(cx, |this, cx| {
-                this.said = Some(done);
+                this.say_result(done);
                 this.read_at = None;
                 cx.notify();
             })
@@ -3250,14 +3304,14 @@ impl AutobahnApp {
     /// takes, so it happens off the main thread and the window says so
     /// while it runs.
     fn update(&mut self, cx: &mut Context<Self>) {
-        self.said = Some(t("service.updating").to_owned());
+        self.say(t("service.updating"), Tone::Plain);
         cx.spawn(async move |this, cx| {
             let done = cx
                 .background_executor()
                 .spawn(async { surface::update() })
                 .await;
             this.update(cx, |this, cx| {
-                this.said = Some(done);
+                this.say_result(done);
                 this.command_build = surface::command_build();
                 this.read_at = None;
                 cx.notify();
@@ -3338,7 +3392,7 @@ impl AutobahnApp {
                         cx.write_to_clipboard(ClipboardItem::new_string(
                             surface::INSTALL_LINE.to_owned(),
                         ));
-                        this.said = Some(t("welcome.copied").to_owned());
+                        this.say(t("welcome.copied"), Tone::Done);
                         cx.notify();
                     })),
             )
@@ -3383,7 +3437,7 @@ impl AutobahnApp {
                 .spawn(async move {
                     // The command, and then the service that runs it:
                     // the button says Install Service.
-                    surface::install(&state_root).map(|command| {
+                    surface::install(&state_root).and_then(|command| {
                         surface::serve_after_install(&command, config.as_deref(), &state_root)
                     })
                 })
@@ -3392,10 +3446,7 @@ impl AutobahnApp {
                 this.installing = false;
                 this.ready = surface::installed();
                 this.command_build = surface::command_build();
-                this.said = Some(match done {
-                    Ok(said) => said,
-                    Err(why) => why,
-                });
+                this.say_result(done);
                 // Everything the other panes show came back empty while
                 // there was nothing to ask; ask again now.
                 this.pane = Pane::Groups;
@@ -3590,7 +3641,7 @@ impl AutobahnApp {
     fn read_sheet(&mut self) {
         match Sheet::read(self.config.as_deref()) {
             Ok(sheet) => self.sheet = Some(sheet),
-            Err(complaint) => self.said = Some(complaint),
+            Err(complaint) => self.say(complaint, Tone::Trouble),
         }
     }
 
@@ -3605,14 +3656,14 @@ impl AutobahnApp {
     fn put(&mut self, at: &Spot, value: Option<toml_edit::Item>) {
         let Some(sheet) = &mut self.sheet else { return };
         if let Some(said) = sheet.put(at, value) {
-            self.said = Some(said);
+            self.say(said, Tone::Trouble);
         }
     }
 
     fn save(&mut self) {
         let Some(sheet) = &mut self.sheet else { return };
-        if let Some(said) = sheet.save() {
-            self.said = Some(said);
+        if let Some(outcome) = sheet.save() {
+            self.say_result(outcome);
         }
     }
 
@@ -4117,15 +4168,18 @@ impl AutobahnApp {
             None => sheet.make_group(&name),
         };
         match complaint {
-            Some(said) => self.said = Some(said),
+            Some(said) => self.say(said, Tone::Trouble),
             None => {
-                self.said = Some(fill(
-                    match from.is_some() {
-                        true => "group.renamed",
-                        false => "group.made",
-                    },
-                    &[("name", &name)],
-                ));
+                self.say(
+                    fill(
+                        match from.is_some() {
+                            true => "group.renamed",
+                            false => "group.made",
+                        },
+                        &[("name", &name)],
+                    ),
+                    Tone::Done,
+                );
                 // The form follows the group it just made or renamed,
                 // and every cached field belongs to the old name.
                 self.section = Section::Group(name);
@@ -4142,9 +4196,9 @@ impl AutobahnApp {
     fn drop(&mut self, name: &str) {
         let Some(sheet) = &mut self.sheet else { return };
         match sheet.drop_group(name) {
-            Some(said) => self.said = Some(said),
+            Some(said) => self.say(said, Tone::Trouble),
             None => {
-                self.said = Some(fill("group.removed", &[("name", name)]));
+                self.say(fill("group.removed", &[("name", name)]), Tone::Done);
                 self.section = Section::Settings;
                 self.fields.clear();
                 self.choices.clear();
@@ -4900,7 +4954,7 @@ impl AutobahnApp {
                 false => sheet.later(&at, value),
             };
             if let Some(said) = said {
-                self.said = Some(said);
+                self.say(said, Tone::Trouble);
             }
         }
         self.typed_at = match cleared {
@@ -4930,22 +4984,31 @@ impl AutobahnApp {
         if let Some(config) = &self.config {
             command.arg("--config").arg(config);
         }
-        self.said = Some(match command.output() {
+        match command.output() {
             Ok(output) if output.status.success() => {
                 self.conflict = None;
                 self.sides = None;
                 self.diff = None;
-                fill(
-                    "status.kept",
-                    &[
-                        ("keep", keep),
-                        ("path", &crate::text::display_safe(&item.path)),
-                    ],
-                )
+                self.say(
+                    fill(
+                        "status.kept",
+                        &[
+                            ("keep", keep),
+                            ("path", &crate::text::display_safe(&item.path)),
+                        ],
+                    ),
+                    Tone::Done,
+                );
             }
-            Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-            Err(error) => fill("status.resolve_failed", &[("error", &error.to_string())]),
-        });
+            Ok(output) => self.say(
+                String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                Tone::Trouble,
+            ),
+            Err(error) => self.say(
+                fill("status.resolve_failed", &[("error", &error.to_string())]),
+                Tone::Trouble,
+            ),
+        }
         self.read_at = None;
     }
 
@@ -4978,8 +5041,19 @@ impl AutobahnApp {
     }
 
     fn reveal(&mut self, file: &std::path::Path) {
-        self.said = Some(surface::reveal(file));
+        self.say_result(surface::reveal(file));
     }
+}
+
+/// What kind of thing the footer says: the colour of its message.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tone {
+    /// Something to know.
+    Plain,
+    /// Something that worked.
+    Done,
+    /// Something that did not.
+    Trouble,
 }
 
 /// A group's doctor report, open under its card.

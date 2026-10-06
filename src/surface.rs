@@ -919,7 +919,7 @@ pub(crate) fn ask(
     order: Order,
     config: Option<&std::path::Path>,
     state_root: &std::path::Path,
-) -> String {
+) -> Result<String, String> {
     let done = match order {
         Order::Start => crate::service::start(),
         Order::Stop => crate::service::stop(),
@@ -936,14 +936,14 @@ pub(crate) fn ask(
         Order::Uninstall => crate::service::uninstall(),
     };
     match done {
-        Ok(()) => order.done().to_owned(),
-        Err(error) => fill(
+        Ok(()) => Ok(order.done().to_owned()),
+        Err(error) => Err(fill(
             "service.refused",
             &[
                 ("order", order.label()),
                 ("error", &first_line(&format!("{error:#}"))),
             ],
-        ),
+        )),
     }
 }
 
@@ -954,7 +954,7 @@ pub(crate) fn ask(
 /// the login service pointed at the new binary and restarted. It takes
 /// as long as a download takes, so a window calls it off the main
 /// thread and shows what came back.
-pub(crate) fn update() -> String {
+pub(crate) fn update() -> Result<String, String> {
     match crate::update::run(crate::update::Options {
         version: None,
         bin_dir: None,
@@ -964,14 +964,14 @@ pub(crate) fn update() -> String {
         // if it is pointed at the new one.
         retarget: true,
     }) {
-        Ok(()) => t("service.updated").to_owned(),
-        Err(error) => fill(
+        Ok(()) => Ok(t("service.updated").to_owned()),
+        Err(error) => Err(fill(
             "service.refused",
             &[
                 ("order", t("service.update")),
                 ("error", &first_line(&format!("{error:#}"))),
             ],
-        ),
+        )),
     }
 }
 
@@ -992,7 +992,7 @@ pub(crate) fn reveal_label() -> &'static str {
 /// folder and leaves the finding to the person — which is still better
 /// than the `open -R` this used to run everywhere, which on Linux is
 /// either missing or a program for opening virtual consoles.
-pub(crate) fn reveal(file: &std::path::Path) -> String {
+pub(crate) fn reveal(file: &std::path::Path) -> Result<String, String> {
     #[cfg_attr(target_os = "macos", allow(unused_variables))]
     let folder = file.parent().unwrap_or(file);
     let shown = tilde(&file.display().to_string());
@@ -1011,7 +1011,7 @@ pub(crate) fn reveal(file: &std::path::Path) -> String {
     for (program, arguments) in tried {
         match std::process::Command::new(program).args(arguments).status() {
             Ok(status) if status.success() => {
-                return fill("status.revealed", &[("path", &shown)]);
+                return Ok(fill("status.revealed", &[("path", &shown)]));
             }
             // A file manager that is not installed is not a failure to
             // report; it is the next one's turn.
@@ -1021,8 +1021,8 @@ pub(crate) fn reveal(file: &std::path::Path) -> String {
         }
     }
     match last {
-        Some(why) => fill("status.finder_refused", &[("status", &why)]),
-        None => fill("status.no_file_manager", &[("path", &shown)]),
+        Some(why) => Err(fill("status.finder_refused", &[("status", &why)])),
+        None => Err(fill("status.no_file_manager", &[("path", &shown)])),
     }
 }
 
@@ -1376,7 +1376,7 @@ pub(crate) fn serve_after_install(
     command: &std::path::Path,
     config: Option<&std::path::Path>,
     state_root: &std::path::Path,
-) -> String {
+) -> Result<String, String> {
     use std::io::Write;
     let path = tilde(&command.display().to_string());
     let registered = (|| -> anyhow::Result<bool> {
@@ -1395,17 +1395,20 @@ pub(crate) fn serve_after_install(
     let (line, said) = match registered {
         Ok(true) => (
             "installed and started the login service".to_owned(),
-            fill("welcome.serving", &[("path", &path)]),
+            Ok(fill("welcome.serving", &[("path", &path)])),
         ),
         Ok(false) => (
             "the configuration describes no sessions, so no login service was installed".to_owned(),
-            fill("welcome.no_sessions", &[("path", &path)]),
+            Ok(fill("welcome.no_sessions", &[("path", &path)])),
         ),
         Err(error) => {
             let error = first_line(&format!("{error:#}"));
             (
                 format!("the login service was not installed: {error}"),
-                fill("welcome.not_serving", &[("path", &path), ("error", &error)]),
+                Err(fill(
+                    "welcome.not_serving",
+                    &[("path", &path), ("error", &error)],
+                )),
             )
         }
     };
@@ -1440,7 +1443,7 @@ fn wrong_program(executable: &std::path::Path) -> bool {
 /// app: a service file names one path, and nothing rewrites it but an
 /// install. So the app looks when it opens. The arguments and the state
 /// root are kept; only the program changes.
-pub(crate) fn mend_service() -> Option<String> {
+pub(crate) fn mend_service() -> Option<Result<String, String>> {
     let registered = crate::service::registration().ok()??;
     if !wrong_program(&registered.executable) {
         return None;
@@ -1460,20 +1463,20 @@ pub(crate) fn mend_service() -> Option<String> {
     };
     let mended = crate::service::retarget(&command).and_then(|()| begin());
     Some(match mended {
-        Ok(()) => fill(
+        Ok(()) => Ok(fill(
             "service.mended",
             &[
                 ("was", was.as_str()),
                 ("now", &tilde(&command.display().to_string())),
             ],
-        ),
-        Err(error) => fill(
+        )),
+        Err(error) => Err(fill(
             "service.not_mended",
             &[
                 ("was", was.as_str()),
                 ("error", &first_line(&format!("{error:#}"))),
             ],
-        ),
+        )),
     })
 }
 
@@ -1519,7 +1522,7 @@ pub(crate) fn report(
 /// large ones — a clean that walks the state root, a resolve that moves
 /// files — are the command's, and asking it is how they stay one
 /// implementation rather than two.
-pub(crate) fn ran(arguments: &[&str], config: Option<&std::path::Path>) -> String {
+pub(crate) fn ran(arguments: &[&str], config: Option<&std::path::Path>) -> Result<String, String> {
     let mut command = std::process::Command::new(exe());
     command.args(arguments);
     if let Some(path) = config {
@@ -1528,19 +1531,19 @@ pub(crate) fn ran(arguments: &[&str], config: Option<&std::path::Path>) -> Strin
     match command.output() {
         Ok(done) if done.status.success() => {
             let said = String::from_utf8_lossy(&done.stdout);
-            match said.trim().lines().last() {
+            Ok(match said.trim().lines().last() {
                 Some(line) if !line.trim().is_empty() => line.trim().to_owned(),
                 _ => fill("status.ran", &[("command", &arguments.join(" "))]),
-            }
+            })
         }
         Ok(done) => {
             let complained = String::from_utf8_lossy(&done.stderr);
-            first_line(complained.trim())
+            Err(first_line(complained.trim()))
         }
-        Err(error) => fill(
+        Err(error) => Err(fill(
             "status.unreachable_command",
             &[("error", &error.to_string())],
-        ),
+        )),
     }
 }
 
@@ -1888,7 +1891,7 @@ impl Sheet {
 
     /// Writes the edited document, if the loader takes it and nobody
     /// else has touched the file since it was read.
-    pub(crate) fn save(&mut self) -> Option<String> {
+    pub(crate) fn save(&mut self) -> Option<Result<String, String>> {
         let sheet = self;
         if sheet.pending() == 0 {
             return None;
@@ -1897,10 +1900,10 @@ impl Sheet {
         // gate is the whole point, and a stale yes is not one.
         sheet.settle();
         if let Some(refused) = &sheet.refused {
-            return Some(fill(
+            return Some(Err(fill(
                 "config.not_saved",
                 &[("reason", &crate::surface::first_line(refused))],
-            ));
+            )));
         }
         // Somebody may have been editing the same file in an editor
         // since it was read. Their work is not this window's to
@@ -1908,7 +1911,7 @@ impl Sheet {
         if let Ok(now) = std::fs::read_to_string(&sheet.path) {
             if now != sheet.text {
                 sheet.refused = Some(t("config.changed").to_owned());
-                return Some(t("config.changed_short").to_owned());
+                return Some(Err(t("config.changed_short").to_owned()));
             }
         }
         let text = sheet.document.to_string();
@@ -1920,9 +1923,12 @@ impl Sheet {
                 sheet.refused = None;
                 let path = sheet.path.clone();
                 let path = tilde(&path.display().to_string());
-                Some(counted("config.saved", edits, &[("path", &path)]))
+                Some(Ok(counted("config.saved", edits, &[("path", &path)])))
             }
-            Err(error) => Some(fill("config.unwritable", &[("error", &error.to_string())])),
+            Err(error) => Some(Err(fill(
+                "config.unwritable",
+                &[("error", &error.to_string())],
+            ))),
         }
     }
 }

@@ -58,10 +58,6 @@ use anyhow::{bail, Context, Result};
 
 use crate::tree::{apply, Change, Node};
 
-/// Marks a checkpoint as carrying a generation. Its absence means the file
-/// was written before journalling existed and is generation zero.
-const CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNANC";
-
 /// Marks a checkpoint that states its own format. Two little-endian
 /// version bytes follow the marker, then the generation, digest and
 /// payload as before.
@@ -74,7 +70,9 @@ const CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNANC";
 /// discarded silently.
 const VERSIONED_CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNAN2";
 
-/// The format this build writes.
+/// The format this build writes. Format 1 is the first released: the
+/// numbers before it belonged to development builds, and a checkpoint
+/// carrying one is refused, never misread.
 ///
 /// It is also the journal's format. Replay runs *before* an old checkpoint
 /// is rewritten, so the records a previous build left are decoded by this
@@ -83,28 +81,28 @@ const VERSIONED_CHECKPOINT_MAGIC: [u8; 8] = *b"ABAHNAN2";
 /// every upgraded session misreads its journal — refused at best, a wrong
 /// ancestor at worst. `the_encodings_this_format_promises_are_unchanged`
 /// holds the bytes still, so such a change fails until it does.
-const CHECKPOINT_VERSION: u16 = 4;
+const CHECKPOINT_VERSION: u16 = 1;
 
-/// The first format whose journal records carry a checksummed header.
+/// The first format whose journal records carry a checksummed header:
+/// every released one.
 ///
 /// A record's header layout is told by its marker, not by the checkpoint:
-/// a format-3 checkpoint can sit in front of legacy records, left when an
-/// upgrade's rename landed but its journal was never cleared. What the
-/// checkpoint's format decides is how far a legacy record that runs past
-/// the end is trusted to be a torn tail — the build that wrote a format-3
+/// a checkpoint can sit in front of legacy records, left when an upgrade's
+/// rename landed but its journal was never cleared. What the checkpoint's
+/// format decides is how far a legacy record that runs past the end is
+/// trusted to be a torn tail — the build that wrote a checksummed-era
 /// checkpoint normalized its journal first, so under one nothing legacy is
 /// ever torn.
-const CHECKSUMMED_JOURNAL: u16 = 3;
+const CHECKSUMMED_JOURNAL: u16 = 1;
 
 /// The oldest format this build reads.
 ///
-/// Format 4 is the first written with postcard, and the formats before
-/// it are fixed-width bytes this build would misread rather than fail
-/// on — so none of them is read at all. They were never released: the
-/// encoding changed before the first tag, so the only checkpoints in
-/// that shape were written by development builds, and the message that
-/// refuses one names the command that recovers.
-const OLDEST_READABLE_CHECKPOINT: u16 = 4;
+/// Format 1 is the first released, written with postcard. Development
+/// builds before the release wrote formats 2 to 4 under the same marker,
+/// and one under the marker before it, in layouts this build would
+/// misread rather than fail on — so none of them is read, and the message
+/// that refuses one names the command that recovers.
+const OLDEST_READABLE_CHECKPOINT: u16 = 1;
 
 /// The smallest journal worth compacting. Below this the full write costs
 /// more than the reading it would save.
@@ -1020,9 +1018,9 @@ fn checkpoint_version(data: &[u8]) -> u16 {
     {
         let start = VERSIONED_CHECKPOINT_MAGIC.len();
         u16::from_le_bytes(data[start..start + 2].try_into().expect("two bytes"))
-    } else if data.starts_with(&CHECKPOINT_MAGIC) {
-        1
     } else {
+        // A checkpoint under the marker before versions, or under none:
+        // neither is a format this build reads, and 0 says so.
         0
     }
 }
@@ -1107,45 +1105,19 @@ fn read_checkpoint(path: &Path) -> Result<(u64, Option<Node>, u64, u16)> {
     if !(OLDEST_READABLE_CHECKPOINT..=CHECKPOINT_VERSION).contains(&version) {
         return Err(unreadable_checkpoint(version));
     }
-    match version {
-        // A checkpoint from a build that predates journalling is the bare
-        // hierarchy. It reads as generation zero.
-        0 => {
-            let ancestor: Option<Node> =
-                crate::wire::decode(&data).context("unable to decode ancestor")?;
-            Ok((0, ancestor, size, 0))
-        }
-        // Format 1 states no version: a marker, a generation, a digest.
-        1 => {
-            let body = &data[CHECKPOINT_MAGIC.len()..];
-            if body.len() < 16 {
-                bail!("the ancestor checkpoint is truncated");
-            }
-            let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
-            let payload = &body[16..];
-            if digest(generation, payload) != body[8..16] {
-                bail!("the ancestor checkpoint is corrupt");
-            }
-            let ancestor: Option<Node> =
-                crate::wire::decode(payload).context("unable to decode ancestor")?;
-            Ok((generation, ancestor, size, 1))
-        }
-        // Format 2 and later state their version, and the digest covers it.
-        _ => {
-            let body = &data[VERSIONED_CHECKPOINT_MAGIC.len() + 2..];
-            if body.len() < 16 {
-                bail!("the ancestor checkpoint is truncated");
-            }
-            let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
-            let payload = &body[16..];
-            if checkpoint_digest(version, generation, payload) != body[8..16] {
-                bail!("the ancestor checkpoint is corrupt");
-            }
-            let ancestor: Option<Node> =
-                crate::wire::decode(payload).context("unable to decode ancestor")?;
-            Ok((generation, ancestor, size, version))
-        }
+    // Every readable format states its version, and the digest covers it.
+    let body = &data[VERSIONED_CHECKPOINT_MAGIC.len() + 2..];
+    if body.len() < 16 {
+        bail!("the ancestor checkpoint is truncated");
     }
+    let generation = u64::from_le_bytes(body[..8].try_into().expect("eight bytes"));
+    let payload = &body[16..];
+    if checkpoint_digest(version, generation, payload) != body[8..16] {
+        bail!("the ancestor checkpoint is corrupt");
+    }
+    let ancestor: Option<Node> =
+        crate::wire::decode(payload).context("unable to decode ancestor")?;
+    Ok((generation, ancestor, size, version))
 }
 
 /// Reports whether the checkpoint at `path` is one this build can read,
@@ -2800,10 +2772,10 @@ mod tests {
     /// `read_checkpoint`) the old layout, and only then update the bytes.
     #[test]
     fn the_encodings_this_format_promises_are_unchanged() {
-        // Format 4 is postcard: varint lengths, no padding. Nothing
+        // Format 1 is postcard: varint lengths, no padding. Nothing
         // before it is read, so there are no older bytes to keep.
         assert_eq!(
-            CHECKPOINT_VERSION, 4,
+            CHECKPOINT_VERSION, 1,
             "a new format: record its bytes below, beside the old ones"
         );
         let achieved = JournalEntry::Achieved(vec![

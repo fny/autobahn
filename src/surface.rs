@@ -1243,8 +1243,9 @@ pub(crate) fn command_build() -> Option<CommandBuild> {
 /// it: updating the command changes the file and not the process.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum SupervisorBuild {
-    /// Running, and this app's own version.
-    Same,
+    /// Running, and this app's own version; with its build, commit and
+    /// all, when it could be asked.
+    Same(Option<String>),
     /// Running another version: the one it named, or one from before
     /// supervisors could say.
     Other(Option<String>),
@@ -1258,7 +1259,7 @@ pub(crate) enum SupervisorBuild {
 pub(crate) fn supervisor_build(state_root: &std::path::Path) -> SupervisorBuild {
     use crate::supervisor::control::Probe;
     match crate::supervisor::control::probe(state_root) {
-        Probe::Answered(_) => SupervisorBuild::Same,
+        Probe::Answered(_) => SupervisorBuild::Same(crate::supervisor::control::build(state_root)),
         Probe::Mismatch(version) => SupervisorBuild::Other(version),
         Probe::Unresponsive => SupervisorBuild::Silent,
         Probe::Absent => SupervisorBuild::Absent,
@@ -1269,9 +1270,12 @@ impl SupervisorBuild {
     /// The line for it under "this build".
     pub(crate) fn said(&self) -> String {
         match self {
-            SupervisorBuild::Same => fill(
+            SupervisorBuild::Same(build) => fill(
                 "service.build_running",
-                &[("version", &crate::protocol::version())],
+                &[(
+                    "version",
+                    build.as_deref().unwrap_or(&crate::protocol::version()),
+                )],
             ),
             SupervisorBuild::Other(Some(version)) => {
                 fill("service.build_running", &[("version", version)])
@@ -1286,7 +1290,7 @@ impl SupervisorBuild {
     /// one for a supervisor too old to say: it matches nothing.
     fn package(&self) -> Option<String> {
         match self {
-            SupervisorBuild::Same => Some(package(&crate::protocol::version()).to_owned()),
+            SupervisorBuild::Same(_) => Some(package(&crate::protocol::version()).to_owned()),
             SupervisorBuild::Other(version) => {
                 Some(package(version.as_deref().unwrap_or_default()).to_owned())
             }
@@ -1326,6 +1330,15 @@ fn package(build: &str) -> &str {
     &build[..end]
 }
 
+/// The commit inside a build's description: `a1b2c3d` out of
+/// `1.0.1+e1 (a1b2c3d)`, `a1b2c3d, modified` out of a tree with changes,
+/// and nothing out of a build that named none.
+fn commit_of(build: &str) -> Option<&str> {
+    let start = build.find('(')? + 1;
+    let end = build[start..].find(')')? + start;
+    Some(build[start..end].trim())
+}
+
 /// A package version's numbers, for telling older from newer.
 fn numbers(package: &str) -> Vec<u64> {
     package
@@ -1341,25 +1354,31 @@ fn numbers(package: &str) -> Vec<u64> {
 /// itself, so it settles the supervisor too. Then a supervisor that is
 /// not the installed command, which a restart settles. Last an app
 /// older than its command, which only a download settles. Two builds of
-/// one version are not told apart here, because the supervisor names a
-/// version and no commit.
+/// one version are told apart by their commits, when the supervisor
+/// could say which it was built from.
 pub(crate) fn advice(
     app: &str,
     command: Option<&CommandBuild>,
     supervisor: &SupervisorBuild,
 ) -> Option<Advice> {
-    let command = package(&command?.version);
+    let command = command?;
+    let installed = package(&command.version);
     let app = package(app);
-    if numbers(command) < numbers(app) {
+    if numbers(installed) < numbers(app) {
         return Some(Advice::UpdateCommand);
     }
     if supervisor
         .package()
-        .is_some_and(|running| running != command)
+        .is_some_and(|running| running != installed)
     {
         return Some(Advice::Restart);
     }
-    (numbers(command) > numbers(app)).then_some(Advice::NewerApp)
+    if let SupervisorBuild::Same(Some(running)) = supervisor {
+        if commit_of(running) != commit_of(&command.version) {
+            return Some(Advice::Restart);
+        }
+    }
+    (numbers(installed) > numbers(app)).then_some(Advice::NewerApp)
 }
 
 /// Registers and starts the login service once the installer has put the
@@ -1997,6 +2016,17 @@ mod tests {
             advice(app, Some(&same), &SupervisorBuild::Other(None)),
             Some(Advice::Restart)
         );
+        // One version, two commits: the supervisor says which it is.
+        let same_build = SupervisorBuild::Same(Some("1.0.1+e1 (a1b2c3d)".to_owned()));
+        assert_eq!(advice(app, Some(&same), &same_build), None);
+        let other_commit = SupervisorBuild::Same(Some("1.0.1+e1 (0000000)".to_owned()));
+        assert_eq!(
+            advice(app, Some(&same), &other_commit),
+            Some(Advice::Restart)
+        );
+        let modified = SupervisorBuild::Same(Some("1.0.1+e1 (a1b2c3d, modified)".to_owned()));
+        assert_eq!(advice(app, Some(&same), &modified), Some(Advice::Restart));
+        assert_eq!(advice(app, Some(&same), &SupervisorBuild::Same(None)), None);
         let new = command("1.10.0");
         assert_eq!(
             advice(app, Some(&new), &other("1.10.0+e2")),

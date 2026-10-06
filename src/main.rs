@@ -1688,6 +1688,7 @@ fn run_control(request: ControlRequest, state_root: Option<PathBuf>, verb: &str)
         ControlResponse::Progress(_) => bail!("the supervisor answered with progress"),
         ControlResponse::Sessions(_) => bail!("the supervisor answered with its sessions"),
         ControlResponse::Resolution(_) => bail!("the supervisor answered with a resolution"),
+        ControlResponse::Build(_) => bail!("the supervisor answered with its build"),
         // `send` turns this into an error with the remedy; kept for the
         // match to be whole.
         ControlResponse::Mismatch { supervisor } => bail!(

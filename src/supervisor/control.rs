@@ -77,6 +77,12 @@ pub enum ControlRequest {
         /// The resolution's identifier.
         id: u64,
     },
+    /// Which build this supervisor is: `protocol::build()`, the version
+    /// with the commit when one is known. The app's service page asks,
+    /// to tell two builds of one version apart. Last on purpose: a
+    /// supervisor from before cannot decode it and answers with an
+    /// error, which reads as not saying.
+    Build,
 }
 
 /// One session's part in a resolution.
@@ -270,6 +276,8 @@ pub enum ControlResponse {
     Sessions(Inventory),
     /// Where each part of a resolution stands, in the order sent.
     Resolution(Vec<(SessionKey, PartState)>),
+    /// The supervisor's build, with its commit when it knows one.
+    Build(String),
 }
 
 /// What a running supervisor is running.
@@ -540,6 +548,9 @@ impl Registry {
                 Err(error) => ControlResponse::Error(format!("undecodable request: {error}")),
             };
         }
+        if let ControlRequest::Build = request {
+            return ControlResponse::Build(crate::protocol::build());
+        }
         if let ControlRequest::Sessions = request {
             return ControlResponse::Sessions(Inventory {
                 sessions: entries
@@ -673,6 +684,7 @@ impl Registry {
             | ControlRequest::Resolve { .. }
             | ControlRequest::Resolved { .. }
             | ControlRequest::Yield { .. }
+            | ControlRequest::Build
             | ControlRequest::Versioned { .. } => {
                 unreachable!("answered above")
             }
@@ -1179,6 +1191,26 @@ fn probe_within(state_root: &Path, timeout: Duration) -> Probe {
         Ok(ControlResponse::Mismatch { supervisor }) => Probe::Mismatch(Some(supervisor)),
         Err(error) if timed_out(&error) => Probe::Unresponsive,
         _ => Probe::Mismatch(None),
+    }
+}
+
+/// Asks the supervisor owning `state_root` which build it is, with its
+/// commit when it knows one. None when none answers, or when the one
+/// running is too old to be asked: it reads the question as undecodable.
+pub fn build(state_root: &Path) -> Option<String> {
+    let stream = UnixStream::connect(socket_path(state_root)).ok()?;
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
+    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
+    let mut reader = stream.try_clone().ok()?;
+    let mut writer = stream;
+    let versioned = ControlRequest::Versioned {
+        version: crate::protocol::version(),
+        request: crate::wire::encode(&ControlRequest::Build).ok()?,
+    };
+    crate::transport::send_control_frame(&mut writer, &versioned).ok()?;
+    match crate::transport::receive_control_frame(&mut reader) {
+        Ok(ControlResponse::Build(build)) => Some(build),
+        _ => None,
     }
 }
 

@@ -91,21 +91,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgtk-4-dev \
-            libdbus-1-dev \
-            libxdo-dev \
-            libasound2-dev \
             libfontconfig-dev \
             libwayland-dev \
             libxkbcommon-x11-dev \
-            libssl-dev \
-            libzstd-dev \
-            libvulkan-dev \
-            libxcb-composite0-dev \
-            libxcb-render0-dev \
-            libxcb-shape0-dev \
-            libxcb-xfixes0-dev \
             pkg-config \
-            cmake \
             clang
 
       # Lints here rather than in ci.yml: ci.yml compiles gpui-kit only to

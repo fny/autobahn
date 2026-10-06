@@ -80,12 +80,11 @@ done
 # shellcheck disable=SC2086
 packages=$(printf '%s\n' $packages | sort -u)
 
-# Which part of the app a package serves. GTK and what comes with it is
-# the menu bar item; ALSA is notifications; everything else is the window.
+# Which part of the app a package serves: GTK and what comes with it is
+# the menu bar item; everything else is the window.
 section_of() {
     case "$1" in
-        libgtk-*|libglib*|libgobject*|libgio*|libdbus-*|libxdo*|libgdk*|libgraphene*|libpango*|libcairo*|libharfbuzz*) echo tray ;;
-        libasound*) echo sound ;;
+        libgtk-*|libglib*|libgobject*|libgio*|libgdk*|libgraphene*|libpango*|libcairo*|libharfbuzz*) echo tray ;;
         *) echo app ;;
     esac
 }
@@ -135,8 +134,6 @@ HEADER
     list app
     printf '\n# Tray item\n'
     list tray
-    printf '\n# Desktop notifications and sound\n'
-    list sound
 } > "$out"
 
 echo "$out: $(echo "$packages" | wc -l | tr -d ' ') packages"

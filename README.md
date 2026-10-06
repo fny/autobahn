@@ -4,11 +4,11 @@
 
 *Subsecond file sync with German precision.*
 
-Autobahn gives you two-way sync between local and remote folders faster than you can type. In this demo, I'm saving the left file after each key stroke. Even though the file lives in a tree of 100K files receiving a barrage of other edits, *the changes propogate instantly.*
+Autobahn gives you two-way sync between machines faster than you can type. In this demo, I'm saving the left file after each key stroke. Even though the file lives in a tree of 100K files syncing a barrage of other edits, *these changes propagate instantly.*
 
 <img src="assets/autobahn-typing.gif" alt="Typing on a laptop, synced live to a remote host over SSH" width="720">
 
-To get started, make sure your remotes are [accessible over SSH](docs/ssh.md). Then install the the [CLI](#getting-started-with-the-cli) or [desktop app](#desktop-app).
+To get started, make sure your machines are [accessible over SSH](docs/ssh.md). Then install the the [CLI](#getting-started-with-the-cli) or [desktop app](#desktop-app).
 
 > ✨ Want to support Autobahn? Want to use Autobahn free of AGPLv3? <br />
 > Simply donate to the [Justice-in-Education Initiative](docs/donations.md).
@@ -21,15 +21,16 @@ These people bought books for people who need a second chance. Thank you!
 
 **$50 of $10,000** on the [road to MIT](DONORS.md#the-road-to-mit). See [all donors](DONORS.md), or [become one](docs/donations.md).
 
-## Why do I need this?
+## The Problem
 
 - Browsing files over SSH or NFS is clunky.
 - You can't use your local tools on remote files.
-- `rsync` is one way, and its slow.
+- `rsync` only syncs one way, and its slow in a loop.
 - Other tools require gigs of RAM for big trees, or a cloud account, or both.
 - Other tools are also slow.
+- You want to run agents `--dangerously` on your local files but you should do it somewhere else.
 
-Unhinged solution: keep everything in sync with a "benchmaxxed" tool so editing local files is practically the same as editing remote ones.
+Unhinged solution: sync everything in realtime with a "benchmaxxed" tool so editing local files is practically the same as editing remote ones.
 
 ## Why Autobahn?
 
@@ -74,9 +75,9 @@ primary = "~/Workspace"
 replicas = ["/Volumes/Backup/Workspace"]    #  - local paths work too
 ```
 
-Finally, run `autobahn install` to install the login service or run `autobahn watch` to keep a sync running until Ctrl-C.
+Finally, run `autobahn install` to install the login service. See the [Commands](docs/commands.md) page for more details about the CLI.
 
-Make sure you have your [SSH configuration](docs/ssh.md) set up so you can connect to your remotes!
+Make sure you have your [SSH configuration](docs/ssh.md) set up so you can connect to your remote machines!
 
 ## Desktop App
 
@@ -85,13 +86,13 @@ Autobahn ships with a desktop app and menu bar item that are about as well teste
 - **macOS**: [Apple Silicon](https://github.com/fny/autobahn/releases/latest/download/Autobahn-macos-aarch64.zip), Intel you build
 - **Linux**: [x86_64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-x86_64.tar.gz), [aarch64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-aarch64.tar.gz)
 
-On Linux, extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the packages listed in the archive's `APT_REQUIREMENTS.txt` with installation requirements.
+On Linux, extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the packages listed in the archive's `APT_REQUIREMENTS.txt`.
 
 <img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
 
 To learn more, see the [application's documentation](docs/app.md).
 
-Make sure you have your [SSH configuration](docs/ssh.md) set up so you can connect to your remotes!
+Make sure you have your [SSH configuration](docs/ssh.md) set up so you can connect to your remote machines!
 
 ## Sync Modes
 
@@ -166,13 +167,13 @@ None of this has undergone nearly the same level of testing as `autobahn` itself
 
 ## AI Disclaimer
 
-This project was heavily vibe coded, and with great vibe coding comes great responsibility. As such, I have scanned every line in this repo, run extensive soak testing, used Autobahn myself for weeks, had guardrail-free models run security scans, and put it through thousands of benchmark runs. While all of the documentation was drafted by LLMs, I've rewritten much of it. Please forgive any lingering Claudeisms.
+With great vibe coding comes great responsibility. As such, I have scanned every line in this repo, run extensive soak testing, used Autobahn myself for weeks, had guardrail-free models run security scans, and put it through thousands of benchmark runs. While all of the documentation was drafted by LLMs, I've rewritten much of it. Please forgive any lingering Claudeisms.
 
 ## Contributing
 
-- I won't accept PRs unless I know you. I prefer my slop over your slop, so instead file an issue for a bug report or (small) feature request.
+- I will rarely accept PRs unless I know you. I prefer my slop over your slop, so instead file an issue for a bug report or feature request.
 - Bug reports should come with detailed context from a human or LLM.
-- Feature requests should be small with high impact.
+- Feature requests should be small and high impact.
 - Have a greater request? Go fork yourself. ;D
 
 ## Documentation

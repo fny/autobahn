@@ -29,6 +29,8 @@ on:
       - 'Cargo.toml'
       - 'Cargo.lock'
       - '.github/workflows/app.yml'
+      # The Linux archive carries this script's output.
+      - 'scripts/apt-requirements.sh'
   workflow_dispatch:
 
 permissions:

@@ -39,15 +39,12 @@ If you only want a status light, without the desktop app's GUI framework (GPUI) 
 
 #### macOS Application Bundle
 
-Build the self-contained macOS `.app` bundle from source:
+Download the latest build of the [Autobah Tray app](https://github.com/fny/autobahn/releases/latest/download/Autobahn-Tray-macos-aarch64.zip) or build the it from source:
 
 ```sh
 apps/tray/build.sh                  # Builds "Autobahn Tray.app"
 open "apps/tray/Autobahn Tray.app"  # Launch directly, or move to /Applications
 ```
-
-> **Why use the `.app` bundle?**
-> macOS links desktop notification badges and icons to the originating app bundle. Running the raw executable directly causes notifications to display generic system or terminal icons instead of the Autobahn logo.
 
 #### CLI Invocations
 

@@ -4,11 +4,11 @@
 
 *Subsecond file sync with German precision.*
 
-Autobahn gives you two-way sync between local and remote folders faster than you can type. Here I'm saving a file in a tree with 100k files after each key stroke, and the changes propogate instantly.
+Autobahn gives you two-way sync between local and remote folders faster than you can type. In this demo, I'm saving the left file after each key stroke. Even though the file lives in a tree of 100K files receiving a barrage of other edits, *the changes propogate instantly.*
 
 <img src="assets/autobahn-typing.gif" alt="Typing on a laptop, synced live to a remote host over SSH" width="720">
 
-To get started, make sure your remotes are [accessible over SSH with your private key](docs/ssh.md). Then install the [desktop app](#desktop-app) or the [CLI](#getting-started-with-the-cli).
+To get started, make sure your remotes are [accessible over SSH](docs/ssh.md). Then install the the [CLI](#getting-started-with-the-cli) or [desktop app](#desktop-app).
 
 > ✨ Want to support Autobahn? Want to use Autobahn free of AGPLv3? <br />
 > Simply donate to the [Justice-in-Education Initiative](docs/donations.md).
@@ -21,22 +21,23 @@ These people bought books for people who need a second chance. Thank you!
 
 **$50 of $10,000** on the [road to MIT](DONORS.md#the-road-to-mit). See [all donors](DONORS.md), or [become one](docs/donations.md).
 
-## The Problem
+## Why do I need this?
 
 - Browsing files over SSH or NFS is clunky.
-- Agents can't run `--dangerously` on your local files without putting your machine at risk.
-- Some sync tools require gigs of RAM for big trees, or a cloud account, or both.
+- You can't use your local tools on remote files.
+- `rsync` is one way, and its slow.
+- Other tools require gigs of RAM for big trees, or a cloud account, or both.
+- Other tools are also slow.
 
-Unhinged solution: keep everything in sync so editing local files is practically the same as editing remote ones.
+Unhinged solution: keep everything in sync with a "benchmaxxed" tool so editing local files is practically the same as editing remote ones.
 
-## Why Autobahn
+## Why Autobahn?
 
 - **Fast as hell.** Delivers sub-30ms propagation times for updates across trees containing hundreds of thousands of files.
 - **Lightweight.** Employs immutable shared-tree structures in memory, requiring significantly less RAM and idle CPU than conventional sync daemons.
 - **Safe.** Choose a sync policy per group that matches your risk profile, backed by tests and bounded formal models. See [Safety](docs/safety.md) for the guarantees and their limits.
 - **Reviewed to death.** GLM 5.3, KIMI 3, Astra, and Fable were used to perform correctness and security reviews.
 - **Privacy first.** No cloud service, no account, no third party.
-
 
 ## Getting Started with the CLI
 
@@ -79,14 +80,12 @@ Make sure you have your [SSH configuration](docs/ssh.md) set up so you can conne
 
 ## Desktop App
 
-Autobahn comes with a poorly tested desktop app and menu bar item, so expect bugs the way you'd expect them from Apple.
+Autobahn ships with a desktop app and menu bar item that are about as well tested as a macOS point release.
 
-- **macOS** — open `Autobahn.app`
-- **Linux** — extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the desktop libraries the workflow lists.
+- **macOS**: [Apple Silicon](https://github.com/fny/autobahn/releases/latest/download/Autobahn-macos-aarch64.zip), Intel you build
+- **Linux**: [x86_64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-x86_64.tar.gz), [aarch64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-aarch64.tar.gz)
 
-Install the latest version from the [releases page](https://github.com/fny/autobahn/releases).
-
-I highly recommend trying the app unless you plan to handle conflicts over the CLI like a masochist.
+On Linux, extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the [desktop libraries the workflow lists](https://github.com/fny/autobahn/blob/5692537/.github/workflows/app.yml#L90-L98).
 
 <img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
 

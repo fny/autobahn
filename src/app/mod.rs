@@ -316,26 +316,32 @@ fn show_the_window(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
 fn open_settings(config: Option<PathBuf>, state_root: PathBuf, cx: &mut App) {
     crate::dock::in_the_dock(true);
     cx.activate(true);
-    let desk = cx.try_global::<Desk>().and_then(|desk| desk.0.upgrade());
-    match (desk, cx.windows().first().copied()) {
-        (Some(desk), Some(window)) => {
-            window
-                .update(cx, |_, window, cx| {
-                    window.activate_window();
-                    desk.update(cx, |desk, cx| {
-                        desk.pane = Pane::Config;
-                        desk.section = Section::Settings;
-                        desk.settle(Pane::Config, window, cx);
-                        cx.notify();
-                    });
-                })
-                .ok();
+    // After the current update, not during it: ⌘, arrives through the
+    // window's own key handling, and that window cannot be updated again
+    // from inside it ("window not found"). The menu item arrives outside
+    // one, and is not hurt by waiting a turn.
+    cx.defer(move |cx| {
+        let desk = cx.try_global::<Desk>().and_then(|desk| desk.0.upgrade());
+        match (desk, cx.windows().first().copied()) {
+            (Some(desk), Some(window)) => {
+                window
+                    .update(cx, |_, window, cx| {
+                        window.activate_window();
+                        desk.update(cx, |desk, cx| {
+                            desk.pane = Pane::Config;
+                            desk.section = Section::Settings;
+                            desk.settle(Pane::Config, window, cx);
+                            cx.notify();
+                        });
+                    })
+                    .ok();
+            }
+            _ => {
+                let pane = Some("config:settings".to_owned());
+                open_window(config, state_root, pane, true, false, cx);
+            }
         }
-        _ => {
-            let pane = Some("config:settings".to_owned());
-            open_window(config, state_root, pane, true, false, cx);
-        }
-    }
+    });
 }
 
 /// Keeps the item up to date and answers what is chosen in it.

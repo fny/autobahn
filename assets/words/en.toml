@@ -152,7 +152,7 @@ asked_everything = "{done} every session"
 
 [welcome]
 greeting = "Autobahn"
-tagline = "Subsecond sync with German precision"
+tagline = "Subsecond file sync with German precision"
 install_now = "Install Service"
 installing = "Installing..."
 starting = "Starting..."

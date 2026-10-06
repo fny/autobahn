@@ -1069,7 +1069,6 @@ impl AutobahnApp {
         };
         self.refreshing = true;
         let state_root = self.state_root.clone();
-        let asks_supervisor = self.pane == Pane::Service;
         cx.spawn(async move |this, cx| {
             let read = cx
                 .background_executor()
@@ -1093,8 +1092,11 @@ impl AutobahnApp {
                                 .next()
                                 .unwrap_or_else(|| surface::first_line(&said))
                         });
-                    let supervisor =
-                        asks_supervisor.then(|| surface::supervisor_build(&state_root));
+                    // Asked every time, not only with the service pane
+                    // open: the first reading is made before the pane is
+                    // chosen, and one more probe of a local socket costs
+                    // nothing next to the report.
+                    let supervisor = Some(surface::supervisor_build(&state_root));
                     Refreshed {
                         hook_set,
                         report,
@@ -2911,6 +2913,7 @@ impl AutobahnApp {
                             div()
                                 .pt(step(1.))
                                 .flex()
+                                .flex_wrap()
                                 .gap(step(1.5))
                                 .child(
                                     Button::new("keep-primary")

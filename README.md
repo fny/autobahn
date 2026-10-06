@@ -2,9 +2,9 @@
 
 [![Release](https://img.shields.io/github/v/release/fny/autobahn)](https://github.com/fny/autobahn/releases) [![CI](https://github.com/fny/autobahn/actions/workflows/ci.yml/badge.svg)](https://github.com/fny/autobahn/actions/workflows/ci.yml) [![License](https://img.shields.io/badge/license-AGPL--3.0%20or%20Donor-blue)](#license) [![Platforms](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey)](#system-requirements--limitations) [![Donate](https://img.shields.io/badge/donate-Justice--in--Education-ff69b4)](docs/donations.md)
 
-*Subsecond sync with German precision.*
+*Subsecond file sync with German precision.*
 
-Autobahn keeps folders on your machine in sync with remotes faster than you can type. Here's a recorded demo with a save after each keystroke:
+Autobahn gives you two-way sync between local and remote folders faster than you can type. Here I'm saving a file in a tree with 100k files after each key stroke, and the changes propogate instantly.
 
 <img src="assets/autobahn-typing.gif" alt="Typing on a laptop, synced live to a remote host over SSH" width="720">
 
@@ -79,14 +79,16 @@ Make sure you have your [SSH configuration](docs/ssh.md) set up so you can conne
 
 ## Desktop App
 
-Autobahn comes with an poorly tested desktop app and menu bar item which make managing the supervisor and syncing simple. Masochists are welcome to use the CLI alone.
-
-<img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
-
-Install the latest version from the [releases page](https://github.com/fny/autobahn/releases).
+Autobahn comes with a poorly tested desktop app and menu bar item, so expect bugs the way you'd expect them from Apple.
 
 - **macOS** — open `Autobahn.app`
 - **Linux** — extract the archive and run `./autobahn-app`. You need a graphical session (Wayland or X11), a Vulkan driver, and the desktop libraries the workflow lists.
+
+Install the latest version from the [releases page](https://github.com/fny/autobahn/releases).
+
+I highly recommend trying the app unless you plan to handle conflicts over the CLI like a masochist.
+
+<img src="assets/screenshots/groups.png" alt="App showing three sync groups across four sessions, all synchronized" width="900">
 
 To learn more, see the [application's documentation](docs/app.md).
 

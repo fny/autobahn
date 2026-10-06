@@ -9,7 +9,7 @@ Download the app from the [releases page](https://github.com/fny/autobahn/releas
 - **macOS**: [Apple Silicon](https://github.com/fny/autobahn/releases/latest/download/Autobahn-macos-aarch64.zip), Intel you build
 - **Linux**: [x86_64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-x86_64.tar.gz), [aarch64](https://github.com/fny/autobahn/releases/latest/download/Autobahn-linux-aarch64.tar.gz)
 
-For Linux extract it and run `./autobahn-app`. You need a graphical session (Wayland or X11) and a Vulkan driver. The archive's `APT_REQUIREMENTS.txt` lists the Ubuntu or Debian packages the app uses, read off the binary when it was built, and this installs them: `grep -v '^#' APT_REQUIREMENTS.txt | xargs sudo apt-get install -y`. It's built on Ubuntu 24.04, so older distributions may be missing a new enough glibc.
+For Linux extract it and run `./autobahn-app`. You need a graphical session (Wayland or X11) and a Vulkan driver. The archive's `APT_REQUIREMENTS.txt` lists the required Ubuntu or Debian packages. Use this command to install them: `grep -v '^#' APT_REQUIREMENTS.txt | xargs sudo apt-get install -y`. It's built on Ubuntu 24.04, so older distributions may be missing a new enough glibc.
 
 ## First Run
 

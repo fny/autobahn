@@ -984,15 +984,19 @@ impl AutobahnApp {
         self.said_at = Some(Instant::now());
     }
 
-    /// Lets a message go once it has been read: a plain or green one
-    /// after a few seconds, a red one never on its own. The hints had no
-    /// turn otherwise, since nothing else ever cleared the line. Says
-    /// whether anything changed.
+    /// Lets a message go once it has been read: a plain one after a few
+    /// seconds, a done one after a moment, a red one never on its own.
+    /// The hints had no turn otherwise, since nothing else ever cleared
+    /// the line. Says whether anything changed.
     fn expire_said(&mut self) -> bool {
-        const SAID_FOR: Duration = Duration::from_secs(8);
-        let stale = self.said.is_some()
-            && self.tone != Tone::Trouble
-            && self.said_at.is_some_and(|at| at.elapsed() >= SAID_FOR);
+        let said_for = match self.tone {
+            Tone::Plain => Duration::from_secs(8),
+            // "Diff copied" is read in a glance, and a line that stays
+            // green for seconds afterwards reads as still happening.
+            Tone::Done => Duration::from_secs(2),
+            Tone::Trouble => return false,
+        };
+        let stale = self.said.is_some() && self.said_at.is_some_and(|at| at.elapsed() >= said_for);
         if stale {
             self.clear_said();
         }
@@ -1006,8 +1010,8 @@ impl AutobahnApp {
         self.hint = SharedString::from(crate::words::hint_besides(&self.hint));
     }
 
-    /// Puts an outcome in the footer: what worked in green, what did not
-    /// in red.
+    /// Puts an outcome in the footer: what worked for a moment, what did
+    /// not in red until it is read.
     fn say_result(&mut self, outcome: Result<String, String>) {
         match outcome {
             Ok(said) => self.say(said, Tone::Done),
@@ -1573,9 +1577,15 @@ impl AutobahnApp {
         }
     }
 
-    /// Whether something slow is running that the bar is talking about.
+    /// Whether the bar's line gets the spinner: something slow is
+    /// running that it is talking about, or something just finished and
+    /// the line says so for a moment.
     fn busy(&self) -> bool {
-        self.resolving || self.diffing || self.ordering || self.doctoring.is_some()
+        self.resolving
+            || self.diffing
+            || self.ordering
+            || self.doctoring.is_some()
+            || (self.said.is_some() && self.tone == Tone::Done)
     }
 
     fn footer(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -1587,7 +1597,7 @@ impl AutobahnApp {
             && self.copied_at.is_some_and(|at| at.elapsed() < COPIED_FOR);
         let colour = match self.tone {
             Tone::Plain => DIM,
-            Tone::Done => GREEN,
+            Tone::Done => DIM,
             Tone::Trouble => RED,
         };
         div()

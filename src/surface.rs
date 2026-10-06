@@ -1477,6 +1477,42 @@ pub(crate) fn mend_service() -> Option<String> {
     })
 }
 
+/// Runs one of the command's subcommands and keeps everything it said,
+/// for a report that is read whole: `doctor`'s. [`ran`] keeps one line.
+pub(crate) fn report(
+    arguments: &[&str],
+    config: Option<&std::path::Path>,
+    state_root: &std::path::Path,
+) -> Result<String, String> {
+    let mut command = std::process::Command::new(exe());
+    command.args(arguments);
+    if let Some(path) = config {
+        command.arg("--config").arg(path);
+    }
+    command.arg("--state-root").arg(state_root);
+    let done = match command.output() {
+        Ok(done) => done,
+        Err(error) => {
+            return Err(fill(
+                "status.unreachable_command",
+                &[("error", &error.to_string())],
+            ))
+        }
+    };
+    let out = String::from_utf8_lossy(&done.stdout).trim().to_owned();
+    let err = String::from_utf8_lossy(&done.stderr).trim().to_owned();
+    let said = match (out.is_empty(), err.is_empty()) {
+        (false, true) => out,
+        (true, false) => err,
+        (false, false) => format!("{out}\n{err}"),
+        (true, true) => fill("status.ran", &[("command", &arguments.join(" "))]),
+    };
+    match done.status.success() {
+        true => Ok(said),
+        false => Err(said),
+    }
+}
+
 /// Runs one of the command's own subcommands and says what it said.
 ///
 /// The window does the small things itself, through the library; the

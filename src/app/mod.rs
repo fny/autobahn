@@ -513,6 +513,13 @@ pub struct AutobahnApp {
     /// The message last copied from the footer, so its button can say so
     /// for as long as that message is the one showing.
     copied: Option<String>,
+    /// A group's doctor report, open under its card: the group, the
+    /// report, and whether a reset is being asked about, in which case
+    /// the report is what to read before saying yes.
+    doctor: Option<Doctored>,
+    /// The group whose report is being read right now, since reading
+    /// scans both sides of every session and takes as long as that takes.
+    doctoring: Option<String>,
     /// Whether there is an `autobahn` to talk to. Read once at the
     /// start and again after an install, because it is the answer to
     /// "is this window of any use yet".
@@ -815,6 +822,8 @@ impl AutobahnApp {
             shape: crate::config::schema(),
             said: None,
             copied: None,
+            doctor: None,
+            doctoring: None,
             command_build: surface::command_build(),
             supervisor_build: surface::SupervisorBuild::Absent,
         };
@@ -1515,10 +1524,276 @@ impl AutobahnApp {
                             .text_size(px(11.))
                             .text_color(rgb(colour))
                             .child(summary),
-                    ),
+                    )
+                    .child(self.group_buttons(&group.name, cx)),
+            )
+            .when_some(
+                self.doctor
+                    .clone()
+                    .filter(|doctored| doctored.group == group.name),
+                |band, doctored| band.child(self.doctor_panel(&doctored, cx)),
             )
             .children(rows)
             .into_any_element()
+    }
+
+    /// What can be asked of a whole group, on its card. The safe ones are
+    /// plain buttons; the two that change the configuration or bring
+    /// deleted files back are quieter, and Reset asks before it acts.
+    fn group_buttons(&self, name: &str, cx: &mut Context<Self>) -> Div {
+        let reading = self.doctoring.as_deref() == Some(name);
+        let button = |id: &str, label: &'static str, tip: &'static str| {
+            Button::new(SharedString::from(format!("group-{id}-{name}")))
+                .xsmall()
+                .outline()
+                .label(label)
+                .tooltip(tip)
+        };
+        let (doctor, flush, verify, reset, disable) = (
+            name.to_owned(),
+            name.to_owned(),
+            name.to_owned(),
+            name.to_owned(),
+            name.to_owned(),
+        );
+        div()
+            .flex_shrink_0()
+            .flex()
+            .gap(step(1.5))
+            .child(
+                button("doctor", t("group.doctor"), t("tip.group_doctor"))
+                    .disabled(reading)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.read_doctor(&doctor, false, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                button("flush", t("verb.flush"), t("tip.group_flush")).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.group_control(&flush, Verb::Flush);
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                button("verify", t("verb.verify"), t("tip.group_verify")).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.group_control(&verify, Verb::Verify);
+                        cx.notify();
+                    },
+                )),
+            )
+            .child(
+                Button::new(SharedString::from(format!("group-reset-{name}")))
+                    .xsmall()
+                    .ghost()
+                    .label(t("group.reset"))
+                    .tooltip(t("tip.group_reset"))
+                    .disabled(reading)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.read_doctor(&reset, true, cx);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new(SharedString::from(format!("group-disable-{name}")))
+                    .xsmall()
+                    .ghost()
+                    .label(t("group.disable"))
+                    .tooltip(t("tip.group_disable"))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.disable_group(&disable);
+                        cx.notify();
+                    })),
+            )
+    }
+
+    /// A group's doctor report, under its card. Asked about a reset, it
+    /// is the thing to read first, and the Merge button sits with it.
+    fn doctor_panel(&self, doctored: &Doctored, cx: &mut Context<Self>) -> Div {
+        let name = doctored.group.clone();
+        let title = match doctored.offer_reset {
+            true => fill("group.reset_title", &[("name", &name)]),
+            false => fill("group.doctor_title", &[("name", &name)]),
+        };
+        let report = doctored.report.clone();
+        let merging = name.clone();
+        div()
+            .flex()
+            .flex_col()
+            .border_b_1()
+            .border_color(rgb(HAIR))
+            .bg(rgb(RAISED))
+            .child(
+                div()
+                    .px(step(4.))
+                    .py(step(2.))
+                    .flex()
+                    .items_center()
+                    .gap(step(1.5))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .text_size(px(11.5))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(rgb(match doctored.offer_reset {
+                                true => AMBER,
+                                false => DIM,
+                            }))
+                            .truncate()
+                            .child(title),
+                    )
+                    .when(doctored.offer_reset, |row| {
+                        row.child(
+                            Button::new(SharedString::from(format!("merge-{name}")))
+                                .xsmall()
+                                .primary()
+                                .label(t("group.merge"))
+                                .tooltip(t("tip.merge"))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.reset_group(&merging);
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new(SharedString::from(format!("copy-doctor-{name}")))
+                            .xsmall()
+                            .outline()
+                            .label(t("status.copy"))
+                            .tooltip(t("tip.copy_doctor"))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                if let Some(doctored) = &this.doctor {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        surface::for_the_clipboard(&doctored.report),
+                                    ));
+                                    this.said = Some(t("group.doctor_copied").to_owned());
+                                    cx.notify();
+                                }
+                            })),
+                    )
+                    .child(
+                        Button::new(SharedString::from(format!("close-doctor-{name}")))
+                            .xsmall()
+                            .ghost()
+                            .label(t("group.close"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.doctor = None;
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("doctor-{name}")))
+                    .max_h(px(360.))
+                    .overflow_y_scroll()
+                    .px(step(4.))
+                    .pb(step(3.))
+                    .font_family(self.mono.clone())
+                    .child(said(
+                        SharedString::from(format!("doctor-text-{name}")),
+                        &crate::text::display_safe(&report),
+                        DIM,
+                        11.,
+                    )),
+            )
+    }
+
+    /// Reads a group's doctor report off the main thread: it scans both
+    /// sides of every session, which on a large tree takes a while. With
+    /// `offer_reset`, the report opens as the question a reset asks.
+    fn read_doctor(&mut self, name: &str, offer_reset: bool, cx: &mut Context<Self>) {
+        if self.doctoring.is_some() {
+            return;
+        }
+        self.doctoring = Some(name.to_owned());
+        self.said = Some(fill("group.doctoring", &[("name", name)]));
+        let group = name.to_owned();
+        let config = self.config.clone();
+        let state_root = self.state_root.clone();
+        cx.spawn(async move |this, cx| {
+            let asked = group.clone();
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    surface::report(&["doctor", &asked], config.as_deref(), &state_root)
+                })
+                .await;
+            this.update(cx, |this, cx| {
+                this.doctoring = None;
+                let report = match done {
+                    Ok(report) => report,
+                    Err(report) => report,
+                };
+                this.doctor = Some(Doctored {
+                    group: group.clone(),
+                    report,
+                    offer_reset,
+                });
+                this.said = Some(fill("group.doctored", &[("name", &group)]));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// A control request for every session of a group.
+    fn group_control(&mut self, name: &str, verb: Verb) {
+        let selector = crate::supervisor::control::Selector {
+            group: Some(name.to_owned()),
+            host: None,
+            session: None,
+        };
+        let request = match verb {
+            Verb::Flush => crate::supervisor::control::ControlRequest::Flush(selector),
+            Verb::Verify => crate::supervisor::control::ControlRequest::Verify(selector),
+            Verb::Pause => crate::supervisor::control::ControlRequest::Pause(selector),
+            Verb::Resume => crate::supervisor::control::ControlRequest::Resume(selector),
+        };
+        self.said = Some(
+            match crate::supervisor::control::send(&self.state_root, &request) {
+                Ok(_) => fill("group.controlled", &[("done", verb.done()), ("name", name)]),
+                Err(error) => format!("{error:#}"),
+            },
+        );
+        self.read_at = None;
+    }
+
+    /// Discards what a group's sessions last agreed on, as `autobahn
+    /// reset <group>` does: the next cycle merges both sides and only
+    /// adds, so deleted files come back. Only ever reached through the
+    /// report that says what that means for this group.
+    fn reset_group(&mut self, name: &str) {
+        let request = crate::supervisor::control::ControlRequest::Reset(
+            crate::supervisor::control::Selector {
+                group: Some(name.to_owned()),
+                host: None,
+                session: None,
+            },
+        );
+        self.said = Some(
+            match crate::supervisor::control::send(&self.state_root, &request) {
+                Ok(_) => fill("group.reset_done", &[("name", name)]),
+                Err(error) => format!("{error:#}"),
+            },
+        );
+        self.doctor = None;
+        self.read_at = None;
+    }
+
+    /// Turns a group off in the configuration, as `autobahn disable
+    /// --group` does. Its state is kept; the Configuration page is where
+    /// it is turned back on, since a group that is off leaves this page.
+    fn disable_group(&mut self, name: &str) {
+        self.said = Some(surface::ran(
+            &["disable", "--group", name],
+            self.config.as_deref(),
+        ));
+        self.read_at = None;
     }
 
     fn session_row(
@@ -1625,6 +1900,52 @@ impl AutobahnApp {
                     &crate::text::display_safe(error),
                     RED,
                 ))
+            })
+            // A halt names doctor and reset; here they are, beside it.
+            .when(session.state == "halted", |band| {
+                let (doctor, reset) = (group.name.clone(), group.name.clone());
+                let reading = self.doctoring.as_deref() == Some(group.name.as_str());
+                band.child(
+                    div()
+                        .pl(step(8.))
+                        .pb(step(2.5))
+                        .flex()
+                        .gap(step(1.5))
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "halted-doctor-{}-{}",
+                                group.name, session.replica
+                            )))
+                            .xsmall()
+                            .outline()
+                            .label(t("group.doctor"))
+                            .tooltip(t("tip.group_doctor"))
+                            .disabled(reading)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.read_doctor(&doctor, false, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(
+                            Button::new(SharedString::from(format!(
+                                "halted-reset-{}-{}",
+                                group.name, session.replica
+                            )))
+                            .xsmall()
+                            .ghost()
+                            .label(t("group.reset"))
+                            .tooltip(t("tip.group_reset"))
+                            .disabled(reading)
+                            .on_click(cx.listener(
+                                move |this, _, _, cx| {
+                                    this.read_doctor(&reset, true, cx);
+                                    cx.notify();
+                                },
+                            )),
+                        ),
+                )
             })
             // What is waiting reads across the card, the reason first.
             .when(open, |band| {
@@ -4659,6 +4980,16 @@ impl AutobahnApp {
     fn reveal(&mut self, file: &std::path::Path) {
         self.said = Some(surface::reveal(file));
     }
+}
+
+/// A group's doctor report, open under its card.
+#[derive(Clone)]
+struct Doctored {
+    group: String,
+    report: String,
+    /// Opened by Reset: the report is what to read before merging, and
+    /// the Merge button sits with it.
+    offer_reset: bool,
 }
 
 /// What can be asked of a running session.

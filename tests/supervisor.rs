@@ -4455,10 +4455,7 @@ fn doctor_says_whether_a_reset_is_free_and_writes_nothing() {
     assert!(ok, "{text}");
     assert!(text.contains("baseline: readable"), "{text}");
     assert!(text.contains("nothing to do"), "{text}");
-    assert!(
-        text.contains("a reset: ") && text.contains("free"),
-        "{text}"
-    );
+    assert!(text.contains("a reset would copy nothing"), "{text}");
 
     // A deletion the baseline knows about, not yet carried across.
     fs::remove_file(primary.join("gone.txt")).unwrap();
@@ -4467,11 +4464,11 @@ fn doctor_says_whether_a_reset_is_free_and_writes_nothing() {
     let (ok, text) = cli(&world, &config, &["doctor", "work"]);
     assert!(ok, "{text}");
     assert!(
-        text.contains("delete gone.txt to replica"),
+        text.contains("gone.txt  deleted on the primary"),
         "the next cycle: {text}"
     );
     assert!(
-        text.contains("copy gone.txt to primary"),
+        text.contains("a reset would copy 1 file (4 bytes) to the primary"),
         "what a reset would bring back: {text}"
     );
     // The baseline is untouched. (A scan refreshes its scan cache, as any

@@ -2923,7 +2923,11 @@ impl AutobahnApp {
                                         .label(t("conflicts.keep_primary"))
                                         .tooltip(t("tip.keep_primary"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.settle_all(&[primary.clone()], Keep::Primary, cx);
+                                            this.settle_all(
+                                                std::slice::from_ref(&primary),
+                                                Keep::Primary,
+                                                cx,
+                                            );
                                             cx.notify();
                                         })),
                                 )
@@ -2938,7 +2942,11 @@ impl AutobahnApp {
                                         ))
                                         .tooltip(t("tip.keep_replica"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.settle_all(&[host.clone()], Keep::Replica, cx);
+                                            this.settle_all(
+                                                std::slice::from_ref(&host),
+                                                Keep::Replica,
+                                                cx,
+                                            );
                                             cx.notify();
                                         })),
                                 )
@@ -2950,7 +2958,11 @@ impl AutobahnApp {
                                         .label(t("conflicts.keep_both"))
                                         .tooltip(t("tip.keep_both"))
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.settle_all(&[both.clone()], Keep::Both, cx);
+                                            this.settle_all(
+                                                std::slice::from_ref(&both),
+                                                Keep::Both,
+                                                cx,
+                                            );
                                             cx.notify();
                                         })),
                                 )

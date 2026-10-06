@@ -1753,14 +1753,48 @@ impl AutobahnApp {
                         what,
                     })
                 };
-                menu.menu(t("group.doctor"), ask(GroupAsk::Doctor))
-                    .menu(t("verb.flush"), ask(GroupAsk::Flush))
-                    .menu(t("verb.verify"), ask(GroupAsk::Verify))
-                    .separator()
-                    .menu(t("group.disable"), ask(GroupAsk::Disable))
-                    .menu_element(ask(GroupAsk::Reset), |_, _| {
-                        div().text_color(rgb(RED)).child(t("group.reset"))
-                    })
+                // Each item says what it does when hovered, as the
+                // buttons it replaced did.
+                let item =
+                    |id: &'static str, label: &'static str, tip: &'static str, colour: u32| {
+                        move |_: &mut Window, _: &mut App| {
+                            div()
+                                .id(id)
+                                .w_full()
+                                .text_color(rgb(colour))
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(tip)
+                                        .build(window, cx)
+                                })
+                                .child(label)
+                        }
+                    };
+                menu.menu_element(
+                    ask(GroupAsk::Doctor),
+                    item("menu-doctor", t("group.doctor"), t("tip.group_doctor"), INK),
+                )
+                .menu_element(
+                    ask(GroupAsk::Flush),
+                    item("menu-flush", t("verb.flush"), t("tip.group_flush"), INK),
+                )
+                .menu_element(
+                    ask(GroupAsk::Verify),
+                    item("menu-verify", t("verb.verify"), t("tip.group_verify"), INK),
+                )
+                .separator()
+                .menu_element(
+                    ask(GroupAsk::Disable),
+                    item(
+                        "menu-disable",
+                        t("group.disable"),
+                        t("tip.group_disable"),
+                        INK,
+                    ),
+                )
+                .menu_element(
+                    ask(GroupAsk::Reset),
+                    item("menu-reset", t("group.reset"), t("tip.group_reset"), RED),
+                )
             })
     }
 
@@ -1851,11 +1885,13 @@ impl AutobahnApp {
                             })),
                     ),
             )
+            // The report takes the height it needs and the page scrolls
+            // as a whole: a scrolling box inside a scrolling page catches
+            // the wheel and holds it.
             .child(
                 div()
-                    .id(SharedString::from(format!("doctor-{name}")))
-                    .max_h(px(360.))
-                    .overflow_y_scroll()
+                    .w_full()
+                    .min_w(px(0.))
                     .px(step(4.))
                     .pb(step(3.))
                     .font_family(self.mono.clone())

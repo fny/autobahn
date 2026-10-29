@@ -6,7 +6,7 @@ Everyone listed here has become an official supporter of Autobahn by supporting 
 
 ## The Road to MIT
 
-`░░░░░░░░░░░░░░░░░░░░` **$50 of $10,000**
+`░░░░░░░░░░░░░░░░░░░░` **$101 of $10,000**
 
 At $10K, Autobahn goes MIT for everyone.
 
@@ -29,6 +29,7 @@ _$50 and up. Enough for a personal license._
 |     | Who                                                            | 🪪 Since   |
 | --- | -------------------------------------------------------------- | ---------- |
 | <img src="https://github.com/ChrisMckerracher.png?size=40" width="20" height="20" alt="" /> | [Christopher Mckerracher](https://github.com/ChrisMckerracher) | 2026-10-04 |
+| <img src="https://github.com/preston-voltai.png?size=40" width="20" height="20" alt="" /> | [Preston Lee](https://github.com/preston-voltai)               | 2026-10-29 |
 
 ## 🛵 On-Ramp
 

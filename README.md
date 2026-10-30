@@ -19,7 +19,9 @@ These people bought books for people who need a second chance. Thank you!
 
 <a href="https://github.com/ChrisMckerracher"><img src="https://github.com/ChrisMckerracher.png?size=96" width="40" height="40" alt="Christopher Mckerracher" title="Christopher Mckerracher" align="middle"></a> &nbsp;[Christopher Mckerracher](https://github.com/ChrisMckerracher)
 
-**$50 of $10,000** on the [road to MIT](DONORS.md#the-road-to-mit). See [all donors](DONORS.md), or [become one](docs/donations.md).
+<a href="https://github.com/preston-voltai"><img src="https://github.com/preston-voltai.png?size=96" width="40" height="40" alt="Preston Lee" title="Preston Lee" align="middle"></a> &nbsp;[Preston Lee](https://github.com/preston-voltai)
+
+**$101 of $10,000** on the [road to MIT](DONORS.md#the-road-to-mit). See [all donors](DONORS.md), or [become one](docs/donations.md).
 
 ## The Problem
 
